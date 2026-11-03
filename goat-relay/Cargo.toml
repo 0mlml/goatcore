@@ -1,0 +1,102 @@
+[package]
+name = "goat-relay"
+version = "0.0.1-alpha"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "Netbird-relay-compatible relay server in Rust (data plane). Block 33B+. Clean-room reimplementation per docs/design/netbird-relay-wire-protocol.md."
+repository = "https://github.com/usareur-af/goatcore"
+readme = "README.md"
+keywords = ["netbird", "relay", "wireguard", "vpn", "mesh"]
+categories = ["network-programming"]
+
+[dependencies]
+goat-relay-protocol = { path = "../goat-relay-protocol", version = "0.0.1-alpha" }
+# Async runtime per ADR 0709 D7. NOT `rt-multi-thread` — single-threaded
+# `Builder::new_current_thread()` per pinned thread.
+tokio = { version = "1", features = ["rt", "sync", "net", "io-util", "macros", "time", "signal"] }
+# Thread-to-core pinning per ADR 0709 D7 layer 1.
+core_affinity = "0.8"
+# TLS termination per ADR 0709 D8. Crypto provider = `ring` per the
+# D8 "Crypto provider" subsection; `aws-lc-rs` migration deferred.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# PEM cert/key loader — feeds rustls 0.23's CertificateDer / PrivateKeyDer.
+rustls-pemfile = "2"
+# Relay-client auth (timed-HMAC v2 validator, goat-relay/src/auth.rs).
+# Same crypto provider as rustls/quinn per ADR 0709 D8 (one crypto stack,
+# not a second RustCrypto dep) — SHA256 key derivation + constant-time
+# HMAC-SHA256 verification. 0.17 matches the version rustls 0.23 resolves.
+ring = "0.17"
+# WebSocket framing per ADR 0709 D10. We terminate TLS upstream and pass a
+# plaintext stream to tokio-tungstenite — no tls feature needed here.
+# 0.26+ accepts Bytes directly in Message::Binary (no Vec<u8> roundtrip),
+# closing the WS-vs-QUIC asymmetry on the forward path. Zero-copy audit
+# F-A1 — dominant per-message overhead on the WS path was
+# Message::Binary(frame.to_vec()). At 100 Mbps single-flow ≈ 14k allocs/sec
+# eliminated. tokio-tungstenite 0.26 is API-compatible apart from the
+# Vec→Bytes flip in Message::Binary; tracked as part of Block 33C readiness.
+tokio-tungstenite = "0.26"
+# QUIC transport per ADR 0709 D9. RFC 9221 datagrams (NOT streams) per
+# spec §2; quinn exposes Connection::send_datagram / read_datagram.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# Sink/Stream extension traits (`SinkExt::send`, `StreamExt::next`) for
+# driving the WebSocketStream send/receive sides ergonomically.
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Zero-copy reference-counted byte buffers for the routing dispatch
+# boundary (`Bytes` clones are refcount-only). Step 4.
+bytes = "1"
+# UDP socket plumbing for the QUIC listener's SO_REUSEPORT bind path.
+# tokio::net::UdpSocket has no built-in reuse-port API; quinn::Endpoint
+# accepts a pre-bound std::net::UdpSocket which we build via socket2 with
+# SO_REUSEADDR + SO_REUSEPORT enabled. tokio::net::TcpSocket already has
+# set_reuseaddr / set_reuseport so the WS listener doesn't need socket2.
+# Block 33C.1 lever L8.
+# `all` feature unlocks `set_reuse_port` (gated behind the feature
+# in socket2 0.5 because the underlying setsockopt isn't on every
+# target — Windows doesn't have it; we cfg-guard the call site too).
+socket2 = { version = "0.5", features = ["all"] }
+
+# kTLS hand-off — Linux-only per ADR 0709 D8. macOS dev builds without
+# this dep; Linux production builds with it. See goat-relay/src/listener/
+# ws_ktls.rs for the integration point. Validation lives at step 8
+# (bench-env Linux smoke).
+#
+# tokio-uring — Linux-only per ADR 0711. Provides io_uring SQPOLL +
+# multishot recv + registered buffers. Each shard runs its own
+# `tokio_uring::Runtime` instance on Linux; macOS dev builds keep
+# vanilla tokio current_thread runtime. The cfg-gated module
+# `goat-relay/src/runtime.rs` selects the right path at compile time.
+# Block 33C.1 lever L5.
+[target.'cfg(target_os = "linux")'.dependencies]
+ktls = "6"
+tokio-uring = "0.5"
+# Block 33C.1 lever L8.b — SO_ATTACH_REUSEPORT_CBPF for source-IP
+# affinity steering across SO_REUSEPORT shards. Uses raw setsockopt
+# with classic BPF program; libc gives us the constants + sock_filter
+# / sock_fprog struct definitions.
+libc = "0.2"
+
+[dev-dependencies]
+# Self-signed test cert generation for the listener integration test.
+rcgen = "0.13"
+# tokio's test-util feature enables `tokio::time::pause` / `advance` for
+# the keepalive task's interval-based unit tests. Re-importing tokio here
+# with `test-util` extends the feature set used in test builds.
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+# Microbenchmark harness for the routing-dispatch hot path. Matches
+# upstream's relay/test/benchmark_test.go shape via cargo bench rather
+# than `go test -bench`. Mirrors goat-relay-protocol/benches/wire_format.rs.
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[[bin]]
+name = "goat-relay"
+path = "src/main.rs"
+
+[[bench]]
+name = "routing_dispatch"
+harness = false

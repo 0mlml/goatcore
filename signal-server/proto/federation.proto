@@ -1,0 +1,46 @@
+// Server-to-server federation RPC. Only spoken between signal servers;
+// clients never see it.
+//
+// On a local registry miss in Send()/ConnectStream delivery, the serving
+// signal server broadcasts the EncryptedMessage to all peer signal servers
+// via Forward. The server that has the target peer delivers it and returns
+// delivered=true; others return delivered=false. At 2-5 servers, broadcast
+// is correct — no peer-location tracking needed.
+syntax = "proto3";
+
+package signalfederation;
+
+option go_package = "github.com/usareur-af/goatcore/signal-server/gen/federation;federation";
+
+import "signalexchange.proto";
+
+service SignalFederation {
+    rpc Forward(signalexchange.EncryptedMessage) returns (ForwardResult) {}
+
+    // PresenceUpdate (ADR 1108): the caller pushes its currently-registered peer
+    // keys so a receiver can forward a cross-shard message DIRECTLY to the owning
+    // server instead of broadcasting to every peer. Presence is an eventually-
+    // consistent projection — broadcast stays the fallback for unknown keys, so
+    // correctness never depends on it. The ack returns the RESPONDER's node name,
+    // closing the address<->node correlation the caller needs to route outbound
+    // (it dials peers by address but learns ownership by node name).
+    rpc PresenceUpdate(PresenceDelta) returns (PresenceAck) {}
+}
+
+message ForwardResult {
+    bool delivered = 1;
+}
+
+// PresenceDelta carries a sender's registered-peer set: either a full snapshot
+// (full=true, `added` is the complete set) or an incremental change.
+message PresenceDelta {
+    string node = 1;             // the SENDER's node name (owner of these keys)
+    bool full = 2;               // true = full snapshot: replace all state for `node`
+    repeated string added = 3;   // keys now registered on the sender
+    repeated string removed = 4; // keys no longer registered (ignored when full)
+    uint64 epoch = 5;            // monotonic per sender; receiver drops older epochs
+}
+
+message PresenceAck {
+    string node = 1;             // the RESPONDER's node name (for addr<->node mapping)
+}
