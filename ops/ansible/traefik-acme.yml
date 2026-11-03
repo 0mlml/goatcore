@@ -497,9 +497,13 @@
     # =====================================================================
     # 5. Bring up Traefik against the merged stack
     # =====================================================================
+    # --no-deps: traefik depends_on management-a, which depends on postgres-a.
+    # Without it, a base compose file that changed recreates that whole chain:
+    # on 2026-11-03 this task restarted Postgres on zagros-prod A and started the
+    # stopped standby stack on Router-B. Only Traefik is meant to move here.
     - name: Recreate Traefik with the ACME overlay
       ansible.builtin.command:
-        cmd: docker compose -f docker-compose.yml -f docker-compose.acme.yml up -d --force-recreate traefik
+        cmd: docker compose -f docker-compose.yml -f docker-compose.acme.yml up -d --no-deps --force-recreate traefik
         chdir: "{{ compose_dir }}"
       register: _traefik_up
       changed_when: "'Started' in _traefik_up.stderr or 'Created' in _traefik_up.stderr or 'Recreated' in _traefik_up.stderr"
@@ -554,6 +558,8 @@
     #    to the public name and check the issuer.
     # =====================================================================
     - name: External verification — openssl s_client against public mgmt FQDN
+      args:
+        executable: /bin/bash
       delegate_to: localhost
       become: false
       ansible.builtin.shell:

@@ -1,0 +1,85 @@
+#cloud-config
+# =============================================================
+# RADA+ Golden Image — Cloud-Init Configuration
+# =============================================================
+# Drop this file onto the SD card's boot partition after flashing
+# Ubuntu Server 24.04 ARM64. On first boot, the Pi will:
+#   - Create the radaop user with SSH key
+#   - Install base packages
+#   - Harden SSH
+#   - Set timezone
+#   - Enable unattended upgrades
+#
+# After first boot completes, follow the encryption guide
+# (docs/01-rpi5-encrypt-rootfs.md), then dd the image.
+# =============================================================
+
+# --- User account ---
+users:
+  - name: radaop
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    # Replace with your actual SSH public key:
+    ssh_authorized_keys:
+      - REPLACE_WITH_YOUR_PUBLIC_KEY
+
+# --- SSH hardening ---
+ssh_pwauth: false
+disable_root: true
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+      PubkeyAuthentication yes
+    permissions: '0644'
+  - path: /etc/dropbear/initramfs/authorized_keys
+    content: |
+      REPLACE_WITH_YOUR_PUBLIC_KEY
+    permissions: '0600'
+
+# --- Packages ---
+package_update: false
+package_upgrade: false
+# OFFLINE: packages:
+# OFFLINE:   - python3
+# OFFLINE:   - ufw
+# OFFLINE:   - htop
+# OFFLINE:   - net-tools
+# OFFLINE:   - curl
+# OFFLINE:   - ca-certificates
+# OFFLINE:   - nano
+# OFFLINE:   - unattended-upgrades
+# OFFLINE:   - cryptsetup
+# OFFLINE:   - dropbear-initramfs
+# OFFLINE:   - busybox
+
+# --- Timezone ---
+timezone: UTC
+
+# --- NTP ---
+ntp:
+  enabled: true
+
+# --- Commands to run on first boot ---
+runcmd:
+  # Install NetBird VPN client
+  - ['bash', '-c', 'curl -fsSL https://pkgs.netbird.io/install.sh | sh']
+  # Enable unattended upgrades
+  - ['systemctl', 'enable', 'unattended-upgrades']
+  # Restart SSH to apply hardening
+  - ['systemctl', 'restart', 'ssh']
+  # Rebuild initramfs with dropbear keys
+  - ['update-initramfs', '-u']
+  # Print completion message
+  - ['echo', '=== RADA+ golden image base setup complete (NetBird installed) ===']
+  - ['echo', 'Next step - follow docs/01-rpi5-encrypt-rootfs.md for encryption']
+
+# --- Final message ---
+final_message: |
+  RADA+ golden image base setup complete.
+  System boot: $UPTIME seconds.
+  Next: SSH in and follow the encryption guide.

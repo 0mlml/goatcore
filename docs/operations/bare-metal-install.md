@@ -118,7 +118,7 @@ before the standup. Three courses of action were weighed:
 | COA | Method | Status |
 |---|---|---|
 | **A** | in-place `cryptsetup reencrypt` of the Imager root, run once from a first-boot service | **Rejected** — brick-risk if interrupted on a headless box, and these boxes get wiped and re-imaged anyway, so re-encrypting a throwaway install buys nothing |
-| **B** | use the Pi base-image builder to flash, clone and encrypt Ubuntu arm64 | **Current path** — `usareur-af-rpi-base-image`; see the builder and the adoption procedure below |
+| **B** | use the Pi base-image builder to flash, clone and encrypt Ubuntu arm64 | **Current path** — `ops/rpi-base-image/`; see the builder and the adoption procedure below |
 | **C** | UEFI-boot the arm64 Live Server ISO and run subiquity autoinstall | **Superseded** — retained as an unvalidated reference procedure, not the Pi golden path |
 
 The phase-1 host preflight now **fails** on an unencrypted root, so a plaintext
@@ -135,7 +135,7 @@ verify.
 
 ### Pi base-image builder and repair boot order
 
-The current Pi build source is usareur-af-rpi-base-image. Follow its README for a blank machine. It produces a plain LUKS root without LVM; the in-place adoption procedure below preserves the same shape. The encrypted-root preflight and Docker data-directory acceptance are recorded in F-538. Those measurements do not certify every unattended unlock mechanism.
+The current Pi build source is [`ops/rpi-base-image/`](../../ops/rpi-base-image/). Follow its README for a blank machine. It produces a plain LUKS root without LVM; the in-place adoption procedure below preserves the same shape. The encrypted-root preflight and Docker data-directory acceptance are recorded in F-538. Those measurements do not certify every unattended unlock mechanism.
 
 The builder's FIPS-mode posture is not a NIST CMVP validation. Its userspace provider and the stock Raspberry Pi kernel have different validation limits; use the builder's compliance scope and caveats rather than treating a kernel boot flag as proof.
 
@@ -229,13 +229,13 @@ not feed the LUKS role's installer-partition enrolment the way COA C does.
 > yet certified.** Treat it as a procedure to confirm on the hardware, not a
 > stamped path.
 
-The mechanism lives in `usareur-af-rpi-base-image`,
+The mechanism lives in [`ops/rpi-base-image/`](../../ops/rpi-base-image/),
 the Pi 5 base-image builder. Two scripts, run over SSH on the Pi:
 
 1. **`03-prepare-encryption.sh`** (the builder's) — installs `cryptsetup` + initramfs
    hooks, points `/etc/fstab` at `/dev/mapper/rootfs`, and rewrites
    `cmdline.txt` to `cryptdevice=/dev/nvme0n1p2:rootfs`.
-2. **`03b-headless-dropbear-unlock.sh`** (PR #2, the
+2. **`03b-headless-dropbear-unlock.sh`** (the
    headless layer) — installs `dropbear-initramfs`, drops the operator
    pubkey into `/etc/dropbear/initramfs/authorized_keys`, writes a static
    `IP=<ip>::<gw>:<mask>::<nic>:off` line into `initramfs.conf`, adds the NIC
