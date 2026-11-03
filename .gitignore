@@ -1,0 +1,262 @@
+# Secrets
+.env
+.envrc.local
+.envrc.local.d/
+# The env-file secrets posture's default file (ADR 1204): plaintext values, never committed.
+# Covered by the line above; named so a change to it cannot silently expose the file.
+.envrc.local.d/secrets.env
+*.pem
+*.key
+
+# Internal X.509 CA (ADR 0407 / docs/design/internal-tls-ca.md):
+#   - root-cert.pem is PUBLIC distribution material — peers add it as
+#     bundle tls_trust_anchor; commit it. The exception overrides the
+#     `*.pem` rule above.
+#   - ca.key.age is the age-encrypted private signing key — operator-
+#     workstation-only; NEVER commit (the *.age suffix is also matched
+#     by belt-and-suspenders below).
+!ops/enrollment/ca/*/root-cert.pem
+# F-090 Path B intermediate cert is also public material (signed by
+# the root, no private key inside). Operators install this in their
+# macOS keychain to chain-validate every leaf going forward without
+# per-leaf trust hacks. Same distribution shape as root-cert.pem.
+!ops/enrollment/ca/*/intermediate-cert.pem
+# Per-CA-ID raw PUBLIC KEY PEM consumed by wg-cp0-bundle-apply when
+# verifying offline-CA-signed bundles on the device side. Public
+# material; same distribution shape as the root cert. Each rotation
+# adds a new file under public-keys/ with the ca_id in the filename.
+# Operators need this checked in so a clean clone can apply bundles
+# without first deriving the raw pubkey from the X.509 root.
+!ops/enrollment/public-keys/*.pem
+# Block 78A-(a) — offline-CA root + intermediate baked into the
+# netbird-mgmt container image. Public-material certs committed for
+# reproducibility of the image build.
+!ops/netbird/ca/root-cert.pem
+!ops/netbird/ca/intermediate-cert.pem
+ops/enrollment/ca/*/ca.key.age
+*.age
+
+# wg-cp0 enrollment operator-laptop state — endpoint+pubkey-only (no
+# privkey), but carries the relay-to-mesh mapping + per-device pubkeys
+# and shouldn't be in public surface. Operator curates locally; bundles
+# rely on these at issuance time but the JSON files don't ride the repo.
+# See ops/enrollment/cmd/bundle-create/main.go header for the full
+# operator-discipline rationale.
+ops/enrollment/wg-cp0-relays.json
+ops/enrollment/wg-cp0-relays-prod.json
+# wg-cp0-bundle-allowlist.json is promoted to a tracked source-of-truth
+# by ADR 0322 / Block 22R.1 — the accessor library at ops/enrollment/peerset
+# is now the only path that writes the file, schema v2 is enforced, and
+# every change is visible in git history. Per-operator local working
+# copies converge through Load → Save round-trips.
+
+# IDE
+.vscode/
+.idea/
+# Terraform — tree-agnostic, so a NEW terraform-<env>/ tree is covered the day
+# it is created rather than the day someone notices. The old form enumerated one
+# block per tree, and three of those blocks carried the same comment: "This block
+# was missing, so a `terraform init` in the X tree leaked the provider cache into
+# git." terraform-zagros-dev, terraform-vega and terraform-govcloud still had no
+# block at all, and on 2026-09-08 an init in terraform-zagros-dev staged 743 MB of
+# provider cache before it was caught by hand.
+#
+# .terraform.lock.hcl IS committed (Block 13B supply-chain pin — Terraform
+# verifies provider signatures against HashiCorp's signing key using the hashes
+# in that file). None of the patterns below match it.
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.backup
+**/*.tfplan
+**/tf.plan
+**/crash.log
+# operator-local toggle file; the *.example variant IS committed as the template.
+**/*.auto.tfvars
+!**/*.auto.tfvars.example
+
+# Provisioning
+provisioning/.build/
+
+# Operations
+ops/snapshots/
+ops/restore-tmp/
+ops/ansible/inventory.ini
+ops/ansible/inventory/hosts.ini
+ops/ansible/inventory/hosts-*.ini
+# Operator-laptop ansible cache (binaries staged for delegate_to copy).
+# Audit 2026-05-09 §A.3.
+ops/ansible/.cache/
+ops/relay-env-*.sh
+ops/router/router.conf
+ops/router/wgcf-account.toml
+ops/router/wgcf-profile.conf
+
+# TAK Server (export controlled — do not commit)
+ops/tak/*.zip
+ops/tak/*.rpm
+ops/tak/*.deb
+ops/tak/certs/
+ops/tak/backups/
+ops/tak/.env
+
+# Claude Code
+.claude/settings.local.json*
+.claude/projects/
+.claude/*.lock
+.claude/worktrees/
+# Per-session handoff throttle state (Block 48T / ADR 0839 hooks)
+.claude/handoff/
+# Per-session worktree env anchor (ADR 0017 + ops/scripts/iso.skill.md)
+.iso-mode.env
+# Playwright MCP cache
+.playwright-mcp/
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Go
+/ops/smoketest/smoketest
+/ops/secwatch/secwatch
+/ops/snitch/snitch
+/ops/gatewatch/gatewatch
+ops/time-hygiene/bin/
+ops/zenoh/loadgen/loadgen
+# Block 22K enrollment CLIs — Go binaries built locally per cmd dir
+# (`cd ops/enrollment/cmd/<name> && go build` lands the binary in-place).
+# Audit 2026-05-09 §A.1.
+ops/enrollment/cmd/bundle-create/bundle-create
+ops/enrollment/cmd/bundle-extract/bundle-extract
+ops/enrollment/cmd/ca-init/ca-init
+ops/enrollment/cmd/cert-sign/cert-sign
+ops/enrollment/cmd/wg-cp0-bundle-apply/wg-cp0-bundle-apply
+# Stray output if `go build ./cmd/<name>` is run from the module root
+# instead of from inside the cmd dir. Audit §A.2.
+ops/enrollment/bundle-create
+ops/enrollment/wg-cp0-bundle-apply
+
+# Rust
+# Workspace target dir (Block 33 cargo workspace; root Cargo.lock IS committed
+# because the workspace contains a binary crate per goat-relay/Cargo.toml).
+/target/
+# Per-member target / lockfile leftovers (only the workspace-root Cargo.lock
+# is authoritative; per-member Cargo.lock should not exist post-workspace).
+goat-relay-protocol/target/
+goat-relay-protocol/Cargo.lock
+goat-relay/target/
+goat-relay/Cargo.lock
+zenoh-plugins/target/
+zenoh-plugins/Cargo.lock
+# Standalone trial-peer crates (each its own workspace; their Cargo.lock IS
+# committed for --locked image builds, but local target/ never is).
+ops/zenoh-trial-peers/*/target/
+# Outbound federation republisher (its own workspace, same shape as the
+# trial-peer crates; Cargo.lock IS committed for --locked image builds).
+ops/federation/republisher/target/
+# The consistency grading library + its meter (ops/consistency/rust/ is one
+# workspace, so there is exactly one target/ and one Cargo.lock; the lock IS
+# committed for --locked image builds).
+ops/consistency/rust/target/
+# CF-7 aggregator (consistency-foundation.md §7.8): the operator-local config
+# and the per-goatnet client certs are laptop-only; the committed surface is
+# aggregator.example.yaml + serve.sh.
+ops/consistency/aggregator/aggregator.local.yaml
+ops/consistency/aggregator/certs/
+# Local TLS cert/key for ops/goat-relay/docker-compose.yml's `relay`
+# service. Generated locally with openssl; never committed.
+ops/goat-relay/tls/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+venv/
+.venv/
+
+# Smoke test results
+ops/smoketest/results/
+ops/smoke-test-results.jsonl
+ops/snitch/results/
+
+# Binary artifacts
+*.docx
+*.zip
+*.pdf
+# Illustrated briefing PDF is committed for container distribution
+!docs/reference/externally-created/goat-net-briefing-illustrated.pdf
+# ZAGROS-Backbone integration sheet is a compendium source artifact (authored as PDF)
+!docs/reference/externally-created/ZAGROS-Backbone Integration Requirements.pdf
+# Sites-overview deck is a compendium source artifact; the export converts it to PDF
+!docs/reference/externally-created/goat-net-sites-overview.docx
+
+# Export packages (generated by package-export.sh)
+# (line 893); keep tracked despite the *.png blanket rule above.
+
+# Media files (deploy separately, not via git)
+*.mp4
+*.webm
+*.mov
+*.mp3
+
+# SecArmy brief: dv-brief-export.html embeds radar.mp4 as base64 (~14 MB).
+# Build artifact — regenerate via the export agent + inline base64 splice;
+# never commit. The source deck + visual + dossier live alongside in git.
+
+# Whitelist brief artifact distribution directory — these are intentionally
+# committed (via LFS) so reviewers can read PDF/DOCX/PPTX without rebuilding.
+# NATO-form data-access policy: the render-verified PDF is a deliverable
+# (source of record is the .md beside it; regenerate on change).
+# ZAGROS data-access explainer: the concrete companion, same treatment
+# (source of record is the .html beside it; regenerate the PDF on change).
+# Scale-1M implementation plan: rendered reading/sharing copy beside the .md
+# (source of record is the .md; regenerate with render-scale-1m-plan.py on change).
+# The rest of the data-sharing bundle: the complete access model, the
+# grant-keyed-encryption deep-dive, and the federation-compliance criteria.
+# Sources of record are the .html beside each; rebuild all with build-nato-bundle.sh.
+# The signable release instrument: a template meant to be printed and signed,
+# so the rendered copy is part of the deliverable. Built by build-nato-bundle.sh.
+!docs/partner-templates/release-declaration-and-accession.pdf
+# ...but never the Office lock files Word/PowerPoint create while the
+# committed artifacts are open for inspection.
+
+# compiled helper binaries from ops/goat-id-console/tools/ (go build drops them here)
+ops/goat-id-console/reissue-preview
+
+# goat gym — rendered at deploy time, never committed
+ops/gym/site/
+
+# Compiled binaries `go build ./...` drops next to their module. The module name
+# equals the directory name, so the artifact is invisible in a status listing
+# full of source files — which is how three were swept into a commit by
+# `git add -A` during the 2026-08-18 module-path rewrite, and two more during
+# the F-361 CVE remediation the same day. Both sets had to be removed before
+# their PRs.
+ops/admit-audit/admit-audit
+ops/mgmt-host-bootstrap/mgmt-host-bootstrap
+ops/signal-federation-probe/signal-federation-probe
+ops/smoketest/smoketest
+ops/wave3/soak-gen/soak-gen
+
+# goat Skills Handbook: the rendered PDF is a committed deliverable (LFS),
+# regenerated from goat-skills-handbook.md via ops/scripts/render-skills-handbook.sh
+!docs/design/goat-skills-handbook.pdf
+
+# cold-start markers (ADR 1190): per machine, consumed by the next session
+.claude/coldstart.md
+.claude/coldstart.consumed/
+
+# Near-secret opsec values — equipment MAC addresses and host/mesh/LAN IPs.
+# Per ADR 1196: these may live in plaintext ONLY in gitignored local files
+# (or as op:// references), never in a tracked file. The CI/pre-commit guard
+# ops/ci/check-no-identity-spillage.sh enforces this. *.local.md / .yaml / .txt
+# are the sanctioned local home (e.g. docs/reference/*-inventory.local.md).
+*.local.md
+*.local.yaml
+*.local.yml
+*.local.txt
+
+# ops/oss: the derived dictionary concentrates every mesh address, host and operator e-mail
+# in one file; it is rebuilt at export time from the committed seed, never committed (ADR 1215)
+ops/oss/substitutions.yaml
