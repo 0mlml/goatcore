@@ -64,7 +64,7 @@ const netbirdDatadir = "/var/lib/netbird"
 // the smoke fixture and the integration suite agree on what they're
 // testing. Bump both in the same commit.
 const (
-	postgresImage   = "ghcr.io/usareur-af/postgres-spock@sha256:506d65edcd7676b7f0a44660c3f3a0964254ce145df1a48e4d250bda22cd582b"
+	postgresImage   = "ghcr.io/usareur-af/postgres-spock@sha256:038f12f0e5339b2722754c06273a2277fcc4e4e17056c8afd2f52f28ed16e56c"
 	signalImage     = "netbirdio/signal:0.79.0@sha256:04c401eb167ef1aaaf266f9b5a4ee54bdac9d1d650db3a3e1288601632fa6d41"
 	managementImage = "netbirdio/management:0.68.3@sha256:8d3ac9d38c9589520d9d1563c8ae3646b9a038596aae16b9ed089602060a8001"
 	netbirdPeerImg  = "netbirdio/netbird:latest"

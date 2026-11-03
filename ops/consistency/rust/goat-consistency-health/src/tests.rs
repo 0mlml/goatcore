@@ -21,6 +21,12 @@ fn testdata_generation(stem: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(&path).expect("corpus fixture")).unwrap()
 }
 
+/// Whether this checkout carries its signed intent artifacts. A public clone of
+/// goatcore has none; the tests that read them return early there.
+fn has_committed_intent() -> bool {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(|p| p.parent()).unwrap().join("intent").is_dir()
+}
+
 fn committed_intent(goatnet: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -285,6 +291,9 @@ fn a_tampered_or_unsigned_artifact_is_refused_and_reverting_is_green() {
 /// claim, and passing one never waives the other.
 #[test]
 fn a_signed_but_self_inconsistent_artifact_still_fails_its_integrity_check() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     use base64::Engine as _;
     use p256::ecdsa::signature::Signer as _;
     use p256::pkcs8::EncodePublicKey as _;
@@ -387,6 +396,9 @@ fn an_unplaceable_node_is_left_out_of_the_band_not_counted_as_agreeing() {
 
 #[test]
 fn nodes_expected_is_the_denominator_and_comes_from_the_artifact() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     let intent = committed_intent("zagros");
     let env = roll(Some(&intent), "", &[node("zagros-a", "zagros_hosts", "")]);
     let d = detail(&env);
@@ -434,6 +446,9 @@ fn the_rolled_envelope_round_trips_and_declares_its_domain() {
 
 #[test]
 fn a_governed_component_joins_on_its_declared_ledger_key() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     let intent = committed_intent("zagros");
     let current = intent["content_hash"].as_str().unwrap().to_string();
     let expected_portal = intent["components"]
@@ -467,6 +482,9 @@ fn a_governed_component_joins_on_its_declared_ledger_key() {
 
 #[test]
 fn ledger_coverage_gaps_stay_in_the_denominator() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     // postgres-spock and signal-server are declared `ledger_component: null` —
     // deployed from a playbook, not a ledger-writing role. They can never be
     // observed, and counting them is what keeps that gap visible rather than
@@ -533,6 +551,9 @@ fn ledger_coverage_gaps_stay_in_the_denominator() {
 
 #[test]
 fn an_unreconciled_tip_is_unreadable_not_a_converged_fact() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     let intent = committed_intent("zagros");
     let current = intent["content_hash"].as_str().unwrap().to_string();
     let expected_portal = intent["components"]
@@ -574,6 +595,9 @@ fn an_unreconciled_tip_is_unreadable_not_a_converged_fact() {
 /// Red-then-reverted, in one test, over the real committed intent.
 #[test]
 fn a_hand_edited_render_is_red_reconverges_and_reverting_it_is_green() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     let intent = committed_intent("zagros");
     let current = intent["content_hash"].as_str().unwrap().to_string();
     const RENDERED: &str =
@@ -648,6 +672,9 @@ fn a_hand_edited_render_is_red_reconverges_and_reverting_it_is_green() {
 
 #[test]
 fn a_declared_watch_set_with_no_manifest_is_idle_never_red() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     // The recorder is default-off, so EVERY node is in this state until a
     // recording converge runs. Same posture as a node with no applied-intent
     // stamp: nothing to read, never a finding — landing CF-4 must not paint
@@ -674,6 +701,9 @@ fn a_declared_watch_set_with_no_manifest_is_idle_never_red() {
 
 #[test]
 fn a_deleted_render_is_red_and_a_permissions_failure_is_idle() {
+    if !has_committed_intent() {
+        return; // the signed intent artifacts are this deployment's
+    }
     // Deletion of a file the converge rendered is drift; a read failure is
     // ungrounded. The collector's `note` is what keeps those apart, and this
     // pins that the distinction survives the whole projection.
