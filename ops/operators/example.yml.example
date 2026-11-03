@@ -1,0 +1,75 @@
+# Operator manifest — canonical template (internal operator shape)
+#
+# Copy to ops/operators/<handle>.yml (gitignored) and edit.
+# Validate:  ops/operators/validate.py ops/operators/<handle>.yml
+# Schema:    ops/operators/schema/operator-manifest.schema.json
+# Design:    docs/design/operator-onboard-utilities.md
+# Runbook:   docs/operations/operator-onboard.md
+#
+# This template is for INTERNAL OPERATORS — admin/operator NetBird role,
+# typically ADMIN or OPERATOR auto_group, often paired with obs/utility
+# access via the operator-IdP on Orin-C. For third-party VENDOR onboarding
+# (auto_groups including VENDOR + per-vendor Zenoh cert via the portal),
+# use the sibling template at example-vendor.yml.example instead.
+
+identity:
+  handle: alice-smith                   # kebab-case slug; filename = ops/operators/<handle>.yml
+  email: person-17@example.org
+  name: Alice Smith                     # → Ory traits.name (person display)
+  status: active                        # active | revoked
+  added: 2026-05-20
+  added_by: person-900@example.org
+
+# NetBird mesh credential (setup-key issuance).
+# Per-site PAT lookup: site 'site-a' → env var SITE_A_NB_API_TOKEN;
+# a site may alias its variable name (alias-mapped via orchestrator).
+#
+# auto_groups carries SUFFIX names. The orchestrator generates the
+# fully-qualified <SITE-PREFIX>-<SUFFIX> at mint time (e.g. for
+# site=site-a, suffix=OPERATOR → SITE-A-OPERATOR) and resolves
+# to the per-site NetBird group UUID via the live mgmt-API. Allowed
+# suffixes per site live in ops/ansible/netbird_acl_taxonomy.yml;
+# typos fail at orchestrator Phase 0.12 with a clear pointer.
+netbird:
+  enabled: true
+  sites:
+    - vega
+    - nova
+  role: operator                        # bootstrap | admin | operator | peer
+  ttl_days: 30                          # role default; override if needed
+  auto_groups:
+    - OPERATOR                          # → <SITE>-OPERATOR per site
+
+# Ory site Kratos identity (OIDC for netbird-dashboard + portal +
+# panoscope + isitup). Identity-schema groups anchored on mesh-ACL
+# taxonomy. Orchestrator generates <SITE>-<SUFFIX> per site at
+# create time.
+ory_site:
+  enabled: true
+  sites:
+    - vega
+  groups:
+    - OBSERVER                          # → <SITE>-OBSERVER in JWT groups[] claim
+  credentials:
+    password: true
+    passkey: false
+  netbird_mgmt_admin: false             # set true to promote to mgmt-DB admin after auto-create-on-first-JWT
+
+# Ory operator-IdP Kratos identity (obs / utility services on Orin-C).
+# Groups must be from the strict 13-value enum at
+# ops/ansible/roles/operator-idp-kratos/templates/identity-schema.json.j2.
+ory_idp:
+  enabled: true
+  sites:
+    - vega                            # only sites with an obs host qualify
+  groups:
+    - grafana-readonly
+    - openobserve-readonly
+    - minio-readonly
+  fido2_required: true                  # operator must complete WebAuthn on first login
+
+# Zenoh wire-layer identity. Internal operators reach the trial fabric
+# via panoscope's read-only observer + dashboard — no cert needed.
+# Leave disabled.
+zenoh:
+  enabled: false

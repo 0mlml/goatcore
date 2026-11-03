@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: goat-maintainer <person-37@example.org>
+Date: Mon, 16 Jun 2026 00:30:00 +0000
+Subject: [PATCH] consent: forward identity traits.aff into JWT id_token
+
+The identity grammar (ADR 1043) splits identity into orthogonal dimensions so
+capability (the role family, carried in traits.groups) is never named after
+affiliation (WHO the identity belongs to). Phase D gives affiliation its own
+OIDC claim: traits.aff — an object {id, kind, nation?} mirroring the operator
+manifest's affiliation block — must reach the JWT id_token as `aff`, distinct
+from `groups`, so a relying party can authorize by affiliation WITHOUT it
+leaking into a role/groups check.
+
+The upstream oryd/kratos-selfservice-ui-node consent handler (extractSession in
+src/routes/consent.ts) hardcodes a small whitelist of traits to forward, and
+patch 0001 added `groups`. This patch adds `aff` the same way: forward
+identity.traits.aff verbatim into session.id_token.aff when present and a
+non-empty object. Additive only — a no-op for identities that carry no aff
+trait (every identity minted before Phase D), so existing logins are unchanged.
+
+Tracked: docs/project/identity-grammar-implementation-plan.md Phase D, ADR 1043,
+ADR 0857 (the patched-UI mechanism). Applied at build time by apply-patch.sh
+(awk text transform, idempotency marker goat-maintainer-aff-forwarding-patch) and
+gate-checked by tests/verify-patched.sh.
+---
+ src/routes/consent.ts | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/routes/consent.ts b/src/routes/consent.ts
+index 0000001..0000002 100644
+--- a/src/routes/consent.ts
++++ b/src/routes/consent.ts
+@@ -63,6 +63,12 @@
+     // goat-maintainer/ops/ory-consent patch: forward the groups claim into id_token.
+     var __gm = identity.metadata_public || {}, __groups = Object.prototype.hasOwnProperty.call(__gm, "groups") ? __gm.groups : identity.traits.groups
+     if (Array.isArray(__groups) && __groups.length > 0) session.id_token.groups = __groups
++
++    // F-572 / ADR 1188: aff lives in admin-managed metadata_public. A migrated
++    // identity (a groups key in metadata_public) never falls back to self-editable traits.
++    // goat-maintainer/ops/ory-consent patch: forward the aff claim into id_token.
++    var __am = identity.metadata_public || {}, __aff = Object.prototype.hasOwnProperty.call(__am, "groups") ? __am.aff : (__am.aff || identity.traits.aff)
++    if (__aff && typeof __aff === "object" && Object.keys(__aff).length > 0) session.id_token.aff = __aff
+   }
+
+   if (identity.traits.updated_at) {
+--
+2.39.0

@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# live-canary.sh — does a deploy work on a real goatnet today? One command, from an operator laptop.
+#
+# docs/design/deployment-e2e.md §Live canary. Deploys the e2e-canary component
+# to zagros-dev through goatbuilder (the push converger over the real transport),
+# proves it from the host's ledger, reads the rollback history back, and records
+# the run (ops/e2e/report.py). The canary templates no secret, so no `op run`.
+#
+# usage: ops/e2e/live-canary.sh [--goatbuilder BIN] [--record DIR] [--bump]
+#   --bump   first move zagros-dev's canary deviation to the newest image CI built
+#            from main (ghcr.io/usareur-af/e2e-canary:sha-<main>), regenerate and
+#            re-sign the zagros-dev intent (the operator's zagros-dev CA key), land
+#            the pin through pr-land.sh, then deploy. Without --bump the pin on
+#            main is deployed as declared.
+#
+# No GitHub runner reaches a goatnet, so this runs where the operator is:
+# a laptop on the zagros-dev mesh or holding the door (docs/design/env-doors.md).
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
+GB=""; RECORD=""; BUMP=0; ENV=zagros_dev; COMP=e2e-canary
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --goatbuilder) GB="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
+    --record) RECORD="$2"; shift 2 ;;
+    --bump) BUMP=1; shift ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) echo "live-canary: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$GB" ] || GB="$REPO/crates/target/debug/goatbuilder"
+[ -x "$GB" ] || { echo "live-canary: no goatbuilder at $GB — build it: (cd crates && cargo build -p goatbuilder) or pass --goatbuilder" >&2; exit 2; }
+[ -n "$RECORD" ] || RECORD="$(mktemp -d "${TMPDIR:-/tmp}/goat-live-canary.XXXXXX")"
+mkdir -p "$RECORD"; export E2E_RECORD_DIR="$RECORD"
+FAILS=0
+rec() { python3 "$HERE/rec.py" "$@" || FAILS=$((FAILS + 1)); }
+cd "$REPO"
+BR="$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)"
+case "$BR" in main|master) ;; *) echo "live-canary: run from a checkout on main (this one is on '$BR')" >&2; exit 1 ;; esac
+
+if [ "$BUMP" = 1 ]; then
+  command -v crane >/dev/null || { echo "live-canary: --bump needs crane" >&2; exit 2; }
+  MAIN="$(git -C "$REPO" rev-parse --short=7 origin/main)"
+  DIG="$(crane digest "ghcr.io/usareur-af/e2e-canary:sha-$MAIN" 2>&1)" || { echo "live-canary: no image for main@$MAIN yet — crane said: $DIG (e2e-canary-image.yml builds it on every push to main that touches ops/e2e/canary/**)" >&2; exit 1; }
+  REF="ghcr.io/{{ ghcr_org }}/e2e-canary:sha-$MAIN@$DIG"
+  WT="$REPO/../$(basename "$REPO")-wt-canary-$(date -u +%H%M%S)"
+  git -C "$REPO" worktree add -q "$WT" -b "chore/e2e-canary-$(date -u +%Y%m%d-%H%M%S)" origin/main
+  python3 - "$WT/ops/pins/fleet-pins.yaml" "$COMP" "$ENV" "$REF" <<'PY'
+import re, sys
+p, comp, g, ref = sys.argv[1:5]
+s = open(p).read()
+m = re.search(rf'(?m)^  {re.escape(comp)}:\n', s); start = m.start()
+nxt = re.search(r'(?m)^  [A-Za-z0-9_-]+:\n', s[m.end():]); end = m.end() + (nxt.start() if nxt else len(s) - m.end())
+block = s[start:end]
+entry = (f'      {g}:\n        value: "{ref}"\n        reason: >-\n          The live canary (docs/design/deployment-e2e.md): the newest image CI built\n'
+         f'          from main, deployed nightly by ops/e2e/live-canary.sh to prove the push\n          converger on a real goatnet. Never a user-facing service.\n')
+block = re.sub(rf'(?ms)^      {re.escape(g)}:\n(?:        .*\n)+?(?=      [A-Za-z0-9_-]+:|\Z)', '', block)
+block = re.sub(r'(?m)^    deviations:\n', '    deviations:\n' + entry, block, count=1)
+open(p, "w").write(s[:start] + block + s[end:])
+PY
+  python3 "$WT/ops/pins/generate-pins.py" >/dev/null
+  I="$WT/ops/consistency/intent/$ENV/intent.json"
+  CA="$(python3 -c "import json; print(json.load(open('$I')).get('ca_id',''))")"; N="$(printf '%s' "$CA" | sed -e 's/^dev-//' -e 's/-ecdsa-[0-9-]*$//')"
+  K="$HOME/.goat/state/$N/ca.key.age"; [ -f "$K" ] || { echo "live-canary: CA key for $ENV not at $K" >&2; exit 1; }
+  (cd "$WT/ops/enrollment" && go run ./cmd/intent-sign --intent "$I" --root-key "$K" --age-identity "$HOME/.config/age/keys.txt" >/dev/null)
+  python3 "$WT/ops/pins/generate-pins.py" --check >/dev/null
+  python3 "$WT/ops/release/graduate.py" check >/dev/null
+  B="$(mktemp)"; printf 'The live canary moves to the image CI built from main@%s (docs/design/deployment-e2e.md §Live canary). zagros-dev only.\n' "$MAIN" > "$B"
+  "$REPO/ops/scripts/pr-land.sh" --worktree "$WT" --branch "$(git -C "$WT" rev-parse --abbrev-ref HEAD)" --title "chore(e2e): the live canary runs main@$MAIN on zagros-dev" --body-file "$B"
+  git -C "$REPO" fetch -q origin main && GOAT_ALLOW_MASTER_GIT_MUTATE=1 git -C "$REPO" merge --ff-only origin/main >/dev/null
+  git -C "$REPO" worktree remove "$WT" 2>/dev/null || true
+fi
+
+rec doctor -- "$GB" doctor --env "$ENV"
+rec deploy-dry-run --expect-in "DRY: would read /var/lib/goat/$COMP/deploy-history.jsonl" -- "$GB" deploy --env "$ENV" --component "$COMP" --dry-run --yes
+rec deploy-live --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --ack "${USER:-operator} (live canary)" --yes
+rec verify-only --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --verify-only --yes
+rec rollback-list --expect-in "$COMP" -- "$GB" rollback "$COMP" --list
+
+# A real rollback, then the roll forward — the canary exists only for this.
+# Both avenues (ADR 1201), alternating by day: even days goatbuilder, odd days
+# rollback.sh; --avenue overrides. Needs two refs in the host's ledger, which the
+# second --bump provides; with one, the step says so and the run stays green.
+AVENUE="${LIVE_CANARY_AVENUE:-$( [ $(( $(date -u +%j | sed 's/^0*//') % 2 )) = 0 ] && echo cli || echo scripts )}"
+LEDGER_ROW() { ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.152 "sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl"; }
+REFS="$(ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.152 "sudo grep -o '\"ref\": *\"[^\"]*\"' /var/lib/goat/$COMP/deploy-history.jsonl | sort -u | wc -l" 2>/dev/null || echo 0)"
+if [ "${REFS:-0}" -ge 2 ]; then
+  DECLARED="$(LEDGER_ROW | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["ref"])')"
+  if [ "$AVENUE" = cli ]; then
+    rec rollback-one-step-cli -- "$GB" rollback "$COMP" 1 --yes
+  else
+    rec rollback-one-step-scripts --expect-in "rolled back" -- "$REPO/ops/scripts/rollback.sh" "$COMP" 1
+  fi
+  rec ledger-names-the-rollback -- bash -c "row=\"\$(ssh -o BatchMode=yes goat@100.127.0.152 'sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl')\"; echo \"\$row\"; echo \"\$row\" | grep -q '\"action\": *\"rollback\"' && ! echo \"\$row\" | grep -q '\"ref\": *\"$DECLARED\"'"
+  rec roll-forward --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --ack "${USER:-operator} (live canary, roll forward)" --yes
+  rec verify-after-roll-forward --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --verify-only --yes
+else
+  rec rollback-needs-two-refs --note "the host's ledger holds ${REFS:-0} ref(s); the next --bump gives the rollback a target" -- true
+fi
+python3 "$HERE/report.py" "$RECORD" --check --title "live canary ($ENV)" || true
+echo "record: $RECORD"
+[ "$FAILS" = 0 ] && exit 0 || exit 1

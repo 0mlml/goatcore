@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# A stand-in for `crane` on the hermetic harness's PATH: `crane digest <ref>`
+# answers with the digest the LOCAL registry ($E2E_REGISTRY_URL, which the
+# runner resolves as ghcr.io) holds for the ref's image and tag. Nothing else is
+# implemented; every call is recorded (docs/design/deployment-e2e.md §Stubs).
+set -euo pipefail
+url="${E2E_REGISTRY_URL:-https://ghcr.io}"
+ca="${E2E_REGISTRY_CA:-}"
+answer=""
+rec() {
+  [ -n "${E2E_RECORD_DIR:-}" ] || return 0
+  mkdir -p "$E2E_RECORD_DIR"
+  printf '{"tool":"crane","argv":"%s","answer":"%s"}\n' "$*" "$answer" >> "$E2E_RECORD_DIR/crane-calls.jsonl"
+}
+if [ "${1:-}" = "digest" ] && [ -n "${2:-}" ]; then
+  ref="${2%@*}"                      # drop any @digest
+  path="${ref#*/}"                   # drop the registry host; keep org/image as the registry stores it
+  image="${path%%:*}"; tag="${path#*:}"; [ "$tag" = "$path" ] && tag=latest
+  answer="$(curl -sI ${ca:+--cacert "$ca"} -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+      "$url/v2/$image/manifests/$tag" | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tr -d '\r')"
+  rec "$@"
+  [ -n "$answer" ] || { echo "crane-stub: no manifest for $image:$tag at $url" >&2; exit 1; }
+  printf '%s\n' "$answer"; exit 0
+fi
+rec "$@"
+echo "crane-stub: only 'digest <ref>' is implemented (got: $*)" >&2
+exit 1

@@ -1,0 +1,46 @@
+# Smoketest dashboard — health checks for all goat services
+#
+# Traefik routes smoketest.netbird.legacy.example to this container.
+# The Go binary serves both the API and the React dashboard.
+#
+# Requires: same Docker network as Traefik
+
+services:
+  smoketest:
+    container_name: smoketest
+    image: smoketest:latest
+    restart: unless-stopped
+    command: >-
+      smoketest serve
+      --addr :8080
+      --results-file /app/results/results.jsonl
+      --catalogue /app/services.yaml
+      --dashboard-dir /app/dashboard/dist
+    environment:
+      - NETBIRD_API_TOKEN=${NETBIRD_API_TOKEN}
+      - NETBIRD_DOMAIN=netbird.legacy.example
+    dns:
+      - 100.127.1.32
+    volumes:
+      - ./services.yaml:/app/services.yaml:ro
+      - ./results:/app/results
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=netbird_netbird"
+      - "traefik.http.routers.smoketest.rule=Host(`smoketest.netbird.legacy.example`)"
+      - "traefik.http.routers.smoketest.entrypoints=websecure"
+      - "traefik.http.routers.smoketest.tls=true"
+      - "traefik.http.routers.smoketest.middlewares=mesh-only"
+      - "traefik.http.services.smoketest.loadbalancer.server.port=8080"
+    networks:
+      - traefik
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-netbird_netbird}

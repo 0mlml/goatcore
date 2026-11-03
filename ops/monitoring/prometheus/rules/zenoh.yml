@@ -1,0 +1,57 @@
+groups:
+  - name: zenoh
+    rules:
+
+      # Router process has been down for > 2 minutes.
+      - alert: ZenohRouterDown
+        expr: up{job="zenoh"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zenoh router down on {{ $labels.instance }}"
+          description: "Prometheus cannot reach the Zenoh metrics endpoint — router may be crashed or unreachable."
+
+      # Audit logger is receiving zero samples over a 10-minute window during
+      # soak when loadgen is expected to be running (baseline ≥ 1/hr).
+      # Fires only when we've seen at least one sample historically, which
+      # avoids false-positive on cold start.
+      - alert: ZenohSampleRateAnomaly
+        expr: >
+          rate(zenoh_audit_samples_total[10m]) == 0
+          and
+          zenoh_audit_samples_total > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zenoh audit sample rate dropped to zero on {{ $labels.instance }}"
+          description: "No samples seen in the last 10 minutes — loadgen may be stopped or publisher disconnected."
+
+      # Audit-logger interceptor processing overhead > 1ms P99.
+      # zenoh_audit_processing_duration_seconds measures time spent inside the
+      # audit thread per sample — not end-to-end latency. True E2E P99 < 50ms
+      # (Phase 2 gate criterion) requires a separate measurement tool that parses
+      # publisher-embedded timestamps from sample payloads.
+      - alert: ZenohHighLatency
+        expr: >
+          histogram_quantile(0.99,
+            rate(zenoh_audit_processing_duration_seconds_bucket[5m])
+          ) > 0.001
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zenoh audit-logger P99 processing latency > 1ms on {{ $labels.instance }}"
+          description: "Audit-logger interceptor processing P99 exceeds 1ms — suggests contention or slow path in the audit thread."
+
+      # Large sample cardinality burst — more than 20 distinct keyexpr buckets
+      # in the audit-logger label set signals a cardinality explosion.
+      - alert: ZenohAuditCardinalityBurst
+        expr: count by (instance) (zenoh_audit_samples_total) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zenoh audit-logger cardinality explosion on {{ $labels.instance }}"
+          description: "More than 20 distinct keyexpr label values — bucket_keyexpr() may not be reducing cardinality as expected."

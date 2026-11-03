@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""A stand-in for `gh` on the hermetic harness's PATH (docs/design/deployment-e2e.md §Stubs).
+
+What it answers, and how, so nobody mistakes a hermetic pass for live proof:
+
+  api user -q .login                                  -> e2e-operator
+  api repos/<slug>/collaborators/<u>/permission       -> admin
+  api <…/packages/container/<image>/versions…> --jq   -> the digest the LOCAL registry
+                                                         holds for the tag in the jq filter
+  run list … --json … -q …                            -> 1      (a run "exists")
+  run watch <id> …                                    -> exit 0 (it "finished")
+  run view <id> … -q .conclusion                      -> success
+  pr list … --head <branch> --json number -q …        -> the stub's PR number for that branch, or nothing
+  pr create … --head <branch> …                       -> opens a stub PR; prints its URL
+  pr checks <n> …                                     -> one passing check line
+  pr merge <n> … --squash --delete-branch [--admin]   -> a REAL squash merge of that branch
+                                                         into main of the bare origin at
+                                                         $E2E_ORIGIN, then the branch is deleted
+  anything else                                       -> recorded, exit 0, no output
+
+Every call is appended to $E2E_RECORD_DIR/gh-calls.jsonl. State (PR numbers)
+lives in $E2E_GH_STATE/prs.json. Nothing here talks to GitHub.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+ARGS = sys.argv[1:]
+STATE_DIR = os.environ.get("E2E_GH_STATE", os.path.join(tempfile.gettempdir(), "e2e-gh-state"))
+RECORD_DIR = os.environ.get("E2E_RECORD_DIR", "")
+ORIGIN = os.environ.get("E2E_ORIGIN", "")
+REGISTRY_URL = os.environ.get("E2E_REGISTRY_URL", "https://ghcr.io")
+REGISTRY_CA = os.environ.get("E2E_REGISTRY_CA", "")
+
+
+def record(answer, rc=0):
+    if RECORD_DIR:
+        os.makedirs(RECORD_DIR, exist_ok=True)
+        with open(os.path.join(RECORD_DIR, "gh-calls.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "argv": ARGS, "answer": answer, "rc": rc}) + "\n")
+
+
+def state():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    p = os.path.join(STATE_DIR, "prs.json")
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {"next": 1, "prs": {}}
+
+
+def save(st):
+    with open(os.path.join(STATE_DIR, "prs.json"), "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=2)
+
+
+def opt(name, default=None):
+    if name in ARGS:
+        i = ARGS.index(name)
+        if i + 1 < len(ARGS):
+            return ARGS[i + 1]
+    return default
+
+
+def registry_digest(image, tag):
+    import ssl
+    req = urllib.request.Request(
+        f"{REGISTRY_URL}/v2/{image}/manifests/{tag}", method="HEAD",
+        headers={"Accept": "application/vnd.docker.distribution.manifest.v2+json, "
+                           "application/vnd.oci.image.manifest.v1+json, "
+                           "application/vnd.oci.image.index.v1+json, "
+                           "application/vnd.docker.distribution.manifest.list.v2+json"})
+    ctx = ssl.create_default_context(cafile=REGISTRY_CA) if REGISTRY_CA else None
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+            return r.headers.get("Docker-Content-Digest", "")
+    except Exception:
+        return ""
+
+
+def out(text, rc=0):
+    if text:
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    record(text.strip(), rc)
+    sys.exit(rc)
+
+
+def squash_merge(branch, number):
+    """Squash <branch> into main of the bare origin, delete the branch: what `gh pr merge --squash --delete-branch` does."""
+    if not ORIGIN:
+        out("gh-stub: E2E_ORIGIN is not set; cannot merge", 1)
+    tmp = tempfile.mkdtemp(prefix="gh-stub-merge-")
+    env = dict(os.environ, GIT_AUTHOR_NAME="e2e harness", GIT_AUTHOR_EMAIL="e2e@localhost",
+               GIT_COMMITTER_NAME="e2e harness", GIT_COMMITTER_EMAIL="e2e@localhost")
+
+    def git(*a, check=True):
+        return subprocess.run(["git", *a], cwd=tmp, env=env, capture_output=True, text=True, check=check)
+
+    subprocess.run(["git", "clone", "-q", "--branch", "main", ORIGIN, tmp], env=env, check=True, capture_output=True)
+    git("fetch", "-q", "origin", branch)
+    title = state()["prs"].get(str(number), {}).get("title", f"stub PR #{number}")
+    r = git("merge", "--squash", f"origin/{branch}", check=False)
+    if r.returncode != 0:
+        out(f"gh-stub: squash merge of {branch} failed: {r.stderr.strip()}", 1)
+    st = git("diff", "--cached", "--quiet", check=False)
+    if st.returncode != 0:
+        git("commit", "-q", "-m", f"{title} (#{number})")
+    git("push", "-q", "origin", "main")
+    git("push", "-q", "origin", "--delete", branch, check=False)
+    sha = git("rev-parse", "--short", "HEAD").stdout.strip()
+    return sha
+
+
+def main():
+    a = ARGS
+    if not a:
+        out("")
+    if a[0] == "api":
+        # The path is the first non-flag argument: `gh api --paginate <path>`
+        # (fastlane reads every page since #2341) and `gh api <path>` both land here.
+        path = next((x for x in a[1:] if not x.startswith("-")), "")
+        if path == "user":
+            out("e2e-operator")
+        if "/collaborators/" in path and path.endswith("/permission"):
+            out("admin")
+        m = re.search(r"packages/container/([^/]+)/versions", path)
+        if m:
+            # Whichever org the driver asks about (fastlane reads only
+            # ghcr.io/usareur-af since ADR 1195), the local registry holds one
+            # copy under usareur-af/.
+            jq = opt("--jq", "") or opt("-q", "")
+            t = re.search(r'index\(\\?"([^"\\]+)\\?"\)', jq)
+            tag = t.group(1) if t else ""
+            out(registry_digest(f"usareur-af/{m.group(1)}", tag))
+        out("")
+    if a[0] == "run":
+        sub = a[1] if len(a) > 1 else ""
+        if sub == "list":
+            out("1")
+        if sub == "watch":
+            out("")
+        if sub == "view":
+            out("success")
+        out("")
+    if a[0] == "pr":
+        sub = a[1] if len(a) > 1 else ""
+        st = state()
+        if sub == "list":
+            head = opt("--head", "")
+            for n, pr in st["prs"].items():
+                if pr["branch"] == head and pr["state"] == "open":
+                    out(n)
+            out("")
+        if sub == "create":
+            n = st["next"]
+            st["next"] = n + 1
+            st["prs"][str(n)] = {"branch": opt("--head", ""), "title": opt("--title", ""), "state": "open",
+                                 "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            save(st)
+            out(f"https://e2e.invalid/{opt('-R', 'repo')}/pull/{n}")
+        if sub == "checks":
+            out("e2e-stub-check\tpass\t0s\thttps://e2e.invalid/checks/1")
+        if sub == "merge":
+            n = a[2] if len(a) > 2 else ""
+            pr = st["prs"].get(str(n))
+            if not pr:
+                out(f"gh-stub: no such PR {n}", 1)
+            sha = squash_merge(pr["branch"], n)
+            pr["state"] = "merged"
+            pr["merged_sha"] = sha
+            save(st)
+            out(f"✓ Squashed and merged pull request #{n} ({sha})")
+        if sub == "view":
+            n = a[2] if len(a) > 2 else ""
+            pr = st["prs"].get(str(n), {})
+            out(json.dumps(pr))
+        out("")
+    out("")
+
+
+if __name__ == "__main__":
+    main()

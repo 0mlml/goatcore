@@ -1,0 +1,99 @@
+# Prometheus scrape config for a single mgmt-host (development / Phase 2
+# deployment). For the Phase 3 federated-central pattern, this becomes
+# the "agent" config that remote_writes to a central Prometheus at
+# region B — see ops/monitoring/README.md §Deployment Options.
+#
+# External labels are applied to every series before remote_write /
+# storage, so operators can filter `signal_server_connected_peers{site=...}`
+# uniformly across the fleet.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    site: "${SITE_NAME}"   # set via SITE_NAME env var (docker-compose renders)
+
+rule_files:
+  - rules/signal-server.yml
+  - rules/spock.yml
+  - rules/zenoh.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+
+  # ------------------------------------------------------------------
+  # signal-server — our custom federated signal server. /metrics is
+  # registered on the --metrics-addr port (default :9090). The container
+  # publishes connected-peer gauge + relay/forward counters and
+  # histograms. See signal-server/internal/server/metrics.go for the
+  # full metric list.
+  # ------------------------------------------------------------------
+  - job_name: signal-server
+    static_configs:
+      - targets:
+          - "signal-a:9090"   # compose-internal DNS; adjust for phase2 override
+        labels:
+          instance: signal-a
+
+  # ------------------------------------------------------------------
+  # postgres-exporter — sidecar to each postgres instance. Exposes
+  # pg_stat_* + pg_replication_slots and user-defined queries below.
+  # Expected image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+  # (add to ops/compose/mgmt-host/docker-compose.yml when ready — do NOT
+  # edit that file in this branch; the other session is hot on it).
+  # ------------------------------------------------------------------
+  - job_name: postgres
+    static_configs:
+      - targets:
+          - "postgres-exporter-a:9187"
+        labels:
+          instance: postgres-a
+
+  # ------------------------------------------------------------------
+  # node-exporter — host-level CPU / memory / disk / network / filesystem.
+  # Installed per host via Ansible. Port 9100 is the upstream default.
+  # ------------------------------------------------------------------
+  - job_name: node
+    static_configs:
+      - targets:
+          - "node-exporter:9100"
+        labels:
+          instance: mgmt-host
+
+  # ------------------------------------------------------------------
+  # zenoh-router / audit-logger — the upstream REST plugin on :8088 serves
+  # the Zenoh admin key-space (not Prometheus), so we scrape the audit-logger
+  # plugin's own HTTP exposition on :9302 inside the router container.
+  # Metrics: zenoh_audit_samples_total, zenoh_audit_sample_bytes,
+  # zenoh_audit_processing_duration_seconds.
+  # ------------------------------------------------------------------
+  - job_name: zenoh
+    static_configs:
+      - targets:
+          - "${ZENOH_METRICS_TARGET:-host.docker.internal:9302}"
+        labels:
+          instance: zenoh-router
+
+  # ------------------------------------------------------------------
+  # zenoh-loadgen — synthetic load generator for Step 8 soak. Exposes
+  # loadgen_sent_total, loadgen_send_errors_total, loadgen_scenario_active
+  # on :9301 (only deployed to the host that runs loadgen, so scrape is
+  # conditional — missing target means loadgen not active on this host).
+  # ------------------------------------------------------------------
+  - job_name: zenoh_loadgen
+    static_configs:
+      - targets:
+          - "${LOADGEN_METRICS_TARGET:-host.docker.internal:9301}"
+        labels:
+          instance: zenoh-loadgen
+
+  # ------------------------------------------------------------------
+  # Prometheus itself — self-monitoring (scrape duration, rule eval, etc.)
+  # ------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

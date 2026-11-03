@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: goat-maintainer <person-37@example.org>
+Date: Fri, 16 May 2026 00:30:00 +0000
+Subject: [PATCH] consent: forward identity traits.groups into JWT id_token
+
+The upstream oryd/kratos-selfservice-ui-node consent handler (extractSession
+in src/routes/consent.ts) hardcodes a small whitelist of identity traits to
+forward into the OIDC JWT — email, username, website, name. The `groups`
+trait (an array we use for RBAC on every site Hydra consumer: Grafana,
+netbird-dashboard, future relying parties) is not in the list, so it never
+reaches the JWT and downstream services fall back to "every authenticated
+identity is admin" pragmas.
+
+This patch adds three lines to extractSession that forward
+identity.traits.groups verbatim into session.id_token.groups when present
+and non-empty. Additive only — existing behavior is unchanged for
+identities that don't carry a groups trait.
+
+Tracked: docs/project/implementation-plan.md Block 82B-rbac. Resolves the
+v1 pragma in nova-obs (literal-'Admin' JMESPath in
+ops/compose/nova-obs/docker-compose.yml) and unblocks Block 21D.2.f
+(dashboard role-based authorization v2) + Block 21H.3/4 (operator-IdP
+per-consumer claim mapping).
+---
+ src/routes/consent.ts | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/routes/consent.ts b/src/routes/consent.ts
+index 0000000..0000001 100644
+--- a/src/routes/consent.ts
++++ b/src/routes/consent.ts
+@@ -57,6 +57,12 @@
+     } else if (typeof identity.traits.name === "string") {
+       session.id_token.name = identity.traits.name
+     }
++
++    // F-572 / ADR 1188: groups live in admin-managed metadata_public. Once it has
++    // a groups key (even [] or null) the identity is migrated and traits are never read.
++    // goat-maintainer/ops/ory-consent patch: forward the groups claim into id_token.
++    var __gm = identity.metadata_public || {}, __groups = Object.prototype.hasOwnProperty.call(__gm, "groups") ? __gm.groups : identity.traits.groups
++    if (Array.isArray(__groups) && __groups.length > 0) session.id_token.groups = __groups
+   }
+
+   if (identity.traits.updated_at) {
+--
+2.39.0

@@ -1,0 +1,81 @@
+{
+  "$id": "https://goat/schemas/hold-record.v1.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HoldRecordV1 — one member's mesh hold, and what to put back when it ends",
+  "description": "One JSON object per line (JSON Lines) in the hold-record file declared by the peerview role (`lifecycle_hold_records`, default /var/lib/peerview/hold-records.jsonl). Written when a peer is moved into a hold group; read by the console (Access banner, Holds page, Release action) and by `lifecycle-sweep.py --lane release`. THE RECORD IS THE RESTORE SOURCE OF TRUTH: the hold group's name is only the restore TARGET, `prior_groups` is the restore CONTENT, and a release restores exactly that list and nothing else. Canon: docs/design/membership-lifecycle-and-transfer.md §'Hold record', ADR 1136 D1 (clarified 2026-09-11), ADR 1089 (dormancy lane), ADR 1091 (security lane). NO SECRETS and NO PERSONAL DATA beyond the handle: no email, no name, no IP.",
+  "type": "object",
+  "required": ["v", "lane", "site", "peer_id", "peer_name", "handle", "entered_at", "hold_group", "prior_groups", "actor"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "const": 1,
+      "description": "Record version. A reader that does not recognise it refuses the line rather than guessing."
+    },
+    "lane": {
+      "type": "string",
+      "enum": ["dormancy", "security"],
+      "description": "Which kind of hold. `dormancy` = placed by the ADR 1136 inactivity sweep into the ADR 1089 PROBATION lane; releasable from the console. `security` = placed by an admin into the ADR 1091 QUARANTINED group; NEVER one-click releasable, exit is the close-out of an investigation. A peer in a hold group with NO record is treated as `security`."
+    },
+    "site": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Goatnet id (`site_id`), lowercase, e.g. `zagros`. Group names carry it upper-cased as their prefix."
+    },
+    "peer_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "NetBird peer id — the stable key. Peer names can be edited; ids cannot."
+    },
+    "peer_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "NetBird peer name at the time of the hold, as displayed (peer-name grammar: peer-<handle>-<short_tag>-<site>-<date>-<hostname>). Display only; never used as a key."
+    },
+    "handle": {
+      "type": ["string", "null"],
+      "description": "The person's or device's handle, parsed from the peer name by the peer-name grammar. `null` when the name does not follow the grammar, or when the grammar leaves handle and short_tag ambiguous (both may contain hyphens and a writer without the registry cannot split them) — stated rather than invented, never a guess the console would match to the wrong member."
+    },
+    "entered_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "description": "When the hold was placed, UTC, second precision, trailing Z."
+    },
+    "hold_group": {
+      "type": "string",
+      "pattern": "^[A-Z0-9]+(-[A-Z0-9]+)*-(PROBATION-[A-Z0-9]+(-[A-Z0-9]+)*|QUARANTINED)$",
+      "description": "The group the peer was moved INTO: `<SITE>-PROBATION-<role>` for `dormancy`, `<SITE>-QUARANTINED` for `security`. `<SITE>` is `site` upper-cased and MAY itself carry hyphens (`ZAGROS-PROD-QUARANTINED`, taxonomy `site_prefix`); the validator pins the prefix to `site`. Recorded so a reader does not have to derive the lane's group name."
+    },
+    "prior_groups": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Group NAMES the peer held immediately before the hold, excluding NetBird's implicit `All` and excluding the hold group itself. This is the restore content. May be empty (a peer that held only `All`); a release then removes the hold group and adds nothing."
+    },
+    "actor": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Who placed the hold: the literal `sweep` for the scheduled ADR 1136 run, otherwise the operator's handle. Never an email."
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["releasing"],
+      "description": "Optional. Present only while a release of this record is in progress: the releaser rewrites the line with `phase: releasing` under the lock BEFORE it touches any group, so a release that dies half-way (prior groups restored, hold group not yet removed) is distinguishable from a hold that died half-way (hold group added, prior groups not yet removed) — the two are the same live shape. A reader treats a `releasing` record as a release to finish (`lifecycle-sweep.py --lane release --peer <id>` again), never as a stranded hold to complete. Absent = held."
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Optional short human-readable reason, e.g. `inactive 17d (person threshold 14d)`. For `security` holds keep it minimal — the record is readable by every ADMIN, and ADR 1091 minimises signal about an investigation."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "lane": { "const": "dormancy" } } },
+      "then": { "properties": { "hold_group": { "pattern": "^[A-Z0-9]+(-[A-Z0-9]+)*-PROBATION-[A-Z0-9]+(-[A-Z0-9]+)*$" } } }
+    },
+    {
+      "if": { "properties": { "lane": { "const": "security" } } },
+      "then": { "properties": { "hold_group": { "pattern": "^[A-Z0-9]+(-[A-Z0-9]+)*-QUARANTINED$" } } }
+    }
+  ]
+}

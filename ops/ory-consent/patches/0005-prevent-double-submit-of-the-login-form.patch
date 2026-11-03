@@ -1,0 +1,112 @@
+Subject: [PATCH 5/5] prevent a second submit of an already-sent auth form
+
+A login form submitted TWICE orphans the OAuth2 login challenge and delivers
+the operator to Ory's stock welcome page instead of the application they asked
+for. Retrying works, which is what makes it read as intermittent flakiness
+rather than a defect.
+
+MEASURED, not inferred. From the Kratos log on mgmt-zagros-01-thor for the
+2026-08-16 production incident — note that both POSTs carry the SAME referer,
+the SAME flow id and the SAME content-length:
+
+  08:31:22.996  POST /self-service/login  len=195
+                referer .../login?flow=1ca1adb6-500b-4237-affd-8407486c4506
+  08:31:23.652  -> 303, "Identity authenticated successfully"   (aal1 session)
+  08:31:23.693  -> browser follows to login/browser WITH the challenge (correct)
+  08:31:23.806  POST /self-service/login  len=195   <-- SAME form, 810ms later
+                referer .../login?flow=1ca1adb6-500b-4237-affd-8407486c4506
+  08:31:23.812  -> 303 https://auth.zagros.netbird.zagros.example/
+  08:31:23.891  /welcome -> requireAuth -> /sessions/whoami -> 403
+  08:31:23.923  -> bare ?aal=aal2, no login_challenge. Challenge orphaned.
+
+No `PUT /admin/oauth2/auth/requests/login/accept` was ever issued for that
+challenge. One of two real login challenges in a five-hour window was lost.
+
+REPRODUCED DETERMINISTICALLY 2026-08-17 against the live goatnet by rendering
+the form once, keeping its action and csrf_token, and POSTing twice — exactly
+what a browser sends on a double-click, because it never re-fetches the flow:
+
+  submit #1 -> 303 .../self-service/login/browser?aal=aal2&login_challenge=…
+  submit #2 -> 303 https://auth.zagros.netbird.zagros.example/
+
+WHAT THIS PATCH IS NOT. For several hours the recorded fix for this was "teach
+maybeInitiate2FA to carry the login_challenge". That is not implementable: by
+the time that middleware runs, the browser is on /welcome, req.url is
+/welcome, and no challenge is in scope to copy. maybeInitiate2FA is the LAST
+link in the chain, not the first. The first link is the duplicate submission,
+and that is what this patch removes.
+
+SERIALIZATION SAFETY. Kratos's login form carries `method=password` as the
+submit BUTTON's own name/value pair. A button disabled synchronously inside a
+submit handler is excluded from form serialization, so the POST would go out
+without `method` and every login would fail validation. The guard therefore
+blocks the second submit EVENT and defers any visual disabling to a macrotask,
+after the browser has serialized the body. `verify-patched.sh` asserts the
+deferral, not merely the marker, because a correct-looking synchronous version
+breaks all logins.
+
+ONCE PER DOCUMENT. The partial this lands in is included twice on the consent
+page: consent.hbs includes it and so does layouts/auth.hbs, which consent.hbs
+renders inside. Registered twice, the guard cancelled the FIRST submit — the
+first copy marked the form, the second copy saw the mark on the same event and
+prevented it — so "Allow" sent nothing. Measured on zagros 2026-09-17 with the
+only client there that shows the consent page (every other one is first-party
+with skip_consent): GET /consent 200 twice for one challenge, no POST /consent
+at Traefik, no consent/accept at Hydra. The guard now installs once per
+document, and tests/double-submit-guard.test.js runs it included once AND twice.
+
+Applied to a VIEW rather than to lib/routes/consent.js, so it ships via
+apply-view-patch.sh instead of apply-patch.sh.
+
+--- a/views/partials/scripts.hbs
++++ b/views/partials/scripts.hbs
+@@ -1,2 +1,49 @@
+ {{! Scripts }}
+ <script src="assets/passwordInput.js"></script>
++
++{{! goat-maintainer-double-submit-guard }}
++<script>
++  (function () {
++    // Install ONCE per document. This partial is not included once per page:
++    // consent.hbs includes it AND renders inside layouts/auth.hbs, which
++    // includes it again. Two copies of the listener below both see the same
++    // submit event — the first marks the form, the second finds the mark and
++    // cancels the FIRST submission. "Allow" then sends nothing at all.
++    if (window.__dlfSubmitGuardInstalled) return;
++    window.__dlfSubmitGuardInstalled = true;
++
++    // One submission per rendered form. A second submit of the same flow is
++    // answered by Kratos on a consumed flow and navigates the browser off an
++    // in-flight OAuth2 login, orphaning the Hydra challenge.
++    document.addEventListener(
++      "submit",
++      function (event) {
++        var form = event.target;
++        if (!form || form.tagName !== "FORM") return;
++
++        if (form.hasAttribute("data-dlf-submitted")) {
++          // Already sent. Swallow this one; the first response is still coming.
++          event.preventDefault();
++          event.stopImmediatePropagation();
++          return;
++        }
++        form.setAttribute("data-dlf-submitted", "true");
++
++        // Defer the visual disable to a macrotask. Disabling a submit button
++        // synchronously drops its name/value (method=password) from the POST
++        // body — the form would serialize without the method Kratos requires.
++        window.setTimeout(function () {
++          var controls = form.querySelectorAll(
++            'button[type="submit"], input[type="submit"]'
++          );
++          for (var i = 0; i < controls.length; i++) {
++            controls[i].setAttribute("aria-disabled", "true");
++            controls[i].style.pointerEvents = "none";
++            controls[i].style.opacity = "0.6";
++          }
++        }, 0);
++      },
++      true // capture: run before any framework handler can re-dispatch
++    );
++  })();
++</script>

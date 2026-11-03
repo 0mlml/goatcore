@@ -1,0 +1,73 @@
+# Alertmanager config skeleton. Routing is set up; receivers are
+# placeholders — fill in a real email / Slack / PagerDuty receiver
+# before turning Alertmanager loose on real alerts.
+#
+# Deliberately NOT wired to a receiver yet: we don't want 3am pages
+# firing during Phase 2 validation when we're still tuning thresholds.
+# The webhook-noop receiver below silently drops everything; swap to
+# a real receiver (email_config / slack_configs / pagerduty_configs)
+# once thresholds are proven.
+
+global:
+  resolve_timeout: 5m
+
+# Routing tree. Everything falls through to webhook-noop (drops) by
+# default; critical alerts are tagged for a second receiver so you can
+# wire up paging separately without touching the warning route.
+route:
+  receiver: webhook-noop
+  group_by: ["alertname", "site", "component"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: webhook-noop   # TODO: replace with pager receiver
+      continue: true
+
+# Inhibition: when PostgresDown or SpockSlotInvalidated fires, suppress
+# the downstream noise that a dead PG / invalidated slot inevitably
+# causes (lag alerts, relay misses on the same site).
+inhibit_rules:
+  - source_matchers:
+      - alertname = "PostgresDown"
+    target_matchers:
+      - component = "spock"
+    equal: ["site"]
+
+  - source_matchers:
+      - alertname = "SpockSlotInvalidated"
+    target_matchers:
+      - alertname = "SpockSubscriptionLag"
+    equal: ["site", "subscription_name"]
+
+  - source_matchers:
+      - alertname = "SignalServerDown"
+    target_matchers:
+      - component = "signal-server"
+    equal: ["site", "instance"]
+
+receivers:
+  # Default black-hole receiver. Every alert routes here until real
+  # notification channels are wired up. Keeps Alertmanager running +
+  # rules evaluating without spamming anyone.
+  - name: webhook-noop
+    webhook_configs:
+      - url: "http://127.0.0.1:5001/noop"
+        send_resolved: false
+
+  # Placeholder for the real pager receiver — fill in before shipping.
+  #
+  # - name: pager
+  #   pagerduty_configs:
+  #     - routing_key: "<YOUR_PD_INTEGRATION_KEY>"
+  #       severity: "critical"
+  #
+  # Or Slack:
+  # - name: pager
+  #   slack_configs:
+  #     - api_url: "<YOUR_SLACK_WEBHOOK_URL>"
+  #       channel: "#alerts"
+  #       send_resolved: true

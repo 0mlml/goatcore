@@ -1,0 +1,59 @@
+# Local / dev monitoring stack. Bring up independently of the mgmt-host
+# compose — useful for testing alert rules and scrape configs without
+# touching the hot mgmt-host stack.
+#
+# Usage:
+#   cd ops/monitoring
+#   SITE_NAME=dev docker compose up -d
+#   # Prometheus UI:   http://localhost:9090
+#   # Alertmanager UI: http://localhost:9093
+#
+# For Phase 2 per-site deployment, either (a) merge these services
+# into ops/compose/mgmt-host/docker-compose.yml — do NOT do that while
+# the other session is hot on that file; queue it for later — or
+# (b) run this compose alongside, sharing the `mgmt` Docker network.
+
+services:
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: unless-stopped
+    environment:
+      SITE_NAME: ${SITE_NAME:-dev}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks:
+      - monitoring
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+
+networks:
+  monitoring:
+    name: monitoring

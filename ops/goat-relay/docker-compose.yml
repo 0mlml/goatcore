@@ -1,0 +1,95 @@
+# goat-relay local-Linux validation stack — Block 33B step 8 tier 1.5.
+#
+# Runs the relay (and optionally its test suite) inside a real Linux
+# container on macOS dev via Docker Desktop's Linux VM. Exercises the
+# `cfg(target_os = "linux")` branch in `goat-relay/src/listener/ws_ktls.rs`
+# at runtime — including the `ktls::config_ktls_server` hand-off that
+# macOS dev cannot reach (only Linux has SOL_TLS / kernel TLS ULP).
+#
+# This is a NO-AWS validation surface. Tier 4 (real netbird daemons +
+# iperf3 ramp on a t3.micro) is reserved for `terraform/relay-bench.tf`
+# per the runbook at `docs/operations/goat-relay-bench-env-smoke.md`.
+#
+# Usage:
+#
+#   # Build (once):
+#   docker compose -f ops/goat-relay/docker-compose.yml build
+#
+#   # Tier 1: relay only — boots, listeners bind, idle until SIGINT
+#   docker compose -f ops/goat-relay/docker-compose.yml up relay
+#
+#   # Tier 1.5: run all integration tests inside Linux (proves Linux
+#   # kTLS branch works end-to-end including the multi-peer ignored
+#   # tests that match upstream's `relay/test/benchmark_test.go`
+#   # benchmark shape).
+#   docker compose -f ops/goat-relay/docker-compose.yml run --rm tester
+#
+#   # Tier-down all
+#   docker compose -f ops/goat-relay/docker-compose.yml down -v
+#
+# Cert handling:
+#
+# Tier 1's `relay` service mounts `./tls/cert.pem` and `./tls/key.pem`
+# (gitignored — generate locally with `openssl req -x509 ...`). The
+# `tester` service generates its own ephemeral certs via rcgen
+# in-process (test fixture function `self_signed_localhost`); no
+# external cert needed.
+
+services:
+
+  # Tier 1: relay alone, production shape (Chainguard-runtime image).
+  relay:
+    build:
+      context: ../..
+      dockerfile: ops/goat-relay/Dockerfile
+      target: runtime
+    image: goat-relay:dev
+    restart: 'no'
+    ports:
+      # Both TCP (WS) and UDP (QUIC) on the same port number per
+      # ADR 0709 D9/D10. The /tcp and /udp suffixes are explicit
+      # because Docker's HOST:CONTAINER shorthand defaults to TCP only
+      # — F-016's lesson, mirrored from upstream's
+      # infrastructure_files/docker-compose.yml.tmpl ports section.
+      - "33073:33073/tcp"
+      - "33073:33073/udp"
+    volumes:
+      - ./tls/cert.pem:/etc/goat-relay/cert.pem:ro
+      - ./tls/key.pem:/etc/goat-relay/key.pem:ro
+    environment:
+      # Relay-client auth secret. The binary fails closed without it. This
+      # is the NO-AWS local validation tier (self-signed certs above), so a
+      # throwaway dev placeholder default keeps `docker compose up relay`
+      # working; override for real-token interop testing with
+      # `GOAT_RELAY_AUTH_SECRET=... docker compose up relay`. This is NOT a
+      # production secret path — prod sets it from the per-site relay_secret
+      # via the Ansible role's container env (never committed).
+      - "GOAT_RELAY_AUTH_SECRET=${GOAT_RELAY_AUTH_SECRET:-local-dev-relay-secret}"
+    command:
+      - "--tls-cert"
+      - "/etc/goat-relay/cert.pem"
+      - "--tls-key"
+      - "/etc/goat-relay/key.pem"
+      - "--bind"
+      - "0.0.0.0:33073"
+
+  # Tier 1.5: integration test runner (real Linux runtime; kTLS branch
+  # exercised). `cargo test --workspace --release --locked` runs by
+  # default; pass `-- --include-ignored` (or `-- --ignored`) on the
+  # docker compose run command line to include the multi-peer-pair
+  # sweep tests:
+  #
+  #   docker compose ... run --rm tester -- --include-ignored
+  #
+  # Profile-gated so a default `docker compose up` doesn't trigger the
+  # full test build.
+  tester:
+    build:
+      context: ../..
+      dockerfile: ops/goat-relay/Dockerfile
+      target: test
+    image: goat-relay:test
+    profiles: ["test"]
+    # Override at compose-run time as needed; default runs all
+    # non-ignored tests.
+    command: []

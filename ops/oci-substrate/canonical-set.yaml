@@ -1,0 +1,112 @@
+# Canonical-set — enumerated list of OCI images we mirror through the
+# substrate. Source-of-truth for:
+#   - CI fan-out (T0 → T1, .github/workflows/oci-mirror-sync.yml)
+#   - Per-site cron (T1 → T2, ops/ansible/roles/oci-substrate-t2-sync/)
+#   - Pin-regression CI hook (per ADR 0703)
+#   - Group-vars tier-list rendering (per-image *_image_tiers vars
+#     consumed by ops/ansible/tasks/oci-pull-with-fallback.yml)
+#
+# Per-image fields:
+#   upstream_name    : canonical OCI ref at the source-of-record (T0)
+#   canonical_name   : the name compose stacks reference (oci.goat/<service>
+#                      for first-party; upstream_name for third-party.
+#                      Today's dockerd interim rebadges everything under
+#                      goat/<service> — see ADR 0838 §"Edge-native canonical
+#                      name" + "Migration plan" for the post-Quadlet flip.)
+#   digest           : full sha256 digest, pinned (no floating tags)
+#   sign_anchor      : trust-anchor file under trust-anchors/ that verifies this image
+#   consumers        : which compose stacks pull this image (mgmt-host, obs-host, etc.)
+#   notes            : free-form (build-from-source provenance, known issues, etc.)
+#
+# See ADR 0838 + docs/design/oci-goat-substrate.md §2.
+
+canonical_set:
+
+  # ---- First-party (oci.goat/* canonical name) ----
+  # Built-from-source per ADR 0702. Today's dockerd interim references
+  # them as <orin-c>:3030/goat/<service> (see group_vars tier list);
+  # post-Quadlet flip moves to oci.goat/<service> via containerd hosts.toml.
+
+  - upstream_name: ghcr.io/usareur-af/admit-audit:bridge-2026-05-09
+    canonical_name: oci.goat/admit-audit
+    digest: sha256:81b2b07a86fa9c91c693ebed118852f392034d0e5cb73fb3e01112a86fdc1cbe
+    sign_anchor: goat-first-party
+    consumers: [mgmt-host]
+    notes:
+      - "First publish to ghcr.io 2026-05-09 (Block 75E first-consumer migration)."
+      - "Locally built before; substrate is canonical home from now on."
+
+  - upstream_name: ghcr.io/usareur-af/postgres-spock:latest
+    canonical_name: oci.goat/postgres-spock
+    digest: sha256:0830dd6b6cc750ddae23392084931fe5c8cfc66e551dbc81b4fc278adc249008
+    sign_anchor: goat-first-party
+    consumers: [mgmt-host]
+    notes:
+      - "Patched Postgres 16 + Spock multi-master replication extension (ADR 0204)."
+
+  - upstream_name: ghcr.io/usareur-af/signal-server:latest
+    canonical_name: oci.goat/signal-server
+    digest: sha256:2d69c01e88758737df42afe48c493bd40e5176d454437f745a6c391a7a51af78
+    sign_anchor: goat-first-party
+    consumers: [mgmt-host]
+    notes:
+      - "Custom federated signal-server per ADR 0204 multi-site active-active."
+
+  - upstream_name: ghcr.io/usareur-af/netbird-mgmt:patched-53b04e5
+    canonical_name: oci.goat/netbird-mgmt
+    digest: sha256:43efe476c2e84587d3518611ca8d9d3a12e382c4217e2fc012f3a7b6ed0c9a56
+    sign_anchor: goat-first-party
+    consumers: [mgmt-host]
+    notes:
+      - "Patched netbird-management per ADR 0301 + 0706 custom-netbird-image-build-ci."
+      - "Tag-mutation drift observed 2026-05-09: tag 'patched-53b04e5' upstream"
+      - "advanced from running digest 10b87cd6... to 43efe476.... Substrate"
+      - "pinned to upstream-current; next deploy will pick up newer image."
+
+  # mgmt-host-bootstrap, zenoh — also first-party, not yet bridged through
+  # substrate. Add when Block 75F continues to those services.
+
+  # ---- Third-party (today rebadged under goat/<service>; tomorrow keeps upstream name via hosts.toml) ----
+
+  - upstream_name: traefik:v3.7.16
+    canonical_name: traefik   # under goat/ org on Forgejo today; reverts to docker.io/library/traefik via hosts.toml
+    digest: sha256:e561a37f8710d9cf41c78bdf421d822b2c0b48267ec0552e644565fb55466ea9
+    sign_anchor: third-party-anonymous
+    consumers: [mgmt-host]
+    notes:
+      - "Docker Hub upstream; multi-arch index preserved by crane copy."
+
+  - upstream_name: oryd/kratos:v1.3.1
+    canonical_name: kratos
+    digest: sha256:fe2428f103a6240c064b6ea77d3088610865c55fcebccb30355857eccdc25b4b
+    sign_anchor: third-party-anonymous
+    consumers: [mgmt-host]
+    notes:
+      - "Ory Kratos identity service per ADR 0411 + Block 21C."
+
+  - upstream_name: oryd/hydra:v2.3.0
+    canonical_name: hydra
+    digest: sha256:b94007e19a1f7f78157e7f4ea340da8a55b5f104a0f1198755c256f38ef32b4b
+    sign_anchor: third-party-anonymous
+    consumers: [mgmt-host]
+    notes:
+      - "Ory Hydra OAuth2 provider per ADR 0411 + Block 21C."
+
+  - upstream_name: netbirdio/dashboard:latest
+    canonical_name: dashboard
+    digest: sha256:e3ee15351a46345d338a5f9d20cf49bcc3d3594d6d61bc4e5d6f640dda2cbdb0
+    sign_anchor: third-party-anonymous
+    consumers: [mgmt-host]
+    notes:
+      - "Netbird dashboard SPA per Block 21D."
+      - "Floating :latest upstream — bridge digest pins exact bits we deployed."
+
+  # Obs-host third-party (Prometheus stack, Grafana, OpenObserve, MinIO,
+  # OTel Collector, Forgejo itself, registry:2, Codeberg postgres, ollama,
+  # snitch) not yet in substrate. Bridging them through Orin-C creates
+  # a chicken-and-egg problem (Orin-C hosts the substrate AND needs to
+  # consume from it). Resolution lives in design doc §11 Bootstrap path
+  # — they're delivered via Block 68 bootstrap-bundle (bootstrap-set) and
+  # NOT through the runtime substrate. Add to canonical-set entries
+  # marked consumers: [bootstrap-set] when the rebuild.sh integration
+  # (Block 75J) lands.

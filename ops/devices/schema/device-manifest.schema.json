@@ -1,0 +1,108 @@
+{
+  "$id": "https://goat/schemas/device-manifest.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Device onboarding manifest (Phase F.4)",
+  "description": "Declarative spec for one device's wg-cp0 bundle. Consumed by `goat admin client onboard <handle>`, which translates the manifest into a bundle-create invocation. Per-site fleet config (CA-id, age-identity / piv-slot, trust-anchor path, snitch-collector) is NOT in this manifest — it's resolved from env vars + CLI flags by the wrapper. See docs/design/goat-cli.md §Phase F.4.",
+  "type": "object",
+  "required": ["identity", "device", "bundle"],
+  "additionalProperties": false,
+  "properties": {
+    "identity": {
+      "type": "object",
+      "required": ["handle", "role", "status", "added", "added_by"],
+      "additionalProperties": false,
+      "properties": {
+        "handle": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$",
+          "description": "Kebab-case slug; filename = ops/devices/<handle>.yml. 3-32 chars, no leading/trailing hyphen."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["mgmt-host", "orin", "pi", "operator-laptop", "vendor-laptop", "vendor-edge", "mission-partner", "inmate"],
+          "description": "Device role tag — informational for the operator + cross-referenced by the wrapper when deriving sensible default ACL groups. Authoritative ACL membership comes from bundle.acl_groups."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "revoked"]
+        },
+        "added": {
+          "type": "string",
+          "format": "date",
+          "description": "ISO 8601 date the device was first onboarded (YYYY-MM-DD)."
+        },
+        "added_by": {
+          "type": "string",
+          "format": "email",
+          "description": "Email of the operator who minted this device's first bundle."
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Free-form notes — hardware model, physical location, intended use."
+        }
+      }
+    },
+    "device": {
+      "type": "object",
+      "required": ["device_id", "site"],
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$",
+          "description": "Device identifier passed to bundle-create -device-id (e.g. mgmt-prov-site3-01-orin, op-laptop). Convention: <role>-<site>-<n>-<form-factor> or <role>-<host>."
+        },
+        "site": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$",
+          "description": "Site identifier passed to bundle-create -site (e.g. vega, nova, prov-rla)."
+        },
+        "peer_pubkey": {
+          "type": "string",
+          "description": "Optional base64 32-byte mesh peer pubkey. If absent, bundle-create generates a placeholder per Block 21/22H forward-compat."
+        }
+      }
+    },
+    "bundle": {
+      "type": "object",
+      "required": ["acl_groups"],
+      "additionalProperties": false,
+      "properties": {
+        "acl_groups": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9-]{0,62}$"
+          },
+          "uniqueItems": true,
+          "minItems": 1,
+          "description": "Uppercase ACL group names passed to bundle-create -acl-groups (joined comma-separated). Common shapes: ['VEGA','VEGA-MGMT'] for site-scoped, ['NOVA','NOVA-OPERATOR'] for operator devices."
+        },
+        "ttl_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 730,
+          "default": 365,
+          "description": "Bundle TTL in days. Cert / setup-key expiry is derived from this."
+        },
+        "activation_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 90,
+          "default": 14,
+          "description": "Bundle activation deadline in days from mint (per ADR 0308 §3.1)."
+        },
+        "mesh_route_subnet": {
+          "type": "string",
+          "description": "Optional comma-separated CIDRs added to every relay's AllowedIPs (-mesh-route-subnet). Use for mgmt-host Orins that consume via wg-cp0-bundle-apply across multiple relays — see F-114."
+        },
+        "snitch": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, mint a snitch_probe_key + embed it in the bundle (Block 61). Wrapper additionally reads $SNITCH_ADMIN_KEY + --snitch-collector to register the key automatically."
+        }
+      }
+    }
+  }
+}

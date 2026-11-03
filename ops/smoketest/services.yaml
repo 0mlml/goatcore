@@ -1,0 +1,143 @@
+# goat — Service Catalogue
+# Single source of truth for all health-checkable services.
+# The smoketest dashboard probes these on /api/services requests.
+#
+# Check types:
+#   http/https  — HTTP GET, verify status code and optional body substring
+#   tcp         — TCP connect, pass/fail
+#   script      — Run external command (Python app tests)
+#
+# To add a new service: append an entry below and redeploy.
+
+services:
+  # --- Infrastructure ---
+  - name: netbird-management
+    description: Netbird management gRPC + REST API
+    category: infrastructure
+    checks:
+      - type: https
+        url: https://netbird.legacy.example/api/accounts
+        expect:
+          status: 401
+          body_contains: "code"
+
+  - name: netbird-dashboard
+    description: Netbird web UI
+    category: infrastructure
+    checks:
+      - type: https
+        url: https://netbird.legacy.example
+        expect:
+          status: 200
+
+  - name: postgres
+    description: PostgreSQL 16 database (check from NETHOST container network only)
+    category: infrastructure
+    checks:
+      - type: tcp
+        host: netbird-postgres
+        port: 5432
+
+  - name: traefik
+    description: Traefik TLS reverse proxy
+    category: infrastructure
+    checks:
+      - type: tcp
+        host: 100.127.1.32
+        port: 443
+
+  - name: caddy-proxy
+    description: Caddy service proxy (static + reverse proxy)
+    category: infrastructure
+    checks:
+      - type: http
+        url: http://caddy-proxy:80
+        expect:
+          status: 200
+
+  - name: mesh-dns
+    description: Mesh DNS (Netbird proxy → VPS relay dnsmasq)
+    category: infrastructure
+    checks:
+      - type: note
+        url: "Validated implicitly — all services requiring DNS resolution passed"
+
+  - name: isitup
+    description: Infrastructure status page
+    category: infrastructure
+    checks:
+      - type: http
+        url: http://isitup.netbird.legacy.example
+        expect:
+          status: 200
+
+  - name: snitch
+    description: Mesh network performance monitor
+    category: infrastructure
+    checks:
+      - type: http
+        url: http://snitch.netbird.legacy.example/health
+        expect:
+          status: 200
+          body_contains: "ok"
+
+  # --- Applications ---
+  # doodle was retired see docs/operations/archived-services.md
+  - name: demogame
+    description: Demo Game game + shared leaderboard
+    category: application
+    checks:
+      - type: http
+        url: http://demogame.netbird.legacy.example
+        expect:
+          status: 200
+      - type: http
+        url: http://demogame.netbird.legacy.example/health
+        expect:
+          status: 200
+          body_contains: "ok"
+      - type: http
+        url: http://demogame.netbird.legacy.example/api/scores?period=all
+        expect:
+          status: 200
+          body_contains: "scores"
+
+  # --- Relays ---
+  - name: relay-rla
+    description: region 1 relay (rathole + STUN)
+    category: relay
+    checks:
+      - type: tcp
+        host: 203.0.113.2
+        port: 2333
+      - type: https
+        url: https://netbird.legacy.example/api/accounts
+        resolve: "netbird.legacy.example:443:203.0.113.2"
+        expect:
+          status: 401
+
+  - name: relay-rlb
+    description: region 2 relay (rathole + STUN)
+    category: relay
+    checks:
+      - type: tcp
+        host: 203.0.113.20
+        port: 2333
+      - type: https
+        url: https://netbird.legacy.example/api/accounts
+        resolve: "netbird.legacy.example:443:203.0.113.20"
+        expect:
+          status: 401
+
+  - name: relay-rlc
+    description: region 3 relay (rathole + STUN)
+    category: relay
+    checks:
+      - type: tcp
+        host: 203.0.113.30
+        port: 2333
+      - type: https
+        url: https://netbird.legacy.example/api/accounts
+        resolve: "netbird.legacy.example:443:203.0.113.30"
+        expect:
+          status: 401

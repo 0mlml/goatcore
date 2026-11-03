@@ -1,0 +1,103 @@
+# Org manifest — canonical template (the going-forward authoring shape)
+#
+# Copy to ops/operators/<org-handle>.yml (gitignored) and edit.
+# Validate:  ops/operators/validate.py ops/operators/<org-handle>.yml
+# Schema:    ops/operators/schema/operator-manifest.schema.json
+# Design:    docs/design/operator-onboard-utilities.md
+#            docs/design/vendor-to-org-machine-rename.md (ADR 1052)
+#
+# This is the org-neutral template. It is byte-for-byte the same as
+# example-vendor.yml.example EXCEPT the block key is `org:` (and the
+# publisher prefix is `zenoh.trial.org`) instead of the legacy `vendor:`
+# / `zenoh.trial.vendor`. Both are accepted (additive dual-read across
+# the orchestrator, gen-roster.py, and the onboard lint) — the `vendor:`
+# shape stays valid for the existing manifests that use it; new
+# manifests SHOULD author `org:`. "Org" fits the real participants —
+# commands, units, partner-nation orgs — better than "vendor".
+#
+# Self-inclusive onboarding model (unchanged):
+#   Every person at an org gets their own ORG-PRIMARY manifest —
+#   distinct `zenoh.trial.org` prefix → distinct X.509 wire cert +
+#   distinct portal API key + distinct OOB bundle. Multiple people at
+#   the same org share the human-readable `org.display_name`; the
+#   URI-SAN authority (`zenoh.trial.org`) is unique-on-the-wire and MUST
+#   be distinct per person (convention: append a person tail, e.g.
+#   `org59x`, `org61x`).
+#
+# For internal operator manifests (NetBird ADMIN/OPERATOR, no org
+# block) see the sibling template example.yml.example.
+
+# identity.* = the PERSON the Ory Kratos identity represents.
+identity:
+  handle: acme-corp-jane                # kebab-case; filename = ops/operators/<handle>.yml
+  email: jane.smith@acme-corp.example   # Kratos identifier (email-shaped); IS the person
+  name: Jane Smith                      # PERSON display name; → Ory traits.name
+  status: active                        # active | revoked
+  added: 2026-07-28
+  added_by: person-900@example.org
+
+# org.* = the ORG / company / unit / command. Required (schema-enforced)
+# whenever netbird.auto_groups includes VENDOR/DEVELOPER. Distinct from
+# identity.* so an org can rotate the person without re-issuing the cert
+# / ACL / portal API key. All siblings of one org MUST carry the same
+# display_name AND short_tag.
+org:
+  display_name: Acme Corporation        # → goat-zenoh-portal display_name + catalog/console UI
+                                        # (shared across all people at the same org)
+  # short_tag (optional, kebab-case slug, ^[a-z0-9-]{1,32}$): threaded
+  # into the canonical peer-name segment AND set on the Ory identity's
+  # org trait (traits.org) so the id-admin-console identity-detail view
+  # surfaces it. When the Zenoh block is enabled this MUST equal
+  # zenoh.trial.org (one URI-SAN authority per person; orchestrator
+  # warns on drift). Suffix with the person handle for additional people
+  # at an existing org (e.g. `acme-corp-jane`).
+  short_tag: acme-corp
+
+# affiliation.* = the identity grammar's WHO dimension (ADR 1043),
+# distinct from role (auto_groups = what you may do). Optional; when
+# omitted, the org block above maps to kind: vendor. NOTE: affiliation
+# `kind: vendor` is a PERMANENT enum value (a kind of affiliation =
+# commercial company) and is deliberately NOT renamed by ADR 1052.
+# affiliation:
+#   id: acme-corp
+#   kind: vendor        # vendor | organic | partner | civil
+#   display_name: Acme Corporation
+#   parent: defense-industrial-base       # omit for a root unit
+
+# NetBird mesh credential.
+netbird:
+  enabled: true
+  sites:
+    - nova
+  role: peer                            # bootstrap | admin | operator | peer
+  ttl_days: 90
+  auto_groups:
+    - VENDOR                            # role-family group (DEVELOPER is the org-neutral equivalent)
+    - OBSERVER
+
+# Ory site Kratos identity (OIDC for brief, portal, panoscope, isitup).
+ory_site:
+  enabled: true
+  sites:
+    - nova
+  groups: []                            # org member — no admin claims
+  credentials:
+    password: true
+    passkey: false
+  netbird_mgmt_admin: false
+
+# Ory operator-IdP (obs + utility). Org members don't need
+# grafana / openobserve / minio — leave disabled. Empty sites + groups
+# arrays REQUIRED when enabled=false (no stub).
+ory_idp:
+  enabled: false
+  sites: []
+  groups: []
+  fido2_required: false
+
+# Zenoh trial publisher identity. `zenoh.trial.org` is the URI-SAN
+# authority (unique per person). Legacy alias: zenoh.trial.vendor.
+zenoh:
+  enabled: true
+  trial:
+    org: acme-corp                      # MUST equal org.short_tag when both set

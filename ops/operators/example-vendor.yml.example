@@ -1,0 +1,173 @@
+# Vendor manifest — canonical template
+#
+# Copy to ops/operators/<vendor-handle>.yml (gitignored) and edit.
+# Validate:  ops/operators/validate.py ops/operators/<vendor-handle>.yml
+# Schema:    ops/operators/schema/operator-manifest.schema.json
+# Design:    docs/design/operator-onboard-utilities.md
+# Runbook:   docs/operations/operator-onboard.md
+#
+# Self-inclusive onboarding model:
+#
+#   Every person at a vendor company gets their own VENDOR-PRIMARY
+#   manifest — distinct `zenoh.trial.vendor` prefix → distinct X.509
+#   wire-layer cert + distinct portal API key + distinct OOB bundle.
+#   Nothing in the bundle ever asks one teammate to coordinate OOB
+#   with another teammate for credentials.
+#
+#   Multiple people at the same vendor company share the human-readable
+#   `vendor.display_name` (the portal + id-admin-console + dashboard
+#   surface vendor affiliation off of that). The URI-SAN authority
+#   (`zenoh.trial.vendor`) is the unique-on-the-wire identity and MUST
+#   be distinct per person — convention: append a person-distinguishing
+#   tail, e.g. `org59x`, `org61x`, `org59x-yan`. The
+#   `vendor.short_tag` (peer-name segment) MAY follow the same shape
+#   so each person reads off the dashboard distinctly.
+#
+#   Why each person gets their own cert:
+#     - audit attribution on the wire (every published payload carries
+#       the publisher's URI-SAN; per-person prefix → per-person trace)
+#     - revoke without rotating the whole company (revoking Peter's
+#       cert doesn't disrupt Nick)
+#     - self-contained bundle (no "ask your primary" OOB step)
+#
+#   The legacy VENDOR-SIBLING shape (zenoh.enabled: false, share the
+#   primary's cert OOB) is still structurally valid in the schema but
+#   is deprecated. New onboardings SHOULD use vendor-primary per
+#   person. Rationale at docs/design/operator-onboard-utilities.md
+#   §"Per-person vendor-primary (self-inclusive onboarding)".
+#
+# For internal operator manifests (NetBird ADMIN/OPERATOR role + obs/
+# utility access via the operator-IdP on Orin-C, no vendor block) see
+# the sibling template at example.yml.example.
+
+# identity.* = the PERSON the Ory Kratos identity represents.
+# Logs into auth.nova.*, has a Kratos /settings page, manages their own
+# passkey. identity.name flows into Ory traits.name.
+identity:
+  handle: acme-corp-jane                # kebab-case; filename = ops/operators/<handle>.yml
+  email: jane.smith@acme-corp.example   # Kratos identifier (email-shaped); IS the person
+  name: Jane Smith                      # PERSON display name; → Ory traits.name
+  status: active                        # active | revoked
+  added: 2026-05-20
+  added_by: person-900@example.org
+
+# vendor.* = the VENDOR / company / org. Required (schema-enforced)
+# whenever netbird.auto_groups includes VENDOR. Distinct from
+# identity.* so a vendor company can rotate the person without
+# re-issuing the vendor cert / ACL / portal API key.
+# All siblings of one vendor MUST carry the same display_name AND
+# short_tag.
+# NOTE (ADR 1052): `org:` is the going-forward block name; `vendor:` is the
+# legacy alias (both still accepted, dual-read). New manifests should author
+# `org:` — same fields. Shown as `vendor:` here only because most existing manifests
+# still use it; rename the key to `org:` for a fresh one.
+vendor:
+  display_name: Acme Corporation        # → goat-zenoh-portal display_name + catalog UI
+                                        # (shared across all people at the same org)
+  # short_tag (optional, kebab-case slug, ^[a-z0-9-]{1,32}$):
+  # threaded into the canonical peer-name segment so the dashboard
+  # Peers tab shows `peer-<handle>-<short_tag>-<site>-<date>-<hostname>`
+  # (gives at-a-glance vendor affiliation without a second lookup) AND
+  # set on the Ory site-Kratos identity's traits.vendor block so the
+  # id-admin-console identity-detail view surfaces it. When the Zenoh
+  # block is enabled, this MUST equal zenoh.trial.vendor (one URI-SAN
+  # authority per person; orchestrator warns on drift). Omit to keep
+  # the previous 4-segment peer-name shape. Convention: for additional
+  # people at an existing vendor, suffix with the person handle
+  # (e.g. `acme-corp-jane`) so the dashboard distinguishes them.
+  short_tag: acme-corp
+
+# affiliation.* = the identity grammar's WHO dimension (ADR 1043 /
+# docs/design/identity-grammar.md), distinct from role (auto_groups =
+# what you may do). Optional + backward-compatible during the additive
+# migration phase — when omitted, the legacy vendor block above maps to
+# kind: vendor. Hierarchical + identity-only: NEVER a NetBird group,
+# NEVER in the Zenoh write anchor (which stays the bare uuid). When set,
+# it flows into the Ory aff claim + the cert URI-SAN aff/aff-kind
+# attributes + the principal-graph registry.
+#   kind: vendor   (commercial company) | organic (US gov/mil unit)
+#                  | partner (allied / partner-nation org)
+#   parent:        the v1 vertical edge — parent unit's affiliation id.
+#                  Lateral edges (supports / coordinates-with) are a
+#                  reserved future edge type (ADR 1043 §4), not modeled.
+# affiliation:
+#   id: acme-corp
+#   kind: vendor
+#   display_name: Acme Corporation
+#   parent: defense-industrial-base       # omit for a root unit
+#
+# Organic / partner developer example (capability-equal to a vendor,
+# but honestly labeled — auto_groups: [DEVELOPER, OBSERVER]):
+# affiliation:
+#   id: example-command
+#   kind: organic
+#   display_name: Example Command
+#   parent: component-command
+
+# NetBird mesh credential. VENDOR + OBSERVER = brief + portal +
+# panoscope + isitup + Zenoh router :7447 per the per-site mesh ACL
+# matrix (enforcement gates per 83C.2-L7).
+netbird:
+  enabled: true
+  sites:
+    - nova
+  role: peer                            # bootstrap | admin | operator | peer
+  ttl_days: 90                          # peer default (override per ceremony)
+  auto_groups:
+    - VENDOR                            # → <SITE>-VENDOR
+    - OBSERVER                          # → <SITE>-OBSERVER (adds isitup)
+
+# Ory site Kratos identity (OIDC for brief, portal, panoscope, isitup).
+# credentials block required (schema-enforced); declare intent
+# explicitly — no defaulting.
+#   password=true   → 24-char password in OOB bundle (immediate-use)
+#   passkey=true    → 15-min Kratos recovery link in OOB bundle
+#                     (vendor enrolls WebAuthn on first click)
+# The vendor can also enroll a passkey themselves after first login
+# via auth.nova.* → Account → Passkeys regardless of this block.
+ory_site:
+  enabled: true
+  sites:
+    - nova
+  groups: []                            # vendor — no admin claims
+  credentials:
+    password: true
+    passkey: false                      # flip when Kratos recovery-link flow is verified end-to-end on the target site
+  netbird_mgmt_admin: false             # vendors are never netbird-mgmt admins
+
+# Ory operator-IdP (Orin-C obs+utility). Vendors don't need
+# grafana / openobserve / minio — leave disabled.
+# Empty sites + groups arrays REQUIRED when enabled=false (no stub).
+ory_idp:
+  enabled: false
+  sites: []
+  groups: []
+  fido2_required: false
+
+# Zenoh wire-layer cert.
+#
+# Recommended shape (one-primary-per-person, self-inclusive):
+#   zenoh:
+#     enabled: true
+#     trial:
+#       vendor: acme-corp-jane          # ^[a-z0-9-]{1,32}$; URI-SAN = urn:goat-nova:vendor=<vendor>
+#                                       # DISTINCT per person at a given company; convention
+#                                       # is `<company>-<person-handle>` for additional teammates.
+#
+# Legacy (deprecated) shape:
+#   zenoh:
+#     enabled: false                    # cert + api_key delivered OOB from another teammate's
+#                                       # bundle. Discouraged — see header comment for rationale.
+#
+# Wired (Block 83E, Path B): orchestrator Phase 4
+# POSTs to https://portal.nova.netbird.nova.example/api/vendors,
+# which mints the X.509 leaf via cert-sign --uri-san, appends the
+# per-vendor write-ACL rule, reloads zenohd, and returns a one-time
+# bundle tarball URL + portal API key. Requires
+# PORTAL_OPERATOR_API_KEY env var (see operator-onboard.md
+# §"Preconditions").
+zenoh:
+  enabled: true
+  trial:
+    # `org:` is the going-forward key (ADR 1052); `vendor:` is the legacy alias.
+    org: acme-corp-jane

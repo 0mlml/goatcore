@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: goat-maintainer <person-37@example.org>
+Date: Mon, 19 May 2026 19:00:00 +0000
+Subject: [PATCH] consent: fall back to client.audience when
+ requested_access_token_audience is empty
+
+The upstream oryd/kratos-selfservice-ui-node consent handler echoes
+`body.requested_access_token_audience` (from Hydra's consent challenge)
+back to Hydra verbatim as `grant_access_token_audience` on the
+accept-consent PUT. On nova-a, observed empirically that Hydra was
+populating this field as `[]` (empty array) even when the SPA's
+/oauth2/auth request explicitly included `audience=netbird-dashboard`
+(verified via Traefik access log: the audience param was present in the
+SPA's first-hop auth request, but absent from the consent challenge body
+the consent UI received). Result: Hydra mints access_tokens with
+`aud: []`. Every downstream service (netbird-mgmt, future operator-IdP
+consumers) whose JWT validator requires the `aud` claim then rejects
+every browser-issued token with "token invalid"; SPA retries once or
+twice before giving up; user sees a 10+ second slow load on every page
+with empty data. See F-144 for the full root-cause trace.
+
+This patch wraps the audience-echo with a fallback: if Hydra delivers an
+empty `requested_access_token_audience`, fall back to
+`body.client.audience` — the client's whitelisted-audience array from
+its registration. For our first-party clients (netbird-dashboard,
+isitup, grafana, oauth2-proxy-dashboard) this array is
+`["netbird-dashboard"]` (or the equivalent per-client audience) — exactly
+what should land in the minted token's `aud` claim. Additive — when
+Hydra DOES populate requested_access_token_audience correctly (e.g.
+upstream regression fixed), the original value wins. When it doesn't,
+we provide the sane default.
+
+Tracked: docs/findings/F-144-patched-consent-ui-drops-audience-on-grant.md.
+Surfaced during user-reported "dashboard /groups loads slowly / shows
+empty data" investigation, 2026-05-19. Live patch on nova-a's
+selfservice-ui container immediately restored /api/* 200s; this commit
+codifies into the image build so the fix survives the next container
+recreate. Companion to the earlier 0001-forward-traits-groups patch.
+---
+ src/routes/consent.ts | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/routes/consent.ts b/src/routes/consent.ts
+index 0000001..0000002 100644
+--- a/src/routes/consent.ts
++++ b/src/routes/consent.ts
+@@ -136,7 +136,8 @@
+                                                         // We can grant all scopes that have been requested - hydra already checked for us that no additional scopes
+                                                         // are requested accidentally.
+                                                         grant_scope: grantScope,
+-                                                        // ORY Hydra checks if requested audiences are allowed by the client, so we can simply echo this.
+-                                                        grant_access_token_audience: body.requested_access_token_audience,
++                                                        // ORY Hydra checks if requested audiences are allowed by the client, so we can simply echo this.
++                                                        // goat-maintainer-audience-fallback-patch: fall back to client.audience when requested is empty.
++                                                        grant_access_token_audience: ((body.requested_access_token_audience && body.requested_access_token_audience.length) ? body.requested_access_token_audience : ((body.client && body.client.audience) || [])),
+                                                         // The session allows us to set session data for id and access tokens
+                                                         session: session,
+                                                     },
+@@ -235,8 +236,9 @@
+                                             // If the environment variable CONFORMITY_FAKE_CLAIMS is set we are assuming that
+                                             // the app is built for the automated OpenID Connect Conformity Test Suite. You
+                                             session: (0, oidc_cert_1.oidcConformityMaybeFakeSession)(grantScope, session),
+-                                            // ORY Hydra checks if requested audiences are allowed by the client, so we can simply echo this.
+-                                            grant_access_token_audience: body.requested_access_token_audience,
++                                            // ORY Hydra checks if requested audiences are allowed by the client, so we can simply echo this.
++                                            // goat-maintainer-audience-fallback-patch: fall back to client.audience when requested is empty.
++                                            grant_access_token_audience: ((body.requested_access_token_audience && body.requested_access_token_audience.length) ? body.requested_access_token_audience : ((body.client && body.client.audience) || [])),
+                                             // This tells hydra to remember this consent request and allow the same client to request the same
+                                             // scopes from the same user, without showing the UI, in the future.
+--
+2.39.0

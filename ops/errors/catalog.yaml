@@ -1,0 +1,2010 @@
+# The error catalog: every error goat and goatbuilder can print, and every
+# error the tools they call can hand back through them, with what it means
+# and what to do. One home (ADR 1199, docs/design/error-interpretation.md).
+#
+# Compiled into both binaries at build time (crates/goat-errors), so
+# `goat explain` and `goatbuilder explain` work offline. The CI gate
+# ops/ci/check-error-catalog.py keeps this file, the Rust code that cites it,
+# docs/design/goat-cli-error-codes.md and the generated docs/reference/errors.md
+# in step.
+#
+# An entry:
+#   code     stable; `E_*` = goat's own codes (crates/goat-cli/src/errors.rs),
+#            `GB-NNN` = goatbuilder's, `X-<TOOL>-NNN` = a tool either binary calls
+#   tool     who prints it
+#   title    the claim, in the operator's words
+#   what     what happened, one or two sentences
+#   causes   the likely reasons, most likely first
+#   fixes    what to do, as commands where a command exists
+#   read     where to read more (a repo path)
+#   exit     the exit code the binary returns for it (goat and goatbuilder codes only)
+#   matches  regular expressions over the WHOLE text of an error, for errors that
+#            arrive as text (a tool's stderr carried inside a goat error). Any one
+#            matching is a hit. Case-sensitive; keep them literal and specific.
+#
+# Adding an entry is a YAML block here and nothing else, unless a binary should
+# emit the code itself (then cite it in the Rust and the gate checks it exists).
+
+schema: goat-errors/v1
+
+entries:
+
+  # ---------------------------------------------------------------- goat (E_*)
+
+  - code: E_PROFILE_MISSING
+    tool: goat
+    title: no profile for this context
+    what: goat was run before `goat profile init`, or the context named has no profile.toml, certificate or key.
+    causes:
+      - the bundle was never installed on this machine
+      - the bundle was installed into a different context than the one in use
+    fixes:
+      - "goat profile init <bundle.cbor>"
+      - "goat --context <name> …   (when the bundle was installed under another context)"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 3
+    matches:
+      - "no profile for context"
+
+  - code: E_PROFILE_DENIED
+    tool: goat
+    title: the profile exists but this user cannot read it
+    what: the profile directory is there and permission was denied reading it, typically a root-owned 0700 ~/.goat probed without sudo, or bare sudo that reset $HOME to /root.
+    causes:
+      - the profile was created as root
+      - bare `sudo goat …` looked in /root/.goat
+    fixes:
+      - "sudo chown -R $USER ~/.goat"
+      - "sudo -E goat …   (keeps your $HOME)"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 3
+
+  - code: E_BUNDLE_INVALID
+    tool: goat
+    title: the bundle did not verify
+    what: at `goat profile init` the bundle's structure, signature or expiry failed. The help line says which of the three.
+    causes:
+      - a truncated or wrong download (malformed CBOR)
+      - a signing CA this machine does not trust
+      - an expired bundle
+    fixes:
+      - "goat ca ls             (what this machine trusts)"
+      - "goat ca add <root.pem> (when the CA is the problem)"
+      - "ask the operator for a re-issued bundle when it has expired"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 3
+
+  - code: E_OFF_MESH
+    tool: goat
+    title: not connected to the mesh
+    what: the local mesh client reports no connected tunnel, so nothing on the goatnet is reachable.
+    causes:
+      - the mesh client is stopped or logged out
+      - this device was never enrolled
+      - the device is on a network that blocks the mesh
+    fixes:
+      - "netbird status -d"
+      - "goat heal && goat doctor"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 5
+
+  - code: E_CLOCK_SKEW
+    tool: goat
+    title: the device clock is wrong
+    what: the device clock differs from the management server's authenticated HTTPS Date by more than 60 seconds, so certificates cannot be judged valid.
+    causes:
+      - the clock drifted while the device was off or offline
+    fixes:
+      - "synchronise the clock (chrony/ntp), then: goat doctor"
+    read: docs/design/time-hygiene-trusted-time.md
+    exit: 6
+
+  - code: E_ROUTER_UNREACHABLE
+    tool: goat
+    title: the Zenoh router did not answer
+    what: the configured router's TCP path or Zenoh session timed out or could not be reached.
+    causes:
+      - the mesh tunnel is up but the route to the router is not
+      - the router service is down on its host
+      - the endpoint in the profile is stale
+    fixes:
+      - "goat doctor --all"
+      - "compare from another enrolled peer before changing anything local"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 5
+
+  - code: E_CERT_EXPIRED
+    tool: goat
+    title: the mTLS certificate is outside its validity
+    what: the local certificate is expired, not yet valid, or was rejected by the router.
+    causes:
+      - the certificate's validity interval has passed
+      - the device clock is wrong (see E_CLOCK_SKEW)
+    fixes:
+      - "goat profile show"
+      - "goat profile rotate <new-bundle.cbor>   (after the operator re-issues it)"
+    read: docs/design/credential-rotation.md
+    exit: 6
+
+  - code: E_DOCTOR_INCONCLUSIVE
+    tool: goat
+    title: doctor saw a failure it cannot narrow
+    what: a local TLS or configuration failure, or a session rejection, without enough evidence for one cause.
+    causes:
+      - router-side admission refused this identity
+      - a local TLS setup problem the probe cannot distinguish from the router's
+    fixes:
+      - "follow the hint on the failing doctor step"
+      - "if the local certificate is valid, send the step output to the goatnet operator"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 1
+
+  - code: E_PORTAL_UNREACHABLE
+    tool: goat
+    title: the portal API did not answer
+    what: the portal was not reachable for network reasons (DNS, TCP or TLS), not an authorization failure.
+    causes:
+      - the portal host is not reachable over the mesh from this device
+      - mesh DNS is not resolving the portal name
+    fixes:
+      - "goat doctor --all"
+      - "check from another peer: if it answers there, the problem is local"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 4
+
+  - code: E_PORTAL_NOT_FOUND
+    tool: goat
+    title: the portal answered that what was named is not registered
+    what: "the portal is up and answered HTTP 404 for the request path shown: the org, topic, schema, machine or person the command named does not exist there. An answer, not a network fault."
+    causes:
+      - a typo in the org prefix, topic key or handle
+      - the thing is registered on another goatnet than the active context's
+      - it was removed, or never created
+    fixes:
+      - "goat vendor ls   (the orgs that exist)"
+      - "goat topic ls <org>/   (the topics under one org)"
+      - "goat context show   (which goatnet this context talks to)"
+    read: docs/design/goat-cli-error-codes.md
+    matches:
+      - "the portal answered HTTP 404 for"
+    exit: 7
+
+  - code: E_PORTAL_RATE_LIMITED
+    tool: goat
+    title: the portal is rate-limiting this client
+    what: "the portal is up and answered HTTP 429: this client sent too many requests. The hint carries the portal's Retry-After when it sent one."
+    causes:
+      - a script calling goat in a tight loop
+      - an older goat whose `topic ls` with no prefix made one request per org
+    fixes:
+      - "wait the Retry-After the hint names, then retry"
+      - "space the calls out, or list one org at a time: goat topic ls <org>/"
+      - "goat update   (current goat lists the whole goatnet in one request)"
+    read: docs/design/goat-cli-error-codes.md
+    matches:
+      - "the portal answered HTTP 429 for"
+    exit: 8
+
+  - code: E_PORTAL_SERVER_ERROR
+    tool: goat
+    title: the portal failed on its own side
+    what: "the portal is up and answered HTTP 5xx for the request path shown. Nothing on this device's network or credential is at fault."
+    causes:
+      - the portal or a service behind it (its database, the registry) is failing
+      - the portal is restarting during a deploy (often a 502 or 503)
+    fixes:
+      - "retry after the Retry-After the hint names, or in a minute"
+      - "if it persists, send the code, status and path to a platform admin; the portal's log on the goatnet's management host names the cause"
+    read: docs/design/goat-cli-error-codes.md
+    matches:
+      - "the portal answered HTTP 5[0-9][0-9] for"
+    exit: 9
+
+  - code: E_PORTAL_REFUSED
+    tool: goat
+    title: the portal refused the request
+    what: "the portal is up and answered a non-2xx status no command curates (a 400, 405, 410, 413 or 422) for the request path shown."
+    causes:
+      - this goat build and the portal are at different API versions
+      - a value the command sent is one the portal does not accept
+    fixes:
+      - "goat doctor   (shows whether goat is behind the served version)"
+      - "goat update"
+    read: docs/design/goat-cli-error-codes.md
+    matches:
+      - "request refused$"
+    exit: 4
+
+  - code: E_PORTAL_BAD_RESPONSE
+    tool: goat
+    title: the portal answered in a shape this goat build does not understand
+    what: the portal returned 2xx but the body did not deserialize. The portal is healthy; the CLI and the portal are at different versions.
+    causes:
+      - goat is behind the portal
+      - the portal deployed ahead of the CLI
+    fixes:
+      - "goat update   (or re-install from get.<site>)"
+      - "goat --version, and report the endpoint if already current"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 4
+
+  - code: E_TOKEN_INVALID
+    tool: goat
+    title: the portal rejected the token
+    what: "the portal accepted the connection and refused the bearer token (HTTP 401): the credential itself is expired or misissued."
+    causes:
+      - the token in ~/.goat/contexts/<name>/portal.token has expired
+      - the token belongs to another goatnet
+    fixes:
+      - "goat profile rotate <new-bundle.cbor>   (after re-running onboarding)"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 4
+
+  - code: E_PORTAL_FORBIDDEN
+    tool: goat
+    title: the portal refused this identity
+    what: HTTP 403 to the probe. The token was accepted; the identity lacks the access.
+    causes:
+      - the active context is a different identity than you meant
+      - the grant for this surface was never made
+    fixes:
+      - "goat context show"
+      - "ask the goatnet operator for the access grant; rotating the token will not grant it"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 4
+
+  - code: E_NOT_ADMIN
+    tool: goat
+    title: an operator-only action without operator authority
+    what: a `goat admin` action was refused, client-side (no operator credentials in the profile) or by the portal/NetBird API (HTTP 403, nothing changed).
+    causes:
+      - the profile is using the vp_ participant token, not the op_ operator key
+      - the role is not authorized for this action
+    fixes:
+      - "GOAT_PORTAL_TOKEN=op_… goat admin …"
+      - "goat admin operator-key request --reason …   (when you hold no op_ key)"
+    read: docs/design/platform-admin-lifecycle.md
+    exit: 4
+
+  - code: E_TOPIC_CONFLICT
+    tool: goat
+    title: the topic already exists
+    what: "`goat topic create` was asked for a name that is already registered."
+    causes:
+      - someone created it first
+      - a re-run of a create that already succeeded
+    fixes:
+      - "goat topic show <topic>"
+      - "pick a new name, or version the topic (docs/design/pubsub-best-practices.md)"
+    read: docs/design/goat-cli-error-codes.md
+    exit: 1
+
+  # --------------------------------------------------------------- goatbuilder
+
+  - code: GB-001
+    tool: goatbuilder
+    title: unknown component
+    what: the component named is not declared in ops/pins/fleet-pins.yaml (or, on a fixture, in goatbuilder.yaml).
+    causes:
+      - a typo in the component name
+      - the component is declared under its ledger name, not its image name
+    fixes:
+      - "grep -n '^  [a-z0-9-]*:' ops/pins/fleet-pins.yaml | head -60"
+      - "goatbuilder validate"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "unknown component"
+      - "is not declared in goatbuilder.yaml"
+    exit: 2
+
+  - code: GB-002
+    tool: goatbuilder
+    title: unknown goatnet
+    what: the --env value is not a goatnet key the pins declare. A key is spelled exactly as the pins spell it, underscores included.
+    causes:
+      - the goatnet was typed with a hyphen where its key has an underscore
+    fixes:
+      - "goatbuilder deploy --env <goatnet> …"
+      - "goatbuilder doctor --all   (lists every environment)"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "unknown goatnet"
+    exit: 2
+
+  - code: GB-003
+    tool: goatbuilder
+    title: the group is not one the component deploys to
+    what: --group named a group that is not a member of the goatnet, or one where the component is declared absent.
+    causes:
+      - the group belongs to another goatnet
+      - "the pins mark the component `absent: true` for that group"
+    fixes:
+      - "goatbuilder deploy --env <env> --component <c> --dry-run   (prints the member groups)"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "is not a member of goatnet"
+      - "does not run component"
+    exit: 2
+
+  - code: GB-004
+    tool: goatbuilder
+    title: the component declares no image variable
+    what: the pins entry has no `var:` so there is nothing to template into a play.
+    causes:
+      - an incomplete pins entry
+    fixes:
+      - "add `var:` to the component in ops/pins/fleet-pins.yaml, then: goatbuilder validate"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "declares no var in fleet-pins.yaml"
+    exit: 2
+
+  - code: GB-005
+    tool: goatbuilder
+    title: no deploy playbook resolves for the component
+    what: neither <ledger>-deploy.yml nor <component>-deploy.yml exists in ops/ansible, or the declared deploy_playbook is not there.
+    causes:
+      - the component is deployed by another play and does not declare it
+      - the playbook was renamed
+    fixes:
+      - "declare deploy_playbook: <play>.yml on the component in ops/pins/fleet-pins.yaml"
+      - "goatbuilder doctor --all   (the playbook row names what was looked for)"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "no deploy playbook for"
+      - "which is not in ops/ansible/"
+      - "resolves to no play with a hosts: line"
+    exit: 2
+
+  - code: GB-006
+    tool: goatbuilder
+    title: the door to the goatnet did not open
+    what: the goatnet's management host was not reachable over the mesh, so the SSM door was tried, and it did not open.
+    causes:
+      - no AWS credentials in the keychain for aws-vault (the profile in deploy.aws_profile)
+      - the SSM agent on the management host is not connected (TargetNotConnected)
+      - the door registry row is stale
+    fixes:
+      - "ops/scripts/door-open.sh <goatnet> --status"
+      - "aws-vault exec <profile> --no-session -- aws sts get-caller-identity"
+    read: docs/design/env-doors.md
+    matches:
+      - "door to .* did not open"
+      - "door-open: "
+    exit: 1
+
+  - code: GB-007
+    tool: goatbuilder
+    title: a secret the play needs is not in your environment
+    what: the play templates one or more variables from the environment and they are not set, so the run was refused before any host was touched.
+    causes:
+      - the refs file for this component was never written
+      - the command was run without `op run`
+    fixes:
+      - "put the lines for the named variables from <owner>/goat-credentials refs/goat.refs into .envrc.local.d/<file>.refs"
+      - "OP_ACCOUNT=<account> op run --env-file=.envrc.local.d/<file>.refs -- <the same command>"
+    read: docs/design/credential-hygiene-strategy.md
+    matches:
+      - "NOT SET: "
+      - "refusing before any host is touched"
+    exit: 1
+
+  - code: GB-008
+    tool: goatbuilder
+    title: a mutation needs --yes when there is no terminal
+    what: deploy, release, rollback and fastlane change state; without a terminal to confirm on, they refuse unless --yes is passed (contract C10).
+    causes:
+      - run from a script, CI or a pipe
+    fixes:
+      - "add --yes"
+      - "add --dry-run to see the plan without changing anything"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "pass --yes without a terminal"
+    exit: 2
+
+  - code: GB-009
+    tool: goatbuilder
+    title: not a current main checkout
+    what: releases and deploys run from the invoking checkout, and only a main checkout kept current with origin carries the pin that was merged. A branch or detached checkout can deploy a stale pin and verify green.
+    causes:
+      - running from a feature-branch worktree
+      - running from a detached HEAD
+      - main is behind origin/main
+    fixes:
+      - "git checkout main && git pull --ff-only origin main"
+      - "goatbuilder doctor --all   (the checkout row)"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "releases run from a main checkout"
+      - "run rc.sh from a checkout on main"
+      - "is behind origin/main"
+    exit: 1
+
+  - code: GB-010
+    tool: goatbuilder
+    title: a Python dependency is missing
+    what: the pins and intents render through PyYAML and jsonschema, and python3 cannot import one of them.
+    causes:
+      - a fresh machine
+      - a venv that is not on PATH
+    fixes:
+      - "pip install pyyaml jsonschema   (or pipx/venv), then re-run; re-running is safe"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "python deps missing"
+      - "python dep missing"
+      - "PyYAML or jsonschema missing"
+    exit: 2
+
+  - code: GB-011
+    tool: goatbuilder
+    title: only a repository admin may nominate a release candidate
+    what: the GitHub login in use does not hold the admin role on the repository; the rc-validate workflow deletes a tag pushed by anyone else (ADR 1173).
+    causes:
+      - gh is logged in as a different account
+      - the account is a maintainer, not an admin
+    fixes:
+      - "gh auth status"
+      - "ask a repository admin to push the tag, or to grant the role"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "only a repository admin may nominate"
+      - "rc-validate deleted"
+    exit: 1
+
+  - code: GB-012
+    tool: goatbuilder
+    title: the candidate's image build did not succeed
+    what: after the tag was pushed, the image workflow did not appear, or ran and failed, so there is no image to validate.
+    causes:
+      - the workflow is not triggered by this tag shape
+      - a build failure on the tagged commit
+    fixes:
+      - "gh run list --workflow <component>-image.yml --limit 5"
+      - "gh run view <id> --log-failed"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "no .* run appeared for"
+      - "image build failed for"
+    exit: 1
+
+  - code: GB-013
+    tool: goatbuilder
+    title: the image is not in the registry
+    what: the tag's image was not found under repo.image_namespace, so no digest can be pinned.
+    causes:
+      - "crane is missing or unauthenticated — rc.sh resolves the digest with crane and discards its error, so a missing crane reads as the image not existing"
+      - the build published under another name
+      - the package is private and the token cannot read it
+    fixes:
+      - "brew install crane   (then re-run; goatbuilder doctor --all: the tool:crane row says when it is present)"
+      - "crane digest <repo.image_namespace>/<image>:<tag>"
+      - "gh api /orgs/<owner>/packages/container/<image>/versions | head"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "ghcr.io/[^ ]*/[^ ]* not found"
+    exit: 1
+
+  - code: GB-014
+    tool: goatbuilder
+    title: a live validation row failed
+    what: the candidate deployed and a live row on the goatnet failed. On dev the candidate is dead; on preprod after a dev pass it stays open for investigation.
+    causes:
+      - "a row exited 2 — it was never run: its toolchain is missing on this laptop (Playwright for the intake rows, a goat context for the invite rows); the candidate is untested, not dead"
+      - a real regression in the candidate
+      - the row's runner settings are stale for this goatnet
+    fixes:
+      - "if the row exited 2: install what it names (goatbuilder doctor lists it: tool:live-rows, tool:goat-contexts), then resume with --from rows — do not delete the tag"
+      - "ops/validation/flow-map.yaml names the rows; read the failed row's evidence under ops/validation/evidence/"
+      - "fix on main and cut the next rc (dev), or investigate before graduating (preprod)"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "a live row FAILED on"
+    exit: 1
+
+  - code: GB-015
+    tool: goatbuilder
+    title: the checkout could not fast-forward after the pin landed
+    what: the pin PR merged, and the local main has diverged from origin/main, so the deploy could not proceed from a current tree. The PR is in; re-running resumes.
+    causes:
+      - local commits on main
+    fixes:
+      - "git -C <repo> status; move local commits to a branch; git pull --ff-only origin main; re-run the same command"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "could not fast-forward"
+    exit: 1
+
+  - code: GB-016
+    tool: goatbuilder
+    title: no runner settings for the goatnet
+    what: ops/validation/goatnet-runners.yaml has no entry for the goatnet the live rows should run on.
+    causes:
+      - a new goatnet without its runner row
+    fixes:
+      - "add the goatnet's runner block to ops/validation/goatnet-runners.yaml"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "no runner settings for"
+    exit: 1
+
+  - code: GB-017
+    tool: goatbuilder
+    title: not converged on every host
+    what: the play ran, and at least one host's ledger does not name the declared digest with action=deploy. Done is read from the ledger, never assumed.
+    causes:
+      - the play failed part-way on that host
+      - the host is single-homed on another router role and was skipped by design (ADR 1084)
+      - the host was unreachable
+    fixes:
+      - "goatbuilder deploy --env <env> --component <c> --verify-only"
+      - "read the log named in the deploy row; grep -n 'fatal:' <log>"
+    read: docs/design/universal-deploy-rollback.md
+    matches:
+      - "NOT converged"
+    exit: 3
+
+  - code: GB-018
+    tool: goatbuilder
+    title: a required flag is missing or wrong
+    what: release needs --ack and --version or --tag; --from takes tag|dev|rows|preprod|prod; --from prod needs --tag.
+    causes:
+      - the command was typed from memory
+    fixes:
+      - "goatbuilder release --help"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "--ack '<name>' is required"
+      - "--version X.Y.Z \\(or --tag\\) is required"
+      - "--from must be"
+      - "--from preprod-rows needs --tag"
+      - "--from prod needs --tag"
+    exit: 2
+
+  - code: GB-019
+    tool: goatbuilder
+    title: the goatnet's CA key is not on this machine
+    what: re-signing the intents needs <deploy.state_dir>/<goatnet>/ca.key.age and it is not there.
+    causes:
+      - this laptop never held that goatnet's CA key
+    fixes:
+      - "run from the machine that holds it, or obtain it through the credentials runbook in <owner>/goat-credentials"
+    read: docs/design/consistency-foundation.md
+    matches:
+      - "CA key for .* not at"
+    exit: 1
+
+  - code: GB-020
+    tool: goatbuilder
+    title: graduate.py did not produce the expected record
+    what: graduation ran, and wrote no record, or the record names a different candidate_ref than the tag resolves to.
+    causes:
+      - an open graduation set blocking the move (ADR 1125)
+      - a candidate record edited by hand
+    fixes:
+      - "python3 ops/release/graduate.py status"
+      - "read the record under ops/release/records/"
+    read: docs/design/release-graduation.md
+    matches:
+      - "graduate.py open wrote no record"
+      - "names a different candidate_ref"
+    exit: 1
+
+  - code: GB-021
+    tool: goatbuilder
+    title: fastlane refused
+    what: fastlane is the deliberate exception to the ladder and refuses an unpinned digest, an open graduation set, or an artifact whose rollback is not a pin revert.
+    causes:
+      - the ref has no digest under repo.image_namespace
+      - a graduation set is open for the component
+    fixes:
+      - "goatbuilder fastlane <component> --ref <ref> --dry-run"
+      - "python3 ops/release/graduate.py status"
+    read: docs/design/release-graduation.md
+    matches:
+      - "REFUSE — "
+    exit: 1
+
+  - code: GB-022
+    tool: goatbuilder
+    title: intent-sign failed
+    what: re-signing a goatnet's intents after a pin move failed; the signed index is unchanged.
+    causes:
+      - the CA key passphrase was wrong or age could not decrypt it
+      - the enrollment Go module is not at ops/enrollment
+    fixes:
+      - "cd ops/enrollment && go run ./cmd/intent-sign …   (the fix line names the goatnet)"
+    read: docs/design/consistency-foundation.md
+    matches:
+      - "intent-sign for .* failed"
+    exit: 1
+
+  - code: GB-023
+    tool: goatbuilder
+    title: rollback refused or guided by artifact type
+    what: "the component's artifact type is data, cert, forward-only or reversible:false (refused, exit 3), or config/acl (guided, exit 4): its rollback is not a pin flip."
+    causes:
+      - the component carries a migration or a certificate
+    fixes:
+      - "goatbuilder rollback <component> --status"
+      - "follow the guided steps the row prints (config/acl)"
+    read: docs/design/universal-deploy-rollback.md
+    matches:
+      - "no Ansible role at"
+      - "reversible:false"
+    exit: 3
+
+  - code: GB-024
+    tool: goatbuilder
+    title: the fixture is not a shape the mock converger knows
+    what: on --mock, converger.yaml names a behaviour the scripted converger does not know, a record is unreadable, or nothing is declared for the environment.
+    causes:
+      - a hand-edited fixture
+    fixes:
+      - "compare with ops/goatbuilder/fixtures/basic/"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "is not a behaviour this converger knows"
+      - "record unreadable"
+      - "nothing declared for"
+      - "has no declaration for"
+    exit: 2
+
+  - code: GB-025
+    tool: goatbuilder
+    title: the config does not validate
+    what: ops/goatbuilder/goatbuilder.yaml failed the versioned schema or a cross-field rule. The config is generated; fix the source and regenerate.
+    causes:
+      - a hand edit to the generated file
+      - a pins or ladder change the generator was not run for
+    fixes:
+      - "python3 ops/goatbuilder/gen-config.py && goatbuilder validate"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "does not validate"
+      - "embedded schema does not compile"
+    exit: 1
+
+  - code: GB-026
+    tool: goatbuilder
+    title: status reads real hosts only through a converger
+    what: without --mock, status has no converger to read hosts through yet.
+    causes:
+      - the push converger's status path is not built
+    fixes:
+      - "goatbuilder deploy --env <env> --component <c> --verify-only"
+      - "goatbuilder status --mock ops/goatbuilder/fixtures/basic --env dev"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "status reads hosts only through a converger"
+    exit: 2
+
+  - code: GB-027
+    tool: goatbuilder
+    title: not inside a repository
+    what: the repository root could not be resolved from the working directory and -C was not given.
+    causes:
+      - run outside a checkout
+    fixes:
+      - "goatbuilder -C /path/to/goat …"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "cannot resolve the repository root"
+    exit: 2
+
+  - code: GB-028
+    tool: goatbuilder
+    title: a command the verb runs failed
+    what: git, gh, crane, python or another tool exited non-zero; its own words follow and are interpreted below when the catalog knows them.
+    causes:
+      - see the tool's message
+    fixes:
+      - "re-run the quoted command by hand to see its full output"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "^(git|gh|crane|cosign|python3) .* failed$"
+    exit: 1
+
+  - code: GB-029
+    tool: goatbuilder
+    title: the play failed on a group
+    what: ansible-playbook exited non-zero for the group; the log path is in the row.
+    causes:
+      - a fatal task on a host (see the ansible entries below)
+      - a host unreachable over the chosen transport
+    fixes:
+      - "grep -n 'fatal:' <log> | head"
+      - "goatbuilder doctor --env <env>"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "deploy FAILED — log"
+    exit: 1
+
+  - code: GB-030
+    tool: goatbuilder
+    title: no host of the group is in the loaded inventories
+    what: the group is declared in the pins but the inventories loaded for this goatnet carry no host for it, so nothing was deployed (declared, not built).
+    causes:
+      - a site declared ahead of its hardware
+      - the wrong inventory pair for this goatnet
+    fixes:
+      - "grep -n '^\\[<group>\\]' ops/ansible/inventory/*.ini"
+    read: docs/design/env-doors.md
+    matches:
+      - "no host of this group in the loaded inventories"
+    exit: 1
+
+  - code: GB-031
+    tool: goatbuilder
+    title: an op:// reference in your shell is incomplete
+    what: "`op run` validates every environment variable whose value starts with op://, not only the env-file, and refuses the whole run when one has fewer than vault/item/field."
+    causes:
+      - a variable exported from your shell profile for another project holds a two-part op:// reference
+    fixes:
+      - "env | grep 'op://'   (find the variable)"
+      - "env -u <THAT_VAR> op run --env-file=… -- <command>"
+      - "or complete the reference to op://<vault>/<item>/<field>"
+    read: docs/design/credential-hygiene-strategy.md
+    matches:
+      - "incomplete op:// reference"
+    exit: 1
+
+  - code: GB-032
+    tool: goatbuilder
+    title: the candidate record is open but the goatnet runs a different ref
+    what: "graduate.py's C6 check: a record for this component is still open while the goatnet now runs another ref — the record the preprod step superseded was never abandoned."
+    causes:
+      - "a release run on a checkout older than #2039, which abandons the superseded record in the preprod change"
+      - a candidate re-cut while the previous record stayed open
+    fixes:
+      - "re-run the same command from a current main: rc.sh and `goatbuilder release` abandon the superseded record in the preprod change (git pull --ff-only origin main first on an older checkout)"
+      - "python3 ops/release/graduate.py status   (what is open)"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "is open but .* now runs a different ref"
+    exit: 1
+
+  - code: GB-033
+    tool: goatbuilder
+    title: promote refused a graduation step
+    what: "`goatbuilder promote` (the release ladder, ADR 1120/1125) refused: the record, the set, the ladder or the ref does not meet the rule the step names. Nothing graduates by itself; a refusal changes nothing."
+    causes:
+      - the component is not ready (soak, live rows, convergence evidence) — the lines under the refusal name each blocker
+      - the component is a member of an open graduation set and must graduate with it
+      - "a ref that is not digest-pinned (…@sha256:…), or a hotfix without --ack"
+      - no open record for the component, or the record named does not exist or already graduated
+    fixes:
+      - "goatbuilder promote status   (what is open, soaking, ready)"
+      - "goatbuilder promote readiness <component>   (each blocker by name)"
+      - "goatbuilder promote graduate-set <set> --ack '<name>'   (when it is a set member)"
+    read: docs/design/release-graduation.md
+    matches:
+      - "^graduate: "
+      - "graduate: REFUSING"
+      - "is NOT ready"
+      - "graduation check: [0-9]+ failure"
+    exit: 2
+
+  - code: GB-034
+    tool: goatbuilder
+    title: the generated pins or intents differ from fleet-pins.yaml
+    what: "`goatbuilder pins --check` regenerated every member's pins.yml and every goatnet's intent from ops/pins/fleet-pins.yaml and they differ from what is committed, or an intent is unsigned or tampered, or a governed pin is defined outside pins.yml."
+    causes:
+      - fleet-pins.yaml changed without regenerating
+      - a hand edit to a generated pins.yml or intent
+    fixes:
+      - "goatbuilder pins   (regenerate), then re-sign the intents it names, then commit"
+    read: docs/design/consistency-foundation.md
+    matches:
+      - "differs from the committed file"
+      - "Regenerate with "
+    exit: 1
+
+  - code: GB-035
+    tool: goatbuilder
+    title: the goatnet's intent names no usable CA
+    what: an intent has no ca_id, or one from which the CA's directory under <deploy.state_dir> cannot be derived, so it cannot be signed.
+    causes:
+      - a new goatnet whose intent was written without ca_id
+    fixes:
+      - "add ca_id to the goatnet in ops/pins/fleet-pins.yaml, then: goatbuilder pins"
+    read: docs/design/consistency-foundation.md
+    matches:
+      - "declares no ca_id"
+      - "cannot derive a CA name from ca_id"
+    exit: 1
+
+  - code: GB-036
+    tool: goatbuilder
+    title: the component declares no image workflow
+    what: release finds a candidate's image build by the component's image_workflow in fleet-pins.yaml, and there is none.
+    causes:
+      - a component added without image_workflow
+    fixes:
+      - "add image_workflow: <name>-image.yml to the component in ops/pins/fleet-pins.yaml"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "no image_workflow in fleet-pins"
+    exit: 2
+
+  - code: GB-037
+    tool: goatbuilder
+    title: the ladder is missing a live rung
+    what: ops/release/ladder.yaml has no live rung with a goatnet where the step needs one, or does not read.
+    causes:
+      - a rung marked not live while a goatnet is rebuilt
+      - a malformed ladder.yaml
+    fixes:
+      - "goatbuilder promote status   (the rungs as read)"
+      - "python3 -c 'import yaml; yaml.safe_load(open(\"ops/release/ladder.yaml\"))'"
+    read: docs/design/release-graduation.md
+    matches:
+      - "is not live with a goatnet"
+      - "ladder.yaml unreadable"
+      - "ladder has no live rungs"
+    exit: 1
+
+  - code: GB-038
+    tool: goatbuilder
+    title: --from preprod-rows cannot resume this candidate
+    what: resuming at the preprod rows needs preprod to run the candidate on main and exactly one open record for it; one of the two is missing.
+    causes:
+      - the preprod pin was never landed for this candidate
+      - the record was closed, or a second one opened
+    fixes:
+      - "goatbuilder release <component> --tag <tag> --from preprod --ack '<name>'   (pins preprod and opens the record)"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "resume with --from preprod"
+    exit: 1
+
+  - code: GB-039
+    tool: goatbuilder
+    title: a rollback on a fixture needs its environment
+    what: "on a fixture (--mock) a rollback declares the earlier ref in one environment and converges it there, so it needs --env; --list and --status read host ledgers, which a fixture does not have."
+    causes:
+      - "--mock given without --env"
+      - "--list or --status given with --mock"
+    fixes:
+      - "goatbuilder --mock <fixture> rollback <component> 1 --env <env> --ack \"<your name>\" --dry-run"
+      - "goatbuilder --mock <fixture> status --env <env>   (the state a fixture has)"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "rollback on a fixture takes --env"
+      - "--list and --status read host ledgers"
+    exit: 2
+
+  - code: GB-040
+    tool: goatbuilder
+    title: that directory is not a tutor workspace
+    what: "the tutor creates its workspace in an empty or new directory and deletes only a directory that carries its .goatbuilder-tutor marker; it refused to use or delete one that does not."
+    causes:
+      - "--workspace (or $GOATBUILDER_TUTOR) points at a directory with other files in it"
+    fixes:
+      - "goatbuilder tutor --workspace <an empty or new directory>"
+      - "unset GOATBUILDER_TUTOR   (the default is ~/.goatbuilder/tutor)"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "is not a tutor workspace"
+    exit: 2
+
+  - code: GB-041
+    tool: goatbuilder
+    title: there is no such lesson
+    what: the tutor was asked for a lesson number it does not have.
+    causes:
+      - a number past the last lesson
+    fixes:
+      - "goatbuilder tutor --list"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "there is no lesson"
+    exit: 2
+
+  - code: GB-042
+    tool: goatbuilder
+    title: the live rows cannot run from this machine — the candidate is UNTESTED, not dead
+    what: a release step reached the live acceptance rows, and this machine lacks what they need (the console's Playwright toolchain for a browser row, or a tool or context the runner reported with exit 2). The rows did not run; nothing about the candidate failed.
+    causes:
+      - a browser row is mapped and ops/goat-id-console/web/e2e/node_modules is missing, or node/npm is not installed
+      - the acceptance runner exited 2 (a tool or a goat context missing on this machine or on the host it runs goat on)
+    fixes:
+      - "(cd ops/goat-id-console/web/e2e && npm ci && npx playwright install chromium), then re-run the same command"
+      - "read the runner's output above for the missing tool or context, fix it, re-run the same command — never delete the tag"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "the candidate is UNTESTED here, not dead"
+    exit: 1
+
+  - code: GB-043
+    tool: goatbuilder
+    title: the door to the rung did not open for its live rows
+    what: the rows for a rung this laptop is not meshed to run goat on that rung's management host through its door (goat_via door:<env>), and the door did not open or printed no ssh target.
+    causes:
+      - aws-vault cannot reach the declared AWS profile (signed out, a malformed credential, or an expiring session)
+      - session-manager-plugin is not installed
+    fixes:
+      - "ops/scripts/door-open.sh <env> --status, then ops/scripts/door-open.sh <env>"
+      - "aws-vault exec <profile> --no-session -- aws sts get-caller-identity"
+    read: docs/design/env-doors.md
+    matches:
+      - "door to .* did not open for the rows"
+      - "--ssh-target printed no user@host:port"
+    exit: 1
+
+  - code: GB-044
+    tool: goatbuilder
+    title: a release refuses before the tag because a secret is not set
+    what: every rung this run will deploy to templates the component's secrets from your environment, and at least one is not set. Nothing was tagged, pinned or deployed.
+    causes:
+      - the run was not wrapped in op run with a .refs file naming those variables
+      - goat-credentials refs/goat.refs has no line for a variable (ops/ci/check-secrets-coverage.py names it)
+    fixes:
+      - "put the reference lines for the NOT SET names in .envrc.local.d/<file>.refs, then OP_ACCOUNT=<account> op run --env-file=.envrc.local.d/<file>.refs -- <the same command>"
+    read: docs/operations/goatbuilder-first-run.md
+    matches:
+      - "refusing before the tag: .* needs the variables named above"
+    exit: 1
+
+  - code: GB-045
+    tool: goatbuilder
+    title: the published declarations are out of order or altered
+    what: a declaration is applied only from an intact, ordered log (contract C2). A row whose signature does not match its content, or a serial not greater than one already accepted, is refused before anything is published, so a replayed or edited declaration never reaches a machine. A new serial at an earlier digest is accepted; that is a revert.
+    causes:
+      - a row of declared/publications.jsonl was edited by hand after it was published
+      - an older copy of the log was restored over a newer one, or a row was replayed
+    fixes:
+      - "restore declared/publications.jsonl from the source of record"
+      - "to go back to an earlier ref, declare it anew: goatbuilder --mock <fixture> rollback <component> 1 --env <env> --ack \"<your name>\""
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "is older than last accepted"
+      - "the signature does not match its content"
+    exit: 1
+
+  - code: GB-046
+    tool: goatbuilder
+    title: the local declaration is not the source of record's
+    what: a deploy applies only what the source of record declares (contract C3). A local copy behind it is fast-forwarded first, or refused under --frozen; a local copy ahead of it or diverged from it is always refused, because a declaration that is not in the source of record is never applied.
+    causes:
+      - the checkout or the fixture's declared/ was not fast-forwarded and --frozen was passed
+      - a declaration was edited locally instead of in the source of record
+    fixes:
+      - "fast-forward, then re-run: cp source/pins.yaml declared/pins.yaml (on a repository: git pull --ff-only)"
+      - "make the change in the source of record and re-run"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "behind the source of record"
+      - "ahead of the source of record"
+      - "is not the source of record's"
+    exit: 1
+
+  - code: GB-047
+    tool: goatbuilder
+    title: a declaration must name who made it
+    what: every declaration, and every record it converges, carries the person who made it (contract C4). A deploy, rollback or standup run without --ack is refused before anything is published.
+    causes:
+      - --ack was not passed, or was empty
+    fixes:
+      - "re-run with --ack \"<your name>\""
+    read: docs/design/goatbuilder.md
+    matches:
+      - "a declaration names who made it"
+    exit: 1
+
+  - code: GB-048
+    tool: goatbuilder
+    title: the goatnet is not proven built
+    what: the acceptance assay ran and at least one applicable row failed, or could not answer, or no row passed. Only PASS counts toward done; an UNKNOWN row is a row nobody proved (ADR 1115).
+    causes:
+      - a FAIL row is the goatnet failing that check; its caught_would_have text says what it means
+      - an UNKNOWN row could not be probed from here, most often a goat CLI row run where no goat context with a fabric identity exists (E_PROFILE_MISSING)
+      - a SKIPPED negative row whose paired positive did not pass
+    fixes:
+      - "goatbuilder assay <site> --only <row-id>   (re-run one row after a fix)"
+      - "goatbuilder assay <site> --var goat_via=<user@host>   (run the goat CLI rows where a goat context is)"
+      - "goatbuilder assay <site> --plan   (which rows apply to this site)"
+    read: docs/design/goatnet-acceptance-suite.md
+    matches:
+      - "across \\d+ layers \\(GB-048\\)"
+    exit: 3
+
+  - code: GB-049
+    tool: goatbuilder
+    title: the acceptance assay cannot run here
+    what: assay derives the site's values from its group_vars and runs ops/validation/run-acceptance.py with python3; one of those could not start, so nothing was probed.
+    causes:
+      - the site name has no ops/ansible/group_vars/<site>_hosts/vars.yml, or --values names no file
+      - python3 or PyYAML is not installed
+      - the runner stopped with an error rather than a verdict
+    fixes:
+      - "ls ops/ansible/group_vars/   (the site names this repository declares)"
+      - "pip3 install pyyaml"
+      - "python3 ops/validation/run-acceptance.py --self-test"
+    read: docs/design/goatnet-acceptance-suite.md
+    matches:
+      - "no goatnet named `[^`]+` here"
+      - "the site's values could not be derived"
+      - "the acceptance runner did not finish"
+      - "no value set at "
+    exit: 1
+
+  - code: GB-050
+    tool: goatbuilder
+    title: nothing is declared on that goatnet
+    what: diff or adopt found no fleet-pins component whose member groups include the goatnet.
+    causes:
+      - the goatnet key is right but no component is pinned there yet
+      - every component is absent on it
+    fixes:
+      - "goatbuilder doctor --env <goatnet> --all   (lists what the goatnet runs)"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "no component is declared on"
+    exit: 2
+
+  - code: GB-051
+    tool: goatbuilder
+    title: the plan request is incomplete or not planned yet
+    what: plan writes deploy and rollback plans; a deploy plan needs --env, and a rollback plan reads a host ledger, so it has no fixture form.
+    causes:
+      - plan deploy without --env
+      - a verb other than deploy or rollback
+      - plan rollback with --mock
+    fixes:
+      - "goatbuilder plan deploy <component> --env <goatnet> --out <file>"
+      - "goatbuilder plan rollback <component> --n 1 --out <file>"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "plan deploy needs --env"
+      - "plan covers deploy and rollback"
+      - "the fixture has no rollback converger"
+      - "cannot be applied here"
+    exit: 2
+
+  - code: GB-052
+    tool: goatbuilder
+    title: that file is not a goatbuilder plan
+    what: apply runs only a file plan wrote, which carries schema goatbuilder.plan/v1.
+    causes:
+      - the wrong file was passed to apply
+      - the plan was edited by hand and its schema line lost
+    fixes:
+      - "goatbuilder plan <verb> <component> … --out <file>   (write it again)"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "is not a goatbuilder plan"
+    exit: 2
+
+  - code: GB-053
+    tool: goatbuilder
+    title: the plan no longer matches the tree
+    what: apply recomputed the plan's decisions and at least one moved since it was written; it names each, and runs nothing.
+    causes:
+      - main's declaration or the pins file changed since the plan
+      - a newer deploy or rollback moved the rollback target
+      - the plan is old
+    fixes:
+      - "goatbuilder plan <same arguments> --out <file>, review it, then goatbuilder apply <file>"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "no longer matches:"
+    exit: 1
+
+  - code: GB-054
+    tool: goatbuilder
+    title: adopt could not create its worktree
+    what: adopt --yes writes its declarations into a fresh worktree of origin/main beside the checkout; git refused to create it.
+    causes:
+      - origin/main is not fetched
+      - a branch or directory of that name already exists
+    fixes:
+      - "git fetch origin main"
+      - "git worktree list   (remove a stale adopt worktree)"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "git worktree add"
+    exit: 2
+
+  - code: GB-055
+    tool: goatbuilder
+    title: a rollback with no --site would flip every goatnet
+    what: the component is deployed on more than one goatnet and no --site was given; with no site the roll narrows to nothing, so it would flip every goatnet at once, prod included. Nothing was touched; the error lists the goatnets to choose from.
+    causes:
+      - rollback (or plan rollback) was run on a component that spans several goatnets without --site
+      - the goatnet to roll back was left off the command
+    fixes:
+      - "goatbuilder rollback <component> <N> --site <goatnet>   (one of the goatnets the error names)"
+      - "ops/scripts/rollback.sh <component> <N> --site <goatnet>"
+    read: docs/design/universal-deploy-rollback.md
+    matches:
+      - "a rollback with no --site would flip every one"
+    exit: 1
+
+  - code: GB-060
+    tool: goatbuilder
+    title: a standup input is required and not set
+    what: "A role or play the site's standup will reach asserts this variable, or reads it through `| mandatory`, and nothing the site supplies sets it: not group_vars, the inventory, host_vars, the play's vars, a role default, nor an extra var the plan passes. The scan lists every such input at once, before any host is touched."
+    causes:
+      - the site's config surface was made from a reference goatnet and this key was not carried over
+      - the role gained a required input after the site was configured
+    fixes:
+      - "set the variable in ops/ansible/group_vars/<group>/ (or the inventory)"
+      - "goatbuilder doctor --site <site>   (re-scan; every gap is listed)"
+    read: docs/design/goatbuilder-speed.md
+    matches:
+      - "is required and not set"
+    exit: 1
+
+  - code: GB-061
+    tool: goatbuilder
+    title: a secret the standup templates is not in this environment
+    what: "A value the site supplies is lookup('env', NAME), a play or role the standup reaches uses it, and the declared secrets posture cannot supply NAME (ops/secrets/posture.py, ADR 1204)."
+    causes:
+      - the run is not under the site's secrets posture
+      - the posture's references file has no line for this name
+    fixes:
+      - "run under your secrets posture: ops/scripts/with-secrets goatbuilder standup <env> --site <site>"
+      - "add the reference for NAME to your .refs file"
+    read: docs/design/pluggable-dependencies.md
+    matches:
+      - "reads env"
+      - "which the secrets posture does not supply"
+    exit: 1
+
+  - code: GB-062
+    tool: goatbuilder
+    title: a standup input may be required
+    what: "The input is required under a `when:` condition the scan cannot evaluate from the site's own values (it depends on a registered result, a fact, or a template). This is a warning, never a refusal: the scan does not claim more than it knows."
+    causes:
+      - the condition reads a value only known when the play runs
+    fixes:
+      - "read the role at the file named and decide whether the condition will hold for this site"
+      - "set the input anyway if it will"
+    read: docs/design/goatbuilder-speed.md
+    matches:
+      - "required under a condition the scan cannot evaluate"
+    exit: 0
+
+  - code: GB-063
+    tool: goatbuilder
+    title: a standup step's host limit selects no host
+    what: "The plan runs this play with --limit <pattern>, and the pattern matches no host of the target group in the inventory, so the play runs on nothing and reports success."
+    causes:
+      - the limit assumes the mgmt-<site>-01 host naming and this site names its hosts differently
+      - the step is meant for the founder only and this site is a joiner
+    fixes:
+      - "check whether the step should run on this site (a joiner runs no admin surface, ADR 1084 D3)"
+      - "if it should, fix the limit in goat-standup.sh and goatbuilder standup together"
+    read: docs/design/goatbuilder-speed.md
+    matches:
+      - "selects no host of"
+    exit: 0
+
+  - code: GB-064
+    tool: goatbuilder
+    title: the checkout is behind the trunk in what a deploy reads
+    what: "A real run reads ops/ansible (roles, plays, group_vars, inventory, the rendered pins) and ops/pins from the checkout it runs in. The trunk carries commits to those paths that this checkout lacks, so a file rendered from it would remove on the host what those commits added, and the play would report success (contract C3, F-410). Refused before any host is touched, in both avenues (ops/scripts/fresh-source.sh)."
+    causes:
+      - the checkout was not brought onto the trunk after a merge
+      - a feature branch was cut before a change to a role, group_vars or the pins landed
+    fixes:
+      - "on main: git pull --ff-only <trunk remote> main"
+      - "on a branch: git fetch <trunk remote> main && git rebase <trunk remote>/main"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "is behind .* in what a deploy reads"
+    exit: 1
+
+  - code: GB-065
+    tool: goatbuilder
+    title: the trunk could not be fetched, so the checkout cannot be shown current
+    what: "A real run proves its checkout is current with the trunk before any host is touched (contract C3). The trunk remote did not answer a fetch, so that proof is missing and the run is refused. An islanded site, cut off by design, runs with --offline: it is judged against the cached trunk and the ledger row it writes says source: offline."
+    causes:
+      - no route to the git remote (the laptop is offline, the forge is down)
+      - the remote's credentials are not loaded (an ssh key not in the agent)
+    fixes:
+      - "restore the connection to the trunk remote and re-run"
+      - "on an islanded site: re-run with --offline"
+    read: docs/design/goatbuilder-conformance.md
+    matches:
+      - "could not fetch .* so this checkout cannot be shown current"
+    exit: 1
+
+  - code: GB-066
+    tool: goatbuilder
+    title: the site's declared end state cannot be derived or read
+    what: "endstate derives what a site should run from its own declarations (group_vars, the fleet pin table, the inventory) and the service catalog, then reads the site's hosts once over Ansible. One of those could not start, so nothing was graded."
+    causes:
+      - the site name has no ops/ansible/group_vars/<site>_hosts/ directory
+      - python3 or PyYAML is not installed on this machine
+      - the catalog file ops/goatbuilder/endstate/catalog.yaml does not parse
+    fixes:
+      - "ls ops/ansible/group_vars/   (the site names this repository declares)"
+      - "python3 ops/goatbuilder/endstate/endstate.py model <site>   (the derived end state, without reading any host)"
+      - "python3 ops/goatbuilder/endstate/endstate.py --self-test"
+    read: docs/design/goatnet-end-state.md
+    matches:
+      - "no goatnet site named `[^`]+`: ops/ansible/group_vars/"
+    exit: 1
+
+  - code: GB-067
+    tool: goatbuilder
+    title: a site's service presence is undeclared or contradicted
+    what: "Every service the catalog lists must be declared present or absent for every governed site, by exactly one answer: a flag in the site's group_vars, the fleet pin table (an absent deviation), or the founder rule. The baseline ops/goatbuilder/endstate/baseline.txt lists the gaps that exist today and may only shrink: a new gap, or a baseline row that is no longer true, fails."
+    causes:
+      - a new service in the catalog with no flag declared for a site
+      - the fleet pin table renders a component the site's flag says it does not run (or the reverse)
+      - a gap was closed and its baseline row was left behind
+    fixes:
+      - "set the service's flag (its catalog `var:`) in ops/ansible/group_vars/<site>_hosts/vars.yml"
+      - "add `absent: true` for the member in ops/pins/fleet-pins.yaml, then regenerate and re-sign the pins"
+      - "delete the stale row from ops/goatbuilder/endstate/baseline.txt"
+    read: docs/design/goatnet-end-state.md
+    matches:
+      - "GB-067: (new (undeclared|contradiction)|baseline row no longer true)"
+    exit: 1
+
+  - code: GB-068
+    tool: goatbuilder
+    title: the goatnet is not in its declared end state
+    what: "endstate graded every service the site declares: present or absent, deployed (its ledger names the declared ref), active (every container running), healthy (its healthcheck or isitup probe), functional (the acceptance rows that exercise it), and its zero-trust edges (its served name resolves and its certificate verifies, its OIDC client is registered in Hydra, its SPIRE entry exists). At least one grade failed or could not be read, or something runs that the end state does not declare (an orphan)."
+    causes:
+      - a declared service is not running, or its ledger is pending, rolled back or at another ref
+      - an edge is broken, such as an OIDC client never registered or a name that does not resolve
+      - an orphan, such as a container left behind by a retired service, or a Hydra client or SPIRE entry no service declares
+      - a grade could not be read, most often because a host was unreachable or the assay did not run
+    fixes:
+      - "goatbuilder endstate <site>   (each failing grade with its reason)"
+      - "goatbuilder deploy --component <c> --env <goatnet>   (restore a declared service)"
+      - "goatbuilder endstate <site> --json   (the grades as data)"
+    read: docs/design/goatnet-end-state.md
+    matches:
+      - "is NOT in its declared end state"
+    exit: 3
+
+  - code: GB-069
+    tool: goatbuilder
+    title: the rollout preflight cannot run
+    what: "preflight reads the component's declared rollout facts from ops/pins/fleet-pins.yaml (owns_state, rollback, restore_from, coupled_with) and the open graduation sets. The component is not in the pins, or the pins could not be read, so there is nothing to grade."
+    causes:
+      - the component name is misspelled or not a fleet-pins component key
+      - ops/pins/fleet-pins.yaml is missing, unreadable, or did not parse
+      - on a fixture (--mock), declared/artifacts.yaml did not parse
+    fixes:
+      - "grep -n '^  [a-z].*:' ops/pins/fleet-pins.yaml   (the component keys this repository declares)"
+      - "goatbuilder preflight <component> --env <goatnet>   (name the component as its fleet-pins key)"
+    read: docs/design/goatbuilder-rollout-preflight.md
+    matches:
+      - "the rollout preflight cannot run"
+    exit: 1
+
+  - code: GB-070
+    tool: goatbuilder
+    title: survey could read no goatnet at all
+    what: "survey reads every goatnet it was asked for in parallel and reports what it could not read as unknown. When not one goatnet answered, there is nothing to compare, and the run stops instead of printing an empty survey that would look consistent."
+    causes:
+      - this laptop is on no goatnet's mesh profile and no door opened (no AWS credentials for the SSM door)
+      - every goatnet named with --env is misspelled or not in ops/pins/fleet-pins.yaml
+      - ansible is not installed, or ops/scripts/with-aws cannot run
+    fixes:
+      - "goatbuilder doctor --env <goatnet> --all names the transport each goatnet would use and what is missing"
+      - "name goatnets by their fleet-pins key: --env <goatnet> (repeatable)"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "no goatnet could be read"
+    exit: 1
+
+  - code: GB-071
+    tool: goatbuilder
+    title: a site's leaf certificate is not on this controller
+    what: "A play that installs a site's leaf (the zenoh router, the LAN mgmt identity, the dashboard pair, the names collector) found the cert or key nowhere it looks: the site manifest's out_dir (<deploy.state_dir>/<site>-leaves), then a copy staged in this checkout or the main checkout. It refuses before touching a host."
+    causes:
+      - the leaf was never minted for this site, or was minted on another operator's machine
+      - the manifest's out_dir points somewhere this machine does not have
+      - GOAT_LEAF_DIR is set to a directory that does not hold it
+    fixes:
+      - "mint it into the out_dir: ops/scripts/mint-site-certs.sh <site> --only <leaf> (idempotent; an existing leaf is skipped)"
+      - "copy an existing pair into <deploy.state_dir>/<site>-leaves/ (key mode 0600), never into the repository"
+    read: docs/operations/goatnet-standup.md
+    matches:
+      - "GB-071"
+    exit: 1
+
+  - code: GB-072
+    tool: goatbuilder
+    title: goatbuilder cannot name the download surface to update from
+    what: "update (and the behind-version notice) reads the release a goatnet serves at get.<site_id>.<site_dns_zone>/goatbuilder/. It looks at GOATBUILDER_UPDATE_URL, then --site (named from the site's group_vars), then the surface the last successful update used. None of them named a surface that serves goatbuilder for this machine."
+    causes:
+      - the first update on this machine was run without --site, and GOATBUILDER_UPDATE_URL is not set
+      - the site named with --site has no ops/ansible/group_vars/<site>_hosts/ in the checkout goatbuilder was run in
+      - the site does not serve goatbuilder (goat_get_goatbuilder_enabled is not true in its group_vars)
+      - no goatbuilder release is built for this operating system and architecture
+    fixes:
+      - "goatbuilder update --site <site>   (a goatnet that serves goatbuilder)"
+      - "run it from a goat checkout, or pass -C <checkout>"
+      - "GOATBUILDER_UPDATE_URL=https://get.<site>.<zone>/goatbuilder goatbuilder update"
+    read: docs/design/goatbuilder-distribution.md
+    matches:
+      - "cannot resolve goatbuilder's download surface"
+      - "does not serve goatbuilder: goat_get_goatbuilder_enabled"
+    exit: 1
+
+  - code: GB-073
+    tool: goatbuilder
+    title: the goatbuilder download surface could not be read
+    what: "update reads version.json, the platform binary and its .sha256 from get.<site>.<zone>/goatbuilder/. One of them did not arrive: the connection failed, the server answered with an error, the answer was not what the surface publishes, or the binary stopped arriving for 30 seconds. Nothing was installed; the binary in place is the one that ran."
+    causes:
+      - this machine is not on the goatnet's mesh (get.<site> is mesh-only)
+      - the surface is mid-deploy, or does not publish this platform's binary
+      - the link stalled; a slow link is fine, a silent one for 30 seconds is not
+    fixes:
+      - "curl -fsS https://get.<site>.<zone>/goatbuilder/version.json   (is the surface reachable from here?)"
+      - "retry the update; it is idempotent"
+      - "GOATBUILDER_UPDATE_STALL_SECS=120 goatbuilder update   (a slower link)"
+    read: docs/design/goatbuilder-distribution.md
+    matches:
+      - "cannot read the served version"
+      - "the download of .* stalled or broke"
+    exit: 1
+
+  - code: GB-074
+    tool: goatbuilder
+    title: the downloaded goatbuilder is not vouched for by its release
+    what: "Before touching anything, update checks that the <asset>.sha256 the surface serves agrees with the release's SHA256SUMS, that the SHA256SUMS signature verifies against the release workflow's identity (when cosign is on PATH), and that the downloaded binary hashes to that digest. One of these failed, so it refused to install; the installed binary is unchanged."
+    causes:
+      - the surface is mid-deploy and the binary, its checksum and SHA256SUMS are from different releases
+      - the download was altered or truncated on the way
+      - the signature over SHA256SUMS is not from the release workflow of the repository goatbuilder.yaml names
+    fixes:
+      - "retry in a few minutes; the surface's files are written together"
+      - "goatbuilder update --check   (what the surface serves now)"
+      - "cosign verify-blob --bundle SHA256SUMS.cosign-bundle --certificate-identity-regexp '^https://github.com/<owner>/<repo>/' --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS   (the check by hand)"
+    read: docs/design/goatbuilder-distribution.md
+    matches:
+      - "checksum mismatch, refusing to install"
+      - "signature (refused|not checked), refusing to install"
+    exit: 1
+
+  - code: GB-075
+    tool: goatbuilder
+    title: goatbuilder could not replace its own binary
+    what: "The download was verified, but writing it next to the running binary or renaming it into place failed. The rename is atomic, so the binary in place is either the old one, whole, or the new one, whole."
+    causes:
+      - the install directory is not writable by this user (a binary under /usr/local/bin installed with sudo)
+      - the disk is full
+    fixes:
+      - "run the update as the user that installed goatbuilder (sudo goatbuilder update --site <site> for a system-wide install)"
+      - "install by hand from get.<site>.<zone>/goatbuilder/, checking the .sha256 first"
+    read: docs/design/goatbuilder-distribution.md
+    matches:
+      - "goatbuilder-update-[^ ]*\\.tmp"
+    exit: 1
+
+  - code: GB-076
+    tool: goatbuilder
+    title: the rollout is not cleanly reversible or not ready
+    what: "preflight graded the three rollout facts (State, Rollback, Scope) and the readiness half, and at least one row is not a clean, declared, validated pass. An undeclared fact fails closed (stateful, rollback none) and reads not-clean on purpose, so the gap is visible rather than guessed green; an UNKNOWN is not a pass either. The facts are still printed — a stateful, restore-required rollout is a valid state to deploy knowingly, with --ack."
+    causes:
+      - a fact is undeclared, so it failed closed (declare owns_state / rollback / restore_from / coupled_with in ops/pins/fleet-pins.yaml)
+      - a declared rollback contradicts the artifact type (pin-revert over a data/cert/forward-only component, or one flagged reversible false)
+      - a readiness check failed — the ref is not pullable, pins --check found drift, the secrets gate is unsatisfied, the checkout is stale, or the end state is not declared
+      - a validation could not answer (UNKNOWN) — no registry probe, or no reachable ledger for the rollback --dry-run
+    fixes:
+      - "goatbuilder preflight <component> --env <goatnet>   (each not-ok row with its reason)"
+      - "declare the component's rollout facts in ops/pins/fleet-pins.yaml (owns_state, rollback, restore_from, coupled_with)"
+      - "goatbuilder deploy --component <c> --env <goatnet> --ack \"<you>\"   (deploy knowingly; the accepted risk is recorded)"
+    read: docs/design/goatbuilder-rollout-preflight.md
+    matches:
+      - "NOT clean .*\\(GB-076\\)"
+    exit: 3
+
+  # ----------------------------------------------------------- external tools
+
+  - code: X-ANSIBLE-001
+    tool: ansible
+    title: a host was unreachable
+    what: ansible could not open a connection to the host over the transport it was given (ssh over the mesh, or the door).
+    causes:
+      - this laptop is not on the goatnet's mesh profile and no door was opened
+      - the host is down
+      - the SSH key is not accepted (see the ssh entries)
+    fixes:
+      - "goatbuilder doctor --env <env> --all   (the transport row)"
+      - "ssh -o ConnectTimeout=5 <ssh user>@<mesh ip> true"
+    read: docs/design/env-doors.md
+    matches:
+      - "UNREACHABLE!"
+      - "Failed to connect to the host via ssh"
+
+  - code: X-ANSIBLE-002
+    tool: ansible
+    title: sudo on the host wants a password
+    what: a task needed privilege escalation and the host's operator user is not NOPASSWD.
+    causes:
+      - the host was not baselined (mgmt-host-baseline.yml sets NOPASSWD sudo)
+      - the wrong remote user
+    fixes:
+      - "run ops/ansible/mgmt-host-baseline.yml against the host once"
+    read: docs/operations/goatnet-standup.md
+    matches:
+      - "Missing sudo password"
+
+  - code: X-ANSIBLE-003
+    tool: ansible
+    title: a play assertion failed on the host
+    what: a task asserted a precondition, usually that a templated secret is non-empty, and it was false on the host.
+    causes:
+      - a secret the play templates was empty in the deployer's environment (see GB-007)
+      - a group_vars fact missing for this goatnet
+    fixes:
+      - "goatbuilder deploy --env <env> --component <c> --dry-run   (names every variable the play needs)"
+    read: docs/design/credential-hygiene-strategy.md
+    matches:
+      - "Assertion failed"
+      - "\"assertion\": "
+      - "evaluated to false"
+
+  - code: X-ANSIBLE-004
+    tool: ansible
+    title: a task failed on a host
+    what: ansible marks the task fatal; its msg field says what the module could not do.
+    causes:
+      - see the msg in the fatal line
+    fixes:
+      - "grep -n -A3 'fatal:' <log>"
+    read: docs/operations/troubleshooting.md
+    matches:
+      - "fatal: \\[[^\\]]+\\]: FAILED!"
+
+  - code: X-ANSIBLE-005
+    tool: ansible-preflight
+    title: the preflight refused a stale or unsafe checkout
+    what: ops/scripts/ansible-preflight.sh refuses to run a play from a tree that differs from origin/main in a safety-critical path, or from a stale trunk; ansible reads role defaults from the working tree, so a stale tree templates stale pins.
+    causes:
+      - local main behind origin
+      - a feature branch that touches group_vars or roles
+    fixes:
+      - "git pull --ff-only origin main   (the message prints the exact command)"
+    read: docs/design/engineering-baseline.md
+    matches:
+      - "ansible-preflight: REFUSE"
+      - "ansible-preflight: refused"
+
+  - code: X-SSH-001
+    tool: ssh
+    title: the host refused the key
+    what: the connection reached the host and SSH rejected every key offered.
+    causes:
+      - your public key is not on the host's operator user (ssh-key-self-service)
+      - the wrong user (hosts take the deploy.ssh_user account)
+      - the key is not loaded in the agent
+    fixes:
+      - "ssh -v <ssh user>@<host> true 2>&1 | grep -i 'offering\\|denied'"
+      - "goat admin ssh-key …   (register the key through the goatnet)"
+    read: docs/design/ssh-key-self-service.md
+    matches:
+      - "Permission denied \\(publickey"
+
+  - code: X-SSH-002
+    tool: ssh
+    title: no route to the host
+    what: "the connection never reached the host: timed out, no route, or refused on port 22."
+    causes:
+      - the address is on a network this laptop is not on (a mesh IP without the mesh, a Tailscale IP without the tailnet)
+      - the host is down
+    fixes:
+      - "netbird status | head -5"
+      - "goatbuilder doctor --env <env>"
+    read: docs/design/env-doors.md
+    # ssh names the port it tried: "ssh: connect to host h port 22: Connection
+    # refused". The bare phrases also come out of every HTTP client there is,
+    # and this entry then answered an HTTP failure with port 22, a mesh IP and
+    # `netbird status` -- a diagnosis of something nobody did.
+    matches:
+      - "port 22: Connection timed out"
+      - "port 22: Connection refused"
+      - "port 22: Operation timed out"
+      - "port 22: No route to host"
+
+  - code: X-SSH-003
+    tool: ssh
+    title: the host key changed
+    what: the host presented a different key than ~/.ssh/known_hosts holds for that address.
+    causes:
+      - the host was rebuilt (expected after a re-image)
+      - an address was reused by another machine
+    fixes:
+      - "confirm the rebuild with the operator, then: ssh-keygen -R <address>"
+    read: docs/operations/troubleshooting.md
+    matches:
+      - "REMOTE HOST IDENTIFICATION HAS CHANGED"
+      - "Host key verification failed"
+
+  - code: X-OP-001
+    tool: op
+    title: 1Password CLI is not signed in
+    what: op needs a session for the account before it can resolve references.
+    causes:
+      - no `op signin` in this shell
+      - OP_ACCOUNT names a different account than the one signed in
+    fixes:
+      - "eval $(op signin)   (OP_ACCOUNT=<account> for the team store)"
+      - "goatbuilder doctor --credentials --all   (the tool:op-session row)"
+    read: docs/design/credential-hygiene-strategy.md
+    matches:
+      - "not currently signed in"
+      - "account is not signed in"
+      - "authorization timeout"
+      - "please run 'op signin'"
+      - "no account found"
+
+  - code: X-OP-002
+    tool: op
+    title: an op:// reference is malformed
+    what: op run validates every op:// value in the environment and refuses the whole run when one has fewer than three parts (vault/item/field). The variable is often one from your shell profile, not the refs file.
+    causes:
+      - a variable in your shell holds a two-part reference (op://Vault/Item)
+    fixes:
+      - "env | grep 'op://'   (find the variable)"
+      - "env -u <THAT_VAR> op run --env-file=… -- <command>"
+      - "or complete it to op://<vault>/<item>/<field>"
+    read: docs/design/credential-hygiene-strategy.md
+    matches:
+      - "invalid secret reference"
+      - "too few '/'"
+
+  - code: X-OP-003
+    tool: op
+    title: a reference does not resolve to an item
+    what: the vault, item or field named in an op:// reference does not exist, or this account cannot see it.
+    causes:
+      - the item was renamed or moved to another vault
+      - the account lacks access to the vault
+    fixes:
+      - "op item get '<item>' --vault <vault>"
+      - "check refs/goat.refs in <owner>/goat-credentials for the current line"
+    read: docs/design/credential-hygiene-strategy.md
+    matches:
+      - "isn't an item"
+      - "could not resolve"
+      - "no item found"
+      - "isn't a vault"
+
+  - code: X-AWS-001
+    tool: aws
+    title: AWS rejected the credentials
+    what: the access key is unknown to AWS, or a session token was sent where none is accepted.
+    causes:
+      - aws-vault run without --no-session (STS tokens are rejected by this account)
+      - a rotated key still in the keychain
+    fixes:
+      - "aws-vault exec <profile> --no-session -- aws sts get-caller-identity"
+      - "aws-vault add <profile>   (re-enter the current key)"
+    read: docs/design/cloud-environments.md
+    matches:
+      - "InvalidClientTokenId"
+      - "SignatureDoesNotMatch"
+      - "ExpiredToken"
+
+  - code: X-AWS-002
+    tool: aws-vault
+    title: aws-vault has no credentials for the profile
+    what: the keychain holds no credentials under the profile name, or the keychain could not be opened (headless).
+    causes:
+      - a fresh machine
+      - a headless session cannot prompt the keychain
+    fixes:
+      - "aws-vault add <profile>"
+      - "aws-vault list"
+    read: docs/design/cloud-environments.md
+    matches:
+      - "aws-vault: error"
+      - "profile .* not found"
+      - "credentials not found"
+
+  - code: X-AWS-003
+    tool: aws
+    title: the SSM target is not connected
+    what: Session Manager has no live agent for the instance, so the door cannot open.
+    causes:
+      - the host is down or has no route to the SSM endpoint
+      - the instance id in doors.yaml is stale
+    fixes:
+      - "aws-vault exec <profile> --no-session -- aws ssm describe-instance-information --region <region>"
+    read: docs/design/env-doors.md
+    matches:
+      - "TargetNotConnected"
+
+  - code: X-AWS-004
+    tool: aws
+    title: the AWS CLI fell back to an expired aws login session
+    what: "the aws-vault credential for the profile is empty or malformed, so the CLI used an expired `aws login` session instead and asked to reauthenticate."
+    causes:
+      - "the aws-vault credential is empty or malformed, so the CLI fell back to an expired aws login session"
+      - "AWS_VAULT_KEYCHAIN_NAME in the environment (a direnv export) points aws-vault at the wrong keychain"
+    fixes:
+      - "aws login   (when the error names it)"
+      - "env -u AWS_VAULT_KEYCHAIN_NAME aws-vault exec <profile> --no-session -- aws sts get-caller-identity   (when the keychain name is set)"
+      - "aws-vault add <profile>   (when the key really is bad; it replaces the stored key without deleting it first)"
+    read: docs/design/cloud-environments.md
+    matches:
+      - "Your session has expired. Please reauthenticate using 'aws login'"
+
+  - code: X-GIT-001
+    tool: git
+    title: not a git repository
+    what: the working directory is not inside a checkout.
+    causes:
+      - run from the wrong directory
+    fixes:
+      - "cd /path/to/goat   (or pass -C)"
+    read: CONTRIBUTING.md
+    matches:
+      - "not a git repository"
+
+  - code: X-GIT-002
+    tool: git
+    title: the branch cannot fast-forward
+    what: local and remote histories diverged, so a --ff-only pull refuses.
+    causes:
+      - local commits on main
+    fixes:
+      - "git log --oneline origin/main..HEAD   (what is local); move it to a branch, then git pull --ff-only"
+    read: CONTRIBUTING.md
+    matches:
+      - "Not possible to fast-forward"
+      - "non-fast-forward"
+      - "fatal: Need to specify how to reconcile divergent branches"
+
+  - code: X-GIT-003
+    tool: git
+    title: the remote refused access
+    what: "the push or fetch was refused: the SSH key is not authorised for the repository, or the remote does not exist."
+    causes:
+      - the wrong GitHub account for this remote
+      - the key is not loaded
+    fixes:
+      - "ssh -T git@github.com" # oss-allow: GitHub SSH user
+      - "gh auth status"
+    read: CONTRIBUTING.md
+    matches:
+      - "Could not read from remote repository"
+      - "Repository not found"
+
+  - code: X-GH-001
+    tool: gh
+    title: GitHub returned 404
+    what: the repository, run, release or API path does not exist, or this account cannot see it.
+    causes:
+      - a typo in the slug or id
+      - a private resource the account is not a member of
+    fixes:
+      - "gh auth status"
+      - "gh repo view <owner>/<repo>"
+    read: CONTRIBUTING.md
+    matches:
+      - "HTTP 404"
+      - "Could not resolve to a Repository"
+
+  - code: X-GH-002
+    tool: gh
+    title: the GitHub CLI is not logged in
+    what: gh has no token for github.com in this environment.
+    causes:
+      - a fresh machine
+      - GH_TOKEN set to an expired token
+    fixes:
+      - "gh auth login"
+    read: CONTRIBUTING.md
+    matches:
+      - "gh auth login"
+      - "authentication required"
+
+  - code: X-GH-003
+    tool: gh
+    title: GitHub rate-limited or forbade the call
+    what: "HTTP 403 from the API: a rate limit, or a token without the scope."
+    causes:
+      - many unauthenticated calls in a short time
+      - a token missing `read:packages` or `repo`
+    fixes:
+      - "gh api rate_limit"
+      - "gh auth refresh -s read:packages"
+    read: CONTRIBUTING.md
+    matches:
+      - "HTTP 403"
+      - "API rate limit exceeded"
+
+  - code: X-COSIGN-001
+    tool: cosign
+    title: the signature did not verify
+    what: cosign found no signature for the artifact under the expected identity, or the signature does not match.
+    causes:
+      - the artifact was rebuilt without signing
+      - the wrong public key or identity
+    fixes:
+      - "cosign verify --key <org key> <image@digest>"
+    read: docs/design/oci-goat-substrate.md
+    matches:
+      - "no matching signatures"
+      - "signature mismatch"
+      - "cosign: error"
+
+  - code: X-DOCKER-001
+    tool: docker
+    title: no permission on the Docker socket
+    what: the user is not in the docker group on that host, so every docker call is refused.
+    causes:
+      - running docker without sudo on a host where the operator user is not in the docker group
+    fixes:
+      - "sudo docker …   (hosts run docker as root by baseline)"
+    read: docs/operations/troubleshooting.md
+    matches:
+      - "permission denied while trying to connect to the Docker daemon socket"
+
+  - code: X-DOCKER-002
+    tool: docker
+    title: the image could not be pulled
+    what: the registry answered that the manifest is unknown or the pull is unauthorised.
+    causes:
+      - a tag that was never pushed, or a digest from the other GHCR org
+      - the host's registry login has expired
+    fixes:
+      - "crane digest <repo.image_namespace>/<image>:<tag>"
+      - "on the host: sudo docker pull <ref>"
+    read: docs/design/oci-goat-substrate.md
+    matches:
+      - "manifest unknown"
+      - "pull access denied"
+      - "unauthorized: authentication required"
+
+  - code: X-DOCKER-003
+    tool: docker
+    title: the Docker daemon is not running
+    what: the socket exists but nothing answers, or does not exist at all.
+    causes:
+      - docker.service stopped on the host
+      - a local Docker Desktop that is not launched (never launch it for goat work)
+    fixes:
+      - "on the host: sudo systemctl status docker"
+    read: docs/operations/troubleshooting.md
+    matches:
+      - "Cannot connect to the Docker daemon"
+
+  - code: X-NETBIRD-001
+    tool: netbird
+    title: no such mesh profile
+    what: the profile named does not exist on this laptop; profiles are per goatnet.
+    causes:
+      - the profile was never added
+      - the hyphen/underscore form differs from the profile name
+    fixes:
+      - "netbird profile list"
+    read: docs/design/env-doors.md
+    matches:
+      - "profile .* not found"
+      - "unknown profile"
+
+  - code: X-NETBIRD-002
+    tool: netbird
+    title: the mesh daemon is not running
+    what: the netbird client could not reach its own daemon.
+    causes:
+      - the service is stopped
+    fixes:
+      - "sudo netbird service start   (or restart the desktop client)"
+    read: docs/operations/operator-laptop-hygiene.md
+    matches:
+      - "daemon is not running"
+      - "failed to connect to daemon"
+
+  - code: X-HTTP-001
+    tool: http
+    title: the service rejected the credential (401)
+    what: the request reached the service and the token or cookie was not accepted.
+    causes:
+      - an expired or wrong token
+    fixes:
+      - "check which token the command is using; for goat, E_TOKEN_INVALID says how to rotate it"
+    read: docs/design/goat-cli-error-codes.md
+    matches:
+      - "401 Unauthorized"
+      - "HTTP 401"
+
+  - code: X-HTTP-002
+    tool: http
+    title: the service refused the identity (403)
+    what: the credential was accepted and the identity is not allowed to do this.
+    causes:
+      - the wrong one of two credentials (participant vs operator)
+      - no grant for this surface
+    fixes:
+      - "for goat admin verbs: GOAT_PORTAL_TOKEN=op_… goat …"
+    read: docs/design/rbac-adherence.md
+    matches:
+      - "403 Forbidden"
+
+  - code: X-HTTP-003
+    tool: http
+    title: the service is up but its backend is not (5xx)
+    what: "the front door answered with a gateway error: Traefik or Caddy is up and the service behind it is not."
+    causes:
+      - the container is restarting or down
+    fixes:
+      - "on the host: sudo docker ps --format '{{.Names}} {{.Status}}' | grep -v healthy"
+    read: docs/operations/troubleshooting.md
+    matches:
+      - "502 Bad Gateway"
+      - "503 Service Unavailable"
+      - "504 Gateway Time-out"
+
+  - code: X-HTTP-004
+    tool: http
+    title: an onboarding call went to the portal
+    what: "goat sent an onboarding call (invite, approve) to the portal instead of the onboarding endpoint: the portal answers 405 Method Not Allowed, or the call names a host that is only `portal`."
+    causes:
+      - "the context's profile has no onboard_endpoint, so onboarding calls went to the portal"
+    fixes:
+      - "GOAT_ONBOARD_ENDPOINT=<onboard url> goat …   (for this run)"
+      - "goat --context <name> profile init <bundle.cbor> from a current bundle (the profile then carries onboard_endpoint); goatbuilder doctor's tool:goat-contexts row names the contexts"
+    read: docs/design/three-stage-candidate-onboarding.md
+    matches:
+      - "HTTP 405 Method Not Allowed"
+      - "portal API at [`']portal[`'] is unreachable"
+
+  - code: X-DIRENV-001
+    tool: direnv
+    title: direnv exec was given an assignment, not a command
+    what: "`direnv exec <dir> VAR=value cmd` looks VAR=value up on PATH as the command and fails; direnv exec takes a command."
+    causes:
+      - "an environment assignment placed where direnv exec expects the command"
+    fixes:
+      - "direnv exec . env VAR=value cmd"
+    read: docs/operations/operator-laptop-hygiene.md
+    matches:
+      - "direnv: error command '[A-Za-z_]+=[^']*' not found on PATH"
+
+  - code: X-DNS-001
+    tool: dns
+    title: the name did not resolve
+    what: the resolver has no answer for the name; mesh names resolve only while the mesh is up.
+    causes:
+      - off the mesh (mesh names are served by mesh CoreDNS)
+      - a typo in the name
+    fixes:
+      - "netbird status | head -5"
+      - "dig +short <name>   (then the same against the mesh resolver the profile names: goat names)"
+    read: docs/design/dns-service-discovery.md
+    matches:
+      - "Temporary failure in name resolution"
+      - "Could not resolve host"
+      - "no such host"
+      - "NXDOMAIN"
+
+  - code: X-TLS-001
+    tool: tls
+    title: the TLS handshake failed
+    what: the certificate presented was not trusted, did not match, or the handshake ended early.
+    causes:
+      - a CA this machine does not trust (goat ca add)
+      - a clock far enough off that the certificate reads as invalid
+    fixes:
+      - "goat ca ls"
+      - "date -u   (compare with a known-good clock)"
+    read: docs/design/fips-pqc-path.md
+    matches:
+      - "certificate verify failed"
+      - "x509: certificate"
+      - "tls handshake"
+
+  - code: X-SMOKE-001
+    tool: onboard-intake-smoke
+    title: the live rows' browser toolchain is not on this machine
+    what: "the live acceptance rows (intake-form-browser-submit, review-gate-accepts-open-field-invite) run ops/scripts/onboard-intake-smoke.sh from the deployer's laptop, and it exits 2 before touching the goatnet when ops/goat-id-console/web/e2e has no node_modules. The release did not fail on the goatnet; it failed here."
+    causes:
+      - a laptop that never installed the console's Playwright suite
+    fixes:
+      - "(cd ops/goat-id-console/web/e2e && npm ci && npx playwright install chromium)"
+      - "goatbuilder doctor --all   (the tool:live-rows row says when this machine is ready)"
+    read: docs/design/release-candidate-validation.md
+    matches:
+      - "has no node_modules"
+
+  - code: X-PY-001
+    tool: python
+    title: a Python module is missing
+    what: python3 could not import a module a script needs.
+    causes:
+      - a fresh machine or a venv not on PATH
+    fixes:
+      - "pip install <module>   (pyyaml, jsonschema are the usual two)"
+      - "a script Ansible runs on the control node uses ansible_playbook_python, which carries PyYAML; a task that still calls bare python3 should too"
+    read: docs/design/goatbuilder.md
+    matches:
+      - "ModuleNotFoundError: No module named"
+      - "(X-PY-001)"
+
+  # ------------------------------------------------- the secrets posture (ADR 1204)
+
+  - code: X-SECRETS-001
+    tool: with-secrets
+    title: "the declared secrets store is unknown"
+    what: "GOAT_SECRET_STORE or `secrets: store:` in goatbuilder.yaml names a store goat does not have, so no command can get its secrets."
+    causes:
+      - a typo in GOAT_SECRET_STORE or in goatbuilder.yaml
+      - a custom store whose ops/secrets/<name>/run is not on this checkout
+    fixes:
+      - "goatbuilder secrets store   (prints the store in force and where it came from)"
+      - "use one of: 1password, openbao, custom, sops, git-crypt, env-file, env"
+    read: docs/design/pluggable-dependencies.md
+    matches:
+      - "unknown secrets store"
+      - "unknown GOAT_SECRET_STORE"
+
+  - code: X-SECRETS-002
+    tool: with-secrets
+    title: "the env-file store has no file"
+    what: "the declared store is env-file, and its file of values does not exist on this laptop."
+    causes:
+      - the quickstart's env file was never generated
+      - GOAT_SECRET_ENV_FILE points somewhere else
+    fixes:
+      - "goatbuilder secrets init --env <goatnet>   (strong random values, 0600, gitignored)"
+    read: docs/design/pluggable-dependencies.md
+    matches:
+      - "env-file store: .* does not exist"
+
+  - code: X-SECRETS-003
+    tool: goatbuilder
+    title: "refusing to write secret values to a file git would commit"
+    what: "`secrets init` writes plaintext values, so it refuses a path that is not gitignored."
+    causes:
+      - --file names a path inside the repository that .gitignore does not cover
+    fixes:
+      - "add the path to .gitignore, or use the default .envrc.local.d/secrets.env"
+    read: docs/design/pluggable-dependencies.md
+    matches:
+      - "refusing to write values to .* it is not gitignored"
+
+  - code: X-SECRETS-004
+    tool: with-secrets
+    title: "bao:// references need the OpenBao injector"
+    what: "the environment holds bao:// references, and ops/secrets/openbao/run (the OpenBao store's injector, ADR 1203) is not on this checkout."
+    causes:
+      - a .refs file holds bao:// lines on a checkout that predates the OpenBao store
+    fixes:
+      - "git pull --ff-only origin main   (the injector lands with the OpenBao store)"
+      - "or remove the bao:// lines and use op:// references meanwhile"
+    read: docs/design/pluggable-dependencies.md
+    matches:
+      - "bao:// references need the OpenBao store's injector"
+
+  - code: X-SECRETS-005
+    tool: with-secrets
+    title: "a git-crypt file is still encrypted"
+    what: "the declared store is git-crypt and its file has not been unlocked on this laptop, so its values cannot be read."
+    causes:
+      - this clone was never unlocked
+    fixes:
+      - "git-crypt unlock"
+    read: docs/design/pluggable-dependencies.md
+    matches:
+      - "is still encrypted — run: git-crypt unlock"
+
+  - code: X-DIGEST-001
+    tool: image-digest
+    title: "no tool could read the image's digest"
+    what: "ops/scripts/image-digest tried crane, skopeo and docker in turn; none is installed, or each refused, and each tool's own error is printed beneath."
+    causes:
+      - none of crane, skopeo or docker is installed
+      - the registry refused this laptop's credentials (each tool's error says which)
+      - the tag does not exist yet (its image build has not finished)
+    fixes:
+      - "brew install crane"
+      - "gh auth token | crane auth login ghcr.io -u <user> --password-stdin"
+    read: docs/design/pluggable-dependencies.md
+    matches:
+      - "image-digest: none of crane, skopeo or docker is installed"
+      - "image-digest: no digest for"

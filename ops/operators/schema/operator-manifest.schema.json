@@ -1,0 +1,904 @@
+{
+  "$id": "https://goat/schemas/operator-manifest.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Operator onboarding manifest (Block 83)",
+  "description": "Declarative spec for one operator's access across NetBird + Ory site Kratos + Ory operator-IdP Kratos + Zenoh. Consumed by ops/ansible/operator-onboard.yml. Design: docs/design/operator-onboard-utilities.md. Three canonical shapes (vendor-primary / vendor-sibling / operator) — see ops/operators/README.md §'Canonical shapes'.",
+  "type": "object",
+  "required": [
+    "identity",
+    "netbird",
+    "ory_site",
+    "ory_idp",
+    "zenoh"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "identity": {
+      "type": "object",
+      "required": [
+        "handle",
+        "email",
+        "name",
+        "status",
+        "added",
+        "added_by"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "handle": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$",
+          "description": "Kebab-case slug; filename = ops/operators/<handle>.yml. Lowercase alphanumeric + hyphen, 3-32 chars, no leading/trailing hyphen."
+        },
+        "github": {
+          "type": "string",
+          "description": "Optional GitHub username (login) for repo-collaborator grants at onboarding (docs/design/onboarding-github-repo-grants.md). Normalized to a bare login, no leading @."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 320
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "PERSON display name — used as Ory traits.name on the minted Kratos identity (i.e. what the person sees in their account-settings UI). For the VENDOR display name (used as the goat-zenoh-portal vendor display_name on the catalog UI), use top-level vendor.display_name instead. For dogfood / synthetic vendors with no real person, set this to a placeholder like 'Vendor Display Name (dogfood)'."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "inactive",
+            "revoked"
+          ],
+          "description": "Lifecycle state in the declared issuance registry (the Data-Access COP's declared half; see docs/design/credential-revocation-and-offboarding.md + docs/design/data-access-cop.md). active = live; inactive = reversibly cut off (Ory deactivated by the revoke path); revoked = terminally offboarded (--purge). The revoke path flips active -> revoked (or leaves inactive)."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "person",
+            "system"
+          ],
+          "description": "Principal type in the org -> {person, system} graph. Omitted = person (backward-compatible default). A system is a headless publisher (a uuid / Zenoh slot) that is an org member in its own right; persons and systems are SIBLINGS under the org (vendor.short_tag). See enrolled_by for the custody edge."
+        },
+        "enrolled_by": {
+          "type": "string",
+          "format": "email",
+          "description": "Custody/provenance edge (NOT ownership): the handle/email of the person who brought this principal online. Meaningful for systems (a human is primary at bootstrap, but the system is org-owned thereafter). Revocation reads this to re-attribute custody on person-offboarding but does NOT cascade along it."
+        },
+        "autonomy": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "remote",
+            "supervised",
+            "autonomous"
+          ],
+          "description": "SYSTEM-principal only (omit for persons and for infra-class systems). How self-directing the asset is, per the identity grammar (ADR 1043 / docs/design/identity-grammar.md §1.4). Ordered, increasing self-direction: manual = manned/hand-operated; remote = unmanned but teleoperated/tethered (human in direct control, not autonomous); supervised = autonomous with a human on-the-loop; autonomous = fully self-directing. The manned/unmanned split is derivable (manual = manned, all others = unmanned) so no second field is paid. Orthogonal to node-class (any function/platform can be any level). Identity-only attribute — NEVER a NetBird group; rides the cert URI-SAN as autonomy=<level> for attribution + app-layer authz. Refining the autonomous band is a reserved future additive step."
+        },
+        "added": {
+          "type": "string",
+          "format": "date",
+          "description": "ISO 8601 date the operator was first added (YYYY-MM-DD)."
+        },
+        "added_by": {
+          "type": "string",
+          "format": "email",
+          "description": "Email of the operator who provisioned this manifest."
+        },
+        "nationality": {
+          "type": "string",
+          "pattern": "^[A-Z]{2,8}$",
+          "description": "The PERSON's own citizenship — ISO 3166-1 alpha-3 (CAN, USA, SVK). A fact about the person, true regardless of who employs them, and DISTINCT from affiliation.nation, which is the controlling nation of the ORGANISATION they belong to. Neither is derived from the other and the two are permitted to disagree: a Canadian officer assigned to a US command carries nationality CAN while his affiliation carries nation USA, and that is information, not an error. It lives on `identity` rather than inside `affiliation` because the affiliation block describes WHO THE PRINCIPAL BELONGS TO and this describes the principal. Asked of the candidate at intake; the organisation's nation is never asked there — that is an org fact typed by an admin at org registration. Optional; absent means undeclared, never inferred from the organisation. Rationale: ADR 1171."
+        }
+      }
+    },
+    "vendor": {
+      "type": "object",
+      "required": [
+        "display_name"
+      ],
+      "description": "Vendor (company / org) attributes — distinct from identity.* which is the PERSON. Required for any manifest with netbird.auto_groups containing 'VENDOR' (enforced by the conditional at the root level).",
+      "additionalProperties": false,
+      "properties": {
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Vendor display name used as the goat-zenoh-portal vendor display_name + the vendor-catalog UI title. e.g. 'Example Vendor' (when identity.name is 'Pat Example'). For dogfood / synthetic vendors, this can echo the handle. Must match across all siblings of the same vendor."
+        },
+        "short_tag": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]{1,32}$",
+          "description": "Optional kebab-case slug identifying the vendor/service/org. Threaded into (1) the canonical setup-key name + auto_peer_name (peer-<handle>-<short_tag>-<site>-<date> instead of peer-<handle>-<site>-<date>) so a peer's vendor affiliation reads off the dashboard Peers tab without an external lookup, and (2) the Ory site-Kratos traits.vendor object so the id-admin-console identity-detail view surfaces it. When zenoh.trial.vendor is also set, the two values MUST match (orchestrator warns on mismatch). Must match across all siblings of the same vendor."
+        }
+      }
+    },
+    "org": {
+      "type": "object",
+      "required": [
+        "display_name"
+      ],
+      "description": "Org (company / unit / system / partner) attributes — distinct from identity.* which is the PERSON. The org-neutral alias of the legacy 'vendor' block (ADR 1052, additive back-compat). Author EITHER 'org:' or 'vendor:', not both; the onboard + roster read both, preferring 'org'.",
+      "additionalProperties": false,
+      "properties": {
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Org display name used as the goat-zenoh-portal display_name + catalog UI title. e.g. 'Example Vendor' (when identity.name is 'Pat Example'), 'Example Brigade', or a partner-nation unit. For dogfood / synthetic entities, this can echo the handle. Must match across all siblings of the same org."
+        },
+        "short_tag": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]{1,32}$",
+          "description": "Optional kebab-case slug identifying the org/unit/system. Same role as the legacy vendor.short_tag (peer-name segment + Ory trait); when zenoh.trial.org is also set the two MUST match. Must match across all siblings of the same org."
+        }
+      }
+    },
+    "affiliation": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false,
+      "description": "Organizational affiliation — WHO the principal belongs to, distinct from role (what they may do) per the identity grammar (ADR 1043 / docs/design/identity-grammar.md). Hierarchical + identity-only: NEVER a NetBird group, NEVER in the Zenoh write anchor (which stays the bare uuid, ADR 1025). Optional and backward-compatible during the additive migration phase — the legacy top-level vendor block maps to kind: vendor. When present, carried into the Ory aff claim + the cert URI-SAN aff/aff-kind attributes + the principal-graph registry (ADR 1031). Lateral relationships (supports / coordinates-with) are a reserved future edge type (ADR 1043 §4) and intentionally not modeled here yet — v1 carries only the vertical parent edge.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$",
+          "description": "Stable kebab-case unit/affiliation slug, shared across all members of the unit. Cert URI-SAN aff=<id>."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "vendor",
+            "organic",
+            "partner",
+            "civil"
+          ],
+          "description": "Affiliation kind — WHAT SORT OF ENTITY this is. vendor = commercial company. organic = belonging to the sovereign that RUNS THIS ENVIRONMENT (relative to the operator, not to any one nation — on a Lithuanian-sovereign goatnet a Lithuanian unit is organic). partner = MISNAMED VALUE, read it as 'foreign government/military organisation' (incl. multinational bodies such as NATO/SHAPE/EU — marked via the nation field, not a distinct kind). It borrows a word that means something exact elsewhere: partner = EXTERNAL TO THE ALLIANCE, which is affiliation.alliance_standing, not this field. An allied foreign army is kind=partner AND alliance_standing=member, so this value says nothing about alliance standing and must never be read as doing so (ADR 1148). civil = non-governmental civil-society participant (academia, independent researcher, NGO, non-profit). Cert URI-SAN aff-kind=<kind>. Orthogonal to role — a DEVELOPER may be any kind. DEPRECATED AND NO LONGER REQUIRED (ADR 1151 migration step 5): this field asks two independent questions at once — what legal kind of thing this is, and whether it is ours or foreign — which is why a foreign commercial vendor has no correct value. Declare affiliation.sector (plus affiliation.gov_branch when sector is state) instead, and this value is DERIVED: commercial→vendor, civil-society→civil, state→organic or partner by whether the nation equals the goatnet's operating sovereign. It is still ACCEPTED and still emitted, and an explicit value still beats the derivation, so no existing manifest changes meaning and NOTHING RE-MINTS — aff-kind in the URI-SAN is attribution only, never a write prefix."
+        },
+        "alliance_standing": {
+          "type": "string",
+          "enum": [
+            "member",
+            "partner"
+          ],
+          "description": "ALLIANCE standing relative to the goatnet's active framework (ops/identity/coalition-frameworks.yaml; per-goatnet / per-AOR). member = an ALLY, in the alliance. partner = EXTERNAL TO THE ALLIANCE — not 'anyone who is not the host', since an ally is also not the host. Says nothing about coalition participation: a coalition is an ACTIVATED grouping formed for a purpose and membership of it is a positive fact, so a partner may be in no coalition at all. `alliance_standing` is the field name; the legacy `coalition` key is still accepted and `alliance_standing` wins when both are present (ADR 1148). Nation-derived and effective-dated — it rides the registry, never the frozen cert and never the Ory aff claim."
+        },
+        "coalition": {
+          "type": "string",
+          "enum": [
+            "member",
+            "partner"
+          ],
+          "deprecated": true,
+          "description": "Coalition / alliance standing of the affiliation RELATIVE TO the goatnet's active coalition framework (ops/identity/coalition-frameworks.yaml; the framework is a per-goatnet / per-AOR choice — NATO is the first, others such as Five Eyes / AUKUS / a regional coalition add additively, no code change): member = the org's nation is a member of the active framework (or a framework body) and is eligible for that framework's member release-lane (e.g. REL NATO); partner = not a member — bilateral / coalition release-lanes only, never the member lane by standing. Framework-neutral by design so goat net serves any region (AFRICOM / the command / INDOPACOM / SOUTHCOM / Arctic / Homeland / Global), not just the Euro-Atlantic / NATO case. Nation-derived and effective-dated — membership changes (FIN member 2023-04-04, SWE 2024-03-07) — so it rides the registry (currently-is), never the frozen cert and never the Ory aff claim; the manifest may seed an explicit value and the framework registry is authoritative when nation is known. Omitted when no nation. The eligibility predicate for the reserved data-access coalition / releaseset scopes (ADR 1074 / ADR 1027)."
+        },
+        "sector": {
+          "type": "string",
+          "enum": [
+            "state",
+            "commercial",
+            "civil-society",
+            "military",
+            "law-enforcement",
+            "civil-government",
+            "intelligence",
+            "ngo",
+            "media",
+            "academic"
+          ],
+          "description": "What the organisation is, orthogonal to its nation. state = a government body (armed forces, a ministry, police, a state lab); commercial = a company, including a state-owned one; civil-society = an NGO, university, research institute or press organisation. If the organisation sells what it does, it is commercial even when a government owns it. Does NOT say whether the organisation is foreign — that is derived by comparing nation with the goatnet's operating sovereign. The ADR 1077 values (military, law-enforcement, civil-government, intelligence, ngo, media, academic) remain valid until ADR 1151 migration step 5 retires them; the first four mean state plus the matching affiliation.gov_branch, the last three mean civil-society. Neither set is required. Rationale and sourcing: ADR 1151."
+        },
+        "gov_branch": {
+          "type": "string",
+          "enum": [
+            "military",
+            "law-enforcement",
+            "intelligence",
+            "civil"
+          ],
+          "description": "Which part of government, and only meaningful when affiliation.sector is `state`. military = armed forces; law-enforcement = police, gendarmerie, border, customs; intelligence = a national intelligence or security service, which spans military and civilian agencies; civil = another government agency (homeland, emergency management, diplomatic). Omitted where unknown, and omitted for any non-state sector. Not required: a manifest carrying only affiliation.sector stays valid. Rationale: ADR 1151."
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Human-readable unit name (e.g. 'USAREUR-AF'). Display only."
+        },
+        "nation": {
+          "type": "string",
+          "pattern": "^[A-Z]{2,8}$",
+          "description": "Controlling nation / multinational OF THE ORGANISATION named by affiliation.id — ISO 3166-1 alpha-3 preferred (USA, EST, FIN, SVK), or a multinational marker (NATO, EU). This is an ORG fact, not the person's: a Canadian officer at the US command `usareur-af` carries affiliation.nation USA and identity.nationality CAN, and the two disagreeing is the normal state for a liaison or an internationally recruited member. It is typed by an admin when the organisation is registered and is never taken from a candidate's own answer (ADR 1171). Alliance standing and the derived organic test read THIS field only, never a contributor's nation, so an organisation neither gains nor loses standing because of who is attached to it. Load-bearing for partner-kind orgs (sovereignty + data-residency + releasability attribution); optional for vendor/organic. Carried into the cert URI-SAN as nation=<code> (ADR 1043). Releasability *marking* itself stays the ADR 1027 release-set layer — this field is the org's nationality attribution, not a per-message marking."
+        },
+        "sovereignty": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$",
+          "description": "RESERVED (ADR 1043) — the sovereignty / data-residency domain this affiliation's data is bound to, for the FUTURE enforced sovereignty anchor (the ADR 1025 §2 deferred lever). Distinct from nation only when data-residency differs from nationality (e.g. a vendor operating under a partner's residency boundary). Attribution-only today; no enforcement is built. Usually omit — defaults to nation."
+        },
+        "parent": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$",
+          "description": "The v1 (vertical) relationship edge: this unit's parent affiliation id (containment / command). Omitted = root unit. FUTURE-DEVELOPER NOTE: further relationships — comrel (operational command), c2-authority, data-authority, provisions (sustainment), replaces (RIP-TOA), supports/coordinates-with — are additional TYPED EDGES in a reserved `relationships: [{type, target, valid_from?}]` list keyed by affiliation id, NOT sub-fields of `unit_code` or new scalar attributes. `unit_code` stays a stable identifier; relationships are a graph that grows one edge type at a time (edge-type catalog + rule: identity-grammar.md §3.1-3.2, ADR 1043 §4; effective-dated per ADR 1051)."
+        },
+        "unit_code": {
+          "type": "object",
+          "required": [
+            "scheme",
+            "value"
+          ],
+          "additionalProperties": false,
+          "description": "Codified unit-identity code for organic (the operating sovereign's own) and partner (foreign / multinational) units — the unit's authoritative external identifier (US UIC, NATO LOGFAS unit code, or a national SAP/GCSS-Army ERP org code). MUTABLE registry attribute, NOT a cert stamp: it changes when the unit's command relationship (comrel) or position changes, so it rides the registry / descriptor dynamic-attributes layer (effective-dated, as-of-date queryable per ADR 1051), NEVER the frozen cert URI-SAN, NEVER a NetBird group, NEVER the Zenoh write anchor. Omit for vendor/civil kinds and for any unit without a codified identifier. The manifest seeds the current value; the registry is authoritative for current + effective-dated history.",
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "sovereign",
+                "nato-logfas",
+                "sap"
+              ],
+              "description": "Which codification system assigns the code: sovereign = a nation's own national scheme (e.g. the US Unit Identification Code, UIC — 6-char alphanumeric); nato-logfas = NATO-codified in LOGFAS (the NATO logistics / ORBAT force-structure database), for NATO allies; sap = a national SAP-based defense ERP org/unit code (US Army = GCSS-Army; other nations, e.g. Ukraine, run SAP directly). Additively extensible — add schemes without a cutover."
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "The code itself, verbatim in the issuing scheme's format (e.g. a 6-char US UIC). Opaque string — stored + displayed as attribution, not parsed or enforced."
+            },
+            "as_of": {
+              "type": "string",
+              "format": "date",
+              "description": "ISO 8601 date (YYYY-MM-DD) this code became effective for the unit. Optional; the registry carries the authoritative effective-dated history — this is the manifest-declared as-of stamp for the current value."
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "authoritative",
+                "operator-verified",
+                "self-asserted",
+                "open-source"
+              ],
+              "description": "Provenance of this code, recorded at onboarding by the unit-reference service (docs/design/unit-reference-service.md): authoritative = matched an ingested official CUI registry (US UIC catalog / NATO LOGFAS ORBAT / national scheme); operator-verified = an operator confirmed it against a trusted out-of-band source; self-asserted = the onboarder declared it, unmatched (honesty: shown UNCONFIRMED, never a false green); open-source = derived from an open ORBAT/name source. Omitted = self-asserted. Attribution-only — never a gate."
+            }
+          }
+        },
+        "relationship": {
+          "type": "string",
+          "enum": [
+            "constituent",
+            "assigned",
+            "liaison"
+          ],
+          "description": "How this person's own nationality relates to the organisation they belong to. Declared per membership by the admin at approval, NEVER derived. constituent = the member's nation is part of what the organisation is (a Belgian officer at a NATO command); their nation contributes to the org's contributor set, and this value is refused on an org whose composition is `national`. assigned = a full member working for the organisation whose nation is their own and does NOT transfer to it (a Canadian officer at USAREUR-AF — and equally a US officer there); they inherit the org's access, intersected with what their own nationality may receive. liaison = attached from outside, representing another organisation or nation; no effect on the org's national character and the org's access is NOT inherited, so their reads are an explicit grant. This value describes the RELATIONSHIP, not the nationality — what separates the US officer from the Canadian one is identity.nationality, a separate field. It is the explicit form of an inference that is otherwise unconditional and hidden. Optional; absent means undeclared. Rationale: ADR 1171."
+        }
+      }
+    },
+    "netbird": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "sites": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$",
+            "description": "Site identifier matching the <SITE>_NB_API_TOKEN env-var naming (e.g. 'vega' → VEGA_NB_API_TOKEN, 'nova' → NOVA_NB_API_TOKEN via an alias map in the orchestrator)."
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "bootstrap",
+            "admin",
+            "operator",
+            "peer"
+          ],
+          "description": "Per docs/operations/setup-key-rotation.md. TTL defaults: bootstrap=1d, admin=7d, operator=30d, peer=90d."
+        },
+        "ttl_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 365,
+          "description": "Override the role-default TTL. Leave unset to use the role default."
+        },
+        "usage_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "How many peers may enroll with this setup key. Default 1 (one-off). >1 mints a reusable key bounded by this limit. Use for event/lab onboarding where one bundle needs to seed N teammates; default behavior unchanged when omitted."
+        },
+        "handset_limit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "description": "How many phones or tablets this person may enroll on a SEPARATE handset setup key, minted OBSERVER-only with this reuse count and the same peer-name prefix as the device key. Default 1 when omitted; 0 mints no handset key. Capacity, not authorization (ADR 1175)."
+        },
+        "auto_groups": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "MGMT",
+              "SERVICES",
+              "OBSERVER",
+              "MONITOR",
+              "DEVELOPER",
+              "OPERATOR",
+              "SENSOR",
+              "EFFECTOR",
+              "PROCESSOR",
+              "PLATFORM",
+              "COMMAND-POST",
+              "MFT",
+              "OPSCTR",
+              "OFFSITE",
+              "ZENOH",
+              "SNITCH",
+              "GUEST",
+              "MGMT-HOST",
+              "ADMIN",
+              "VENDOR",
+              "PLATFORM-ADMIN",
+              "INFRA",
+              "EXTERNAL-INFRA",
+              "P2P",
+              "BACKEND-INFRA",
+              "MOON",
+              "POD"
+            ]
+          },
+          "uniqueItems": true,
+          "description": "Group suffixes. Union of Block 18A canonical taxonomy (docs/design/mesh-acl.md) and trial-fabric suffixes (docs/design/mesh-acl-posture.md). Per the identity grammar (ADR 1043 / docs/design/identity-grammar.md) the role family is ADMIN / MONITOR / DEVELOPER / OPERATOR (tactical) / OBSERVER: MONITOR is the renamed observability role, DEVELOPER is the affiliation-neutral fabric-dev role (capability-equal to legacy VENDOR), OPERATOR is the tactical actor. Legacy VENDOR / OFFSITE retained as aliases until each goatnet's gated cutover (ADR 1043 §8). Node-class suffixes (SENSOR / EFFECTOR / PROCESSOR / PLATFORM / MGMT-HOST / ZENOH / SNITCH / SERVICES, plus MOON / POD for attached-goatnet uplinks / in-mesh appliances per ADR 1092) name the asset type for system principals; PROCESSOR (non-C2 data process) + PLATFORM (multi-function/mobile composite) were added per ADR 1043 §1.4. QUARANTINED (ADR 1091) is deliberately NOT in this enum — nobody onboards into quarantine; entry is transfer-engine-only. Orchestrator generates <SITE-PREFIX>-<SUFFIX> per site at mint time. Per-site allow-list is deep-validated against ops/ansible/netbird_acl_taxonomy.yml at Phase 0.12. Empty = peer joins only the site default group."
+        },
+        "setup_key_ids": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Recorded at onboard (docs/design/peer-identity-resolution.md, Option B): per-site NetBird setup-key id the orchestrator minted for this person, keyed by site id (e.g. {\"zagros\": \"<key-id>\"}). Written back by the orchestrator after the /api/setup-keys POST — turns the fire-and-forget mint into a recorded person↔key edge for audit + peer→person resolution. Optional; absent for pre-Option-B manifests."
+        },
+        "auto_peer_names": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Recorded at onboard (docs/design/peer-identity-resolution.md, Option B): per-site deterministic peer-name prefix the orchestrator assigned — peer-<handle>[-<short_tag>]-<site>-<date>, keyed by site id. The resolver matches a live peer whose name carries this prefix back to this person. Optional; the peer name is re-derivable from the handle when absent."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "sites",
+              "role"
+            ]
+          }
+        }
+      ]
+    },
+    "ory_site": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "sites": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$"
+          },
+          "uniqueItems": true,
+          "description": "Site identifiers where the operator gets a site-Kratos identity (netbird-dashboard access). Must be non-empty when enabled=true; MUST be empty when enabled=false (no stub content)."
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "PLATFORM-ADMIN",
+              "COMPLIANCE",
+              "OBS-ADMIN",
+              "OBS-READONLY",
+              "GRAFANA-ADMIN",
+              "GRAFANA-READONLY",
+              "IAM-ADMIN",
+              "NETBIRD-ADMIN"
+            ]
+          },
+          "uniqueItems": true,
+          "description": "Ory SERVICE-PERMISSION groups — the JWT `groups` claim that oauth2-proxy / MinIO / goat-id-console gate web-service access on. This is a DIFFERENT axis from `netbird.auto_groups` (the mesh ROLE / node-class that governs network reachability). Source of truth: ops/permissions/group-permissions.yml (drift-guarded by ops/ci/check-ory-groups-enum.sh). Note the deliberate two-axis naming: `ADMIN` is the mesh role (netbird.auto_groups, SoT netbird_acl_taxonomy.yml); `ADMINS` (plural) is the Ory platform-admin permission group here — they are not the same thing and not interchangeable. Empty list is valid (a participant identity with no service-admin claims). MUST be empty when enabled=false."
+        },
+        "credentials": {
+          "type": "object",
+          "required": [
+            "password",
+            "passkey"
+          ],
+          "additionalProperties": false,
+          "description": "Which credential methods to provision for the Kratos identity. Required when ory_site.enabled=true; both fields explicit (no defaulting) so the operator declares intent.",
+          "properties": {
+            "password": {
+              "type": "boolean",
+              "description": "Generate a random 24-char password, set as the identity's password credential via bcrypt hash, include plaintext in the OOB bundle. Suitable as the immediate-use credential the operator hands to the vendor."
+            },
+            "passkey": {
+              "type": "boolean",
+              "description": "Generate a one-shot Kratos recovery link (15 min TTL), include in the OOB bundle. Vendor clicks the link, lands in account-settings, enrolls a WebAuthn passkey (iCloud Keychain / FIDO2 token / Windows Hello). Subsequent logins are passwordless. More secure than shipping a password over the wire."
+            }
+          }
+        },
+        "netbird_mgmt_admin": {
+          "type": "boolean",
+          "description": "If true, after auto-create-on-first-JWT fires, run F-079 SQL promotion: UPDATE users SET role='admin' WHERE id='<sub>'. Default false."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "then": {
+            "required": [
+              "sites",
+              "credentials"
+            ],
+            "properties": {
+              "sites": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sites": {
+                "maxItems": 0
+              },
+              "groups": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ory_idp": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "sites": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$"
+          },
+          "uniqueItems": true,
+          "description": "Site identifiers where the operator gets an operator-IdP Kratos identity (obs/utility access on Orin-C). Only sites with Orin-C standing up qualify. Must be non-empty when enabled=true; MUST be empty when enabled=false (no stub content)."
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "obs-admin",
+              "obs-readonly",
+              "grafana-admin",
+              "grafana-readonly",
+              "minio-admin",
+              "minio-readonly",
+              "openobserve-admin",
+              "openobserve-readonly",
+              "forgejo-admin",
+              "forgejo-user",
+              "prometheus-readonly",
+              "alertmanager-admin",
+              "ollama-user"
+            ]
+          },
+          "uniqueItems": true,
+          "description": "Operator-IdP groups; 13-value enum from ops/ansible/roles/operator-idp-kratos/templates/identity-schema.json.j2. Must be non-empty when enabled=true; MUST be empty when enabled=false."
+        },
+        "fido2_required": {
+          "type": "boolean",
+          "description": "If true (default), operator must complete WebAuthn enrollment on first login before any service grants access."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "then": {
+            "required": [
+              "sites",
+              "groups"
+            ],
+            "properties": {
+              "sites": {
+                "minItems": 1
+              },
+              "groups": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sites": {
+                "maxItems": 0
+              },
+              "groups": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sponsorship": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Sponsorship authorization (ADR 1071), decided at onboarding: whether this identity may mint candidate-onboarding invites and vouch at the stage-2 gate, and the highest tier it may sponsor (at most its own tier). The iam-admin / platform-admin tier presets set it by default; anyone else gets it case-by-case. The onboard path writes it onto the identity's portal registry row, where the invite/vouch gates enforce it.",
+      "required": [
+        "authorized"
+      ],
+      "properties": {
+        "authorized": {
+          "type": "boolean"
+        },
+        "max_tier": {
+          "type": "string",
+          "enum": [
+            "browse",
+            "developer",
+            "iam-admin",
+            "platform-admin"
+          ],
+          "description": "Highest tier this identity may sponsor. Required when authorized; an authorized identity with no recorded max fails closed to the least-privileged tier at the gates."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Optional Ory login email bound to the sponsorship (ADR 1072): lets the sponsor use the id-admin-console onboarding page, scoped to their own invitees. Without it the sponsor still mints/vouches via CLI/API with their own portal key."
+        }
+      }
+    },
+    "machine_quota": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Machine-enrollment grant (ADR 1096): how many machines this person may enroll as a custodian (goat machine enroll) without a separate operator grant. The unit each machine inherits is affiliation.id. Seeded into the portal machine_grants at onboard; 0 (default / omitted) = no grant — grant later with `goat machine grant`."
+    },
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Backend-operator tier (provisioned by operator-tier-onboard.yml). A participant manifest PLUS this block. See docs/operations/admin-operator-guide.md.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "ssh_pubkey": {
+          "type": "string",
+          "description": "Operator SSH public key, installed on the goatnet host for shell access."
+        },
+        "age_recipient": {
+          "type": "string",
+          "description": "Operator age public key for the audit-read roster (printed for OOB apply, never auto-edited)."
+        },
+        "portal_admin": {
+          "type": "boolean",
+          "description": "Stage a portal operator key for attributed portal admin (printed; needs a portal redeploy)."
+        },
+        "zenoh_operator_cert": {
+          "type": "boolean",
+          "description": "Mint the operator-trial-peer Zenoh leaf (CN matches the operator ACL subject; writes ops/**)."
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ory admin groups to PATCH onto the identity (e.g. ADMINS)."
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    },
+    "collab": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Cloud collaboration environment decision, captured per-individual at onboarding. Deliberately LOOSELY COUPLED and provider-agnostic: `enabled` records the sponsor's decision to grant collaboration-environment access; HOW that access is delivered is a separate provisioning step that may change. Today the provisioner mints an account in our own collab plane (Outline / filedrop / Zulip behind Dex + Kanidm, an identity plane SEPARATE from the mesh Ory/Hydra); in future the collab env may be offloaded to an environment we do not fully control, where provisioning becomes a HANDOFF into that environment's own onboarding flow. The engine therefore never assumes first-class bidirectional sync — the mesh identity plane may READ this block for awareness (best-effort; an absent/false activation is normal for an external provider that gives no callback) but NEVER governs the collab account, and nothing in an enforcement path depends on it. Backward-compatible: legacy manifests without this block predate the field.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "The captured decision: grant this identity access to the cloud collaboration environment."
+        },
+        "provider": {
+          "type": "string",
+          "description": "Which collaboration environment fulfills this (e.g. \"goat-collab\" for our own Dex/Kanidm plane, or an external provider slug once offloaded). Optional; defaults to the goatnet's configured provider."
+        },
+        "activated": {
+          "type": "boolean",
+          "description": "Best-effort: set by the provisioner when it confirms the account (or external handoff) completed. May stay false/absent for an external provider with no callback."
+        },
+        "activated_at": {
+          "type": "string",
+          "description": "Date provisioning completed (YYYY-MM-DD), when known."
+        },
+        "account": {
+          "type": "string",
+          "description": "Provider account identifier when the provider exposes one (e.g. the Kanidm username); may be absent for an external or opaque provider."
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    },
+    "zenoh": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "observer": {
+          "type": "boolean",
+          "description": "Read-only fabric WATCHER (not a vendor). When true, the orchestrator mints a nova-CA leaf with CN observer-<handle> via cert-sign — universal-read only (subscribe everywhere, publish nowhere), no portal vendor row, no publish ACL — and packages it as a goat-cli bundle for `goat ui` / `goat sub --tui` / `goat inspect --tui`. Mutually exclusive with trial + prod. For cluster admins / observers who watch the fabric but don't publish (e.g. the maintainer manifest)."
+        },
+        "trial": {
+          "type": "object",
+          "additionalProperties": false,
+          "anyOf": [
+            {
+              "required": [
+                "org"
+              ]
+            },
+            {
+              "required": [
+                "vendor"
+              ]
+            }
+          ],
+          "properties": {
+            "org": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]{1,32}$",
+              "description": "Publisher prefix for the trial fabric — the org-neutral alias of 'vendor' (ADR 1052, additive). The portal mints the AUTHORITATIVE URI-SAN per goatnet (e.g. urn:goat:zagros:org=<anchor> on ZAGROS; legacy nova-a urn:goat-nova:vendor=<prefix>); the cert string is not derived from this field. Must match across all siblings of the same org (one cert per org)."
+            },
+            "vendor": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]{1,32}$",
+              "description": "Legacy alias of zenoh.trial.org (ADR 1052; author 'org' going forward). Publisher prefix for the trial fabric. The portal mints the AUTHORITATIVE URI-SAN per goatnet (e.g. urn:goat:zagros:org=<anchor> on ZAGROS; legacy nova-a urn:goat-nova:vendor=<prefix>). Must match across all siblings (one cert per org)."
+            },
+            "partner_lanes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9-]{1,31}$"
+              },
+              "minItems": 1,
+              "uniqueItems": true,
+              "description": "ADR 1138 — allocate this org's slot from the PRE-CUT PARTNER BLOCK bound to this lane-set (e.g. [\"REL-ALL\",\"REL-PARTNER\"]) instead of the lowest free slot, so the minted CN matches a partner subject the router has ALREADY rendered: no ACL edit, no fabric restart. Order-insensitive. ABSENT = an ordinary slot; for a PARTNER that means they are NOT partitioned and read the whole fabric until somebody hand-carves them, silently. EXPLICIT, never derived from affiliation.nation or affiliation.kind: which lanes a partner may read is a release decision with an owner. The portal REFUSES the mint when no declared block carries this exact lane-set rather than falling back to an ordinary slot."
+            }
+          }
+        },
+        "prod": {
+          "type": "object",
+          "required": [
+            "site",
+            "role",
+            "echelon"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "site": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "opsctr",
+                "command-post",
+                "mft",
+                "offsite"
+              ],
+              "description": "ADR 0844 production URI-SAN role component. STUB per Q4 decision — cert mint works end-to-end via existing cert-sign --uri-san; ACL-apply emits warning + skip until ADR 0844 prod ACL shape lands."
+            },
+            "echelon": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "ADR 0844 production URI-SAN echelon component. Examples: 'corps', 'division', 'brigade'. Free-form pending ADR 0844 v1 enumeration."
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "oneOf": [
+              {
+                "required": [
+                  "trial"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "prod"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "observer"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "prod"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "trial"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "observer"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "observer"
+                ],
+                "properties": {
+                  "observer": {
+                    "const": true
+                  }
+                },
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "trial"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "prod"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "description": "When netbird.auto_groups includes 'VENDOR', the top-level org/vendor display_name block is required (vendor-primary or vendor-sibling shape). Either 'org' or the legacy 'vendor' alias satisfies it (ADR 1052).",
+      "if": {
+        "properties": {
+          "netbird": {
+            "properties": {
+              "auto_groups": {
+                "type": "array",
+                "contains": {
+                  "const": "VENDOR"
+                }
+              }
+            },
+            "required": [
+              "auto_groups"
+            ]
+          }
+        },
+        "required": [
+          "netbird"
+        ]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "required": [
+              "org"
+            ]
+          },
+          {
+            "required": [
+              "vendor"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

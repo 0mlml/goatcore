@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
+From: goat-maintainer <person-37@example.org>
+Date: Wed, 28 May 2026 04:30:00 +0000
+Subject: [PATCH] consent: fall back to client.scope when grantScope is
+ empty on acceptOAuth2ConsentRequest
+
+The upstream oryd/kratos-selfservice-ui-node consent handler echoes
+`body.requested_scope` (from Hydra's consent challenge) back to Hydra
+verbatim as `grant_scope` on the accept-consent PUT — at TWO call sites,
+the skip-consent auto-accept and the full-consent form-POST handler.
+
+Observed empirically on nova-a 2026-05-27/28: for OAuth2 clients
+configured with `skip_consent: true` (the F-077 mitigation that
+auto-grants consent for first-party clients to avoid the
+"checkbox-default-unticked produces zero-scope grant" footgun), Hydra
+delivers `body.requested_scope` empty in the consent challenge. The
+upstream code lands `grantScope = body.requested_scope || []` = `[]`
+and passes that empty array to `acceptOAuth2ConsentRequest` as
+`grant_scope: []`.
+
+The downstream effect, traced via Hydra's stored consent sessions on
+nova-a:
+- The stored session correctly carries the groups claim that patch 1
+  (groups-forwarding) injects into `session.id_token`.
+- BUT Hydra's `/userinfo` endpoint strips ALL claims for scopes that
+  weren't granted — and with `granted_scope: null`, no claims survive
+  the userinfo round-trip.
+- Grafana's `GF_AUTH_GENERIC_OAUTH_ALLOWED_GROUPS` check therefore
+  sees an empty `groups` claim and rejects with
+  `auth.oauth.userinfo.failed - user not a member of one of the
+  required groups`.
+
+This patch wraps the grant_scope echo with a fallback at both call
+sites: when `grantScope` is empty, fall back to
+`body.client.scope.split(' ')` — the OAuth2 client's registered
+scope list from its Hydra client config. For our first-party clients
+(grafana, netbird-dashboard, isitup, oauth2-proxy-dashboard) the
+registered scope list is exactly what the SPA / oauth2-proxy
+requests, so the fallback produces the same result Hydra would have
+produced if its consent-challenge population logic worked.
+
+Additive — when Hydra DOES populate requested_scope correctly (e.g.
+non-skip-consent clients submitting a normal consent form, or
+upstream regression fixed), the original value wins. When it doesn't,
+we provide the sane default.
+
+Mirrors patch 0002 (audience-fallback) one-for-one — same two-spot
+literal-string-replace structure, same anchor file, same idempotency
+marker pattern.
+
+Tracked: docs/findings/F-161-empty-granted-scope-strips-claims-from-userinfo.md.
+Surfaced during user-reported Grafana login failure 2026-05-27
+("user not a member of one of the required groups" despite the
+identity carrying GRAFANA-ADMIN via Kratos traits). Initial hypothesis
+(patch 1 missed the skip-consent code path) was disproved — both
+consent paths DO call extractSession; the broken layer was the scope
+plumbing, not the groups injection.
+
+---
+ src/routes/consent.ts | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/routes/consent.ts b/src/routes/consent.ts
+index 0000002..0000003 100644
+--- a/src/routes/consent.ts
++++ b/src/routes/consent.ts
+@@ -133,8 +133,9 @@
+                                                     consentChallenge: challenge,
+                                                     acceptOAuth2ConsentRequest: {
+-                                                        // We can grant all scopes that have been requested - hydra already checked for us that no additional scopes
+-                                                        // are requested accidentally.
+-                                                        grant_scope: grantScope,
++                                                        // We can grant all scopes that have been requested - hydra already checked for us that no additional scopes
++                                                        // are requested accidentally.
++                                                        // goat-maintainer-scope-fallback-patch: fall back to client.scope when grantScope is empty.
++                                                        grant_scope: ((grantScope && grantScope.length) ? grantScope : ((body.client && body.client.scope) ? body.client.scope.split(" ") : [])),
+                                                         // ORY Hydra checks if requested audiences are allowed by the client, so we can simply echo this.
+                                                         // goat-maintainer-audience-fallback-patch: fall back to client.audience when requested is empty.
+                                                         grant_access_token_audience: ((body.requested_access_token_audience && body.requested_access_token_audience.length) ? body.requested_access_token_audience : ((body.client && body.client.audience) || [])),
+@@ -228,8 +229,9 @@
+                                         consentChallenge: String(challenge),
+                                         acceptOAuth2ConsentRequest: {
+-                                            // We can grant all scopes that have been requested - hydra already checked for us that no additional scopes
+-                                            // are requested accidentally.
+-                                            grant_scope: grantScope,
++                                            // We can grant all scopes that have been requested - hydra already checked for us that no additional scopes
++                                            // are requested accidentally.
++                                            // goat-maintainer-scope-fallback-patch: fall back to client.scope when grantScope is empty.
++                                            grant_scope: ((grantScope && grantScope.length) ? grantScope : ((body.client && body.client.scope) ? body.client.scope.split(" ") : [])),
+                                             // If the environment variable CONFORMITY_FAKE_CLAIMS is set we are assuming that
+                                             // the app is built for the automated OpenID Connect Conformity Test Suite. You
+                                             // can peak inside the code for some ideas, but be aware that all data is fake
+--
+2.39.0

@@ -1,0 +1,133 @@
+# goat-logship event dictionary — the compliance artifact (ADR 1078 §7).
+#
+# One row per internal security event. This is the machine-readable form of
+# the §7 table in docs/design/cyber-logging-and-conmon-export.md. It is the
+# CONTRACT the Vector transforms are checked against: every OCSF class the
+# collector emits carries a `metadata.dictionary_id` equal to a `cef_id` key
+# below, and ops/ci/check-logship-dictionary.sh fails closed if a transform
+# emits an id that is not defined here (property "no unmapped class ships").
+#
+# Fields:
+#   cef_id        stable internal id, also the CEF deviceEventClassId at egress
+#   ocsf_class    OCSF class name + uid (the internal canonical schema)
+#   source        which collector source produces it
+#   au_controls   the 800-53 AU/AC/SI/SC/CM controls it evidences (RMF map)
+#   phase         which build phase lands the producing source
+#   description   one line
+#
+# Extend this table as producers land; the CEF/AU mapping itself is the
+# artifact handed to the AO (ADR 1078 §2, §7).
+
+version: 1
+
+events:
+  - cef_id: auth:sudo
+    ocsf_class: { name: Authentication, uid: 3002 }
+    source: auditd/journald
+    au_controls: [AU-2, AC-6]
+    phase: 1
+    description: Host authentication / sudo / PAM session events.
+
+  - cef_id: auth:privesc
+    ocsf_class: { name: Authentication, uid: 3002 }
+    source: auditd
+    au_controls: [AU-2, AU-6]
+    phase: 1
+    description: Privilege-escalation attempt (setuid/capset/failed sudo).
+
+  - cef_id: auth:ssh
+    ocsf_class: { name: Authentication, uid: 3002 }
+    source: journald
+    au_controls: [AU-2]
+    phase: 1
+    description: SSH session open/close (sshd).
+
+  - cef_id: config:change
+    ocsf_class: { name: Config State, uid: 5002 }
+    source: auditd (config-path watches)
+    au_controls: [AU-2, CM-3]
+    phase: 1
+    description: Sensitive OS config change (identity/privilege/ssh/pam/audit) — catches the out-of-band manual edit git/ansible never records.
+
+  - cef_id: identity:enroll
+    ocsf_class: { name: Account Change, uid: 3001 }
+    source: netbird-mgmt/admit-audit
+    au_controls: [AU-2, AC-2]
+    phase: 1
+    description: Peer enroll / de-enroll.
+
+  - cef_id: operator:action
+    ocsf_class: { name: API Activity, uid: 6003 }
+    source: operator-action-audit
+    au_controls: [AU-2, AU-10]
+    phase: 1
+    description: Operator backend action from the goat admin chokepoint.
+
+  - cef_id: network:egress
+    ocsf_class: { name: Network Activity, uid: 4001 }
+    source: nftables/proxy
+    au_controls: [AU-2, AC-4, SC-7]
+    phase: 1
+    description: Egress decision (allow/deny) at the host firewall / proxy.
+
+  - cef_id: fabric:write
+    ocsf_class: { name: Application Activity, uid: 6002 }
+    source: zenoh-audit-subscriber
+    au_controls: [AU-12]
+    phase: 1
+    description: Fabric write / denial from the Zenoh audit subscriber.
+
+  - cef_id: identity:breakglass
+    ocsf_class: { name: Account Change, uid: 3001 }
+    source: pam/policy-engine
+    au_controls: [AU-2, AC-6]
+    phase: 1
+    description: Break-glass invocation.
+
+  - cef_id: runtime:falco
+    ocsf_class: { name: Detection Finding, uid: 2004 }
+    source: falco
+    au_controls: [SI-3, SI-4]
+    phase: 3
+    description: Container-runtime anomaly (Falco). Phase 3 source.
+
+  - cef_id: host:drift
+    ocsf_class: { name: Compliance Finding, uid: 2003 }
+    source: osquery
+    au_controls: [CM-3, SI-4]
+    phase: 3
+    description: Host-state drift (osquery). Phase 3 source.
+
+  # --- Non-Zenoh application plane (chokepoint-observable, unlike the P2P
+  #     fabric): the web/API surfaces sit behind Traefik + oauth2-proxy. ---
+  - cef_id: app:http
+    ocsf_class: { name: HTTP Activity, uid: 4002 }
+    source: traefik-access-log
+    au_controls: [AU-2, AC-3]
+    phase: 1
+    description: Web/API request through the Traefik ingress (non-Zenoh app plane).
+
+  - cef_id: app:auth
+    ocsf_class: { name: Authentication, uid: 3002 }
+    source: oauth2-proxy
+    au_controls: [AU-2, AC-7]
+    phase: 2
+    description: OIDC / reverse-proxy auth events for the web surfaces (login, denial).
+
+  - cef_id: storage:api
+    ocsf_class: { name: API Activity, uid: 6003 }
+    source: minio-audit
+    au_controls: [AU-2, AC-3]
+    phase: 2
+    description: Object-store (MinIO S3) API call — needs MinIO audit logging enabled.
+
+  # --- Fabric READ: the P2P residual (§3). A subscribe/query/receive happens
+  #     peer-to-peer with no central tap; the audit-subscriber sees publishes,
+  #     never reads. Capturable ONLY as endpoint self-report by the consumer —
+  #     there is deliberately no central producer. ---
+  - cef_id: fabric:read
+    ocsf_class: { name: Application Activity, uid: 6002 }
+    source: endpoint-self-report (P2P — not centrally tappable, §3/AR-005)
+    au_controls: [AU-2, AC-3]
+    phase: 3
+    description: Fabric read/subscribe/query. Endpoint self-report only; no central tap.

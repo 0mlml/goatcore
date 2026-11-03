@@ -1,0 +1,67 @@
+# LEGACY — superseded by testcontainers-go in cmd_integration_test.go
+# (Block 50B.3, 2026-05-03).
+#
+# This file is retained as a hand-poke smoke fixture so an operator can:
+#
+#   docker compose -f testdata/docker-compose.yml up -d
+#   psql "host=127.0.0.1 port=5435 user=postgres password=testdata dbname=netbird sslmode=disable"
+#
+# It is no longer driven by `go test` — the Go integration tests now spin
+# up isolated, parallel-safe stacks per test via testcontainers-go. Keep
+# the image pins below in lock-step with the constants in
+# cmd_integration_test.go (postgresImage, signalImage, managementImage).
+#
+# Up: docker compose -f testdata/docker-compose.yml up -d
+# Down: docker compose -f testdata/docker-compose.yml down -v
+#
+# It has one job beyond hand-poking: `testdata/warm-geolite.sh` brings this
+# stack up to make netbird write its geolocation databases into
+# testdata/geolite/, which the integration tests then mount instead of
+# downloading 82 MB per run. See testdata/geolite/README.md.
+services:
+  postgres:
+    image: ghcr.io/usareur-af/postgres-spock@sha256:506d65edcd7676b7f0a44660c3f3a0964254ce145df1a48e4d250bda22cd582b
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    environment:
+      POSTGRES_PASSWORD: testdata
+    ports:
+      - "127.0.0.1:5435:5432"
+    # Probe TCP, not the Unix socket. On a first boot the entrypoint runs a
+    # temporary server for initdb that answers on the socket only, then
+    # restarts it; a socket probe reports healthy inside that window and
+    # management, which connects over TCP, dies on "connection refused"
+    # (#1521). The Go integration test waits the same way plus a SELECT 1
+    # (cmd_integration_test.go, F-006).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
+      interval: 2s
+      retries: 30
+
+  # Service name `signal-a` matches the URI in management.json so that the
+  # netbird-mgmt container can resolve it via docker DNS without re-rendering
+  # the config per-environment. No `command:`: the image's entrypoint is
+  # `netbird-signal run`, whose cobra parser exits on `-log-level`, and its
+  # default flags are the ones wanted (same as signalImage in
+  # cmd_integration_test.go, which leaves Cmd nil).
+  signal-a:
+    image: netbirdio/signal:0.79.0@sha256:04c401eb167ef1aaaf266f9b5a4ee54bdac9d1d650db3a3e1288601632fa6d41
+    ports:
+      - "127.0.0.1:10001:10000"
+
+  management:
+    image: netbirdio/management:0.68.3@sha256:8d3ac9d38c9589520d9d1563c8ae3646b9a038596aae16b9ed089602060a8001
+    depends_on:
+      postgres: {condition: service_healthy}
+      signal-a: {condition: service_started}
+    environment:
+      NETBIRD_STORE_ENGINE_POSTGRES_DSN: "host=postgres user=postgres password=testdata dbname=netbird sslmode=disable client_encoding=UTF8"
+    volumes:
+      - ./management.json:/etc/netbird/management.json:ro
+      # The Datadir from management.json, bound out so the geolocation
+      # databases netbird downloads/builds on first start survive the
+      # container. warm-geolite.sh drives exactly this to seed the fixture the
+      # integration tests mount; see testdata/geolite/README.md.
+      - ./geolite:/var/lib/netbird
+    ports:
+      - "127.0.0.1:8081:80"
+    command: ["management", "--log-file=console"]

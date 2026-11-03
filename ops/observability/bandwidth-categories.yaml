@@ -1,0 +1,215 @@
+schema_version: 1
+transport:
+- key: mesh-p2p
+  label: Mesh (direct)
+  why: WireGuard to a peer with connectionType=P2P — the cheap path.
+  source: netbird status --json, per-peer rx/tx delta
+- key: mesh-relayed
+  label: Mesh (relayed)
+  why: 'WireGuard to a peer with connectionType=Relayed. The scarcest pipe on the system:
+    relay VPS bandwidth is metered and billed, and the same payload is paid for twice (node->relay,
+    relay->peer). Watch this one first.'
+  source: netbird status --json, per-peer rx/tx delta
+- key: off-mesh
+  label: Not over WireGuard (mostly relay tunnels)
+  why: 'Physical-NIC traffic that is not WireGuard. DERIVED as the exact remainder (NIC total
+    minus the two mesh classes) so the transport plane sums to the NIC total and cannot quietly
+    lose bytes.
+
+    READ THE BREAKDOWN BEFORE NAMING IT. On a relay-ingress host this is NOT internet egress:
+    measured on the ZAGROS Thor 2026-08-14, 14.06 of ~14.46 Mbit/s (97%) was `rathole` on :2333
+    — the rathole tunnels (ADR 1085). READ THE DIRECTION CAREFULLY: this host is a rathole
+    CLIENT, dialling out to the relays, which accept public :443 and pass through to it —
+    "N mgmt-host backends behind every relay". So this traffic TERMINATES HERE, at this
+    node''s own services. It is inbound demand on this host, NOT transit, and this host
+    relays for nobody. Reading it as pass-through inverts the operator''s conclusion:
+    it is real load, not plumbing. On a leaf node the same row
+    really is image pulls, apt, ACME, SSM and time anchors. Same arithmetic, opposite meaning,
+    so the page links it to the workload breakdown rather than asserting a cause.'
+  source: 'derived: node_network_* minus (mesh-p2p + mesh-relayed), floored at 0'
+workload:
+- key: surface-static
+  label: Static assets
+  why: CSS/JS/fonts/images/maps — cacheable, and the first thing to CDN or pin.
+  plane_source: http
+  criticality: sheddable
+  shed_order: 5
+  shed_why: 'Cacheable assets. Cheapest real win: pin or edge-cache instead of re-serving.'
+- key: surface-page
+  label: Dynamic pages
+  why: Server-rendered surface HTML — panoscope, netvis, console, portal, isitup.
+  plane_source: http
+  criticality: important
+  shed_order: 4
+  shed_why: Operator surfaces. Slow pages are painful, not fatal.
+- key: surface-stream
+  label: Live streams
+  why: SSE and websocket. Cost scales with CONCURRENT VIEWERS, not request count, so it behaves
+    nothing like a page load and must not share a bucket with one. goat-map, stethoscope,
+    portal /api/topics/stream.
+  plane_source: http
+  criticality: sheddable
+  shed_order: 5
+  shed_why: Live views. Cost scales with CONCURRENT VIEWERS, so capping viewers reclaims a
+    lot for little loss.
+- key: api
+  label: API calls
+  why: JSON/REST — portal API, rest-pub-bridge, console API, panoscope /api/*.
+  plane_source: http
+  criticality: important
+  shed_order: 3
+  shed_why: Operator and machine actions. Degrades work, does not stop recovery.
+- key: identity
+  label: Identity
+  why: Ory Kratos/Hydra, oauth2-proxy, Dex, Kanidm — login and token traffic.
+  plane_source: http+socket
+  criticality: essential
+  shed_order: 2
+  shed_why: Login. Shed it and no operator can reach a surface to act.
+- key: fabric
+  label: Zenoh fabric
+  why: Pub/sub/query on the fabric port — the data plane proper.
+  plane_source: socket
+  criticality: essential
+  shed_order: 2
+  shed_why: The data plane proper — the reason the mesh exists.
+- key: mesh-control
+  label: Mesh control plane
+  why: NetBird management + signal + relay control. Small per event and constant; it is the
+    thing that must never be starved, because losing it loses the ability to fix everything
+    else.
+  plane_source: socket
+  criticality: essential
+  shed_order: 1
+  shed_why: NetBird mgmt + signal. Shedding this removes the ability to FIX anything else.
+- key: replication
+  label: DB replication
+  why: Postgres/Spock inter-site streaming. Steady and large — the category that starves the
+    others under contention.
+  plane_source: socket
+  criticality: important
+  shed_order: 3
+  shed_why: Steady and large. Deferring it accrues WAL and risks the slot ceiling — throttle,
+    do not stop.
+- key: image-pull
+  label: Image pulls
+  why: dockerd to a registry. Bursty, hundreds of MB, and on a constrained uplink this is
+    what visibly breaks everything else for a few minutes.
+  plane_source: socket
+  criticality: deferrable
+  shed_order: 9
+  shed_why: 'Bursty hundreds of MB. THE canonical thing to batch off-peak: it is the usual
+    cause of a link going unusable for minutes.'
+- key: audit-offload
+  label: Audit offload
+  why: MinIO and cold-storage offload. Scheduled bulk — schedulable around scarcity, once
+    visible.
+  plane_source: socket
+  criticality: deferrable
+  shed_order: 8
+  shed_why: Scheduled bulk to cold storage. Retention is 30d; a few hours late costs nothing.
+- key: backup
+  label: Backup
+  why: pgBackRest. Scheduled bulk, same argument as audit offload.
+  plane_source: socket
+  criticality: deferrable
+  shed_order: 8
+  shed_why: pgBackRest. Schedulable; skipping a window is a judgement, delaying one is not.
+- key: filedrop
+  label: File transfer
+  why: goatdrop and bulk asset delivery — operator-initiated, unpredictable.
+  plane_source: socket
+  criticality: deferrable
+  shed_order: 7
+  shed_why: Operator-initiated bulk. Pause and resume; nothing is lost.
+- key: observability
+  label: Observability
+  why: 'Prometheus scrape plus logship shipping. Meta, but real: a dashboard that hides its
+    own cost is not an honest dashboard.'
+  plane_source: socket
+  criticality: sheddable
+  shed_order: 6
+  shed_why: Monitoring's own cost. Shed LAST among sheddables — shedding it blinds the decision.
+- key: messaging
+  label: Messaging
+  why: Matrix/tuwunel, hedwig, UnifiedPush.
+  plane_source: socket
+  criticality: sheddable
+  shed_order: 6
+  shed_why: Chat and push. Defer without data loss.
+- key: time
+  label: Time sync
+  why: chrony/NTS. Tiny, and listed precisely because it is tiny — it is the one an operator
+    must be able to confirm is NOT being starved.
+  plane_source: socket
+  criticality: essential
+  shed_order: 1
+  shed_why: Tiny and load-bearing. Everything else — cert validity, ordering, audit — rests
+    on it. Never shed.
+- key: http-delegated
+  label: HTTP (counted in the web rows)
+  why: 'Bytes on Traefik''s browser-facing sockets, which BOTH taps can see: `ss` counts the
+    socket, and the access log accounts for the same bytes broken out by surface category.
+    Emitted under its own key so the dashboard''s workload stack can be "everything except
+    this, plus the HTTP plane" — a clean partition instead of an overlap that would inflate
+    the plane by the whole of web traffic. Kept visible rather than dropped because comparing
+    it against the HTTP plane''s total is a free check that the two taps agree.'
+  plane_source: socket
+  criticality: not-applicable
+  shed_order: 0
+  shed_why: Structural or derived row, not a workload anyone can shed.
+- key: transport-underlay
+  label: Mesh transport (counted in the transport plane)
+  why: 'Sockets that ARE the mesh transport rather than work riding on it — the rathole relay
+    tunnels, the netbird control connection, WireGuard itself. Their bytes are the TRANSPORT
+    plane''s, seen one layer down, so the dashboard excludes this row from the workload stack
+    the same way it excludes http-delegated. Found in production, not in review: on the ZAGROS
+    Thor this was the largest single "workload" figure at 127 MB rx, and all of it was the
+    tunnel carrying the mesh. Emitted rather than dropped so the overlap stays measurable.'
+  plane_source: socket
+  criticality: not-applicable
+  shed_order: 0
+  shed_why: Structural or derived row, not a workload anyone can shed.
+- key: other-declared
+  label: Other (declared)
+  why: 'Matched a node-net-health baseline rule that carries no category. Visible on purpose:
+    it means the egress contract knows about this traffic but the category map does not yet,
+    which is a map to fix, not a hole.'
+  plane_source: socket
+  criticality: not-applicable
+  shed_order: 0
+  shed_why: Structural or derived row, not a workload anyone can shed.
+- key: undeclared
+  label: Undeclared
+  why: Matched nothing. Mirrors the node-net-health security bucket of the same name (docs/design/node-net-health.md)
+    — the same sockets, counted for bytes here and graded for risk there.
+  plane_source: socket
+  criticality: not-applicable
+  shed_order: 0
+  shed_why: Structural or derived row, not a workload anyone can shed.
+- key: not-measured
+  label: Not measured
+  why: A flow known to exist whose bytes cannot be counted with the taps we have — chiefly
+    non-WireGuard UDP, since kernel socket byte counters are a TCP facility. Reported as its
+    own key rather than as zero, because zero would be a lie.
+  plane_source: derived
+  criticality: not-applicable
+  shed_order: 0
+  shed_why: Structural or derived row, not a workload anyone can shed.
+- key: unattributed
+  label: Unattributed
+  why: 'The workload plane''s honest coverage gap: mesh transport total minus the sum of every
+    category above. Non-zero by construction — TCP-only socket counters, flows that open and
+    close between samples, UDP. Rendered ALWAYS and EXPLICITLY, never folded into a neighbour
+    to tidy the chart, because a GROWING remainder is the signal that the category map has
+    fallen behind reality. There is an alert on exactly that.'
+  plane_source: derived
+  criticality: not-applicable
+  shed_order: 0
+  shed_why: Structural or derived row, not a workload anyone can shed.
+_shed_doc: 'criticality + shed_order answer the operational question the rest of this file
+  only describes: WHEN THE PIPE IS FULL, WHAT DO I TURN DOWN FIRST. Shed highest shed_order
+  first. essential is never shed — mesh-control and time are what you need to fix everything
+  else, and shedding observability blinds the decision, so it goes last among the sheddables.
+  This is DECLARED POLICY, not a measurement: it says what SHOULD give way, and the dashboard
+  pairs it with what each is actually costing right now so the trade is real.'
