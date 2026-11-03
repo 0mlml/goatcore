@@ -41,6 +41,13 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("repo root")
 }
 
+/// Whether this checkout declares a deployment of its own. A public clone of
+/// goatcore declares none, by design; the tests that read this checkout's own
+/// deployment return early there.
+fn checkout_declares_a_deployment() -> bool {
+    repo().join("ops/goatbuilder/goatbuilder.yaml").is_file()
+}
+
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
@@ -284,6 +291,9 @@ fn no_dashes_past_the_allowlist() {
 /// Rule 8: doctor prints problems by default; `--all` and `-o json` keep every row.
 #[test]
 fn doctor_prints_problems_and_keeps_every_row_for_machines() {
+    if !checkout_declares_a_deployment() {
+        return; // a public clone of goatcore ships no deployment
+    }
     let dir = std::env::temp_dir().join(format!("goatbuilder-standard-doctor-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let r = repo().display().to_string();
@@ -318,6 +328,9 @@ fn no_flourish_when_the_output_is_not_a_terminal() {
 /// Rule 1: `-o json` is the contract on a terminal too, not only through a pipe.
 #[test]
 fn json_on_a_terminal_is_the_document() {
+    if !checkout_declares_a_deployment() {
+        return; // a public clone of goatcore ships no deployment
+    }
     let dir = std::env::temp_dir().join(format!("goatbuilder-standard-jsontty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let r = repo().display().to_string();
