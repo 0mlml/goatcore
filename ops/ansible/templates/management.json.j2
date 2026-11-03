@@ -1,0 +1,163 @@
+{# Netbird management-server config for a mgmt-host instance.
+   Rendered by ops/ansible/mgmt-host.yml; writes to
+   /opt/mgmt-host/<instance>/management.json inside the compose dir.
+
+   Required vars (fail-fast in the playbook):
+     signal_uri              e.g. "192.168.1.128:10000"  — externally reachable,
+                             peers connect directly to this URI
+     netbird_encryption_key  32-byte base64 key for Netbird's DataStoreEncryptionKey.
+                             Generate once: `openssl rand -base64 32`
+                             Stash in .envrc.local; same key across all peers of a site.
+                             Must match on every node of a multi-master cluster so
+                             encrypted setup-keys/tokens in PG can be decrypted on
+                             any node — see docs/design/ha-multi-site.md §5.
+     stun_host               REQUIRED per-site (no template default — F-070).
+                             Hostname of a Coturn STUN server reachable from peers.
+                             Without it, NetBird peers can't gather srflx ICE
+                             candidates and fall back to relay-only for cone-NAT
+                             pairings. Set in group_vars/<site>_hosts/vars.yml,
+                             typically the closest stock-NetBird relay running
+                             Coturn :3478 (e.g. relay-rla.goat.example for prod sites,
+                             relay-rla.legacy.example for dev sites).
+   Optional vars (sensible defaults):
+     signal_proto        "http" (plaintext gRPC) | "https" (TLS) — default: http
+     idp_manager_type    OIDC adapter for the dashboard. Default "none" — see
+                         "netbird-vs-IdP decoupling" note below.
+
+   netbird-vs-IdP decoupling (formalized 2026-04-25):
+     Default ManagerType = "none" is correct for production. With ADR
+     0410's mgmt-host-bootstrap Go CLI handling sovereign account +
+     setup-key creation, netbird-mgmt's IdP requirement is artifactual
+     (it was an artifact of the dashboard-mediated admin flow, not the
+     gRPC peer-enrollment path). Peers enroll via setup keys, which
+     don't need OIDC. The dashboard, if/when wired to Ory in Phase 2
+     (ADR 0411), gets its OIDC from Ory Hydra — netbird's IdpManagerConfig
+     stays "none" because we point services at Ory directly, not through
+     netbird's adapter layer. The full reasoning lives at
+     docs/design/identity-architecture.md §4.3.
+
+   Design: docs/design/ha-multi-site.md §4 (per-site stack).
+   Identity: docs/design/identity-architecture.md (four-domain model).
+#}
+{
+  "DataStoreEncryptionKey": "{{ netbird_encryption_key }}",
+{#
+  ADR 1185: no goatnet ever carries a Default All->All policy. NetBird creates
+  one on every new account unless this is set (upstream #3970). Not a variable:
+  there is no goatnet on which the answer is different.
+#}
+  "DisableDefaultPolicy": true,
+{#
+  STUN/TURN advertise list. Multi-server since F-192 (the ZAGROS all-Rust relay
+  tier runs coturn on every relay, not just one). `stun_hosts` (a list) wins;
+  it falls back to the single legacy `stun_host` so every other goatnet renders
+  unchanged. Empty-list protection is the playbook-level assert in mgmt-host.yml
+  — kept there rather than the prior `mandatory()` filter so the list
+  form works.
+  TURN is opt-in (`turn_hosts`, default empty → `Turns: []` unchanged): the
+  rels:// relay already covers relay-fallback, so TURN is deferred.
+#}
+  "Stuns": [
+{% for _sh in (stun_hosts | default([stun_host])) %}
+    {
+      "Proto": "udp",
+      "URI": "stun:{{ _sh }}:3478",
+      "Username": "",
+      "Password": null
+    }{{ "," if not loop.last else "" }}
+{% endfor %}
+  ],
+  "TURNConfig": {
+    "TimeBasedCredentials": false,
+    "CredentialsTTL": "12h0m0s",
+    "Secret": "{{ turn_secret | default('placeholder-not-yet-wired') }}",
+    "Turns": [
+{% for _th in (turn_hosts | default([])) %}
+      {
+        "Proto": "udp",
+        "URI": "turn:{{ _th }}:3478",
+        "Username": "",
+        "Password": null
+      }{{ "," if not loop.last else "" }}
+{% endfor %}
+    ]
+  },
+{% if relay_addresses is defined and relay_addresses %}
+  "Relay": {
+    "Addresses": {{ relay_addresses | tojson }},
+    "CredentialsTTL": "{{ relay_credentials_ttl | default('24h') }}",
+    "Secret": "{{ relay_secret }}",
+    "PeerBoundTokens": {{ relay_peer_bound_tokens | default(false) | tojson }}
+  },
+{% endif %}
+  "Signal": {
+    "Proto": "{{ signal_proto | default('http') }}",
+    "URI": "{{ signal_uri }}",
+    "Username": "",
+    "Password": null
+  },
+  "ReverseZone": "in-addr.arpa.",
+  "Datadir": "/var/lib/netbird",
+  "HttpConfig": {
+    "Address": "0.0.0.0:80",
+    "LetsEncryptDomain": "",
+    "CertFile": "",
+    "CertKey": "",
+    {# Block 21D.1.c — JWT validation against Hydra's JWKS.       #}
+    {# When the netbird-dashboard is deployed (Block 21D.1), the  #}
+    {# dashboard sends JWTs minted by Hydra in `Authorization`    #}
+    {# headers to /api/*. management-a validates: (a) audience    #}
+    {# matches AuthAudience, (b) issuer matches AuthIssuer, (c)   #}
+    {# signature verifies against the JWKS fetched from           #}
+    {# OIDCConfigEndpoint. Per-site `auth_*` vars populate these. #}
+    {# Default empty preserves legacy / non-Ory sites (e.g.       #}
+    {# legacy upstream-netbird-deploy).                       #}
+    "AuthAudience": "{{ auth_audience | default('') }}",
+    "AuthIssuer": "{{ auth_issuer | default('') }}",
+    "OIDCConfigEndpoint": "{{ auth_oidc_config_endpoint | default('') }}",
+    "IdpSignKeyRefreshEnabled": {{ (auth_idp_sign_key_refresh | default(false)) | to_json }}
+  },
+{% if netbird_pkce_client_id is defined and netbird_pkce_client_id %}
+  {# Interactive operator SSO for the CLI (`netbird login`, `netbird ssh`).  #}
+  {# Without this block management answers NotFound for BOTH the PKCE and    #}
+  {# the device-code flow, and the client dies with "no SSO provider         #}
+  {# returned from management" — every peer is then setup-key-only, and      #}
+  {# `netbird ssh` cannot obtain the JWT its SSH server wants (found         #}
+  {# 2026-08-06 on zagros-prod).                                               #}
+  {#                                                                        #}
+  {# PKCE (RFC 7636), not device-code (RFC 8628): our Hydra pin v2.3.0 ships #}
+  {# the device grant DISABLED, so its discovery doc advertises no           #}
+  {# device_authorization_endpoint. Enable it in Hydra before switching.     #}
+  {#                                                                        #}
+  {# AuthorizationEndpoint/TokenEndpoint are OVERWRITTEN at management       #}
+  {# startup from OIDCConfigEndpoint's discovery doc (ApplyPKCEFlowConfig).  #}
+  {# They are still set here so the config validates if discovery is         #}
+  {# unreachable. Hydra advertises its PUBLIC issuer URLs in that doc, so    #}
+  {# the override yields browser-reachable endpoints even though             #}
+  {# OIDCConfigEndpoint itself is the in-compose address.            #}
+  {#                                                                        #}
+  {# Audience MUST be whitelisted on the Hydra client or Hydra rejects the   #}
+  {# auth request outright — same gotcha as the dashboard client. Default is #}
+  {# `auth_audience` deliberately: one audience then satisfies both the      #}
+  {# management API's JWT check AND the SSH server's, because buildJWTConfig #}
+  {# derives the SSH JWT audience list from HttpConfig.AuthAudience.         #}
+  "PKCEAuthorizationFlow": {
+    "ProviderConfig": {
+      "ClientID": "{{ netbird_pkce_client_id }}",
+      "ClientSecret": "",
+      "Audience": "{{ netbird_pkce_audience | default(auth_audience) }}",
+      "AuthorizationEndpoint": "{{ netbird_pkce_authorization_endpoint }}",
+      "TokenEndpoint": "{{ netbird_pkce_token_endpoint }}",
+      "Scope": "{{ netbird_pkce_scopes | default(['openid', 'profile', 'email', 'offline_access']) | join(' ') }}",
+      "RedirectURLs": {{ (netbird_pkce_redirect_urls | default(['http://localhost:53000/'])) | tojson }},
+      "UseIDToken": {{ (netbird_pkce_use_id_token | default(false)) | to_json }}
+    }
+  },
+{% endif %}
+  "StoreConfig": {
+    "Engine": "postgres"
+  },
+  "IdpManagerConfig": {
+    "ManagerType": "{{ idp_manager_type | default('none') }}"
+  }
+}

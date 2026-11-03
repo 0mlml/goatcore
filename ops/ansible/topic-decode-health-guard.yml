@@ -1,0 +1,33 @@
+---
+# Deploy the hourly topic decode-health audit to a goatnet's mgmt host.
+# Canon: docs/design/topic-decode-health.md. Contract:
+# docs/design/live-state-guard-scheduling.md §4.
+#
+# Its OWN play, deliberately not folded into <env>-refresh.yml. The role refuses
+# to install without its service credential, so riding an unrelated refresh
+# would turn "I bumped a pin" into a failed play on every goatnet that has not
+# minted one yet. Fold it into refresh once every goatnet is configured, not
+# before.
+#
+# Before the first run on a goatnet, mint the portal service key:
+#   MGMT_HOST=... PORTAL_URL=... \
+#     ops/scripts/create-decode-health-identity.sh <goatnet>
+# then put the value it prints into that goatnet's .envrc.local.d entry.
+#
+# Then, over the env door (ADR 1117 — never flip the netbird profile):
+#   ops/scripts/env-door.sh zagros
+#   cd ops/ansible && OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     aws-vault exec usareur-af --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/doors.ini \
+#     topic-decode-health-guard.yml --limit mgmt-zagros-01-thor
+#
+# The first run happens inline with you watching, and the play FAILS if it
+# exits 2 — a guard that cannot read its sources must not be installed quietly.
+# It does NOT fail on exit 1: a topic carrying bad bytes is the fabric's
+# condition, which is what the timer is for.
+- name: Topic decode-health audit — scheduled, per goatnet
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - topic-decode-health-guard

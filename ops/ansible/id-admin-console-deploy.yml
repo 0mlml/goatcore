@@ -1,0 +1,150 @@
+---
+# id-admin-console-deploy.yml — IdP admin console (ADR 0860).
+#
+# Deploys the goat-id-console Go service + the oauth2-proxy-id-console
+# ADMINS-gating sidecar in front of the site's admin.auth hostname.
+#
+# Sibling-of the dashboard oauth2-proxy play. Same Hydra OIDC
+# client provisioning shape, same env-secret discipline, just a different
+# upstream container and FQDN.
+#
+# Idempotent. Re-runs upsert the Hydra OIDC client, re-render the env
+# files (notifies handler to recreate containers only if they changed),
+# sync the canonical ops/permissions/group-permissions.yml to the host,
+# and `docker compose up -d` both containers.
+#
+# Required group_vars (in group_vars/<site>_hosts/vars.yml; see role defaults
+# for shape):
+#   site_id, site_dns_zone, mesh_ip_a
+#   id_admin_console_enabled: true
+#   id_admin_console_oauth2_proxy_enabled: true
+#   id_admin_console_oauth2_proxy_client_secret    env-sourced; 32+ chars
+#   id_admin_console_oauth2_proxy_cookie_secret    env-sourced; 16/24/32 bytes b64
+#   oauth2_proxy_id_console_oidc_client_secret     env-sourced; 32+ chars
+#
+# Pre-flight (operator-fired BEFORE this playbook):
+#   1. Ory + Hydra deployed on the host (ory-deploy.yml ran).
+#   2. ADR 0857 patched consent UI in place (the
+#      JWT carries the `groups` claim this proxy enforces on).
+#   3. Generate fresh secrets on first deploy:
+#        export <SITE>_ID_ADMIN_CONSOLE_OAUTH2_PROXY_CLIENT_SECRET=$(openssl rand -hex 32)
+#        export ID_ADMIN_CONSOLE_OAUTH2_PROXY_COOKIE_SECRET=$(openssl rand -base64 32)
+#      Store in 1Password under
+#      "goat-cluster-secrets / <site> / id-admin-console-*".
+#      Note: the Hydra OIDC client_secret is the SAME value as the
+#      oauth2-proxy CLIENT_SECRET — the apply playbook threads it through
+#      the oauth2-proxy-id-console-oidc-client role.
+#   4. Re-apply traefik-acme.yml AFTER this playbook so the id-admin-console
+#      router lands. The Traefik template gates router rendering on
+#      `id_admin_console_enabled`.
+#
+# Apply pattern:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -l <mgmt-host> id-admin-console-deploy.yml
+#
+#   # Then re-apply Traefik so the new router actually fires:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -l <mgmt-host> traefik-acme.yml
+#
+# Live-fire after the Traefik apply: drill the checklist in
+# docs/operations/id-admin-console-runbook.md §"Daily-driver tasks".
+#
+# Cross-refs:
+# - docs/adr/0860-id-admin-console-separate-tenant.md
+# - docs/design/id-admin-console.md
+# - docs/operations/id-admin-console-runbook.md
+# - docs/adr/0857-patched-selfservice-ui-for-groups-claim.md (groups claim)
+# - docs/adr/0411-ory-idp-mvp.md (the OIDC server this proxy consumes)
+
+- name: Deploy IdP admin console (goat-id-console + oauth2-proxy sidecar)
+  # Was `hosts: all`. Imported by site-services.yml that fans out to every host
+  # in the inventory, so it can reach unrelated goatnets. `-l` is not a fix: this
+  # playbook's own guard
+  # rejects `-e target=` under `-l`, so the two conventions cannot both be
+  # satisfied. Defaulting to `all` keeps every existing caller working.
+  hosts: "{{ target | default('all') }}"
+  become: true
+  # gather_facts: true — both role's ADR 0859 ledger-append tasks reference
+  # ansible_date_time.iso8601 which is only populated when facts are gathered.
+  # The dashboard sibling playbook ships gather_facts:false and would surface
+  # the same bug on Ansible versions that don't auto-gather; tracked
+  # separately as a fleet-wide ledger-task hardening.
+  gather_facts: true
+
+  vars:
+    admin_write_surface: "goat-id-console (onboarding proposals + IdP admin writes)"
+
+  pre_tasks:
+    # FIRST, before the loopback health checks: this play is `hosts: all` and
+    # relies on the operator remembering `-l <host>`. On a two-Orin goatnet
+    # a run without it installs a second console — with its
+    # own onboarding store — beside the authoritative one, and Ory answers on
+    # loopback on both Orins so the checks below would happily pass there.
+    # Single-homed per ADR 1084 §D3.
+    #
+    # F-436: refuse `-e target=` OUTRIGHT. Sibling playbooks in this directory
+    # (onboard-runner-deploy.yml, onboard-intake-deploy.yml) are
+    # `hosts: "{{ target | mandatory }}"`, so an operator who has just run one
+    # of those reasonably reaches for the same flag here — where it is INERT,
+    # `hosts: all` stays `all`, and the play fans out across the entire fleet
+    # inventory, so a console deploy meant for one host can touch every host and
+    # open SSM sessions toward other goatnets. The single-homed
+    # guard below and plain unreachability stop them, but the
+    # guard below and plain unreachability stopped every one of them — but the
+    # blast radius was luck plus a downstream guard, not scoping.
+    #
+    # Failing here is deliberately louder than quietly honouring `target`:
+    # the operator's mental model is wrong, and the message names the flag
+    # that actually scopes this play.
+    - name: "Guard — scope this play to ONE host, by -l or by -e target="
+      ansible.builtin.assert:
+        that:
+          - (target is defined and target | length > 0) or (ansible_play_hosts | length == 1)
+        fail_msg: >-
+          REFUSING: this play must be scoped to a single console host. Pass
+          `-e target=<group>` (the site-services.yml convention) or `-l <host>`.
+          Unscoped, `hosts` falls back to `all` and the run covers every host in
+          the inventory you loaded.
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: "Guard — admin surfaces are single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+
+    - name: Verify Ory Hydra is running (admin port reachable on loopback)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}/health/ready"
+        status_code: [200]
+
+    - name: Verify Ory Kratos admin is running (loopback)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}/admin/identities?per_page=1"
+        status_code: [200]
+
+    - name: Verify the canonical permissions YAML exists in the repo checkout
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../permissions/group-permissions.yml"
+      register: permissions_yaml_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Fail if canonical permissions YAML missing
+      ansible.builtin.assert:
+        that:
+          - permissions_yaml_stat.stat.exists
+        fail_msg: |
+          ops/permissions/group-permissions.yml not found at
+          {{ playbook_dir }}/../permissions/group-permissions.yml — this is the canonical
+          source-of-truth for the /permissions page. Re-run from a clean repo checkout.
+
+  roles:
+    - role: oauth2-proxy-id-console-oidc-client
+      vars:
+        oauth2_proxy_id_console_oidc_client_secret: "{{ id_admin_console_oauth2_proxy_client_secret }}"
+    - role: id-admin-console
+    - role: oauth2-proxy-id-console

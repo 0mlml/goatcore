@@ -1,0 +1,57 @@
+# {{ onboard_env | upper }} backend-operator bundle — {{ manifest.identity.name | default(operator_handle) }} ({{ operator_handle }})
+Issued {{ ansible_date_time.date | default('see file mtime') }}. Hand-deliver; do NOT commit. Contains a private key.
+
+You are a backend/admin operator on the {{ onboard_env }} goatnet. Full
+orientation: docs/operations/admin-operator-guide.md.
+
+## In this bundle
+- operator-cert.pem / operator-key.pem  — your Zenoh operator leaf (CN {{ op_cn }}):
+  writes the ops/** control + audit namespace.
+- {{ onboard_env }}-ca-root.pem          — trust anchor for the {{ onboard_env }} router.
+
+## 1. Install the cert
+```
+mkdir -p ~/.goat/{{ onboard_env }}-operator && cd ~/.goat/{{ onboard_env }}-operator
+cp /path/to/this/bundle/{operator-cert.pem,operator-key.pem,{{ onboard_env }}-ca-root.pem} .
+chmod 400 operator-key.pem
+```
+Zenoh TLS: root_ca_certificate={{ onboard_env }}-ca-root.pem,
+connect_certificate=operator-cert.pem, connect_private_key=operator-key.pem,
+endpoint {{ op_router_endpoint }}, enable_mtls=true.
+
+## 2. Set your operator env
+```
+export GOAT_OPERATOR_HANDLE={{ operator_handle }}
+export GOAT_OPERATOR_AGE_IDENTITY=~/.config/age/{{ onboard_env }}-operator.key   # your age private key
+export {{ onboard_env | upper }}_PORTAL_OPERATOR_API_KEY='<your op_… key — see the operator who onboarded you>'
+# Mint your OWN NetBird PAT (you have ADMINS): dashboard → Users → PATs → Create:
+export {{ onboard_env | upper }}_NB_API_TOKEN='<your netbird PAT>'
+```
+
+## 3. What you can do
+- Onboard a participant: `goat admin onboard <handle> --env {{ onboard_env }}`
+  (mints NetBird key + Ory identity + Zenoh cert via the API/portal — no CA key needed).
+- Revoke: `goat admin onboard <handle> --env {{ onboard_env }} --revoke`
+- Rotate: `goat admin rotate <anchor|alias>`
+- Read the admin audit: `goat audit ops`
+- Admin consoles (MinIO/dashboard/isitup): log in — you have ADMINS{% if manifest.operator.groups is defined %} ({{ manifest.operator.groups | join(', ') }}){% endif %}.
+
+## 4. Host shell
+`ssh {{ op_host.ssh_user }}@{{ op_host.ssh_host }}`  (your SSH key is installed).
+
+Keep operator-key.pem (0400) + your age private key safe. Your handle
+({{ operator_handle }}) is what every admin action you take is attributed to.
+
+{% if op_pages | default(false) | bool %}
+## 5. Paging — you are on the pager for {{ onboard_env }}
+Being granted this tier put you on it (ADR 1168). Alerts about the goatnet's own
+infrastructure reach the self-hosted pager at `https://{{ op_ntfy_map[onboard_env].fqdn }}`.
+
+1. Install the ntfy app (iOS / Android / desktop) and add a server: `https://{{ op_ntfy_map[onboard_env].fqdn }}`.
+2. Log in as `{{ operator_handle }}` with the password in `ntfy.pass` beside this file (0600 — keep it there).
+3. Subscribe to{% for t in op_ntfy_map[onboard_env].topics %} `goat-{{ op_ntfy_map[onboard_env].goatnet }}-{{ t }}`{% if not loop.last %} and{% endif %}{% endfor %}.
+   `critical` is the page; `warning` is the backlog. Subscribe to critical at minimum.
+
+Nothing about your phone or address is stored anywhere — the topic is the only
+thing the goatnet knows. Losing the tier removes your read access in the same act.
+{% endif %}

@@ -1,0 +1,326 @@
+---
+# ops/ansible/goat-client-assay.yml
+#
+# Orchestrator for the DISPOSABLE goat-client assay goatnet: one host carrying
+# the netbird management plane, a goat-relay, and coturn; N private peers that
+# run goat-clientd headless in `netbird-only` mode and are structurally forced
+# onto the relay path.
+#
+# Terraform: terraform/goat-client-assay.tf
+# Runbook:   docs/operations/goat-client-assay-runbook.md
+# Installer: ops/goat-client-assay/install-goat-client.sh
+# Prior art: ops/ansible/cgnat-validation.yml (read the divergences below)
+#
+# This playbook deliberately re-uses whole playbooks by import rather than
+# re-implementing their phases. Every phase below is an existing, exercised
+# path; the assay contributes the composition and the seeding, not new
+# infrastructure code.
+#
+# =============================================================================
+# Required -e vars
+# =============================================================================
+#   postgres_superuser_password   Postgres superuser password for this env.
+#                                 Throwaway — generate a fresh one, do not
+#                                 reuse a live goatnet's.
+#   netbird_encryption_key        base64 32 bytes (`openssl rand -base64 32`).
+#                                 Single-node env, so it needs to match nothing.
+#   cf_api_token                  Cloudflare API token for the DNS-01 challenge
+#                                 on the MGMT cert. traefik-acme.yml defaults
+# this to another site's Cloudflare token, which
+# is the wrong zone here — pass the dev-tree
+#                                 token explicitly:
+#                                   -e cf_api_token=$CLOUDFLARE_API_TOKEN
+#   cloudflare_api_token          Same token again, under the name the
+#                                 goat-relay LE phase asserts on. The two
+#                                 playbooks were written independently and
+#                                 spell it differently; passing both is less
+#                                 surprising than aliasing one to the other.
+#   assay_owner_email             Owner email stamped on the seeded account.
+#
+# Optional -e vars:
+#   assay_setup_key_ttl           default 48h — comfortably past the 24h life
+#                                 of the env, short enough to be inert after.
+#   assay_setup_key_usage         default 20 — reusable key, one mint serves
+#                                 every peer.
+#
+# Secrets sourced from group_vars (env-backed, never committed):
+#   relay_secret                  <- $GOAT_CLIENT_ASSAY_RELAY_SECRET
+#   goat_relay_pull_password      <- $GHCR_READ_TOKEN
+#
+# =============================================================================
+# Run
+# =============================================================================
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/goat-client-assay.ini \
+#       goat-client-assay.yml \
+#       --skip-tags archive_load \
+#       -e postgres_superuser_password="$ASSAY_PG_PW" \
+#       -e netbird_encryption_key="$ASSAY_NB_ENCKEY" \
+#       -e cf_api_token="$CLOUDFLARE_API_TOKEN" \
+#       -e cloudflare_api_token="$CLOUDFLARE_API_TOKEN" \
+#       -e assay_owner_email=person-85@example.org
+#
+# `--skip-tags archive_load` IS REQUIRED, not optional. goat-relay-deploy.yml's
+# imported phase0 is an offline image-transport path that runs on localhost and
+# fails on a missing local `docker save` archive. We pull goat-relay from GHCR
+# instead, so that phase must be skipped. Without the flag this playbook dies on
+# its third import with a confusing "archive does not exist" on your laptop.
+#
+# =============================================================================
+# Divergences from ops/ansible/cgnat-validation.yml (the prior art)
+# =============================================================================
+# 1. ACCOUNT + SETUP-KEY SEEDING. cgnat-validation Phase 3 writes raw SQL into
+#    the netbird DB. Its own header says that pattern is "tactical — superseded
+#    by ADR 0410's mgmt-host-bootstrap Go CLI", and that CLI now exists and is
+#    installed on every mgmt-host by mgmt-host.yml's mgmt-host-bootstrap-wrapper
+#    role. We use the CLI. This is not tidiness: that SQL has since drifted
+#    behind the CLI in two ways that would each break this env —
+#      * it omits `setup_keys.auto_groups = '[]'`, which crashes the
+#        dashboard /groups page;
+#      * it seeds no default All->All accept policy, without which "peers
+#        enroll but never connect (status shows 0/0)"
+#        (ops/mgmt-host-bootstrap/main.go:418-444).
+#    A peer that enrolls and then shows 0/0 is precisely the symptom this assay
+#    is hunting, so inheriting a seeding bug that fabricates it would poison
+#    every result.
+#
+# 2. NO socat MGMT-EXPOSE SIDECAR. cgnat-validation bridges 0.0.0.0:80 to the
+#    loopback-bound mgmt API so peers can reach it over plain HTTP. That
+#    shortcut is unavailable here: a goat-clientd peer takes its management URL
+#    from a signed bundle, and the minter refuses any non-https URL
+#    (ops/enrollment/cmd/bundle-create/main.go:695-697). So the mgmt API is
+#    served through the stack's own Traefik on :443 with a Let's Encrypt cert
+# (Phase 2) — the same "posture 2" other goatnets use.
+#
+# 3. PEERS DO NOT SELF-ENROLL. cgnat peers enrolled from cloud-init because a
+#    netbird setup key can be minted before apply. A bundle cannot: it needs a
+#    setup key that does not exist until Phase 5. Peer enrollment is therefore a
+#    post-playbook SSM step (runbook §4), not a phase here.
+#
+# 4. RELAY IS PART OF THE ENV. cgnat-validation had no relay tier at all — it
+#    was measuring signal federation. The relay is the entire point here, so
+#    Phase 3 imports the real goat-relay deploy, including its Let's Encrypt
+#    cert path. A self-signed relay cert would be rejected outright by the
+#    peers (roles/goat-relay/defaults/main.yml:76-82).
+
+# =============================================================================
+# Phase 1 — management plane
+# =============================================================================
+# mgmt_host_target scopes the fan-out to this env's group ONLY. mgmt-host.yml
+# defaults to the umbrella `mgmt_hosts` group, and a run that forgets this
+# override reaches every reachable mgmt-host in the inventory. This env must never touch another
+# goatnet, so the override is mandatory, not stylistic.
+#
+# phase2: false — single instance, no multi-master overlay.
+- name: "goat-client-assay: netbird management plane"
+  import_playbook: mgmt-host.yml
+  vars:
+    mgmt_host_target: goat_client_assay_hosts
+    phase2: false
+
+# =============================================================================
+# Phase 2 — Let's Encrypt cert on the mgmt endpoint (Traefik, Cloudflare DNS-01)
+# =============================================================================
+# The canonical roles/traefik/ path serves offline-CA-signed leaf certs, whose
+# root we do not hold a signing key for in a throwaway env. traefik-acme.yml
+# is the wired ACME overlay and is explicitly parameterized for sibling goatnets
+# via `-e target=` (see its header at :101-104).
+#
+# public_mgmt_fqdn and acme_email come from THIS GROUP's group_vars, never from
+# play vars: an -e/play-var form can silently render another goatnet's hostnames
+# into this group's routers. cf_api_token is the one value that must come
+# from the command line, because the playbook's default reads a different
+# site's token.
+- name: "goat-client-assay: Traefik ACME for the mgmt endpoint"
+  import_playbook: traefik-acme.yml
+  vars:
+    target: goat_client_assay_hosts
+
+# =============================================================================
+# Phase 3 — goat-relay + coturn on the same host
+# =============================================================================
+# Imported whole. It brings:
+#   * the goat-relay role,
+#   * the Let's Encrypt DNS-01 cert phase, gated on goat_relay_le_dns01 which
+#     this env sets in GROUP_VARS (a play var there would be shadowed — F-188,
+# a relay silently self-signed),
+#   * the coturn role, gated on deploy_coturn.
+#
+# coturn matters more than it looks. Without STUN every peer is relay-forced by
+# the ABSENCE of srflx candidates — a different condition from the one
+# we want, and a weaker test. With coturn up, peers gather real candidates,
+# genuinely attempt a direct path, genuinely fail against the symmetric NAT and
+# the closed peer SG, and fall back. That is the field condition.
+#
+# Requires `--skip-tags archive_load` (see the run block above).
+- name: "goat-client-assay: goat-relay + coturn"
+  import_playbook: goat-relay-deploy.yml
+
+# =============================================================================
+# Phase 4 — seed the account, the All group, the default policy, and a
+#           reusable setup key
+# =============================================================================
+- name: "goat-client-assay: seed account + setup key"
+  hosts: goat_client_assay_hosts
+  gather_facts: false
+  become: true
+  # Overridable via -e assay_setup_key_ttl=... / -e assay_setup_key_usage=...
+  # Do NOT redeclare these in a `vars:` block as self-referencing defaults
+  # (`assay_setup_key_ttl: "{{ assay_setup_key_ttl | default('48h') }}"`) —
+  # play vars sit at higher precedence than the undefined name they reference,
+  # so the template resolves to itself and ansible dies with "Recursive loop
+  # detected in template" (hit on the first live run). The
+  # defaults live inline at the point of use instead.
+  tasks:
+    - name: Require assay_owner_email
+      ansible.builtin.assert:
+        that: assay_owner_email is defined and assay_owner_email | length > 0
+        fail_msg: "Pass -e assay_owner_email=... (stamped as the account owner)."
+
+    # The CLI is idempotent by construction: writes are recorded in a
+    # bootstrap_idempotency table keyed on the operator's intent, so a re-run
+    # replays rather than duplicating. That makes this phase safe to re-run
+    # after a partial failure, which on a throwaway env you will do.
+    - name: Create the assay account (+ All group + default accept policy)
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/mgmt-host-bootstrap
+          - create-account
+          - --owner
+          - "{{ assay_owner_email }}"
+          - --site-name
+          - assay
+      register: assay_account
+      changed_when: "'already-applied' not in assay_account.stdout"
+
+    - name: Extract the account id
+      ansible.builtin.set_fact:
+        assay_account_id: "{{ assay_account.stdout | regex_search('account_id:\\s*(\\S+)', '\\1') | first }}"
+
+    - name: Show the account id
+      ansible.builtin.debug:
+        msg: "assay account_id = {{ assay_account_id }}"
+
+    # One reusable key serves every peer. Bundles are per-device by field
+    # (device id, nonce, expiry) but goat-client enforces no device-uniqueness,
+    # so the peers can share a bundle if you want; either way the key behind it
+    # must be reusable. `--role peer` is the enrollment role; the CLI writes
+    # type='reusable' with the usage limit passed here.
+    - name: Create a reusable peer setup key
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/mgmt-host-bootstrap
+          - create-setup-key
+          - --account
+          - "{{ assay_account_id }}"
+          - --role
+          - peer
+          - --ttl
+          - "{{ assay_setup_key_ttl | default('48h') }}"
+          - --usage
+          - "{{ assay_setup_key_usage | default(20) | string }}"
+          - --name
+          - goat-client-assay
+      register: assay_setup_key
+      changed_when: "'already-applied' not in assay_setup_key.stdout"
+
+    # The plaintext is printed ONCE by the CLI and only the SHA-256 hash is
+    # stored. It is surfaced here because the operator has to paste it into the
+    # bundle mint in the very next step. It lands in your terminal scrollback
+    # and in any ansible log you are capturing — on a 48h-TTL throwaway key for
+    # a same-day-destroyed env that is an acceptable trade, but do not copy this
+    # pattern to a goatnet that outlives the session.
+    #
+    # On a REPLAY (already-applied) the plaintext is deliberately NOT reprinted.
+    # If you lost it, `rotate-setup-key --id <sk_id> --idempotency-key <fresh>`
+    # mints a new one; re-running this task will not give it back.
+    - name: Surface the setup key (shown once — copy it now)
+      ansible.builtin.debug:
+        msg: "{{ assay_setup_key.stdout_lines }}"
+
+# =============================================================================
+# Phase 5 — smoke: is the control plane actually serving?
+# =============================================================================
+# Everything here is checked from the mgmt host itself. Peer-side verification
+# belongs to the installer and the runbook §5, because no peer is enrolled yet
+# at this point in the sequence.
+- name: "goat-client-assay: control-plane smoke"
+  hosts: goat_client_assay_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: signal-a /healthz
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9090/healthz
+        status_code: 200
+      register: assay_signal_health
+      retries: 15
+      delay: 2
+      until: assay_signal_health.status == 200
+
+    # The externally-reachable check that actually matters: a peer dials the
+    # mgmt API by NAME over TLS, so resolve + handshake + route must all work
+    # together. A local loopback curl proves none of that. This runs from the
+    # mgmt host, which reaches its own public name via the EIP — good enough to
+    # catch a missing DNS record or an unminted cert, which are the two failures
+    # that actually happen here.
+    - name: mgmt endpoint answers over TLS at its public name
+      ansible.builtin.uri:
+        url: "https://{{ public_mgmt_fqdn }}/api/peers"
+        # 401 is the healthy answer: the endpoint is up, TLS verified against
+        # the public trust store, and it is refusing an unauthenticated caller.
+        # A 200 here would mean the API is unauthenticated, which is a finding.
+        status_code: [401, 403]
+        validate_certs: true
+      register: assay_mgmt_tls
+      retries: 30
+      delay: 10
+      until: assay_mgmt_tls.status in [401, 403]
+
+    - name: goat-relay TCP listener present on 33073
+      ansible.builtin.command: ss -lntp
+      register: assay_relay_listen
+      changed_when: false
+
+    - name: Assert the relay is listening
+      ansible.builtin.assert:
+        that: "':33073' in assay_relay_listen.stdout"
+        fail_msg: >-
+          goat-relay is not listening on 33073. Check
+          `docker logs goat-relay` — the usual cause is a missing or
+          unreadable cert at /etc/goat-relay/cert.pem, which means the
+          Let's Encrypt phase did not complete.
+        success_msg: "goat-relay listening on 33073"
+
+    - name: coturn STUN listener present on 3478
+      ansible.builtin.command: ss -lunp
+      register: assay_stun_listen
+      changed_when: false
+
+    - name: Assert coturn is listening (peers need real srflx candidates)
+      ansible.builtin.assert:
+        that: "':3478' in assay_stun_listen.stdout"
+        fail_msg: >-
+          coturn is not listening on UDP 3478. Peers would then be relay-forced
+          by the absence of STUN rather than by NAT, which is a weaker
+          and different test than this env is meant to run. Check that
+          deploy_coturn is true in group_vars.
+        success_msg: "coturn listening on 3478 — peers will gather real srflx candidates"
+
+    - name: Enrolled peer count (expected 0 at this point)
+      ansible.builtin.command:
+        argv: [/usr/local/bin/mgmt-host-bootstrap, list-peers]
+      register: assay_peers
+      changed_when: false
+
+    - name: Acceptance summary
+      ansible.builtin.debug:
+        msg:
+          - "Control plane is up. Next: mint bundles and enroll peers — runbook §3 and §4."
+          - "mgmt endpoint:  https://{{ public_mgmt_fqdn }}"
+          - "signal_uri:     {{ signal_uri }} (proto {{ signal_proto | default('http') }})"
+          - "relay:          {{ relay_addresses | default(['(unset)']) | join(', ') }}"
+          - "peers enrolled: (see list-peers output below)"
+          - "{{ assay_peers.stdout_lines }}"

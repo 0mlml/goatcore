@@ -1,0 +1,1193 @@
+# Traefik dynamic config — mgmt + signal + Ory + dashboard routers.
+#
+# Rendered by ops/ansible/traefik-acme.yml at /etc/traefik/dynamic/mgmt.yml.
+# DO NOT EDIT ON THE HOST — see the playbook header for the source-of-truth path.
+#
+# Traefik's file-watcher (--providers.file.watch=true) reloads this without
+# a container restart. Filename intentionally distinct from `dynamic.yml`
+# (which the canonical traefik role at ops/ansible/roles/traefik/ owns) so
+# a later site-bootstrap.yml run cannot stomp this overlay.
+#
+# Two Let's Encrypt certs minted via the `le` ACME resolver
+# (docker-compose.acme.yml) — split into public-only + mesh-only to close
+# the SAN-list information disclosure a single combined cert would make:
+#
+#   1. PUBLIC cert (anchored by signal): main = netbird.<zone>,
+#      no SANs. Served on the rathole-forwarded :443 path. Off-mesh TLS
+#      handshake can no longer enumerate internal hostnames via the cert.
+#
+#   2. MESH-ONLY cert (anchored by the dashboard router):
+#      main = *.<site>.<zone>, sans = only the names that wildcard does not
+#      cover (admin.auth.<site>.<zone>, *.<service>.<site>.<zone>). With
+#      external_service_wildcard_cert: false, main = dashboard.<site>.<zone>
+#      and every mesh-only name is a SAN. Never both: Let's Encrypt refuses
+#      a name next to a wildcard that covers it (#2149).
+#      Hostnames only exist in mesh CoreDNS (no public DNS). Only mesh peers
+#      ever resolve them and only mesh peers ever see this SAN list.
+#
+# panoscope.<site>.* is intentionally NOT in the mesh-only SAN list — the
+# panoscope role mints its own cert via traefik-panoscope.yml.j2. Same
+# for goat-zenoh-portal.
+#
+# IMPORTANT — tls.domains MUST be declared exactly ONCE per hostname
+# across the dynamic config. Multiple routers each declaring overlapping
+# SAN lists fires concurrent ACME orders, each of which writes the same
+# Cloudflare TXT record, and Cloudflare rejects subsequent writes with
+# "An identical record already exists (81058)". The two anchors above
+# carry disjoint hostname lists so this can't happen.
+#
+# Pattern that works:
+#   - signal carries tls.domains for the PUBLIC anchor (1 cert)
+#   - dashboard carries tls.domains for the MESH-ONLY anchor (1 cert)
+#   - every other router declares only `tls: {certResolver: le}` —
+#     Traefik SNI-matches against whichever of the two certs covers the
+#     requested hostname.
+#
+# IMPORTANT — Host() rules MUST NOT include `127.0.0.1` (or any IP).
+# Traefik auto-derives a SAN list from each router's Host() values when
+# `tls.certResolver` is set without explicit `tls.domains`, and LE rejects
+# RFC-1122 loopback identifiers (urn:ietf:params:acme:error:rejectedIdentifier).
+#
+# Routers (highest-priority first — Traefik picks the longest-matching rule
+# but explicit priority makes the order obvious):
+#
+#   signal       — pri 100 — Host(netbird.<zone>) &&
+#                                PathPrefix(/signalexchange.SignalExchange/)
+#                                → h2c://signal-a:10000
+#                                ANCHOR FOR PUBLIC CERT (tls.domains = [netbird only]).
+#   signal-mesh-apex — pri 100 — websecure twin of signal: same
+#                                Host+PathPrefix rule, same backend, but on
+#                                the websecure entrypoint with the mesh-only
+#                                allowlist. Serves enrolled peers whose mesh
+#                                DNS answer for the enrollment apex is the
+#                                host's mesh IP. SNI-matches the public cert — no
+#                                tls.domains here (single-anchor rule above).
+#   mgmt-mesh-apex   — pri 10 —  websecure twin of mgmt-public: apex
+#                                catch-all → mgmt, mesh-only allowlist.
+#                                Same mesh-side purpose as its signal twin.
+#   signal-federation — pri 95 — (gated: signal_federation_ingress_enabled)
+#                                PathPrefix(/signalfederation.SignalFederation/)
+#                                on enrollment → signal. Public fallback
+#                                path for signal federation (Phase 3, ADR
+#                                1085 Amendment 1); bearer-token authz
+#                                in-process, own LE cert anchor for the
+#                                per-host federation hostname.
+#   kratos-api   — pri 100 — Host(auth.<site>.<zone>) && PathPrefix(/sessions,
+#                                /self-service, /.well-known, /schemas, /health)
+#                                → http://kratos:4433
+#   selfservice  — pri 10  — Host(auth.<site>.<zone>) catch-all
+#                                → http://selfservice-ui:3000
+#   hydra        — pri 50  — Host(oauth2.<site>.<zone>)
+#                                → http://hydra:4444 (OAuth2 issuer)
+#   dashboard    — pri 50  — Host(dashboard.<site>.<zone>)
+#                                → http://dashboard:80 (netbirdio/dashboard;
+#                                middleware dashboard-root-to-access-control
+#                                redirects `/` at the TLS terminator)
+#                                ANCHOR FOR MESH-ONLY CERT (tls.domains =
+#                                *.<site>.<zone> + the names it does not cover;
+#                                see the dashboard router below).
+#   mgmt-public  — pri 10  — Host(netbird.<zone>)
+#                                → h2c://management-a:80
+#                                (public enrollment surface; SNI = public cert)
+#   mgmt-mesh    — pri 10  — Host(mgmt.<site>.<zone>) catch-all
+#                                → h2c://management-a:80
+#                                (mesh-only alias; mesh-only-allowlist
+#                                 middleware; SNI = mesh-only cert)
+#   grafana      — pri 50  — Host(grafana.<site>.<zone>)
+#                                → http://grafana:3000 (the obs stack,
+#                                source ops/compose/goat-obs/, running as
+#                                compose project <site_id>-obs; Block 82
+#                                sub-block)
+#
+# Mesh-only gating:
+#   - Enrollment routers (signal, mgmt-public) are pinned to the
+#     `enrollment` entrypoint EXCLUSIVELY (Traefik :8443 in the
+#     container, host-bound to 127.0.0.1:8443; the rathole-client unit
+#     on the mgmt host forwards relay-tunneled TCP to that port — see
+#     ops/ansible/templates/client.toml.j2). No `.<site>.*` router attaches
+#     to `enrollment`, so a public-via-rathole request whose Host header
+#     is anything other than `netbird.<zone>` 404s at
+#     routing time regardless of source IP.
+#   - Every other (.<site>.*) router is pinned to the `websecure`
+#     entrypoint EXCLUSIVELY (:443 on all interfaces; mesh-reachable
+#     via the mgmt host's netbird IP and on-host-container-reachable via the
+#     docker bridge gateway). Each carries the `mesh-only-allowlist`
+#     middleware (IPAllowList on netbird CGNAT 100.64.0.0/10 plus
+#     RFC1918 Docker bridge 172.16.0.0/12 for the on-host-container path)
+#     as defense-in-depth.
+#   - **Why two layers (entrypoint + middleware)?** The middleware alone is
+#     not enough: the rathole → 127.0.0.1:443 → Docker SNAT chain rewrites
+#     the source to the bridge gateway (172.x.0.1), which matches the
+#     on-host-container entry in the allowlist and defeats the gate. The
+#     entrypoint split fixes this structurally — public traffic via rathole
+#     never reaches the websecure entrypoint, so its source IP is irrelevant.
+#   - The same middleware is referenced as `mesh-only-allowlist@file`
+#     from panoscope + goat-zenoh-portal Traefik dynamic configs so
+#     additional surfaces inherit the gate without duplicating the rule.
+#     Those configs also stay on the websecure entrypoint (they don't define
+#     the enrollment one and don't carry enrollment routers).
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+      cipherSuites:
+        - TLS_AES_256_GCM_SHA384
+        - TLS_CHACHA20_POLY1305_SHA256
+{% if zenoh_door_ingress_enabled | default(false) %}
+    # env-doors Tier 2 lane (ADR 1117, env-doors.md §"Tier 2") — mutual-TLS
+    # option for the zenoh-door TCP router below. RequireAndVerifyClientCert
+    # against the OFFLINE dev CA (the same root that signs this goatnet's
+    # zenoh leaves): only a holder of a CA-signed client cert completes the
+    # outer handshake, so the public surface does not widen in practice.
+    # The CA file is installed to /etc/goat/tls/ (already mounted ro
+    # into the Traefik container by the base compose) by traefik-acme.yml.
+    zenoh-door-mtls:
+      minVersion: VersionTLS12
+      clientAuth:
+        caFiles:
+          - /etc/goat/tls/zenoh-door-client-ca.pem
+        clientAuthType: RequireAndVerifyClientCert
+{% endif %}
+
+http:
+  middlewares:
+    # goat-entrypoint-ceiling — the universal ceiling, tier 1 of two.
+    #
+    # Attached at the ENTRYPOINT (see the `--entrypoints.websecure.http.
+    # middlewares` flag in the Traefik command set), so it covers every router
+    # on :443 — including surfaces that do not exist yet. That is the whole
+    # point: per-router attachment would have to be remembered sixteen times
+    # today and once more for every future service, and the one everybody
+    # forgets is the one that gets hammered.
+    #
+    # WHY IT IS THIS BIG (ADR 1123): a 50 r/s per-source limit on the entrypoint
+    # refuses THIS HOST'S OWN netbird client. The hub's client reaches signal
+    # through /etc/hosts (netbird.<zone> -> 127.0.0.1), docker-proxy and this
+    # websecure entrypoint, so Traefik sees it as one source address, the docker
+    # gateway, and that address carries most of the host's requests. Relayed
+    # peers are never behind this limiter: rathole forwards them to
+    # 127.0.0.1:8443, the `enrollment` entrypoint, which has no rate limit.
+    #
+    # So the entrypoint number is sized for the hub's own client at full peer
+    # load: 3000 r/s average, 6000 burst. It still stops a genuine runaway (a
+    # script in a tight loop). The browsing ceiling is tier 2, below.
+    #
+    # sourceCriterion is the real client IP: mesh peers arrive on their
+    # 100.64/10 address and on-host callers on the docker gateway; requestHost
+    # / requestHeaderName would both be wrong (one buckets all callers of a
+    # vhost together, the other trusts a spoofable header).
+    goat-entrypoint-ceiling:
+      rateLimit:
+        average: {{ traefik_entrypoint_ratelimit_average | default(3000) }}
+        burst: {{ traefik_entrypoint_ratelimit_burst | default(6000) }}
+        period: 1s
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+
+    # goat-ratelimit — the browsing-surface ceiling, tier 2 of two.
+    #
+    # Attached PER ROUTER, not at the entrypoint — see goat-entrypoint-ceiling
+    # above for why. It
+    # goes on the request routers a person drives from a browser: dashboard,
+    # auth UI + API, hydra, grafana, the admin console, the guide, relay
+    # health, every ADR 1178 external service — and, in their own route files,
+    # the portal request router, panoscope, isitup, microscope, netvis,
+    # stethoscope, flashlight, herd and the MinIO console. Those surfaces are
+    # reached over the mesh, so the source is the peer's own address and 50
+    # r/s is per person.
+    #
+    # NOT on: signal-mesh-apex, mgmt-mesh-apex, mgmt-mesh (control plane —
+    # gRPC + the management API the goat CLI drives), host-net-ingest and
+    # zenoh-health-ingest (fleet nodes posting health), the onboarding intake
+    # API (id-admin-console-onboard; enrollment), the portal SSE stream router
+    # (ADR 1133). Same exclusion list as goat-inflight, for the same reason:
+    # a control-plane or stream router bucketed per source IP throttles peers
+    # for using the surface as designed.
+    #
+    # WHY THIS EXISTS: goat-map and panoscope had no request ceiling of any
+    # kind. goat-map answers from an in-memory store so client demand costs
+    # CPU only, but panoscope turns HTTP requests into `session.get()` against
+    # the router's Zenoh storage, and a router can wedge under query load.
+    # See docs/design/surface-overload-protection.md.
+    #
+    # NUMBERS, and why they are not smaller: these surfaces are mesh-only and
+    # authenticated — there is no anonymous client and no hostile one assumed
+    # here. This is sized to stop runaway/unattended demand (a reconnect loop,
+    # a wall-mounted dashboard, a script someone left running), NOT to ration
+    # operators. A human clicking a UI stays far under 50 r/s; the burst
+    # absorbs a page load fanning out to many endpoints at once.
+    #
+    goat-ratelimit:
+      rateLimit:
+        average: {{ goat_ratelimit_average | default(50) }}
+        burst: {{ goat_ratelimit_burst | default(100) }}
+        period: 1s
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+
+    # goat-inflight — the CONCURRENCY ceiling, per source peer.
+    #
+    # goat-ratelimit above counts requests per second, which is the right
+    # ceiling only while requests cost roughly the same. They may not: a portal
+    # authentication that walks every vendor row running bcrypt makes ONE request
+    # cost many CPU-seconds. A caller issuing about one request per second — a
+    # sliver of the rate ceiling, invisible to it, nothing an operator would look
+    # at twice — can hold most of a many-core host.
+    #
+    # Rate says how OFTEN work arrives. In-flight depth says how much is being
+    # done at once, and expensive requests are exactly the ones that pile up
+    # there. The two ceilings answer different questions and a surface that
+    # can do real work per request wants both.
+    #
+    # Attached PER ROUTER, not at the entrypoint like goat-entrypoint-ceiling
+    # and goat-compress. An in-flight cap holds a slot for the whole life of a
+    # request, and this fleet's streaming routes (portal /api/topics/stream,
+    # ADR 1133) hold connections open for many minutes on purpose — a
+    # universal cap would count those against their source and throttle peers
+    # for using the surfaces as designed. So it goes on the request routers
+    # that can do expensive work, and the stream routers are left out.
+    #
+    # 24 is far above anything legitimate: browsers cap at ~6 connections per
+    # host, and a portal client fanning out a page load sits at about one
+    # concurrent request. It is sized to stop a runaway sweep, not to
+    # ration anyone. Exceeding it returns 429.
+    goat-inflight:
+      inFlightReq:
+        amount: {{ goat_inflight_amount | default(24) }}
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+
+    # goat-compress — universal response compression, attached at the
+    # ENTRYPOINT beside goat-entrypoint-ceiling so it covers every router on :443,
+    # including surfaces that do not exist yet. Same reasoning as the
+    # ratelimit: per-router attachment is a thing to remember once per
+    # service, and the one everybody forgets is the one that needs it.
+    #
+    # WHY THIS EXISTS: the payloads are text and compress well: panoscope's
+    # snapshot JSON about 10x, isitup's peerview.json 5x, the gym 4x, goat-docs
+    # 3x, the portal's HTML nearly 3x. panoscope matters most, because its
+    # frontend polls /api/snapshot on a tier-gated cadence (ADR 1123) so one open
+    # browser tab is a standing load for as long as it stays open.
+    #
+    # Compression is NEGOTIATED: a client that sends no Accept-Encoding
+    # it can satisfy gets the identity encoding, so this cannot break a
+    # consumer that does not understand it.
+    #
+    # EXCLUSIONS, and why each one is here:
+    #   text/event-stream — SSE. A compressor buffers to fill a window,
+    #     and buffering an event stream delays exactly the events the
+    #     stream exists to deliver promptly. The portal's SSE route is
+    #     the majority of what Traefik counts against `portal`. Never
+    #     remove this line.
+    #   application/grpc — Traefik excludes it by default; named here so
+    #     a future edit to this list cannot silently drop it. The signal
+    #     server holds a gRPC stream per peer.
+    #   The already-compressed media types: spending CPU to re-compress
+    #     a PNG or a gzip costs bytes rather than saving them.
+    goat-compress:
+      compress:
+        # Below this, the encoding header costs more than the body saves.
+        minResponseBodyBytes: {{ goat_compress_min_bytes | default(1024) }}
+        excludedContentTypes:
+          - text/event-stream
+          - application/grpc
+          - image/png
+          - image/jpeg
+          - image/webp
+          - image/gif
+          - application/zip
+          - application/gzip
+          - application/octet-stream
+
+    # F-080 — netbirdio/dashboard's `/` route doesn't hydrate post-OIDC.
+    # Redirect bare `/` → `/access-control` at Traefik so the workaround
+    # survives every dashboard container churn.
+    dashboard-root-to-access-control:
+      redirectRegex:
+        regex: "^(https?://[^/]+)?/?$"
+        replacement: "${1}/access-control"
+        permanent: false
+
+    # The guide host serves exactly ONE path, so a bare visit to the hostname
+    # would 404 — and the hostname is the memorable part, so people type it.
+    # Redirect / to the page instead of showing them a dead end.
+    guide-root-to-onboarding-guide:
+      redirectRegex:
+        regex: "^(https?://[^/]+)?/?$"
+        replacement: "${1}/public/onboarding-guide"
+        permanent: false
+
+    # mesh-only-allowlist — restrict access to peers in the netbird mesh.
+    # Mesh peers arrive on the mgmt host's netbird interface with a source IP in
+    # 100.64.0.0/10 (the netbird default CGNAT pool). On-host containers
+    # (oauth2-proxy-isitup, panoscope reaching portal.<site>.*, future
+    # grafana-OIDC-proxy etc) need access to OIDC-discovery endpoints on
+    # Traefik from inside the host's Docker bridge networks — those
+    # source IPs land in RFC1918 172.16.0.0/12.
+    # Trust shape: a container running on the mgmt host IS the mgmt host; the mesh-only
+    # invariant is about external traffic, not on-host loopback-through-
+    # bridge.
+    #
+    # Excluding 127.0.0.1 does NOT make the public rathole path 403.
+    # rathole-client (systemd-native on the mgmt host) connects to a local
+    # port to forward relay-tunneled bytes, and Docker's iptables MASQUERADE
+    # rule on host-to-published-port traffic SNATs the source to the bridge
+    # gateway IP (172.x.0.1), which matches the 172.16/12 entry above and
+    # DEFEATS the gate. So rathole-client forwards to 127.0.0.1:8443, a
+    # dedicated `enrollment` Traefik entrypoint that only signal + mgmt-public
+    # attach to. The middleware here stays as defense-in-depth — if a config
+    # error attaches a mesh-only router to the enrollment entrypoint, this
+    # allowlist 403s the public-via-rathole traffic since its source
+    # (172.x.0.1) isn't in 100.64.0.0/10 (mesh) — but the entrypoint split is
+    # what closes the bypass.
+    #
+    # Referenced as `mesh-only-allowlist@file` from panoscope +
+    # goat-zenoh-portal Traefik configs so those surfaces inherit
+    # the gate without duplicating the rule.
+    # F-420 defense-in-depth: goat-id-console trusts X-Forwarded-* for identity
+    # (actorFromHeaders), which is safe ONLY behind the oauth2-proxy that strips
+    # client-supplied copies. The three id-admin-console-onboard routers reach
+    # :8080 WITHOUT that proxy, so they must scrub the family themselves.
+    scrub-forwarded-identity:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Groups: ""
+          X-Forwarded-User: ""
+          X-Forwarded-Email: ""
+          X-Forwarded-Preferred-Username: ""
+
+{% if probation_explainer_enabled | default(false) | bool %}
+    # ADR 1089: every browser document request on the mesh asks the console
+    # whether the connection-derived source address belongs to a current,
+    # internally consistent dormancy hold. trustForwardHeader=false is
+    # load-bearing: client-supplied forwarding headers never become identity.
+    goat-probation-gate:
+      forwardAuth:
+        address: "http://goat-id-console:8080/internal/probation/auth"
+        trustForwardHeader: false
+{% endif %}
+
+{% if netbird_dashboard_split_enabled | default(false) | bool %}
+    # Mesh change control (docs/design/mesh-change-control.md §2, ADR 1189):
+    # the catch-all refusal for mgmt-read.<site>, and for group writes and
+    # non-/api/ paths on mgmt-admin.<site>. No request can come from
+    # 255.255.255.255, so every request this middleware sees gets 403.
+    mgmt-read-refuse:
+      ipAllowList:
+        sourceRange:
+          - "255.255.255.255/32"
+
+{% endif %}
+    mesh-source-allowlist:
+      ipAllowList:
+        sourceRange:
+          - "100.64.0.0/10"  # netbird CGNAT — mesh peers
+          - "172.16.0.0/12"  # RFC1918 Docker bridge — on-host containers
+{% for cidr in mesh_only_allowlist_extra_cidrs | default([]) %}
+          - "{{ cidr }}"  # extra source (mesh_only_allowlist_extra_cidrs)
+{% endfor %}
+
+    # Browser/application routers use this chain. Connectivity-critical
+    # NetBird management, signal and Ory identity routers use
+    # mesh-source-allowlist directly, so a console or hold-record outage cannot
+    # break control-plane or identity-plane reachability. The requested
+    # application still carries this chain, so bypassing the explainer on Ory
+    # does not restore application access for a held peer.
+    mesh-only-allowlist:
+      chain:
+        middlewares:
+          - mesh-source-allowlist
+{% if probation_explainer_enabled | default(false) | bool %}
+          - goat-probation-gate
+{% endif %}
+{#
+  mesh_only_allowlist_extra_cidrs (default []) — additional source CIDRs a
+  goatnet may need to admit through the mesh-only gate. Motivating case: the
+  goat-client-assay env, where enrollment rides the websecure apex (no
+  rathole/enrollment-entrypoint split) and the not-yet-enrolled peers arrive
+  from their NAT-gateway /32 — without an entry here every gRPC login 403s
+  before a peer can ever join the mesh (hit on the assay first bringup,
+  2026-07-31). Keep entries /32-narrow and per-env (group_vars or -e); this
+  is a widening of a security gate, never a place for 0.0.0.0/0.
+#}
+
+  routers:
+    signal:
+      priority: 100
+      rule: "Host(`{{ public_mgmt_fqdn }}`) && PathPrefix(`/signalexchange.SignalExchange/`)"
+      # F-153: pinned to the enrollment entrypoint EXCLUSIVELY (the
+      # rathole-tunneled forwarding target on the mgmt host, host-bound to
+      # 127.0.0.1:8443). This router is the only public-internet-
+      # reachable signal-server surface; new peers' first contact
+      # arrives here. Mesh peers don't use this hostname for signal
+      # (they go peer-to-signal-server directly).
+      entryPoints:
+        - enrollment
+      service: signal
+      tls:
+        certResolver: le
+        # PUBLIC-ONLY cert anchor — Traefik mints ONE LE cert containing
+        # ONLY netbird.<zone> (the enrollment hostname). No
+        # mesh-only hostnames live in this cert's SAN list, so an off-mesh
+        # TLS handshake against the public DNS name can't enumerate
+        # internal surfaces via the cert.
+        domains:
+          - main: {{ public_mgmt_fqdn }}
+
+    # Websecure twins of the two enrollment-entrypoint apex routers
+    # (mesh-control-path plan Phase 1, F-255): enrolled peers resolve the
+    # enrollment apex via mesh DNS to the Thor's MESH IP and arrive on the
+    # websecure entrypoint — on-site peers reach control over LAN+mesh, and
+    # the control plane stops transiting WAN→relay→rathole when the mesh
+    # path is up. The mesh-only bypass is PUBLIC
+    # rathole-SNAT traffic reaching websecure; these routers serve
+    # MESH-SOURCE traffic and keep the mesh-only allowlist — the inverse
+    # case. Public traffic still cannot reach websecure at all (site is
+    # CGNAT; rathole forwards only to 127.0.0.1:8443, the enrollment
+    # entrypoint). Neither router declares tls.domains — the apex hostname
+    # is already anchored on signal's public cert (declare-once rule in
+    # the header) and both SNI-match it.
+    signal-mesh-apex:
+      priority: 100
+      rule: "Host(`{{ public_mgmt_fqdn }}`) && PathPrefix(`/signalexchange.SignalExchange/`)"
+      entryPoints:
+        - websecure
+      service: signal
+      middlewares:
+        - mesh-source-allowlist
+      tls:
+        certResolver: le
+
+    mgmt-mesh-apex:
+      priority: 10
+      rule: "Host(`{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: mgmt
+      middlewares:
+        - mesh-source-allowlist
+      tls:
+        certResolver: le
+
+{% if signal_federation_ingress_enabled | default(false) %}
+    # mesh-control-path Phase 3 (ADR 1085 Amendment 1) — public federation
+    # fallback ingress. The PEER mgmt host's federation-proxy dials a relay
+    # with SNI {{ signal_federation_ingress_fqdn }}; the relay dispatcher
+    # (haproxy-ingress) pins that hostname to THIS host's rathole tunnel;
+    # TLS terminates here and the gRPC stream h2c-forwards to the local
+    # signal-server. The Host() match works because the peer's signal
+    # sets SIGNAL_FEDERATION_AUTHORITY to this hostname (its default h2
+    # :authority would be its local proxy alias) — keeping the federation
+    # surface reachable ONLY under its dedicated hostname, not via the
+    # apex/intake SNIs that land on the same entrypoint. Authz is the
+    # bearer token enforced in-process by signal-server (fedauth.go;
+    # mirrors the relay-metrics-ingest token pattern), so NO
+    # mesh-only-allowlist here — the caller arrives via the public relay
+    # path by design. Priority 95: above the mgmt-public catch-all
+    # (pri 10); signal (pri 100) needs the apex Host so never collides.
+    signal-federation:
+      priority: 95
+      rule: "Host(`{{ signal_federation_ingress_fqdn }}`) && PathPrefix(`/signalfederation.SignalFederation/`)"
+      entryPoints:
+        - enrollment
+      service: signal
+      tls:
+        certResolver: le
+        # Own cert anchor — the federation hostname appears on no other
+        # router, so the declare-once rule in the header holds.
+        domains:
+          - main: {{ signal_federation_ingress_fqdn }}
+{% endif %}
+
+    kratos-api:
+      priority: 100
+      rule: >
+        Host(`auth.{{ site_id }}.{{ public_mgmt_fqdn }}`) &&
+        (PathPrefix(`/sessions`) ||
+         PathPrefix(`/self-service`) ||
+         PathPrefix(`/.well-known`) ||
+         PathPrefix(`/schemas`) ||
+         PathPrefix(`/health`))
+      entryPoints:
+        - websecure
+      service: kratos-api
+      middlewares:
+        - mesh-source-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+
+    selfservice:
+      priority: 10
+      rule: "Host(`auth.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: selfservice
+      middlewares:
+        - mesh-source-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+
+    hydra:
+      priority: 50
+      rule: "Host(`oauth2.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: hydra
+      middlewares:
+        - mesh-source-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+
+    dashboard:
+      priority: 50
+      rule: "Host(`dashboard.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: dashboard
+      tls:
+        certResolver: le
+        # MESH-ONLY cert anchor — second LE cert, disjoint from signal's
+        # public cert. Mesh-only routers (mgmt's `mgmt.<site>.*` alternate,
+        # kratos-api, selfservice, hydra, grafana, isitup,
+        # brief) SNI-match against this cert. Since these hostnames don't
+        # exist in public Cloudflare DNS (mesh CoreDNS only), only mesh peers
+        # ever request them and only mesh peers ever see this SAN list.
+{# The mesh-only certificate's names, collected first and emitted once.
+
+   Every name a mesh-only router on this host serves goes into _mesh.names:
+   the fixed surfaces (dashboard, auth, oauth2, mgmt, grafana), each optional
+   surface whose flag is on, and every external service (ADR 1178).
+
+   External services are NOT one SAN per hostname: a certificate holds at most
+   100 names, and a goatnet hosting hundreds of services would hit that and
+   fail renewal for every name on this cert. With
+   external_service_wildcard_cert on (the default), the request carries
+     *.<site>.<zone>            covering every single-label name under the site,
+                                present and future (it also stops the cert
+                                enumerating internal hostnames, the 2026-05-16
+                                pen-test point), and
+     *.<name>.<site>.<zone>     one per `tls: edge` service that nests a
+                                hostname (<surface>.<name>; one level deep).
+   A `tls: partner` service adds nothing: its names resolve to the partner's
+   host, which presents its own certificate.
+
+   Let's Encrypt refuses an order that lists a name together with a wildcard
+   that already covers it ("is redundant with a wildcard domain in the same
+   request", #2149), so with the wildcard on the request is the wildcard as
+   `main` plus only the names it does not cover (more than one label under
+   the site, e.g. admin.auth.<site>.<zone>). ops/ci/check-acme-san-requests.sh
+   renders this file for every goatnet and fails on any redundant name.
+
+   external_service_wildcard_cert: false restores the explicit per-hostname
+   list for one goatnet: the rollback, without reverting the template. #}
+{% set _site_zone = site_id ~ '.' ~ public_mgmt_fqdn %}
+{% set _wild = external_service_wildcard_cert | default(true) | bool %}
+{% set _mesh = namespace(names=[]) %}
+{% for _n in ['dashboard', 'auth', 'oauth2', 'mgmt'] %}
+{%   set _mesh.names = _mesh.names + [_n ~ '.' ~ _site_zone] %}
+{% endfor %}
+{% for _ext_var in (lookup('varnames', '^external_service_', wantlist=True) | sort) %}
+{%   set _ext = lookup('vars', _ext_var) %}
+{#   external_service_wildcard_cert itself matches the prefix; only mappings are services. #}
+{%   if _ext is mapping and (_ext.enabled | default(true) | bool) and (_ext.tls | default('edge')) == 'edge' %}
+{%     if _wild %}
+{%       if (_ext.hostnames | default([_ext.name])) | select('search', '\.') | list | length > 0 %}
+{%         set _mesh.names = _mesh.names + ['*.' ~ _ext.name ~ '.' ~ _site_zone] %}
+{%       endif %}
+{%     else %}
+{%       for _h in (_ext.hostnames | default([_ext.name])) %}
+{%         set _mesh.names = _mesh.names + [_h ~ '.' ~ _site_zone] %}
+{%       endfor %}
+{%     endif %}
+{%   endif %}
+{% endfor %}
+{# Mesh change control's two dashboard names (mesh-change-control.md §2). #}
+{% if netbird_dashboard_split_enabled | default(false) | bool %}
+{%   set _mesh.names = _mesh.names + ['admin-dashboard.' ~ _site_zone, 'mgmt-read.' ~ _site_zone] %}
+{%   if warrant_membership_enabled | default(false) | bool %}
+{%     set _mesh.names = _mesh.names + ['mgmt-admin.' ~ _site_zone] %}
+{%   endif %}
+{% endif %}
+{# Optional mesh-only surfaces: each role renders its own router to
+   /etc/traefik/dynamic/<name>.yml, which SNI-matches this certificate.
+   isitup (isitup-deploy.yml, via oauth2-proxy); brief and dataflows (static
+   nginx); saltlick (peering directory, mesh-only by decision D-14,
+   peering-directory-service.md); admin.auth (id-admin-console, ADMINS gate,
+   ADR 0860); relay-health (ADMINS gate, F-213); sandbox (zenoh-sandbox,
+   zenoh-sandbox.md); compliance (compliance-proxy, ADR 1029). #}
+{% for _flag, _name in [('isitup_enabled', 'isitup'), ('brief_enabled', 'brief'),
+                        ('dataflows_enabled', 'dataflows'), ('saltlick_enabled', 'saltlick'),
+                        ('id_admin_console_enabled', 'admin.auth'),
+                        ('relay_health_enabled', 'relay-health'),
+                        ('zenoh_sandbox_enabled', 'sandbox'),
+                        ('compliance_proxy_enabled', 'compliance')] %}
+{%   if lookup('vars', _flag, default=false) | bool %}
+{%     set _mesh.names = _mesh.names + [_name ~ '.' ~ _site_zone] %}
+{%   endif %}
+{% endfor %}
+{# The obs stack (Block 82B sub-block): Grafana behind Traefik on this cert. #}
+{% set _mesh.names = _mesh.names + ['grafana.' ~ _site_zone] %}
+{% if _wild %}
+{%   set _mesh_main = '*.' ~ _site_zone %}
+{%   set _mesh_sans = _mesh.names | reject('regex', '^[^.*]+\\.' ~ (_site_zone | regex_escape) ~ '$') | unique | list %}
+{% else %}
+{%   set _mesh_main = 'dashboard.' ~ _site_zone %}
+{%   set _mesh_sans = _mesh.names | reject('equalto', _mesh_main) | unique | list %}
+{% endif %}
+        domains:
+          - main: "{{ _mesh_main }}"
+{% if _mesh_sans | length > 0 %}
+            sans:
+{%   for _s in _mesh_sans %}
+              - "{{ _s }}"
+{%   endfor %}
+{% endif %}
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+        - dashboard-root-to-access-control
+
+    # Router SPLIT — same backend (mgmt service), disjoint hostname rules
+    # so Traefik mints clean per-cert SANs and so the mesh-only allowlist
+    # can apply to the mesh-alias hostname without blocking enrollment:
+    #
+    #   mgmt-public — Host(netbird.<zone>): public enrollment surface;
+    #                    SNI-matches the public cert (anchored by signal).
+    #                    No mesh-only-allowlist (peers reach this BEFORE
+    #                    they have a mesh IP).
+    #
+    #   mgmt-mesh   — Host(mgmt.<site>.<zone>): mesh-alias for the same
+    #                    backend; SNI-matches the mesh-only cert (anchored
+    #                    by dashboard, mgmt.<site> is in its SAN list).
+    #                    Carries `mesh-only-allowlist` so off-mesh
+    #                    requests get 403 before reaching the backend.
+    #
+    # The two stay split: a single `mgmt` router with rule
+    # `Host(netbird) || Host(mgmt.<site>.*)` and no explicit tls.domains makes
+    # Traefik auto-add BOTH hostnames to whatever cert it mints for the
+    # router — leaking the mesh alias into the public cert's SAN list visible
+    # to any off-mesh TLS client.
+    mgmt-public:
+      priority: 10
+      rule: "Host(`{{ public_mgmt_fqdn }}`)"
+      # F-153: pinned to the enrollment entrypoint EXCLUSIVELY (the
+      # rathole-tunneled forwarding target on the mgmt host, host-bound to
+      # 127.0.0.1:8443). This is the public-internet-reachable mgmt-API
+      # surface; peer enrollment + periodic config-refresh both ride
+      # this hostname. Mesh peers needing the management API by mesh
+      # identity use the `mgmt.<site>.<zone>` alias served by
+      # `mgmt-mesh` below — same backend (h2c://management-a:80),
+      # disjoint hostname rule + websecure entrypoint + mesh-only
+      # allowlist.
+      entryPoints:
+        - enrollment
+      service: mgmt
+      tls:
+        certResolver: le
+
+{% if relay_health_enabled | default(false) %}
+    # ADR 1058 — token-gated relay-metrics ingest. On the ENROLLMENT entrypoint
+    # so relays reach it via the rathole :443 path (relays aren't mesh peers →
+    # NO mesh-only-allowlist; the bearer token checked by the ingest service is
+    # the gate, not Traefik). Priority 90: matches /relay-metrics-ingest before
+    # the mgmt-public catch-all (pri 10), below signal (pri 100). Reuses
+    # the public enrollment hostname + cert — additive, enrollment untouched.
+    relay-metrics-ingest:
+      priority: 90
+      rule: "Host(`{{ public_mgmt_fqdn }}`) && PathPrefix(`/relay-metrics-ingest`)"
+      entryPoints:
+        - enrollment
+      service: relay-metrics-ingest
+      tls:
+        certResolver: le
+
+    # host-net ingest, MESH side (relay-health-dashboard.md §"Site network
+    # hosts"): site hosts publish HostNetHealthV1 to the on-Thor ingest over
+    # the mesh at relay-health.<site>.<zone>/host-net-ingest, so the PRIVATE
+    # dashboard's host band stores its own copy (the cloud twin is the
+    # outage-resilient vantage). Priority 100: matches before relay-health
+    # (pri 50), whose oauth2-proxy would 302 the tokened POST. Publishers are
+    # mesh peers → mesh-only-allowlist stays; the bearer token is the authz.
+    host-net-ingest:
+      priority: 100
+      rule: "Host(`relay-health.{{ site_id }}.{{ public_mgmt_fqdn }}`) && PathPrefix(`/host-net-ingest`)"
+      entryPoints:
+        - websecure
+      service: relay-metrics-ingest
+      middlewares:
+        - mesh-source-allowlist
+      tls:
+        certResolver: le
+
+    # zenoh router service-health ingest, MESH side: the
+    # Thor probes its local router and POSTs to the on-Thor ingest over the mesh
+    # at relay-health.<site>.<zone>/zenoh-health-ingest so the PRIVATE dashboard's
+    # zenoh band stores its own copy. Twin of host-net-ingest (same host,
+    # service, mesh-only gate); pri 100 so it matches before relay-health's
+    # oauth2-proxy would 302 the tokened POST.
+    zenoh-health-ingest:
+      priority: 100
+      rule: "Host(`relay-health.{{ site_id }}.{{ public_mgmt_fqdn }}`) && PathPrefix(`/zenoh-health-ingest`)"
+      entryPoints:
+        - websecure
+      service: relay-metrics-ingest
+      middlewares:
+        - mesh-source-allowlist
+      tls:
+        certResolver: le
+{% endif %}
+
+    mgmt-mesh:
+      priority: 10
+      rule: "Host(`mgmt.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: mgmt
+      middlewares:
+        - mesh-source-allowlist
+      tls:
+        certResolver: le
+{% if netbird_dashboard_split_enabled | default(false) | bool %}
+
+    # Mesh change control — two dashboard addresses (docs/design/
+    # mesh-change-control.md §2, ADR 1189). Rendered only where
+    # netbird_dashboard_split_enabled.
+    #
+    # mgmt-read — the everyday dashboard's API endpoint. Reads of the
+    # management API only: GET/HEAD/OPTIONS under /api/, forwarded to the same
+    # `mgmt` service mgmt.<site> uses. OPTIONS is the browser's CORS preflight.
+    # A person whose NetBird role could write still cannot write from
+    # dashboard.<site>, because nothing but a read reaches the server here.
+    mgmt-read:
+      priority: 60
+      rule: "Host(`mgmt-read.{{ site_id }}.{{ public_mgmt_fqdn }}`) && PathPrefix(`/api/`) && (Method(`GET`) || Method(`HEAD`) || Method(`OPTIONS`))"
+      entryPoints:
+        - websecure
+      service: mgmt
+      middlewares:
+        - mesh-source-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+
+    # Everything else on mgmt-read.<site> — POST/PUT/DELETE/PATCH, gRPC, any
+    # path outside /api/ — lands here and is answered 403 by mgmt-read-refuse
+    # before reaching any backend.
+    mgmt-read-refuse:
+      priority: 1
+      rule: "Host(`mgmt-read.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: noop@internal
+      middlewares:
+        - mgmt-read-refuse
+      tls:
+        certResolver: le
+
+{%   if warrant_membership_enabled | default(false) | bool %}
+    # mgmt-admin — the admin dashboard's API endpoint on a goatnet where
+    # warrant owns peer membership (mesh-change-control.md §2, ADR 1189).
+    # Everything under /api/ reaches the same `mgmt` service mgmt.<site> uses,
+    # EXCEPT a write to a group (POST/PUT/PATCH/DELETE on /api/groups or
+    # /api/groups/*): the converger would put such an edit back on its next
+    # pass, so the door refuses it up front instead of letting it silently
+    # revert. Membership changes go through ops/warrant/membership/<scope>.yaml.
+    mgmt-admin-refuse-groups-write:
+      priority: 70
+      rule: "Host(`mgmt-admin.{{ site_id }}.{{ public_mgmt_fqdn }}`) && (Path(`/api/groups`) || PathPrefix(`/api/groups/`)) && (Method(`POST`) || Method(`PUT`) || Method(`PATCH`) || Method(`DELETE`))"
+      entryPoints:
+        - websecure
+      service: noop@internal
+      middlewares:
+        - mgmt-read-refuse
+      tls:
+        certResolver: le
+
+    mgmt-admin:
+      priority: 60
+      rule: "Host(`mgmt-admin.{{ site_id }}.{{ public_mgmt_fqdn }}`) && PathPrefix(`/api/`)"
+      entryPoints:
+        - websecure
+      service: mgmt
+      middlewares:
+        - mesh-source-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+
+    # Anything on mgmt-admin.<site> outside /api/ (gRPC included; the admin
+    # dashboard's gRPC endpoint stays mgmt.<site>) is answered 403.
+    mgmt-admin-refuse:
+      priority: 1
+      rule: "Host(`mgmt-admin.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: noop@internal
+      middlewares:
+        - mgmt-read-refuse
+      tls:
+        certResolver: le
+
+{%   endif %}
+    # admin-dashboard — the write address: a second dashboard container
+    # pointed at the full API on mgmt.<site>, behind its own oauth2-proxy
+    # (NETBIRD-ADMIN only). Always routed through that fence: if the fence is
+    # not deployed this answers 502, never an unfenced dashboard.
+    dashboard-admin:
+      priority: 50
+      rule: "Host(`admin-dashboard.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: dashboard-admin
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+        - dashboard-root-to-access-control
+      tls:
+        certResolver: le
+{% endif %}
+
+    grafana:
+      priority: 50
+      rule: "Host(`grafana.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: grafana
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+
+{# External-service routers (ADR 1178). One router per enabled declaration.
+   mesh-only-allowlist is the edge's whole gate: identity is the SERVICE's
+   business (its own fence verifies the goatnet's tokens — `door` in the
+   declaration says what that fence decides), never this router's. #}
+{% for _ext_var in (lookup('varnames', '^external_service_', wantlist=True) | sort) %}
+{%   set _ext = lookup('vars', _ext_var) %}
+{#   `tls: partner` renders NO router: those names resolve straight to the
+     partner's mesh IP and they terminate TLS themselves. #}
+{%   if _ext is mapping and (_ext.enabled | default(true) | bool) and (_ext.tls | default('edge')) == 'edge' %}
+    {{ _ext.traefik_name | default('ext-' ~ _ext.name) }}:
+      priority: 50
+      rule: "Host({% for _h in (_ext.hostnames | default([_ext.name])) %}`{{ _h }}.{{ site_id }}.{{ public_mgmt_fqdn }}`{% if not loop.last %}, {% endif %}{% endfor %})"
+      entryPoints:
+        - websecure
+      service: {{ _ext.traefik_name | default('ext-' ~ _ext.name) }}
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+{%   endif %}
+{% endfor %}
+
+{% if id_admin_console_enabled | default(false) %}
+{%   if probation_explainer_enabled | default(false) | bool %}
+    # Reserved cross-host target for the probation explainer's form. The
+    # browser-router ForwardAuth explicitly admits this path; the handler then
+    # repeats source-IP classification and validates the current-hold token.
+    probation-reactivation-request:
+      priority: 10000
+      rule: "Path(`/__goat/probation/request`)"
+      entryPoints:
+        - websecure
+      service: id-admin-console-onboard
+      middlewares:
+        - mesh-source-allowlist
+      tls:
+        certResolver: le
+{%   endif %}
+    id-admin-console:
+      priority: 50
+      rule: "Host(`admin.auth.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: id-admin-console
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+    # Machine realm for the onboarding engine (docs/design/onboarding-extraction-plan.md).
+    # The console's /api/onboard/* is bearer-gated in-app (onboardAPIGate), so it
+    # is served on its OWN mesh host straight to the console — bypassing the
+    # oauth2-proxy admin fence, which 302-redirects a bearer token to login. This
+    # is the reachability the `goat admin invite`/`queue` CLI needs (the runner
+    # already reaches it container-to-container). PathPrefix confines this host to
+    # the machine realm; the human web surfaces stay only behind admin.auth.*.
+    # Mirrors the portal's old bearer /api/onboard/* exposure on portal.<site>.*.
+    # The onboarding guide — the post-mesh half of the welcome package
+    # (internal/welcome/guide.go). Its OWN mesh host rather than a path on
+    # onboard.<site>: that host is deliberately confined to the machine realm
+    # (see the note below it), and this is a human page. Un-gated on purpose —
+    # it carries no credential values and is identical for everyone at a tier,
+    # so mesh reachability IS the control. The PathPrefix keeps this host to
+    # exactly that page; nothing else on the console is exposed through it.
+    # Bare guide.<site> with no path — redirect to the page. Lower priority than
+    # the PathPrefix router above so it only catches what that one does not.
+    id-admin-console-guide-root:
+      priority: 50
+      # Without Path(`/`) this bare-Host router would catch EVERY path on
+      # guide.<site> and forward it to the console at :8080 with NO oauth2
+      # fence, so a mesh peer with a forged X-Forwarded-Groups could reach adminGate.
+      rule: "Host(`guide.{{ site_id }}.{{ public_mgmt_fqdn }}`) && Path(`/`)"
+      entryPoints:
+        - websecure
+      service: id-admin-console-onboard
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+        - scrub-forwarded-identity
+        - guide-root-to-onboarding-guide
+      tls:
+        certResolver: le
+    id-admin-console-guide:
+      priority: 51
+      rule: "Host(`guide.{{ site_id }}.{{ public_mgmt_fqdn }}`) && PathPrefix(`/public/onboarding-guide`)"
+      entryPoints:
+        - websecure
+      service: id-admin-console-onboard
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+        - scrub-forwarded-identity
+      tls:
+        certResolver: le
+    id-admin-console-onboard:
+      priority: 51
+      # ADR 1147 item 4. PathPrefix(`/api/onboard/`) alone would leave every
+      # other machine-realm route on this host answering Traefik's bare
+      # `404 page not found` before the console is ever reached -- which
+      # `goat admin org tree|update` then renders as "ORG_MATCH_ENABLED off", a
+      # sentence that is false wherever the flag is on. Traefik v3 takes one
+      # argument per PathPrefix, so these
+      # compose with || (same style as the kratos-api router below).
+      #
+      # The auth boundary does NOT move: all three families register through the
+      # same middleware wrapper as /api/onboard/* (handlers.go:355-377) -- the
+      # machine-realm gate -- and org-registry mutations are operator-only,
+      # enforced in the handlers. This changes reachability only.
+      rule: >
+        Host(`onboard.{{ site_id }}.{{ public_mgmt_fqdn }}`) &&
+        (PathPrefix(`/api/onboard/`) ||
+         PathPrefix(`/api/org-registry/`) ||
+         PathPrefix(`/api/users/`))
+      entryPoints:
+        - websecure
+      service: id-admin-console-onboard
+      middlewares:
+        - mesh-only-allowlist
+        - scrub-forwarded-identity
+      tls:
+        certResolver: le
+{% endif %}
+{% if relay_health_enabled | default(false) %}
+    relay-health:
+      priority: 50
+      rule: "Host(`relay-health.{{ site_id }}.{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: relay-health
+      middlewares:
+        - mesh-only-allowlist
+        - goat-ratelimit
+      tls:
+        certResolver: le
+{% endif %}
+
+  services:
+    signal:
+      loadBalancer:
+        servers:
+          # signal-server container in the mgmt-host compose project. Service
+          # name `signal-a` resolves on the `mgmt` Docker network; bound to
+          # `:10000` per the compose `--grpc-addr=:10000` flag. h2c upstream
+          # for HTTP/2 cleartext gRPC framing.
+          - url: "h2c://signal-a:10000"
+
+    kratos-api:
+      loadBalancer:
+        servers:
+          # Kratos public API (per docker-compose.ory.yml). Plain HTTP
+          # upstream — Kratos doesn't speak gRPC; standard HTTP/1.1 fine.
+          - url: "http://kratos:4433"
+
+    selfservice:
+      loadBalancer:
+        servers:
+          # Ory selfservice-ui-node container renders the login/registration/
+          # error/recovery/verification/settings HTML forms and calls Kratos
+          # server-to-server. Catches everything on auth.<site>.* that's not a
+          # Kratos API path (the priority-100 kratos-api router above).
+          - url: "http://selfservice-ui:3000"
+
+    hydra:
+      loadBalancer:
+        servers:
+          # Hydra public OAuth2 endpoint (per docker-compose.ory.yml).
+          - url: "http://hydra:4444"
+
+    dashboard:
+      loadBalancer:
+        servers:
+{% if dashboard_oauth2_proxy_enabled | default(false) %}
+          # L7 admin-fence (Block 83C.2-L7) — oauth2-proxy-dashboard sidecar
+          # gates the dashboard on the ADMINS Kratos group claim before
+          # forwarding to dashboard:80.
+          # Deployed by the dashboard oauth2-proxy play; the sidecar
+          # itself sets OAUTH2_PROXY_UPSTREAMS=http://dashboard:80 so the
+          # netbirdio/dashboard container is still the eventual destination.
+          - url: "http://oauth2-proxy-dashboard:4180"
+{% else %}
+          # netbirdio/dashboard container (nginx-served React SPA, :80).
+          # Direct upstream — any authenticated Kratos identity reaches the
+          # SPA. Site-specific gate (e.g. ADMINS-only) lands by setting
+          # dashboard_oauth2_proxy_enabled: true and re-applying this
+          # template + the dashboard oauth2-proxy play.
+          - url: "http://dashboard:80"
+{% endif %}
+
+{% if netbird_dashboard_split_enabled | default(false) | bool %}
+    dashboard-admin:
+      loadBalancer:
+        servers:
+          # oauth2-proxy-dashboard-admin (dashboard-fence-deploy.yml play 2),
+          # which forwards to dashboard-admin:80 once the NETBIRD-ADMIN check
+          # passes.
+          - url: "http://oauth2-proxy-dashboard-admin:4180"
+
+{% endif %}
+    mgmt:
+      loadBalancer:
+        servers:
+          # netbird-mgmt container in the mgmt-host compose project. Service
+          # name `management-a` resolves on the `mgmt` Docker network.
+          #
+          # Scheme MUST be `h2c://` (HTTP/2 cleartext), NOT `http://`.
+          # netbird-mgmt's `:80` listener multiplexes both gRPC (HTTP/2 framing,
+          # e.g. ManagementService/GetServerKey + LoginPeer) and HTTP REST
+          # (`/api/...`) on the same port via cmux. Traefik defaults to
+          # forwarding HTTP/1.1 to the backend, which makes gRPC requests look
+          # like plain HTTP/1.1 to management-a — the Go server's HTTP/1.1
+          # mux has no handler for `/management.ManagementService/...` paths
+          # and returns plain `404 page not found`. The netbird daemon then
+          # bombs with `rpc error: code = Unimplemented ... received unexpected
+          # content-type "text/plain; charset=utf-8"`.
+          - url: "h2c://management-a:80"
+
+    grafana:
+      loadBalancer:
+        servers:
+          # Grafana container in the obs compose project, which is named
+          # <site_id>-obs at deploy from the one source tree.
+          # Shares the `mgmt` docker network so
+          # Traefik resolves the `grafana` service name without label-based
+          # discovery. Source: ops/compose/goat-obs/docker-compose.yml.
+          # Default is the container name, which works only when Grafana runs
+          # on THIS host and shares the `mgmt` network. On a three-Orin site
+          # the obs stack lives on its OWN host (ADR 0826), where that name
+          # resolves to nothing and Traefik answers 502. Point
+          # `grafana_backend_url` at the obs host's mesh address there.
+          - url: "{{ grafana_backend_url | default('http://grafana:3000') }}"
+
+{# External-service backends (ADR 1178). NOT container names: each is a mesh
+   IP + port on the host that runs the workload. Traefik terminates TLS here;
+   the hop is plain HTTP inside the WireGuard mesh. #}
+{% for _ext_var in (lookup('varnames', '^external_service_', wantlist=True) | sort) %}
+{%   set _ext = lookup('vars', _ext_var) %}
+{%   if _ext is mapping and (_ext.enabled | default(true) | bool) and (_ext.tls | default('edge')) == 'edge' %}
+    {{ _ext.traefik_name | default('ext-' ~ _ext.name) }}:
+      loadBalancer:
+        servers:
+          - url: "{{ _ext.backend_url }}"
+{%   endif %}
+{% endfor %}
+
+{% if id_admin_console_enabled | default(false) %}
+    id-admin-console:
+      loadBalancer:
+        servers:
+          # L7 admin-fence (ADR 0860) — oauth2-proxy-id-console sidecar
+          # gates admin.auth.<site>.<zone> on the ADMINS Kratos group claim
+          # before forwarding to goat-id-console:8080. Deployed via
+          # the id-admin-console play; the sidecar's
+          # OAUTH2_PROXY_UPSTREAMS points at http://goat-id-console:8080.
+          - url: "http://oauth2-proxy-id-console:4180"
+    id-admin-console-onboard:
+      loadBalancer:
+        servers:
+          # Straight to the console's bearer-gated machine realm — NO oauth2
+          # sidecar (the onboarding CLI presents a portal/operator key, not an
+          # Ory session). The console's onboardAPIGate is the auth boundary.
+          - url: "http://goat-id-console:8080"
+{% endif %}
+{% if relay_health_enabled | default(false) %}
+    relay-health:
+      loadBalancer:
+        servers:
+          # Admin gate — oauth2-proxy-relay-health sidecar gates
+          # relay-health.<site>.<zone> on the ADMINS group claim before
+          # forwarding to relay-health:80 (static dashboard). Deployed via
+          # relay-health-deploy.yml; the sidecar's OAUTH2_PROXY_UPSTREAMS
+          # points at http://relay-health:80.
+          - url: "http://oauth2-proxy-relay-health:4180"
+
+    # ADR 1058 — relay-metrics ingest backend (token-gated in-service, no oauth2).
+    relay-metrics-ingest:
+      loadBalancer:
+        servers:
+          - url: "http://relay-metrics-ingest:8090"
+{% endif %}
+
+{% if zenoh_door_ingress_enabled | default(false) %}
+# env-doors Tier 2 lane, first as-built instance (ADR 1117; env-doors.md
+# §"Tier 2"): an SNI-pinned mTLS TCP lane through the EXISTING relay ingress
+# to this goatnet's zenoh router — built for the CF-7 hosted aggregator's
+# cross-env leg (consistency-foundation.md §7.8 as-built).
+#
+# Path: client sidecar (door, TLS-wrap with an offline-CA client cert)
+#   → relay :443 (haproxy SNI pin {{ zenoh_door_ingress_fqdn }}, fail-closed
+#     to this host's rathole tunnel)
+#   → rathole → THIS Traefik's enrollment entrypoint
+#   → TCP router below: outer TLS terminates HERE with
+#     RequireAndVerifyClientCert (zenoh-door-mtls option above)
+#   → raw forward to the zenoh router's tls/:7447.
+#
+# The zenoh mTLS session rides INSIDE the lane unchanged end-to-end — the
+# router still sees and verifies the subscriber's own leaf; this layer only
+# decides who may reach the port at all. No AWS API in the connect path.
+# TCP routers with a HostSNI match take the connection before any HTTP
+# router, and only for this SNI — enrollment/signal/intake are untouched.
+tcp:
+  routers:
+    zenoh-door:
+      entryPoints:
+        - enrollment
+      rule: "HostSNI(`{{ zenoh_door_ingress_fqdn }}`)"
+      service: zenoh-door
+      tls:
+        certResolver: le
+        options: zenoh-door-mtls
+        # Own cert anchor — the hostname appears on no other router, so the
+        # declare-once rule in the header holds.
+        domains:
+          - main: {{ zenoh_door_ingress_fqdn }}
+
+  services:
+    zenoh-door:
+      loadBalancer:
+        servers:
+          # The zenoh router's TLS listener, addressed at the host's mesh IP
+          # (the same address remote subscribers dial — e.g. a cloud
+          # relay-health box, node_net_health_zenoh_endpoint). Container→own-
+          # host-IP traffic resolves locally; no new listener is opened.
+          - address: "{{ zenoh_door_backend_addr }}"
+{% endif %}

@@ -1,0 +1,36 @@
+---
+# traefik-refresh.yml — thin helper that re-renders the Traefik dynamic
+# config (and re-pushes certs) without re-running the rest of
+# site-bootstrap.yml. Useful when:
+#
+#   - A change lands in `ops/ansible/roles/traefik/` (template, defaults,
+#     or pre-flight) and you need it on the host now.
+#   - A cert was rotated via `ops/enrollment/cmd/cert-sign/` and you
+#     want to push the new leaf without bouncing the rest of the stack.
+#   - A `traefik_services` / `traefik_middlewares` edit lands in a
+#     site's group_vars and you want to roll it out.
+#
+# Traefik's `--providers.file.watch=true` picks up the rendered
+# dynamic.yml without a container restart, so this is safe to run
+# under traffic. The role's own pre-flight asserts cert/key files
+# exist on the operator laptop and that every middleware referenced
+# by a service is defined.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i inventory/hosts.ini -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     traefik-refresh.yml -e site_id=vega
+#
+# Add `-l mgmt-vega-01-orin` to scope to a single host inside the
+# site (skip Router-B passive per ADR 1010 D1, etc.).
+
+- name: traefik-refresh — re-render dynamic config + re-push certs
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Apply traefik role
+      ansible.builtin.import_role:
+        name: traefik
+      when: has_mgmt_api | default(false) | bool

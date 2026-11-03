@@ -1,0 +1,32 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-time-health roll-up on nova-a (ADR 1036/1037, F-184 —
+# docs/design/environment-health-surface.md, the time domain). Subscribes
+# ops/time/attest/** and publishes ops/time/health/<site>. Persists nothing.
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       time-health-deploy.yml
+#
+#   # ZAGROS sibling goatnet:  add  -e target=zagros_hosts
+#
+# Pre-flight (operator-side):
+#   1. zenoh-router Healthy on the target host.
+#   2. goat-ntp-health-pub deployed on the hosts (so ops/time/attest/** has data).
+#   3. Infra leaf cert + key minted (Subject CN=goat-time-health-trial-peer) at
+#      /opt/time-health/certs/time-health-{cert,key}.pem (ACL rule infra-w-time-health).
+#   4. goat-time-health image SHA-pinned in the role defaults + deploy-history.yml
+#      (replace the PENDING :latest placeholder with the built digest).
+#
+# Live-fire: `goat health --domain time` (when the consumer ships) or a live
+# subscriber on ops/time/health/<site> sees the per-site EnvHealthV1{domain:"time"}.
+
+- name: deploy goat-time-health roll-up on nova trial fabric (ADR 1036/1037, F-184)
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: time-health

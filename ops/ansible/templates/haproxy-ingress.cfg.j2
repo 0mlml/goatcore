@@ -1,0 +1,101 @@
+# {{ ansible_managed }}
+# haproxy — relay ingress dispatcher (ADR 1085).
+#
+# TLS-passthrough L4 dispatch of the relay's public :443 across N mgmt-host
+# rathole tunnels (docs/design/relay-ingress-dispatch.md). TLS terminates on
+# the mgmt-hosts (Traefik) — this layer never holds keys, matching the
+# relay/bridge L4-passthrough-only posture.
+
+global
+    log /dev/log local0 notice
+    maxconn {{ rathole_ingress_dispatch_maxconn | default(10000) }}
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    mode tcp
+    log global
+    option dontlognull
+    # Deliberately NO `option tcplog` — per-connection logs would grind the
+    # small relay disks under a busy mgmt-sync ingress (disk-full has killed
+    # SSM on these boxes before). Server UP/DOWN transitions still log.
+    timeout connect {{ rathole_ingress_dispatch_timeout_connect | default('5s') }}
+    timeout client {{ rathole_ingress_dispatch_timeout_client | default('300s') }}
+    timeout server {{ rathole_ingress_dispatch_timeout_server | default('300s') }}
+    # Long-lived gRPC streams (netbird mgmt sync, signal) ride the tunnel
+    # timeout once bytes flow both ways.
+    timeout tunnel {{ rathole_ingress_dispatch_timeout_tunnel | default('1h') }}
+
+# Local-only stats — SSM debugging vantage:
+#   curl -s http://127.0.0.1:{{ rathole_ingress_dispatch_stats_port | default(8404) }}/;csv
+listen stats
+    bind 127.0.0.1:{{ rathole_ingress_dispatch_stats_port | default(8404) }}
+    mode http
+    stats enable
+    stats uri /
+
+frontend public_ingress
+    bind 0.0.0.0:443
+    # Peek at the ClientHello for SNI pins; 5s covers slow dialers. Non-TLS
+    # junk (scanners) falls through to the balanced pool after the delay and
+    # dies at the backend TLS layer.
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+{% for b in rathole_ingress_backends %}
+{% for host in (b.sni_pin | default([])) %}
+    use_backend pin_{{ b.name }} if { req_ssl_sni -i {{ host }} }
+{% endfor %}
+{% endfor %}
+{% if signal_ingress_pin_enabled | default(false) %}
+    # ADR 1102 Decision A — per-relay signal home pin (DORMANT unless enabled).
+    # Signal has its own SNI ({{ signal_ingress_sni }}, distinct from the mgmt
+    # apex) so it is separable here; THIS relay pins it to its home-site backend
+    # instead of source-hashing across both. A peer's signal home = the site of
+    # the relay it connects through (ADR 1102). Enrollment / mgmt-sync / Ory-login
+    # stay in `balanced` (they need the fleet-wide-identical stickiness). Only the
+    # signal route varies per relay. Fail-closed like the other pins — no fallback.
+    use_backend pin_signal if { req_ssl_sni -i {{ signal_ingress_sni }} }
+{% endif %}
+    default_backend balanced
+
+# Balanced pool — consistent source-hash: identical config fleet-wide (same
+# server ids, weights, order) means EVERY relay maps a given client IP to the
+# SAME backend, so per-node session state that deliberately does not
+# replicate (Ory login flows / sessions / OAuth2 state — ADR 1010 D8) survives
+# DNS round-robin bouncing a client between relays. Mapping diverges only
+# when relays disagree about backend health — and then failover is the right
+# behavior anyway.
+#
+# check-ssl = full TLS handshake probe. A wedged rathole tunnel (TCP accepts,
+# ServerHello never comes — the F-213 signature) goes DOWN in ~fall×inter
+# seconds and traffic shifts to surviving backends; the rathole watchdog
+# separately restarts rathole-server to bring the wedged tunnel back.
+backend balanced
+    balance source
+    hash-type consistent
+{% for b in rathole_ingress_backends %}
+    server {{ b.name }} 127.0.0.1:{{ b.tunnel_port }} id {{ loop.index }} weight {{ b.weight | default(1) }} check check-ssl verify none inter 3s fall 3 rise 2
+{% endfor %}
+{% for b in rathole_ingress_backends %}
+{% if (b.sni_pin | default([])) | length > 0 %}
+
+# {{ b.name }} pin — hostnames whose backing state lives ONLY on {{ b.name }}
+# (single-writer surfaces). No fallback by design: fail closed rather than
+# serve a writer surface from a node that cannot take the write.
+backend pin_{{ b.name }}
+    server {{ b.name }} 127.0.0.1:{{ b.tunnel_port }} check check-ssl verify none inter 3s fall 3 rise 2
+{% endif %}
+{% endfor %}
+{% if signal_ingress_pin_enabled | default(false) %}
+{% set signal_backend_name = (signal_home_backend_by_relay | default({}))[inventory_hostname] | default(signal_ingress_default_backend | default('zagros-a')) %}
+{% set sb = (rathole_ingress_backends | selectattr('name', 'equalto', signal_backend_name) | list | first) %}
+
+# ADR 1102 Decision A — signal home for THIS relay ({{ inventory_hostname }}) is
+# {{ signal_backend_name }}. Resolved from signal_home_backend_by_relay (committed
+# relay->site map); tunnel_port looked up from rathole_ingress_backends by name so
+# there is one source of truth for the backend address. Fail-closed, no fallback.
+backend pin_signal
+    server {{ sb.name }} 127.0.0.1:{{ sb.tunnel_port }} check check-ssl verify none inter 3s fall 3 rise 2
+{% endif %}

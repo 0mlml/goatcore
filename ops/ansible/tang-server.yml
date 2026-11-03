@@ -1,0 +1,34 @@
+---
+# Block 65C — install Tang server on an A↔B mgmt-host pair.
+#
+# Each Orin runs Tang on its wg-cp0 address (per-host wg_cp0_address in
+# host_vars). The peer Orin's LUKS slot Clevis-binds to this Tang for
+# silent auto-unseal when the peer is up. ADR 0612 + ADR 0313 invariants:
+# wg-cp0-internal listener only; public Tang is rejected by pre-flight.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/mgmt-hosts.ini tang-server.yml \
+#       --limit <site>_hosts
+
+#   # any other site (a three-Orin set):
+#   ansible-playbook -i inventory/mgmt-hosts-mesh.ini tang-server.yml \
+#     -e target=<site>_hosts
+#
+# `target` is parametrized because Tang peer-unlock is the answer to "the site
+# power-cycled and nothing came back" at ANY site.
+
+- name: Block 65C — install Tang server on Orin mgmt-host pair
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  pre_tasks:
+    # goat-standup.sh runs this against the WHOLE site group before
+    # mgmt-host-luks.yml, so a host that serves no Tang (no
+    # tang_listen_address, no wg_cp0_address) is skipped, not failed.
+    - name: Skip hosts that declare no Tang listener
+      ansible.builtin.meta: end_host
+      when: (tang_listen_address | default(wg_cp0_address | default(''))) | length == 0
+  roles:
+    - role: tang-server

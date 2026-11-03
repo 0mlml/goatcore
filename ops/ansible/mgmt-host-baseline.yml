@@ -1,0 +1,401 @@
+---
+# mgmt-host-baseline.yml — generic OS baseline for any mgmt-host.
+#
+# Idempotent. Safe to re-run. Runs BEFORE mgmt-host-luks.yml and the per-site
+# bootstrap playbook. Encodes the OS-level prep that's identical across every
+# mgmt-host so each new site
+# bring-up reuses the same baseline rather than open-coding it.
+#
+# What it does:
+#   1. apt update + full-upgrade (catches up the latest security/kernel updates)
+#   2. apt autoremove (drops orphaned packages)
+#   3. Install Docker CE + Compose plugin (multi-arch; canonical container
+#      orchestrator per ADR 0207). Cloud envs ship with Docker; on-prem
+#      mgmt-hosts don't — installing here makes Docker a
+#      baseline guarantee for the per-site bootstrap playbook.
+#   4. Set hostname from inventory_hostname (Tegra default `tegra-ubuntu` →
+#      e.g. <mgmt-host>)
+#   5. Sync /etc/hosts (replace any references to the old hostname)
+#   6. Reboot if a reboot is required (kernel/lib update marker) — ONE node at
+#      a time, health-gated, in its own play (fleet-management.md §6.7 ADOPT 2)
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -l <mgmt-host> mgmt-host-baseline.yml
+#
+# Pre-requisites:
+#   - Run ops/scripts/seed-ssh-key.sh first (key auth + NOPASSWD sudo)
+#
+# Standard mgmt-host bring-up sequence (turnkey):
+#   1. ops/scripts/seed-ssh-key.sh "$USER@$HOST" <PASS_VAR>
+#   2. ansible-playbook -l <host> mgmt-host-baseline.yml
+#   3. ansible-playbook -l <host> mgmt-host-luks.yml
+#   4. ansible-playbook -l <host> <site>-bootstrap.yml -e ...
+# Each step is idempotent — re-running is safe.
+
+# ---------------------------------------------------------------------------
+# BLAST-RADIUS GATE. The plays below default to `mgmt_hosts`, an
+# umbrella group over EVERY goatnet's mgmt hosts, production included, and they apt-upgrade and reboot-wave what they resolve to.
+# An unnarrowed run is a fleet-wide operation, not a site bring-up.
+#
+# The same fan-out applies to mgmt-host.yml (see the `mgmt_host_target` comment
+# there). The safe behaviour must not depend on every caller remembering to narrow.
+#
+# So narrowing is asserted, not assumed. Declare scope with EITHER:
+#   -e target=<site>_hosts   (what goat-standup.sh and the importers pass)
+#   --limit <host-or-group>  (what the per-env bringup runbooks use)
+# `--limit all`, `--limit '*'` and `--limit mgmt_hosts` all name the fleet and
+# are NOT narrowings; a deliberate fleet-wide run says so: -e fleet_wide=true
+- name: "blast-radius gate — refuse an unnarrowed fleet-wide run"
+  # This play mirrors the working plays' `hosts:` rather than using `localhost`,
+  # because `--limit` applies to EVERY play: a localhost gate play resolves to
+  # zero hosts under any --limit and is silently skipped, and a gate that cannot
+  # run is not a gate. run_once + delegate_to keeps it to one local execution.
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  become: false
+  tasks:
+    - name: F-376 — the run must name one site, or declare itself fleet-wide
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.assert:
+        that:
+          - (target is defined and (target | string | length) > 0)
+            or (ansible_limit | default('') | string not in ['', 'all', '*', 'mgmt_hosts'])
+            or (fleet_wide | default(false) | bool)
+        fail_msg: >-
+          Unnarrowed run refused. Without `target`, or a `--limit` that
+          names something narrower than the fleet, this playbook resolves to the
+          umbrella group `mgmt_hosts` — every mgmt host on every goatnet,
+          production included — and it apt-upgrade and reboot-wave what they resolve to. Re-run with
+          `-e target=<site>_hosts` (e.g. `-e target=zagros_prod_hosts`) or
+          `--limit <host>`. If a fleet-wide run really is what you want, say it
+          out loud: `-e fleet_wide=true`.
+        success_msg: >-
+          scope declared —
+          {{ 'target=' ~ target if target is defined
+             else ('--limit ' ~ ansible_limit
+                   if ansible_limit | default('') | string | length > 0
+                   else 'fleet_wide=true (deliberate)') }}
+
+- name: mgmt-host baseline (apt upgrade + hostname + Docker + reboot if required)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    # apt-upgrade BEFORE installing Docker so the docker-engine role lands on
+    # an upgraded base (security patches, kernel, glibc).
+    - name: Refresh apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 600
+
+    - name: Apply full-upgrade (security + kernel)
+      ansible.builtin.apt:
+        upgrade: full
+      register: apt_full_upgrade
+
+    - name: Autoremove orphaned packages
+      ansible.builtin.apt:
+        autoremove: true
+
+  roles:
+    # Docker Compose is the canonical container orchestrator (ADR 0207). Cloud
+    # envs come with Docker via AMI, on-prem mgmt-hosts
+    # don't — installing here as part of the baseline so the per-site bootstrap
+    # playbook can rely on Docker being present.
+    - role: docker-engine
+
+    # ADR 1081 Layer 3 — host-local WAN-egress shaping (cake/BBR + control-
+    # plane priority). Behind `egress_shaping_enabled` (default OFF), so a
+    # plain baseline run is a no-op; enabled per-host only after the tc-netem
+    # canary gate. HOST-LOCAL egress only — NOT fabric QoS (ADR 1033 boundary).
+    # roles/egress-shaping/README.md.
+    - role: egress-shaping
+
+    # NetBird boot-wedge self-heal. Every mgmt host runs netbird as a
+    # mesh peer, and stock netbird.service waits only on network.target — so a
+    # reboot can start netbird before the network is usable, wedging it at a
+    # handful of peers with no self-recovery. Behind `netbird_selfheal_enabled` (default OFF), so a plain
+    # baseline run is a no-op; enabled per host group in group_vars. Installs
+    # the network-online.target ordering drop-in + the wedge watchdog.
+    # roles/netbird-boot-selfheal + docs/design/netbird-boot-selfheal.md.
+    # Gated at the play level so the role (and its rollback-ledger meta-dep)
+    # only runs where a group enables it — no audit-ledger noise on hosts where
+    # it's a no-op.
+    - role: netbird-boot-selfheal
+      when: netbird_selfheal_enabled | default(false) | bool
+
+    # netbird CLIENT version pin. Behind `netbird_version` (default empty =
+    # no-op); set per host group. Reinstalls the pinned STOCK package when the
+    # RUNNING binary's version string differs (a hand-copied binary is
+    # invisible to dpkg) and apt-holds so upgrades can't
+    # float the client. Standalone leg: netbird-client-pin-deploy.yml.
+    # NOTE: an actual pin change bounces the netbird daemon (~10-30s mesh blip).
+    - role: netbird-client-pin
+      when: (netbird_version | default('')) | length > 0
+
+  tasks:
+
+    # F-182 — general fix for the mesh-IP bind boot race. A container whose
+    # host-port publish is pinned to the netbird mesh IP (e.g. the Zenoh
+    # trial router on wt0) can't bind at boot, because Docker (re)starts
+    # unless-stopped containers before the netbird daemon has enrolled and
+    # assigned the mesh IP to wt0 — the publish fails "cannot assign
+    # requested address" and the container exits 255. Docker can't simply be
+    # ordered after the mesh IP (the IP depends on netbird enrolling against
+    # the netbird-mgmt *container*, so gating docker on it deadlocks).
+    # ip_nonlocal_bind lets docker-proxy bind the address before it exists on
+    # any interface (the keepalived/HAProxy VIP pattern); once netbird brings
+    # wt0 up, inbound packets route to the already-bound socket. Host-wide, so
+    # every present + future mesh-IP-pinned container is covered with no
+    # per-service unit. Applied by systemd-sysctl early in boot, before docker.
+    - name: F-182 — allow binding the netbird mesh IP before it's assigned (nonlocal bind)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/30-netbird-nonlocal-bind.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # F-182 — mesh-IP bind boot-race fix. Lets a socket bind the netbird
+          # mesh IP (wt0) before netbird has assigned it at boot, so Docker
+          # host-port publishes pinned to the mesh IP don't fail with EADDRNOTAVAIL.
+          net.ipv4.ip_nonlocal_bind = 1
+          net.ipv6.ip_nonlocal_bind = 1
+      register: nonlocal_bind_sysctl
+
+    # bringup-access-invariant — the golden path must never hand back a box the
+    # operator who built it can't log into. Seed the platform-admin roster into
+    # the booted-OS login authorized_keys (the dropbear initramfs gets the same
+    # roster via the dropbear-initramfs role). Fail CLOSED on an empty roster —
+    # that is exactly what produced the delta-obs-b lockout. Source: group_vars/all.yml.
+    - name: "access invariant — the platform-admin roster must be non-empty"
+      ansible.builtin.assert:
+        that: (admin_authorized_keys | length) > 0
+        fail_msg: >-
+          admin_authorized_keys is empty — refusing to build a host with no
+          platform-admin access seeded (the delta-obs-b lockout). Set
+          PLATFORM_ADMIN_SSH_PUBKEYS (newline-delimited) in
+          .envrc.local.d/45-platform-admin-keys.envrc and re-run.
+
+    - name: "access invariant — seed platform-admin roster into booted-OS authorized_keys"
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user | default('goat') }}"
+        key: "{{ item }}"
+        state: present
+        exclusive: false   # additive — never wipe the bootstrap key
+      loop: "{{ admin_authorized_keys }}"
+
+    - name: F-182 — apply nonlocal-bind sysctl now (no reboot needed)
+      # Apply ONLY this drop-in — NOT `sysctl --system`. `--system` re-applies
+      # every /etc/sysctl.d/*.conf and exits non-zero if ANY unrelated key is
+      # absent on this kernel. A golden-image `10-bufferbloat.conf` setting
+      # net.core.default_qdisc (absent on the JetPack 7 Tegra kernel) made the
+      # whole step fail for an unrelated reason. Loading just our file is the correct scope for this task
+      # and robust to foreign sysctl drop-ins. boot-time application is via
+      # systemd-sysctl, which tolerates individual missing keys (unlike the CLI).
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/30-netbird-nonlocal-bind.conf
+      changed_when: false
+      when: nonlocal_bind_sysctl is changed
+
+    - name: Ensure systemd-resolved is enabled (DNS sanity for downstream plays)
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        enabled: true
+        state: started
+
+    # F-250 — a mgmt-host is a headless appliance; a short power-button press
+    # must NOT reboot it. logind's default HandlePowerKey=poweroff means a
+    # stray/bumped/flaky ACPI power event takes down the whole site control
+    # plane, forcing the entire mesh to re-pair each time. Ignore the short press fleet-wide; a long
+    # press still powers off as the deliberate operator safety valve. Applies
+    # to every mgmt-host regardless of arch.
+    - name: F-250 — ensure logind.conf.d drop-in directory exists
+      # A stock flash has no /etc/systemd/logind.conf.d — copy alone fails
+      # ("Destination directory does not exist").
+      ansible.builtin.file:
+        path: /etc/systemd/logind.conf.d
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: F-250 — logind must ignore a short power-button press (appliance safety)
+      ansible.builtin.copy:
+        dest: /etc/systemd/logind.conf.d/10-ignore-powerkey.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # F-250 — a headless mgmt appliance must not reboot on a stray/bumped/
+          # flaky power-button press (it takes down the site control plane +
+          # re-storms the mesh). Short press ignored; long press still powers
+          # off (deliberate operator action). Use `sudo shutdown` to power off.
+          [Login]
+          HandlePowerKey=ignore
+          HandlePowerKeyLongPress=poweroff
+      register: logind_powerkey
+
+    - name: F-250 — reload logind so the power-key override takes effect now
+      # Safe on a live host: restarting systemd-logind does not drop existing
+      # SSH sessions (sshd owns them), only re-reads seat/session config.
+      ansible.builtin.systemd:
+        name: systemd-logind
+        state: restarted
+      when: logind_powerkey is changed
+
+    - name: F-231 — ensure journald.conf.d drop-in directory exists
+      # Same stock-flash gap as the logind drop-in above: no journald.conf.d
+      # exists until something creates it, and `copy` alone fails.
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: F-231 — journald must survive a reboot (makes the next outage RCA-able)
+      # THE GAP THIS CLOSES: journald defaults to volatile storage, so the kernel
+      # log does not survive a reboot — and the one record that would name the
+      # cause of an abrupt reset (panic? watchdog? power? disk?) dies with it.
+      # Without this an abrupt reset cannot be root-caused, and a remediation applied
+      # by hand on one host never reaches a goatnet stood up afterwards.
+      #
+      # SystemMaxUse is capped deliberately. Persistent journals live on the
+      # root filesystem (eMMC — Docker's data-root is on the NVMe per F-093),
+      # and an uncapped journal that fills root wedges the host. Trading a
+      # bounded log for an unbounded one is not an improvement.
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/10-persistent.conf
+        mode: "0644"
+        owner: root
+        group: root
+        content: |
+          # F-231 — a host that cannot explain its own last reboot cannot be
+          # root-caused. Persist the journal, but bound it: root is the eMMC.
+          [Journal]
+          Storage=persistent
+          SystemMaxUse={{ journald_system_max_use | default('2G') }}
+          SystemKeepFree={{ journald_system_keep_free | default('1G') }}
+          MaxRetentionSec={{ journald_max_retention | default('30day') }}
+      register: journald_persistent
+
+    - name: F-231 — create /var/log/journal so persistence takes effect
+      # systemd creates this itself on restart when Storage=persistent, but
+      # doing it explicitly means the directory (and therefore the behaviour)
+      # is asserted by this play rather than assumed as a side effect.
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: directory
+        mode: "2755"
+        owner: root
+        group: systemd-journal
+
+    - name: F-231 — restart journald so persistence starts now, not next boot
+      # Safe on a live host: a brief gap in log capture, no service impact.
+      # Doing it now matters — the whole point is to be recording BEFORE the
+      # next unexplained event, and "next reboot" is exactly when we lose it.
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
+      when: journald_persistent is changed
+
+    - name: F-231 — verify the journal is actually persistent
+      # Assert, do not assume. F-231's remediation was believed live fleet-wide
+      # for six weeks while two goatnets had volatile journals.
+      ansible.builtin.command:
+        cmd: journalctl --header
+      register: journald_check
+      changed_when: false
+      failed_when: false
+
+    - name: F-231 — fail if the journal is still volatile
+      ansible.builtin.assert:
+        that:
+          - "'/var/log/journal' in journald_check.stdout | default('')"
+        fail_msg: >-
+          journald is still writing to /run (volatile) after configuring
+          Storage=persistent. The next reboot will erase the evidence of
+          whatever caused it. Check /etc/systemd/journald.conf.d/10-persistent.conf
+          and that /var/log/journal exists with group systemd-journal.
+        success_msg: "journald is persistent — logs will survive a reboot."
+
+    - name: Set hostname to inventory_hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+        use: systemd
+
+    - name: Ensure /etc/hostname matches inventory_hostname
+      ansible.builtin.copy:
+        content: "{{ inventory_hostname }}\n"
+        dest: /etc/hostname
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Ensure /etc/hosts has 127.0.1.1 line for inventory_hostname
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "^127\\.0\\.1\\.1\\s"
+        line: "127.0.1.1 {{ inventory_hostname }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+# A reboot is a wave of blast unit `node` against the site disruption budget —
+# the interim fix docs/design/fleet-management.md §6.7 ADOPT 2 names, which
+# FM-4 later subsumes with the declared budget and the wave machinery. Until
+# this play, the reboot below ran inside the play above with no serialization,
+# so a run against a three-Orin group (ADR 0826) rebooted the whole site at
+# once. `serial:` is a PLAY keyword with no block-level form, which is why the
+# reboot is its own play: the non-disruptive baseline above stays parallel and
+# only the disruption is serialized.
+- name: mgmt-host baseline — reboot wave (one node at a time, health-gated)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  # The gate stalls the wave rather than working around it: if a node does not
+  # come back healthy, the play stops there instead of rebooting the next one.
+  # A budget that a failure quietly steps past is not a budget.
+  any_errors_fatal: true
+
+  tasks:
+    - name: Probe whether a reboot is required (apt-leftover marker)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot the host if apt requested it
+      ansible.builtin.reboot:
+        msg: "Reboot requested by mgmt-host-baseline (apt full-upgrade)"
+        connect_timeout: 10
+        reboot_timeout: 600
+        post_reboot_delay: 30
+        test_command: "uptime"
+      when: reboot_required.stat.exists
+
+    - name: Health gate — this node is back before the next one reboots
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 600
+      when: reboot_required.stat.exists
+
+    - name: Final verification — kernel + hostname after baseline
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+      loop:
+        - "uname -r"
+        - "hostname"
+      register: baseline_verify
+      changed_when: false
+
+    - name: Print verification results
+      ansible.builtin.debug:
+        msg: "{{ item.cmd | join(' ') }} → {{ item.stdout }}"
+      loop: "{{ baseline_verify.results }}"
+      loop_control:
+        label: "{{ item.cmd | join(' ') }}"

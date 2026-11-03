@@ -1,0 +1,29 @@
+---
+# Deploy the CF-6 consistency console
+# (docs/design/consistency-foundation.md §7, ADR 1110 D5).
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini \
+#     consistency-console-deploy.yml -e target=zagros_hosts
+#
+# Default-off everywhere: the role's fail-closed assert refuses to run without
+# consistency_console_enabled and a digest-pinned image (no PENDING sentinel),
+# so this playbook is inert until a goatnet's group_vars opts in.
+#
+# Verify by BROWSING THE PAGE, not the logs: an empty grid saying
+# "nothing heard" after a deploy means the router ACL rule for the console's
+# subscribe subject is missing or the rollup meter
+# is not running. The pre-flight list is in the role's tasks/main.yml header.
+
+- name: consistency-console | the stateless projection over the consistency rollup
+  hosts: "{{ target | mandatory }}"
+  become: true
+  roles:
+    # The OAuth2 client MUST be registered before the fence that presents it
+    # (#2126: zagros-dev ran the fence against a client nothing registered).
+    - role: consistency-console-oidc-client
+      when:
+        - consistency_console_enabled | default(false) | bool
+        - consistency_console_oauth2_proxy_enabled | default(true) | bool
+    - consistency-console

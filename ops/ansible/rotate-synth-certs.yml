@@ -1,0 +1,240 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# rotate-synth-certs.yml — re-issue the synthetic publisher fleet's leaf
+# certs IN PLACE (ADR 1044 — credential rotation) without changing any
+# anchor. This is the rotate sibling of the synth-vendor deploy playbook:
+# that playbook ONBOARDS each peer (allocate slot + mint CN=anchor cert);
+# this one ROTATES each already-onboarded peer (re-mint a fresh leaf for
+# the SAME anchor), swaps the cert+key on the host, and restarts the
+# containers so they pick up the new leaf.
+#
+# WHY: a mint path that only allocates a new slot means changing an issued cert
+# (expiry renewal, post-compromise re-key, or retrofitting a new URI-SAN scheme)
+# takes delete + re-onboard to a NEW anchor — a teardown of identity.
+# Rotation re-derives the URI-SAN from the CURRENT portal minter config,
+# so certs come back on the current scheme with the same anchor, alias,
+# namespace, ACL.
+#
+# IDEMPOTENT-ish: rotation always mints a fresh leaf (that is the point),
+# so re-running re-rotates. The handle→anchor map (synth-anchors.json) is
+# READ ONLY here and never rewritten — rotation does not churn anchors.
+# A peer with no anchor in the map is skipped (onboard it first).
+#
+# PRE-FLIGHT (operator-side):
+#   1. The fleet is already deployed + onboarded (synth-anchors.json present
+#      on the target host) via the synth-vendor deploy playbook.
+#   2. PORTAL_OPERATOR_API_KEY in the controller env (sourced from
+#      the operator's secret references).
+#
+# RUN:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       rotate-synth-certs.yml -e target=<site>_hosts
+#
+# VERIFY AFTER: dump a rotated leaf's URI-SAN (panoscope/flashlight
+# source_info, or `openssl x509 -in <anchor>-cert.pem -text | grep URI`),
+# confirm the new scheme + the SAME anchor, and that the synth peer is
+# still publishing under <anchor>/** on a live subscriber.
+
+- name: rotate the synthetic publisher fleet's leaf certs in place
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    zagros_portal_url: "{{ portal_public_url }}"
+
+  tasks:
+    # synth_vendor_compose_dir / synth_vendor_cert_dir are zenoh-synth-vendors
+    # ROLE defaults. This playbook does not run that role (it only restarts the
+    # already-deployed fleet), so the role defaults never load. Resolve them via
+    # a self-referential default(): a group_vars override (if any) is kept; else
+    # fall back to the same literal the role defaults to. NOT in play vars (which
+    # would outrank a legitimate group_vars setting).
+    - name: rotate | resolve synth paths (role defaults are not loaded here)
+      ansible.builtin.set_fact:
+        synth_vendor_compose_dir: "{{ synth_vendor_compose_dir | default('/opt/synth-vendors', true) }}"
+        synth_vendor_cert_dir: "{{ synth_vendor_cert_dir | default('/opt/synth-vendors/certs', true) }}"
+
+    - name: rotate | derive the anchors-map path
+      ansible.builtin.set_fact:
+        synth_anchors_path: "{{ synth_vendor_compose_dir }}/synth-anchors.json"
+
+    - name: rotate | assert operator API key present (controller env)
+      ansible.builtin.assert:
+        that:
+          - lookup('env', (site_id | upper | replace('-', '_')) ~ '_PORTAL_OPERATOR_API_KEY') | length > 0
+        fail_msg: >-
+          PORTAL_OPERATOR_API_KEY is unset in the controller environment.
+          Source it from .envrc.local.d/30-site-services.envrc, then re-run.
+
+    # ---- read the durable handle→anchor map (authoritative, READ ONLY) -
+    - name: rotate | slurp the durable handle→anchor map
+      ansible.builtin.slurp:
+        src: "{{ synth_anchors_path }}"
+      register: synth_anchors_slurp
+      failed_when: false
+      check_mode: false
+
+    - name: rotate | parse the anchor map (fail if absent — onboard first)
+      ansible.builtin.set_fact:
+        synth_anchor_map: >-
+          {{
+            (synth_anchors_slurp.content | default('') | length > 0)
+            | ternary((synth_anchors_slurp.content | default('') | b64decode | from_yaml), {})
+          }}
+
+    - name: rotate | assert the fleet is onboarded
+      ansible.builtin.assert:
+        that:
+          - synth_anchor_map | length > 0
+        fail_msg: >-
+          No {{ synth_anchors_path }} (or it is empty) on this host — the
+          fleet is not onboarded, so there is nothing to rotate. Run
+          zagros-zenoh-synth-vendors-deploy.yml first.
+
+    - name: rotate | build the rotation list (handle, anchor)
+      ansible.builtin.set_fact:
+        synth_to_rotate: >-
+          {{
+            synth_to_rotate | default([]) + [
+              {'handle': item.key, 'anchor': item.value}
+            ]
+          }}
+      loop: "{{ synth_anchor_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} → {{ item.value }}"
+
+    - name: rotate | report rotation plan
+      ansible.builtin.debug:
+        msg: >-
+          Rotating {{ synth_to_rotate | length }} leaf cert(s) in place
+          (anchors unchanged): {{ synth_to_rotate | map(attribute='handle') | list }}
+
+    # ---- rotate each anchor (re-mint a fresh leaf, SAME anchor) --------
+    - name: rotate | POST /api/vendors/{anchor}/rotate (on controller)
+      # Portal calls run from the CONTROLLER, not the Thor (the Thor cannot
+      # reach its own portal by mesh hostname) — mirrors the onboard play.
+      ansible.builtin.uri:
+        url: "{{ zagros_portal_url }}/api/vendors/{{ item.anchor }}/rotate"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ lookup('env', (site_id | upper | replace('-', '_')) ~ '_PORTAL_OPERATOR_API_KEY') }}"
+        status_code: [200]
+        return_content: true
+        timeout: 60
+      register: synth_rotate_results
+      loop: "{{ synth_to_rotate }}"
+      loop_control:
+        label: "{{ item.handle }} ({{ item.anchor }})"
+      delegate_to: localhost
+      become: false
+      when: not ansible_check_mode
+
+    - name: rotate | report new URI-SAN per anchor
+      ansible.builtin.debug:
+        msg: "{{ item.item.handle }} → {{ item.json.uri_san | default('?') }}"
+      loop: "{{ synth_rotate_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.handle }}"
+      when:
+        - not ansible_check_mode
+        - item.status == 200
+
+    # ---- fetch + place the fresh one-time cert bundles ----------------
+    # Two-step copy-then-extract (Thor-local), because a mesh-tunnel
+    # unarchive can wedge.
+    - name: rotate | download the fresh one-time bundle tarball (on controller)
+      ansible.builtin.get_url:
+        url: "{{ zagros_portal_url }}{{ item.json.bundle_url }}"
+        dest: "/tmp/synth-rotate-{{ item.item.handle }}.tar.gz"
+        mode: "0600"
+        force: true
+        timeout: 60
+      delegate_to: localhost
+      become: false
+      loop: "{{ synth_rotate_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.handle }}"
+      when:
+        - not ansible_check_mode
+        - item.status == 200
+
+    - name: rotate | copy the cert bundle to the Thor
+      ansible.builtin.copy:
+        src: "/tmp/synth-rotate-{{ item.item.handle }}.tar.gz"
+        dest: "/tmp/synth-rotate-{{ item.item.handle }}.tar.gz"
+        mode: "0600"
+      loop: "{{ synth_rotate_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.handle }}"
+      when:
+        - not ansible_check_mode
+        - item.status == 200
+
+    - name: rotate | overwrite cert+key in the anchor's cert dir (Thor-local)
+      # The slot-mode rotate tarball holds <anchor>-cert.pem / <anchor>-key.pem
+      # (prefix=anchor), the exact {cert_dir}/{anchor}/ layout the role placed
+      # at onboard. force overwrites the old leaf in place.
+      ansible.builtin.unarchive:
+        src: "/tmp/synth-rotate-{{ item.item.handle }}.tar.gz"
+        dest: "{{ synth_vendor_cert_dir }}/{{ item.item.anchor }}/"
+        remote_src: true
+        owner: "65532"
+        group: "65532"
+        include:
+          - "{{ item.item.anchor }}-cert.pem"
+          - "{{ item.item.anchor }}-key.pem"
+      loop: "{{ synth_rotate_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.handle }}"
+      when:
+        - not ansible_check_mode
+        - item.status == 200
+
+    - name: rotate | scrub the one-time bundle tarball on the Thor
+      ansible.builtin.file:
+        path: "/tmp/synth-rotate-{{ item.item.handle }}.tar.gz"
+        state: absent
+      loop: "{{ synth_rotate_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.handle }}"
+      when:
+        - not ansible_check_mode
+        - item.status == 200
+
+    - name: rotate | scrub the one-time bundle tarball on the controller
+      ansible.builtin.file:
+        path: "/tmp/synth-rotate-{{ item.item.handle }}.tar.gz"
+        state: absent
+      delegate_to: localhost
+      become: false
+      loop: "{{ synth_rotate_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.handle }}"
+      when:
+        - not ansible_check_mode
+        - item.status == 200
+
+    # ---- restart the fleet so containers re-read the new leaf ----------
+    # The synth containers bind-mount the cert dir and read the leaf at
+    # session open, so a restart is required to pick up the rotated cert.
+    # The compose project + topics + anchors are unchanged.
+    - name: rotate | restart the synth fleet to pick up the new certs
+      ansible.builtin.command:
+        cmd: "docker compose restart"
+        chdir: "{{ synth_vendor_compose_dir }}"
+      register: synth_rotate_restart
+      changed_when: true
+      when: not ansible_check_mode
+
+    - name: rotate | done
+      ansible.builtin.debug:
+        msg: >-
+          Rotated {{ synth_to_rotate | length }} synth leaf cert(s) in place
+          and restarted the fleet. Anchors / aliases / namespaces / ACL
+          unchanged. Verify a rotated leaf's URI-SAN + that the peer is
+          still publishing under its anchor on a live subscriber.

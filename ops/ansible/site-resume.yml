@@ -1,0 +1,168 @@
+---
+# site-resume.yml — operator-fired single-command resume for a long-offline site.
+#
+# Companion to site-bootstrap.yml. Distinction:
+#   - site-bootstrap.yml — fresh bringup of a new site (assumes clean substrate).
+#   - site-resume.yml    — resume a previously-bootstrapped site that came back
+#                          from extended power-off (days-to-months). Handles the
+#                          stale-substrate detection + recovery dance that
+#                          site-bootstrap alone cannot.
+#
+# When to run:
+#   Any mgmt-host that's been offline more than a few days and you want to
+#   bring back to the current trunk substrate. Operator types one command;
+#   the playbook detects what's stale and fixes only what needs fixing.
+#
+# Sequence (each phase is conditional + idempotent):
+#   Phase 0: Clock-step (idempotent — only fires if clock is implausibly old)
+#   Phase 1: F-093 retrofit (only fires if Docker Root Dir is on eMMC)
+#   Phase 2: site-bootstrap.yml (idempotent; no-ops phases that already match
+#            trunk; updates whatever drifted)
+#   Phase 3: Spock subscription health check + advise on sub-recreate if
+#            invalidated (the actual sub_drop + sub_create is operator-fired
+#            for safety — too destructive to auto-do; the playbook prints the
+#            exact ceremony for the operator to follow)
+#
+# Operator usage:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ansible-playbook -i inventory/mgmt-hosts.ini site-resume.yml \
+#       -e site_id=prov-x \
+#       -e postgres_superuser_password="$PROV_JDN_PG_PASS" \
+#       -e netbird_encryption_key="$PROV_JDN_NB_ENCKEY" \
+#       -e pgbackrest_cipher_pass="$PROV_JDN_BKP_KEY" \
+#       -e bootstrap_owner_email="person-85@example.org"
+#
+# Why a wrapper, not a flag on site-bootstrap.yml:
+#   site-bootstrap.yml asserts fail-loud on stale substrate (correct posture
+#   for a brand-new site). site-resume.yml explicitly opts in to "fix-as-you-
+#   go" — different operator intent.
+#
+# Composition with the proposed Block 81 boot-time self-heal service:
+#   site-resume.yml is the OPERATOR-FIRED form of the same recovery logic.
+#   Block 81 (design at docs/design/self-healing-substrate-sync.md) is the
+#   FUTURE host-side autonomous form. Both share the same recovery primitives
+#   (f093-retrofit.yml, the site-bootstrap re-run, the Spock sub-recreate
+#   ceremony); the difference is just who fires them. Until Block 81 lands,
+#   site-resume.yml is the canonical recovery path.
+
+# ============================================================================
+# Phase 0 — clock-step (idempotent; only acts when clock is bogus)
+#
+# Without this, the F-096 chicken-and-egg cascades: bad RTC → 1970 clock →
+# NTS-KE TLS validation fails → chrony never syncs → tai64n replay rejects
+# WireGuard handshakes → mgmt-stack TLS validation fails. The
+# chrony-presync.service installed by site-bootstrap (via ntp-hygiene role)
+# handles this on FUTURE reboots, but a host that's stale enough to need
+# site-resume.yml at all may have been bootstrapped before chrony-presync
+# landed (ba47f494). Belt + suspenders.
+# ============================================================================
+- name: "site-resume: clock-step if implausible"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read host clock
+      ansible.builtin.command: date -u +%s
+      register: host_epoch
+      changed_when: false
+
+    - name: Read controller clock (operator laptop)
+      ansible.builtin.command: date -u +%s
+      register: controller_epoch
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Compute clock skew
+      ansible.builtin.set_fact:
+        clock_skew_seconds: "{{ (controller_epoch.stdout | int) - (host_epoch.stdout | int) }}"
+
+    - name: Show clock skew
+      ansible.builtin.debug:
+        msg: |
+          host_epoch:       {{ host_epoch.stdout }} ({{ host_epoch.stdout | int | strftime('%Y-%m-%dT%H:%M:%SZ', utc=true) }})
+          controller_epoch: {{ controller_epoch.stdout }} ({{ controller_epoch.stdout | int | strftime('%Y-%m-%dT%H:%M:%SZ', utc=true) }})
+          skew:             {{ clock_skew_seconds }} seconds
+
+    - name: Step clock if skew > 1 day (host is implausibly behind)
+      # Threshold: 86400 s = 1 day. Hosts only get this far behind via bad
+      # RTC at boot (the F-096 epoch-1970 case). Normal NTP drift never
+      # reaches 1 day.
+      ansible.builtin.command:
+        cmd: "date -u -s @{{ controller_epoch.stdout }}"
+      when: (clock_skew_seconds | int) > 86400
+
+    - name: Restart chrony if clock was stepped (let it pick up real upstreams)
+      ansible.builtin.systemd:
+        name: chronyd
+        state: restarted
+      when: (clock_skew_seconds | int) > 86400
+      failed_when: false
+
+# ============================================================================
+# Phase 1 — F-093 retrofit (idempotent; only acts when needed)
+#
+# Imports f093-retrofit.yml as a sub-playbook. The retrofit's first task is
+# `meta: end_host` if Docker Root Dir already on the NVMe → no-op when not
+# needed.
+# ============================================================================
+- name: "site-resume: F-093 retrofit if needed"
+  ansible.builtin.import_playbook: f093-retrofit.yml
+  vars:
+    f093_mode: "{{ f093_mode | default('fresh') }}"
+
+# ============================================================================
+# Phase 2 — site-bootstrap.yml (idempotent; updates what drifted)
+#
+# Imports site-bootstrap.yml as a sub-playbook. All Phase 0-7 tasks are
+# already idempotent on their own — no-ops on tasks that match trunk, updates
+# tasks that drifted.
+# ============================================================================
+- name: "site-resume: apply current trunk substrate"
+  ansible.builtin.import_playbook: site-bootstrap.yml
+
+# ============================================================================
+# Phase 3 — Spock subscription health (advisory)
+#
+# Reports whether the local Spock subscriptions are replicating or stalled.
+# Does NOT auto-recreate (sub_drop + sub_create synchronize_data:=true is too
+# destructive for an automation default). Prints the exact recovery commands
+# for the operator. Composes with docs/operations/post-partition-convergence-
+# runbook.md.
+# ============================================================================
+- name: "site-resume: Spock subscription health (advisory)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Query Spock subscription status
+      # Tolerant of "spock node not yet created" (rc=1 with that specific
+      # message) — that's a separate problem class (operator-fired
+      # spock.node_create() ceremony per Block 64Q), not a failure of the
+      # resume path.
+      ansible.builtin.shell:
+        cmd: |
+          docker exec postgres-a psql -U postgres netbird -t -A -c \
+            "SELECT subscription_name || ':' || status FROM spock.sub_show_status();" \
+            2>&1 | head -20
+      register: spock_sub_status
+      changed_when: false
+      failed_when: false
+
+    - name: Report Spock subscription health
+      ansible.builtin.debug:
+        msg: |
+          Spock subscription status on {{ inventory_hostname }}:
+          {{ spock_sub_status.stdout }}
+
+          Interpretation:
+            - "replicating"  → healthy; nothing to do.
+            - "down" / "not started" → operator-fired sub-recreate may be needed:
+                docker exec postgres-a psql -U postgres netbird -c \
+                  "SELECT spock.sub_drop('<sub_name>'); \
+                   SELECT spock.sub_create('<sub_name>', '<provider_dsn>', synchronize_data := true);"
+              See docs/operations/post-partition-convergence-runbook.md.
+            - "current database is not configured as spock node" → fresh DB; \
+              run the spock-mesh-peering ceremony (Block 64Q) or manual \
+              sub_create per the runbook.

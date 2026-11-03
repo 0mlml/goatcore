@@ -1,0 +1,50 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the external dead-man's-switch watcher.
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -e target=<site>_hosts deadman-watch-deploy.yml
+#
+# WHAT IT IS: the obs host's Alertmanager sends the always-firing `Watchdog`
+# alert here every minute. This host notices when it STOPS and pages PagerDuty
+# DIRECTLY — never through the Alertmanager being watched, which is unavailable
+# exactly when it matters.
+#
+# WHERE IT GOES: NOT the obs host. An obs stack cannot witness its own death.
+# The role refuses to install on a host flagged has_obs_host.
+#
+# COVERAGE: a mgmt-host watcher catches the obs host dying. It does NOT catch
+# the whole site losing power, because it dies too. The relays cannot host one without
+# opening a new public listener (TLS-passthrough L4 only, never mesh peers), so
+# a genuinely independent watcher means a third-party absence-detector. This is
+# strictly better than nothing and explicitly not everything.
+#
+# AFTER DEPLOYING, point each obs host at its OWN path on it:
+#   deadman_webhook_url: "http://<watcher-mesh-ip>:9099/{{ inventory_hostname }}"
+#   deadman_webhook_token: "{{ lookup('env', 'DEADMAN_WATCH_TOKEN') ... }}"
+# list that hostname in the watcher's deadman_watch_expected_sources, and re-run
+# the obs bootstrap so Alertmanager picks it up.
+#
+# ORDER: obs hosts first, watcher second. An old receiver accepts any path and
+# writes the shared file, so re-rendering the obs side first changes nothing.
+# A new checker pages on every expected host that has not posted to its own
+# path within the threshold (300s) — deploy it first and each obs host still on
+# the bare path pages, correctly, until it is re-rendered.
+#
+# Verify end to end (the ONLY test that counts):
+#   1. ssh <watcher>  systemctl status deadman-receive
+#   2. on the obs host: docker stop prometheus
+#   3. within threshold+interval, a PagerDuty incident appears
+#   4. docker start prometheus  -> it resolves itself
+# Until step 3 has been SEEN, the switch is unproven.
+
+- name: deploy the external dead-man's-switch watcher
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: deadman-watch

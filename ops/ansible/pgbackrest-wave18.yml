@@ -1,0 +1,168 @@
+---
+# ops/ansible/pgbackrest-wave18.yml
+#
+# ⚫ VALIDATED PASS. Kept as a re-usable template for
+# future re-runs. See docs/operations/pgbackrest-wave18-validation.md
+# §8 for the findings that came out of the initial run (archive_mode=on
+# only, docker restart instead of compose restart, per-container config
+# render). The playbook has been patched in-place to incorporate those
+# findings; a re-run against a fresh pgbackrest-wave18 env should
+# succeed on the first try.
+#
+# Wave 1.8 smoke-test orchestrator: stands up the mgmt-host stack with the
+# phase2 overlay (postgres-a + postgres-b both on one host) on the
+# pgbackrest-wave18 EC2 and deploys BOTH pgBackRest stanzas independently
+# against it. Exercises the paired-stanza design end-to-end on real
+# hardware without disturbing hadev / vega / integdev.
+#
+# ENVIRONMENT: ephemeral pgbackrest-wave18 EC2 provisioned via
+# terraform/pgbackrest-wave18.tf. Destroy after the smoke test passes.
+#
+# Required -e vars (all secrets, pulled from 1Password via operator env):
+#   postgres_superuser_password         Postgres superuser pw (same for A + B)
+#   netbird_encryption_key               base64 32 bytes, same across both
+#   pgbackrest_repo1_cipher_pass_a       aes-256-cbc key for A-side stanza
+#   pgbackrest_repo1_cipher_pass_b       aes-256-cbc key for B-side stanza
+#                                        (must differ from A-side)
+#
+# Usage (from ops/ansible/):
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ansible-playbook \
+#       -i inventory/pgbackrest-wave18.ini \
+#       pgbackrest-wave18.yml \
+#       -e postgres_superuser_password="$PGBR_W18_PG_PASS" \
+#       -e netbird_encryption_key="$PGBR_W18_NB_ENCKEY" \
+#       -e pgbackrest_repo1_cipher_pass_a="$PGBR_W18_CIPHER_A" \
+#       -e pgbackrest_repo1_cipher_pass_b="$PGBR_W18_CIPHER_B"
+#
+# Runbook: docs/operations/pgbackrest-wave18-validation.md.
+
+# ===========================================================================
+# Phase 1 — base mgmt-host stack with phase2 overlay.
+# ===========================================================================
+- name: "wave18: base stack"
+  import_playbook: mgmt-host.yml
+  vars:
+    phase2: true
+    site_name: wave18
+    signal_uri: "127.0.0.1:10000"
+
+# ===========================================================================
+# Phase 2 — pgBackRest Router-A-side stanza (postgres-a, stanza wave18-a-netbird).
+# ===========================================================================
+- name: "wave18: pgBackRest A-side (postgres-a)"
+  hosts: pgbackrest_wave18_hosts
+  gather_facts: false
+  become: true
+  vars:
+    site_name: wave18-a
+    postgres_container_name: postgres-a
+    pgbackrest_archive_mode: "on"
+    pgbackrest_repo1_dir: /opt/docker-data/pgbackrest
+    pgbackrest_log_dir: /var/log/pgbackrest
+    pgbackrest_spool_dir: /var/spool/pgbackrest
+    pgbackrest_repo1_cipher_pass: "{{ pgbackrest_repo1_cipher_pass_a }}"
+  roles:
+    - pgbackrest
+
+# ===========================================================================
+# Phase 3 — pgBackRest Router-B-side stanza (postgres-b, stanza wave18-b-netbird).
+# ===========================================================================
+- name: "wave18: pgBackRest B-side (postgres-b, archive_mode=on per finding #1)"
+  hosts: pgbackrest_wave18_hosts
+  gather_facts: false
+  become: true
+  vars:
+    site_name: wave18-b
+    postgres_container_name: postgres-b
+    # archive_mode=on (not always) per Wave 1.8 finding #1: pgBackRest
+    # rejects archive_mode=always with error [067]. In a true streaming-
+    # replica topology, use --backup-standby for I/O offload instead.
+    pgbackrest_archive_mode: "on"
+    pgbackrest_repo1_dir: /opt/docker-data/pgbackrest-b
+    pgbackrest_log_dir: /var/log/pgbackrest-b
+    pgbackrest_spool_dir: /var/spool/pgbackrest-b
+    pgbackrest_repo1_cipher_pass: "{{ pgbackrest_repo1_cipher_pass_b }}"
+  roles:
+    - pgbackrest
+
+# ===========================================================================
+# Phase 4 — smoke: assert both stanzas green.
+# ===========================================================================
+- name: "wave18: smoke (both stanzas green)"
+  hosts: pgbackrest_wave18_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: pgbackrest info — A-side stanza
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - postgres-a
+          - pgbackrest
+          - --stanza=wave18-a-netbird
+          - info
+      register: info_a
+      changed_when: false
+
+    - name: Assert A-side has a full backup
+      ansible.builtin.assert:
+        that: "'full backup' in info_a.stdout"
+        fail_msg: "A-side stanza has no full backup"
+
+    - name: pgbackrest info — B-side stanza
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - postgres-b
+          - pgbackrest
+          - --stanza=wave18-b-netbird
+          - info
+      register: info_b
+      changed_when: false
+
+    - name: Assert B-side has a full backup
+      ansible.builtin.assert:
+        that: "'full backup' in info_b.stdout"
+        fail_msg: "B-side stanza has no full backup"
+
+    - name: Check pg_stat_archiver on A
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ postgres_superuser_password }}"
+          - postgres-a
+          - psql
+          - -U
+          - postgres
+          - -tAc
+          - "SELECT archived_count FROM pg_stat_archiver;"
+      register: archived_a
+      changed_when: false
+
+    - name: Check pg_stat_archiver on B (archive_mode=always)
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ postgres_superuser_password }}"
+          - postgres-b
+          - psql
+          - -U
+          - postgres
+          - -tAc
+          - "SELECT archived_count FROM pg_stat_archiver;"
+      register: archived_b
+      changed_when: false
+
+    - name: Surface archive counts to operator
+      ansible.builtin.debug:
+        msg:
+          - "A-side archived_count: {{ archived_a.stdout | trim }}"
+          - "B-side archived_count: {{ archived_b.stdout | trim }}"
+          - "Next: run docs/operations/pgbackrest-wave18-validation.md §3 (PITR drill)"

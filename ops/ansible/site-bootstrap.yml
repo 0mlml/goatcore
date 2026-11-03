@@ -1,0 +1,1187 @@
+---
+# site-bootstrap.yml — UNIFIED per-site mgmt-host bringup orchestrator.
+#
+# Block 22L: a single phases-with-gates playbook driven by the
+# `mgmt_stack_profile` group_var.
+#
+# This playbook is profile-aware. Each phase carries a `when:` clause
+# tied to either the profile itself or one of the supporting axis vars
+# (has_mgmt_api / intra_site_pair / has_durable_independent_state /
+# participates_in_spock / has_obs_host). The per-site group_vars/<site>_hosts/
+# vars.yml file declares the profile + axis vars; this orchestrator
+# dispatches accordingly.
+#
+# Profile taxonomy (today; see docs/design/turnkey-three-orin-bringup.md
+# §"Mgmt-stack profile taxonomy" for the full table + future entries):
+#
+#   full                  → A/B mgmt-host pair + obs-host C, full
+#                           mgmt-stack with mgmt-API + Traefik TLS +
+#                           account/setup-key seeding + admit-audit +
+#                           pgBackRest + intra-site streaming repl
+#   postgres-spock-only   → provisional notional
+#                           sites (single Orin, postgres-spock
+#                           only — no mgmt-API, no Traefik, no admit-
+#                           audit, no pgBackRest, no streaming pair).
+#                           Per ADR 0827 §"Mgmt-stack scope expansion"
+#                           decision (a).
+#
+# Operator contract (unchanged from prior site-bootstrap.yml shim — same
+# command line still works):
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       site-bootstrap.yml \
+#       -e site_id=<site> \
+#       -e postgres_superuser_password="$SITE_PG_PASS" \
+#       -e netbird_encryption_key="$SITE_NB_ENCKEY" \
+#       -e pgbackrest_cipher_pass="$SITE_BKP_KEY" \
+#       -e bootstrap_owner_email="ops@example.net"
+#
+#   For postgres-spock-only sites, the secret surface is smaller:
+#
+#     site-bootstrap.yml \
+#       -e site_id=<site> \
+#       -e postgres_superuser_password="$SITE_PG_PASS"
+#
+# Each phase is idempotent on its own; safe to re-run.
+#
+# Failover at full-profile sites is operator-fired (`pg_ctl promote` on B
+# + DNS/bundle re-issue). See the postgres failover runbook. VRRP-on-Orins (the
+# keepalived-mgmt path) is removed; do not restore.
+
+# ============================================================================
+# Phase 0 — operator environment pre-flight gate
+#
+# Loads the per-site group_vars file directly (templated path resolves
+# from -e site_id) so we can read `mgmt_stack_profile` BEFORE the play
+# touches the site's hosts. Profile-aware env-var-list selection comes
+# from ops/ansible/vars/site-required-env-vars.yml (shared with
+# site-preflight.yml).
+#
+# Per-site group_vars MAY override `required_env_vars` directly (declares
+# an explicit list); otherwise the profile default applies.
+# ============================================================================
+- name: "site-bootstrap: pre-flight environment gate"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "vars/site-required-env-vars.yml"
+    - "group_vars/{{ site_id | replace('-', '_') }}_hosts/vars.yml"
+  vars:
+    site_id_upper: "{{ site_id | upper | replace('-', '_') }}"
+    effective_required_env_vars: >-
+      {{ required_env_vars
+         | default(profile_required_env_vars[mgmt_stack_profile]) }}
+  tasks:
+    - name: "site_id provided"
+      ansible.builtin.assert:
+        that:
+          - site_id is defined
+          - site_id | length > 0
+        fail_msg: >-
+          site_id is required. Pass it via -e site_id=<name>
+          (e.g. -e site_id=zagros-prod).
+
+    - name: "mgmt_stack_profile is declared in group_vars"
+      ansible.builtin.assert:
+        that:
+          - mgmt_stack_profile is defined
+          - mgmt_stack_profile in ['full', 'postgres-spock-only']
+        fail_msg: |
+          mgmt_stack_profile must be declared in
+          group_vars/{{ site_id | replace('-', '_') }}_hosts/vars.yml.
+          Today's accepted values: full | postgres-spock-only.
+          Future profiles (cloud-poc, integdev) are named in
+          docs/design/turnkey-three-orin-bringup.md §"Mgmt-stack profile
+          taxonomy" but not yet absorbed into this orchestrator. Add the
+          profile + axis vars (has_mgmt_api / intra_site_pair /
+          has_durable_independent_state / participates_in_spock /
+          has_obs_host) to your group_vars file, then re-run.
+
+    - name: "required env vars are set"
+      ansible.builtin.assert:
+        that:
+          - "lookup('env', item) | length > 0"
+        fail_msg: >-
+          Required env var {{ item }} is empty. Set it in
+          .envrc.local (1Password-backed) before running site-bootstrap.
+        success_msg: "{{ item }} present."
+        quiet: true
+      loop: "{{ effective_required_env_vars }}"
+      no_log: true
+
+    - name: "summary"
+      ansible.builtin.debug:
+        msg: |
+          Pre-flight PASS for {{ site_id }}:
+            - mgmt_stack_profile:           {{ mgmt_stack_profile }}
+            - has_mgmt_api:                 {{ has_mgmt_api | default(false) }}
+            - intra_site_pair:              {{ intra_site_pair | default(false) }}
+            - has_durable_independent_state:{{ has_durable_independent_state | default(true) }}
+            - participates_in_spock:        {{ participates_in_spock | default(false) }}
+            - has_obs_host:                 {{ has_obs_host | default(false) }} (informational; bringup is a separate operator step)
+            - {{ effective_required_env_vars | length }} env vars present
+
+# ============================================================================
+# Phase 0.5 — Docker data-root pre-flight
+#
+# Catches the F-093 bug recurrence: Docker silently using its default
+# /var/lib/docker on the eMMC root filesystem instead of the configured
+# data-root on the NVMe. Without this gate, bootstrap proceeds and
+# silently fills the eMMC with image/volume layers — a slow-burn disk-
+# fill that surfaces later as a hard-to-diagnose outage.
+#
+# Two assertions:
+#   1. /opt/docker-data is a separate mount (NVMe per
+#      docs/design/os-baseline-and-luks.md), not just a directory on /.
+#   2. Docker daemon's actual `Docker Root Dir` matches the configured
+#      `docker_engine_data_root` group_var.
+#
+# Only fires for sites that declare `docker_engine_data_root` in
+# group_vars (production sites). Dev envs leave it empty and
+# skip this check (no NVMe to migrate to).
+#
+# If either assertion fails, run the migration ceremony FIRST:
+# docs/operations/docker-data-root-migration.md, then re-run.
+# ============================================================================
+- name: "site-bootstrap: Docker data-root pre-flight"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  # F-093 separate-mount assertion: defaults ON via the `| default(true)`
+  # filter in each task's `when:` clause. Production fleet uses a second
+  # physical NVMe at /opt/docker-data and inherits the default. Single-
+  # NVMe-OS sites (e.g. AGX Thor JetPack 7 flash, where the whole NVMe IS
+  # the rootfs) override via group_vars: `require_docker_data_separate_mount: false`.
+  # Per-task `default(true)` lets group_vars win — a play-level `vars:`
+  # block here would override group_vars per Ansible precedence rules.
+  # Docker data-root match + containerd root match still enforce (those
+  # checks don't require separate mount).
+  tasks:
+    - name: Assert the docker data tree is a separate mount (NVMe per os-baseline-and-luks.md)
+      # The mount point is DERIVED from docker_engine_data_root's parent
+      # (e.g. /opt/docker-data/docker → /opt/docker-data; /data/docker → /data),
+      # because a hardcoded /opt/docker-data breaks the first site with a different
+      # NVMe mount path.
+      ansible.builtin.command: "findmnt -n {{ docker_engine_data_root | dirname }}"
+      register: docker_data_mount
+      changed_when: false
+      failed_when: docker_data_mount.rc != 0
+      when:
+        - (docker_engine_data_root | default('') | length) > 0
+        - require_docker_data_separate_mount | default(true) | bool
+      # F-093 closure: NVMe must be mounted before Docker can use it.
+      # Bootstrap fails if the data tree is just a directory on /.
+      # Gated by `require_docker_data_separate_mount` so single-NVMe-OS
+      # sites (Thor) can run with it on the rootfs.
+
+    - name: Ensure /opt/docker-data tree exists (single-NVMe-OS path)
+      # Single-NVMe-OS sites (e.g. AGX Thor) opt out of the
+      # separate-mount assertion above; /opt/docker-data needs to exist
+      # as a plain directory on the rootfs before Docker starts pointing
+      # at it. Idempotent (mkdir -p semantics via ansible.builtin.file).
+      # Mode 0711 matches the fleet convention from the LUKS-mount path.
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0711"
+      loop:
+        - "{{ docker_engine_data_root | default('/opt/docker-data/docker') | dirname }}"
+        - "{{ docker_engine_data_root | default('/opt/docker-data/docker') }}"
+        - "{{ docker_engine_containerd_root | default('/opt/docker-data/containerd') }}"
+      when:
+        - (docker_engine_data_root | default('') | length) > 0
+        - not (require_docker_data_separate_mount | default(true) | bool)
+
+    - name: Read current Docker Root Dir
+      ansible.builtin.command: docker info --format '{% raw %}{{.DockerRootDir}}{% endraw %}'
+      register: docker_root_dir_actual
+      changed_when: false
+      when: (docker_engine_data_root | default('') | length) > 0
+
+    - name: Assert Docker daemon's data-root matches configured docker_engine_data_root
+      ansible.builtin.assert:
+        that:
+          - docker_root_dir_actual.stdout | trim == (docker_engine_data_root | default(''))
+        fail_msg: |
+          F-093 closure check FAILED.
+          Docker is running with data-root `{{ docker_root_dir_actual.stdout | trim }}` but
+          docker_engine_data_root is configured as `{{ docker_engine_data_root | default('(unset)') }}`.
+
+          Production deploys MUST have data-root on the NVMe to avoid eMMC disk-fill.
+          Run the migration ceremony FIRST: docs/operations/docker-data-root-migration.md
+          Then re-run site-bootstrap.yml.
+
+          (If this is a fresh deploy with no data on /var/lib/docker yet, just `sudo
+          systemctl restart docker` to pick up the daemon.json data-root.)
+      when:
+        # Only assert when production-mode is active (production sites
+        # set docker_engine_data_root in group_vars; dev envs leave
+        # it empty and skip this check).
+        - (docker_engine_data_root | default('') | length) > 0
+
+    - name: Read current containerd root from config.toml
+      # F-093 second-half closure: containerd has its
+      # OWN root path separate from Docker's data-root. We assert it
+      # matches docker_engine_containerd_root so an operator who configured
+      # Docker's data-root but forgot containerd doesn't ship to production
+      # with image layers still on eMMC.
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          if [ -f /etc/containerd/config.toml ]; then
+            awk -F '"' '/^root = /{print $2; exit}' /etc/containerd/config.toml
+          fi
+        executable: /bin/bash
+      register: containerd_root_from_config
+      changed_when: false
+      when: (docker_engine_containerd_root | default('') | length) > 0
+
+    - name: Assert containerd root matches configured docker_engine_containerd_root
+      ansible.builtin.assert:
+        that:
+          - (containerd_root_from_config.stdout | default('') | trim)
+            == (docker_engine_containerd_root | default(''))
+        fail_msg: |
+          F-093 closure check FAILED (containerd half).
+          containerd config.toml has root `{{ containerd_root_from_config.stdout | default('(missing)') | trim }}`
+          but docker_engine_containerd_root is configured as `{{ docker_engine_containerd_root | default('(unset)') }}`.
+
+          containerd stores image layers + container snapshots under its OWN
+          root directory — separate from Docker's data-root. Without this
+          override on NVMe, every image pull adds to /var/lib/containerd
+          on the eMMC and grows independently.
+
+          Run the migration ceremony FIRST: docs/operations/docker-data-root-migration.md
+          §"containerd root migration" then re-run site-bootstrap.yml.
+      when:
+        - (docker_engine_containerd_root | default('') | length) > 0
+
+# ============================================================================
+# Phase 1 — NTP preflight + hygiene + health agent daemon
+#
+# ALWAYS runs. Skewed clocks poison Spock LWW conflict resolution and
+# break audit timestamping.
+# ============================================================================
+- name: "site-bootstrap: NTP preflight + hygiene baseline"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: true
+  become: true
+  pre_tasks:
+    # Turnkey: the ntp-health-agent / ntp-admit-sidecar roles copy a prebuilt
+    # Go binary from ops/time-hygiene/bin/<goos>-<goarch>/, which is gitignored
+    # build output — a fresh checkout doesn't have it and the role fails loud
+    # build output — a fresh checkout doesn't have it and the role fails loud.
+    # absent. `creates` skips when already built; the Makefile cross-compiles
+    # both arches. Needs Go on the controller (the operator's machine).
+    - name: Build ops/time-hygiene binaries on the controller if absent
+      ansible.builtin.command:
+        cmd: make build
+        chdir: "{{ playbook_dir }}/../time-hygiene"
+        creates: "{{ playbook_dir }}/../time-hygiene/bin/linux-{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}/ntp-health-agent"
+      delegate_to: localhost
+      become: false
+      run_once: true
+  roles:
+    - ntp-hygiene
+    - ntp-health-agent
+
+# ============================================================================
+# Phase 1B — NTP admit-fail-safe sidecar
+#
+# Sits in front of management-a and blocks peer-admit when NTP verdict is
+# unhealthy. Only meaningful when management-a is running (full profile).
+# ============================================================================
+- name: "site-bootstrap: NTP admit-fail-safe sidecar"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Apply ntp-admit-sidecar role (when has_mgmt_api)
+      ansible.builtin.import_role:
+        name: ntp-admit-sidecar
+      when: has_mgmt_api | default(false) | bool
+
+# ============================================================================
+# Phase 2A — full mgmt-stack via mgmt-host.yml
+#
+# mgmt-host.yml targets `hosts: mgmt_hosts`. Only sites that ACTUALLY
+# run the full mgmt-stack are children of `mgmt_hosts`.
+# So this import_playbook simply no-ops for postgres-spock-only sites.
+#
+# Image pins inherit from group_vars/<site>_hosts/vars.yml. Forwarding
+# them via `vars:` here would create a self-recursive Jinja loop in
+# newer ansible-core; group_vars inheritance through import_playbook is
+# the right channel.
+# ============================================================================
+- name: "site-bootstrap: full mgmt-stack (delegate, when has_mgmt_api)"
+  ansible.builtin.import_playbook: mgmt-host.yml
+  vars:
+    phase2: false
+    # Scope the imported play to ONLY the current site's hosts. Without
+    # this, mgmt-host.yml's default `hosts: mgmt_hosts` would fan out to
+    # every reachable mgmt_hosts member on every site-bootstrap invocation.
+    mgmt_host_target: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  when: has_mgmt_api | default(false) | bool
+
+# ============================================================================
+# Phase 2B — postgres-spock-only inline (mgmt-stack subset)
+#
+# Re-uses ops/compose/mgmt-host/docker-compose.yml unchanged but only
+# brings up the postgres-a service. Other services in that compose file
+# (signal-a, management-a, traefik, mgmt-host-bootstrap) have no
+# `depends_on` chain from postgres-a, so selective `up -d postgres-a` is
+# safe. Per ADR 0827 §"Mgmt-stack scope expansion" decision (a).
+# ============================================================================
+- name: "site-bootstrap: postgres-spock only (when mgmt_stack_profile == postgres-spock-only)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: true
+  become: true
+  vars:
+    compose_dir: /opt/mgmt-host
+    secrets_dir: /opt/secrets
+  tasks:
+    - name: postgres-spock-only block (gated)
+      when: mgmt_stack_profile == 'postgres-spock-only'
+      block:
+        - name: require postgres_superuser_password
+          ansible.builtin.assert:
+            that:
+              - postgres_superuser_password is defined
+              - postgres_superuser_password | length > 0
+            fail_msg: >-
+              Pass -e postgres_superuser_password="${{ site_id_upper }}_PG_PASS"
+              (sourced from .envrc.local; do NOT hardcode or check in).
+          vars:
+            site_id_upper: "{{ site_id | upper | replace('-', '_') }}"
+
+        - name: ensure compose directory exists
+          ansible.builtin.file:
+            path: "{{ compose_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: ensure secrets directory exists
+          ansible.builtin.file:
+            path: "{{ secrets_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: Check pgBackRest config before publishing the base Compose mount
+          ansible.builtin.import_tasks: tasks/pgbackrest-config-preflight.yml
+          tags: [always]
+
+        - name: copy base docker-compose.yml (only postgres-a will be up'd below)
+          ansible.builtin.copy:
+            src: ../compose/mgmt-host/docker-compose.yml
+            dest: "{{ compose_dir }}/docker-compose.yml"
+            mode: "0644"
+
+        - name: render minimal .env for postgres-spock-only
+          ansible.builtin.copy:
+            dest: "{{ compose_dir }}/.env"
+            mode: "0600"
+            content: |
+              # Rendered by ops/ansible/site-bootstrap.yml on {{ ansible_date_time.iso8601 }}
+              # Postgres-spock-only subset for {{ site_id }} (mgmt_stack_profile=postgres-spock-only;
+              # ADR 0827 mgmt-stack scope (a)). signal-server, netbird-mgmt, traefik,
+              # mgmt-host-bootstrap intentionally absent from this .env — those services
+              # are not started and their image pins are moot. If a future decision
+              # expands the mgmt-stack scope, add the relevant *_IMAGE env vars here.
+              SITE_NAME={{ site_id }}
+              POSTGRES_SUPERUSER_PASSWORD={{ postgres_superuser_password }}
+              {% if postgres_spock_image is defined and postgres_spock_image %}
+              POSTGRES_SPOCK_IMAGE={{ postgres_spock_image }}
+              {% endif %}
+
+        - name: pull postgres-spock image
+          ansible.builtin.command:
+            cmd: docker compose pull postgres-a
+            chdir: "{{ compose_dir }}"
+          changed_when: true
+
+        - name: bring up postgres-a only (selective service start)
+          # Critical: do NOT use `docker compose up -d` (no service arg). That
+          # would start signal-a + management-a + traefik + mgmt-host-bootstrap
+          # which we explicitly don't want under this profile.
+          ansible.builtin.command:
+            cmd: docker compose up -d postgres-a
+            chdir: "{{ compose_dir }}"
+          changed_when: true
+
+        - name: wait for postgres-a ready
+          ansible.builtin.command:
+            cmd: docker exec postgres-a pg_isready -U postgres
+          register: pg_ready
+          retries: 30
+          delay: 2
+          until: pg_ready.rc == 0
+          changed_when: false
+
+        # F-044 preflight — same shape as mgmt-host.yml. Catches the pgEdge-
+        # baked-data-dir case (POSTGRES_PASSWORD env silently ignored) at
+        # compose-up time instead of at first Spock subscription attempt.
+        - name: F-044 preflight — postgres password auth round-trip
+          block:
+            - name: F-044 — psql connect via TCP with env-derived password
+              ansible.builtin.command:
+                argv:
+                  - docker
+                  - exec
+                  - postgres-a
+                  - sh
+                  - -c
+                  - "PGPASSWORD={{ postgres_superuser_password | quote }} psql -h 127.0.0.1 -U postgres -d postgres -tAc 'SELECT 1'"
+              register: pg_pwcheck
+              changed_when: false
+              # A freshly-basebackup'd streaming standby refuses connections with
+              # "the database system is in recovery mode" until it reaches a
+              # consistent state — not an auth failure, not F-044. Retry so a
+              # healthy standby passes on its own (mirrors the mgmt-host.yml fix,
+              # F-538).
+              retries: 12
+              delay: 5
+              until: pg_pwcheck.rc == 0
+          rescue:
+            - name: F-044 — a standby still in recovery is not an auth failure (tolerate)
+              ansible.builtin.debug:
+                msg: >-
+                  postgres-a reports "in recovery mode" — a streaming standby that
+                  has not yet reached consistency. Not F-044; convergence is
+                  verified by the postgres-streaming-replication role.
+              when: "'in recovery mode' in (pg_pwcheck.stderr | default(''))"
+            - name: F-044 — postgres password mismatch; fail loud with operator path
+              when: "'in recovery mode' not in (pg_pwcheck.stderr | default(''))"
+              ansible.builtin.fail:
+                msg: |
+                  POSTGRES PASSWORD AUTH FAILED — F-044 likely cause.
+                  See docs/findings/F-044-pgedge-postgres-baked-data-dir.md
+                  for the fix path.
+
+        - name: confirm signal-a / management-a / traefik are NOT running
+          # If any of these come back non-empty, someone has expanded the
+          # mgmt-stack scope on a postgres-spock-only profile. That is a
+          # deliberate decision (move site to `full` profile), not a default.
+          ansible.builtin.command:
+            cmd: docker ps --filter name={{ item }} --format '{{ "{{" }}.Names{{ "}}" }}'
+          register: not_running_check
+          loop:
+            - signal-a
+            - management-a
+            - traefik
+          changed_when: false
+          failed_when: not_running_check.stdout | length > 0
+
+# ============================================================================
+# Phase 2.5 — Traefik TLS terminator (Block 22J / ADR 0407)
+#
+# Reverse-proxies the running management-a container at :443 with an
+# offline-CA-signed leaf cert. Only meaningful when has_mgmt_api.
+#
+# Skip with `-e skip_traefik=true` for envs that don't need TLS yet.
+# ============================================================================
+- name: "site-bootstrap: Traefik TLS terminator (when has_mgmt_api)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  vars:
+    skip_traefik: false
+  tasks:
+    - name: Apply traefik role
+      ansible.builtin.import_role:
+        name: traefik
+      # An EMPTY traefik_services is a deliberate "Traefik is deployed by a
+      # different path" signal (the LE/ACME-via-Cloudflare overlay in
+      # <site>-traefik-acme.yml, used by trial-fabric sites),
+      # NOT a misconfiguration. Auto-skip Phase 2.5 in that case so the
+      # bootstrap runs turnkey end-to-end — superseding the old "operator must
+      # manually stop here" convention. Sites that populate traefik_services
+      # (offline-CA terminator path) still get Phase 2.5. `skip_traefik` stays
+      # as an explicit per-run override.
+      when:
+        - has_mgmt_api | default(false) | bool
+        - not (skip_traefik | bool)
+        - (traefik_services | default([]) | length) > 0
+
+# ============================================================================
+# Phase 3 — account + bootstrap setup-key seed via Go CLI (Block 21A)
+#
+# ADR 0410 + 0413. The retired DB-direct INSERT pattern produced rows real
+# netbird peers couldn't authenticate against (modern image hashes the
+# presented key). Only meaningful when has_mgmt_api.
+#
+# Runs on the FIRST host in the site's host group. Idempotent: create-account
+# is no-op if the site already has an account; create-setup-key always creates
+# a new key (intentionally — fresh single-use bootstrap key per run).
+# ============================================================================
+- name: "site-bootstrap: seed account + bootstrap setup key (when has_mgmt_api)"
+  # Run on the first host of the site's group (deterministic: that's
+  # Router-A for A/B-pair sites, the only Orin for single-Orin sites).
+  # `groups` magic var is known at parse time after inventory loads.
+  hosts: "{{ groups[(site_id | replace('-', '_')) ~ '_hosts'][0] }}"
+  gather_facts: false
+  become: true
+  vars:
+    site_id_upper: "{{ site_id | upper | replace('-', '_') }}"
+    bootstrap_key_ttl_hours: "{{ (setup_key_ttl_days_bootstrap | default(1) | int) * 24 }}"
+  tasks:
+    - name: founder account + bootstrap setup-key block (gated)
+      # goatnet_founder gate (ADR 1081): a JOINER site (goatnet_founder:
+      # false) must NOT mint its own account + bootstrap setup-key — that would
+      # create a SECOND, divergent account whose rows then conflict under Spock.
+      # The joiner's account/user/policy rows arrive via the guarded initial
+      # seed (<site>-seed-from-peer.yml) + Spock replication. Founder sites leave
+      # goatnet_founder unset → defaults true → Phase 3 runs as before.
+      when:
+        - has_mgmt_api | default(false) | bool
+        - goatnet_founder | default(true) | bool
+      block:
+        - name: require bootstrap_owner_email
+          ansible.builtin.assert:
+            that:
+              - bootstrap_owner_email is defined
+              - bootstrap_owner_email | length > 0
+            fail_msg: "Pass -e bootstrap_owner_email=<owner-email> (e.g. person-85@example.org)."
+
+        # The wait sits in a block so its FAILURE can name its cause (#383). On a
+        # fresh site management-a restart-loops dialing hydra:4444, because Ory
+        # deploys in a later phase, so the schema never appears and this task
+        # used to die on a bare "retries exhausted" after 150 s. That is the
+        # expected first-run stop (docs/operations/goatnet-standup.md, the
+        # `wait for the netbird schema` row); the rescue says so and gives the
+        # recovery. The success path is unchanged.
+        - name: wait for the netbird schema, and name the cause if it never appears
+          block:
+            - name: wait for the netbird schema (management-a migrations) before seeding
+              # The accounts relation is created by management-a's own migrations
+              # at first boot, AFTER postgres reports healthy — running
+              # create-account too early fails with `relation "accounts" does not
+              # exist`. Poll instead of sleep.
+              ansible.builtin.command: >-
+                docker exec postgres-a psql -U postgres -d netbird -tAc
+                "SELECT to_regclass('public.accounts') IS NOT NULL"
+              register: netbird_schema_ready
+              changed_when: false
+              retries: 30
+              delay: 5
+              until: "'t' in (netbird_schema_ready.stdout | default(''))"
+          rescue:
+            - name: read management-a's recent log to name why the schema never appeared
+              # The log is READ here and never printed. management-a's store DSN
+              # carries the Postgres superuser password and NetBird prints that
+              # DSN on a store connect or auth error, which is one of the
+              # failures that lands in this rescue. no_log keeps it out of -v
+              # output; the fail tasks below test it and never interpolate it.
+              # failed_when false is not a swallow: one of the three fail tasks
+              # below always fires, and an unreadable log lands in the last.
+              ansible.builtin.command: docker logs --tail 80 management-a
+              register: schema_wait_mgmt_log
+              changed_when: false
+              failed_when: false
+              no_log: true
+
+            - name: is a Hydra container on this host at all
+              # Tells the first run (Ory never deployed here, no container) from
+              # an outage (Hydra deployed and not answering). The dial failure
+              # in management-a's log reads the same for both. Matched on the
+              # compose service label: the overlay sets no container_name.
+              ansible.builtin.command:
+                cmd: docker ps -a --filter label=com.docker.compose.service=hydra --format '{{ "{{" }}.Names{{ "}}" }}'
+              register: schema_wait_hydra_container
+              changed_when: false
+              failed_when: false
+
+            - name: note what the two reads found
+              ansible.builtin.set_fact:
+                schema_wait_hydra_dial_failed: >-
+                  {{ 'hydra:4444' in
+                     ((schema_wait_mgmt_log.stdout | default('')) ~ (schema_wait_mgmt_log.stderr | default(''))) }}
+                schema_wait_hydra_deployed: "{{ (schema_wait_hydra_container.stdout | default('') | trim | length) > 0 }}"
+
+            - name: the identity stack is not deployed yet (the expected first-run stop)
+              ansible.builtin.fail:
+                msg: |
+                  The netbird schema never appeared because management-a cannot
+                  reach Hydra (hydra:4444), and no Hydra container exists on this
+                  host. management-a needs the identity stack, and Ory deploys in
+                  the next phase, so on a site that has never had Ory this is the
+                  expected first-run stop.
+
+                  Recover, from the repo root on the operator machine:
+                    ops/scripts/goat-standup.sh {{ site_id }} --from 6 --to 6
+
+                  Phase 6 deploys Ory under the preflight and aws-vault wrapper with
+                  the flags ory-deploy.yml needs, then its last step re-runs this
+                  play, which finds the schema and prints the setup-key banner.
+              when:
+                - schema_wait_hydra_dial_failed | bool
+                - not (schema_wait_hydra_deployed | bool)
+
+            - name: Hydra is deployed and management-a still cannot reach it
+              ansible.builtin.fail:
+                msg: |
+                  The netbird schema never appeared because management-a cannot
+                  reach Hydra (hydra:4444), and a Hydra container already exists on
+                  this host ({{ schema_wait_hydra_container.stdout | default('') | trim | replace('\n', ', ') }}).
+                  This is not the first-run stop: Hydra is deployed and is down or
+                  unreachable. On the host, read `docker ps -a` for its state and
+                  `docker logs --tail 80` for that container, fix the cause, then
+                  re-run phase 6, which is idempotent and ends by re-running this play:
+                    ops/scripts/goat-standup.sh {{ site_id }} --from 6 --to 6
+              when:
+                - schema_wait_hydra_dial_failed | bool
+                - schema_wait_hydra_deployed | bool
+
+            - name: the schema never appeared, and Hydra is not the reason
+              ansible.builtin.fail:
+                msg: |
+                  The netbird schema (public.accounts) did not appear within 150 s,
+                  and management-a's log does not show the Hydra dial failure that
+                  explains a first run. The log is not printed here because it can
+                  carry the store DSN, which holds the Postgres superuser password.
+                  Read it on the host:
+                    docker logs --tail 80 management-a
+
+        - name: create-or-find account via Go CLI
+          ansible.builtin.command:
+            cmd: >-
+              mgmt-host-bootstrap create-account
+              --owner {{ bootstrap_owner_email | quote }}
+              --site-name {{ site_id | quote }}
+          register: create_account
+          changed_when: "'created' in create_account.stdout"
+
+        - name: extract account_id from CLI output
+          ansible.builtin.set_fact:
+            site_account_id: "{{ create_account.stdout | regex_search('acc_[a-zA-Z0-9_-]+') }}"
+          failed_when: site_account_id is none or site_account_id | length == 0
+
+        - name: mint bootstrap setup-key (single-use, role=bootstrap)
+          ansible.builtin.command:
+            cmd: >-
+              mgmt-host-bootstrap create-setup-key
+              --account {{ site_account_id | quote }}
+              --role bootstrap
+              --ttl {{ bootstrap_key_ttl_hours }}h
+          register: create_key
+          changed_when: true
+          no_log: true
+
+        - name: show bootstrap setup key
+          ansible.builtin.debug:
+            msg: |
+              -----------------------------------------------------------
+              {{ site_id }} bootstrap setup key
+              -----------------------------------------------------------
+              Account:     {{ site_account_id }}
+              Role:        bootstrap
+              TTL:         {{ setup_key_ttl_days_bootstrap | default(1) }} day(s)
+              Usage limit: 1 peer (single-use)
+              Management:  https://{{ site_enrollment_dns | default('<undefined>') }}
+              CLI output (key plaintext is in here):
+              {{ create_key.stdout }}
+              -----------------------------------------------------------
+              Copy to 1Password as
+                "goat / {{ site_id }} / bootstrap key / <today>"
+              Revoke within 24 h via:
+                mgmt-host-bootstrap rotate-setup-key --id <sk_...>
+              -----------------------------------------------------------
+
+# ============================================================================
+# Phase 4 — observability MVP (legacy on-mgmt-host)
+#
+# When `has_obs_host` is true, observability lives on a separate Orin-C
+# host (the canonical three-Orin shape per ADR 0826)
+# and is brought up via Phase 8 below. Phase 4 here is the LEGACY single-
+# host shape — deploys Prometheus + Alertmanager + node_exporter co-
+# located on the mgmt-host pair. Only fires when has_obs_host=false (or
+# when explicitly overridden via the legacy var).
+# ============================================================================
+- name: "site-bootstrap: observability MVP (legacy on-mgmt-host)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  vars:
+    postgres_exporter_password: >-
+      {{ postgres_superuser_password | default('') | hash('sha256') | truncate(32, True, '') }}
+  tasks:
+    - name: Apply observability role (legacy on-mgmt-host shape)
+      ansible.builtin.import_role:
+        name: observability
+      when:
+        - has_mgmt_api | default(false) | bool
+        - not (has_obs_host | default(false) | bool)
+        # Legacy on-mgmt-host obs assumes an A/B pair where each Orin
+        # scrapes the other's node-exporter (peer_node_exporter_target).
+        # Single-Orin sites (intra_site_pair=false) don't have a peer to
+        # scrape — they're scraped externally by another site's obs-host.
+        - intra_site_pair | default(false) | bool
+
+# ============================================================================
+# Phase 4B — Spock ACE drift-watch (Block 52A.3 interim L2a divergence detector)
+#
+# Dormant on day-1 single-postgres state (spock_drift_watch_peers empty);
+# emits a heartbeat + peer-count gauge so the dashboard reflects the
+# intentional dormancy rather than a silent miss. Only meaningful for
+# Spock-participating sites.
+# Design: docs/design/replication-consistency-observability.md §6.
+# ============================================================================
+- name: "site-bootstrap: Spock ACE drift-watch (when participates_in_spock)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Apply spock-drift-watch role
+      ansible.builtin.import_role:
+        name: spock-drift-watch
+      when: participates_in_spock | default(false) | bool
+
+# ============================================================================
+# Phase 5 — pgBackRest paired-stanza on local NVMe
+#
+# Two distinct stanzas (e.g. <site>-a-netbird on Router-A + <site>-b-netbird
+# on Router-B), each with a local repo at /opt/docker-data/pgbackrest/.
+# Cross-site site-loss durability is carried by Spock replication.
+# Only meaningful when the site holds durable independent state (full
+# profile). postgres-spock-only sites replicate FROM a publisher and
+# don't carry independent backup discipline (data loss = re-replicate).
+# Design: docs/design/pgbackrest.md §2.
+# ============================================================================
+# ---------------------------------------------------------------------------
+# DECLINING BACKUPS REQUIRES A DURABILITY STORY.
+#
+# The gate defaults TRUE. A site that says nothing gets backed up, because the
+# failure mode of a silent default is unbounded: a site can run for months with
+# archive_mode=off, no stanza and zero backups under real identities and live
+# fabric slots, on a `false` set with a note to flip it later. A comment is
+# addressed to a person who may never read it again — the gate is the only thing
+# the machine reads.
+#
+# So `false` is now a claim, and this asserts the claim: a site may carry no
+# independent backups ONLY if durability arrives some other way, which today
+# means Spock replication from a publisher. `false` + `participates_in_spock:
+# false` is a site with NO durability at all.
+# ---------------------------------------------------------------------------
+- name: "site-bootstrap: backups pre-flight — no-backups requires a durability story"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: false
+  tasks:
+    - name: A site declining pgBackRest must carry durability another way
+      ansible.builtin.assert:
+        that:
+          - (has_durable_independent_state | default(true) | bool)
+            or (participates_in_spock | default(false) | bool)
+            or (intra_site_pair | default(false) | bool)
+        fail_msg: >-
+          {{ site_id }} sets has_durable_independent_state: false,
+          participates_in_spock: false AND intra_site_pair: false, which is a
+          site with no independent backups and no replicated copy — nothing would
+          survive losing its disk. If durability really does arrive some other
+          way, say where in the group_var comment and add that axis here. If it
+          does not, the answer is has_durable_independent_state: true.
+        success_msg: >-
+          durability: {{ "own pgBackRest stanza"
+            if (has_durable_independent_state | default(true) | bool)
+            else ("Spock replication from a publisher"
+              if (participates_in_spock | default(false) | bool)
+              else "an intra-site A->B streaming standby (phase 6A)") }}
+
+- name: "site-bootstrap: pgBackRest paired-stanza (when has_durable_independent_state)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  vars:
+    pgbackrest_repo1_cipher_pass: >-
+      {{ (pgbackrest_cipher_pass | default('') ~ '-repo1-' ~ inventory_hostname)
+         | hash('sha256') | truncate(32, True, '') }}
+  tasks:
+    - name: Apply pgbackrest role
+      ansible.builtin.import_role:
+        name: pgbackrest
+      when: has_durable_independent_state | default(true) | bool
+
+# ============================================================================
+# Phase 6 — admit-audit C1+C3 sidecar
+#
+# Sits in front of management-a; only meaningful when has_mgmt_api.
+# ============================================================================
+- name: "site-bootstrap: admit-audit sidecar (when has_mgmt_api)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  vars:
+    admit_audit_password: >-
+      {{ (postgres_superuser_password | default('') ~ '-audit')
+         | hash('sha256') | truncate(32, True, '') }}
+  tasks:
+    - name: Apply admit-audit role
+      ansible.builtin.import_role:
+        name: admit-audit
+      when: has_mgmt_api | default(false) | bool
+
+# ============================================================================
+# Phase 6A — intra-site Postgres streaming replication (A primary → B standby)
+#
+# Idempotent — the role's Phase 2 detection skips destructive wipe +
+# basebackup if B is already a healthy streaming standby. Set
+# `-e postgres_streaming_force_rebuild=true` to force a re-basebackup.
+#
+# Only meaningful when intra_site_pair (A/B). Single-Orin sites skip.
+# This is the INTRA-site path (single WAL stream); the INTER-site path
+# (multi-master) is Spock and is gated behind `spock_peered=true` in
+# Phase 7 smoke.
+# ============================================================================
+- name: "site-bootstrap: intra-site Postgres streaming replication (when intra_site_pair)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  vars:
+    site_id_upper: "{{ site_id | upper | replace('-', '_') }}"
+    postgres_replicator_password: "{{ lookup('env', site_id_upper ~ '_REPLICATOR_PASS') }}"
+  pre_tasks:
+    - name: "pre | refuse to start without postgres_replicator_password env var (when intra_site_pair)"
+      ansible.builtin.assert:
+        that:
+          - postgres_replicator_password | length > 0
+        fail_msg: >-
+          {{ site_id_upper }}_REPLICATOR_PASS must be set in the operator
+          environment (.envrc.local). The postgres-streaming-replication
+          role uses it for both the primary-side `replicator` role and the
+          standby-side `primary_conninfo`. Refusing to proceed.
+        success_msg: "Replicator password present."
+      when: intra_site_pair | default(false) | bool
+  tasks:
+    - name: Apply postgres-streaming-replication role
+      ansible.builtin.import_role:
+        name: postgres-streaming-replication
+      when: intra_site_pair | default(false) | bool
+
+# ============================================================================
+# Phase 7 — smoke test
+#
+# Profile-aware. Different services exist depending on profile; tasks
+# below carry the appropriate `when:` clauses.
+# ============================================================================
+- name: "site-bootstrap: smoke test"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: management-a is up (when has_mgmt_api)
+      ansible.builtin.command:
+        cmd: docker ps --filter name=management-a --format '{{ "{{" }}.Status{{ "}}" }}'
+      register: mgmt_status
+      changed_when: false
+      failed_when: mgmt_status.stdout is not search('Up')
+      when: has_mgmt_api | default(false) | bool
+
+    - name: postgres-a is up
+      ansible.builtin.command:
+        cmd: docker ps --filter name=postgres-a --format '{{ "{{" }}.Status{{ "}}" }}'
+      register: pg_status
+      changed_when: false
+      failed_when: pg_status.stdout is not search('Up')
+
+    - name: spock extension is installed in the netbird database (when participates_in_spock)
+      # The postgres-spock image's init scripts create per-service databases
+      # (netbird, hydra, kratos, netbird_events, netbird_idp) and install the
+      # spock extension into the netbird database specifically. The default
+      # `postgres` database does NOT have spock installed (extensions are
+      # per-database scope). Query netbird explicitly so this matches reality.
+      ansible.builtin.command:
+        cmd: >-
+          docker exec postgres-a psql -U postgres -d netbird -tAc
+          "SELECT extversion FROM pg_extension WHERE extname='spock'"
+      register: spock_ext
+      changed_when: false
+      failed_when: spock_ext.stdout | length == 0
+      when: participates_in_spock | default(false) | bool
+
+    - name: Inter-site Spock subscription is replicating (only when peered)
+      # `spock_peered` is the INTER-SITE flag: when true, this site is wired
+      # into the multi-site federation. Intra-site A↔B uses Postgres streaming
+      # replication, NOT Spock — verified separately via pg_stat_replication.
+      #
+      # Multi-publisher sites have multiple subscriptions (e.g. one site subscribing
+      # to two others in a 3-site star). The check passes iff EVERY status line equals
+      # 'replicating'.
+      ansible.builtin.command:
+        cmd: >-
+          docker exec postgres-a psql -U postgres netbird -t -A -c
+          "SELECT status FROM spock.sub_show_status();"
+      register: spock_status
+      changed_when: false
+      failed_when: >-
+        spock_status.stdout | length == 0
+        or spock_status.stdout_lines
+           | reject('equalto', 'replicating')
+           | list | length > 0
+      when:
+        - participates_in_spock | default(false) | bool
+        - spock_peered | default(false) | bool
+
+    # Prometheus runs on the obs-host (Orin-C) under the three-Orin topology.
+    # The Prometheus-side alert + target assertions live in <site>-obs-bootstrap.yml
+    # Phase 7 smoke. Stat the legacy on-mgmt-host prometheus.yml; if absent,
+    # skip these checks.
+    - name: Check whether legacy on-mgmt-host prometheus.yml is present
+      ansible.builtin.stat:
+        path: "/opt/mgmt-host/monitoring/prometheus.yml"
+      register: prom_yml_local
+      when: has_mgmt_api | default(false) | bool
+
+    - name: Prometheus reports firing alerts (informational, legacy on-mgmt-host obs only)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9092/api/v1/alerts"
+        return_content: true
+      register: prom_alerts
+      when:
+        - has_mgmt_api | default(false) | bool
+        - prom_yml_local.stat is defined
+        - prom_yml_local.stat.exists | default(false)
+
+    - name: All Prometheus scrape targets must be healthy (legacy on-mgmt-host obs only)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9092/api/v1/targets?state=any"
+        return_content: true
+      register: prom_targets
+      retries: 12
+      delay: 5
+      until: >-
+        (prom_targets.json.data.activeTargets
+          | selectattr('health','equalto','down')
+          | list | length) == 0
+      when:
+        - has_mgmt_api | default(false) | bool
+        - prom_yml_local.stat is defined
+        - prom_yml_local.stat.exists | default(false)
+
+    - name: mgmt-host-bootstrap wrapper is on PATH (Block 21A) (when has_mgmt_api)
+      ansible.builtin.command:
+        cmd: which mgmt-host-bootstrap
+      register: wrapper_path
+      changed_when: false
+      failed_when: wrapper_path.rc != 0 or '/usr/local/bin/mgmt-host-bootstrap' not in wrapper_path.stdout
+      when: has_mgmt_api | default(false) | bool
+
+    - name: summary
+      ansible.builtin.debug:
+        msg: |
+          {{ site_id }} bootstrap complete for {{ inventory_hostname }} (profile={{ mgmt_stack_profile }}).
+          postgres-a:    {{ pg_status.stdout }}
+          {% if has_mgmt_api | default(false) | bool %}
+          management-a:  {{ mgmt_status.stdout }}
+          mgmt-host-bootstrap wrapper: {{ wrapper_path.stdout | trim }}
+          {% endif %}
+          {% if participates_in_spock | default(false) | bool %}
+          spock ext:     {{ spock_ext.stdout }}
+          spock sub:     {{ spock_status.stdout | default('standalone (spock_peered=false)') }}
+          {% endif %}
+
+# ============================================================================
+# Phase 7B — inter-site Spock auto-mesh (Block 64Q.3)
+#
+# Wires bidirectional Spock subscriptions between this site and every
+# other `participates_in_spock` site in the mgmt-host fleet. Idempotent —
+# the role short-circuits when `inter_site_spock_topology` is `none`
+# (the safe default for sites not yet migrated from the manual ceremony).
+#
+# Targets the primary Orin only (router_role=A on A/B pair sites, the
+# single host on single-Orin sites). The role uses delegate_to per peer
+# to wire the peer-side subscription in the same pass — a single
+# site-bootstrap.yml run for a NEW site brings it fully into the mesh.
+#
+# Default (`inter_site_spock_topology: none`) means the role does NOT
+# touch the existing 12-edge live state. Operator opts in per-site by
+# flipping the local site's `inter_site_spock_topology` to `full_mesh`
+# AFTER the 64Q.4 replicator-DSN migration has retrofitted the existing
+# edges. See ops/ansible/roles/spock-mesh-peering/README.md.
+# ============================================================================
+# ============================================================================
+# Phase 7D — Zenoh router: NOT deployed here (role-selection fence)
+#
+# A goatnet's router is the `goat-zenoh` role, deployed by
+# `zenoh-deploy.yml -e target=<site>_hosts` (standup phase 9).
+# site-bootstrap deliberately deploys NO router: the fabric role owns the
+# live ACL, the mTLS material and the mesh-IP bind, and it must run after
+# the certs of phase 5 exist — none of which site-bootstrap can satisfy.
+#
+# This play used to apply the minimal `roles/zenoh` (plain TCP, no mTLS,
+# no ACL, container `zenoh-router`, host-published 0.0.0.0:7447) whenever
+# `zenoh_enabled` was true. That role is a lab artifact — it has
+# never deployed a goatnet router, and on a goatnet its 0.0.0.0:7447
+# publish collides with the live fabric router's mesh-IP:7447 publish
+# (F-124 item 5; `zenoh-deploy.yml` still carries the one-shot cleanup for
+# hosts where the stray container was landed before this fence existed).
+#
+# The gate is therefore inverted into a fail-closed assertion: a goatnet
+# that still carries `zenoh_enabled: true` stops the standup with a pointer
+# rather than silently receiving the wrong router.
+# See docs/design/zenoh-data-fabric.md §"Which role deploys a goatnet's
+# router".
+# ============================================================================
+- name: "site-bootstrap: Zenoh router role-selection fence"
+  hosts: "{{ groups[(site_id | replace('-', '_')) ~ '_hosts'][0] }}"
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Refuse the retired zenoh_enabled gate (wrong-router fence)
+      ansible.builtin.fail:
+        msg: >-
+          `zenoh_enabled` is set for this site, but site-bootstrap no longer
+          deploys a Zenoh router. That flag applied the integdev-lab
+          `roles/zenoh` (plain TCP, no mTLS, no ACL) and would land a
+          `zenoh-router` container colliding with the fabric router on
+          :7447. Remove `zenoh_enabled` from this site's group_vars and
+          deploy the router with
+          `zenoh-deploy.yml -e target={{ site_id | replace('-', '_') }}_hosts`
+          (standup phase 9). See
+          docs/design/zenoh-data-fabric.md §"Which role deploys a goatnet's
+          router".
+      when: zenoh_enabled is defined and (zenoh_enabled | bool)
+
+- name: "site-bootstrap: inter-site Spock auto-mesh (when participates_in_spock + topology set)"
+  hosts: "{{ groups[(site_id | replace('-', '_')) ~ '_hosts'][0] }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Apply spock-mesh-peering role
+      # include_role (dynamic) not import_role (static) — when this play's
+      # gate evaluates false, the WHOLE role is skipped. With import_role,
+      # the `when:` clause propagates to every task in the role, which lets
+      # the role's first short-circuit task get skipped along with the gate
+      # task — but downstream tasks (e.g. "ensure local Spock node X
+      # exists") have no individual `when:` and try to execute with vars
+      # that the (skipped) setup tasks should have defined, then fail.
+      # This applies to a single-host site with
+      # participates_in_spock: false + inter_site_spock_topology: none.
+      ansible.builtin.include_role:
+        name: spock-mesh-peering
+      when:
+        - participates_in_spock | default(false) | bool
+        - (inter_site_spock_topology | default('none')) != 'none'
+
+# ============================================================================
+# Phase 7C — mgmt-host snitch probe (Block 61G; opt-in per site)
+#
+# Wires the mgmt-host into the snitch fleet-health probe register so
+# every Orin emits per-cycle reports the way bridge VPSes do.
+#
+# Gate is `snitch_enabled` (group_var; default false). Opt-in per
+# site because the snitch-bundle role's prerequisites differ by
+# bringup vintage:
+#
+#   - Block 68 rapid-bringup hosts (today: prov-conus) carry the
+#     bootstrap-bundle layout natively at /opt/goat/bootstrap/
+#     and were minted with `--snitch=true` so the per-device probe
+#     key is in the offline-enrollment bundle. Set snitch_enabled=true.
+#
+#   - Operator-flashed hosts pre-Block-68
+#     lack the bootstrap-bundle layout AND were minted
+#     without --snitch=true. They need EITHER a bundle re-issue
+#     cycle (run bundle-create with --snitch=true + lay down the
+#     bootstrap-bundle binaries) OR an inventory-side probe-key
+#     override via `snitch_probe_key_inventory` + manual binary copy
+#     before flipping snitch_enabled=true.
+#
+# The phase is fail-loud on missing prerequisites — that's the
+# correct posture per ADR 0006 minimal-surface preference. Operator
+# sees the failure and fixes it; we don't silently swallow.
+# ============================================================================
+- name: "site-bootstrap: mgmt-host snitch probe (when snitch_enabled)"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: false
+  become: true
+  vars:
+    # Needed by snitch_probe_key_inventory below; every other play that uses
+    # site_id_upper defines it locally, and this one must too.
+    site_id_upper: "{{ site_id | upper | replace('-', '_') }}"
+  tasks:
+    - name: Apply snitch-bundle role
+      ansible.builtin.import_role:
+        name: snitch-bundle
+      vars:
+        # Per-site env-var probe-key override path. When the offline-enrollment
+        # bundle on this host carries the snitch_probe_key field natively
+        # (Block 68 rapid-bringup ceremony with `--snitch=true`), set this
+        # to "" to force the role to bundle-extract the key. When the bundle
+        # was minted before --snitch=true was the norm, set the env var
+        # `<SITE>_SNITCH_PROBE_KEY` (1Password-backed, in .envrc.local) and
+        # the role uses the inventory override.
+        snitch_probe_key_inventory: "{{ lookup('env', site_id_upper ~ '_SNITCH_PROBE_KEY') | default('', true) }}"
+      when:
+        - has_mgmt_api | default(false) | bool
+        - snitch_enabled | default(false) | bool
+
+# ============================================================================
+# Phase 7D — narrow Ory Spock repset (Block 21G; opt-in per site)
+#
+# Lands the narrow Spock repset for Ory tables per ADR 1010 D8.
+# Installs the Spock extension in kratos + hydra databases (the
+# production init script intentionally does NOT — see comment in
+# ops/postgres/spock/init/02-spock-extension.sql), creates the
+# `ory_narrow` repset in both DBs, adds the canonical 10
+# inclusion-list tables, asserts no exclusion-list table is a
+# member, and wires cross-site subscriptions to peer sites'
+# `ory_narrow` repsets.
+#
+# Gate is `ory_spock_enabled` (group_var; default false). Opt-in
+# per site. The role short-circuits via end_play if the gate is
+# false, so this phase is safe to leave wired in site-bootstrap.yml
+# fleet-wide.
+#
+# Pre-flight: kratos-a + hydra-a containers MUST be healthy (the
+# role waits up to ory_spock_preflight_wait_seconds for them).
+# Phase 7D therefore runs AFTER Phase 6 (mgmt-host compose stack
+# brings up kratos + hydra) and Phase 7B (spock-mesh-peering for
+# netbird DB). Per-DB independent — kratos and hydra each get their
+# own Spock node, ory_narrow repset, and subscription set.
+#
+# See:
+#   docs/adr/1010-ory-on-spock-mindful-operation.md (D8 amendment)
+#   docs/project/ory-spock-narrow-repset-plan.md (Pattern C plan)
+#   docs/project/ory-spock-narrow-repset-schema-audit.md
+#   ops/ansible/roles/ory-narrow-repset/README.md
+# ============================================================================
+- name: "site-bootstrap: narrow Ory Spock repset (when ory_spock_enabled)"
+  hosts: "{{ groups[(site_id | replace('-', '_')) ~ '_hosts'][0] }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Apply ory-narrow-repset role
+      ansible.builtin.import_role:
+        name: ory-narrow-repset
+      when:
+        - participates_in_spock | default(false) | bool
+        - (inter_site_spock_topology | default('none')) != 'none'
+        - ory_spock_enabled | default(false) | bool
+
+# ============================================================================
+# Phase 8 — obs-host bringup (separate operator-fired step)
+#
+# REMOVED from site-bootstrap.yml in Block 22L.4 because
+# `ansible.builtin.import_playbook` resolves its path argument at PARSE
+# time (not at task execution time). A `when:` clause skips execution
+# but does NOT skip the file-load — so wrapping
+# `import_playbook: "{{ site_id }}-obs-bootstrap.yml"` with a conditional
+# fails for postgres-spock-only sites where no `<site>-obs-bootstrap.yml`
+# file exists.
+#
+# The obs-host is also a separate physical machine (Orin-C) with its
+# own SSH-based bringup chain (not the SSM/mesh-IP path the mgmt-host
+# pair uses). Tying it into site-bootstrap.yml as a hard-coded phase
+# was always a bit forced.
+#
+# For full-profile sites, bring up the obs-host
+# via the per-site obs-bootstrap playbook as a SEPARATE operator step:
+#
+#   ansible-playbook -i inventory/mgmt-hosts.ini \
+#     <site>-obs-bootstrap.yml
+#
+# Per-site obs-bootstrap.yml collapse into a unified obs-bootstrap.yml
+# (mirroring this playbook's collapse) is its own follow-on, not in
+# Block 22L.4 scope.
+# ============================================================================

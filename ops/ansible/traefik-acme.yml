@@ -1,0 +1,579 @@
+---
+# traefik-acme.yml — wire Let's Encrypt ACME (Cloudflare DNS-01) into
+# Traefik on a mgmt host.
+#
+# A standalone overlay rather than a change to the canonical traefik role:
+# a single playbook lays down only what an ACME-fronted goatnet needs on
+# top of the base mgmt-host compose, instead of carving an `acme_mode` switch
+# into the upstream `ops/ansible/roles/traefik/` (which is wired for
+# offline-CA leaf certs per ADR 0407).
+#
+# What this playbook does on the mgmt host:
+#   1. Renders `/opt/mgmt-host/docker-compose.acme.yml` — a compose
+#      OVERRIDE that re-defines the `traefik:` service with the ACME
+#      command flags + a `/letsencrypt` volume + the Cloudflare DNS API
+#      token env var. Docker Compose REPLACES (not merges) `command:`
+#      arrays in overrides, so the override re-lists the entire base
+#      command set; the comment in the template flags this as a known
+#      maintenance touchpoint.
+#   2. Ensures `/opt/mgmt-host/letsencrypt/` exists on the host (mode
+#      0700 root:root) — this is where Traefik persists `acme.json`
+#      across restarts.
+#   3. Renders `/etc/traefik/dynamic/mgmt.yml` — the file-provider
+#      router for `netbird.<zone>` (the public DNS name
+#      that the relays answer via DNS round-robin + rathole-
+#      forward back to the mgmt host). Uses `tls.certResolver: le` and a
+#      `tls.domains[]` block so Traefik mints + serves the LE cert.
+#      Backend is `http://management-a:80` (netbird-mgmt API).
+#   4. Patches `mgmt-host-compose-watch.sh` discovery list to include
+#      `docker-compose.acme.yml` AND adds `traefik` to the per-site
+#      compose-watch allowlist so the watcher can revive Traefik with
+#      the overlay if the container ever disappears. The first patch
+#      is upstream-in-tree (re-runnable role), the second is the
+#      `mgmt_host_compose_watch_services` group_var which nova_hosts/vars.yml
+#      owns.
+#   5. Brings up Traefik against the merged stack via
+#      `docker compose -f docker-compose.yml -f docker-compose.acme.yml
+#      up -d traefik`.
+#   6. Polls for `acme.json` to become non-empty (first cert mint runs
+#      in the background — DNS-01 propagation takes 30-90s depending
+#      on Cloudflare).
+#   7. Delegates back to the controller and runs `openssl s_client` from
+#      the operator laptop against `netbird.<zone>:443`
+#      to verify the cert is real (issuer "Let's Encrypt" instead of
+#      "TRAEFIK DEFAULT CERT").
+#
+# Deliberate omissions vs the canonical `ops/ansible/roles/traefik/`:
+#   - No offline-CA leaf cert delivery (cert is minted by ACME).
+#   - No `traefik_services:` group_var consumption — this overlay is the
+#     source-of-truth for the mgmt router until the upstream role grows an
+#     `acme_mode` switch.
+#   - No FIPS-aligned TLS-options block: public LE certs are not a FIPS chain.
+#
+# Follow-on: merge this overlay back into `ops/ansible/roles/traefik/` as a
+# clean `acme_mode: file|acme` toggle so future LE-fronted sites don't fork
+# this playbook.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       traefik-acme.yml
+#
+# Inventory rationale: the target group is defined in the committed
+# `inventory/mgmt-hosts.ini` (the bootstrap inventory used by SSM). The
+# `inventory/mgmt-hosts-mesh.ini` overlay replaces `ansible_host` with the
+# mesh IP so SSH-over-mesh is used instead of SSM — fast, and the routine
+# pattern for any post-bootstrap refresh.
+#
+# Pre-flight:
+#   - The mgmt host reachable on its mesh IP from the operator laptop (the
+#     `mgmt-hosts-mesh.ini` overlay's ansible_host). Operator's netbird
+#     daemon must be up against the goatnet's mgmt server.
+#   - The base mgmt-host compose is up (site-bootstrap.yml with
+#     skip_traefik=true).
+#   - The goatnet's Cloudflare API token in the environment.
+#   - DNS for `netbird.<zone>` answering (cert-mint validation uses the
+#     public A records to find the relay-fronted :443 path back to the
+#     mgmt host's Traefik on the rathole tunnel).
+#
+# Rollback: `docker compose up -d traefik` from /opt/mgmt-host (drops the
+#   overlay file by default). Re-running the play restores ACME state.
+
+- name: Wire Traefik ACME (Let's Encrypt via Cloudflare DNS-01)
+  # Host scope parameterized so any goatnet can mint its own mgmt cert:
+  # `-e target=<site>_hosts -e public_mgmt_fqdn=netbird.<zone>
+  #  -e acme_email=ops@<zone> -e cf_api_token=$CLOUDFLARE_API_TOKEN_<SITE>`.
+  hosts: "{{ target | mandatory }}"
+  become: true
+  vars:
+    compose_dir: /opt/mgmt-host
+    le_dir: /opt/mgmt-host/letsencrypt
+    dynamic_dir: /etc/traefik/dynamic
+    # public_mgmt_fqdn + acme_email come from the TARGET GROUP's group_vars
+    # (each group declares its own). They are not play vars: play vars outrank
+    # group_vars, so a play-level default renders one goatnet's hostnames into
+    # another's routers. Do not add them at play level.
+    #
+    # The token follows the SAME rule. A play-level default would outrank the
+    # group_vars value, so an operator who forgets `-e` gets another goatnet's
+    # token — non-empty, so the pre-flight passes, and DNS-01 fails much later
+    # against the wrong zone.
+    #
+    # It defaults to the target group's own `cloudflare_api_token`, which
+    # each ACME group declares as a lookup of its goatnet's
+    # CLOUDFLARE_API_TOKEN_* variable. An explicit `-e cf_api_token=...` still
+    # wins for a one-off. Resolved on the controller at launch, so the secret
+    # reaches the host only through compose env interpolation, never as
+    # plaintext substituted into a rendered file.
+    cf_api_token: "{{ cloudflare_api_token | default('', true) }}"
+
+  pre_tasks:
+    # #390: ACME routes the public_mgmt_fqdn hostname family, while Ory
+    # issuers and redirects use site_dns_zone. LAN plays never enter this
+    # overlay; Ory-less targets can legitimately use distinct names.
+    # hydra_secrets_system is the current Ory-presence marker.
+    - name: Pre-flight | Ory DNS names are declared
+      ansible.builtin.assert:
+        that:
+          - site_dns_zone is defined
+          - public_mgmt_fqdn is defined
+          - site_dns_zone is string
+          - public_mgmt_fqdn is string
+          - site_dns_zone | trim | length > 0
+          - public_mgmt_fqdn | trim | length > 0
+        fail_msg: >-
+          An Ory-carrying internet site must declare non-empty site_dns_zone
+          and public_mgmt_fqdn strings in its target group's vars.yml.
+          site_dns_zone={{ site_dns_zone | default('UNDEFINED') }},
+          public_mgmt_fqdn={{ public_mgmt_fqdn | default('UNDEFINED') }}.
+      when: hydra_secrets_system is defined
+
+    - name: Pre-flight | site_dns_zone matches public_mgmt_fqdn (Ory-carrying sites)
+      ansible.builtin.assert:
+        that:
+          - site_dns_zone == public_mgmt_fqdn
+        fail_msg: >-
+          site_dns_zone={{ site_dns_zone }} differs from
+          public_mgmt_fqdn={{ public_mgmt_fqdn }}.
+          On an internet site carrying Ory, set both to the enrollment DNS
+          name in the target group's vars.yml. ACME routes the latter name;
+          Ory issuers and redirects use the former. A LAN configuration may
+          split these names and cannot be copied unchanged into this path.
+      when: hydra_secrets_system is defined
+
+    - name: Pre-flight | this goatnet's Cloudflare DNS-01 token resolves
+      ansible.builtin.assert:
+        that:
+          - cf_api_token | length > 0
+        fail_msg: |
+          cf_api_token is empty. Traefik's Cloudflare DNS-01 ACME challenge
+          cannot run without it.
+
+          It defaults to `cloudflare_api_token` from the TARGET GROUP's
+          group_vars, which every ACME group declares as a lookup of its own
+          zone's token, e.g. in group_vars/zagros_hosts/vars.yml:
+
+            cloudflare_api_token: "{{ '{{' }} lookup('env', 'CLOUDFLARE_API_TOKEN_ZAGROS') {{ '}}' }}"
+
+          Empty means one of two things: the group has no `cloudflare_api_token`
+          (declare it), or the CLOUDFLARE_API_TOKEN_* variable it names is not
+          exported in this shell (source .envrc.local.d via direnv).
+
+          A one-off `-e cf_api_token=$CLOUDFLARE_API_TOKEN_<ZONE>` still
+          overrides, but it should not be the routine path — that is how the
+          wrong goatnet's token used to satisfy this check.
+
+    - name: Pre-flight | base compose file present
+      ansible.builtin.stat:
+        path: "{{ compose_dir }}/docker-compose.yml"
+      register: _base_compose
+      failed_when: not _base_compose.stat.exists
+
+    - name: Pre-flight | read the active warrant membership mode for probation
+      ansible.builtin.set_fact:
+        _probation_warrant_mode: >-
+          {{ (lookup('ansible.builtin.file', playbook_dir ~ '/../warrant/membership/' ~ warrant_membership_scope ~ '/_scope.yaml') | from_yaml).converge | default('') }}
+      when:
+        - probation_explainer_enabled | default(false) | bool
+        - warrant_membership_enabled | default(false) | bool
+
+    - name: Pre-flight | probation explainer has legacy classifier prerequisites
+      ansible.builtin.assert:
+        that:
+          - id_admin_console_enabled | default(false) | bool
+          - peerview_enabled | default(false) | bool
+          - id_admin_console_notify_mgmt_url | default('') | length > 0
+          - id_admin_console_enroll_watch_nb_token | default('') | length > 0
+          - not (warrant_membership_enabled | default(false) | bool) or (_probation_warrant_mode | default('')) != 'enforce'
+        fail_msg: >-
+          REFUSING probation_explainer_enabled: deploy a compatible console
+          first, provide its NetBird read token and legacy hold-record source,
+          and do not enable this legacy-record classifier on a warrant scope
+          whose _scope.yaml says converge: enforce.
+        quiet: true
+      when: probation_explainer_enabled | default(false) | bool
+
+    - name: Pre-flight | probation hold-record source exists on the host
+      ansible.builtin.stat:
+        path: "{{ id_admin_console_hold_records_host_dir | default(peerview_state_dir | default('/var/lib/peerview')) }}/hold-records.jsonl"
+      register: _probation_hold_records
+      when: probation_explainer_enabled | default(false) | bool
+
+    - name: Pre-flight | probation hold-record source is a regular file
+      ansible.builtin.assert:
+        that:
+          - _probation_hold_records.stat.exists
+          - _probation_hold_records.stat.isreg | default(false)
+        fail_msg: >-
+          REFUSING probation_explainer_enabled: the active legacy hold-record
+          file is absent on this host. Deploy/converge peerview first.
+        quiet: true
+      when: probation_explainer_enabled | default(false) | bool
+
+    # A non-empty token is not enough for an application-wide auth dependency:
+    # prove that the exact URL/token pair rendered into goat-id-console can read
+    # the endpoint its classifier needs. Keep both the request arguments and the
+    # peer response out of Ansible output.
+    - name: Pre-flight | probation NetBird peer source is readable
+      ansible.builtin.uri:
+        url: "{{ id_admin_console_notify_mgmt_url | regex_replace('/+$', '') }}/api/peers"
+        method: GET
+        headers:
+          Authorization: "Token {{ id_admin_console_enroll_watch_nb_token }}"
+          Accept: application/json
+        follow_redirects: none
+        status_code: 200
+        return_content: true
+      register: _probation_peer_source
+      no_log: true
+      when: probation_explainer_enabled | default(false) | bool
+
+    - name: Pre-flight | probation NetBird peer source has the expected shape
+      ansible.builtin.assert:
+        that:
+          - _probation_peer_source.json is defined
+          - (_probation_peer_source.json | type_debug) == 'list'
+        fail_msg: >-
+          REFUSING probation_explainer_enabled: the configured NetBird peer
+          source did not return the JSON array required by the classifier.
+        quiet: true
+      when: probation_explainer_enabled | default(false) | bool
+
+    # Console-first activation: current-main images that predate #1812 return
+    # 404 here. The readiness endpoint uses the RUNNING console's environment
+    # to read both classifier dependencies, catching a stale container token or
+    # URL that the desired-variable host probe above cannot observe.
+    - name: Pre-flight | running probation classifier is ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ id_admin_console_host_port | default(8088) }}/internal/probation/ready"
+        method: GET
+        status_code: 204
+        return_content: false
+      when: probation_explainer_enabled | default(false) | bool
+
+  tasks:
+    # =====================================================================
+    # 0. Re-sync the base mgmt-host compose file.
+    #
+    # The canonical owner of `{{ compose_dir }}/docker-compose.yml` is
+    # ops/ansible/mgmt-host.yml (Phase 2A), but that playbook is the
+    # heavy bootstrap path. For routine Traefik-side changes (new
+    # entrypoint declarations, new port publishes, env-var additions)
+    # we re-sync the file here so the recreate-Traefik step at the
+    # bottom of this play actually picks them up. Idempotent: copy
+    # short-circuits when content is unchanged.
+    #
+    # Example: the `--entrypoints.enrollment.address=:8443` entrypoint and the
+    # matching `127.0.0.1:8443:8443` port publish live in the base file. Without
+    # this resync the entrypoint never reaches the host, the Traefik recreate
+    # uses the stale compose, rathole-client points at a dead port, and
+    # enrollment breaks for new peers.
+    # =====================================================================
+    - name: Check pgBackRest config before publishing the base Compose mount
+      ansible.builtin.import_tasks: tasks/pgbackrest-config-preflight.yml
+      tags: [always]
+
+    - name: Re-sync base mgmt-host docker-compose.yml (canonical at ops/compose/mgmt-host/)
+      ansible.builtin.copy:
+        src: ../compose/mgmt-host/docker-compose.yml
+        dest: "{{ compose_dir }}/docker-compose.yml"
+        mode: "0644"
+      register: _base_compose_synced
+
+    # =====================================================================
+    # 1. Host filesystem layout — acme.json persistence dir
+    # =====================================================================
+    - name: Ensure {{ le_dir }} exists (acme.json persistence)
+      ansible.builtin.file:
+        path: "{{ le_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Ensure {{ dynamic_dir }} exists
+      ansible.builtin.file:
+        path: "{{ dynamic_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # =====================================================================
+    # 2. Render the compose override (overlay)
+    # =====================================================================
+    - name: Render docker-compose.acme.yml overlay
+      ansible.builtin.template:
+        src: traefik-acme/docker-compose.acme.yml.j2
+        dest: "{{ compose_dir }}/docker-compose.acme.yml"
+        owner: root
+        group: root
+        mode: "0640"
+      register: _overlay_rendered
+
+    # =====================================================================
+    # 2.5. zenoh-door lane client-CA (env-doors Tier 2, ADR 1117; gated).
+    #
+    # The dynamic config's `zenoh-door-mtls` TLS option verifies lane
+    # clients against the OFFLINE dev CA — the same root that signs this
+    # goatnet's zenoh leaves, already on this host at zenoh_door_client_ca_src
+    # (default /etc/<zenoh_stack>/tls/ca-root-cert.pem). Copy it (public
+    # material, remote_src) into /etc/goat/tls/, which the base
+    # compose already mounts read-only into the Traefik container — no new
+    # mount, no secret transfer. Must land BEFORE the dynamic render so the
+    # file-watcher reload finds the CA file.
+    # =====================================================================
+    - name: Ensure /etc/goat/tls exists (zenoh-door client-CA home)
+      ansible.builtin.file:
+        path: /etc/goat/tls
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: zenoh_door_ingress_enabled | default(false)
+
+    - name: Install zenoh-door client-CA for Traefik mTLS (env-doors Tier 2)
+      ansible.builtin.copy:
+        src: "{{ zenoh_door_client_ca_src }}"
+        dest: /etc/goat/tls/zenoh-door-client-ca.pem
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      when: zenoh_door_ingress_enabled | default(false)
+
+    # =====================================================================
+    # 3. Render the dynamic config (router for the public mgmt FQDN)
+    # =====================================================================
+    - name: Render Traefik dynamic config for the mgmt routers
+      ansible.builtin.template:
+        src: traefik-acme/mgmt-dynamic.yml.j2
+        dest: "{{ dynamic_dir }}/mgmt.yml"
+
+    # The route filename is mgmt.yml; an older deployment may still hold
+    # nova-mgmt.yml. Traefik's file provider reads the whole directory, so leaving
+    # the old file behind is not inert: every router in it would be declared a
+    # second time, on the same Host() rules, including the two enrollment
+    # routers. Removed here, in the same play that renders the replacement, so
+    # the two can never be live at once.
+    #
+    # ORDERING: this task must stay AFTER the render above and BEFORE the
+    # Traefik recreate, which is the same ordering constraint the entrypoint
+    # middleware flag already depends on.
+    - name: Remove the pre-rename mgmt route file
+      ansible.builtin.file:
+        path: "{{ dynamic_dir }}/nova-mgmt.yml"
+        state: absent
+        owner: root
+        group: root
+        mode: "0644"
+      register: _dynamic_rendered
+
+    # =====================================================================
+    # 4. Append the CF token to /opt/mgmt-host/.env so docker-compose's
+    #    env interpolation finds it. This file is the canonical env
+    #    surface for the mgmt-host compose project (loaded by all overlays
+    #    + by mgmt-host-compose-watch). Mode 0600 root:root.
+    #
+    #    We use `lineinfile` with a fixed key prefix so re-runs are
+    #    idempotent (replace, not append). The `no_log` on this task keeps
+    #    the token out of ansible-playbook output.
+    # =====================================================================
+    - name: Inject CLOUDFLARE_DNS_API_TOKEN into /opt/mgmt-host/.env
+      ansible.builtin.lineinfile:
+        path: "{{ compose_dir }}/.env"
+        regexp: "^CLOUDFLARE_DNS_API_TOKEN="
+        line: "CLOUDFLARE_DNS_API_TOKEN={{ cf_api_token }}"
+        owner: root
+        group: root
+        mode: "0600"
+        create: true
+      no_log: true
+      register: _env_token
+
+    # =====================================================================
+    # 4.1. Pin COMPOSE_FILE so a bare `docker compose` cannot silently drop
+    #      the ACME overlay.
+    #
+    # A bare `sudo docker compose up -d` (no -f, no service name) reads only
+    # docker-compose.yml, recreates every service defined there including
+    # traefik, and drops this overlay — taking the `le` resolver with it.
+    # Traefik then serves CN=TRAEFIK DEFAULT CERT, so every netbird client on
+    # the goatnet fails the TLS handshake to management, including the mgmt
+    # hosts themselves. acme.json is not lost; it simply has no resolver left
+    # to load it.
+    #
+    # The header of THIS file documents `docker compose up -d traefik` from
+    # /opt/mgmt-host as the deliberate rollback, so the same command is easy
+    # to fire by accident. That is why the safe default lives in the
+    # environment rather than in an operator's memory.
+    #
+    # COMPOSE_FILE in the project .env is compose's own mechanism for this.
+    # Explicit `-f` flags still override it, so every scoped call in the
+    # roles (`-f docker-compose.yml -f <overlay> up -d <service>`) behaves
+    # exactly as before. What changes is that the BARE command is now safe.
+    # =====================================================================
+    - name: Pin COMPOSE_FILE so a bare `docker compose` keeps the ACME overlay
+      ansible.builtin.lineinfile:
+        path: "{{ compose_dir }}/.env"
+        regexp: "^COMPOSE_FILE="
+        line: "COMPOSE_FILE=docker-compose.yml:docker-compose.acme.yml"
+        owner: root
+        group: root
+        mode: "0600"
+        create: true
+      register: _env_compose_file
+
+    # 4.2. Container ceilings for traefik / management-a / signal-a, from the
+    #      same group_vars mgmt-host.yml renders. The compose file copied above
+    #      falls back to 0.5 / 1.0 / 1.0 without them, so this runs before
+    #      "Recreate Traefik with the ACME overlay" below.
+    - name: Sync mgmt-host container ceilings into .env
+      ansible.builtin.include_tasks: tasks/mgmt-host-ceilings-env.yml
+
+    # =====================================================================
+    # 4.5. Evict stale public-anchor cert from acme.json (idempotent).
+    #
+    # The LE cert is split into public-only + mesh-only anchors, and the mgmt
+    # router into mgmt-public + mgmt-mesh, so the public anchor's Host()-derived
+    # SAN list does not carry the mesh alias. But Traefik does not automatically discard a cert that
+    # was minted with extra SANs as long as the cert still covers all
+    # currently-needed hostnames — so after a template change, an old
+    # leaky public cert would linger in acme.json until natural renewal
+    # (~60 days), and off-mesh TLS handshakes would keep advertising the
+    # mesh alias in the SAN list.
+    #
+    # This task surgically removes the public-anchor entry from
+    # acme.json IFF its SAN list contains anything beyond the public
+    # FQDN itself. On the next Traefik start, the resolver sees the
+    # entry missing, runs a fresh ACME order against signal's
+    # tls.domains anchor, and writes back a clean single-name cert.
+    #
+    # Idempotent: re-runs are no-ops once the cert is clean.
+    # =====================================================================
+    - name: Evict stale public-anchor cert from acme.json
+      ansible.builtin.shell:
+        cmd: |
+          test -s {{ le_dir }}/acme.json || { echo "no-acme-json"; exit 0; }
+          python3 - <<'PY'
+          import json, os, tempfile
+          p = "{{ le_dir }}/acme.json"
+          with open(p) as f:
+              d = json.load(f)
+          le = d.get("le") or {}
+          certs = le.get("Certificates") or []
+          fqdn = "{{ public_mgmt_fqdn }}"
+          removed = False
+          kept = []
+          for c in certs:
+              dom = c.get("domain") or {}
+              if dom.get("main") == fqdn:
+                  sans = [s for s in (dom.get("sans") or []) if s != fqdn]
+                  if sans:
+                      # Leaky cert — drop it; Traefik will re-mint on next start.
+                      print(f"EVICTED stale public-anchor cert: extra SANs = {sans}")
+                      removed = True
+                      continue
+              kept.append(c)
+          if removed:
+              le["Certificates"] = kept
+              d["le"] = le
+              fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+              with os.fdopen(fd, "w") as f:
+                  json.dump(d, f)
+              os.chmod(tmp, 0o600)
+              os.rename(tmp, p)
+          else:
+              print("NOOP: public-anchor cert is already clean (or absent)")
+          PY
+      args:
+        executable: /bin/bash
+      register: _acme_evict
+      changed_when: "'EVICTED' in _acme_evict.stdout"
+
+    # =====================================================================
+    # 5. Bring up Traefik against the merged stack
+    # =====================================================================
+    - name: Recreate Traefik with the ACME overlay
+      ansible.builtin.command:
+        cmd: docker compose -f docker-compose.yml -f docker-compose.acme.yml up -d --force-recreate traefik
+        chdir: "{{ compose_dir }}"
+      register: _traefik_up
+      changed_when: "'Started' in _traefik_up.stderr or 'Created' in _traefik_up.stderr or 'Recreated' in _traefik_up.stderr"
+
+    # =====================================================================
+    # 6. Wait for first cert mint — Traefik writes /letsencrypt/acme.json
+    #    as soon as the ACME order completes. DNS-01 propagation through
+    #    Cloudflare is usually 30-90s.
+    # =====================================================================
+    - name: Wait for acme.json to have a cert for the public mgmt FQDN
+      # `args.executable: /bin/bash` is REQUIRED — Ansible's `shell` module
+      # defaults to /bin/sh which on Ubuntu is `dash`, and dash rejects
+      # `set -o pipefail`. The earlier (failed) iteration of this task
+      # used pipefail and every retry exited rc=2 on the set line, so the
+      # actual content check never ran. Use python3 (always present on a
+      # mgmt-host) to do a real schema-aware check instead of grep-by-string
+      # so we both honor structure AND catch the precise domain we asked
+      # Traefik to mint.
+      ansible.builtin.shell:
+        cmd: |
+          test -s {{ le_dir }}/acme.json || exit 1
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("{{ le_dir }}/acme.json"))
+          certs = (d.get("le") or {}).get("Certificates") or []
+          for c in certs:
+              if (c.get("domain") or {}).get("main") == "{{ public_mgmt_fqdn }}" \
+                 and c.get("certificate"):
+                  sys.exit(0)
+          sys.exit(1)
+          PY
+      args:
+        executable: /bin/bash
+      register: _acme_ready
+      retries: 30
+      delay: 10
+      until: _acme_ready.rc == 0
+      changed_when: false
+
+    - name: Show Traefik logs (last 50 lines) for the audit trail
+      ansible.builtin.command:
+        cmd: docker logs --tail 50 traefik
+      register: _traefik_logs
+      changed_when: false
+
+    - name: Print Traefik logs
+      ansible.builtin.debug:
+        var: _traefik_logs.stdout_lines
+
+    # =====================================================================
+    # 7. External verification — from the controller, openssl-connect
+    #    to the public name and check the issuer.
+    # =====================================================================
+    - name: External verification — openssl s_client against public mgmt FQDN
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          echo "Q" | openssl s_client -connect {{ public_mgmt_fqdn }}:443 \
+            -servername {{ public_mgmt_fqdn }} 2>/dev/null \
+            | openssl x509 -noout -issuer -subject -dates
+      register: _external_cert
+      changed_when: false
+      failed_when: false
+
+    - name: Print external cert summary
+      ansible.builtin.debug:
+        msg: |
+          External TLS verification ({{ public_mgmt_fqdn }}:443):
+          {{ _external_cert.stdout }}
+
+          If issuer reads "C=US, O=Let's Encrypt, CN=..." then Phase 2.5
+          is closed. If issuer still says "TRAEFIK DEFAULT CERT", check
+          the Traefik logs above — common causes are CF token scope
+          (must include `Zone:DNS:Edit` for `nova.example`) or
+          DNS propagation slower than the 5min wait budget.

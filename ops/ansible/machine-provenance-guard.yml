@@ -1,0 +1,30 @@
+---
+# Deploy the hourly gear-provenance audit to a goatnet's mgmt host (ADR 1130).
+#
+# Its OWN play, deliberately not folded into <env>-refresh.yml. Two reasons:
+# the role refuses to install without both service credentials, so riding an
+# unrelated refresh would turn "I bumped a pin" into a failed play on every
+# goatnet that has not minted them yet; and standing up a background process
+# that holds an admin-scoped mesh token deserves a command somebody chose to
+# run. Fold it into refresh once every goatnet is configured, not before.
+#
+# Before the first run on a goatnet, mint the two identities:
+#   MGMT_HOST=... ops/scripts/create-provenance-guard-identity.sh <goatnet>
+# The NetBird half lands in the envrc and 1Password on its own; put the portal
+# key it prints into that goatnet's .envrc.local.d entry.
+#
+# Then, over the env door (ADR 1117 — never flip the netbird profile):
+#   ops/scripts/env-door.sh zagros
+#   cd ops/ansible && OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     aws-vault exec usareur-af --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/doors.ini \
+#     machine-provenance-guard.yml --limit mgmt-zagros-01-thor
+#
+# The first run happens inline with you watching, and the play FAILS if it
+# exits 2 — a guard that cannot read its sources must not be installed quietly.
+- name: Gear-provenance audit — scheduled, per goatnet
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - machine-provenance-guard

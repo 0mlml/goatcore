@@ -1,0 +1,55 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy goat-fabric-crawler — the SINGLE lazy crawler
+# (docs/design/zenoh-cardinality-budget-and-lazy-crawler.md §4). Sequential
+# bounded per-owner cardinality census; publishes
+# ops/fabric/cardinality/<site> + ops/fabric/census/<site>; optionally writes
+# the router-health band's zenoh-fabric.json (retiring the shell sampler's
+# full `**` walk).
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       fabric-crawler-deploy.yml
+#
+#   # A sibling goatnet:  add  -e target=<site>_hosts
+#
+# Pre-flight (operator-side):
+#   1. zenoh-router Healthy on the target host.
+#   2. Leaf cert present (default: the fabric-health infra leaf — deploy the
+#      fabric-health role first; rule infra-w-fabric-health already covers
+#      ops/fabric/** so no ACL change / router restart is needed, F-156).
+#   3. goat-fabric-crawler image SHA-pinned in the role defaults +
+#      deploy-history.yml (replace the PENDING :latest placeholder).
+#   4. When pointing fabric_crawler_json_out_host_path at the relay-health
+#      ingest: set relay_health_fabric_sampler_enabled: false in the same
+#      group_vars change so exactly ONE walker runs.
+#
+# Live-fire: a subscriber on ops/fabric/cardinality/<site> sees the rollup
+# (owners + budget_state; the sprawl owner reads truncated/exception); the
+# router-health band's cardinality panels keep rendering from the crawler's
+# zenoh-fabric.json.
+
+- name: deploy goat-fabric-crawler (single lazy crawler, cardinality-budget layer 4)
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    # SINGLE means single. A goatnet's host group can hold TWO hosts, and a
+    # group-wide `-e target=` over a transport reaching both would have
+    # started a SECOND crawler on the second host: two walkers where the design says
+    # exactly one (zenoh-cardinality-budget-and-lazy-crawler.md §4), two
+    # publishers to the same ops/fabric/census/<site> key, and double the
+    # RocksDB LOG.old debris that F-340 is about.
+    #
+    # The invariant must not depend on nobody having run the play against the
+    # group. Same guard the
+    # admin-mutation surfaces use (ADR 1084 §D3); the crawler qualifies for the
+    # same reason they do — its safety argument is that there is one of it.
+    - name: "Guard — the lazy crawler is single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+
+  roles:
+    - role: fabric-crawler

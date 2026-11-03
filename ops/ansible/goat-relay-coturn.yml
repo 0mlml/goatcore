@@ -1,0 +1,71 @@
+---
+# goat-relay-coturn.yml — deploy coturn (STUN) onto the all-Rust goat-relay tier.
+#
+# WHY THIS EXISTS: coturn lived inline only in the legacy relay-server.yml. The
+# all-Rust goat-relay tier (goat-relay-deploy.yml) shipped without it, so ZAGROS
+# ran zero STUN — every peer relay-forced, no direct P2P. The coturn
+# role is wired into goat-relay-deploy.yml, but that play also re-pushes the
+# goat-relay image + re-runs the data-plane deploy; this standalone play applies
+# JUST coturn to already-running relays without that churn. Mirrors the
+# goat-relay-rathole.yml pattern.
+#
+# RUN (ZAGROS, SSM to the relays):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec usareur-af --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#     -i inventory/hosts-zagros.ini -i inventory/zagros-goat-relay-alias.ini \
+#     goat-relay-coturn.yml
+#
+# Requires UDP+TCP 3478 open in the goat-relay SG (terraform coturn_enabled).
+# deploy_coturn is read from the relay group vars (zagros-goat-relay-alias.ini
+# [goat_relay_hosts:vars]); pass -e deploy_coturn=true for a tier that hasn't
+# set it. STUN-first: TURN stays off (see the coturn role).
+
+- name: Deploy coturn STUN on the goat-relay tier
+  hosts: "{{ target | mandatory }}"
+  become: true
+
+  tasks:
+    - name: coturn gate — require deploy_coturn (avoid surprise STUN tier)
+      ansible.builtin.assert:
+        that: deploy_coturn | default(false) | bool
+        fail_msg: >-
+          deploy_coturn is not set for these hosts. Set it in the relay group
+          vars (ZAGROS: inventory/zagros-goat-relay-alias.ini [goat_relay_hosts:vars])
+          or pass -e deploy_coturn=true.
+
+    # coturn external-ip must be the PUBLIC IP. The [relay_servers] inventory
+    # exposes goat_relay_advertised_addr but not goat_relay_public_ip, and the
+    # EC2 default-route address is the PRIVATE IP — so detect the public IP from
+    # instance metadata (IMDSv2), same as goat-relay-rathole.yml.
+    - name: Detect public IP from EC2 metadata (IMDSv2)
+      ansible.builtin.shell: |
+        TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 30")
+        curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+          http://169.254.169.254/latest/meta-data/public-ipv4
+      register: coturn_public_ip_result
+      changed_when: false
+
+    - name: Set coturn_external_ip from detected public IP
+      ansible.builtin.set_fact:
+        coturn_external_ip: "{{ coturn_public_ip_result.stdout | trim }}"
+
+  roles:
+    - role: coturn
+      when: deploy_coturn | default(false) | bool
+
+  post_tasks:
+    - name: Smoke — coturn listening on UDP+TCP 3478
+      ansible.builtin.shell: |
+        ss -lunp | grep -q ':3478 ' && echo "udp ok"
+        ss -lntp | grep -q ':3478 ' && echo "tcp ok"
+      register: coturn_listen
+      changed_when: false
+      failed_when: false
+
+    - name: Smoke — report
+      ansible.builtin.debug:
+        msg: >-
+          coturn on {{ inventory_hostname }} ({{ coturn_external_ip }}):
+          {{ coturn_listen.stdout_lines | default(['no listener seen']) }}

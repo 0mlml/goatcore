@@ -1,0 +1,465 @@
+# Onboarding bundle — {{ manifest.identity.name }} ({{ manifest.identity.handle }})
+
+**Status:** {{ 'enrolled' if onboard_action == 'enroll' else 'revoked' }} {{ ansible_date_time.iso8601 }} by {{ lookup('env', 'USER') | default('unknown') }}
+
+---
+
+## Identity
+
+- **Email:** {{ manifest.identity.email }}
+- **Name:** {{ manifest.identity.name }}
+- **Handle:** {{ manifest.identity.handle }}
+
+## NetBird mesh access
+
+{% if manifest.netbird.enabled and onboard_action == 'enroll' %}
+{% for site in manifest.netbird.sites %}
+{% set _key = (netbird_minted_keys | default({}))[site] | default({}) %}
+
+### Site: {{ site }}
+
+```
+key:       {{ _key.key | default('<MINT FAILED — check audit log>') }}
+key_id:    {{ _key.id | default('<unknown>') }}
+role:      {{ manifest.netbird.role }}
+expires:   {{ _key.expires | default('<unknown>') }}
+type:      {{ _key.type | default('one-off') }}
+devices:   {{ _key.usage_limit | default(1) }}  ({{ 'ONE device only — see below' if (_key.usage_limit | default(1) | int) == 1 else 'this key enrols up to ' ~ _key.usage_limit ~ ' of your devices' }})
+mgmt_url:  {{ netbird_site_url_map.get(site, 'https://netbird.' ~ site ~ '.net') }}
+```
+
+{% if (_key.usage_limit | default(1) | int) == 1 %}
+> **This key works once.** The first device that enrols successfully consumes it.
+> Any attempt after that — a second machine, a reinstall, or the native Windows
+> client after you already installed one under WSL — is refused with
+> `couldn't add peer: setup key is invalid`. Decide which machine you want on the
+> mesh *before* you run the command. If you need another, ask your onboarding
+> operator for a fresh key; they cannot un-spend this one.
+{% endif %}
+
+#### iPad / iPhone / Android (mobile)
+
+1. Install **NetBird** from the App Store (iOS) / Play Store (Android).
+2. Open the app. Accept the VPN configuration prompt.
+3. Tap "Setup with Setup Key" (some app versions: "Self-hosted").
+4. Enter:
+   - **Management URL:** `{{ netbird_site_url_map.get(site, 'https://netbird.' ~ site ~ '.net') }}`
+   - **Setup key:** `{{ _key.key | default('<KEY>') }}`
+5. Tap Connect. Green toggle = on the mesh.
+
+Note: iOS/Android have one active VPN slot. Disable any other VPN profile before enabling NetBird.
+
+#### macOS / Linux (desktop, CLI)
+
+> **On a Windows laptop? Skip this section — use "Windows (native)" below.**
+> WSL is a Linux machine inside your Windows one, with its own network. Installing
+> the client there enrols *WSL*, not Windows: the peer registers and looks healthy
+> on the admin dashboard, while your Windows browser still cannot reach any mesh
+> service. It also spends an enrolment off your key. Only install under WSL if you
+> specifically want WSL on the mesh and you know your key has a spare enrolment.
+
+```bash
+curl -fsSL https://pkgs.netbird.io/install.sh | sudo bash
+sudo netbird up \
+  --management-url {{ netbird_site_url_map.get(site, 'https://netbird.' ~ site ~ '.net') }} \
+  --setup-key {{ _key.key | default('<KEY>') }}{{ ' \\\n  --enable-rosenpass --rosenpass-permissive' if (rosenpass_enabled | bool) else '' }}
+netbird status
+```
+
+If you're already on another NetBird mesh on the same computer, use a named profile:
+
+```bash
+netbird profile add {{ site }}
+sudo netbird up --profile {{ site }} \
+  --management-url {{ netbird_site_url_map.get(site, 'https://netbird.' ~ site ~ '.net') }} \
+  --setup-key {{ _key.key | default('<KEY>') }}{{ ' \\\n  --enable-rosenpass --rosenpass-permissive' if (rosenpass_enabled | bool) else '' }}
+```
+
+Note: the macOS tray GUI is broken for self-hosted profiles. Use CLI for profile management; tray is read-only status display.
+
+#### Windows (native)
+
+This is the right section for a Windows laptop. The Linux/macOS install one-liner above does NOT work on native Windows (no `sudo`, no bash) — and running it inside WSL instead puts *WSL* on the mesh, not Windows. Two paths:
+
+1. **MSI installer (recommended)** — download `netbird_installer_X.Y.Z_windows_amd64.msi` from <https://github.com/netbirdio/netbird/releases/latest> and run it. (NetBird's Windows MSI ships with `_installer` in the filename; the bare `netbird_X.Y.Z_*` tarballs on the same release page are headless archives, not Windows installers.) Adds NetBird as a Windows service + tray app.
+2. **winget** — `winget install Netbird.Netbird` in an Administrator PowerShell.
+
+After install, configure the self-hosted management URL + setup key via the CLI in an Administrator PowerShell or Command Prompt:
+
+```powershell
+netbird up `
+  --management-url {{ netbird_site_url_map.get(site, 'https://netbird.' ~ site ~ '.net') }} `
+  --setup-key {{ _key.key | default('<KEY>') }}{{ ' `\n  --enable-rosenpass --rosenpass-permissive' if (rosenpass_enabled | bool) else '' }}
+netbird status
+```
+
+(Backticks are PowerShell line-continuation; on `cmd.exe` use `^` or a single line.) Green icon in the system tray = on the mesh. The tray app on Windows allows entering the management URL + setup-key via UI as well — either works.
+
+{% endfor %}
+{% else %}
+NetBird mesh access not provisioned ({{ 'manifest disabled' if not manifest.netbird.enabled else 'revoke action' }}).
+{% endif %}
+
+## If you can't reach mesh services (keep this handy)
+
+The services below (isitup, portal, panoscope, brief) only resolve when your
+NetBird peer is healthy — they do **not** answer from the public internet, so
+"the page won't load" usually means your mesh connection, not a dead service.
+Work through this before assuming the network is down. **You can do all of it
+from any working internet** (home Wi-Fi, a phone hotspot) — you do not need to
+already be on the mesh.
+
+1. **Rule out your own internet first.** Open a normal public website (e.g.
+   `https://example.com`). If that also fails, it's your connection — fix that
+   first; the mesh is not the problem.
+
+2. **Check the client:** run `netbird status` and read three lines —
+   - `Management` and `Signal` should say **Connected**.
+   - `Nameservers` should say **1/1 Available**.
+
+   If those are healthy but one service still won't load, the problem is likely
+   that one service (not you) — contact your onboarding operator (step 6).
+
+3. **If `Management` or `Signal` say `Disconnected`, or `Nameservers` is `0/1`:**
+   your peer's connection is stuck. Try **one** clean restart first — this keeps
+   your existing identity:
+
+   ```bash
+   sudo netbird down && sudo netbird up
+   ```
+
+   Wait ~30s and re-run `netbird status`. Do **not** toggle down/up repeatedly —
+   one clean cycle is enough; cycling it in a loop does not help.
+
+4. **Still `Disconnected` after that (a reboot won't fix this either):**
+   re-enroll with the setup key + management URL from **your Site section above**.
+   This rebuilds your peer registration from scratch:
+
+   ```bash
+   sudo netbird down && sudo netbird up \
+     --management-url <mgmt_url from your Site section> \
+     --setup-key <key from your Site section>
+   ```
+
+   **This spends one of your key's device enrolments.** Check the `devices:` count
+   in your Site section above. If it reads 1, your key was used up by your first
+   enrolment and this step will fail with `couldn't add peer: setup key is
+   invalid` — that is not something you can fix from here, so skip to step 6 and
+   ask for a fresh key. Seeing that message means the key is spent, expired or
+   revoked; it does **not** mean your management URL is wrong, because the error
+   came back *from* that server.
+   On Windows, use the `netbird up`
+   PowerShell form from the Windows section above. Note: re-enrolling registers
+   a **fresh** peer and leaves your old one showing as disconnected on the admin
+   dashboard — that's expected; mention it to your operator so they tidy the old
+   entry.
+
+5. **Confirm recovery:** `netbird status` should show `Management` + `Signal`
+   **Connected**, `Nameservers` **1/1**, and the peers count climbing. Then
+   reload the service in your browser.
+
+6. **Still stuck, or you don't have a working setup key?** Contact your
+   onboarding operator (the person who sent you this bundle) and include your
+   `netbird status` output. Don't keep cycling the client.
+
+> **Quick "is it me or the mesh?" check:** if a second device (your phone, on
+> the NetBird app) *can* get on the mesh from the same network, the problem is
+> this computer's client — use steps 3–4. If no device can get in on two
+> different networks, the network path to the mesh is the suspect — contact your
+> operator.
+
+## Ory site Kratos identity (OIDC login for mesh services)
+
+{% if manifest.ory_site.enabled and onboard_action == 'enroll' %}
+{% for site in manifest.ory_site.sites %}
+{% set _cred = (ory_site_provisioned | default({}))[site] | default({}) %}
+
+### Site: {{ site }}
+
+**Login URL:** `{{ ory_site_kratos_admin_host_map[site].auth_url | default('https://auth.' + site + '.netbird.' + (ory_site_zone_map[site] | default('nova.example'))) }}/`
+(or open any OIDC-gated service and you'll be redirected to it)
+
+**Username (Kratos identifier — must be email-shaped):**
+```
+{{ manifest.identity.email }}
+```
+
+{% if _cred.password is defined %}
+**Password (random, generated at provisioning time):**
+```
+{{ _cred.password }}
+```
+
+Log in with your email + password. Change your password at: `{{ ory_site_kratos_admin_host_map[site].auth_url | default('https://auth.' + site + '.netbird.' + (ory_site_zone_map[site] | default('nova.example'))) }}/settings`
+{% endif %}
+
+{% if _cred.recovery_link is defined %}
+**Passkey enrollment link (one-time, expires {{ _cred.recovery_link_expires | default('15min') }}):**
+```
+{{ _cred.recovery_link }}
+```
+
+1. Open the link in your browser or iPad.
+2. You'll land in account settings.
+3. Add a passkey under "Security keys" — iCloud Keychain on iPad, Windows Hello, or a hardware FIDO2 token.
+4. Subsequent logins are passwordless (FaceID / TouchID / device biometric).
+{% endif %}
+
+{% if _cred.password is not defined and _cred.recovery_link is not defined %}
+> **Provisioning gap:** identity created but no credential method was selected. Re-run the orchestrator with `ory_site.credentials.password: true` or `passkey: true` in the manifest.
+{% endif %}
+
+**Groups (mesh-ACL-anchored per Q2 resolved decision):**
+{% if manifest.ory_site.groups | default([]) | length > 0 %}
+{% for suffix in manifest.ory_site.groups | default([]) %}
+- `{{ site | upper | replace('-', '-') }}-{{ suffix }}`
+{% endfor %}
+{% else %}
+- _(none — vendor identity with no admin claims)_
+{% endif %}
+
+{% if manifest.ory_site.netbird_mgmt_admin | default(false) %}
+**Admin promotion:** F-079 SQL promotion will run after first-JWT auto-create.
+{% endif %}
+
+{% endfor %}
+{% else %}
+Site-Kratos identity not provisioned.
+{% endif %}
+
+## Services reachable on the mesh
+
+Once NetBird is up (green status) and you've logged in once via the Ory
+identity above, the following services are reachable from your browser.
+All are OIDC-gated by the same site Kratos identity — the browser will
+redirect to `auth.<site>.…` on first hit and bounce you back.
+
+{% if manifest.netbird.enabled and manifest.ory_site.enabled and onboard_action == 'enroll' %}
+{% for site in manifest.ory_site.sites %}
+{% set _host = services_host_suffix_map.get(site, site ~ '.netbird.' ~ site ~ '.net') %}
+
+### Site: {{ site }}
+
+| Service | URL | What it is |
+|---|---|---|
+| **brief** | `https://brief.{{ _host }}` | GOAT-Net overview presentation — background, architecture diagrams, downloadable briefing PDF. Read this first if it's your first time on the mesh. |
+| **isitup** | `https://isitup.{{ _host }}` | Live service-health dashboard — shows which mesh-internal services are currently reachable from each site, with last-seen timestamps. Use to confirm the mesh + your reachability are healthy. |
+| **panoscope** | `https://panoscope.{{ _host }}` | Live Zenoh traffic inspector — browse active topics, see who's publishing what, decode message payloads against registered protobuf schemas. Your published topics show up here once they're flowing. |
+| **portal** | `https://portal.{{ _host }}` | goat-zenoh-portal — vendor self-service for topic registration, protobuf schema upload, ACL view, your own vendor-activity history. You'll spend most of your portal time here once your first publisher is working. The Bearer-token API surface (your portal api_key from the Zenoh section below) backs the same endpoints. |
+
+All four require being on the NetBird mesh first — they don't resolve from the public internet. If you get DNS NXDOMAIN or a connection timeout, check `netbird status` shows green and that you don't have another VPN holding the slot.
+
+{% endfor %}
+{% else %}
+_(NetBird + Ory site identity not both provisioned — service URLs above will not be reachable.)_
+{% endif %}
+
+## Ory operator-IdP Kratos identity (obs / utility)
+
+{% if manifest.ory_idp.enabled and onboard_action == 'enroll' %}
+{% for site in manifest.ory_idp.sites %}
+
+### Operator-IdP at {{ site }}
+
+> **TODO (Block 83D operator-IdP path):** WebAuthn enrollment link will appear here when Phase 3 is implemented.
+
+**Recovery link (one-time, expires 24h):** `<83D operator-IdP path pending>`
+
+**Groups (operator-IdP 13-value enum per Q5):**
+{% for group in manifest.ory_idp.groups %}
+- `{{ group }}`
+{% endfor %}
+
+{% if manifest.ory_idp.fido2_required | default(true) %}
+**FIDO2 required.** Operator MUST complete WebAuthn enrollment on first login before any service grants access.
+{% endif %}
+
+{% endfor %}
+{% else %}
+Operator-IdP identity not provisioned.
+{% endif %}
+
+## Zenoh wire-layer cert
+
+{% if manifest.zenoh.enabled and onboard_action == 'enroll' %}
+{% if manifest.zenoh.trial is defined %}
+
+### Zenoh trial fabric
+
+You have **two credentials** for the trial fabric:
+
+1. **X.509 wire-layer cert + key** — what the Zenoh router validates at session establishment. Lives inside the bundle tarball below.
+2. **Portal API key** — what authenticates you to the portal at `{{ zenoh_vendor_provisioned.portal_url | default('https://portal.nova.netbird.nova.example') }}` for topic registration + schema upload + inspector calls. Distinct from the X.509 cert by design.
+
+| Field | Value |
+|---|---|
+| Vendor prefix | `{{ manifest.zenoh.trial.vendor }}` |
+| URI-SAN | `{{ zenoh_vendor_provisioned.uri_san | default('(minted at provisioning — per-goatnet scheme, see your cert)') }}` |
+| Portal | {{ zenoh_vendor_provisioned.portal_url | default('https://portal.nova.netbird.nova.example') }} |
+| Router endpoint (mTLS) | `{{ zenoh_vendor_provisioned.router_endpoint | default('tls/100.127.0.190:7447') }}` |
+| Portal API key | `{{ zenoh_vendor_provisioned.api_key | default('(not in this bundle — see note below)', true) }}` |
+| Bundle tarball URL (one-time, ~24h) | {{ zenoh_vendor_provisioned.portal_url | default('https://portal.nova.netbird.nova.example') }}{{ zenoh_vendor_provisioned.bundle_url | default('(not regenerable — see note below)', true) }} |
+
+{% if zenoh_vendor_provisioned.status | default(0) == 409 %}
+> **Note:** The portal returned `409 vendor exists`. This vendor prefix was registered in a prior run; the api_key + bundle_url above are NOT recoverable (the api_key is bcrypt-hashed in the portal registry). Either (a) deliver the prior bundle if you still have it, or (b) revoke the vendor row at the portal and re-run this orchestrator.
+{% endif %}
+
+**Download + unpack the tarball:**
+
+```bash
+mkdir -p ~/{{ manifest.zenoh.trial.vendor }}-zenoh
+cd ~/{{ manifest.zenoh.trial.vendor }}-zenoh
+curl -fsSL '{{ zenoh_vendor_provisioned.portal_url | default('https://portal.nova.netbird.nova.example') }}{{ zenoh_vendor_provisioned.bundle_url | default('<bundle_url from above>') }}' -o bundle.tar.gz
+tar -xzf bundle.tar.gz
+ls -la
+# expected:
+#   {{ manifest.zenoh.trial.vendor }}-cert.pem   ← present at handshake to the router
+#   {{ manifest.zenoh.trial.vendor }}-key.pem    ← keep mode 0400
+#   <ca-root>.pem                                ← trust anchor (per-goatnet filename; see NOTES.md)
+#   first-publisher.py                           ← worked Python publisher (mTLS pre-wired)
+#   <onboarding-guide>.md                        ← longer-form onboarding guide (per-goatnet filename)
+#   NOTES.md                                     ← per-participant notes
+```
+
+After download, **delete the bundle URL** — it's one-time and the contents should not be re-fetched from the URL after this point.
+
+**Smoke the connection.** The fastest path is the bundled Python publisher. From the unpacked directory:
+
+_Linux / macOS:_
+```bash
+python3 -m venv venv && . venv/bin/activate
+pip install eclipse-zenoh protobuf
+python3 first-publisher.py
+```
+
+_Windows:_
+```bat
+python -m venv venv && venv\Scripts\activate
+pip install eclipse-zenoh protobuf
+python first-publisher.py
+```
+
+This publishes 5 hello messages on `{{ manifest.zenoh.trial.vendor }}/hello/v1`. The script has the mTLS connection block pre-wired (router endpoint, your cert + key, the fabric CA root). Use it as the starting point for your real publisher.
+
+If you'd rather use the Zenoh release-binary CLI (`zenoh -e tls/...`, `z_put`, `z_sub`), the longer-form onboarding guide inside the tarball walks the install + flag-set.
+
+**Register topics + upload protobuf descriptors** via the portal:
+
+```bash
+curl -fsS -X POST \
+     -H 'Authorization: Bearer {{ zenoh_vendor_provisioned.api_key | default('<portal api_key>') }}' \
+     -H 'Content-Type: application/json' \
+     -d '{"key_pattern":"{{ manifest.zenoh.trial.vendor }}/foo/v1","format":"json","description":"first topic"}' \
+     {{ zenoh_vendor_provisioned.portal_url | default('https://portal.nova.netbird.nova.example') }}/api/vendors/{{ manifest.zenoh.trial.vendor }}/topics
+```
+
+The portal UI at the URL above does the same thing through a form; bring the api_key as a Bearer token.
+
+**Need a second cert?** Each participant can hold **up to two** Zenoh certs. This bundle provisions your **first** slot (the `{{ manifest.zenoh.trial.vendor }}` prefix above). If you need a second — a separate machine or service that publishes on its own identity (e.g. a ground control station, a CI runner, a second laptop) — ask your onboarding operator. The second slot is minted by hand in the portal as an additional slot under your name. Each cert is an independent per-uuid slot with its own `<slot>/**` write namespace; the two don't share a write anchor. Putting the second machine on the mesh spends another enrolment off your setup key, so check the `devices:` count in your Site section above — if it reads 1, ask for a fresh key at the same time.
+
+Full walkthrough: the onboarding guide inside your tarball.
+
+{% elif manifest.zenoh.prod is defined %}
+
+### ADR 0844 production
+
+**Not yet wired.** Phase 0.13.a would have rejected this manifest at pre-flight — the prod portal awaiting ADR 0844 doesn't exist yet. If you're seeing this section, the orchestrator skipped Phase 0.13.a (--check mode or a code change) — the bundle does not carry a real cert.
+
+When ADR 0844's prod portal lands, Phase 4 will dispatch to it the same way it dispatches to the trial portal today.
+
+- **Site:** `{{ manifest.zenoh.prod.site }}`
+- **Role:** `{{ manifest.zenoh.prod.role }}`
+- **Echelon:** `{{ manifest.zenoh.prod.echelon }}`
+- **URI-SAN (target shape):** `urn:goat:peer:site={{ manifest.zenoh.prod.site }},role={{ manifest.zenoh.prod.role }},echelon={{ manifest.zenoh.prod.echelon }}`
+
+{% endif %}
+{% else %}
+Zenoh access not provisioned.
+{% endif %}
+
+## goat-cli profile (ADR 1019)
+
+{% if goat_cli_bundle_minted | default(false) %}
+Your cert tarball (downloaded + unpacked above) **already contains** a
+signed **CBOR profile bundle**, `{{ manifest.zenoh.trial.vendor }}-goat-cli.cbor`,
+that loads everything (cert, key, CA roots, portal token, endpoint pair)
+into `~/.goat/contexts/default/` in one command. No separate file to
+fetch — it rides the same tarball as your cert.
+
+The offline-CA signature covers the whole tuple (cert + key + token +
+endpoints + ca-roots), so an attacker who tampers with the tarball in
+transit can't swap the portal endpoint while keeping a valid cert.
+
+| Field | Value |
+|---|---|
+| CBOR bundle | `{{ manifest.zenoh.trial.vendor }}-goat-cli.cbor` (in your cert tarball) |
+| Mode | `0400` (sensitive — contains your private key + portal token) |
+| Bundle CA | `{{ goat_cli_ca_id_map.get(zenoh_trial_site, 'dev-' ~ zenoh_trial_site ~ '-ca') }}` |
+
+**Install the `goat` binary** (macOS / Linux only — run after NetBird is
+up, the download host is mesh-only):
+
+```bash
+OS=$(uname -s | tr 'A-Z' 'a-z')                      # darwin | linux
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+DL=$(mktemp -d)                                      # private download dir, not a shared /tmp name
+curl -fsSL {{ goat_get_base_url | default('https://get.nova.netbird.nova.example') }}/goat-${OS}-${ARCH} -o "$DL/goat"
+[ "$OS" = darwin ] && codesign --force --sign - "$DL/goat"   # macOS: clear the launch hang, before the move
+sudo mkdir -p /usr/local/bin
+sudo install -m 0755 "$DL/goat" /usr/local/bin/goat
+goat --version                                       # /usr/local/bin is on PATH everywhere
+```
+
+No Windows build — on Windows, skip the CLI and use the web surfaces
+(portal / panoscope / brief) in a browser.
+
+**Then load your profile (one-time), from the unpacked tarball dir:**
+
+```bash
+goat ca add {{ manifest.zenoh.trial.vendor }}-goat-cli-ca.pem      # trust the CA that signed your bundle, once per goatnet
+goat profile init {{ manifest.zenoh.trial.vendor }}-goat-cli.cbor
+```
+
+`goat` ships trusting no goatnet, so `profile init` refuses (`E_BUNDLE_INVALID`
+— wrong CA) until the root that signed your bundle has been added — run
+`goat ca add` first. The `-goat-cli-ca.pem` sits beside the `.cbor` in the
+tarball. `goat ca add` prints a SHA-256 fingerprint: check it against one
+your operator gave you out of band before you rely on it. `goat ca ls`
+shows what you already trust.
+
+`goat profile init` then verifies the CA signature against the root you
+just added, writes the cert + key + CA-roots + portal token + profile.toml
+into `~/.goat/contexts/default/` (dir `0700`, files `0600`), then
+runs `goat doctor` to verify reachability across all four steps
+(ZTOL membership, Zenoh router TCP+TLS, mTLS session, portal
+`/api/vendors`).
+
+Then:
+
+```bash
+goat profile show       # confirm endpoints + cert expiry
+goat doctor             # re-run any time to validate reachability
+```
+
+For topic CRUD, pub/sub, stethoscope delegation, vendor browse —
+see `goat --help` or the goat-cli design doc inside the repo.
+
+{% elif manifest.zenoh.enabled and manifest.zenoh.trial is defined and onboard_action == 'enroll' and zenoh_vendor_provisioned.status | default(0) == 409 %}
+> **goat-cli profile bundle not minted on this run.** The portal
+> returned `409 vendor exists` (Phase 4); the api_key + tarball
+> needed to mint a fresh CBOR bundle were unrecoverable. If you
+> still have the prior CBOR bundle, that one is still valid
+> (cert + token + endpoints + ca-roots are all CA-signed against the
+> nova CA root the goat-cli verifier embeds). Otherwise revoke
+> the vendor row at the portal and re-run this orchestrator.
+{% else %}
+> goat-cli profile bundle not minted (Zenoh not enabled, revoke
+> action, or --check mode).
+{% endif %}
+
+---
+
+## Enforcement caveat (mesh L7 gating, as of 2026-05-16)
+
+Any authenticated user currently reaches every OIDC-gated service URL on the mesh — L7 group-claim gating is not yet enforced. Your group labels are correct for future enforcement but access is not yet restricted by them today.
+

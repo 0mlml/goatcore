@@ -1,0 +1,330 @@
+---
+# relay-server-rathole.yml — extracted rathole tasks (gated subset of
+# relay-server.yml).
+#
+# Imported via `ansible.builtin.import_tasks` from relay-server.yml,
+# guarded by `when: deploy_rathole | default(true) | bool`. Allows
+# relays where wg-cp0 replaces rathole's mgmt-API forwarding role
+# (ADR 0313) to skip the rathole stack entirely without dragging
+# dead-weight binary + idle systemd unit.
+#
+# Set `deploy_rathole: false` in inventory `[relay_servers:vars]` to skip.
+# The default stays `deploy_rathole: true`.
+
+# ==================================================================
+# Dependencies (rathole-only — only `unzip` for the rathole tarball)
+# ==================================================================
+- name: Install rathole dependencies
+  ansible.builtin.apt:
+    name: [unzip]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ==================================================================
+# Rathole — management forwarding (TCP 443 → mgmt host)
+# ==================================================================
+- name: Check rathole binary
+  ansible.builtin.stat:
+    path: "{{ rathole_bin }}"
+  register: rathole_binary
+
+- name: Install rathole
+  when: not rathole_binary.stat.exists
+  block:
+    - name: Download rathole
+      ansible.builtin.get_url:
+        url: "{{ rathole_url }}"
+        dest: /tmp/rathole.zip
+        mode: "0644"
+
+    - name: Create extraction directory
+      ansible.builtin.file:
+        path: /tmp/rathole-extract
+        state: directory
+        mode: "0755"
+
+    - name: Extract rathole
+      ansible.builtin.unarchive:
+        src: /tmp/rathole.zip
+        dest: /tmp/rathole-extract
+        remote_src: true
+
+    - name: Install rathole binary
+      ansible.builtin.copy:
+        src: /tmp/rathole-extract/rathole
+        dest: "{{ rathole_bin }}"
+        mode: "0755"
+        remote_src: true
+
+    - name: Clean up download
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/rathole.zip
+        - /tmp/rathole-extract
+
+# -- Generate credentials (fresh install only) --
+- name: Check rathole config exists
+  ansible.builtin.stat:
+    path: "{{ rathole_config_dir }}/server.toml"
+  register: rathole_config
+
+- name: Generate fresh credentials
+  when: not rathole_config.stat.exists
+  block:
+    - name: Generate Noise keypair
+      ansible.builtin.shell: "{{ rathole_bin }} --genkey 2>&1"
+      register: keygen_output
+      changed_when: false
+
+    - name: Parse private key
+      ansible.builtin.shell: "echo '{{ keygen_output.stdout }}' | grep -A1 'Private' | tail -1 | tr -d '[:space:]'"
+      register: fresh_private_key
+      changed_when: false
+
+    - name: Parse public key
+      ansible.builtin.shell: "echo '{{ keygen_output.stdout }}' | grep -A1 'Public' | tail -1 | tr -d '[:space:]'"
+      register: fresh_public_key
+      changed_when: false
+
+    - name: Generate auth token
+      ansible.builtin.shell: openssl rand -hex 32
+      register: fresh_auth_token
+      changed_when: false
+
+# -- Read existing credentials (re-run) --
+- name: Read existing credentials
+  when: rathole_config.stat.exists
+  block:
+    - name: Read existing token
+      ansible.builtin.shell: "grep default_token {{ rathole_config_dir }}/server.toml | grep -oP '\"\\K[^\"]+'"
+      register: existing_auth_token
+      changed_when: false
+
+    - name: Read existing private key
+      ansible.builtin.shell: "grep local_private_key {{ rathole_config_dir }}/server.toml | grep -oP '\"\\K[^\"]+'"
+      register: existing_private_key
+      changed_when: false
+
+    # Primary source on re-run: the public key the relay persisted locally
+    # at first genkey (server.pubkey, written below). This is ALWAYS present
+    # on a relay whose rathole config exists, so it breaks the chicken-and-egg
+    # where the SM read below returns empty on a relay whose first deploy
+    # failed AFTER keygen but BEFORE the SM-store: SM has no public_key, so the
+    # re-run couldn't populate it, so SM-store would skip.
+    - name: Read existing public key from local server.pubkey (persisted at genkey)
+      ansible.builtin.shell: "cat {{ rathole_config_dir }}/server.pubkey 2>/dev/null | tr -d '[:space:]' || true"
+      register: existing_public_key_file
+      changed_when: false
+
+    # Fallback only (legacy relays predating server.pubkey persistence).
+    - name: Read existing public key from Secrets Manager (fallback)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: >
+        {{ aws_cmd }} aws secretsmanager get-secret-value
+        --region "{{ aws_region }}"
+        --secret-id "{{ rathole_secret_name }}"
+        --query SecretString --output text
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('public_key',''))"
+      register: existing_public_key_sm
+      changed_when: false
+      failed_when: false
+      when: rathole_secret_name is defined
+
+# -- Unify credential facts --
+# Public-key priority: fresh genkey > local server.pubkey > SM fallback. Never
+# depend on SM having been populated by a prior (possibly-failed) run.
+- name: Set credential facts
+  ansible.builtin.set_fact:
+    rathole_private_key: "{{ fresh_private_key.stdout | default(existing_private_key.stdout, true) }}"
+    rathole_auth_token: "{{ fresh_auth_token.stdout | default(existing_auth_token.stdout, true) }}"
+    rathole_public_key: "{{ fresh_public_key.stdout | default(existing_public_key_file.stdout | default(existing_public_key_sm.stdout | default('', true), true), true) }}"
+
+# (vps_public_ip detection moved to main relay-server.yml — Coturn also
+# uses it for `external-ip`, so it must be set unconditionally. Was here
+# before the rathole extraction.)
+
+# -- Write config --
+- name: Create config directory
+  ansible.builtin.file:
+    path: "{{ rathole_config_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Write server config
+  ansible.builtin.template:
+    src: templates/server.toml.j2
+    dest: "{{ rathole_config_dir }}/server.toml"
+    mode: "0600"
+  notify: Restart rathole server
+
+- name: Persist public key for future reads
+  ansible.builtin.copy:
+    content: "{{ rathole_public_key }}"
+    dest: "{{ rathole_config_dir }}/server.pubkey"
+    mode: "0600"
+  when: rathole_public_key | length > 0
+
+- name: Install rathole systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/rathole-server.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Rathole Relay Server (goat)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart={{ rathole_bin }} -s {{ rathole_config_dir }}/server.toml
+      Restart=on-failure
+      RestartSec=5s
+      LimitNOFILE=1048576
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart rathole server
+
+- name: Enable and start rathole
+  ansible.builtin.systemd:
+    name: rathole-server
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ==================================================================
+# Ingress dispatcher (ADR 1085) — haproxy TLS-passthrough over N tunnels
+# ==================================================================
+# When rathole_ingress_dispatch_enabled, server.toml binds one tunnel service
+# per mgmt-host backend on localhost (rendered above) and haproxy owns the
+# public :443: SNI pins for single-writer hostnames, consistent source-hash
+# balancing for everything else, check-ssl health that routes around a wedged
+# tunnel in seconds. Default OFF — legacy single-service :443 unchanged.
+# docs/design/relay-ingress-dispatch.md.
+- name: Ingress dispatcher — require a non-empty backend list (fail closed)
+  ansible.builtin.assert:
+    that:
+      - rathole_ingress_backends | default([]) | length > 0
+    fail_msg: >-
+      rathole_ingress_dispatch_enabled is true but rathole_ingress_backends
+      is empty — haproxy would own :443 with nothing behind it. Declare the
+      backend list (see docs/design/relay-ingress-dispatch.md) or disable
+      the dispatcher.
+    quiet: true
+  when: rathole_ingress_dispatch_enabled | default(false) | bool
+
+- name: Ingress dispatcher — install haproxy
+  ansible.builtin.apt:
+    name: [haproxy]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: rathole_ingress_dispatch_enabled | default(false) | bool
+
+- name: Ingress dispatcher — render haproxy.cfg
+  ansible.builtin.template:
+    src: templates/haproxy-ingress.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    mode: "0644"
+    validate: haproxy -c -f %s
+  register: haproxy_cfg_rendered
+  when: rathole_ingress_dispatch_enabled | default(false) | bool
+
+# Rollback path (flip the flag off, re-run): haproxy must release :443
+# BEFORE the queued rathole restart rebinds the legacy 0.0.0.0:443 service.
+- name: Ingress dispatcher (disabled) — stop haproxy if present
+  ansible.builtin.systemd:
+    name: haproxy
+    state: stopped
+    enabled: false
+  failed_when: false
+  when: not (rathole_ingress_dispatch_enabled | default(false) | bool)
+
+# First-convert ordering: the rathole restart queued by the server.toml
+# change must fire NOW so the tunnels move off 0.0.0.0:443 before haproxy
+# tries to bind it. Idempotent re-runs queue no handler — no-op.
+- name: Flush handlers — rebind rathole tunnels before haproxy takes :443
+  ansible.builtin.meta: flush_handlers
+
+- name: Ingress dispatcher — enable + start haproxy
+  ansible.builtin.systemd:
+    name: haproxy
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: rathole_ingress_dispatch_enabled | default(false) | bool
+
+- name: Ingress dispatcher — reload haproxy on config change (graceful drain)
+  ansible.builtin.systemd:
+    name: haproxy
+    state: reloaded
+  when:
+    - rathole_ingress_dispatch_enabled | default(false) | bool
+    - haproxy_cfg_rendered is changed
+
+- name: Ingress dispatcher — record deploy in the rollback ledger (ADR 1060)
+  ansible.builtin.include_role:
+    name: rollback-ledger
+  vars:
+    rollback_component: relay-ingress-dispatch
+    rollback_artifact_type: config
+    rollback_ref: "{{ lookup('pipe', 'git rev-parse HEAD') }}"
+    rollback_restore_pointer: >-
+      set rathole_ingress_dispatch_enabled=false and re-run the rathole play
+      (haproxy stops, rathole rebinds 0.0.0.0:443 single-service)
+  when: rathole_ingress_dispatch_enabled | default(false) | bool
+
+# ==================================================================
+# Self-heal watchdog — health-based restart of a wedged tunnel
+# ==================================================================
+# rathole-server's Restart=on-failure never fires on a LOGICAL wedge (stale
+# :443 binding to a dead control channel; the process stays "running"), so a
+# relay can serve dead TLS indefinitely and silently drop ~1/N enrollment
+# dials. This watchdog probes :443 end-to-end and restarts rathole-server
+# after N consecutive failures, forcing the mgmt-host client to re-establish.
+- name: Install rathole self-heal watchdog script
+  ansible.builtin.template:
+    src: templates/rathole-watchdog.sh.j2
+    dest: /usr/local/bin/rathole-relay-watchdog.sh
+    mode: "0755"
+
+- name: Install rathole watchdog systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/rathole-watchdog.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Rathole tunnel self-heal watchdog (goat, F-213)
+      After=rathole-server.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/rathole-relay-watchdog.sh
+
+- name: Install rathole watchdog systemd timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/rathole-watchdog.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Probe the rathole :443 tunnel every {{ rathole_watchdog_interval | default('15s') }}
+
+      [Timer]
+      OnBootSec=60
+      OnUnitActiveSec={{ rathole_watchdog_interval | default('15s') }}
+      AccuracySec=2s
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable and start rathole watchdog timer
+  ansible.builtin.systemd:
+    name: rathole-watchdog.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: rathole_watchdog_enabled | default(true) | bool

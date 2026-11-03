@@ -1,0 +1,238 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# spire-ca-standby.yml — make the passive node ready for SPIRE failover.
+#
+# THE GAP THIS CLOSES. SPIRE's state lives in
+# two places and only one of them survives losing the active node:
+#
+#   registration entries, attested nodes -> the `spire` Postgres DB on
+#       postgres-a. Same cluster as `netbird`, so pgBackRest's PHYSICAL backup
+#       covers it (the stanza is merely NAMED "<site>-netbird"). Survives.
+#
+#   the CA PRIVATE KEY -> {{ spire_data_dir }}/server/keys.json on the active
+#       node's local disk. KeyManager is the "disk" plugin (server.conf.j2:64),
+#       so this file is NOT in Postgres, NOT in the Spock replication set
+#       (spock_mesh_database is `netbird`, one database), and NOT in any backup.
+#       DOES NOT SURVIVE.
+#
+# Lose the active node and promotion starts a server with no CA key: it mints a
+# NEW CA and every SVID issued under the old one stops chaining. The trust domain
+# is gone, not degraded. That is ONE FILE, and this play copies it.
+#
+# WHY THE CONTROLLER IS THE TRANSIT rather than a host-to-host pull. Convergence
+# is PULLED here (ADR 1109) and `standby_safe` in ops/standby/service-classes.yaml
+# describes this shape ("replication-receivers: passive PULL"), so a timer on the
+# standby fetching from the active node would fit the doctrine. It would also
+# require NEW standing SSH trust from the passive Orin to the active one — a
+# credential existing only for this convenience, widening what a standby
+# compromise reaches. Ansible already reaches both nodes, so the material moves
+# active -> controller -> standby inside ONE run and no new trust is created.
+#
+# ENCRYPTED AT REST ON THE STANDBY. Plaintext exists only in a controller temp
+# dir for the length of the run and is shredded in an `always` block even on
+# failure. What lands on the standby is age-encrypted to the operator AND the
+# break-glass recipient, so a standby compromise does not hand over the CA —
+# promotion needs an operator identity, the same posture the offline CA already
+# has (~/.goat/state/<env>-ca/ca.key.age).
+#
+# THIS PLAY STARTS NOTHING. The standby receives a file. `spire_enabled` stays
+# false there, roles/spire's fail-closed guard still refuses to run a server, and
+# no config references the staged artifact. It is inert until promotion.
+#
+# LIMITATION, STATED BECAUSE IT IS THE ONE THAT BITES: this is a SNAPSHOT, not a
+# stream. SPIRE rotates its CA on spire_ca_ttl (2160h / 90d default) and rotation
+# makes the staged copy stale. There is deliberately NO timer — a timer needs the
+# host-to-host trust this play avoids. Re-run after any CA rotation and on the
+# normal deploy cadence. A `.stamp` beside the artifact records what was taken
+# and when, so staleness is READABLE on the node instead of assumed.
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/ansible-preflight.sh \
+#     -i inventory/mgmt-hosts.ini -i inventory/doors-groupvars.ini \
+#     spire-ca-standby.yml -e target=<site>_hosts
+#
+# PROMOTION: docs/operations/spire-failover-promotion.md
+
+- name: spire-ca-standby | stage the active node's CA onto every passive member
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    spire_ca_staged_name: "spire-ca-staged.json.age"
+    # The one member whose spire_enabled is true. Asserted below to be exactly
+    # one before anything is read or written.
+    spire_ca_servers: >-
+      {{ ansible_play_hosts_all
+         | select('ne', '')
+         | map('extract', hostvars)
+         | selectattr('spire_enabled', 'defined')
+         | selectattr('spire_enabled')
+         | map(attribute='inventory_hostname') | list }}
+    spire_ca_recipients: >-
+      {{ [lookup('env', 'DEV_CA_AGE_OPERATOR_1'),
+          lookup('env', 'DEV_CA_AGE_BREAK_GLASS')]
+         | map('trim') | reject('equalto', '') | list }}
+
+  tasks:
+
+    # roles/spire owns spire_data_dir / spire_ca_ttl / spire_trust_domain. Pull
+    # its defaults into scope rather than restating them here — a second home for
+    # a path is a second thing to drift.
+    - name: spire-ca-standby | load roles/spire defaults (runs nothing)
+      ansible.builtin.include_role:
+        name: spire
+        tasks_from: noop
+        public: true
+
+    # ---- preconditions: refuse to stage a wrong or absent CA ----------------
+
+    - name: spire-ca-standby | exactly one member may be the SPIRE server
+      ansible.builtin.assert:
+        that:
+          - spire_ca_servers | length == 1
+        fail_msg: >-
+          spire-ca-standby: this group must hold EXACTLY ONE host with
+          spire_enabled true — the node whose CA is being staged. Found
+          {{ spire_ca_servers | length }} ({{ spire_ca_servers | join(', ') }}).
+          ZERO means there is no CA to stage; run spire-deploy.yml first. MORE
+          THAN ONE means two CAs already exist inside one trust domain, which is
+          the split-brain roles/spire's entry guard exists to prevent — stop and
+          reconcile, do not stage.
+      run_once: true
+
+    - name: spire-ca-standby | age recipients must resolve, and there must be two
+      ansible.builtin.assert:
+        that:
+          - spire_ca_recipients | length == 2
+        fail_msg: >-
+          spire-ca-standby: need DEV_CA_AGE_OPERATOR_1 and
+          DEV_CA_AGE_BREAK_GLASS in the environment
+          (.envrc.local.d/40-dev-ca-operators.envrc). Encrypting to one recipient
+          makes a single lost identity a lost trust domain, which defeats the
+          purpose; break-glass is the second door.
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: spire-ca-standby | the CA key must exist on the designated server
+      ansible.builtin.stat:
+        path: "{{ spire_data_dir }}/server/keys.json"
+      register: spire_ca_key_stat
+      when: inventory_hostname in spire_ca_servers
+
+    - name: spire-ca-standby | refuse to stage an absent or empty key
+      ansible.builtin.assert:
+        that:
+          - spire_ca_key_stat.stat.exists
+          - spire_ca_key_stat.stat.size > 0
+        fail_msg: >-
+          spire-ca-standby: {{ spire_data_dir }}/server/keys.json is missing or
+          empty on {{ inventory_hostname }}. Staging an absent key leaves a
+          standby that LOOKS prepared and is not — worse than an obviously empty
+          one. Bring the server up first.
+      when: inventory_hostname in spire_ca_servers
+
+    # ---- move it, encrypt it, stage it -------------------------------------
+
+    - name: spire-ca-standby | controller temp dir (0700, shredded in always)
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: spire-ca-stage-
+      register: spire_ca_tmp
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: spire-ca-standby | stage, then always shred the plaintext
+      block:
+
+        - name: spire-ca-standby | fetch the CA key to the controller
+          ansible.builtin.fetch:
+            src: "{{ spire_data_dir }}/server/keys.json"
+            dest: "{{ spire_ca_tmp.path }}/keys.json"
+            flat: true
+          when: inventory_hostname in spire_ca_servers
+          no_log: true
+
+        - name: spire-ca-standby | age-encrypt to operator + break-glass
+          ansible.builtin.command:
+            cmd: >-
+              age -o {{ spire_ca_tmp.path }}/{{ spire_ca_staged_name }}
+              -r {{ spire_ca_recipients | join(' -r ') }}
+              {{ spire_ca_tmp.path }}/keys.json
+            creates: "{{ spire_ca_tmp.path }}/{{ spire_ca_staged_name }}"
+          delegate_to: localhost
+          become: false
+          run_once: true
+
+        - name: spire-ca-standby | place + stamp on each passive member
+          when: inventory_hostname not in spire_ca_servers
+          block:
+
+            - name: spire-ca-standby | staging dir (root-only)
+              ansible.builtin.file:
+                path: "{{ spire_data_dir }}/standby"
+                state: directory
+                owner: root
+                group: root
+                mode: "0700"
+
+            - name: spire-ca-standby | place the encrypted CA
+              ansible.builtin.copy:
+                src: "{{ spire_ca_tmp.path }}/{{ spire_ca_staged_name }}"
+                dest: "{{ spire_data_dir }}/standby/{{ spire_ca_staged_name }}"
+                owner: root
+                group: root
+                mode: "0600"
+
+            # Staleness must be readable ON THE NODE. This play is a snapshot and
+            # SPIRE rotates on spire_ca_ttl, so a reader needs to know WHICH
+            # snapshot without trusting a deploy log they cannot see.
+            - name: spire-ca-standby | stamp what was staged and when
+              ansible.builtin.copy:
+                dest: "{{ spire_data_dir }}/standby/{{ spire_ca_staged_name }}.stamp"
+                owner: root
+                group: root
+                mode: "0644"
+                content: |
+                  # Written by ops/ansible/spire-ca-standby.yml — do not hand-edit.
+                  # (No ansible_managed banner: it is not defined in this repo's
+                  # ansible.cfg, and a stamp that fails to render is a stamp
+                  # nobody gets.)
+                  staged_from={{ spire_ca_servers | first }}
+                  trust_domain={{ spire_trust_domain }}
+                  source_key_mtime={{ hostvars[spire_ca_servers | first]['spire_ca_key_stat']['stat']['mtime'] | default('unknown') }}
+                  spire_ca_ttl={{ spire_ca_ttl }}
+                  # SNAPSHOT, not a stream. Re-run spire-ca-standby.yml after any
+                  # CA rotation; a staged key older than spire_ca_ttl may not
+                  # match the live bundle.
+                  # Promotion: docs/operations/spire-failover-promotion.md
+
+      always:
+        - name: spire-ca-standby | shred the controller plaintext
+          ansible.builtin.command:
+            cmd: "find {{ spire_ca_tmp.path }} -type f -name 'keys.json' -delete"
+          delegate_to: localhost
+          become: false
+          run_once: true
+          changed_when: false
+          failed_when: false
+
+        - name: spire-ca-standby | remove the controller temp dir
+          ansible.builtin.file:
+            path: "{{ spire_ca_tmp.path }}"
+            state: absent
+          delegate_to: localhost
+          become: false
+          run_once: true
+
+    - name: spire-ca-standby | summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'ACTIVE server — CA staged FROM here'
+             if inventory_hostname in spire_ca_servers
+             else 'passive — encrypted CA at ' ~ spire_data_dir ~ '/standby/'
+                  ~ spire_ca_staged_name ~ ' (inert; nothing started)' }}

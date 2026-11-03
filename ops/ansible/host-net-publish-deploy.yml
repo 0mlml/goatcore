@@ -1,0 +1,34 @@
+---
+# host-net-publish-deploy.yml — install the host-net health publisher on the
+# site network hosts (mgmt-hosts/Thors). Why it exists:
+# each site host self-publishes its uplink loss/rtt, iface rates, rathole
+# tunnel flap counts, signal/mgmt control-plane rates and its own mesh view to
+# the CLOUD relay-health ingest (stored; rendered last-known while the host is
+# dark) and optionally the local Thor ingest.
+#
+# Required group_vars (per host group, e.g. group_vars/<site>_hosts/vars.yml):
+#   host_net_publish_enabled: true
+#   host_net_goatnet: <site>
+#   host_net_ingest_urls: https://relay-health.<zone>/host-net-ingest
+#   relay_metrics_bearer_token
+#
+# Ingest counterpart: relay-health role `host_net_allowed_names` must list the
+# publishing hosts (group_vars/<site>_relay_health/vars.yml), then re-apply
+# relay-health-cloud-deploy.yml so the .env + traefik route land.
+#
+# Apply (site hosts over mesh SSH; small + idempotent, retries fine on a
+# degraded uplink):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     -e target=<site>_hosts host-net-publish-deploy.yml
+#
+# Cross-refs: docs/design/relay-health-dashboard.md §"Site network hosts",
+#   ops/relay/health/host-net-publish.sh (the publisher),
+#   ops/relay/health/relay-metrics-ingest.py (the ingest + storage).
+
+- name: Deploy host-net health publisher (site network hosts)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  roles:
+    - host-net-publish

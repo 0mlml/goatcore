@@ -1,0 +1,37 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy a standalone Prometheus node_exporter to hosts that are SCRAPED but do
+# not run an obs stack of their own — the mgmt pair, the breakglass node.
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -e target=<site>_hosts node-exporter-deploy.yml
+#
+# WHY: a scrape target with no exporter behind it reads as down and pages
+# continuously once alerting is live, and it looks like a stale address or a hung
+# sensor. The fix is this play, not a collector flag.
+#
+# ORDER MATTERS — run this BEFORE adding a host to `obs_scrape_targets`:
+#   1. node-exporter-deploy.yml   (the exporter exists)
+#   2. <site>-obs-bootstrap.yml (Prometheus is told to scrape it)
+# Reversed, Prometheus gets a target with nothing behind it and `TargetDown`
+# (severity critical, for: 5m) pages within minutes. That is precisely the
+# ordering error F-289 records, and it is cheap to not repeat.
+#
+# Jetson note: thermal_zone is disabled by default (role defaults explain why).
+# On x86 hosts set node_exporter_disabled_collectors: [] to get it back.
+#
+# Verify after:
+#   curl -s http://<mesh-ip>:9100/metrics | grep -c '^node_'      # > 0
+#   curl -s http://<obs-host>:9090/api/v1/targets | jq '[.data.activeTargets[]
+#     | select(.health!="up")] | length'                          # 0
+
+- name: deploy standalone node_exporter to scraped hosts without an obs stack
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: node-exporter

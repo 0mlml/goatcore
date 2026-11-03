@@ -1,0 +1,39 @@
+---
+# netbird-admin-reconcile.yml — install/refresh the continuous Kratos-groups ->
+# netbird-role reconciler on a goatnet's mgmt host, and run it once now.
+#
+# WHY THIS IS A STANDALONE PLAYBOOK:
+#
+# The reconcile used to exist only as an inline block inside dashboard-deploy.yml.
+# Two consequences:
+#
+#   1. It ran only when someone deployed the dashboard. An admin onboarded
+#      between deploys kept correct Ory groups and zero NetBird rights, with no
+#     signal anywhere.
+#   2. Every task in the block was gated on `site_admins | length > 0`. A goatnet
+#      can seed no site_admins (founding its NetBird account via the operator's
+#      first dashboard login), so the whole feature was inert there — the gate
+#      was a proxy for "this site has Ory", and it was the wrong proxy.
+#
+# The role installs a systemd timer, so promotion now happens within one
+# interval of a person's first sign-in, on every goatnet, with nobody in the
+# loop. This playbook is the on-demand face of the same role.
+#
+# Apply:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       netbird-admin-reconcile.yml -e target=<site>_hosts
+#
+# Single-active: Kratos + the netbird management DB live on Router-A, so limit
+# to the A host when a site runs an A/B pair.
+
+- name: Reconcile Kratos admin groups into netbird-mgmt roles
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+
+  roles:
+    - netbird-admin-reconcile

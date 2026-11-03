@@ -1,0 +1,113 @@
+---
+# net-health.yml — deploy the active network-health monitoring skeleton.
+# STUB PLAYBOOK: structure is complete; each play is gated on a default-off flag
+# so it is safe to land and wire per goatnet. See
+# ops/monitoring/net-health/README.md + docs/design/network-health-monitoring.md.
+#
+# Run (ZAGROS, over the mesh):
+#   cd ops/ansible && OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh -i inventory/hosts-zagros.ini net-health.yml
+
+# ---- 1. reachability canary on the OFF-node vantages ------------------------
+- name: net-health | reachability canary (off-node vantages)
+  hosts: net_health_vantages          # e.g. zagros-b + the cloud relay-health box
+  gather_facts: false
+  tasks:
+    - when: net_health_canary_enabled | default(false) | bool
+      block:
+        - name: ensure dir
+          ansible.builtin.file: { path: /opt/net-health, state: directory, mode: "0750" }
+        - name: install canary script
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../monitoring/net-health/reachability-canary.sh"
+            dest: /opt/net-health/reachability-canary.sh
+            mode: "0755"
+        # FIVE columns, in the order reachability-canary.sh reads them:
+        #   name  mesh_ip  lan_ip  service_url  goatnet
+        #
+        # This rendered FOUR previously — lan_ip was missing — so every
+        # field after mesh_ip landed one column left. service_url was read as
+        # lan_ip (the script would `ping https://…`, always false) and goatnet
+        # was read as service_url (it would `curl zagros`, always 000). The
+        # canary would then have reported lan_reachable=false and
+        # service_reachable=false for every healthy node, and
+        # `overlay_only_down` — the whole F-263 smoking-gun signal — computed
+        # from garbage.
+        #
+        # It never fired: net_health_canary_enabled is set in no group_vars, so
+        # this was latent rather than wrong-in-production. Caught by reading the
+        # script and the playbook against each other before switching it on.
+        # A tab-separated contract with no header is exactly the kind that
+        # drifts silently, so both ends now name the columns in a comment.
+        - name: render target list (per-goatnet, from group_vars nethealth_targets)
+          ansible.builtin.copy:
+            dest: /opt/net-health/targets.tsv
+            mode: "0644"
+            content: |
+              # name	mesh_ip	lan_ip	service_url	goatnet
+              {% for t in nethealth_targets | default([]) %}
+              {{ t.name }}	{{ t.mesh_ip }}	{{ t.lan_ip | default('-') }}	{{ t.service_url | default('-') }}	{{ t.goatnet | default(site_id | mandatory) }}
+              {% endfor %}
+        - name: render env
+          ansible.builtin.copy:
+            dest: /opt/net-health/net-health.env
+            mode: "0640"
+            content: |
+              NETHEALTH_VANTAGE={{ net_health_vantage_name | default(inventory_hostname) }}
+              NETHEALTH_TARGETS_FILE=/opt/net-health/targets.tsv
+              NETHEALTH_INGEST_URLS={{ net_health_ingest_urls | default('') }}
+              NETHEALTH_TOKEN={{ lookup('env', net_health_token_env | default('ZAGROS_RELAY_METRICS_BEARER_TOKEN')) }}
+        - name: systemd unit + timer
+          ansible.builtin.template:
+            src: "{{ item }}.j2"
+            dest: "/etc/systemd/system/{{ item }}"
+            mode: "0644"
+          loop: [ reachability-canary.service, reachability-canary.timer ]
+        - name: enable timer
+          ansible.builtin.systemd: { name: reachability-canary.timer, enabled: true, state: started, daemon_reload: true }
+
+# ---- 2. netbird-degradation probe folded into host-net-publish --------------
+# The probe ships with the host-net-publish role (host_net_netbird_health_enabled).
+# host-net-publish.sh runs it and merges the JSON as the payload "netbird_health"
+# block. No separate unit. This play just drops the script where the role expects.
+- name: net-health | netbird degradation probe on mgmt nodes
+  hosts: net_health_nodes             # the mgmt/site nodes (zagros_hosts + zagros_b_hosts)
+  gather_facts: false
+  tasks:
+    - when: net_health_degradation_enabled | default(false) | bool
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../monitoring/net-health/netbird-degradation-probe.sh"
+        dest: /opt/host-net-publish/netbird-degradation-probe.sh
+        mode: "0755"
+
+# ---- 3. alert evaluator on the ingest host ----------------------------------
+- name: net-health | alert evaluator (thresholds; dispatch STUBBED)
+  hosts: net_health_ingest            # the host running relay-metrics-ingest
+  gather_facts: false
+  tasks:
+    - when: net_health_alerts_enabled | default(false) | bool
+      block:
+        - ansible.builtin.file: { path: /opt/net-health, state: directory, mode: "0750" }
+        - ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../monitoring/net-health/alert-eval.py"
+            dest: /opt/net-health/alert-eval.py
+            mode: "0755"
+        - name: env (thresholds + PagerDuty key left UNSET for operator to wire)
+          ansible.builtin.copy:
+            dest: /opt/net-health/alert-eval.env
+            mode: "0640"
+            content: |
+              NETHEALTH_INGEST_DIR={{ net_health_ingest_dir | default('/opt/relay-health/www/ingest') }}
+              NETHEALTH_UNREACHABLE_SECS={{ net_health_unreachable_secs | default(180) }}
+              NETHEALTH_RELAY_FWD_ERR_MAX={{ net_health_relay_fwd_err_max | default(20) }}
+              # PAGERDUTY_ROUTING_KEY=  <- operator wires this later (see alert-eval.py TODO)
+        - ansible.builtin.template:
+            src: "{{ item }}.j2"
+            dest: "/etc/systemd/system/{{ item }}"
+            mode: "0644"
+          loop: [ nethealth-alert-eval.service, nethealth-alert-eval.timer ]
+        - ansible.builtin.systemd: { name: nethealth-alert-eval.timer, enabled: true, state: started, daemon_reload: true }
+
+# ---- 4. dashboard served behind the existing relay-health Ory gate -----------
+# nethealth.html is copied by the relay-health role alongside relay-health.html
+# (net_health_dashboard_enabled) — same oauth2-proxy admin gate, new route.

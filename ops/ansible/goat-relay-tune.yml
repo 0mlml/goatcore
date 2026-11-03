@@ -1,0 +1,107 @@
+---
+# goat-relay-tune.yml — Phase 2 optimization stack apply on the goat-relay tier.
+#
+# Applies the Block 33C.1 lever stack that the Phase 1 deploy intentionally
+# left at defaults. Fires AFTER `goat-relay-deploy.yml` lands the tier
+# alongside the legacy stock-netbird-relay tier; fires BEFORE Phase 3
+# advertises goat-relay in `management.json`.
+#
+# This session applies the no-reboot levers:
+#   - Tier-1 sustained-Gbps sysctl baseline
+#   - H1 CPU governor=performance (~5-15% latency lift)
+#   - H3 hugepages (low-impact alone; pairs with L5 io_uring once it lands)
+#   - F-041 prefer-quic-bias-ms=100 (deterministic QUIC selection in race-dialer)
+#
+# Two reboot-required levers stay deferred to a follow-on session:
+#   - H2 mitigations=off (per ADR 0823; needs operator-fired reboot per host)
+#   - L8.b CBPF source-IP affinity (needs CAP_NET_ADMIN container cap testing)
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ansible-playbook -i inventory/hosts.ini goat-relay-tune.yml
+
+- name: goat-relay tier — optimization (host tuning, no reboot)
+  hosts: goat_relay_hosts
+  become: true
+
+  vars:
+    # Tier-1 sysctl baseline — M-018 evidence (364→761 Mbps single-flow lift)
+    goat_relay_tier1_sysctl_enable: true
+    # H1 CPU governor=performance — DISABLED on EC2: AWS Nitro hypervisor
+    # controls CPU frequency; the c7i/c6i instances do not expose a
+    # writable scaling governor, and `cpupower frequency-set` aborts.
+    # H1 lever applies on bare-metal (ADR 0218 substrate) — not relevant
+    # to today's cloud deploy. Re-evaluate at the bare-metal Phase
+    # 3 trigger.
+    goat_relay_h1_cpu_governor_enable: false
+    # H3 hugepages — low-impact alone, sized for relay buffer pools
+    goat_relay_h3_hugepages_enable: true
+    goat_relay_h3_hugepages_count: 512
+    # H2 + L8.b explicitly OFF — reboot + cap testing required, follow-on session
+    goat_relay_h2_mitigations_off_enable: false
+
+  roles:
+    - role: goat-relay-host-tuning
+
+  post_tasks:
+    - name: Verify Tier-1 sysctl actually applied
+      ansible.builtin.shell: |
+        echo "tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control)"
+        echo "default_qdisc=$(sysctl -n net.core.default_qdisc)"
+        echo "rmem_max=$(sysctl -n net.core.rmem_max)"
+        echo "somaxconn=$(sysctl -n net.core.somaxconn)"
+      register: tier1_check
+      changed_when: false
+
+    - name: Verify H1 governor actually applied
+      ansible.builtin.shell: |
+        # cpupower may not be in PATH for all shells; explicit
+        /usr/bin/cpupower frequency-info -p 2>&1 | head -5
+      register: h1_check
+      changed_when: false
+      failed_when: false
+
+    - name: Verify H3 hugepages applied
+      ansible.builtin.shell: cat /proc/sys/vm/nr_hugepages
+      register: h3_check
+      changed_when: false
+
+    - name: tuning summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+            goat-relay {{ inventory_hostname }} — Phase 2 TUNING APPLIED
+          ========================================
+          Tier-1: {{ tier1_check.stdout_lines | join('  ') }}
+          H1:     {{ h1_check.stdout_lines | default(['(unavailable)']) | join('  ') }}
+          H3:     nr_hugepages={{ h3_check.stdout | trim }}
+
+          Status: in-flight tunings applied (no reboot needed).
+          Note:    H1 cpufreq is no-op on AWS Nitro — hypervisor controls
+                   CPU frequency, no writable scaling governor exposed.
+                   Set goat_relay_h1_cpu_governor_enable: false for cloud
+                   deploys; H1 is bare-metal-only per ADR 0218.
+          Next:    H2 mitigations=off + L8.b CBPF affinity in follow-on
+                   session (operator-fired reboot per host + container
+                   cap testing). The play below re-runs the goat-relay
+                   role with prefer-quic-bias-ms=100
+                   automatically — no separate command needed.
+          ========================================
+
+# Re-render the goat-relay container with prefer-quic-bias-ms=100. This
+# is a separate play so the host-tuning role doesn't need to know about
+# the relay role.
+- name: goat-relay tier — F-041 mitigation (prefer-quic-bias-ms=100)
+  hosts: goat_relay_hosts
+  become: true
+  vars:
+    goat_relay_image: goat-relay:tier4b
+    goat_relay_bind_addr: "0.0.0.0:33073"
+    # F-041 mitigation — server-side QUIC-preference bias. Production
+    # value 100ms — cost is one-time per daemon process lifetime; benefit
+    # is deterministic QUIC selection in the daemon's race-dialer.
+    goat_relay_prefer_quic_bias_ms: 100
+
+  roles:
+    - role: goat-relay

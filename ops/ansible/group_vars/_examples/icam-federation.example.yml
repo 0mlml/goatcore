@@ -1,0 +1,101 @@
+# icam-federation.example.yml — External ICAM federation toggle switch.
+#
+# COPY this into a site's group_vars (e.g. group_vars/<site>_hosts/icam-federation.yml),
+# set `enabled: true`, and keep only the provider(s) you want. Default is OFF; with
+# federation off the Kratos oidc block does not render and nothing changes.
+#
+# Design: docs/design/external-icam-federation.md. Role default + full field docs:
+# ops/ansible/roles/ory/defaults/main.yml (icam_federation).
+#
+# ONE selector (providers[].mode), THREE interchangeable backends, one converged
+# downstream contract (a Kratos oidc provider + a claim-map jsonnet). Prove one,
+# default to #1, keep #2/#3 in the pocket.
+#
+# SECRETS: each provider's OIDC client secret is read from the operator environment at
+# deploy time as ICAM_OIDC_<ID>_CLIENT_SECRET and written to ory/kratos-icam.env (0600),
+# the kratos service's compose env_file — NEVER inlined into kratos.yaml (0644). <ID> = the
+# provider id upper-cased with '-' -> '_' (eams-a -> EAMS_A).
+
+icam_federation:
+  enabled: false          # <-- master switch; leave false to keep the plane native
+
+  providers:
+
+    # ---- PATH #1 — upstream_oidc: federate an EXTERNAL enterprise IdP (DEFAULT) --
+    # Zero smartcard code. The external IdP already validates CAC (EAMS-A / Azure Gov).
+    # Enterprise-reachability dependency — treat as OPPORTUNISTIC (island-mode stays up
+    # on the native password/webauthn methods when the upstream is unreachable).
+    - id: eams-a
+      mode: upstream_oidc
+      scheme: dod-piv               # grammar identity.source_scheme
+      authority: doctrinal
+      label: "CAC / EAMS-A"
+      issuer_url: "https://federation.eams.example.mil/"   # <-- real EAMS-A / Azure-Gov issuer
+      client_id: "goat-zagros"
+      scopes: ["openid", "profile", "email"]
+      claim_map: eams-a             # -> ops/identity/claim-maps/eams-a.jsonnet
+      asserts_min: { ial: ial2, aal: aal2, fal: fal2 }
+      boundary_il: 5
+
+    # ---- PATH #2 — mtls_proxy: a card from any sovereign PKI, no enterprise IdP ----
+    # issuer_url points at the LOCAL icam-mtls-proxy (deploy the default-off
+    # icam-mtls-proxy role with icam_mtls_proxy_pkis naming the profiles). The proxy
+    # terminates x509 mTLS against each profile's CA bundle and hands Dex
+    # "<pki>:<identifier>" (ADR 1209; registry ops/identity/sovereign-pkis.yaml). The
+    # claim map is the GENERATED sovereign-pki.jsonnet; `scheme` is recorded per
+    # profile by that map (dod-piv for us-dod), so the value here is documentary.
+    # - id: card-local
+    #   mode: mtls_proxy
+    #   scheme: sovereign-pki
+    #   authority: doctrinal
+    #   label: "Certificate (smart card)"
+    #   issuer_url: "https://card-proxy.example.net/"
+    #   client_id: "goat-example"
+    #   claim_map: sovereign-pki
+    #   asserts_min: { ial: ial3, aal: aal3, fal: fal2 }
+    #   boundary_il: 5
+
+    # ---- PATH #3 — keycloak_frontend: Platform One x509 flows, in the pocket ------
+    # issuer_url points at the LOCAL icam-keycloak-cac role (Keycloak running the
+    # native X.509 authenticator as the CAC front-end); Kratos federates over OIDC.
+    # - id: cac-keycloak
+    #   mode: keycloak_frontend
+    #   scheme: dod-piv
+    #   authority: doctrinal
+    #   label: "CAC (Keycloak)"
+    #   issuer_url: "https://keycloak.example.net/realms/goat/"
+    #   client_id: "goat-example"
+    #   claim_map: eams-a
+    #   asserts_min: { ial: ial3, aal: aal3, fal: fal2 }
+    #   boundary_il: 5
+
+    # ---- login.gov (industry, IAL2 civil/partner) — upstream_oidc ----------------
+    # - id: login-gov
+    #   mode: upstream_oidc
+    #   scheme: login-gov
+    #   authority: industry
+    #   label: "login.gov"
+    #   issuer_url: "https://idp.int.identitysandbox.gov/"   # sandbox; prod = secure.login.gov
+    #   client_id: "urn:gov:gsa:openidconnect.profiles:sp:sso:goat:example"
+    #   scopes: ["openid", "email", "profile"]
+    #   claim_map: login-gov
+    #   asserts_min: { ial: ial2, aal: aal2, fal: fal2 }
+    #   boundary_il: 2
+    #   # NOTE: login.gov requires private_key_jwt client auth (not client_secret),
+    #   # which Kratos's generic provider doesn't do — bridge via Dex or verify Kratos
+    #   # private_key_jwt support. See docs/operations/dod-pki-cac-federation-setup.md D.2.
+
+    # ---- DoD Entra / Azure Gov (RECOMMENDED #1 — Kratos-native client_secret) --------
+    # The easiest #1 to bring online: internet-reachable, client_secret (no shim), reuses
+    # the built entra claim-map. See dod-pki-cac-federation-setup.md D.1.
+    # - id: entra
+    #   mode: upstream_oidc
+    #   scheme: entra
+    #   authority: industry
+    #   label: "DoD Entra"
+    #   issuer_url: "https://login.microsoftonline.us/<tenant-id>/v2.0"
+    #   client_id: "<app-registration-client-id>"   # secret via ICAM_OIDC_ENTRA_CLIENT_SECRET
+    #   scopes: ["openid", "email", "profile"]
+    #   claim_map: entra
+    #   asserts_min: { ial: ial2, aal: aal2, fal: fal2 }
+    #   boundary_il: 5

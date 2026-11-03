@@ -1,0 +1,104 @@
+# netbird-exercise-expand.yml — shared include: expand `netbird_exercises`
+# (declared in netbird_acl_taxonomy.yml) into synthetic per-exercise site
+# entries so every consumer of the taxonomy/matrix/site-maps treats an
+# exercise exactly like a site (exercise-group-sets tee-up).
+#
+# Include AFTER the include_vars of the taxonomy (and matrix, where used) and
+# BEFORE any `target_site in netbird_acl_taxonomy` assertion. Safe when only
+# the taxonomy is loaded (bootstrap): the matrix expansion is skipped unless
+# netbird_acl_matrix is defined. Idempotent within a play.
+#
+# Guarantees:
+#   - taxonomy entry: the exercise's prefix + the fleet-standard
+#     netbird_exercise_template.groups, PLUS netbird_exercise_gear_template.groups
+#     when the row declares `gear: true` (ADR 1116 — opt-in, because 16 gear
+#     classes across every declared scope is ~96 near-empty groups on a shared
+#     mgmt server, which is the arithmetic ADR 1116 §8 refuses for probation
+#     mirrors).
+#   - matrix entry: netbird_exercise_rules_template.rules with
+#     cutover.default_policy_action=keep — an exercise NEVER disables the
+#     host site's Default policy (its enable/disable belongs to the host
+#     site's own cutover lifecycle).
+#   - URL + token env-var: inherited from the host_site's existing rows.
+
+- name: "exercise-expand — validate host_site of every declared exercise"
+  ansible.builtin.assert:
+    that:
+      - item.value.host_site is defined
+      - item.value.host_site in netbird_site_url_map
+      - item.value.host_site in netbird_site_env_var_map
+      - item.value.site_prefix is defined
+      - item.value.site_prefix | length > 0
+      # A scope that opts into the ADR 1116 gear classes must be able to see
+      # them. Silently expanding to the base set would create a SITE_ONE-* scope
+      # with no KID group and no sign that anything was dropped.
+      - not (item.value.gear | default(false)) or netbird_exercise_gear_template is defined
+      # `kind:` is what the teardown guard reads (ADR 1158). It was advisory
+      # previously which meant an operational site and an exercise were
+      # indistinguishable to every consumer and teardown was guarded by a
+      # comment. Required, and closed — a new word must be added here first.
+      - item.value.kind is defined
+      - item.value.kind in ['exercise', 'operational']
+    fail_msg: >-
+      netbird_exercises['{{ item.key }}'] must declare site_prefix + a
+      host_site present in netbird_site_url_map/netbird_site_env_var_map
+      (got host_site={{ item.value.host_site | default('<unset>') }});
+      and kind: exercise|operational
+      (got kind={{ item.value.kind | default('<unset>') }});
+      and if it declares gear: true, netbird_exercise_gear_template must be
+      loaded (it lives in netbird_acl_taxonomy.yml).
+  loop: "{{ netbird_exercises | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: "exercise-expand — synthesize taxonomy + site-map entries"
+  ansible.builtin.set_fact:
+    netbird_acl_taxonomy: >-
+      {{ netbird_acl_taxonomy
+         | combine({item.key: {'site_prefix': item.value.site_prefix,
+                               'groups': netbird_exercise_template.groups
+                                         + (netbird_exercise_gear_template.groups
+                                            if (item.value.gear | default(false))
+                                            else [])}}) }}
+    netbird_site_url_map: >-
+      {{ netbird_site_url_map
+         | combine({item.key: netbird_site_url_map[item.value.host_site]}) }}
+    netbird_site_env_var_map: >-
+      {{ netbird_site_env_var_map
+         | combine({item.key: netbird_site_env_var_map[item.value.host_site]}) }}
+  loop: "{{ netbird_exercises | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: "exercise-expand — synthesize matrix entries (when matrix loaded)"
+  ansible.builtin.set_fact:
+    netbird_acl_matrix: >-
+      {{ netbird_acl_matrix
+         | combine({item.key: {'site_prefix': item.value.site_prefix,
+                               'rules': netbird_exercise_rules_template.rules
+                                        + (netbird_exercise_gear_rules_template.rules
+                                           if (item.value.gear | default(false))
+                                           else []),
+                               'cutover': {'default_policy_action': 'keep',
+                                           'default_policy_name_pattern': 'Default'}}}) }}
+  loop: "{{ netbird_exercises | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: netbird_acl_matrix is defined and netbird_exercise_rules_template is defined
+
+# Fails loud rather than expanding a gear scope to the base rule set: a SITE_ONE
+# matrix silently missing its gear rules would apply cleanly and leave every
+# gear peer uncovered, which reads as success. Gated on the matrix being loaded
+# at all — bootstrap loads only the taxonomy, and has no rules to check.
+- name: "exercise-expand — a gear scope must have gear RULES when the matrix is loaded"
+  ansible.builtin.assert:
+    that:
+      - not (item.value.gear | default(false)) or netbird_exercise_gear_rules_template is defined
+    fail_msg: >-
+      netbird_exercises['{{ item.key }}'] declares gear: true but
+      netbird_exercise_gear_rules_template is not loaded — the ADR 1116 gear
+      classes would be created with no rules covering them.
+  loop: "{{ netbird_exercises | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: netbird_acl_matrix is defined and netbird_exercise_rules_template is defined

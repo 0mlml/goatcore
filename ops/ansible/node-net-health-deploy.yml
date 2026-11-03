@@ -1,0 +1,42 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the node-net-health collector + publisher
+# (docs/design/node-net-health.md — the `net` domain of the environment-health
+# surface, ADR 1036). A host-side hourly systemd timer runs the classifying
+# collector (ops/node-net-health/nnh-snapshot.py: mesh plane + full 4-bucket
+# socket classification against the node-class baseline registry); the
+# containerized publisher grades it and publishes ops/net/health/<node>.
+# Observation, not enforcement (Block 17 egress-proxy owns enforcement).
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -e target=zagros_hosts node-net-health-deploy.yml
+#
+# Pre-flight (operator-side):
+#   1. zenoh-router Healthy on the target host with the infra-node-net-health
+#      subject + infra-w-net-health rule LIVE (router restart after the
+#      template change — F-156), else writes are silently denied.
+#   2. netbird daemon enrolled + running (F-098 guard skips the mesh plane
+#      honestly when absent).
+#   3. Infra leaf cert + key minted (Subject CN=goat-node-net-health-trial-peer)
+#      at the role's node_net_health_cert_dir.
+#   4. goat-node-net-health image digest-pinned in the role defaults +
+#      deploy-history.yml (the role refuses the PENDING sentinel).
+#   5. node_net_health_enabled + the node-class baseline registry
+#      (node_net_health_node_class / _baseline_rules) set in group_vars —
+#      the egress contract; fail-closed, every rule carries name + why.
+#
+# Live-fire: `goat sub --context zagros 'ops/net/health/**' --take 2` sees the
+# per-node EnvHealthV1{domain:"net"}; a seeded off-baseline connection (curl
+# to a non-baseline host) appears attributed in the undeclared list within
+# one snapshot (run-now: systemctl start node-net-health-snapshot.service).
+
+- name: deploy node-net-health collector + publisher (net domain, ADR 1036)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: node-net-health

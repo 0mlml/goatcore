@@ -1,0 +1,225 @@
+---
+# authenticated-doors.yml — put an authenticated door in front of the surfaces
+# that had no identity gate at all.
+#
+# WHAT THIS CHANGES. demogame, brief and dataflows were `mesh-only` until
+# a Traefik IP allowlist on the mesh range was the only gate, so
+# every caller that reached the mesh was served and no identity was ever
+# recorded. The permissions console meanwhile rendered all three as denied to
+# every group but PLATFORM-ADMIN, which is what prompted this work.
+#
+# The doors refuse nobody. `*_oauth2_proxy_allowed_groups` is empty on all
+# three, so any identity the site Hydra will issue a token for passes. The
+# point is ATTRIBUTION: Hydra records one consent grant per (person, client),
+# and microscope's hydra-consents adapter reads exactly that. A surface with no
+# door emits no grant and no session, so it is invisible to that machinery
+# however much of it is built.
+#
+# WHAT IT DOES NOT GIVE YOU. A consent grant is a standing record with a moving
+# `handled_at`, not a per-visit event: repeat visits collapse into one row.
+# Visit counts and visit history are a separate capture path (SurfaceVisitV1)
+# and are not in this playbook.
+#
+# ORDER. The role provisions each Hydra client BEFORE its container starts and
+# then verifies /oauth2/start redirects at this site's issuer. A fence whose
+# client Hydra never heard of is healthy in every probe and broken in every
+# browser.
+#
+# RUN:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini authenticated-doors.yml -l <console host>
+#
+# ROLLBACK is per surface and needs no image change: set
+# `<surface>_oauth2_proxy_enabled: false` in the site's group_vars and re-run
+# the surface's own deploy playbook. The Traefik route falls back to addressing
+# the container directly and the surface is mesh-only again.
+
+- name: Authenticated doors for the previously ungated surfaces
+  # `hosts: all` scoped by `-l <host>`, matching id-admin-console-deploy.yml.
+  # NOT `{{ target | default(omit) }}` — that resolves to None when target is
+  # undefined and the play silently matches no hosts, which reads as success.
+  hosts: all
+  become: false
+  gather_facts: true
+
+  # These are stated here, not read from the fenced roles' defaults. A role
+  # default is NOT visible to the playbook that include_role's it — the vars:
+  # block below is templated before the role's defaults enter scope, so
+  # `{{ brief_hostname }}` resolves to "undefined" rather than to the value the
+  # brief role would compute. Everything here derives from group_vars, which
+  # ARE in scope, or from the service registry (ops/serve/services.yaml).
+  vars:
+    authenticated_doors_brief_hostname: "brief.{{ site_id }}.{{ site_dns_zone }}"
+    authenticated_doors_brief_upstream_host: "brief"
+    authenticated_doors_brief_upstream_port: 80
+
+    authenticated_doors_dataflows_hostname: "dataflows.{{ site_id }}.{{ site_dns_zone }}"
+    authenticated_doors_dataflows_upstream_host: "dataflows"
+    authenticated_doors_dataflows_upstream_port: 80
+
+    # demogame_url_host IS a group_var on every goatnet that runs it, so it
+    # is in scope; the port is the registry's container_port for the service.
+    authenticated_doors_demogame_hostname: "{{ demogame_url_host }}"
+    authenticated_doors_demogame_upstream_host: "demogame"
+    authenticated_doors_demogame_upstream_port: 8095
+
+    authenticated_doors_traefik_network: "mgmt"
+
+  pre_tasks:
+    - name: Guard — this play is scoped by `-l <host>`, never by `-e target=`
+      ansible.builtin.assert:
+        that:
+          - target is not defined
+        fail_msg: >-
+          REFUSING: pass `-l <the console host>` (zagros -> mgmt-zagros-01-thor,
+          zagros-prod -> mgmt-zagros-prod-01-orin). `-e target=` would widen this
+          to every host in the loaded inventory.
+      run_once: true
+      delegate_to: localhost
+
+    - name: Verify the site Hydra admin API answers before touching any door
+      ansible.builtin.uri:
+        url: "{{ authenticated_doors_hydra_admin_url | default('http://127.0.0.1:4445') }}/admin/clients?limit=1"
+        status_code: [200]
+      # Every door in this play registers a client. If Hydra is unreachable the
+      # role would still start three sidecars, each of which fails only in a
+      # browser. Fail here instead, before anything is running.
+
+  tasks:
+    # ---- brief: a static deck. No XHR, no stream, no probe path of its own.
+    - name: brief | authenticated door
+      ansible.builtin.include_role:
+        name: oauth2-proxy-surface
+      vars:
+        oauth2_proxy_surface_name: "brief"
+        oauth2_proxy_surface_hostname: "{{ authenticated_doors_brief_hostname }}"
+        oauth2_proxy_surface_upstream_host: "{{ authenticated_doors_brief_upstream_host }}"
+        oauth2_proxy_surface_upstream_port: "{{ authenticated_doors_brief_upstream_port }}"
+        oauth2_proxy_surface_allowed_groups: "{{ brief_oauth2_proxy_allowed_groups }}"
+        oauth2_proxy_surface_client_secret: "{{ brief_oauth2_proxy_client_secret }}"
+        oauth2_proxy_surface_cookie_secret: "{{ brief_oauth2_proxy_cookie_secret }}"
+        oauth2_proxy_surface_traefik_network: "{{ authenticated_doors_traefik_network }}"
+        oauth2_proxy_surface_request_log_file: "/var/log/oauth2-proxy/request.log"
+      when: brief_oauth2_proxy_enabled | default(false) | bool
+
+    # ---- dataflows: sibling of brief, same shape.
+    - name: dataflows | authenticated door
+      ansible.builtin.include_role:
+        name: oauth2-proxy-surface
+      vars:
+        oauth2_proxy_surface_name: "dataflows"
+        oauth2_proxy_surface_hostname: "{{ authenticated_doors_dataflows_hostname }}"
+        oauth2_proxy_surface_upstream_host: "{{ authenticated_doors_dataflows_upstream_host }}"
+        oauth2_proxy_surface_upstream_port: "{{ authenticated_doors_dataflows_upstream_port }}"
+        oauth2_proxy_surface_allowed_groups: "{{ dataflows_oauth2_proxy_allowed_groups }}"
+        oauth2_proxy_surface_client_secret: "{{ dataflows_oauth2_proxy_client_secret }}"
+        oauth2_proxy_surface_cookie_secret: "{{ dataflows_oauth2_proxy_cookie_secret }}"
+        oauth2_proxy_surface_traefik_network: "{{ authenticated_doors_traefik_network }}"
+        oauth2_proxy_surface_request_log_file: "/var/log/oauth2-proxy/request.log"
+      when: dataflows_oauth2_proxy_enabled | default(false) | bool
+
+    # ---- demogame: the only one of the three with machine callers and
+    # long-lived connections, and therefore the only one with real risk.
+    #
+    # Its handlers (ops/serve/demogame/main.go): GET/POST /api/scores,
+    # GET /api/scores/stream (SSE), GET /api/mp/ws (websocket), GET /health,
+    # GET /metrics.
+    #
+    #   api_routes ^/api/    — the leaderboard polls, the stream reconnects and
+    #     the websocket drops. Each of those retried against an invalid session
+    #     would start an OIDC flow and mint a fresh 15-minute CSRF cookie, with
+    #     nobody ever completing a flow to clear them, until the Cookie header
+    #     outgrows the proxy buffer and the player gets `400 Request Header Or
+    #     Cookie Too Large` with no way back but clearing cookies by hand
+    #. With api_routes they 401 like an XHR should and mint nothing.
+    #
+    #   skip_auth_routes ^/(health|metrics)$ — the Prometheus `blackbox-https`
+    #     job probes https://<fqdn>/health through this FRONT DOOR, and a
+    #     scrape reaches /metrics. Neither has a cookie jar or any way to log
+    #     in, so gating them turns a healthy service red and adds a guaranteed
+    #     login-initiation per probe interval.
+    - name: demogame | authenticated door
+      ansible.builtin.include_role:
+        name: oauth2-proxy-surface
+      vars:
+        oauth2_proxy_surface_name: "demogame"
+        oauth2_proxy_surface_hostname: "{{ authenticated_doors_demogame_hostname }}"
+        oauth2_proxy_surface_upstream_host: "{{ authenticated_doors_demogame_upstream_host }}"
+        oauth2_proxy_surface_upstream_port: "{{ authenticated_doors_demogame_upstream_port }}"
+        oauth2_proxy_surface_allowed_groups: "{{ demogame_oauth2_proxy_allowed_groups }}"
+        oauth2_proxy_surface_client_secret: "{{ demogame_oauth2_proxy_client_secret }}"
+        oauth2_proxy_surface_cookie_secret: "{{ demogame_oauth2_proxy_cookie_secret }}"
+        oauth2_proxy_surface_traefik_network: "{{ authenticated_doors_traefik_network }}"
+        oauth2_proxy_surface_request_log_file: "/var/log/oauth2-proxy/request.log"
+        oauth2_proxy_surface_api_routes: "^/api/"
+        oauth2_proxy_surface_skip_auth_routes: "^/(health|metrics)$"
+      when: demogame_oauth2_proxy_enabled | default(false) | bool
+
+    # ---- help: the help desk of ADR 1176. The APPLICATION runs on another peer
+    # (for example a partner-run host in EXTERNAL-INFRA); only the door and the
+    # route live here. The door's upstream is that peer's mesh IP and port, stated
+    # in group_vars as help_desk_upstream_host / help_desk_upstream_port.
+    #
+    #   skip_auth_routes ^/ping$ — oauth2-proxy answers /ping itself, and the
+    #     registry row probes it (health_path: /ping, the trust-sandbox shape),
+    #     so the status page reads the door's liveness without a cookie jar.
+    #   No api_routes: HESK is server-rendered pages and forms, no polling XHR.
+    - name: help | authenticated door
+      ansible.builtin.include_role:
+        name: oauth2-proxy-surface
+      vars:
+        oauth2_proxy_surface_name: "help"
+        oauth2_proxy_surface_hostname: "help.{{ site_id }}.{{ site_dns_zone }}"
+        oauth2_proxy_surface_upstream_host: "{{ help_desk_upstream_host }}"
+        oauth2_proxy_surface_upstream_port: "{{ help_desk_upstream_port | default(80) }}"
+        oauth2_proxy_surface_allowed_groups: "{{ help_oauth2_proxy_allowed_groups }}"
+        oauth2_proxy_surface_client_secret: "{{ help_oauth2_proxy_client_secret }}"
+        oauth2_proxy_surface_cookie_secret: "{{ help_oauth2_proxy_cookie_secret }}"
+        oauth2_proxy_surface_traefik_network: "{{ authenticated_doors_traefik_network }}"
+        oauth2_proxy_surface_request_log_file: "/var/log/oauth2-proxy/request.log"
+        oauth2_proxy_surface_skip_auth_routes: "^/ping$"
+      when: help_oauth2_proxy_enabled | default(false) | bool
+
+  post_tasks:
+    - name: Doors deployed
+      ansible.builtin.debug:
+        msg: >-
+          Doors up and their Hydra registrations verified. The routes still
+          address the containers directly until the second play below swings
+          them.
+      run_once: true
+
+# SECOND PLAY: point each surface's Traefik route at its new door.
+#
+# This is deliberately part of the same playbook. A door that is running but not
+# routed to changes nothing, and a route pointed at a door that is not running
+# takes the surface down — so the two belong in one run, in this order, with the
+# door's Hydra registration already verified above.
+#
+# Each surface's route is rendered by its OWN role, which is why the roles are
+# re-run here rather than the template being copied into this repo twice. The
+# roles are idempotent; the only thing that changes is the upstream, because
+# `<surface>_oauth2_proxy_enabled` is now true.
+- name: Swing the routes onto the doors
+  hosts: all
+  # `become: true` at play level: these roles talk to the Docker socket, and the
+  # goat account is not in the docker group. Without it the role fails at
+  # its first handler with "permission denied while trying to connect to the
+  # Docker API", after having already rendered the route file — which leaves the
+  # route pointing at a door whose container was never reconciled.
+  become: true
+  gather_facts: true
+
+
+  post_tasks:
+    - name: What is now attributable
+      ansible.builtin.debug:
+        msg: >-
+          Each visitor now produces a Hydra consent grant per surface, readable
+          in microscope (hydra-consents adapter) as "reached this, last at
+          <handled_at>". demogame' route is rendered by
+          ops/ansible/demogame-deploy.yml, which must be re-run separately —
+          its template is in ops/ansible/templates/, not in a role.
+      run_once: true

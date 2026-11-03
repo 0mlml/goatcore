@@ -1,0 +1,48 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Stage-2 mesh front for the cloud compliance dashboard on a mgmt host
+# (`compliance.<site_dns_zone>`). Stands up oauth2-proxy
+# (COMPLIANCE-group gated, site Hydra) + aws-sigv4-proxy (-> AWS_IAM-locked
+# Function URL). Design: docs/design/compliance-dashboard-mesh-fronting.md;
+# decision: ADR 1029 (goat side) + usareur-af-infra ADR 0001.
+#
+# SHELF-READY: run only once the usareur-af-infra env is at STAGE 2 —
+# enable_function_url=true applied (the Function URL exists) and this proxy's
+# invoke credential granted via function_url_invoke_principal_arns. Until
+# then the dashboard stays on the ALB (Stage 1).
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     COMPLIANCE_PROXY_OIDC_CLIENT_SECRET=$COMPLIANCE_OIDC_CLIENT_SECRET \
+#     COMPLIANCE_PROXY_COOKIE_SECRET=$COMPLIANCE_COOKIE_SECRET \
+#     COMPLIANCE_FUNCTION_URL_HOST=<id>.lambda-url.eu-central-1.on.aws \
+#     COMPLIANCE_FUNCTION_URL_REGION=eu-central-1 \
+#     COMPLIANCE_INVOKE_AWS_ACCESS_KEY_ID=$COMPLIANCE_INVOKE_AKID \
+#     COMPLIANCE_INVOKE_AWS_SECRET_ACCESS_KEY=$COMPLIANCE_INVOKE_SECRET \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     -l <mgmt-host> compliance-proxy-deploy.yml
+#
+# Pre-flight (operator-side):
+#   1. usareur-af-infra env at Stage 2 (Function URL live + invoke cred granted).
+#   2. Hydra client `oauth2-proxy-compliance` registered (oidc-client step).
+#   3. compliance.<zone> in CoreDNS (ops/dns/<site>/mesh-hosts) + a
+#      Traefik route -> oauth2-proxy-compliance:4180 with the mesh-only
+#      middleware (re-render traefik-acme.yml with compliance_proxy_enabled).
+#   4. Dashboard Lambda trusts the forwarded X-Auth-Request-* identity.
+
+- name: compliance-proxy | deploy
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    compliance_proxy_enabled: true
+    compliance_proxy_oidc_client_secret: "{{ lookup('env', 'COMPLIANCE_PROXY_OIDC_CLIENT_SECRET') }}"
+    compliance_proxy_cookie_secret: "{{ lookup('env', 'COMPLIANCE_PROXY_COOKIE_SECRET') }}"
+    compliance_function_url_host: "{{ lookup('env', 'COMPLIANCE_FUNCTION_URL_HOST') }}"
+    compliance_function_url_region: "{{ lookup('env', 'COMPLIANCE_FUNCTION_URL_REGION') }}"
+    compliance_invoke_aws_access_key_id: "{{ lookup('env', 'COMPLIANCE_INVOKE_AWS_ACCESS_KEY_ID') }}"
+    compliance_invoke_aws_secret_access_key: "{{ lookup('env', 'COMPLIANCE_INVOKE_AWS_SECRET_ACCESS_KEY') }}"
+  roles:
+    - compliance-proxy

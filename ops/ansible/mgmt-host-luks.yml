@@ -1,0 +1,159 @@
+---
+# mgmt-host-luks.yml — generic LUKS bring-up for any mgmt-host with an NVMe
+# data volume backing /opt/docker-data.
+#
+# Idempotent. Safe to re-run. Format-if-unformatted is gated by
+# `cryptsetup isLuks`, so on a host with an existing LUKS volume the role
+# is a no-op for the destructive steps and only re-renders crypttab + fstab
+# + systemd mount unit (also idempotent).
+#
+# Per-host passphrase is sourced from an env var whose name derives from the
+# inventory `site_name` + `router_role` of the host:
+#   site_name=site-a, router_role=A → SITE_A_LUKS_PASS
+#   site_name=site-b, router_role=B → SITE_B_LUKS_PASS
+# The env var lives in .envrc.local (gitignored) and is backed up in 1Password.
+#
+# Volume definition is consumed from the per-site group_vars/<site>_hosts/vars.yml
+# under the key `luks_volumes_mgmt_host`. Other groups can either define `luks_volumes_mgmt_host`
+# in their own vars.yml, or pass `-e luks_volumes_mgmt_host='...'` at the
+# command line for ad-hoc bring-ups.
+#
+# Usage (from the operator laptop):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -l <mgmt-host> mgmt-host-luks.yml
+#
+# Pre-requisites:
+#   1. SSH key auth to the host (run ops/scripts/seed-ssh-key.sh first if not).
+#   2. <SITE>_A_LUKS_PASS (or equivalent) set in env (.envrc.local +
+#      direnv allow).
+#   3. NVMe physically installed and visible as /dev/nvme0n1 (verify with
+#      `lsblk` if unsure).
+#
+# Post-conditions:
+#   - /dev/nvme0n1 is LUKS2-formatted (or was already)
+#   - /dev/mapper/docker-data is open
+#   - /opt/docker-data is mounted with ext4
+#   - /etc/crypttab + /etc/fstab + systemd mount unit persist the config
+#   - On next reboot, console will prompt for the passphrase
+#
+# Operator must save the passphrase to 1Password BEFORE the first reboot.
+# Without it, the volume cannot be unlocked at boot — total data loss for
+# /opt/docker-data.
+
+# ---------------------------------------------------------------------------
+# BLAST-RADIUS GATE. The plays below default to `mgmt_hosts`, an
+# umbrella group over EVERY goatnet's mgmt hosts, production included, and they LUKS-format and mount the data volume on what they resolve to.
+# An unnarrowed run is a fleet-wide operation, not a site bring-up.
+#
+# The same fan-out applies to mgmt-host.yml (see the `mgmt_host_target` comment
+# there). The safe behaviour must not depend on every caller remembering to narrow.
+#
+# So narrowing is asserted, not assumed. Declare scope with EITHER:
+#   -e target=<site>_hosts   (what goat-standup.sh and the importers pass)
+#   --limit <host-or-group>  (what the per-env bringup runbooks use)
+# `--limit all`, `--limit '*'` and `--limit mgmt_hosts` all name the fleet and
+# are NOT narrowings; a deliberate fleet-wide run says so: -e fleet_wide=true
+- name: "blast-radius gate — refuse an unnarrowed fleet-wide run"
+  # This play mirrors the working plays' `hosts:` rather than using `localhost`,
+  # because `--limit` applies to EVERY play: a localhost gate play resolves to
+  # zero hosts under any --limit and is silently skipped, and a gate that cannot
+  # run is not a gate. run_once + delegate_to keeps it to one local execution.
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  become: false
+  tasks:
+    - name: F-376 — the run must name one site, or declare itself fleet-wide
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.assert:
+        that:
+          - (target is defined and (target | string | length) > 0)
+            or (ansible_limit | default('') | string not in ['', 'all', '*', 'mgmt_hosts'])
+            or (fleet_wide | default(false) | bool)
+        fail_msg: >-
+          Unnarrowed run refused. Without `target`, or a `--limit` that
+          names something narrower than the fleet, this playbook resolves to the
+          umbrella group `mgmt_hosts` — every mgmt host on every goatnet,
+          production included — and it LUKS-format and mount the data volume on what they resolve to. Re-run with
+          `-e target=<site>_hosts` (e.g. `-e target=zagros_prod_hosts`) or
+          `--limit <host>`. If a fleet-wide run really is what you want, say it
+          out loud: `-e fleet_wide=true`.
+        success_msg: >-
+          scope declared —
+          {{ 'target=' ~ target if target is defined
+             else ('--limit ' ~ ansible_limit
+                   if ansible_limit | default('') | string | length > 0
+                   else 'fleet_wide=true (deliberate)') }}
+
+- name: Resolve per-host LUKS passphrase env var name
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  tasks:
+    - name: Set luks_passphrase_envvar from site_name + router_role
+      ansible.builtin.set_fact:
+        luks_passphrase_envvar: "{{ (site_id | default(site_name | regex_replace('-[ab]$', ''))) | upper | replace('-', '_') }}_{{ router_role | upper }}_LUKS_PASS"
+      when: luks_passphrase_envvar is not defined
+
+    # Only when there is LUKS work to do. Everything below takes its lists with
+    # default([]), so a site that declares none changes nothing and needs no
+    # key: a goatlite declares disk_encryption: false and renders every one of
+    # them empty, and demanding a passphrase here stopped its phase 2 on a box
+    # with nothing to encrypt. Any site that does declare a volume, an
+    # installer partition or an encrypted LV is gated exactly as before.
+    - name: Verify the resolved env var is non-empty
+      ansible.builtin.assert:
+        that:
+          - lookup('env', luks_passphrase_envvar) | length > 0
+        fail_msg: >-
+          Env var '{{ luks_passphrase_envvar }}' is empty or unset.
+          Add it to .envrc.local and run `direnv allow` before re-running.
+      when: >-
+        (luks_volumes_mgmt_host | default([]) | length > 0)
+        or (luks_installer_partitions | default([]) | length > 0)
+        or (luks_encrypted_lvs | default([]) | length > 0)
+
+- name: Apply LUKS unlock role for mgmt-host data volumes
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    # default([]) so a host-site node whose only LUKS work is installer-LUKS
+    # enrollment + an encrypted-LV carve (luks_installer_partitions /
+    # luks_encrypted_lvs from group_vars, no separately-formatted second disk)
+    # does not need to declare an empty luks_volumes_mgmt_host.
+    luks_volumes: "{{ luks_volumes_mgmt_host | default([]) }}"
+  roles:
+    - role: luks-unlock
+
+    # bringup-access-invariant — dropbear remote-unlock (ADR 0612), fed the
+    # platform-admin roster (dropbear_authorized_keys <- admin_authorized_keys,
+    # :2222) so a box paused at a LUKS unlock prompt is reachable by EVERY
+    # admin, not stranded. Gated per-host: set dropbear_remote_unlock: true
+    # (with dropbear_initramfs_ip_config) on node classes that pause for a
+    # network unlock. This is the role's invocation in the chain — it was
+    # authored but never invoked before (the delta-obs-b orphan gap).
+    - role: dropbear-initramfs
+      when: dropbear_remote_unlock | default(false) | bool
+
+- name: Show post-condition summary
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Verify each LUKS volume is mounted with the right filesystem
+      ansible.builtin.command:
+        cmd: "findmnt --json {{ item.mount_point }}"
+      register: mount_facts
+      changed_when: false
+      loop: "{{ luks_volumes_mgmt_host | default([]) }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.mount_point }}"
+
+    - name: Print mount summary
+      ansible.builtin.debug:
+        msg: "{{ item.stdout | from_json }}"
+      loop: "{{ mount_facts.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"

@@ -1,0 +1,67 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# require-netbird-service-identity.yml — the deploy-time gate for a role that
+# reads a NetBird service-identity token. Registry and design:
+# ops/netbird/service-identities.yaml, docs/design/netbird-service-identities.md.
+#
+# Include it from the consuming role BEFORE anything renders the token:
+#
+#   - name: <role> | require the NetBird service identity
+#     ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+#     vars:
+#       nsi_identity: portal-mint                     # a key under identities:
+#       nsi_token: "{{ lookup('env', portal_netbird_api_token_envvar) }}"
+#       nsi_enabled: "{{ portal_mesh_key_mint_enabled | bool }}"
+#
+# nsi_token is the value the role is about to render, from wherever the role
+# reads it. nsi_enabled defaults to true (a consumer that always needs it).
+#
+# When the consumer is enabled it refuses two things:
+#   1. an empty token — the deploy would go green and the service would run
+#      without the capability (the zagros-dev portal refused every machine
+#      enrollment this way previously);
+#   2. a token that differs from the registry's token_env for this goatnet —
+#      group_vars reading another goatnet's variable, or a hand-typed name that
+#      drifted from the one the mint script writes.
+# Neither check prints the token.
+
+- name: "netbird-service-identity | load the registry entry for {{ nsi_identity }}"
+  ansible.builtin.set_fact:
+    _nsi: "{{ (lookup('file', role_path ~ '/../../../netbird/service-identities.yaml') | from_yaml).identities[nsi_identity] }}"
+    _nsi_goatnet: "{{ site_id | mandatory }}"
+  when: nsi_enabled | default(true) | bool
+
+- name: "netbird-service-identity | derive this goatnet's token variable"
+  ansible.builtin.set_fact:
+    _nsi_env: "{{ _nsi.token_env | replace('{SITE}', _nsi_goatnet | upper | replace('-', '_')) }}"
+  when: nsi_enabled | default(true) | bool
+
+- name: "netbird-service-identity | {{ nsi_identity }} token is present"
+  ansible.builtin.assert:
+    that:
+      - nsi_token | default('') | length > 0
+    fail_msg: >-
+      {{ role_name }} needs the NetBird service identity '{{ nsi_identity }}'
+      (service user {{ (_nsi.declared_names | default({})).get(_nsi_goatnet, _nsi.service_user | replace('{goatnet}', _nsi_goatnet)) }})
+      and {{ _nsi_env }} is empty in this shell.
+      {{ _nsi.without_it | default('') }}
+      {% if _nsi.bootstrap | default(false) %}This is the bootstrap identity: mint
+      it by hand as docs/operations/goatnet-standup.md Phase 11 describes, export
+      it as {{ _nsi_env }}, then re-run this play.{% else %}Mint it:
+      ops/scripts/netbird-service-identities.py {{ _nsi_goatnet }} --mint (writes
+      the token to .envrc.local.d/30-site-services.envrc and 1Password), then
+      re-run this play.{% endif %}
+    quiet: true
+  when: nsi_enabled | default(true) | bool
+
+- name: "netbird-service-identity | {{ nsi_identity }} token is read from the registry's variable"
+  ansible.builtin.assert:
+    that:
+      - nsi_token == lookup('env', _nsi_env)
+    fail_msg: >-
+      {{ role_name }} reads the '{{ nsi_identity }}' token from somewhere other
+      than {{ _nsi_env }}, the name ops/netbird/service-identities.yaml gives it
+      on {{ _nsi_goatnet }}. Point the group_vars lookup at {{ _nsi_env }}.
+    quiet: true
+  when: nsi_enabled | default(true) | bool

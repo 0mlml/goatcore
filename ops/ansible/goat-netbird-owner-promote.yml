@@ -1,0 +1,145 @@
+---
+# goat-netbird-owner-promote.yml — RECOVERY-ONLY: promote an existing netbird
+# user to account Owner with a role-ONLY UPDATE.
+#
+# WHEN YOU NEED THIS (rare): a goatnet whose netbird account has no reachable
+# owner — i.e. the DB was forked/restored from another goatnet's end-state (an
+# anti-pattern) so the operator's first OIDC login became a plain `user`, not
+# the Owner. A from-EMPTY standup never needs this: netbird makes the first
+# OIDC login the account Owner automatically (verified in the management source,
+# management/server/account.go; a fresh account's creating user gets
+# UserRoleOwner) and goat-netbird-account-init.yml seeds the rest.
+#
+# WHY NOT THE REST API: the netbird API refuses to grant the owner role unless
+# the CALLER is already an owner (management/server/user.go: "only owners can
+# add owner role to other users"). In the owner-less recovery case there is no
+# such caller, so the API literally cannot do it. The only mechanism left is a
+# direct store write — and the SAFE form is a role-ONLY UPDATE on a row netbird
+# already created via OIDC. We touch exactly one column (`role`); we never
+# INSERT a user and never write any other column. Hand-inserting an owner row
+# (or writing a partial row with NULL string columns) POISONS enrollment —
+# every peer-login fails `cannot scan NULL into *string` and the mesh drops.
+# This play exists to make that impossible.
+# ops/ci/check-netbird-user-sql.sh enforces the rule tree-wide.
+#
+# TARGET SELECTION (pick ONE):
+#   -e nb_owner_user_id=<oidc-sub>   explicit: the user's netbird id (OIDC sub).
+#                                    Find it in the dashboard, or from
+#                                    `select id, role, is_service_user from users
+#                                     where account_id=<acct>;` (emails are not
+#                                    in this table — they live in the IdP).
+#   (default) auto: if EXACTLY ONE non-service user exists in the account, that
+#                   user is the target. If 0 or >1, the play fails and asks for
+#                   an explicit -e nb_owner_user_id (no guessing).
+#
+# Apply (reach the host over its mesh IP, or a bastion):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     -l <mgmt-host> goat-netbird-owner-promote.yml \
+#     [-e nb_owner_user_id=<oidc-sub>]
+
+- name: Promote an existing netbird user to account Owner (recovery, role-only)
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    netbird_pg_container: "postgres-a"
+    netbird_pg_db: "netbird"
+    netbird_pg_user: "postgres"
+    nb_mgmt_container: "management-a"
+    nb_owner_user_id: ""   # optional explicit target (OIDC sub)
+
+  tasks:
+    - name: Resolve this goatnet's account_id from the netbird store
+      ansible.builtin.shell: >-
+        docker exec {{ netbird_pg_container }} psql -U {{ netbird_pg_user }}
+        -d {{ netbird_pg_db }} -At
+        -c "select id from accounts order by created_at limit 1;"
+      register: nb_acct
+      changed_when: false
+
+    - name: Fail if no account found (mgmt not bootstrapped yet)
+      ansible.builtin.assert:
+        that: nb_acct.stdout | trim | length > 0
+        fail_msg: >-
+          No netbird account found in {{ netbird_pg_container }}.
+          Bootstrap the mgmt host (and let an operator log in via OIDC) first.
+
+    - name: Set account fact
+      ansible.builtin.set_fact:
+        nb_account_id: "{{ nb_acct.stdout | trim }}"
+
+    # Auto-target: the single non-service user, ONLY when one is unambiguous.
+    - name: Auto-resolve the lone non-service user (when no explicit id given)
+      ansible.builtin.shell: >-
+        docker exec {{ netbird_pg_container }} psql -U {{ netbird_pg_user }}
+        -d {{ netbird_pg_db }} -At
+        -c "select id from users where account_id='{{ nb_account_id }}'
+            and is_service_user = false;"
+      register: nb_humans
+      changed_when: false
+      when: nb_owner_user_id | length == 0
+
+    - name: Pin the target user id (explicit wins; else the lone human)
+      ansible.builtin.set_fact:
+        nb_target_user_id: >-
+          {{ nb_owner_user_id if (nb_owner_user_id | length > 0)
+             else (nb_humans.stdout_lines | first | trim) }}
+      when: nb_owner_user_id | length > 0 or (nb_humans.stdout_lines | default([]) | length == 1)
+
+    - name: Fail loudly if the target is ambiguous or absent (no guessing)
+      ansible.builtin.assert:
+        that: nb_target_user_id is defined and (nb_target_user_id | length > 0)
+        fail_msg: >-
+          Cannot pick an owner target automatically:
+          {{ (nb_humans.stdout_lines | default([]) | length) }} non-service
+          users in account {{ nb_account_id }}. Re-run with an explicit
+          -e nb_owner_user_id=<oidc-sub> (find it in the dashboard or via
+          `select id, role, is_service_user from users where account_id=...`).
+      when: nb_owner_user_id | length == 0
+
+    - name: Verify the target exists, is a real (non-service) user, and read its role
+      ansible.builtin.shell: >-
+        docker exec {{ netbird_pg_container }} psql -U {{ netbird_pg_user }}
+        -d {{ netbird_pg_db }} -At -F'|'
+        -c "select role, is_service_user from users
+            where account_id='{{ nb_account_id }}' and id='{{ nb_target_user_id }}';"
+      register: nb_target
+      changed_when: false
+
+    - name: Fail if the target user is missing or is a service user
+      ansible.builtin.assert:
+        that:
+          - nb_target.stdout | trim | length > 0
+          - (nb_target.stdout.split('|')[1] | trim) == 'f'
+        fail_msg: >-
+          User {{ nb_target_user_id }} not found in account {{ nb_account_id }},
+          or it is a service user (service users cannot be owners). Aborting —
+          this play never INSERTs a user; let netbird create the human via OIDC
+          login first, then re-run.
+
+    - name: Promote to Owner — role column ONLY (idempotent; never touches any other column)
+      ansible.builtin.shell: >-
+        docker exec {{ netbird_pg_container }} psql -U {{ netbird_pg_user }}
+        -d {{ netbird_pg_db }} -At
+        -c "update users set role='owner'
+            where account_id='{{ nb_account_id }}' and id='{{ nb_target_user_id }}'
+            and is_service_user = false and role <> 'owner';"
+      register: nb_promote
+      changed_when: "'UPDATE 1' in nb_promote.stdout"
+
+    - name: Reload netbird management so it picks up the role change
+      ansible.builtin.command: "docker restart {{ nb_mgmt_container }}"
+      when: nb_promote.changed
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          netbird owner-promote for account {{ nb_account_id }}:
+            target user: {{ nb_target_user_id }}
+            prior role:  {{ nb_target.stdout.split('|')[0] | trim }}
+            changed:     {{ nb_promote.changed }}  (UPDATE touched the `role` column only)
+          A from-empty standup never needs this — netbird self-owns the first
+          OIDC login. This is the forked/owner-less recovery escape hatch.

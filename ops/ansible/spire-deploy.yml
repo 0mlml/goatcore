@@ -1,0 +1,45 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy SPIRE (server + agent) on a goatnet mgmt-host — Phase A.
+#
+# Requires two secrets in the environment:
+#   - <SITE>_SPIRE_DB_PASS — the spire logical-DB role password (group_vars
+#                            looks it up via env)
+#   - postgres_superuser_password — passed as `-e`, sourced from <SITE>_PG_PASS;
+#                            the role uses it to provision the spire role+DB on
+#                            postgres-a (same convention as ory-deploy.yml).
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#     -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     spire-deploy.yml -e target=<site>_hosts \
+#     -e postgres_superuser_password="$SITE_PG_PASS"
+#
+# `target` has a default for shape-parity with the other deploy playbooks; always
+# pass -e target=<site>_hosts explicitly.
+
+- name: Deploy SPIRE workload identity on a goatnet mgmt-host
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify mgmt-host base stack is up (postgres-a)
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml ps -q postgres-a
+      register: spire_pg_check
+      changed_when: false
+      failed_when: spire_pg_check.stdout == ""
+
+    - name: Copy docker-compose.spire.yml overlay to /opt/mgmt-host/
+      ansible.builtin.copy:
+        src: ../compose/mgmt-host/docker-compose.spire.yml
+        dest: /opt/mgmt-host/docker-compose.spire.yml
+        owner: root
+        group: root
+        mode: "0644"
+
+  roles:
+    - spire

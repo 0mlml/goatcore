@@ -1,0 +1,45 @@
+{{ ansible_managed | comment }}
+# rathole-client@<relay> — the mgmt host's reverse tunnel to one relay.
+#
+# This unit is the ONLY home for the client unit definition, because copies
+# drifting apart is how a fix lands on one goatnet and not the others.
+#
+# It serves both shapes. The per-relay template unit
+# (rathole-client@.service, many tunnels) takes the defaults; the single-tunnel
+# unit (rathole-client.service) overrides rathole_client_instance and
+# rathole_client_config.
+#
+# ORDERING, NOT REQUIREMENT. rathole is a static binary, not a
+# container: it does not need docker to RUN, only for the local port it
+# forwards to to be worth reaching. `Requires=docker.service` made a docker
+# failure fatal and PERMANENT — systemd abandons a unit whose Requires= is
+# unmet with "Dependency failed" and, critically, never revisits that decision
+# when the dependency recovers seconds later. A single docker failure during
+# boot would abandon every tunnel and take the host off the public internet
+# with every container healthy.
+#
+# `After=` keeps the ordering (start after docker when docker is coming up).
+# `Wants=` keeps the intent (pull docker in) WITHOUT making its failure fatal.
+# A tunnel that comes up before Traefik is not a fault: rathole holds the
+# control channel and retries the local forward per connection, so it heals
+# itself the moment Traefik is listening.
+[Unit]
+Description=Rathole Relay Client{{ rathole_client_instance | default(' — %i') }} ({{ rathole_client_label | default('goat') }})
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+# Never stop retrying. Without this, >5 restarts in 10s trips systemd's default
+# start limit and the unit stays failed until a human intervenes — the same
+# "dead and silent" end state this finding exists to prevent.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart={{ rathole_bin }} -c {{ rathole_config_dir }}/{{ rathole_client_config | default('client-%i.toml') }}
+# `always`, not `on-failure`: a rathole client that exits 0 because the relay
+# closed the control channel must still come back.
+Restart=always
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,89 @@
+---
+# mgmt-cert-sans-preview.yml — render a goatnet's Traefik mgmt router config
+# LOCALLY and print the exact Let's Encrypt anchor set it would ask for.
+#
+# Why this exists. The hostname list a mgmt cert covers is not written down
+# anywhere as a list — it is *computed* by
+# templates/traefik-acme/mgmt-dynamic.yml.j2 from the target group's
+# `public_mgmt_fqdn` + `site_id` + seven capability flags. Reading the set off
+# the template by eye is how you pre-issue a cert that is missing a SAN, and a
+# missing SAN is only discovered when Traefik decides the staged cert does not
+# cover a live router and fires a fresh ACME order — inside the standup hour,
+# which is the one place the whole pre-staging contract exists to protect.
+#
+# This play touches NOTHING remote. It renders the same template the real
+# overlay renders, against the same group_vars, on the controller, and prints
+# the `tls.domains` anchors. Use it to:
+#   - derive the argument list for a laptop-side pre-issue (lego / certbot),
+#   - diff "what the cert covers" against "what the config asks for" after any
+#     capability flag flips.
+#
+# Usage:
+#   cd ops/ansible
+#   ansible-playbook -i inventory/mgmt-hosts.ini \
+#     -e target=<site>_hosts mgmt-cert-sans-preview.yml
+#
+# Output lands in `{{ preview_out_dir }}` (default: a mktemp dir printed at the
+# end) and is also printed to stdout as one FQDN per line under each anchor.
+
+- name: Preview the mgmt LE anchor set for a goatnet
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  run_once: true
+
+  vars:
+    # PLAY VAR, not the `connection:` play keyword. Every mgmt-host group in
+    # inventory/mgmt-hosts.ini sets `ansible_connection=ssh` as a group var, and
+    # a group var outranks the play keyword — so `connection: local` here would
+    # be silently ignored and the play would try to SSH to a TBD_ sentinel. A
+    # play var outranks a group var, which is what makes this stick.
+    ansible_connection: local
+    preview_out_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/mgmt-cert-sans-preview"
+
+  tasks:
+    - name: Ensure the preview output dir exists
+      ansible.builtin.file:
+        path: "{{ preview_out_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render the mgmt Traefik dynamic config locally
+      ansible.builtin.template:
+        src: traefik-acme/mgmt-dynamic.yml.j2
+        dest: "{{ preview_out_dir }}/{{ target | mandatory }}-mgmt-dynamic.yml"
+        mode: "0644"
+
+    - name: Load the rendered config back as structured data
+      ansible.builtin.set_fact:
+        _rendered: "{{ lookup('file', preview_out_dir ~ '/' ~ (target | mandatory) ~ '-mgmt-dynamic.yml') | from_yaml }}"
+
+    # Every router that carries `tls.domains` is an ACME ANCHOR — Traefik fires
+    # exactly one order per anchor. Routers with a bare `tls.certResolver` mint
+    # nothing; they SNI-match an anchor's cert. The declare-once rule in the
+    # template header is what keeps the anchors' hostname lists disjoint.
+    - name: Collect the ACME anchors (routers declaring tls.domains)
+      ansible.builtin.set_fact:
+        _anchors: >-
+          {{ _rendered.http.routers
+             | dict2items
+             | selectattr('value.tls', 'defined')
+             | selectattr('value.tls.domains', 'defined')
+             | list }}
+
+    - name: Print each anchor's full hostname set
+      ansible.builtin.debug:
+        msg: >-
+          ANCHOR {{ item.key }} — {{ (item.value.tls.domains | map(attribute='main') | list)
+                                     + (item.value.tls.domains
+                                        | map(attribute='sans') | select('defined') | flatten | list) }}
+      loop: "{{ _anchors }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Print the flat FQDN list (one per line, pre-issue argument order)
+      ansible.builtin.debug:
+        msg: "{{ _anchors | map(attribute='value.tls.domains') | flatten | list }}"
+
+    - name: Print where the rendered config landed
+      ansible.builtin.debug:
+        msg: "Rendered config: {{ preview_out_dir }}/{{ target | mandatory }}-mgmt-dynamic.yml"

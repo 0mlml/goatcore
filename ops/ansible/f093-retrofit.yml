@@ -1,0 +1,251 @@
+---
+# f093-retrofit — migrate Docker data-root + containerd root from eMMC to NVMe.
+#
+# Use when site-bootstrap.yml Phase 0.5 fails with the F-093 closure check
+# (Docker daemon's data-root != configured docker_engine_data_root). The
+# Phase 0.5 assertion is forward-looking: it refuses to deploy onto an
+# unmigrated host, but does not perform the migration. This playbook is
+# the migration's IaC form — generalizing the manual ceremony in
+# docs/operations/docker-data-root-migration.md into a re-runnable, idempotent
+# operator action.
+#
+# When to run:
+#   - On any mgmt-host where docker_engine_data_root is set but the running
+#     daemon is still on /var/lib/docker.
+#   - On any host that comes back from a long power-off whose substrate
+#     pre-dates ba47f494.
+#
+# Two modes (controlled by `f093_mode`):
+#   - fresh (default): rename /var/lib/{docker,containerd} → .bak-pre-retrofit-<date>
+#     and write fresh daemon.json + config.toml. Site-bootstrap will pull
+#     images fresh. Safe when no running compose stack OR existing data is stale
+#     (e.g. Spock slot already invalidated by max_slot_wal_keep_size cap).
+#   - migrate: rsync /var/lib/{docker,containerd} → /opt/docker-data/{docker,containerd}
+#     and rename the originals. Preserves existing image layers + volumes.
+#     Slower (~25 min for 40 GB on eMMC IO); follows the full doc procedure.
+#
+# Idempotent: if Docker Root Dir is already on the configured NVMe path,
+# exits cleanly with no action (via meta: end_host).
+#
+# Reference: docs/operations/docker-data-root-migration.md
+# Closes: F-093 (Docker data-root default + Spock unbounded WAL — Docker half)
+#
+# Operator usage:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ansible-playbook -i inventory/mgmt-hosts.ini f093-retrofit.yml \
+#       -e site_id=prov-conus -e f093_mode=fresh
+#
+# After this runs successfully, run site-bootstrap.yml normally:
+#   ansible-playbook ... site-bootstrap.yml -e site_id=prov-conus
+
+- name: "f093-retrofit: Docker data-root + containerd root → NVMe"
+  hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
+  gather_facts: true
+  become: true
+  vars:
+    f093_mode: "fresh"
+    f093_bak_suffix: "bak-pre-retrofit-{{ ansible_date_time.date }}"
+    # These default to the production NVMe layout from
+    # group_vars/{vega,prov_fra,prov_jdn,prov_conus}_hosts/vars.yml. If
+    # a site uses a different path, set docker_engine_data_root and
+    # docker_engine_containerd_root in that site's group_vars before running.
+    _docker_root: "{{ docker_engine_data_root | default('/opt/docker-data/docker') }}"
+    _containerd_root: "{{ docker_engine_containerd_root | default('/opt/docker-data/containerd') }}"
+  tasks:
+    - name: f093-retrofit | mode is valid
+      ansible.builtin.assert:
+        that: f093_mode in ['fresh', 'migrate']
+        fail_msg: "f093_mode must be 'fresh' or 'migrate' (got '{{ f093_mode }}')"
+
+    - name: f093-retrofit | /opt/docker-data is mounted (NVMe per os-baseline-and-luks.md)
+      ansible.builtin.command: findmnt -n /opt/docker-data
+      register: nvme_mount_check
+      changed_when: false
+      failed_when: nvme_mount_check.rc != 0
+
+    - name: f093-retrofit | read current Docker Root Dir
+      ansible.builtin.command: docker info --format '{% raw %}{{.DockerRootDir}}{% endraw %}'
+      register: docker_root_pre
+      changed_when: false
+      check_mode: false
+
+    - name: f093-retrofit | idempotent skip — host already migrated
+      ansible.builtin.meta: end_host
+      when: docker_root_pre.stdout | trim == _docker_root
+
+    - name: f093-retrofit | probe pre-state (du / df)
+      ansible.builtin.shell:
+        cmd: |
+          echo "host:                  $(hostname)"
+          echo "docker_root_current:   {{ docker_root_pre.stdout | trim }}"
+          echo "docker_root_target:    {{ _docker_root }}"
+          echo "containerd_root_target:{{ _containerd_root }}"
+          echo "mode:                  {{ f093_mode }}"
+          echo "var_lib_docker_size:   $(du -sh /var/lib/docker 2>/dev/null | awk '{print $1}')"
+          echo "var_lib_ctd_size:      $(du -sh /var/lib/containerd 2>/dev/null | awk '{print $1}')"
+          echo "nvme_free:             $(df -h /opt/docker-data | tail -1 | awk '{print $4}')"
+        executable: /bin/bash
+      register: pre_probe
+      changed_when: false
+
+    - name: f093-retrofit | summary
+      ansible.builtin.debug:
+        msg: "{{ pre_probe.stdout_lines }}"
+
+    - name: f093-retrofit | stop mgmt-host-compose-watch.service (if running)
+      ansible.builtin.systemd:
+        name: mgmt-host-compose-watch.service
+        state: stopped
+      failed_when: false
+
+    - name: f093-retrofit | stop docker.socket + docker.service + containerd
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - docker.socket
+        - docker.service
+        - containerd
+      failed_when: false
+
+    # ---- mode: fresh — rename only, no rsync ----
+    - name: f093-retrofit | fresh-mode block (rename /var/lib/{docker,containerd} → .bak)
+      when: f093_mode == "fresh"
+      block:
+        - name: f093-retrofit | rename /var/lib/docker → .bak (idempotent)
+          ansible.builtin.command:
+            cmd: "mv /var/lib/docker /var/lib/docker.{{ f093_bak_suffix }}"
+            creates: "/var/lib/docker.{{ f093_bak_suffix }}"
+            removes: "/var/lib/docker"
+
+        - name: f093-retrofit | rename /var/lib/containerd → .bak (idempotent)
+          ansible.builtin.command:
+            cmd: "mv /var/lib/containerd /var/lib/containerd.{{ f093_bak_suffix }}"
+            creates: "/var/lib/containerd.{{ f093_bak_suffix }}"
+            removes: "/var/lib/containerd"
+
+    # ---- mode: migrate — full rsync per docs/operations/docker-data-root-migration.md ----
+    - name: f093-retrofit | migrate-mode block (rsync /var/lib → /opt/docker-data, then rename)
+      when: f093_mode == "migrate"
+      block:
+        - name: f093-retrofit | ensure NVMe target dirs exist
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+          loop:
+            - "{{ _docker_root }}"
+            - "{{ _containerd_root }}"
+
+        - name: f093-retrofit | rsync /var/lib/docker → {{ _docker_root }}
+          ansible.builtin.command:
+            cmd: "rsync -aHAX /var/lib/docker/ {{ _docker_root }}/"
+          # rsync -aHAX preserves perms / hardlinks / ACLs / xattrs — all
+          # critical for Docker overlay2 (heavy hardlinking) and containerd
+          # snapshots (xattr-stored metadata). Without -H, layer dedup is lost
+          # and the destination balloons.
+
+        - name: f093-retrofit | rsync /var/lib/containerd → {{ _containerd_root }}
+          ansible.builtin.command:
+            cmd: "rsync -aHAX /var/lib/containerd/ {{ _containerd_root }}/"
+
+        - name: f093-retrofit | rename /var/lib/docker → .bak (post-rsync)
+          ansible.builtin.command:
+            cmd: "mv /var/lib/docker /var/lib/docker.{{ f093_bak_suffix }}"
+            creates: "/var/lib/docker.{{ f093_bak_suffix }}"
+            removes: "/var/lib/docker"
+
+        - name: f093-retrofit | rename /var/lib/containerd → .bak (post-rsync)
+          ansible.builtin.command:
+            cmd: "mv /var/lib/containerd /var/lib/containerd.{{ f093_bak_suffix }}"
+            creates: "/var/lib/containerd.{{ f093_bak_suffix }}"
+            removes: "/var/lib/containerd"
+
+    # ---- common: write configs + restart ----
+    - name: f093-retrofit | ensure config + NVMe dirs exist
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "/etc/docker", mode: "0755" }
+        - { path: "/etc/containerd", mode: "0755" }
+        - { path: "{{ _docker_root }}", mode: "0711" }
+        - { path: "{{ _containerd_root }}", mode: "0755" }
+
+    - name: f093-retrofit | write /etc/docker/daemon.json
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "data-root": "{{ _docker_root }}",
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+
+    - name: f093-retrofit | validate daemon.json
+      ansible.builtin.command: jq . /etc/docker/daemon.json
+      changed_when: false
+
+    - name: f093-retrofit | write /etc/containerd/config.toml
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by ops/ansible/f093-retrofit.yml — do not hand-edit.
+          # Matches the render in ops/ansible/roles/docker-engine/tasks/main.yml.
+          version = 2
+          root = "{{ _containerd_root }}"
+          state = "/run/containerd"
+
+    - name: f093-retrofit | reset failed units before restart
+      ansible.builtin.command:
+        cmd: "systemctl reset-failed {{ item }}"
+      loop:
+        - containerd
+        - docker.socket
+        - docker.service
+      changed_when: false
+      failed_when: false
+
+    - name: f093-retrofit | start containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: started
+
+    - name: f093-retrofit | start docker
+      ansible.builtin.systemd:
+        name: docker.service
+        state: started
+
+    - name: f093-retrofit | verify Docker Root Dir now on NVMe (retry while dockerd warms)
+      ansible.builtin.command: docker info --format '{% raw %}{{.DockerRootDir}}{% endraw %}'
+      register: docker_root_post
+      changed_when: false
+      retries: 10
+      delay: 2
+      until: docker_root_post.stdout | trim == _docker_root
+
+    - name: f093-retrofit | post-state summary
+      ansible.builtin.debug:
+        msg: |
+          F-093 retrofit complete on {{ inventory_hostname }}:
+            Mode:                  {{ f093_mode }}
+            Docker Root Dir (was): {{ docker_root_pre.stdout | trim }}
+            Docker Root Dir (now): {{ docker_root_post.stdout | trim }}
+            containerd root:       {{ _containerd_root }}
+            Bak directories:       /var/lib/{docker,containerd}.{{ f093_bak_suffix }}
+            Disk usage:            see Phase 0 probe above
+
+          Next step:
+            ansible-playbook -i inventory/mgmt-hosts.ini site-bootstrap.yml -e site_id={{ site_id }}
+
+          Bak directory cleanup (after 24h-stable):
+            sudo rm -rf /var/lib/{docker,containerd}.{{ f093_bak_suffix }}

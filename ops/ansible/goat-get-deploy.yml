@@ -1,0 +1,48 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Operator-fired playbook to bring up the goat-cli download surface
+# (`get.<site>.<zone>`) on a goatnet host. Target a
+# specific goatnet with `-e target=<group>`.
+# nginx:alpine re-serves the signed goat-cli release binaries
+# (linux/darwin × amd64/arm64 + windows/amd64) mesh-internally so on-mesh
+# vendors can install `goat` without reaching the private goat-maintainer GitHub
+# release page.
+# Pure Ansible — no out-of-band scripts. Cloudflare DNS publishing matches
+# the brief/panoscope pattern.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN \
+#     GOAT_CLI_RELEASE_TOKEN=$GOAT_CLI_RELEASE_TOKEN \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     -l <mgmt-host> goat-get-deploy.yml
+#
+# Pre-flight (operator-side):
+#   1. goat-cli release `goat_get_release_tag` exists on
+#      usareur-af/goatcore with the goat-<os>-<arch> + SHA256SUMS
+#      assets (built by .github/workflows/goat-cli-release.yml).
+#   2. GOAT_CLI_RELEASE_TOKEN (or GH_TOKEN) env var exported with
+#      contents:read on the repo so the host can pull the assets.
+#   3. CLOUDFLARE_API_TOKEN env var exported when
+#      goat_get_publish_cloudflare_dns is true in group_vars.
+#   4. get.<site>.<site_dns_zone> is in that goatnet's LE SAN list — flip
+#      `goat_get_enabled: true` in group_vars/<goatnet>_hosts/vars.yml and
+#      re-run the site traefik-acme play BEFORE this playbook so the cert is
+#      minted and Traefik can serve it.
+#
+# Cross-refs:
+# - docs/design/goat-cli-mesh-download.md
+# - docs/operations/goat-cli-install.md (§Mesh download)
+
+- name: goat-get | deploy
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  # NOTE: no play-var cloudflare_api_token here — it would SHADOW the per-site
+  # group_vars token (each site sets it to CLOUDFLARE_API_TOKEN_<SITE>). Same
+  # play-var-shadows-group_var class as the panoscope CF token + the postgres
+  # pin. The role reads the group_var; -e overrides at the CLI.
+  roles:
+    - goat-get

@@ -1,0 +1,35 @@
+# Resolve WHICH HOSTS an operator's SSH key may be installed on, from the roles
+# they hold. Included by every path that installs a key, so the answer is
+# computed in exactly one place.
+#
+# Two callers today — operator-tier-onboard.yml (key carried on the manifest)
+# and operator-ssh-key-install.yml (key approved in the console). If each
+# resolved scope for itself they would drift, and the drift would be silent:
+# one path would grant a shell the other would not, and nobody would notice
+# until an offboarding missed a host.
+#
+# Contract
+#   in   op_ssh_groups   list of the operator's role/group names (any case)
+#   out  op_ssh_targets  list of { ssh_host, ssh_user } to install on
+#        op_ssh_scope_names  the scope names that matched, for messages
+#
+# Goatnets that have not declared `operator_ssh_scopes` fall back to the flat
+# `operator_ssh_hosts` list, so environments predating scopes are unchanged.
+
+- name: "scope — match the operator's roles to declared scopes"
+  ansible.builtin.set_fact:
+    op_ssh_scope_names: >-
+      {{ (operator_ssh_role_scopes | default({}) | dict2items
+          | selectattr('key', 'in', op_ssh_groups | default([]) | map('upper') | list)
+          | map(attribute='value') | list | flatten | unique) }}
+  when: (operator_ssh_scopes | default({})) | length > 0
+
+- name: "scope — expand those scopes to concrete hosts"
+  ansible.builtin.set_fact:
+    op_ssh_targets: >-
+      {{ ((operator_ssh_scopes | default({})) | length > 0)
+         | ternary(
+             (op_ssh_scope_names | default([]))
+               | map('extract', operator_ssh_scopes | default({}))
+               | list | flatten | unique,
+             operator_ssh_hosts | default([])) }}

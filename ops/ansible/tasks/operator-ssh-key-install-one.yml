@@ -1,0 +1,243 @@
+# Install ONE approved key. Included per row by operator-ssh-key-install.yml.
+#
+# The order matters: resolve scope, refuse if it is empty, install, and only
+# then tell the console it is installed. Marking first and installing second
+# would leave the console asserting a shell that does not exist if any host is
+# unreachable — the precise lie this track exists to stop telling.
+
+# set_fact persists across loop iterations. Clear the previous row's answer
+# FIRST so that if anything below skips, this key cannot inherit the last
+# person's host list and be installed somewhere it was never scoped for.
+- name: "S4.-1 — clear the previous row's resolved scope"
+  ansible.builtin.set_fact:
+    op_ssh_targets: []
+    op_ssh_scope_names: []
+    # Row env gate. The installer must never place a key on hosts outside its
+    # recorded env — but a bad row must not abort the run either: earlier rows
+    # have already acted by the time a loop assert fires, and one cross-goatnet
+    # or legacy empty-env row (CLI submits could omit --env) bricking the whole
+    # queue is worse than skipping it loudly (same principle as S4.1 below).
+    # `default('')` also covers the field being absent: the console omits empty
+    # fields from the JSON (omitempty). `trim` matches the console's own
+    # TrimSpace-based comparisons: submits are trimmed at the boundary now,
+    # but a row minted before that would otherwise count toward the panel's
+    # queue depth yet never drain here.
+    op_row_env_ok: "{{ (key_row.env | default('') | trim) == onboard_env }}"
+
+- name: "S4.-0 — skip a cross-goatnet row"
+  ansible.builtin.debug:
+    msg: >-
+      SKIPPING {{ key_row.handle }} ({{ key_row.fingerprint }}): recorded for
+      goatnet '{{ key_row.env | default('') }}' but this run targets
+      {{ onboard_env }}. A key never installs outside its recorded env. The key
+      stays `approved`; fix the row's env (or run the installer for its
+      goatnet), then re-run.
+  when: not (op_row_env_ok | bool)
+
+- name: "S4.-0b — report the cross-goatnet skip to the console (best-effort)"
+  ansible.builtin.uri:
+    url: "{{ onboard_api_base }}/api/onboard/ssh-keys/{{ key_row.id }}/skip-report"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ onboard_api_key }}"
+    body_format: json
+    body:
+      reason: "env_mismatch"
+      env: "{{ onboard_env }}"
+      groups: []
+    status_code: [200, 409]
+  register: skip_report_env_mismatch
+  failed_when: false
+  no_log: true
+  when:
+    - not (op_row_env_ok | bool)
+    - not ssh_key_install_check | bool
+
+- name: "S4.-0c — warn when skip-report failed"
+  ansible.builtin.debug:
+    msg: >-
+      FAILED reporting skip for {{ key_row.handle }} ({{ key_row.fingerprint }}) to
+      {{ onboard_api_base }}: HTTP {{ skip_report_env_mismatch.status | default('n/a') }}.
+      The terminal skip message above remains the fallback signal.
+  when:
+    - not (op_row_env_ok | bool)
+    - not ssh_key_install_check | bool
+    - skip_report_env_mismatch.status is defined
+    - skip_report_env_mismatch.status != 200
+    - skip_report_env_mismatch.status != 409
+
+- name: "S4.0 — read the operator's manifest (roles live there, not on the key row)"
+  ansible.builtin.slurp:
+    src: "{{ operator_manifest_root }}/{{ onboard_env }}/{{ key_row.handle }}.yml"
+  register: op_manifest_raw
+  failed_when: false
+  when: op_row_env_ok | bool
+
+# A key approved for someone with no manifest cannot be scoped, and guessing a
+# scope is how you hand out the wrong shell. Skip loudly and move on rather
+# than failing the whole run — one unresolvable row must not block the others.
+- name: "S4.1 — skip a key whose operator has no manifest"
+  ansible.builtin.debug:
+    msg: >-
+      SKIPPING {{ key_row.handle }} ({{ key_row.fingerprint }}): no manifest at
+      {{ operator_manifest_root }}/{{ onboard_env }}/{{ key_row.handle }}.yml, so their
+      roles are unknown and the install scope cannot be resolved. Finish their
+      onboarding, then re-run. The key stays `approved` and will be picked up next time.
+  when:
+    # env gate first: a cross-goatnet row skips S4.0, which also leaves
+    # `content` undefined — without this guard it would misreport as no_manifest.
+    - op_row_env_ok | bool
+    - op_manifest_raw.content is not defined
+
+- name: "S4.1b — report the skip to the console (best-effort)"
+  ansible.builtin.uri:
+    url: "{{ onboard_api_base }}/api/onboard/ssh-keys/{{ key_row.id }}/skip-report"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ onboard_api_key }}"
+    body_format: json
+    body:
+      reason: "no_manifest"
+      env: "{{ onboard_env }}"
+      groups: []
+    status_code: [200, 409]
+  register: skip_report_no_manifest
+  failed_when: false
+  no_log: true
+  when:
+    - op_row_env_ok | bool
+    - op_manifest_raw.content is not defined
+    - not ssh_key_install_check | bool
+
+- name: "S4.1c — warn when skip-report failed"
+  ansible.builtin.debug:
+    msg: >-
+      FAILED reporting skip for {{ key_row.handle }} ({{ key_row.fingerprint }}) to
+      {{ onboard_api_base }}: HTTP {{ skip_report_no_manifest.status | default('n/a') }}.
+      The terminal skip message above remains the fallback signal.
+  when:
+    - op_row_env_ok | bool
+    - op_manifest_raw.content is not defined
+    - not ssh_key_install_check | bool
+    - skip_report_no_manifest.status is defined
+    - skip_report_no_manifest.status != 200
+    - skip_report_no_manifest.status != 409
+
+- name: "S4.2 — resolve the role-scoped blast radius"
+  when: op_manifest_raw.content is defined
+  block:
+    - name: "S4.2a — parse the manifest"
+      ansible.builtin.set_fact:
+        op_manifest: "{{ op_manifest_raw.content | b64decode | from_yaml }}"
+
+    - name: "S4.2b — roles to scopes to hosts (shared with operator-tier-onboard)"
+      ansible.builtin.include_tasks: operator-ssh-scope.yml
+      vars:
+        op_ssh_groups: "{{ op_manifest.operator.groups | default([]) }}"
+
+    - name: "S4.2c — skip a key that would land nowhere"
+      ansible.builtin.debug:
+        msg: >-
+          SKIPPING {{ key_row.handle }} ({{ key_row.fingerprint }}): their roles
+          ({{ op_manifest.operator.groups | default([]) | join(', ') | default('none', true) }})
+          resolve to no host on {{ onboard_env }}. Either the role is missing from
+          operator_ssh_role_scopes, or every scope it maps to is empty — e.g. no
+          NETWORK-class gear is enrolled yet. The key stays `approved`; it is NOT
+          marked installed, because it is not.
+      when: (op_ssh_targets | default([])) | length == 0
+
+    - name: "S4.2d — report the no-scope skip to the console (best-effort)"
+      ansible.builtin.uri:
+        url: "{{ onboard_api_base }}/api/onboard/ssh-keys/{{ key_row.id }}/skip-report"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ onboard_api_key }}"
+        body_format: json
+        body:
+          reason: "no_scope"
+          env: "{{ onboard_env }}"
+          groups: "{{ op_manifest.operator.groups | default([]) }}"
+        status_code: [200, 409]
+      register: skip_report_no_scope
+      failed_when: false
+      no_log: true
+      when:
+        - (op_ssh_targets | default([])) | length == 0
+        - not ssh_key_install_check | bool
+
+    - name: "S4.2e — warn when skip-report failed"
+      ansible.builtin.debug:
+        msg: >-
+          FAILED reporting skip for {{ key_row.handle }} ({{ key_row.fingerprint }}) to
+          {{ onboard_api_base }}: HTTP {{ skip_report_no_scope.status | default('n/a') }}.
+          The terminal skip message above remains the fallback signal.
+      when:
+        - (op_ssh_targets | default([])) | length == 0
+        - not ssh_key_install_check | bool
+        - skip_report_no_scope.status is defined
+        - skip_report_no_scope.status != 200
+        - skip_report_no_scope.status != 409
+
+    - name: "S4.3 — install on the in-scope hosts"
+      when:
+        - (op_ssh_targets | default([])) | length > 0
+        - not ssh_key_install_check | bool
+      block:
+        - name: "S4.3a — add_host for each in-scope target"
+          ansible.builtin.add_host:
+            name: "sshkey-target-{{ item.ssh_host }}"
+            ansible_host: "{{ item.ssh_host }}"
+            ansible_user: "{{ item.ssh_user }}"
+            ansible_connection: ssh
+            groups: sshkey_targets
+          changed_when: false
+          loop: "{{ op_ssh_targets }}"
+          loop_control:
+            label: "{{ item.ssh_user }}@{{ item.ssh_host }}"
+
+        # Same lineinfile shape as operator-tier-onboard.yml O2.1 — deliberately
+        # the same write, so a key installed by either path looks identical and
+        # the revoke cut (operator-onboard.yml R1.6) removes both the same way.
+        - name: "S4.3b — write the key to authorized_keys"
+          ansible.builtin.lineinfile:
+            path: "~{{ item.ssh_user }}/.ssh/authorized_keys"
+            # `default('')` INSIDE the ternary branch too: ternary evaluates
+            # both branches eagerly, and the console omits empty fields from
+            # its JSON, so a guarded-but-bare `key_row.comment` still crashes
+            # on comment-less rows.
+            line: "{{ key_row.key_type }} {{ key_row.key_body }}{{ (key_row.comment | default('') | length > 0) | ternary(' ' ~ (key_row.comment | default('')), '') }}"
+            state: present
+            create: true
+            mode: "0600"
+          delegate_to: "sshkey-target-{{ item.ssh_host }}"
+          loop: "{{ op_ssh_targets }}"
+          loop_control:
+            label: "{{ item.ssh_user }}@{{ item.ssh_host }}"
+          register: key_written
+
+        # Only now. Every host above succeeded, so `installed` is a fact.
+        - name: "S4.3c — tell the console it is installed"
+          ansible.builtin.uri:
+            url: "{{ onboard_api_base }}/api/onboard/ssh-keys/{{ key_row.id }}/installed"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ onboard_api_key }}"
+            status_code: [200, 409]
+          register: mark_done
+          no_log: true
+
+        - name: "S4.3d — say where it landed"
+          ansible.builtin.debug:
+            msg: >-
+              INSTALLED {{ key_row.handle }} ({{ key_row.fingerprint }}) on
+              {{ op_ssh_targets | map(attribute='ssh_host') | join(', ') }}
+              {{ (mark_done.status == 409) | ternary('— console already had it marked installed', '— console updated') }}
+
+    - name: "S4.4 — check mode: say what WOULD happen, change nothing"
+      ansible.builtin.debug:
+        msg: >-
+          WOULD INSTALL {{ key_row.handle }} ({{ key_row.fingerprint }}) on
+          {{ op_ssh_targets | map(attribute='ssh_host') | join(', ') }}{{ (key_row.skip_reason | default('') | length > 0) | ternary(' [Standing skip annotation: ' ~ (key_row.skip_reason | default('')) ~ ']', '') }}
+      when:
+        - (op_ssh_targets | default([])) | length > 0
+        - ssh_key_install_check | bool

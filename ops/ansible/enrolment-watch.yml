@@ -1,0 +1,46 @@
+---
+# Deploy the netbird enrolment watch to a goatnet's mgmt host.
+# Contract: docs/design/live-state-guard-scheduling.md §4.
+#
+# WHAT IT WATCHES. The management server's own auth stream, for a device that
+# cannot enrol and keeps trying. One WireGuard key can retry every few seconds
+# for longer than logs are kept, never once succeeding, and nothing else
+# aggregates the stream.
+#
+# WHY A GUARD AND NOT A RATE LIMIT. Every failing client found so far has been
+# OURS: a stale setup key, a monitoring probe hitting an authenticated endpoint
+# without credentials. Blocking them would silence the symptom, leave the device
+# permanently unenrolled, and destroy the evidence — the same shape as F-428 and
+# the pgBackRest deferral, where a real signal sat unread for months. The job is
+# attribution, not suppression.
+#
+# Its OWN play, deliberately not folded into <env>-refresh.yml: the role refuses
+# to install without a declared textfile directory, so riding an unrelated
+# refresh would turn "I bumped a pin" into a failed play on every goatnet that
+# has not set one.
+#
+# Run over the env door (ADR 1117 — never flip the netbird profile):
+#   ops/scripts/env-door.sh <site>
+#   cd ops/ansible && OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#     -i inventory/mgmt-hosts.ini -i inventory/doors-groupvars.ini \
+#     enrolment-watch.yml -e target=<site>_hosts
+#
+# The first run happens inline with you watching. The play FAILS on exit 2 — a
+# guard that cannot read its source must not be installed quietly, because a
+# silent 2 is indistinguishable from "all fine". It does NOT fail on exit 1: a
+# stuck peer is the condition the timer exists to report.
+#
+# KNOWN GAP, stated here so nobody rediscovers it under pressure. This names the
+# offending WireGuard key and cannot name the DEVICE. The management server
+# records no name, no address and no peers row for a peer that never enrols, and
+# the gRPC arrives through Traefik, which may have no access log configured,
+# in which case the client address is not recorded anywhere on the path. Enabling Traefik
+# access logging is the missing half of attribution and is not done here.
+- name: netbird enrolment watch — scheduled, per goatnet
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - enrolment-watch

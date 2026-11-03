@@ -1,0 +1,43 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-logship off-box cyber-logging collector (Vector) — ADR 1078
+# Phase 1. Collects host/OS + fabric security events, normalizes to OCSF, and
+# ships them off the Thor to Object-Lock S3, retaining near-zero locally.
+# ZAGROS first (sandbox), per the standard cutover discipline.
+#
+# Run from any laptop on the netbird mesh:
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ansible-playbook \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       goat-logship-deploy.yml -e target=zagros_hosts
+#
+# Pre-flight (operator-side, one-time per fresh deploy):
+#   1. The dedicated Object-Lock bucket exists in the usareur-af account
+#      (terraform-govcloud/cyber-logging-s3.tf applied — GovCloud). Confirm the name matches
+#      logship_s3_bucket.
+#   2. An ingest-only access key for the goat-logship-ingest IAM user is
+#      minted and exported (never committed):
+#        LOGSHIP_S3_ACCESS_KEY_ID / LOGSHIP_S3_SECRET_ACCESS_KEY
+#   3. The goat-obs stack is up (obs.yml has run) so the absence-alarm scrape
+#      job + rules/goat-logship.yml are live — otherwise a silent collector is
+#      exactly the F-169 blind spot this closes.
+#
+# Sink 2 (external-collector CEF egress) stays DEFAULT-OFF. Enable only against a named,
+# confirmed collector endpoint by setting logship_sink_collector_enabled +
+# logship_collector_endpoint in the target group_vars (ADR 1078 §10).
+#
+# Re-probe after deploy (ADR 1078 §6 — "resolved" = deployed + re-probed live):
+#   - Objects land under s3://<bucket>/ocsf/date=.../host=.../class=... off-box.
+#   - The Thor holds only the disk buffer (near-zero local retention).
+#   - Stopping the collector fires GoatLogshipStreamSilent within ~15m.
+
+- name: deploy goat-logship off-box cyber-logging collector
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: goat-logship

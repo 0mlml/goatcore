@@ -1,0 +1,50 @@
+---
+# relay-health-deploy.yml — mesh-internal, Ory-admin-gated relay-fleet
+# health dashboard. Static nginx + host prober timer (fast probes,
+# credential-free) + oauth2-proxy admin gate (mirror oauth2-proxy-id-console
+# / ADR 0860).
+#
+# Required group_vars (group_vars/<site>_hosts/vars.yml):
+#   site_id, public_mgmt_fqdn, mesh_ip_a
+#   relay_health_enabled: true
+#   relay_health_oauth2_proxy_client_secret    env-sourced; 32+ chars
+#   relay_health_oauth2_proxy_cookie_secret    env-sourced; 16/24/32 bytes b64
+#   relay_health_oauth2_proxy_allowed_groups   admin group
+#
+# Pre-flight (operator-fired BEFORE this playbook):
+#   1. Ory + Hydra up on the management host (ory-deploy.yml ran).
+#   2. ADR 0857 patched consent UI (JWT `groups` claim).
+#   3. Generate secrets on first deploy + store in the gitignored env file
+#      (30-site-services.envrc):
+#        export <SITE>_RELAY_HEALTH_OAUTH2_PROXY_CLIENT_SECRET=$(openssl rand -hex 32)
+#        # cookie_secret MUST be exactly 16/24/32 BYTES. `openssl rand -base64 32`
+#        # yields a 44-CHAR string that oauth2-proxy counts as 44 bytes → crash-loop
+#        # ("cookie_secret must be 16, 24, or 32 bytes"). Use a 32-char value:
+#        export <SITE>_RELAY_HEALTH_OAUTH2_PROXY_COOKIE_SECRET=$(openssl rand -hex 16)
+#   4. Re-apply traefik-acme.yml AFTER this playbook so the relay-health
+#      router + mesh-only-cert SAN land (gated on relay_health_enabled).
+#
+# Apply:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/hosts-<site>.ini -i inventory/mgmt-hosts-<site>-mesh.ini \
+#       -e target=<site>_hosts relay-health-deploy.yml
+#   # then re-apply Traefik so the router + SAN land:
+#   ... -e public_mgmt_fqdn=<public-mgmt-fqdn> traefik-acme.yml
+#
+# Cross-refs: docs/design/relay-health-dashboard.md,
+#   ops/relay/health/ (the prober + dashboard), ADR 0860 (gate pattern).
+
+- name: Deploy relay-health dashboard (static serve + prober + admin gate)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true   # role ledger-append uses ansible_date_time.iso8601
+
+  pre_tasks:
+    - name: Verify Ory Hydra admin reachable on loopback
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ operator_idp_hydra_admin_host_port | default(hydra_admin_host_port | default(4445)) }}/health/ready"
+        status_code: [200]
+
+  roles:
+    - role: relay-health

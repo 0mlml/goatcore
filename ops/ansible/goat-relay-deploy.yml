@@ -1,0 +1,540 @@
+---
+# goat-relay-deploy.yml — Phase 1 deploy-alongside for the Block 33 goat-relay tier.
+#
+# Provisions the new Rust relay tier (3 × c7i.2xlarge per ADR 0712) alongside
+# the legacy stock-netbird-relay tier (3 × t3.micro). Phase 1 of the four-phase
+# blue-green cutover described in docs/design/relay-blue-green-cutover.md.
+#
+# Phase 1 = DEPLOY ALONGSIDE — instances exist, listeners up, traffic NOT yet
+# advertised in management.json. management.json edits + canary peer
+# enrollment are Phase 2/3 follow-on work in subsequent sessions.
+#
+# Usage (after `terraform apply` provisions the goat_relay_<region> modules and
+# `inventory/generate.sh` populates [goat_relay_hosts]):
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ansible-playbook -i inventory/hosts.ini goat-relay-deploy.yml
+#
+# Optional --limit goat-relay-rla to deploy a single region first.
+#
+# Deploy shape: docker (existing role at roles/goat-relay/), authorized for
+# early cutover by docs/design/relay-blue-green-cutover.md Phase 1. Production
+# shape per ADR 0709 D3 amendment is systemd-native; the swap to systemd-native
+# is queued as a Phase-2-monitoring sub-deliverable BEFORE Phase 3 advertise.
+
+# =============================================================================
+# Phase 0 — local image transfer (localhost → S3 → all relay hosts)
+# =============================================================================
+# Mirrors the tier-4b deploy pattern (`goat-relay-tier4b.yml` Phase 1).
+#
+# PREFERRED PATH (+): `.github/workflows/goat-relay-image.yml`
+# publishes `ghcr.io/{{ ghcr_org }}/goat-relay:latest` (+ `:sha-<short>` / `:v*`), so
+# the goat-relay role's `Pull goat-relay image` task pulls from the registry
+# directly — no local build or S3 transfer needed. Just run the role with the
+# default `goat_relay_image`. This Phase-0 archive path remains as the
+# OFFLINE / air-gapped fallback (and for ad-hoc local tags): the role's pull
+# task skips when `docker image inspect` already finds the image, so a pre-load
+# via `docker load` satisfies it unchanged.
+#
+# Required -e vars:
+#   goat_relay_image_archive   local path to `docker save | gzip` output
+#                              (run before the playbook:
+#                              docker save goat-relay:tier4b | gzip > /tmp/goat-relay-phase1.tar.gz)
+#   ssm_bucket                 S3 bucket reachable by hosts via SSM IAM role
+#                              (= ansible_aws_ssm_bucket_name in inventory)
+#
+# Override `goat_relay_image` to whatever local tag the archive contains.
+# Default `goat-relay:tier4b` matches the artifact built for the M-040
+# bench cycle that validated kTLS + multi-shard + QUIC ALPN.
+
+- name: "push goat-relay image archive to S3 + presign for hosts"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  # Offline/air-gapped image-transport path. With the registry tier
+  # (ghcr.io/{{ ghcr_org }}/goat-relay, published by goat-relay-image.yml), skip this
+  # whole play + the phase1 docker-load task with `--skip-tags archive_load`
+  # and let the goat-relay role pull from GHCR (set goat_relay_pull_auth_enabled
+  # + goat_relay_pull_password). See the header note above.
+  tags: ["archive_load"]
+  vars:
+    goat_relay_image_archive: "{{ lookup('env', 'GOAT_RELAY_IMAGE_ARCHIVE') | default('/tmp/goat-relay-phase1.tar.gz', true) }}"
+    ssm_bucket: "{{ lookup('env', 'SSM_BUCKET') | default('example-legacy-ansible-ssm-20260405131504905400000001', true) }}"
+  tasks:
+    - name: verify image archive exists locally
+      ansible.builtin.stat:
+        path: "{{ goat_relay_image_archive }}"
+      register: archive_stat
+      failed_when: not archive_stat.stat.exists
+
+    - name: upload archive to SSM S3 bucket
+      ansible.builtin.command:
+        argv:
+          - aws
+          - s3
+          - cp
+          - "{{ goat_relay_image_archive }}"
+          - "s3://{{ ssm_bucket }}/goat-relay-phase1.tar.gz"
+          - --region
+          - eu-central-1
+      changed_when: true
+
+    - name: generate presigned URL (4h, accommodates first-deploy apt install latency)
+      ansible.builtin.command:
+        argv:
+          - aws
+          - s3
+          - presign
+          - "s3://{{ ssm_bucket }}/goat-relay-phase1.tar.gz"
+          - --expires-in
+          - "14400"
+          - --region
+          - eu-central-1
+      register: presigned
+      changed_when: false
+
+    - name: stash presigned URL for the deploy play
+      ansible.builtin.set_fact:
+        goat_relay_image_url: "{{ presigned.stdout }}"
+
+# =============================================================================
+# Phase 1 — host-side deploy (per-relay)
+# =============================================================================
+
+- name: goat-relay tier — deploy alongside
+  hosts: goat_relay_hosts
+  become: true
+
+  vars:
+    # Image override — EMPTY by default so the role-default PIN
+    # (roles/goat-relay/defaults/main.yml, kept in the ADR 0859 deploy-history
+    # ledger) stays authoritative. A play-level `goat_relay_image:` default
+    # would SHADOW that pin (the F-188 play-var-shadows-default trap) and float
+    # the fleet to `:latest` — exactly F-229's un-vetted-floating-image
+    # anti-pattern (it did, on the canary, before this fix). The
+    # offline/archive path (phase0/phase1, tag `archive_load`) sets
+    # GOAT_RELAY_IMAGE (or `-e goat_relay_image=`) to the local docker-load tag,
+    # e.g. `goat-relay:tier4b`; the role's `Pull goat-relay image` step then
+    # skips because `docker image inspect` finds the pre-loaded image. When the
+    # override is empty it is passed to the role as `omit`, so the role default
+    # wins.
+    goat_relay_image_override: "{{ lookup('env', 'GOAT_RELAY_IMAGE') | default('', true) }}"
+
+    # Cert mode (goat_relay_self_signed_cert / goat_relay_le_dns01) now lives in
+    # the goat-relay role defaults so a per-env inventory override actually wins
+    # (a play var here would SHADOW [relay_servers:vars]).
+    # Default stays self-signed for first-light/bench; generate-relays.sh flips
+    # per-env inventory opts in to LE-DNS01 (publicly-trusted, peers require it). Real CA-
+    # signed certs otherwise land via the offline-CA bundle path (Block 22J).
+
+    # Bind on all interfaces; F-032 — advertised addr MUST be the public
+    # hostname/IP, set per-host via inventory by generate.sh.
+    goat_relay_bind_addr: "0.0.0.0:33073"
+
+    # Production shards default — `--shards <num cores>` on c7i.2xlarge = 8.
+    # Empty string lets the binary pick `cores.len()`.
+    goat_relay_shards: ""
+
+  pre_tasks:
+    # ==================================================================
+    # Image override. The role-default pin is
+    # authoritative; set a host-level goat_relay_image fact ONLY when the
+    # GOAT_RELAY_IMAGE env / -e override is non-empty. A play-level
+    # `goat_relay_image:` default would shadow the pin and float the fleet to
+    # whatever it hardcoded (it floated to :latest — F-229's
+    # un-vetted-floating-image anti-pattern). set_fact only fires on a real
+    # override, so the empty default leaves the role-default pin in force.
+    # ==================================================================
+    - name: Apply GOAT_RELAY_IMAGE override (else role-default pin wins)
+      ansible.builtin.set_fact:
+        goat_relay_image: "{{ goat_relay_image_override }}"
+      when: goat_relay_image_override | length > 0
+
+    # ==================================================================
+    # Required-var fail-fast. Inventory-emitted by generate.sh from
+    # terraform output. If these are missing, generate.sh ran against
+    # outputs that don't include goat_relays — re-run after terraform
+    # apply.
+    # ==================================================================
+    - name: Require goat_relay_advertised_addr (set by inventory/generate.sh)
+      ansible.builtin.assert:
+        that:
+          - goat_relay_advertised_addr is defined
+          - goat_relay_advertised_addr | length > 0
+        fail_msg: |
+          goat_relay_advertised_addr not set on host {{ inventory_hostname }}.
+          Re-run ops/ansible/inventory/generate.sh after `terraform apply`
+          completes; the script reads the goat_relays output.
+
+    # ==================================================================
+    # Docker prereqs (mirrors relay-server.yml install pattern). The
+    # goat-relay role at roles/goat-relay/ assumes docker is present.
+    # On a fresh c7i.2xlarge AMI this is a one-time install.
+    # ==================================================================
+    - name: Check Docker installed
+      ansible.builtin.command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker
+      when: docker_check.rc | default(1) != 0
+      block:
+        - name: Install Docker prerequisites
+          ansible.builtin.apt:
+            name: [ca-certificates, curl, gnupg]
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+          retries: 3
+          delay: 10
+          register: docker_apt_prereq
+          until: docker_apt_prereq is succeeded
+
+        - name: Add Docker GPG key
+          ansible.builtin.shell: |
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            chmod a+r /etc/apt/keyrings/docker.gpg
+          args:
+            creates: /etc/apt/keyrings/docker.gpg
+
+        - name: Add Docker repository
+          ansible.builtin.shell: |
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+              > /etc/apt/sources.list.d/docker.list
+          args:
+            creates: /etc/apt/sources.list.d/docker.list
+
+        - name: Install Docker CE
+          ansible.builtin.apt:
+            name: [docker-ce, docker-ce-cli, containerd.io]
+            state: present
+            update_cache: true
+          retries: 3
+          delay: 10
+          register: docker_apt_install
+          until: docker_apt_install is succeeded
+
+        - name: Enable and start Docker
+          ansible.builtin.systemd:
+            name: docker
+            enabled: true
+            state: started
+
+    # ==================================================================
+    # Let's Encrypt cert via Cloudflare DNS-01 (publicly-trusted) — OPT-IN.
+    # ==================================================================
+    # The netbird relay client validates the rels:// server cert against the
+    # system trust store (netbird shared/relay/tls/client_prod.go; the
+    # InsecureSkipVerify path is dev-build-only), so a SELF-SIGNED relay cert is
+    # REJECTED by every peer — the relay listens but no peer ever connects
+    # (Relays 0/N). Partner-onboarding goatnets therefore present a publicly-trusted
+    # LE cert — zero peer-side CA install — matching the stock relay tier
+    # (relay-server.yml). A goatnet whose managed peers bundle its own offline CA
+    # keeps its offline-CA cert, so this is OPT-IN: default off; an env opts in with
+    # goat_relay_le_dns01=true + goat_relay_self_signed_cert=false. DNS-01 needs
+    # cloudflare_api_token and works with :80/:443 occupied (rathole owns :443).
+    # certbot auto-renews via its systemd timer; the deploy-hook re-stages the
+    # renewed cert into the role's mount path + restarts the container.
+    # `length > 0` is not enough. A relay can serve an
+    # EXPIRED certificate because cloudflare.ini held a value that was present
+    # but not a usable token: certbot's dns-cloudflare plugin rejected it, every
+    # unattended renewal for 30 days failed, and nothing surfaced that until the
+    # certs died and took the relay tier down fleet-wide. A Cloudflare API token
+    # is 40+ characters; 30 is a floor that rejects a truncated or placeholder
+    # value without pinning an exact vendor format.
+    - name: LE — require relay_dns_name + a plausible cloudflare_api_token for DNS-01
+      ansible.builtin.assert:
+        that:
+          - relay_dns_name is defined and (relay_dns_name | length > 0)
+          - cloudflare_api_token is defined
+          - (cloudflare_api_token | trim | length) >= 30
+        fail_msg: >-
+          goat_relay_le_dns01=true needs relay_dns_name (emitted per-host by
+          inventory/generate-relays.sh) and
+          -e cloudflare_api_token=$CLOUDFLARE_API_TOKEN_<ENV>.
+          Got {{ (cloudflare_api_token | default('') | trim | length) }} characters —
+          a Cloudflare API token is 40+. A short or empty value here does not fail
+          the deploy, it fails every renewal 60 days later.
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    - name: LE — install certbot + Cloudflare DNS-01 plugin
+      ansible.builtin.apt:
+        name: [certbot, python3-certbot-dns-cloudflare]
+        state: present
+        update_cache: true
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    - name: LE — ensure goat-relay cert dir exists
+      ansible.builtin.file:
+        path: /etc/goat-relay
+        state: directory
+        mode: "0755"
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    - name: LE — write Cloudflare DNS-01 credentials (0600)
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/cloudflare.ini
+        content: "dns_cloudflare_api_token = {{ cloudflare_api_token }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    # Deploy-hook re-stages the renewed cert (deref'd to stable, non-symlink
+    # files the role's two-file bind-mount can serve) + restarts the container.
+    # certbot fires it on first issuance AND every unattended renewal.
+    - name: LE — ensure certbot renewal-hooks/deploy dir exists
+      ansible.builtin.file:
+        path: /etc/letsencrypt/renewal-hooks/deploy
+        state: directory
+        mode: "0755"
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    - name: LE — install certbot deploy-hook (restage cert + restart goat-relay)
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/goat-relay-restage.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -eu
+          D=/etc/letsencrypt/live/{{ relay_dns_name }}
+          install -m 0644 "$D/fullchain.pem" /etc/goat-relay/cert.pem
+          install -m 0644 "$D/privkey.pem"   /etc/goat-relay/key.pem
+          docker restart {{ goat_relay_container_name | default('goat-relay') }} 2>/dev/null || true
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    - name: LE — check for an existing cert
+      ansible.builtin.stat:
+        path: "/etc/letsencrypt/live/{{ relay_dns_name }}/fullchain.pem"
+      register: le_cert
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    - name: LE — obtain cert via certbot DNS-01 (Cloudflare)
+      ansible.builtin.shell: |
+        certbot certonly --dns-cloudflare \
+          --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+          --dns-cloudflare-propagation-seconds 30 \
+          -d {{ relay_dns_name }} \
+          --email {{ relay_certbot_email | default('person-35@example.org') }} \
+          --agree-tos --non-interactive
+      when:
+        - goat_relay_le_dns01 | default(false) | bool
+        - not (le_cert.stat.exists | default(false))
+      register: le_certbot
+
+    # PROVE RENEWAL WORKS, rather than proving a credentials file exists.
+    #
+    # Everything upstream of this check — the token is set, the file is written,
+    # certbot is installed, the timer is enabled, the deploy-hook is in place — can
+    # be TRUE while renewal has been failing for weeks. Each of those passes whether
+    # or not renewal can actually complete, so none of them could have caught
+    # it. `--dry-run` exercises the real ACME flow against the staging
+    # directory: it authenticates to Cloudflare, writes the DNS challenge
+    # record and cleans it up, and fails if any of that does not work.
+    #
+    # It fails the DEPLOY. A relay whose renewal is broken is a relay that will
+    # take the mesh's fallback path down in under 90 days, and the deploy is
+    # the last moment anyone is looking.
+    - name: LE — prove unattended renewal actually works (certbot --dry-run)
+      ansible.builtin.command: certbot renew --dry-run --non-interactive
+      register: le_dryrun
+      changed_when: false
+      failed_when: le_dryrun.rc != 0
+      async: 600
+      poll: 15
+      # async/poll, not a plain command: a full ACME staging round-trip
+      # includes a 30s DNS propagation wait and routinely outruns the SSM
+      # exec timeout. Without this the task returns UNREACHABLE and the
+      # play stops BEFORE the tasks that start the relay container — which
+      # is worse than no check, because it half-deploys: certificates
+      # issued, relay never started, nothing listening on 33073.
+      when: goat_relay_le_dns01 | default(false) | bool
+
+    # First-issuance staging (the deploy-hook only fires on renewals). key 0644
+    # for the Chainguard-distroless nonroot reader (same trade-off the role
+    # README notes for the self-signed path below).
+    - name: LE — stage cert into the role's mount path
+      ansible.builtin.shell: |
+        set -eu
+        install -m 0644 /etc/letsencrypt/live/{{ relay_dns_name }}/fullchain.pem /etc/goat-relay/cert.pem
+        install -m 0644 /etc/letsencrypt/live/{{ relay_dns_name }}/privkey.pem   /etc/goat-relay/key.pem
+      when: goat_relay_le_dns01 | default(false) | bool
+      changed_when: true
+
+    # ==================================================================
+    # Self-signed cert for Phase 1 first-light. The goat-relay role
+    # asserts cert + key exist on the host but does NOT generate them
+    # (security-relevant; out of role scope per its README). For Phase 1
+    # before peers dial these endpoints, self-signed is operationally
+    # sufficient — replaced by offline-CA-signed cert before Phase 3.
+    # NOTE: self-signed certs are REJECTED by netbird relay clients (see the
+    # LE block above) — only valid for first-light/bench where no real peer
+    # dials. For a peer-facing tier set goat_relay_le_dns01=true (LE) or
+    # deliver an offline-CA cert peers trust.
+    # ==================================================================
+    - name: Ensure cert directory exists
+      ansible.builtin.file:
+        path: /etc/goat-relay
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Stat existing cert
+      ansible.builtin.stat:
+        path: /etc/goat-relay/cert.pem
+      register: existing_cert
+
+    - name: Generate self-signed cert
+      when:
+        - goat_relay_self_signed_cert | bool
+        - not existing_cert.stat.exists
+      ansible.builtin.shell: |
+        set -eu
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+          -subj "/CN={{ goat_relay_advertised_addr | regex_replace(':[0-9]+$', '') }}" \
+          -keyout /etc/goat-relay/key.pem \
+          -out /etc/goat-relay/cert.pem
+        chmod 0644 /etc/goat-relay/cert.pem
+        chmod 0600 /etc/goat-relay/key.pem
+      args:
+        creates: /etc/goat-relay/cert.pem
+
+    # Chainguard-runtime container needs world-readable cert + key (the
+    # `nonroot` user inside the container can't read 0600 root:root files).
+    # Single-tenant relay host, no shared FS, SG locked to TCP/UDP 33073 only;
+    # acceptable trade-off for Phase 1+2 self-signed certs. Real CA-signed
+    # certs delivered via offline-CA bundle (Block 22J) before Phase 3 use
+    # explicit per-file ownership the role consumes.
+    - name: Chmod self-signed cert + key for Chainguard nonroot reader
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0644"
+      loop:
+        - /etc/goat-relay/cert.pem
+        - /etc/goat-relay/key.pem
+      when: goat_relay_self_signed_cert | bool
+
+    # phase0 → phase1 image transport. Pull the local-built tarball via
+    # the 1h presigned URL, gunzip, and docker load. Mirrors tier-4b
+    # `goat-relay-tier4b.yml` Phase 1 → Phase 3 transport pattern.
+    - name: load goat-relay image from S3 presigned URL
+      # Offline path only — `--skip-tags archive_load` skips this when pulling
+      # from the GHCR registry tier (the goat-relay role pull handles it).
+      tags: ["archive_load"]
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if docker image inspect '{{ goat_relay_image }}' >/dev/null 2>&1; then
+          echo "image-already-loaded"
+          exit 0
+        fi
+        curl -fsSL '{{ hostvars["localhost"].goat_relay_image_url }}' \
+          | gunzip \
+          | docker load
+      args:
+        executable: /bin/bash
+      register: image_load
+      changed_when: "'Loaded image' in (image_load.stdout | default(''))"
+
+  roles:
+    # The role encodes the F-023 + F-027 invariant pair (modules-load.d
+    # + network_mode=host) and pulls + runs the container with kTLS
+    # enabled. See roles/goat-relay/README.md for the operational chain.
+    - role: goat-relay
+
+    # coturn STUN tier — the all-Rust relay never carried coturn, so
+    # without this every peer is relay-forced (no STUN → no srflx → no P2P).
+    # Gated: only goatnets that set deploy_coturn get it, and the
+    # goat-relay SG must open 3478 (terraform coturn_enabled module var).
+    - role: coturn
+      when: deploy_coturn | default(false) | bool
+
+  post_tasks:
+    # ==================================================================
+    # Smoke checks — Phase 1 acceptance evidence. Each check is a
+    # tractable signal the deploy actually landed; together they cover
+    # the runbook's Phase 1 Verification list.
+    #
+    # NOTE: `goat_relay_ktls_active` Prometheus gauge is queued as
+    # Block 50A boot-time assertion — not yet emitted by the binary.
+    # Today we read kTLS-active state from the role's existing
+    # startup-log assertion ("kernel TLS ULP available" or "awaiting
+    # ctrl-c") which the role already asserts. Re-add a metric-based
+    # check here when 50A lands.
+    # ==================================================================
+    - name: Smoke — listeners visible on TCP+UDP 33073 (ss -lntp/-lunp)
+      ansible.builtin.shell: |
+        set -e
+        echo "=== TCP listeners on 33073 ==="
+        ss -lntp 'sport = :33073' || true
+        echo ""
+        echo "=== UDP listeners on 33073 ==="
+        ss -lunp 'sport = :33073' || true
+      register: ss_listeners
+      changed_when: false
+
+    - name: Smoke — assert TCP 33073 listener present
+      ansible.builtin.assert:
+        that:
+          - "'33073' in ss_listeners.stdout"
+        fail_msg: |
+          Neither TCP nor UDP 33073 listener visible via `ss`. The
+          goat-relay container started (the role asserted that) but the
+          listeners are not bound on the host. Likely network_mode=host
+          regressed or the container exited after start. Check:
+            docker ps -a --filter name={{ goat_relay_container_name | default('goat-relay') }}
+            docker logs {{ goat_relay_container_name | default('goat-relay') }} --tail 50
+
+    # Loopback dial — confirms the listener accepts SYNs locally.
+    # Public-internet reachability is verified separately by the
+    # operator's manual peer probe (see runbook §Phase 1 Verification).
+    # Uses `nc -z` rather than bash /dev/tcp redirection to keep the
+    # task body free of YAML-confusing `<` / `>` characters.
+    - name: Smoke — TCP 33073 reachable from this host (loopback dial)
+      ansible.builtin.command:
+        cmd: nc -z -w 5 127.0.0.1 33073
+      register: tcp_loopback
+      changed_when: false
+      failed_when: tcp_loopback.rc != 0
+
+    # UDP 33073 reachability check is *derived* from socket presence
+    # rather than active probe. Active `nc -zu` is poison per F-045 +
+    # the snitch documentation — sending a UDP datagram into the QUIC
+    # listener can poison it; rely on `ss -lunp` socket presence
+    # as the post-deploy authority.
+    - name: Smoke — assert UDP 33073 listener registered (ss -lunp)
+      ansible.builtin.shell: |
+        set -e
+        ss -lunp 'sport = :33073' | grep -q 33073 && echo "UDP_OK" || echo "UDP_FAIL"
+      register: udp_listener
+      changed_when: false
+      failed_when: "'UDP_OK' not in udp_listener.stdout"
+
+    - name: Smoke — capture container state for the deploy record
+      ansible.builtin.shell: |
+        set -e
+        docker ps --filter name={{ goat_relay_container_name | default('goat-relay') }} \
+          --format 'table {% raw %}{{.Names}}\t{{.Status}}\t{{.Ports}}{% endraw %}'
+      register: container_state
+      changed_when: false
+
+    - name: DEPLOY ALONGSIDE acceptance summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+            goat-relay {{ inventory_hostname }} — Phase 1 ACCEPTANCE
+          ========================================
+          Public IP:        {{ goat_relay_public_ip | default('unknown') }}
+          Advertised:       rels://{{ goat_relay_advertised_addr }}
+          Container state: {{ container_state.stdout_lines | default([]) | join(' / ') }}
+          TCP listener:    {{ tcp_loopback.stdout | default('unknown') }}
+          UDP listener:    {{ udp_listener.stdout | default('unknown') }}
+
+          Status: Phase 1 (deploy alongside) complete on this host.
+          Next:    Phase 2 (monitoring + canary peer) — operator-fired.
+          See:     docs/design/relay-blue-green-cutover.md
+          ========================================

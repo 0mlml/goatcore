@@ -1,0 +1,80 @@
+{# ops/ansible/templates/ory/hydra.yaml.j2
+   Block 21C — Ory Hydra config rendered per-site by the `ory` Ansible role.
+   ADR 0411 (Accepted post-spike 2026-04-25). Source-of-truth-spike at
+   /tmp/ory-spike/hydra.yaml from 2026-04-25.
+
+   Required vars:
+     site_name              short site name, e.g. "vega"
+     site_dns_zone          full mesh DNS zone, e.g. "netbird.legacy.example"
+
+   Token strategy: opaque tokens by default (Hydra `ory_at_*` format).
+   Services validate via /admin/oauth2/introspect. Flip to JWT only when a
+   service genuinely needs offline validation — JWKS path is documented
+   below but commented.
+
+   Login + consent UI: minimal placeholder. We don't have a Kratos-paired
+   login UI yet; for week-1 we'll route Hydra's login redirect through
+   Kratos's login page using Hydra's "skip login if session cookie present"
+   pattern. Detail in the role's README.
+#}
+serve:
+  public:
+    port: 4444
+    cors:
+      enabled: true
+      allowed_origins:
+        - "https://*.{{ site_name }}.{{ site_dns_zone }}"
+      allowed_methods:
+        - POST
+        - GET
+        - PUT
+        - DELETE
+      allowed_headers:
+        - Authorization
+        - Content-Type
+  admin:
+    port: 4445
+
+urls:
+  self:
+    issuer: https://oauth2.{{ site_name }}.{{ site_dns_zone }}/
+  consent: https://auth.{{ site_name }}.{{ site_dns_zone }}/consent
+  login: https://auth.{{ site_name }}.{{ site_dns_zone }}/login
+  logout: https://auth.{{ site_name }}.{{ site_dns_zone }}/logout
+  error: https://auth.{{ site_name }}.{{ site_dns_zone }}/error
+
+secrets:
+  system:
+    # SECRETS_SYSTEM env var (set in /opt/mgmt-host/.env) overrides this.
+    - "rendered-config-fallback-do-not-use-32chrs"
+
+oidc:
+  subject_identifiers:
+    supported_types:
+      - public
+
+oauth2:
+  expose_internal_errors: true
+  # Default = opaque tokens; introspection-based validation. Change to "jwt"
+  # to issue signed JWTs (services then validate via /.well-known/jwks.json
+  # without a network round-trip).
+  # access_token_strategy: jwt
+
+ttl:
+  # auth_code is sized per ADR 1010 D2: an authorization code issued
+  # on the pre-failover active node must still be exchangeable on the
+  # post-failover active node after WAL replay. Budget = 60 s realized
+  # lag × 10 safety factor = 10 m. Do not lower without re-checking.
+  # access_token + refresh_token are independent — they are validated
+  # by the consuming service (introspect or JWKS), not bound by Spock
+  # replication lag.
+  access_token: 1h
+  refresh_token: 30d
+  id_token: 1h
+  auth_code: 10m
+  login_consent_request: 30m
+
+log:
+  level: info
+  format: json
+  leak_sensitive_values: false

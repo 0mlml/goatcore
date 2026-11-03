@@ -1,0 +1,69 @@
+---
+# ops/ansible/oci-substrate-deploy.yml
+#
+# Operator-fired play that lands the OCI image distribution substrate
+# (Block 75) on a target site's mgmt-host(s). Composable; can be invoked
+# with --limit <host> to apply incrementally.
+#
+# Phases:
+#   1. oci-substrate-client — daemon.json insecure-registries +
+#      registry-mirrors config; bounces docker (brief outage)
+#   2. admit-audit — re-render .env with substrate URL + docker pull
+#      from substrate + docker compose up
+#   3. oci-substrate-t2-sync — T1 → T2 cron on the site's Orin-C.
+#      OFF unless oci_t2_sync_enabled is true (default false fleet-wide),
+#      so this phase is a no-op on every site today.
+#
+# Usage:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#   aws-vault exec <profile> --no-session -- \
+#   ansible-playbook -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     oci-substrate-deploy.yml --limit <mgmt-host>
+#
+# Per-site config required:
+#   group_vars/<site>_hosts/vars.yml
+#     oci_substrate_t2_endpoint: "<orin-c-ip>:3030"
+#     admit_audit_image: "<substrate-url>"
+#     admit_audit_use_substrate: true
+#
+# Phase 3 additionally needs, in the obs group:
+#     oci_t2_sync_enabled: true
+#   and, in the operator's shell, R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY.
+#   T1 endpoints are cluster-shared and already set in group_vars/all.yml.
+
+- name: OCI substrate — client wiring
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - oci-substrate-client
+
+- name: OCI substrate — admit-audit (Block 75E first consumer)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    # Same vars passed via -e on the bootstrap so admit-audit
+    # role's step 4 (.env append) has all required values. These are typically
+    # in .envrc.local on the operator workstation per CLAUDE.md.
+    admit_audit_password: "{{ lookup('env', 'VEGA_ADMIT_AUDIT_PASS') | default('changeme', true) }}"
+  roles:
+    - role: admit-audit
+      tags: [admit-audit]
+
+# Phase 3 runs on the site's OBSERVABILITY host, not its mgmt hosts — the T2
+# Forgejo cache lives on Orin-C (ADR 0838 §"Sync model"). Hence its own target
+# var; `t2_sync_target` falls back to `target` so a single -e still works where
+# one group covers both.
+#
+# The `when` sits on the role application rather than inside the role so that
+# it also gates the rollback-ledger meta-dependency: a disabled role must not
+# append a ledger row saying it deployed.
+- name: OCI substrate — T1 → T2 sync cron (Orin-C; gated, default off)
+  hosts: "{{ t2_sync_target | default(target) | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - role: oci-substrate-t2-sync
+      when: oci_t2_sync_enabled | default(false) | bool
+      tags: [oci-t2-sync]

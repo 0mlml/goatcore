@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# rathole-relay-watchdog — health-based self-heal for the rathole reverse
+# tunnel(s) that front netbird.<zone>:443 enrollment.
+#
+# WHY: rathole-server.service uses systemd Restart=on-failure, but a wedged
+# tunnel is a LOGICAL hang, not a process crash — the server stays "running"
+# while holding a stale binding pointed at a dead control channel, so
+# on-failure never fires and the relay serves dead TLS indefinitely (TCP
+# accepts, TLS ClientHello goes nowhere). This watchdog probes the tunnel(s)
+# end-to-end and restarts rathole-server after N consecutive UNHEALTHY
+# probes, forcing the mgmt-host rathole client to re-establish a clean
+# control channel.
+#
+# TWO failure modes, both caught here:
+#   1. DEAD  — TCP connects but TLS/HTTP stalls to timeout.
+#   2. SLOW  — curl completes but the round-trip through the tunnel to the
+#              mgmt-host and back exceeds SLOW_SECONDS. A pure reachability
+#              check misses this: sub-timeout probes keep RESETTING the fail
+#              counter.
+#
+# Dispatch mode (ADR 1085): probes each backend TUNNEL PORT on localhost —
+# probing :443 would hit haproxy, which routes around a wedged tunnel and
+# masks it. Connection REFUSED is NOT a wedge in dispatch mode: rathole only
+# binds a service port while a client is registered, so refused means "that
+# mgmt-host is offline / not yet wired" — restarting rathole-server for it
+# would cut the HEALTHY tunnels every interval while one backend is down.
+# haproxy's own checks already route around a refused backend.
+#
+# Managed by Ansible (relay-server-rathole.yml). Idempotent + stateless
+# except the /run failure counters (cleared on reboot).
+set -euo pipefail
+
+{% if rathole_ingress_dispatch_enabled | default(false) | bool %}
+# Ingress-dispatch mode: one probe target per backend tunnel.
+PROBE_PORTS="{{ rathole_ingress_backends | map(attribute='tunnel_port') | join(' ') }}"
+DISPATCH_MODE=1
+{% else %}
+PROBE_PORTS="443"
+DISPATCH_MODE=0
+{% endif %}
+TIMEOUT="{{ rathole_watchdog_probe_timeout | default(5) }}"
+THRESHOLD="{{ rathole_watchdog_fail_threshold | default(3) }}"
+# A healthy enroll round-trip is well under a second; a wedged-but-alive tunnel
+# runs seconds. SLOW_SECONDS must sit above the healthy baseline and below
+# TIMEOUT. The THRESHOLD consecutive-strikes requirement absorbs transient blips.
+SLOW_SECONDS="{{ rathole_watchdog_slow_seconds | default(2.5) }}"
+SERVICE="rathole-server.service"
+
+restart_needed=0
+for port in $PROBE_PORTS; do
+  STATE_FILE="/run/rathole-watchdog-${port}.fails"
+
+  # Probe once, capturing BOTH reachability (curl exit) and latency
+  # (time_total). curl (no -f) exits 0 on ANY HTTP response over completed
+  # TLS = the tunnel delivered to the mgmt-host's Traefik; non-zero =
+  # refused / TLS-stall / timeout. `|| rc=$?` keeps a failed probe from
+  # aborting under `set -e`.
+  rc=0
+  t=$(curl -ksS -m "$TIMEOUT" -o /dev/null -w '%{time_total}' "https://127.0.0.1:${port}/" 2>/dev/null) || rc=$?
+
+  # Healthy = reachable AND fast. awk does the float compare (bash can't).
+  if [ "$rc" -eq 0 ] && awk "BEGIN{exit !($t < $SLOW_SECONDS)}"; then
+    echo 0 > "$STATE_FILE"
+    continue
+  fi
+
+  # Dispatch mode: connection refused (curl rc=7) = no client registered for
+  # this service — an absent backend, not a wedge. Reset and move on.
+  if [ "$DISPATCH_MODE" -eq 1 ] && [ "$rc" -eq 7 ]; then
+    echo 0 > "$STATE_FILE"
+    continue
+  fi
+
+  fails=$(( $(cat "$STATE_FILE" 2>/dev/null || echo 0) + 1 ))
+  echo "$fails" > "$STATE_FILE"
+  if [ "$rc" -ne 0 ]; then
+    reason="unreachable (curl rc=$rc)"
+  else
+    reason="slow ${t}s >= ${SLOW_SECONDS}s"
+  fi
+  logger -t rathole-watchdog "tunnel :${port} UNHEALTHY — ${reason} (${fails}/${THRESHOLD}) on $(hostname)"
+
+  if [ "$fails" -ge "$THRESHOLD" ]; then
+    restart_needed=1
+  fi
+done
+
+if [ "$restart_needed" -eq 1 ]; then
+  logger -t rathole-watchdog "threshold reached — restarting ${SERVICE} to clear wedged tunnel(s)"
+  systemctl restart "$SERVICE"
+  for port in $PROBE_PORTS; do
+    echo 0 > "/run/rathole-watchdog-${port}.fails"
+  done
+fi

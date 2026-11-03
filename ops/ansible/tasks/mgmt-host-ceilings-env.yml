@@ -1,0 +1,39 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# mgmt-host-ceilings-env.yml — keep the container ceilings in
+# {{ compose_dir }}/.env matching group_vars.
+#
+# WHY THIS EXISTS. ops/compose/mgmt-host/docker-compose.yml reads
+# TRAEFIK_CPUS, TRAEFIK_MEMORY, MANAGEMENT_A_CPUS, MANAGEMENT_A_MEMORY,
+# SIGNAL_A_CPUS and SIGNAL_A_MEMORY from .env and falls back to the fleet
+# values (0.5/1G, 1.0/512M, 1.0/512M) when a key is absent. mgmt-host.yml
+# writes them in its full .env render, but other plays copy the same compose
+# file and recreate a service without that render. Without this file, a
+# routine traefik-acme.yml run on a host whose .env predates the keys would
+# recreate Traefik at the 0.5-core default whatever group_vars asks for.
+#
+# WHAT IT DOES. Reads the same mgmt_* group_vars as mgmt-host.yml, so the
+# writers cannot disagree: each key is written when its var is set and
+# non-empty, and removed when it is not.
+#
+# Requires: compose_dir. Include BEFORE the task that recreates the service.
+- name: Write each mgmt-host container ceiling to .env, or remove it when unset
+  ansible.builtin.lineinfile:
+    path: "{{ compose_dir }}/.env"
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ lookup('vars', item.var, default='') }}"
+    state: "{{ 'present' if (lookup('vars', item.var, default='') | string | length > 0) else 'absent' }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  loop:
+    - { key: TRAEFIK_CPUS, var: mgmt_traefik_cpus }
+    - { key: TRAEFIK_MEMORY, var: mgmt_traefik_memory }
+    - { key: MANAGEMENT_A_CPUS, var: mgmt_management_cpus }
+    - { key: MANAGEMENT_A_MEMORY, var: mgmt_management_memory }
+    - { key: SIGNAL_A_CPUS, var: mgmt_signal_cpus }
+    - { key: SIGNAL_A_MEMORY, var: mgmt_signal_memory }
+  loop_control:
+    label: "{{ item.key }}"

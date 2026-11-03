@@ -1,0 +1,50 @@
+---
+# spock-mesh-wire.yml — apply spock-mesh-peering to ONE named host, without
+# re-running that host's whole site-bootstrap.
+#
+# WHY THIS EXISTS. Inter-site Spock is symmetric and spock-mesh-peering curates
+# repset membership and subscriptions on the LOCAL host only. So adding a joiner
+# to a goatnet requires BOTH sides to run their Phase 7B — the joiner's own
+# bootstrap does its half, and the founder must do the other. Until now the only
+# documented way to do the founder's half was "re-run the founder's bootstrap",
+# which on a live production node re-runs every phase to reach one role.
+#
+# node-addition.md §5.4a states the rule; this is the narrow way to satisfy it.
+#
+# A joiner brought up while the founder never ran its half replicates ONE WAY
+# and reports healthy from the joiner's own console — the state nobody notices.
+#
+# Usage:
+#   ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini \
+#     -i inventory/mgmt-hosts-mesh.ini spock-mesh-wire.yml \
+#     -l <host> -e site_id=<that host's site_id> \
+#     -e postgres_superuser_password="$<SITE>_PG_PASS"
+#
+# The host's group_vars must ALREADY declare participates_in_spock: true and a
+# non-none inter_site_spock_topology naming the peer's site_id (not its group
+# name). The role is gated on both, exactly as Phase 7B gates it, so a host that
+# is not meant to federate is a clean no-op rather than a surprise.
+
+- name: "spock-mesh-wire — apply spock-mesh-peering to one host"
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: "spock-mesh-wire | show what this will wire"
+      ansible.builtin.debug:
+        msg: >-
+          host={{ inventory_hostname }} site_id={{ site_id }}
+          participates_in_spock={{ participates_in_spock | default(false) }}
+          topology={{ inter_site_spock_topology | default('none') }}
+          peers={{ inter_site_spock_peers | default([]) | join(',') or '(none)' }}
+
+    - name: Apply spock-mesh-peering role
+      # include_role, not import_role — same reason Phase 7B uses it: with
+      # import_role the gate propagates to every task, the role's short-circuit
+      # setup tasks get skipped with it, and downstream tasks then run without
+      # the vars those setup tasks were supposed to define.
+      ansible.builtin.include_role:
+        name: spock-mesh-peering
+      when:
+        - participates_in_spock | default(false) | bool
+        - (inter_site_spock_topology | default('none')) != 'none'

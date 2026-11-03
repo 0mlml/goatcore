@@ -1,0 +1,42 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-fabric-health meter on a mgmt host (ADR 1034 — the QoS "Reveal"
+# pillar, docs/design/fabric-health-surface.md). A normal mTLS Zenoh client
+# peer that subscribes ** and publishes ops/fabric/health/<site> +
+# ops/fabric/footprint/<peer>. Persists nothing.
+#
+# Run from any laptop on the netbird mesh:
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       fabric-health-deploy.yml
+#
+# Pre-flight (operator-side, one-time per fresh deploy):
+#   1. zenoh-router container Healthy on the host (zenoh-deploy.yml).
+#   2. Infra-class leaf cert + key minted via offline-CA cert-sign with
+#      URI-SAN `urn:goat-<site>:infra:fabric-health`, placed at:
+#        /opt/fabric-health/certs/fabric-health-cert.pem
+#        /opt/fabric-health/certs/fabric-health-key.pem
+#        /opt/fabric-health/certs/ca-root.pem  (CA root, or set
+#        fabric_health_ca_root_src to the router's CA file)
+#   3. ghcr.io/{{ ghcr_org }}/goat-fabric-health digest published (pinned in the
+#      role defaults + deploy-history.yml).
+#
+# Live-fire after deploy (the ADR 1034 gate): `goat health` shows fabric
+# weather; a synth-vendor firehose moves a class toward amber/red and
+# surfaces as that vendor's footprint (`goat health --peer <vendor>`);
+# record an M-NNN measurement. Note: green/amber/red thresholds are only
+# meaningful once fabric_health_target_{msgs,bytes} carry MEASURED ceilings
+# (load-test apparatus) — until then a loaded class may read green/amber by
+# the seed targets; an idle class honestly reads IDLE, never a false green.
+
+- name: deploy goat-fabric-health meter (ADR 1034)
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: fabric-health

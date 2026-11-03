@@ -1,0 +1,346 @@
+---
+# wg-cp0-bootstrap.yml — bring up the silent control-plane WireGuard mesh
+# between prod relays + the network host (Block 22 / ADR 0313).
+#
+# Block 22K reshaped this orchestrator to root client-side trust in the
+# offline CA via signed enrollment bundles (closes F-053). Two flows
+# coexist during the cutover window:
+#
+#   1. BUNDLE-ROOTED (default for clients). The operator runs the
+#      ceremony at docs/operations/wg-cp0-bundle-ceremony.md to issue
+#      a per-device bundle on the air-gapped workstation and an
+#      operator-curated allowlist file at wg_cp0_bundle_allowlist_file.
+#      The orchestrator's Pass 2A reads that file to populate the
+#      relay's allowlist (alongside any legacy-flow peers); Pass 2B
+#      runs the wg-cp0-client role which consumes wg_cp0_bundle_path
+#      and renders the device's conf + privkey from the bundle.
+#
+#   2. LEGACY local-keygen (gated per-host by wg_cp0_legacy_local_keygen).
+#      Pass 1B generates a wg keypair on each opted-in client and stashes
+#      its pubkey as a host fact; Pass 2A's accumulator picks up these
+#      facts (existing pre-22K behavior). DEPRECATED — emits a warning
+#      from the wg-cp0-client role on each run.
+#
+# Relay-side keys (Pass 1A) are persistent + non-bundle. Pass 1A always
+# runs against relays.
+#
+# Pre-requisites:
+#   - terraform-prod/ already applied (relays exist, UDP 51821 SG open)
+#   - Three inventories loaded together:
+#       relay inventory: [relay_servers] group with per-host:
+#         wg_cp0_relay_address     e.g. 198.18.0.2 (fra), .3 (isr), .4 (mum)
+#         wg_cp0_public_endpoint   e.g. 203.0.113.1:51821 (relay's public IP + port)
+#       mgmt inventory: [wg_cp0_clients] group with per-host:
+#         wg_cp0_client_address    e.g. 198.18.0.1 (Orin-A), .5 (Orin-B)
+#   - For BUNDLE-flow clients, also pass via -e:
+#         wg_cp0_bundle_path           controller path to bundle.cbor
+#         wg_cp0_ca_pubkey_local_path  controller path to ca.pub PEM
+#         wg_cp0_bundle_allowlist_file controller path to bundle-peers JSON
+#                                       (operator-curated; see ceremony runbook)
+#
+# Usage (all-bundle fleet):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook \
+#       -i inventory/hosts-prod.ini \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/wg-cp0-prod.ini \
+#       -e wg_cp0_bundle_path=/tmp/<device>.bundle.cbor \
+#       -e wg_cp0_ca_pubkey_local_path=$(pwd)/../enrollment/public-keys/<ca-id>.pem \
+#       -e wg_cp0_bundle_allowlist_file=$(pwd)/../enrollment/wg-cp0-bundle-allowlist.json \
+#       wg-cp0-bootstrap.yml
+#
+# Idempotent — safe to re-run.
+
+# === Pass 1A — relays: install + key generation (persistent, non-bundle) ===
+# Block 22N (added) — `wg_cp0_relay_hosts` is a parent inventory group
+# defined in wg-cp0-prod.ini that contains BOTH the legacy `relay_servers`
+# (t3.micro per region) and the Block 33 Rust `goat_relay_hosts`
+# (c7i.2xlarge per region). Pre-Block-22N this targeted `relay_servers`
+# only; the rename is the single load-bearing change that makes the
+# wg-cp0-server role apply to both tiers, producing the active-active
+# 6-server mesh that closes F-060's single-point-of-forwarding for
+# cross-site Spock + mgmt-API + signal-fed traffic.
+- name: "wg-cp0 pass 1A — relay install + key generation"
+  hosts: wg_cp0_relay_hosts
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Install WireGuard tooling
+      ansible.builtin.apt:
+        name: [wireguard, wireguard-tools]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Generate keypair if missing
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 077
+        wg genkey > /etc/wireguard/wg-cp0-priv.key
+      args:
+        creates: /etc/wireguard/wg-cp0-priv.key
+        # /bin/sh on Ubuntu is dash, which rejects 'set -o pipefail' with
+        # 'Illegal option -o pipefail'. Force bash for the bash-isms above.
+        executable: /bin/bash
+      no_log: true
+
+    - name: Lock down privkey
+      ansible.builtin.file:
+        path: /etc/wireguard/wg-cp0-priv.key
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Read privkey
+      ansible.builtin.command:
+        cmd: cat /etc/wireguard/wg-cp0-priv.key
+      register: wg_cp0_priv_read
+      changed_when: false
+      no_log: true
+
+    - name: Derive pubkey
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo -n "{{ wg_cp0_priv_read.stdout }}" | wg pubkey
+      args:
+        executable: /bin/bash  # dash rejects 'set -o pipefail'; bash needed.
+      register: wg_cp0_pub_derive
+      changed_when: false
+      no_log: true
+
+    - name: Stash keys as host facts (for pass 2 cross-referencing)
+      ansible.builtin.set_fact:
+        wg_cp0_privkey_b64: "{{ wg_cp0_priv_read.stdout }}"
+        wg_cp0_pubkey_b64: "{{ wg_cp0_pub_derive.stdout }}"
+      no_log: true
+
+    - name: Show this relay's wg-cp0 PUBLIC key (for the ceremony's relays-roster JSON)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} wg-cp0 PUBLIC key: {{ wg_cp0_pubkey_b64 }}"
+
+# === Pass 1B — clients: install + LEGACY key generation (deprecated) =======
+# Bundle-flow clients skip this entire pass; their keypair lives inside the
+# offline-CA-signed bundle and is materialized by wg-cp0-client's Pass 2B
+# via wg-cp0-bundle-apply.
+
+- name: "wg-cp0 pass 1B — legacy client install + local key generation (DEPRECATED)"
+  hosts: wg_cp0_clients
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Skip clients in bundle-flow mode (Block 22K — closes F-053)
+      ansible.builtin.meta: end_host
+      when:
+        - wg_cp0_bundle_path | default('', true) | length > 0
+        - not (wg_cp0_legacy_local_keygen | default(false) | bool)
+
+    - name: Install WireGuard tooling (legacy clients)
+      ansible.builtin.apt:
+        name: [wireguard, wireguard-tools]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Generate keypair if missing (legacy clients only)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 077
+        wg genkey > /etc/wireguard/wg-cp0-priv.key
+      args:
+        creates: /etc/wireguard/wg-cp0-priv.key
+        executable: /bin/bash
+      no_log: true
+
+    - name: Lock down privkey
+      ansible.builtin.file:
+        path: /etc/wireguard/wg-cp0-priv.key
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Read privkey
+      ansible.builtin.command:
+        cmd: cat /etc/wireguard/wg-cp0-priv.key
+      register: wg_cp0_priv_read
+      changed_when: false
+      no_log: true
+
+    - name: Derive pubkey
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo -n "{{ wg_cp0_priv_read.stdout }}" | wg pubkey
+      args:
+        executable: /bin/bash
+      register: wg_cp0_pub_derive
+      changed_when: false
+      no_log: true
+
+    - name: Stash keys as host facts (Pass 2A reads these for the legacy allowlist)
+      ansible.builtin.set_fact:
+        wg_cp0_privkey_b64: "{{ wg_cp0_priv_read.stdout }}"
+        wg_cp0_pubkey_b64: "{{ wg_cp0_pub_derive.stdout }}"
+      no_log: true
+
+    - name: Show this client's wg-cp0 PUBLIC key (legacy flow)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} wg-cp0 PUBLIC key (legacy): {{ wg_cp0_pubkey_b64 }}"
+
+# === Pass 2A — relay-side conf + listener =================================
+# Allowlist is the union of:
+#   (a) bundle-flow peers from wg_cp0_bundle_allowlist_file (operator-curated
+#       JSON; emitted by the ceremony at bundle-issuance time per Block 22K)
+#   (b) legacy clients with wg_cp0_pubkey_b64 facts from Pass 1B (deprecated)
+# Both sources go through the same wg_cp0_allowed_peers contract that the
+# wg-cp0-server role expects.
+
+- name: "wg-cp0 pass 2A — relay servers config + listener"
+  hosts: wg_cp0_relay_hosts # Block 22N — both legacy relay_servers + new goat_relay_hosts
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Initialize wg_cp0_allowed_peers
+      ansible.builtin.set_fact:
+        wg_cp0_allowed_peers: []
+
+    # Source (a): bundle-flow peers from operator-curated JSON.
+    #
+    # F-057 / Block 22K.8 lesson: the prior implementation used
+    # `delegate_to: localhost` + `run_once: true` on the set_fact below. That
+    # combination stores the fact on `localhost` only — the relay hosts in
+    # this play do NOT inherit it via `hostvars[inventory_hostname]`, so the
+    # later loop's `hostvars[inventory_hostname].wg_cp0_bundle_peers | default([])`
+    # silently resolved to `[]`. When --limit excluded clients, source (b)
+    # also produced 0 entries, and the relay ended up with an empty allowlist
+    # accepting zero handshakes. **Fix: drop run_once; let each relay run
+    # set_fact on itself.** `lookup('file', ...)` runs controller-side
+    # regardless of the task's host context, so the file read still happens
+    # once-per-controller-process per relay (cheap; same JSON, idempotent).
+    - name: Probe bundle allowlist file (controller-side)
+      ansible.builtin.stat:
+        path: "{{ wg_cp0_bundle_allowlist_file }}"
+      register: _wg_cp0_bundle_allowlist_stat
+      delegate_to: localhost
+      become: false
+      when: wg_cp0_bundle_allowlist_file | default('', true) | length > 0
+
+    - name: Load bundle allowlist file (lookup is controller-side; per-relay set_fact)
+      ansible.builtin.set_fact:
+        # Block 22R.1 bumped the on-disk shape from a flat list to a v2
+        # envelope `{schema_version, peers: [...], relays: [...], ...}`.
+        # bundle-create writes v2 today; v1 callers shouldn't exist
+        # anymore (the seed migrated atomically), but tolerate the older
+        # flat-list shape by checking the parsed type and unwrapping
+        # `.peers` when it's a dict.
+        wg_cp0_bundle_peers_raw: "{{ lookup('file', wg_cp0_bundle_allowlist_file) | from_json }}"
+      when:
+        - wg_cp0_bundle_allowlist_file | default('', true) | length > 0
+        - _wg_cp0_bundle_allowlist_stat.stat.exists | default(false)
+
+    - name: Extract peer list from v2 envelope (or pass through v1 flat list)
+      ansible.builtin.set_fact:
+        wg_cp0_bundle_peers: "{{ (wg_cp0_bundle_peers_raw.peers if wg_cp0_bundle_peers_raw is mapping else wg_cp0_bundle_peers_raw) | default([]) }}"
+      when: wg_cp0_bundle_peers_raw is defined
+
+    - name: Append bundle-flow peers to allowed_peers
+      ansible.builtin.set_fact:
+        # v2 fields: name + current_pubkey + wg_cp0_address.
+        # v1 fields: name + pubkey + address. Use `default(<v1>)` so a v1
+        # flat list keeps working until the migration is complete fleet-wide.
+        wg_cp0_allowed_peers: "{{ wg_cp0_allowed_peers + [{
+            'name': item.name,
+            'pubkey': item.current_pubkey | default(item.pubkey),
+            'allowed_ips': [(item.wg_cp0_address | default(item.address)) ~ '/32']
+          }] }}"
+      loop: "{{ wg_cp0_bundle_peers | default([]) }}"
+      when: wg_cp0_bundle_peers is defined
+
+    # Source (b): legacy clients with Pass 1B pubkey facts.
+    # Loop + accumulator — the Jinja2 list-comprehension form errors out on
+    # the bundled ansible-core / Jinja2 version with "expected token ',', got
+    # 'for'", so plain loop + accumulator works across versions.
+    - name: Append legacy-flow clients to allowed_peers (Pass 1B fact-derived)
+      ansible.builtin.set_fact:
+        wg_cp0_allowed_peers: "{{ wg_cp0_allowed_peers + [{
+            'name': item,
+            'pubkey': hostvars[item].wg_cp0_pubkey_b64,
+            'allowed_ips': [hostvars[item].wg_cp0_client_address ~ '/32']
+          }] }}"
+      loop: "{{ groups['wg_cp0_clients'] | default([]) }}"
+      when:
+        - hostvars[item].wg_cp0_pubkey_b64 is defined
+        - hostvars[item].wg_cp0_client_address is defined
+
+    - name: Show effective allowlist size (bundle + legacy union)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} wg-cp0 allowlist: {{ wg_cp0_allowed_peers | length }} peer(s)"
+
+    # F-057 / Block 22K.8 hard-stop guard — prevents the silent-zero failure mode.
+    # An empty allowlist on a relay = zero handshakes accepted from any peer.
+    # Last failure emptied the allowlist on all 3 prod relays
+    # because the source-(a) loop's `hostvars[...]` resolution failed and
+    # source-(b) had no clients in --limit. This assertion catches that
+    # before the role renders /etc/wireguard/wg-cp0.conf with `Allowed peers: 0`.
+    - name: Assert wg-cp0 allowlist is non-empty
+      ansible.builtin.assert:
+        that:
+          - wg_cp0_allowed_peers | length > 0
+        fail_msg: |
+          {{ inventory_hostname }} would render /etc/wireguard/wg-cp0.conf with ZERO peers.
+          A relay with empty allowlist accepts zero handshakes (silent-failure
+          mode that caused F-057 / Block 22K.8). Either:
+            - Set wg_cp0_bundle_allowlist_file to the operator-curated JSON
+              with at least one peer entry; OR
+            - Include legacy clients in --limit so Pass 1B fact-gathers their
+              pubkeys + source (b) populates the allowlist.
+          Refuse to deploy a relay with empty allowlist.
+  roles:
+    - role: wg-cp0-server
+
+# === Pass 2B — client-side conf + tunnel =================================
+# Client role branches on wg_cp0_bundle_path:
+#   - non-empty → bundle flow (build wg-cp0-bundle-apply, ship bundle, render)
+#   - empty + wg_cp0_legacy_local_keygen=true → render from inventory facts
+# Both paths converge on the same systemd enable + smoke at the role's tail.
+#
+# Skip gate: callers that have already done their own client-side
+# configuration (e.g. wg-cp0-rotate-bundles.yml's Pass 3) re-import this
+# playbook only to refresh the relay-side allowlist + listener via
+# Pass 1A + 2A. They set wg_cp0_skip_client_pass=true to skip Pass 2B,
+# which would otherwise re-invoke the wg-cp0-client role with no
+# wg_cp0_bundle_path (fresh bundle was shredded post-apply by Pass 3) +
+# fall into the legacy-flow assertion + fail loudly. Block 79 closure.
+
+- name: "wg-cp0 pass 2B — clients config + tunnel up"
+  hosts: wg_cp0_clients
+  become: true
+  gather_facts: false
+  any_errors_fatal: false
+  pre_tasks:
+    - name: "Pass 2B skip gate — rotate-bundles already did Pass 3 client-side config"
+      ansible.builtin.meta: end_host
+      when: wg_cp0_skip_client_pass | default(false) | bool
+    # Loop + accumulator — see Pass 2A note about Jinja2 comprehension support.
+    - name: Initialize wg_cp0_relays
+      ansible.builtin.set_fact:
+        wg_cp0_relays: []
+    - name: Append each relay server to wg_cp0_relays (legacy flow only — bundle flow reads from bundle.known_endpoints)
+      # Block 22N — walk wg_cp0_relay_hosts (= relay_servers + goat_relay_hosts
+      # under the active-active mesh shape) so both tiers feed the legacy-
+      # flow accumulator. Bundle-flow clients consume the same set via the
+      # bundle's KnownEndpoint array; this loop only fires when
+      # wg_cp0_legacy_local_keygen is set on a per-host basis.
+      ansible.builtin.set_fact:
+        wg_cp0_relays: "{{ wg_cp0_relays + [{
+            'name': item,
+            'endpoint': hostvars[item].wg_cp0_public_endpoint,
+            'pubkey': hostvars[item].wg_cp0_pubkey_b64,
+            'allowed_ips': [hostvars[item].wg_cp0_relay_address ~ '/32']
+          }] }}"
+      loop: "{{ groups['wg_cp0_relay_hosts'] | default(groups['relay_servers']) | default([]) }}"
+      when:
+        - hostvars[item].wg_cp0_pubkey_b64 is defined
+        - hostvars[item].wg_cp0_relay_address is defined
+        - hostvars[item].wg_cp0_public_endpoint is defined
+  roles:
+    - role: wg-cp0-client

@@ -1,0 +1,414 @@
+---
+# goat — Shared Ansible Variables
+#
+# Account-specific values should be overridden via:
+#   - inventory host/group vars
+#   - extra-vars (-e) from the orchestration script
+#   - environment variables
+#
+# This file contains defaults that apply across all hosts.
+
+# Domain
+domain: legacy.example
+netbird_domain: "netbird.{{ domain }}"
+
+# Container registry namespace. Consumers pin images as
+# ghcr.io/{{ ghcr_org }}/<image>@<digest>. There is one namespace, usareur-af,
+# the usareur-af org's. Previously this was derived from the deploying
+# checkout's git origin so a goat-maintainer checkout pulled from a ghcr.io/goat-maintainer
+# mirror; that mirror and its personal-account token were retired (ADR 1195).
+# GHCR_ORG still overrides it for a deliberate one-off pull from elsewhere.
+ghcr_org: "{{ lookup('env', 'GHCR_ORG') or 'usareur-af' }}"
+
+# Source repository for GitHub RELEASE assets (get.<site> and `goat docs`
+# tarballs): USAREUR-AF/goatcore, whichever checkout runs the deploy. The goat-maintainer
+# repository is no longer a release source (ADR 1195). GOAT_SOURCE_REPO
+# overrides it.
+source_repo: "{{ lookup('env', 'GOAT_SOURCE_REPO') or 'USAREUR-AF/goatcore' }}"
+
+# Intra-mesh PQC (Rosenpass, ADR 0602 / docs/design/rosenpass-intra-mesh-pqc.md).
+# The single per-goatnet knob that makes EVERY enrollment surface (bridge,
+# operator-laptop, mgmt-host, operator bundle, bootstrap examples, and the
+# onboarding console — see id_admin_console_notify_rosenpass) hand new peers
+# `--enable-rosenpass --rosenpass-permissive`, PQ-securing their WireGuard
+# sessions. DEFAULT OFF fleet-wide: merging changes nothing until a goatnet
+# flips this to true. Permissive means enabling it never breaks connectivity to
+# not-yet-enabled peers, so the staged rollout is a per-goatnet config flip
+# (canary goatnet first). `rosenpass_up_flags` is the computed fragment the
+# `netbird up` tasks append (empty string when off).
+rosenpass_enabled: false
+rosenpass_up_flags: "{{ '--enable-rosenpass --rosenpass-permissive' if (rosenpass_enabled | bool) else '' }}"
+
+# Held-member browser explainer (ADR 1089). Deployment is a deliberate second
+# step after a compatible goat-id-console is healthy. The Traefik play refuses
+# activation on warrant-enforced scopes, whose holds live in warrant rather
+# than the legacy hold-record file consumed by this increment.
+probation_explainer_enabled: false
+
+# Rathole
+rathole_version: "v0.5.0"
+rathole_url: "https://github.com/rapiz1/rathole/releases/download/{{ rathole_version }}/rathole-x86_64-unknown-linux-gnu.zip"
+rathole_bin: /usr/local/bin/rathole
+rathole_config_dir: /etc/rathole
+# rathole client tunnel tuning (rendered into templates/client.toml.j2).
+# Fleet DEFAULTS = the current pre-ADR-1081 values, so untouched goatnets are
+# unchanged. A goatnet overrides to the storm-hardened values (20 / 5) in its
+# group_vars — see ADR 1081 L3 (docs/design/control-plane-storm-resilience.md).
+# rathole v0.5.0 `retry_interval` is a FLAT seconds integer (no exponential
+# backoff in the config schema — verified), so hardening = a larger flat value.
+rathole_heartbeat_timeout: 40
+rathole_retry_interval: 1
+
+# --- relay ingress dispatch (ADR 1085) --------------------------------------
+# When rathole_ingress_dispatch_enabled on a relay, server.toml binds one
+# localhost tunnel service per mgmt-host backend and haproxy owns the public
+# :443 (TLS passthrough): SNI pins for single-writer hostnames, consistent
+# source-hash balancing for the rest, check-ssl health checks that route
+# around a wedged tunnel in seconds. Generalized to ANY
+# number of backends. Default OFF fleet-wide (inline `| default(false)` —
+# DELIBERATELY not defined here: playbook group_vars/all.yml outranks INI
+# [group:vars], so an all.yml default would clobber the per-goatnet values
+# in the inventory). Backend-list shape (name /
+# service / tunnel_port / weight / sni_pin) + full design:
+# docs/design/relay-ingress-dispatch.md.
+
+# NETHOST (infrastructure node) — instance-specific (Class A per
+# docs/design/instance-variability-model.md). Lives in all.yml only because it is read
+# cross-group (nethost + bridge_servers via c2-map-gate + inventory/generate.sh); it is inert
+# for other instances (no other instance runs the nethost-* / c2-map-gate service playbooks).
+# A second instance of this shape must override this — it is not a shared/global value.
+nethost_mesh_ip: 100.127.1.32
+nethost_user: goat
+netbird_config_path: /opt/netbird/config.yaml
+
+# TAK Server
+tak_config_dir: /opt/tak
+tak_certs_dir: /opt/tak/certs
+tak_data_dir: /opt/tak/data
+tak_docker_image: "takserver:latest"
+tak_ca_name: goatCA
+tak_federation_name: goat-federation
+
+# TAK federation routes through a bridge VPS (Netbird mesh -> socat -> federation
+# hub). Set federation_host to the bridge's mesh IP and add a matching
+# bridge_forwards entry for the instance.
+# federation_host: ""
+# federation_port: "9001"
+
+# Bridge VPS: TCP forwarding rules for partner connectivity, deployed to every
+# bridge. Declared per instance in the bridge group's group_vars, shape:
+#   - { name: <unit>, listen_port: 9001, dest_host: <host>, dest_port: 9001 }
+# with optional proto: tcp|udp.
+bridge_forwards: []
+
+# AWS — no home-instance default (fail-closed; see docs/design/instance-variability-model.md §3).
+# Real runs wrap the whole invocation in `aws-vault exec <account> --no-session -- ...`, which
+# sets AWS_VAULT, so aws_cmd renders empty and aws_profile is never read. The only path that
+# reads aws_profile is a *bare* ansible run (no aws-vault wrapper). aws_profile has no
+# default, so the bare path fails loud with a named error instead of targeting
+# the wrong AWS account. Declare it per-instance where a bare run is intended.
+aws_cmd: "{% if lookup('env', 'AWS_VAULT') %}{% else %}aws-vault exec {{ aws_profile | mandatory('aws_profile is unset. Run inside `aws-vault exec <account> --no-session -- ...`, or declare aws_profile per-instance in the playbook/group_vars. There is no home-instance default — see docs/design/instance-variability-model.md.') }} --no-session -- {% endif %}"
+
+# -- Service criticality tiers (docs/design/service-criticality-tiers.md) ----
+# Fleet-wide vocabulary: what breaks if the service is absent.
+#   core=0 essential=1 utility=2 nicety=3. Sidecars (oauth2-proxy-<svc>,
+# <svc>-spiffe-helper) inherit their primary's tier and are not listed.
+# Per-site ceiling: site_deploy_tier_max (Class-C; default = full parity).
+# Sites derive per-service *_enabled flags from this map — the map is the
+# SoT for membership; deploy ORDER stays with goatnet-turnkey-standup.md.
+service_tiers:
+  # core — the goatnet does not function without these
+  traefik: 0
+  netbird_mgmt: 0
+  netbird_signal: 0
+  postgres: 0
+  kratos: 0
+  hydra: 0
+  selfservice_ui: 0
+  zenoh_router: 0
+  mesh_dns: 0
+  spire_server: 0
+  spire_agent: 0
+  admit_audit: 0
+  netbird_dashboard: 0   # first OIDC login mints the account Owner; admin-gated
+  # essential — nobody new gets on, nothing is auditable
+  portal: 1
+  id_admin_console: 1
+  onboard_runner: 1
+  onboard_intake: 1
+  minio: 1
+  audit_subscriber: 1
+  goat_get: 1
+  goat_docs: 1
+  grant_keyd: 1            # no new grant becomes an encryption key without it
+  # utility — operators are blinder; users unaffected
+  panoscope: 2
+  stethoscope: 2
+  flashlight: 2
+  isitup: 2
+  obs_stack: 2
+  goat_logship: 2
+  env_health_publishers: 2
+  relay_health: 2
+  relay_metrics_ingest: 2
+  compliance_proxy: 2
+  # nicety — no effect on operational value
+  demogame: 3
+  zenoh_sandbox: 3
+  synth_vendors: 3
+  brief: 3
+  dataflows: 3
+
+# Per-site deploy ceiling — services with tier <= this deploy. Class-C knob;
+# override in group_vars/<site>_hosts/vars.yml.
+site_deploy_tier_max: 3
+
+# -- OCI substrate T1 mirror endpoints (Block 68C / ADR 0838) ----------------
+#
+# WHY THESE LIVE IN all.yml. The provisioning tier is a DELIBERATE
+# cross-goatnet shared service, not a per-goatnet fact: the mirrors stay on one
+# shared estate and every goatnet pulls from them. Nothing new binds under a
+# goatnet's own zone.
+#
+# So this is neither Class A nor Class C in
+# docs/design/instance-variability-model.md §1. Class A is "MUST differ per
+# instance" and would make a shared endpoint a fail-closed error; Class C is a
+# per-site shape knob. These are the third thing: ONE value, shared by every
+# instance on purpose. The §3 rule that "all.yml carries Class-C defaults only"
+# exists to stop a home-instance default masquerading as a global — the failure
+# it was written against is a home-profile `aws_profile` default. That is the opposite of
+# this: there is no per-instance value being shadowed, because there is
+# deliberately only one provisioning tier. Same reasoning shape as nethost_mesh_ip
+# above, which documents its own exception rather than hiding it.
+#
+# NOT IN THE PER-GOATNET PINS / CAPABILITIES MODEL, and that is the point.
+# ops/pins/fleet-pins.yaml governs per-goatnet IMAGE pins and
+# ops/pins/parity-capabilities.yaml governs per-goatnet capability DECISIONS —
+# both compare member groups against each other and render disagreement as
+# skew. An endpoint that is correct precisely because every goatnet shares it
+# would render as permanent false agreement there and would invite a future
+# reader to "fix" the shared value into per-goatnet copies. The one thing here
+# that IS a per-goatnet decision — whether a site's Orin-C runs the sync at all
+# — is `oci_t2_sync_enabled`, and that DOES carry a parity-capabilities row.
+#
+# TIER NUMBERING: these keys use ADR 0838's scheme (T1 = the R2 + ECR mirror
+# pair, T2 = the per-site Orin-C Forgejo cache). Block 68's pull-image.sh uses
+# the opposite (T2 = R2 edge, T1 = S3). Both vocabularies are live in the tree;
+# say which you mean, every time.
+
+# T1A — Cloudflare R2. The estate's published R2 surface, already bound as an
+# R2 custom domain and already the DEFAULT_T2 of ops/bootstrap/pull-image.sh
+# (terraform-prod/r2-mirror.tf output `image_mirror_t2_endpoint`).
+#
+# HONEST LIMIT, and one reason oci_t2_sync_enabled stays false: this endpoint
+# serves plain signed-artifact GETs, which is exactly what pull-image.sh needs
+# and what the Phase −0.5 dogfood exercises. The oci-substrate-t2-sync script
+# drives `crane auth login` / `crane copy` against it, i.e. OCI REGISTRY
+# semantics, and that has never been proven against this bucket. ADR 0838 §3.1
+# assumes a containerd `hosts.toml` rewrite over the R2 S3 API rather than a
+# registry. Wiring the value is the repo half; proving the protocol is live
+# work — docs/design/rapid-site-bringup.md §5 "What the light-up still needs".
+oci_t1_r2_endpoint: "image-mirror.example"
+
+# T1B — AWS ECR Private, usareur-af account, primary region. Value of record:
+# docs/design/oci-goat-substrate.md §3.2. The design doc's own confidentiality
+# rule (§"No bucket / repo names in narrative documentation") puts the concrete
+# endpoint HERE rather than in prose, so this is its designed home.
+#
+# HONEST LIMIT: verified that NO `aws_ecr_*` resource exists in any
+# terraform tree. This is the address of a registry whose `oci-goat/*` repos
+# have not been created. Creating them is Block 75A, not this standup.
+oci_t1_ecr_endpoint: "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+
+# R2 S3-API credential for the T1A mirror. ACCOUNT-SCOPED, deliberately NOT
+# `<SITE>_`-prefixed: one provisioning tier means one credential pair, and an
+# `<SITE>_R2_*` name would imply a per-goatnet credential that does not and
+# should not exist.
+#
+# Per CLAUDE.md §Credentials these are read from the operator's environment at
+# deploy time and never committed; home is `.envrc.local.d/10-cloud-and-
+# thirdparty.envrc` (cloud + third-party blast radius), alongside the
+# Cloudflare tokens. Empty resolves to empty, and the role asserts on it rather
+# than deploying a sync that cannot authenticate.
+oci_t1_r2_access_key_id: "{{ lookup('env', 'R2_ACCESS_KEY_ID') }}"
+oci_t1_r2_secret_access_key: "{{ lookup('env', 'R2_SECRET_ACCESS_KEY') }}"
+
+# ---------------------------------------------------------------------------
+# Off-mesh services — the isitup "Off-Mesh Services" section
+# ---------------------------------------------------------------------------
+#
+# The surfaces a mesh user needs that are NOT on the mesh: public-internet
+# addresses, each with its own sign-in plane. The list lives here rather than
+# per-site because most of it is the same from every goatnet — one home for the
+# fact, per-site opt-in.
+#
+# Two planes are represented, and neither is this goatnet's mesh Ory:
+#   - the PUBLIC plane — Dex brokering Kanidm. Fronts the relay-health dashboards, which
+#     are deliberately off-mesh so they still answer when the mesh or Thor is
+#     down (ADR 1066), and the cross-goatnet consistency aggregator, whose door
+# follows the goatnet membership roster (ADR 1093, external-dash-doors).
+# - the COLLAB plane — Dex + Kanidm on its own collab zone
+#     (collab-services), fronting chat / docs / files. Deliberately
+#     severed from the mesh; F-274 is the record of what that severance costs.
+#
+# A site opts in with TWO lines in its group_vars — the list, and the name of
+# its own off-mesh relay-health box:
+#   isitup_relay_health_public_fqdn: "relay-health.<site>.<zone>"
+#   isitup_external_services: "{{ isitup_external_services_catalog }}"
+# Live on goatnets that set these.
+#
+# Rows are `type: external` (URL probe — there is no local container to
+# inspect), `category: external` (the page section), `access: offmesh` (the
+# blue badge: different login, not "more privileged"). ids are suffixed where a
+# mesh row already owns the bare name (relay-health, consistency), because
+# history.json is keyed by id and a collision would fuse two services' uptime
+# bars.
+
+# This goatnet's own off-mesh relay-health box. Empty by default; a site that
+# opts into the section MUST name it (the role asserts rather than rendering a
+# row that links to `https:///`). Two catalog rows resolve from it: the fleet
+# dashboard at `/` and the cross-goatnet overview at `/goatnets.html`, which
+# every relay-health box serves beside its own fleet page.
+isitup_relay_health_public_fqdn: ""
+
+# NO account-door row: nobody is expected to NAVIGATE to these planes.
+# A signed-out click on the collab row lands at the collab Dex login backed by
+# the same Kanidm, and the Kanidm address lives in the workspace row's desc.
+# A join-gate, if one is stood up, is a row: it is a place a person is sent.
+isitup_external_services_catalog:
+  # This goatnet's own relay fleet, not a sibling's. Each goatnet's page names
+  # its own box because that is the one its viewers have a door on and the one
+  # whose relays carry their traffic; the level above is one click away.
+  - id: relay-health-public
+    name: "Relay health — this goatnet"
+    desc: >-
+      This goatnet's relay fleet. Public address, its own sign-in.
+    fqdn: "{{ isitup_relay_health_public_fqdn }}"
+    type: external
+    kind: ui
+    access: offmesh
+    category: external
+    icon: heartbeat
+  # The level above the fleet page: one row per goatnet, click through to that
+  # goatnet's own fleet (relay-health-dashboard.md §"Goatnet overview"). Served
+  # by the SAME box — hence the same fqdn with a link_path, which is why that
+  # column exists at all. Each goatnet reports itself through one verdict
+  # function, and a goatnet with no published summary renders UNKNOWN rather
+  # than down (ADR 1034).
+  - id: relay-health-goatnets
+    name: "Relay fleets — all goatnets"
+    desc: >-
+      One row per goatnet, each clicking through to that goatnet's relay
+      fleet.
+    fqdn: "{{ isitup_relay_health_public_fqdn }}"
+    type: external
+    health_path: /goatnets.html
+    link_path: /goatnets.html
+    kind: ui
+    access: offmesh
+    category: external
+    icon: globe
+  # CF-7 hosted aggregator — the cross-goatnet drift view. Off-mesh on purpose: it reads several goatnets, so it cannot live
+  # inside one. consistency-foundation.md §7.8.
+  #
+  # NAMED AS A SCOPE PAIR with the mesh `consistency` row every goatnet also
+  # carries (group_vars/<env>_hosts/vars.yml), because they are ONE binary and
+  # ONE image in two deployment modes and the page was showing them as two
+  # unexplained services called the same thing (operator: "we list
+  # consistency as both an external and internal service"). The pair reads the
+  # same way as relay-health-public / relay-health-goatnets above — "this
+  # goatnet" vs "all goatnets" — and the desc on each says what the OTHER one
+  # survives that it does not. Keep the two descs edited together.
+  - id: consistency-aggregator
+    name: "Consistency — all goatnets"
+    desc: >-
+      Compares every goatnet against the others and names the drift. Off-mesh,
+      so it goes dark when the WAN does.
+    fqdn: consistency.zagros-prod.goat.example
+    type: external
+    kind: ui
+    access: offmesh
+    category: external
+    icon: chart
+  - id: collab-home
+    name: "Collaboration workspace"
+    fqdn: collab.goat.example
+    type: external
+    kind: ui
+    access: offmesh
+    category: external
+    icon: portal
+    desc: >-
+      Chat, docs and files behind one collab sign-in. Password self-service for
+      that account is at idm.collab.goat.example.
+  - id: collab-chat
+    name: "Team chat (Zulip)"
+    desc: >-
+      Team chat, on the collab sign-in.
+    fqdn: chat.collab.goat.example
+    type: external
+    kind: ui
+    access: offmesh
+    category: external
+    icon: chat
+  - id: collab-docs
+    name: "Team docs (Outline)"
+    desc: >-
+      Team documents, on the collab sign-in.
+    fqdn: outline.collab.goat.example
+    type: external
+    kind: ui
+    access: offmesh
+    category: external
+    icon: docs
+  - id: collab-files
+    name: "Team files"
+    desc: >-
+      Shared file storage, on the collab sign-in.
+    fqdn: files.collab.goat.example
+    type: external
+    kind: ui
+    access: offmesh
+    category: external
+    icon: folder
+
+# ---------------------------------------------------------------------------
+# ansible_managed as a VARIABLE, not just a config option.
+#
+# `ansible_managed` is an ansible.cfg setting exposed to the `template` module's
+# render context. It is NOT in the ordinary variable namespace, so a
+# `copy:` task whose `content:` contains `{{ ansible_managed }}` fails
+# finalization with "'ansible_managed' is undefined" — every run, and the file
+# is never written.
+#
+# That is not hypothetical: it blocked the audit-subscriber deploy on
+# at `bound local-tail retention`, and the same pattern is live in
+# roles/goat-logship (1 site) and roles/netbird-client-pin (2 sites). Those
+# tasks have been failing silently-to-the-eye — loud in the play, but the role
+# simply never got that far — for as long as they have existed.
+#
+# Defining it here puts the name in the variable namespace, which fixes every
+# `copy: content:` use at once and leaves `template:` behaviour unchanged.
+# Deliberately a static string: the upstream default embeds {file}/{host}/{uid}
+# and a timestamp, and a timestamp in rendered content makes every run report
+# `changed` forever, which is how a fleet loses the signal value of `changed`.
+ansible_managed: "Ansible managed — edit the role, not this file (ops/ansible)"
+
+# --- Platform-admin access roster (bringup-access-invariant) ----------------
+# ONE roster of platform-admin SSH pubkeys that EVERY host build seeds into
+# BOTH the booted-OS login authorized_keys (mgmt-host-baseline.yml) AND the
+# dropbear initramfs (dropbear-initramfs role), so the golden path can never
+# hand back an encrypted box the operator who built it is locked out of — the
+# delta-obs-b lockout. Sourced from the env (newline-delimited
+# PLATFORM_ADMIN_SSH_PUBKEYS in .envrc.local.d/45-platform-admin-keys.envrc),
+# never a committed pubkey list (CI check-no-identity-spillage). See
+# docs/design/host-site-node-disk-encryption.md §"operator-access invariant".
+admin_authorized_keys: >-
+  {{ (lookup('env', 'PLATFORM_ADMIN_SSH_PUBKEYS') | default('', true)).split('\n')
+     | map('trim') | select | list }}
+
+# dropbear remote-unlock (ADR 0612) is fed the SAME roster and lives on :2222
+# (:2222 = boot-time unlock door, :22 = full-OS sshd). The role is invoked in
+# the bring-up for nodes with dropbear_remote_unlock: true.
+dropbear_authorized_keys: "{{ admin_authorized_keys }}"
+dropbear_initramfs_ssh_port: 2222

@@ -1,0 +1,68 @@
+---
+# pubsub-state-checkout-deploy.yml — deploy the Block 86 recovery-side warm
+# CHECKOUT (passive-node half) for ANY goatnet that has a passive mgmt node.
+# Site-agnostic: pass -e target=<group>. Recovery side of
+# docs/design/pubsub-state-as-code.md.
+#
+# Runs on the PASSIVE mgmt node only — router_role B. A flat goatnet with no
+# passive node has no router_role B, so this play is a no-op there (the mirror's
+# MinIO/Forgejo tiers are the recovery source in that topology).
+#
+# Cross-compiles a static linux/arm64 pubsub-apply on the control node and
+# stages it next to a warm checkout that a pull-timer keeps current. Never
+# reconciles — RECOVERY.md carries the failover one-liner.
+#
+# PRE-CONDITIONS: Forgejo repo populated (run pubsub-state-mirror-deploy.yml
+# first); FORGEJO_PUBSUB_TOKEN in the env; Go on the control node.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec usareur-af --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -e target=<group> pubsub-state-checkout-deploy.yml
+#   (add --limit <passive-node>,localhost to skip the active node)
+
+- name: Cross-compile pubsub-apply for arm64 (control node)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _apply_out: "/tmp/pubsub-apply-arm64-{{ target }}"
+  tasks:
+    - name: Build static linux/arm64 pubsub-apply
+      ansible.builtin.command:
+        cmd: go build -o "{{ _apply_out }}" ./cmd/pubsub-apply
+        chdir: "{{ playbook_dir }}/../goat-zenoh-portal"
+      environment:
+        GOOS: linux
+        GOARCH: arm64
+        CGO_ENABLED: "0"
+      changed_when: true
+
+    - name: Confirm it is an arm64 ELF
+      ansible.builtin.command: file "{{ _apply_out }}"
+      register: _file_out
+      changed_when: false
+      failed_when: "'ARM aarch64' not in _file_out.stdout"
+
+- name: Deploy warm recovery checkout (passive node)
+  hosts: "{{ target }}"
+  gather_facts: true
+  become: true
+  roles:
+    - role: pubsub-state-checkout
+      when: (router_role | default('')) == 'B'
+      vars:
+        pubsub_state_apply_binary_src: "/tmp/pubsub-apply-arm64-{{ target }}"
+
+  post_tasks:
+    - name: Echo recovery posture
+      when: (router_role | default('')) == 'B'
+      ansible.builtin.debug:
+        msg: |
+          Warm pubsub-state checkout live on {{ inventory_hostname }}.
+            Checkout : {{ pubsub_state_checkout_dir }}/repo
+            Binary   : {{ pubsub_state_checkout_dir }}/bin/pubsub-apply
+            Recovery : {{ pubsub_state_checkout_dir }}/RECOVERY.md
+            Timer    : pubsub-state-pull.timer

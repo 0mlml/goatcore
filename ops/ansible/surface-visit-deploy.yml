@@ -1,0 +1,102 @@
+---
+# surface-visit-deploy.yml — the per-visit attribution emitters (ADR 1163).
+#
+# WHAT THIS DEPLOYS. One small container per fenced door. Each tails that
+# door's oauth2-proxy request log, keeps the AUTHENTICATED requests, and
+# publishes each as an age-encrypted SurfaceVisitV1 onto
+# ops/audit/surface/<surface>/<actor>. The audit-subscriber persists it to the
+# MinIO governance tier; microscope's surface-visits adapter reads it back.
+#
+# WHY IT EXISTS. A Hydra consent grant is a STANDING record with a moving
+# handled_at — repeat visits collapse into one row, so it answers "has this
+# person reached brief, and when last" and can never answer "how many times".
+# This is the per-request half.
+#
+# PREREQUISITES, and each of them fails silently if skipped:
+#
+#   1. THE ROUTER MUST GRANT ops/audit/surface/**. The seed carries
+#      infra-w-surface-visit + the infra-surface-visit subject
+#      (CN=goat-surface-visit-trial-peer) with a write-only policy. On a
+#      goatnet whose live ACL has diverged from the seed, adding the three
+#      entries to the live config and SIGHUPing is the supported path — the
+#      portal's own renderer does exactly that. Do NOT set
+# goat_zenoh_allow_acl_rerender to force a re-render: that would
+# drop runtime-added portal rules.
+#
+#   2. THE LEAF MUST EXIST, with Subject CN=goat-surface-visit-trial-peer.
+#      That exact CN is the ACL subject match — Zenoh 1.9.0 has no URI-SAN
+#      matcher — so a leaf with any other CN connects cleanly and is denied on
+#      every publish, with no error anywhere. Mint per
+#      ops/enrollment/ca/<goatnet>/README.md and stage at
+#      {{ surface_visit_cert_dir }}.
+#
+#   3. THE DOORS MUST BE UP. An emitter resolves its log from the container
+#      oauth2-proxy-<surface>; without the door there is nothing to tail, and
+#      the role fails rather than running an emitter that reports zero visits.
+#
+# RUN:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini surface-visit-deploy.yml -l <console host>
+#
+# ROLLBACK: `docker compose -f /opt/surface-visit/docker-compose.yml down`, or
+# set surface_visit_enabled false and re-run. Nothing else changes — the doors
+# keep working and Hydra keeps recording the standing grant. What is lost is
+# per-visit granularity, not attribution.
+
+- name: Per-visit attribution emitters
+  hosts: all
+  become: false
+  gather_facts: true
+
+  pre_tasks:
+    - name: Guard — scoped by `-l <host>`, never by `-e target=`
+      ansible.builtin.assert:
+        that:
+          - target is not defined
+        fail_msg: >-
+          REFUSING: pass `-l <the console host>`. `-e target=` would widen this
+          to every host in the loaded inventory.
+      run_once: true
+      delegate_to: localhost
+
+    # The roster is read from the operator's own environment, never committed.
+    # Order is fixed so the rendered file is stable across runs and a diff means
+    # the roster actually changed.
+    - name: Assemble the operator age roster from the environment
+      ansible.builtin.set_fact:
+        surface_visit_age_recipients: >-
+          {{ [
+               lookup('env', 'DEV_CA_AGE_OPERATOR_1'),
+               lookup('env', 'DEV_CA_AGE_BREAK_GLASS'),
+             ] | select('match', '^age1') | list }}
+
+    - name: The roster must not be empty
+      ansible.builtin.assert:
+        that:
+          - surface_visit_age_recipients | length > 0
+        fail_msg: >-
+          No age recipients resolved from the environment. Source
+          .envrc.local.d/40-dev-ca-operators.envrc. This is a hard stop, not a
+          fallback: with no roster the only alternatives are publishing visit
+          history in the clear or emitting nothing, and both are worse than
+          refusing to start.
+      run_once: true
+
+  tasks:
+    - name: Deploy the emitters
+      ansible.builtin.include_role:
+        name: surface-visit
+      when: surface_visit_enabled | default(false) | bool
+
+  post_tasks:
+    - name: Where the visits go
+      ansible.builtin.debug:
+        msg: >-
+          Visits now land on ops/audit/surface/<surface>/<actor>, age-encrypted
+          to the operator roster. microscope's surface-visits adapter reads
+          counts and times from the key path; the per-request path and status
+          decrypt operator-side. A zero in that adapter is a WINDOW result, not
+          proof nobody came — pair it with the standing consent grant.
+      run_once: true

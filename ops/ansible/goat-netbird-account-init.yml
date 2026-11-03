@@ -1,0 +1,157 @@
+---
+# goat-netbird-account-init.yml — seed the per-goatnet netbird account's
+# baseline so a fresh standup is USABLE without hand-surgery.
+#
+# WHY THIS EXISTS: a netbird account cloned from another's end state, without
+# the first-login step, ships with NO policy (every peer isolated — Peers 0/0),
+# NO mesh-DNS nameserver group (peers get no resolver), and no owner. This
+# play codifies the account-level essential that is not a policy:
+#   Mesh-DNS nameserver group — pushes the per-site CoreDNS resolver
+#   (mesh_ip_a:5353) to peers for *.<site_dns_zone>.
+#
+# IT SEEDS NO POLICY (ADR 1185). It used to seed an enabled Default All<->All
+# `pol_<site_id>_default` on any site whose matrix entry did not declare
+# `delete`. A joiner with no matrix entry whose NetBird store is replicated
+# from another site would put that policy into the LIVE account: every peer
+# could reach every other on any port. A goatnet's reach comes only from the declared ACL, applied by
+# netbird-acl-cutover.yml at standup (goat-standup.sh phase 12); NetBird's own
+# Default is switched off in management.json (DisableDefaultPolicy).
+#
+# FOUNDERS ONLY. A joiner (goatnet_founder: false) shares the founder's account
+# through replication; every row this play writes lands in the founder's live
+# account. The play refuses to run on a joiner.
+#
+# It writes the nameserver group DIRECTLY into the netbird Postgres because the
+# REST API path needs a PAT, which needs an onboarded owner. The insert is
+# idempotent (ON CONFLICT DO NOTHING), writes only a FULL row in the
+# non-encrypted name_server_groups table, and never touches `users`
+# (ops/ci/check-netbird-user-sql.sh) or `policies` / `policy_rules`
+# (ops/ci/check-no-default-allow.sh).
+#
+# Owner promotion is deliberately NOT here, and on a CLEAN standup it is not
+# needed at all: netbird assigns the FIRST OIDC login as account Owner
+# (verified in the management source: a fresh account's creating user gets
+# UserRoleOwner). It creates no Default policy: management.json sets
+# DisableDefaultPolicy (ADR 1185). Forking an end-state netbird DB (an existing
+# owner-less account) is an anti-pattern; nothing in the
+# bootstrap forks a DB, so a from-empty standup self-owns on first login. If a
+# forked/recovery env genuinely needs promotion, the netbird REST API CANNOT do
+# it (only an existing owner can grant the owner role — management/server/
+# user.go), so the sole safe path is a role-ONLY UPDATE that never touches the
+# encrypted email/name columns: goat-netbird-owner-promote.yml. Hand-inserting
+# an owner row (or writing plaintext into the encrypted email/name columns)
+# POISONS enrollment — every peer-login `cannot scan NULL into *string` — and
+# takes the mesh down. This play only seeds the account-level,
+# user-agnostic baseline; it never writes the users table.
+#
+# Apply (reach the host over its mesh IP once enrolled, or a bastion):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     -l <mgmt-host> goat-netbird-account-init.yml
+
+- name: Seed netbird account baseline (mesh-DNS nameserver group; no policy — ADR 1185)
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    netbird_pg_container: "postgres-a"
+    netbird_pg_db: "netbird"
+    netbird_pg_user: "postgres"
+    # Distinct internal name: `mesh_coredns_port: "{{ mesh_coredns_port |
+    # default(5353) }}"` self-references (play vars shadow group_vars) and
+    # recurses under ansible-core's eager templating.
+    account_init_mesh_dns_port: "{{ mesh_coredns_port | default(5353) }}"
+    nb_mgmt_container: "management-a"
+
+  tasks:
+    # NOTE — enrollment-apex /etc/hosts hygiene is deliberately NOT auto-edited
+    # here. A `127.0.0.1 netbird.<zone>` that resolves the mgmt
+    # host's own enrollment to the local main Traefik, which 404s the mgmt gRPC,
+    # is a *consistency* bug, not "any loopback apex mapping is bad": the host's
+    # self-enrollment can legitimately override the apex to loopback AS LONG AS
+    # its management-url carries the local mgmt gRPC port (:8443) — that is the
+    # standup phase-8 design. Blindly stripping the mapping would break that
+    # valid local-enroll path. The apex resolution and the management-url port
+    # must AGREE; which strategy a goatnet standardizes on (apex->relay-IP with
+    # :443-relay-path, or apex->127.0.0.1 with :8443-local-mgmt) is a live call.
+    # See F-188 §"enrollment-apex trap" — a tracked follow-up, not auto-fixed.
+
+    # A joiner's NetBird store is the founder's, replicated (ADR 1084): a row
+    # written here is written into the founder's live account.
+    - name: Refuse on a joiner (its account belongs to the founder)
+      ansible.builtin.assert:
+        that:
+          - goatnet_founder | default(true) | bool
+        fail_msg: >-
+          {{ inventory_hostname }} is a joiner (goatnet_founder: false). Its
+          NetBird store replicates the founder's account, so anything this play
+          writes lands in the founder's live account. Joiners run nothing here;
+          goat-standup.sh skips this phase for them (ADR 1185, F-551).
+
+    - name: Resolve this goatnet's account_id + All-group id from the netbird store
+      ansible.builtin.shell: >-
+        docker exec {{ netbird_pg_container }} psql -U {{ netbird_pg_user }}
+        -d {{ netbird_pg_db }} -At -F'|'
+        -c "select a.id, g.id from accounts a join groups g on g.account_id=a.id and g.name='All' limit 1;"
+      register: nb_acct
+      changed_when: false
+
+    # Graceful skip (not a hard fail) so this play is safe to run as a phase of
+    # the site bootstrap. The netbird account is created on the operator's FIRST
+    # OIDC login; on a from-empty standup it does not exist until then, so during
+    # the bootstrap pass this play no-ops with a clear remediation and the
+    # standup proceeds. Re-run it (or the site refresh) after first login to seed.
+    - name: Note + skip if no account yet (first OIDC login not done — not a failure)
+      ansible.builtin.debug:
+        msg: |
+          No netbird account + 'All' group in {{ netbird_pg_container }} yet —
+          skipping the nameserver-group seed. This is expected before
+          the operator's first dashboard OIDC login (which creates the account +
+          owner). After logging in, re-run this play or zagros-refresh.yml to seed:
+            ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini \
+              -i inventory/mgmt-hosts-mesh.ini -l {{ inventory_hostname }} \
+              goat-netbird-account-init.yml
+      when: nb_acct.stdout | trim | length == 0
+
+    - name: Set account + group facts
+      ansible.builtin.set_fact:
+        nb_account_id: "{{ nb_acct.stdout.split('|')[0] | trim }}"
+        nb_all_group_id: "{{ nb_acct.stdout.split('|')[1] | trim }}"
+      when: nb_acct.stdout | trim | length > 0
+
+    - name: Seed mesh-DNS nameserver group (idempotent; no policy — ADR 1185)
+      ansible.builtin.shell: |
+        docker exec -i {{ netbird_pg_container }} psql -U {{ netbird_pg_user }} -d {{ netbird_pg_db }} <<SQL
+        BEGIN;
+        -- Mesh-DNS nameserver group -> per-site CoreDNS at mesh_ip_a:5353 for *.<site_dns_zone>
+        INSERT INTO name_server_groups (id, account_id, name, description, name_servers, groups,
+                "primary", domains, enabled, search_domains_enabled)
+        VALUES ('nsgrp_{{ site_id }}_mesh_dns','{{ nb_account_id }}','{{ site_id }}-mesh-dns',
+                'Mesh DNS — resolves *.{{ site_dns_zone }} via {{ site_id }} CoreDNS ({{ site_id }} account-init seed).',
+                '[{"IP":"{{ mesh_ip_a }}","NSType":1,"Port":{{ account_init_mesh_dns_port }}}]',
+                '["{{ nb_all_group_id }}"]', false, '["{{ site_dns_zone }}"]', true, false)
+        ON CONFLICT (id) DO NOTHING;
+        COMMIT;
+        SQL
+      register: nb_seed
+      changed_when: "'INSERT 0 1' in nb_seed.stdout"
+      when: nb_acct.stdout | trim | length > 0
+
+    - name: Reload netbird management so it picks up the seeded account state
+      ansible.builtin.command: "docker restart {{ nb_mgmt_container }}"
+      when: nb_seed.changed | default(false)
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          netbird account-init for {{ site_id }} (account {{ nb_account_id }}):
+            Default policy:      none (ADR 1185 — reach comes from the declared ACL only)
+            mesh-DNS nameserver: nsgrp_{{ site_id }}_mesh_dns -> {{ mesh_ip_a }}:{{ account_init_mesh_dns_port }} for *.{{ site_dns_zone }}
+            changed:             {{ nb_seed.changed }}
+          Owner: a from-empty standup self-owns — netbird makes the FIRST OIDC
+          login the account Owner. Manual promotion is a RECOVERY action only
+          (forked/owner-less DB); use goat-netbird-owner-promote.yml — never a
+          raw users-table write (see docs/findings/F-188).
+      when: nb_acct.stdout | trim | length > 0

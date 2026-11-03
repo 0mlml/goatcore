@@ -1,0 +1,86 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# assert-portal-key-accepted.yml — prove a surface's portal credential works,
+# at deploy time, before the deploy is allowed to report success.
+#
+# WHY THIS EXISTS. A surface can present the portal a key it does not accept,
+# when the per-goatnet variable it renders from is not the one the portal builds
+# its accepted set from. Every call returns 401, and panoscope then cannot fetch
+# the slot-alias registry and draws raw anchors instead of names.
+#
+# Nothing else catches it, and the reason is the point of this file:
+#
+#   * The failure is a WARNING. Each surface logs "refresh failed; keeping
+#     prior registry" and carries on serving.
+#   * The fallback CONCEALS it. Keeping the prior registry is sound until a
+#     restart, after which there is no prior registry — so the degradation is
+#     total while the container stays healthy and the deploy reports success.
+#   * So a broken credential and a quiet fabric look identical from outside.
+#
+# Finding it by accident is not a detection mechanism.
+#
+# This is. The deploy now asks the portal, with the key the surface will
+# actually present, whether it is accepted — and fails the play if it is not.
+#
+# Retries because the portal re-reads its service-key store on an interval
+# (PORTAL_OPERATOR_API_KEYS_RELOAD, 30s by default): a key registered moments
+# ago is legitimately not live yet, and failing on the first 401 would make
+# first deploys flaky for a reason that is not a fault.
+#
+# Callers set:
+#   portal_key_assert_service  — name, for the message
+#   portal_key_assert_url      — the portal base URL
+#   portal_key_assert_key      — the bearer the surface will present
+#
+# A caller that cannot reach the portal at all (no route, portal down) gets a
+# clear failure too: that is also a deploy whose result would otherwise be a
+# surface quietly serving nothing.
+
+- name: "{{ portal_key_assert_service }} | portal key — refuse to be a no-op"
+  # A check that can silently not run is worth less than no check, because it
+  # reads as a pass. This fired for real: panoscope's caller named a variable
+  # that did not exist, the `when` defaulted it to empty, the assertion skipped,
+  # and the deploy reported success having proved nothing.
+  ansible.builtin.assert:
+    that:
+      - portal_key_assert_url | default('') | length > 0
+      - portal_key_assert_key | default('') | length > 0
+    fail_msg: >-
+      {{ portal_key_assert_service }}: the portal-key assertion was invoked with
+      no URL or no key ("{{ portal_key_assert_url | default('') }}"). That means
+      the caller passed a variable that does not exist. Fix the caller — do not
+      relax this, or the check becomes decoration.
+    quiet: true
+
+- name: "{{ portal_key_assert_service }} | portal key — ask the portal whether it accepts this key"
+  ansible.builtin.uri:
+    url: "{{ portal_key_assert_url }}/api/aliases"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ portal_key_assert_key }}"
+    status_code: [200]
+    timeout: 15
+    validate_certs: false
+  register: portal_key_assert_probe
+  until: portal_key_assert_probe.status == 200
+  retries: 12
+  delay: 5
+  changed_when: false
+  no_log: true
+  failed_when: false
+
+- name: "{{ portal_key_assert_service }} | portal key — fail the deploy if it does not"
+  ansible.builtin.fail:
+    msg: >-
+      {{ portal_key_assert_service }} cannot authenticate to the portal at
+      {{ portal_key_assert_url }} — it answered
+      {{ portal_key_assert_probe.status | default('no response') }} after 60s of
+      retries. The surface would still START and still look healthy: it logs a
+      refresh warning, keeps whatever registry it already had, and after a
+      restart that registry is EMPTY — so it would serve raw identifiers with
+      no names and report nothing wrong. That is F-559, and it went unnoticed
+      for weeks on three surfaces because nothing asked this question.
+      Check that the role registered its key in the portal's service-key
+      directory and that the portal has re-read it (30s), then re-run.
+  when: portal_key_assert_probe.status | default(0) != 200

@@ -1,0 +1,49 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# minio-console-deploy.yml — expose the MinIO web console behind native Ory
+# (Hydra) OIDC SSO + a mesh-only Traefik route. Idempotent; re-runs upsert
+# the Hydra client, re-render the compose + Traefik overlay, and recreate the
+# minio container so the MINIO_IDENTITY_OPENID_* env takes effect.
+#
+# Block: minio-ory-console. Runbook (deploy + live-verify checklist):
+#   the MinIO console runbook.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     <SITE>_MINIO_ROOT_USER=... <SITE>_MINIO_ROOT_PASSWORD=... \
+#     <SITE>_MINIO_OIDC_CLIENT_SECRET=$(openssl rand -hex 32) \
+#     ansible-playbook -i inventory/mgmt-hosts-mesh.ini \
+#     -e target=<site>_hosts minio-console-deploy.yml
+#
+# Pre-flight (operator-side):
+#   1. MinIO already deployed on the target (this just adds OIDC + the route).
+#   2. <SITE>_MINIO_OIDC_CLIENT_SECRET set (32+ hex chars; 1Password-backed,
+#      fresh per site). The minio-oidc-client role asserts it.
+#   3. The target's Hydra is up and its admin API reachable on
+#      minio_oidc_hydra_admin (default http://127.0.0.1:4447 — confirm the
+#      site publishes the Hydra admin port there; override in group_vars if
+#      not).
+#   4. minio.<site>.<zone> is in the site's Let's Encrypt cert SAN list (the
+# mesh-only cert). Re-render the Traefik ACME cert with the new
+#      host before this playbook so the route serves a valid cert.
+#   5. The mesh DNS record minio.<site> is published (ops/dns/<site>/mesh-hosts
+#      + a CoreDNS sync) so the hostname resolves on the mesh.
+#
+# After this runs, re-run isitup-deploy.yml on the same host so the new
+# "MinIO Console" row + the minio-net join take effect on the status page.
+
+- name: "minio-console | provision Hydra OAuth2 client"
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+  roles:
+    - minio-oidc-client
+
+- name: "minio-console | re-apply MinIO with OIDC + Traefik console route"
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - minio

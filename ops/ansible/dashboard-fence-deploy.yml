@@ -1,0 +1,137 @@
+---
+# dashboard-fence-deploy.yml — the oauth2-proxy fences in front of the NetBird
+# dashboard, for any goatnet. Runs AFTER dashboard-deploy.yml.
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       dashboard-fence-deploy.yml -e target=<site>_hosts
+#
+# Play 1 — the everyday fence (Block 83C.2-L7): Hydra client
+#   `oauth2-proxy-dashboard` + container `oauth2-proxy-dashboard` in front of
+#   dashboard:80, admitting `dashboard_oauth2_proxy_allowed_groups`.
+# Play 2 — the admin fence, only when `netbird_dashboard_split_enabled`
+#   (docs/design/mesh-change-control.md §2, ADR 1189): Hydra client
+#   `oauth2-proxy-dashboard-admin` + container `oauth2-proxy-dashboard-admin`
+#   in front of dashboard-admin:80 at admin-dashboard.<site>, admitting
+#   `dashboard_admin_oauth2_proxy_allowed_groups` (NETBIRD-ADMIN). The SAME two
+#   roles as play 1 with different values; separate plays so each instance's
+#   handlers run with its own values.
+#
+# The pre-flight below checks the dashboard was rendered for THIS goatnet, not
+# merely that SOME `dashboard` container is running: a reused host can keep a
+# stale container whose dashboard.env points at another goatnet's mgmt and Hydra.
+#
+# Traefik routes (mgmt-dynamic.yml.j2) come from traefik-acme.yml; mesh names
+# from the isitup_services rows via ops/dns/generate-mesh-hosts.py.
+
+- name: Dashboard fence — everyday address (oauth2-proxy-dashboard)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    admin_write_surface: "oauth2-proxy-dashboard (fence in front of the NetBird dashboard)"
+
+  pre_tasks:
+    - name: "Guard — admin surfaces are single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+
+    - name: Verify Ory Hydra is running (admin port reachable on loopback)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}/health/ready"
+        status_code: [200]
+
+    - name: Verify the netbird-dashboard container is up
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml -f /opt/mgmt-host/docker-compose.dashboard.yml ps -q dashboard
+      register: dashboard_check
+      changed_when: false
+      failed_when: dashboard_check.stdout == ""
+
+    # F-566. Reads the one identity line; the file also holds the OIDC secret.
+    - name: Read which goatnet the dashboard was rendered for
+      ansible.builtin.command:
+        cmd: grep -E '^NEXTAUTH_URL=' /opt/mgmt-host/dashboard.env
+      register: dashboard_rendered_for
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse to fence a dashboard rendered for another goatnet
+      ansible.builtin.assert:
+        that:
+          - dashboard_rendered_for.stdout | trim == ('NEXTAUTH_URL=https://dashboard.' ~ site_id ~ '.' ~ site_dns_zone)
+        fail_msg: >-
+          /opt/mgmt-host/dashboard.env says
+          "{{ dashboard_rendered_for.stdout | default('') | trim or 'no NEXTAUTH_URL line' }}",
+          not https://dashboard.{{ site_id }}.{{ site_dns_zone }}. The dashboard
+          behind this fence was rendered for another goatnet (or not at all).
+          Run dashboard-deploy.yml -e target={{ target }} first, then re-run this.
+        quiet: true
+
+  roles:
+    - role: oauth2-proxy-dashboard-oidc-client
+      vars:
+        oauth2_proxy_dashboard_oidc_client_secret: "{{ dashboard_oauth2_proxy_client_secret }}"
+    - role: oauth2-proxy-dashboard
+
+- name: Dashboard fence — admin address (oauth2-proxy-dashboard-admin)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    admin_write_surface: "oauth2-proxy-dashboard-admin (fence in front of the NetBird admin dashboard)"
+    _admin_fqdn: "admin-dashboard.{{ site_id }}.{{ site_dns_zone }}"
+
+    # oauth2-proxy-dashboard-oidc-client, second client.
+    oauth2_proxy_dashboard_oidc_client_id: oauth2-proxy-dashboard-admin
+    oauth2_proxy_dashboard_oidc_client_name: "oauth2-proxy-dashboard-admin ({{ site_id }})"
+    oauth2_proxy_dashboard_oidc_redirect_uri: "https://{{ _admin_fqdn }}/oauth2/callback"
+    oauth2_proxy_dashboard_oidc_client_secret: "{{ dashboard_admin_oauth2_proxy_client_secret | default('') }}"
+
+    # oauth2-proxy-dashboard, second instance.
+    dashboard_oauth2_proxy_service: oauth2-proxy-dashboard-admin
+    dashboard_oauth2_proxy_compose_src: docker-compose.oauth2-proxy-dashboard-admin.yml
+    dashboard_oauth2_proxy_compose_file: /opt/mgmt-host/docker-compose.oauth2-proxy-dashboard-admin.yml
+    dashboard_oauth2_proxy_envfile: /opt/mgmt-host/oauth2-proxy-dashboard-admin.env
+    dashboard_oauth2_proxy_env_prefix: OAUTH2_PROXY_DASHBOARD_ADMIN
+    dashboard_oauth2_proxy_upstream: "http://dashboard-admin:80"
+    dashboard_oauth2_proxy_host_port: 4184
+    dashboard_oauth2_proxy_fqdn: "{{ _admin_fqdn }}"
+    dashboard_oauth2_proxy_cookie_domain: "{{ _admin_fqdn }}"
+    dashboard_oauth2_proxy_oidc_client_id: oauth2-proxy-dashboard-admin
+    dashboard_oauth2_proxy_allowed_groups: "{{ dashboard_admin_oauth2_proxy_allowed_groups }}"
+    dashboard_oauth2_proxy_client_secret: "{{ dashboard_admin_oauth2_proxy_client_secret | default('') }}"
+    dashboard_oauth2_proxy_cookie_secret: "{{ dashboard_admin_oauth2_proxy_cookie_secret | default('') }}"
+
+  pre_tasks:
+    - name: Nothing to do unless the dashboard split is on
+      ansible.builtin.meta: end_host
+      when: not (netbird_dashboard_split_enabled | default(false) | bool)
+
+    - name: "Guard — admin surfaces are single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+
+    - name: Verify the dashboard-admin container is up (dashboard-deploy.yml with the split on)
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml -f /opt/mgmt-host/docker-compose.dashboard-admin.yml ps -q dashboard-admin
+      register: dashboard_admin_check
+      changed_when: false
+      failed_when: dashboard_admin_check.stdout == ""
+
+    # An empty allowed-groups list makes oauth2-proxy admit any login — the
+    # opposite of what the admin address is for.
+    - name: The admin fence names the groups it admits
+      ansible.builtin.assert:
+        that:
+          - dashboard_admin_oauth2_proxy_allowed_groups | default('') | trim | length > 0
+        fail_msg: >-
+          dashboard_admin_oauth2_proxy_allowed_groups is empty, which would
+          admit every login to the write address. Set it (NETBIRD-ADMIN,
+          mesh-change-control.md §2).
+        quiet: true
+
+  roles:
+    - role: oauth2-proxy-dashboard-oidc-client
+    - role: oauth2-proxy-dashboard

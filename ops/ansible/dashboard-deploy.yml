@@ -1,0 +1,377 @@
+---
+# dashboard-deploy.yml — Block 21D.1 first 21D OIDC consumer wire-up.
+# Runs AFTER ory-deploy.yml (Hydra must be up to provision the OIDC client).
+# Idempotent — re-runs upsert the OIDC client and re-render dashboard.env.
+#
+# Single-active deployment matching ory-deploy.yml shape: dashboard runs
+# only on Router-A. On A→B failover, dashboard goes down with the rest
+# of the mgmt-stack until A is restored or B is operator-promoted.
+#
+# Required group_vars (in group_vars/<site>_hosts/vars.yml or via -e):
+#   site_id                                  per-site identifier
+#   site_dns_zone                            mesh DNS zone (e.g. <site_dns_zone>)
+#   netbird_dashboard_oidc_client_secret     env-sourced via lookup; ≥16 chars
+#                                            (1Password-backed, exported from
+#                                            .envrc.local)
+#
+# Pre-flight (operator-fired BEFORE running this playbook):
+#   1. Ory deployed at this site (ory-deploy.yml ran successfully).
+#   2. Mesh-internal hostname renumber complete (group_vars/<site>_hosts/
+#      vars.yml has site_dns_zone: <site_dns_zone> for prod sites).
+#   3. TLS leaf cert minted for dashboard.<site>.<site_dns_zone> via
+#      cert-sign on operator laptop:
+#        cd ops/enrollment
+#        ./cert-sign --eku serverAuth \
+#          --cn dashboard.<site>.<site_dns_zone> \
+#          --san dashboard.<site>.<site_dns_zone> \
+#          --san <wg-cp0-ip-of-orin-A> \
+#          --san 127.0.0.1 \
+#          --out-cert ~/.goat/state/<site>/dashboard-a-cert.pem \
+#          --out-key ~/.goat/state/<site>/dashboard-a-key.pem
+#      (the required root-CA flags are elided: --root-cert, --root-key,
+#      --age-identity, --ca-id, --site-id — see cert-sign --help)
+#   4. NETBIRD_DASHBOARD_<SITE>_DASHBOARD_OIDC_CLIENT_SECRET env var set
+#      (32+ chars; one-time generation via `openssl rand -base64 32`,
+#      stored in 1Password under "Dashboard OIDC client secret — <site>").
+#
+# Apply pattern:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -l <mgmt-host> dashboard-deploy.yml \
+#       -e postgres_superuser_password="$PG_PASS"
+#
+# Cross-refs:
+# - docs/project/implementation-plan.md Block 21D.1
+# - docs/operations/dashboard-bringup.md (full operator runbook)
+# - ADR 0411 — Ory IdP MVP (the OIDC server this dashboard consumes)
+# - ADR 1010 — Ory-on-Spock mindful operation (single-active per D1)
+# - ADR 0407 — internal X.509 CA (dashboard TLS leaf cert chain)
+
+- name: Deploy netbird-dashboard to mgmt-host
+  # Was `hosts: all`. Imported by site-services.yml that fans out to every host
+  # in the inventory, so it can reach unrelated goatnets. `-l` is not a fix: this
+  # playbook's own guard
+  # rejects `-e target=` under `-l`, so the two conventions cannot both be
+  # satisfied. Defaulting to `all` keeps every existing caller working.
+  hosts: "{{ target | default('all') }}"
+  become: true
+  # Facts required: the ADR 1060 deploy-ledger row stamps
+  # ansible_facts.date_time (it crashes with gather_facts: false).
+  gather_facts: true
+
+  vars:
+    admin_write_surface: "netbird-dashboard (mesh policy / group / setup-key writes)"
+
+  pre_tasks:
+    # FIRST, before the loopback health checks. The header above already says
+    # "dashboard runs only on Router-A" — this is the thing that makes that
+    # true rather than merely stated. `hosts: all` + a two-Orin group and no
+    # `-l` puts a second mesh-admin dashboard on Orin-B; Ory answers on
+    # loopback there too, so the checks below would not catch it.
+    # ADR 1084 §D3.
+    - name: "Guard — admin surfaces are single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+
+    - name: Verify Ory Hydra is running (admin port reachable on loopback)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:4445/health/alive"
+        status_code: [200]
+      register: hydra_alive
+
+    - name: Verify the Traefik service is up (mgmt-host base stack alive)
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml ps -q traefik
+      register: traefik_check
+      changed_when: false
+      failed_when: traefik_check.stdout == ""
+
+    # Delivery (#387). On a traefik_services: [] site nothing else puts the
+    # pair on the host: site-bootstrap.yml skips Phase 2.5 there. When the
+    # controller holds the pair (goat_leaf: the manifest out_dir, then the old
+    # in-checkout copy, #2165), install it with the
+    # modes docs/operations/mgmt-stack-cert-rotation.md Step 2 uses. No pair
+    # on the controller = no change, and the check below still decides.
+    - name: Look for the dashboard TLS pair on the controller
+      ansible.builtin.stat:
+        path: "{{ ('dashboard-' ~ (router_role | lower) ~ '-' ~ item ~ '.pem') | goat_leaf(site_id) }}"
+      delegate_to: localhost
+      become: false
+      register: dashboard_src_stat
+      loop: [cert, key]
+      when: (dashboard_cert_delivery_mode | default('file')) == 'file'
+
+    - name: Deliver the dashboard TLS pair from the controller
+      when:
+        - (dashboard_cert_delivery_mode | default('file')) == 'file'
+        - dashboard_src_stat.results | selectattr('stat', 'defined') | selectattr('stat.exists') | list | length == 2
+      block:
+        - name: Ensure the dashboard TLS directory exists
+          ansible.builtin.file:
+            path: "/etc/goat/tls/dashboard-{{ router_role | lower }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Install the dashboard TLS cert and key
+          ansible.builtin.copy:
+            src: "{{ ('dashboard-' ~ (router_role | lower) ~ '-' ~ item.name ~ '.pem') | goat_leaf(site_id) }}"
+            dest: "/etc/goat/tls/dashboard-{{ router_role | lower }}/{{ item.name }}.pem"
+            owner: root
+            group: root
+            mode: "{{ item.mode }}"
+          loop:
+            - {name: cert, mode: "0644"}
+            - {name: key, mode: "0400"}
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: "{{ item.name == 'key' }}"
+
+    # Cert delivery is offline-CA-leaf by default (Block 22J / ADR 0407).
+    # Sites whose Traefik mints certs via ACME (Let's Encrypt + Cloudflare
+    # DNS-01) opt out
+    # by setting `dashboard_cert_delivery_mode: acme` in group_vars. In ACME
+    # mode the cert is owned by Traefik (/letsencrypt/acme.json), not laid
+    # down at /etc/goat/tls/, so the file-existence pre-flight is
+    # the wrong gate. Traefik mints the cert SANs via tls.domains in the
+    # site's dynamic config (mgmt-dynamic.yml.j2); on a
+    # rendered fresh dashboard hostname the cert reissue happens on next
+    # Traefik reload.
+    - name: Verify dashboard TLS leaf cert is delivered to host
+      ansible.builtin.stat:
+        path: "/etc/goat/tls/dashboard-{{ router_role | lower }}/cert.pem"
+      register: dashboard_cert_stat
+      when: (dashboard_cert_delivery_mode | default('file')) == 'file'
+
+    - name: Fail loud with operator path when cert missing
+      ansible.builtin.fail:
+        msg: |
+          Dashboard TLS leaf cert not found at
+          /etc/goat/tls/dashboard-{{ router_role | lower }}/cert.pem.
+
+          Mint via cert-sign on operator laptop, then deliver the pair.
+
+          GB-071: this play installs the pair itself when the controller holds it at
+          {{ ('dashboard-' ~ (router_role | lower) ~ '-cert.pem') | goat_leaf(site_id) }}
+          (the site manifest's out_dir; mint it with
+          {{ ('dashboard-' ~ (router_role | lower) ~ '-cert.pem') | goat_leaf_mint(site_id) }}
+          when the manifest lists a dashboard-{{ router_role | lower }} leaf), then re-run this play.
+          {% if (traefik_services | default([]) | length) > 0 %}
+          This site lists traefik_services, so site-bootstrap.yml Phase 2.5
+          delivers every cert_src / key_src named there: add the dashboard
+          pair to that list if it is missing, then re-run site-bootstrap.yml.
+          {% else %}
+          This site's traefik_services is empty, so site-bootstrap.yml SKIPS
+          Phase 2.5 and re-running it delivers nothing. Use the controller
+          path above, or deliver by hand per
+          docs/operations/mgmt-stack-cert-rotation.md "Step 2 — Push the
+          new cert + key" (install the cert 0644 and the key 0400, root-owned,
+          into /etc/goat/tls/dashboard-{{ router_role | lower }}/).
+          {% endif %}
+
+          Mint:
+
+            cd ops/enrollment
+            ./cert-sign --eku serverAuth \
+              --cn dashboard.{{ site_id }}.{{ site_dns_zone }} \
+              --san dashboard.{{ site_id }}.{{ site_dns_zone }} \
+          {% if netbird_dashboard_split_enabled | default(false) | bool %}
+              --san admin-dashboard.{{ site_id }}.{{ site_dns_zone }} \
+              --san mgmt-read.{{ site_id }}.{{ site_dns_zone }} \
+          {% if warrant_membership_enabled | default(false) | bool %}
+              --san mgmt-admin.{{ site_id }}.{{ site_dns_zone }} \
+          {% endif %}
+          {% endif %}
+              --san {{ ansible_host }} \
+              --san 127.0.0.1 \
+              --out-cert ~/.goat/state/{{ site_id }}/dashboard-{{ router_role | lower }}-cert.pem \
+              --out-key ~/.goat/state/{{ site_id }}/dashboard-{{ router_role | lower }}-key.pem
+            (plus the required root-CA flags: --root-cert, --root-key,
+            --age-identity, --ca-id, --site-id — see cert-sign --help)
+
+          See docs/operations/dashboard-bringup.md §"Step 2 — mint a unified
+          TLS leaf cert" for
+          the full command + signing-host posture.
+
+          Sites whose Traefik mints via ACME (Let's Encrypt) skip this
+          pre-flight — set `dashboard_cert_delivery_mode: acme` in
+          group_vars/<site>_hosts/vars.yml.
+      when:
+        - (dashboard_cert_delivery_mode | default('file')) == 'file'
+        - not dashboard_cert_stat.stat.exists
+
+  # With netbird_dashboard_split_enabled the role also runs the admin
+  # dashboard container (mesh-change-control.md §2). Its fence, and the
+  # everyday dashboard's, are dashboard-fence-deploy.yml — run it next.
+  roles:
+    - netbird-dashboard
+
+  post_tasks:
+    # ===================================================================
+    # Block 21D.1.c — first-admin auto-promotion in netbird-mgmt's
+    # `users` table. Closes the F-079 turnkey gap that previously
+    # required Claude/operator-fired SQL after first login.
+    #
+    # Trigger: a netbird user-row exists (created by F-079 auto-create-
+    # on-first-JWT after first OIDC sign-in) AND there are zero admins.
+    #
+    # Promotion rule: the EARLIEST non-service user becomes admin.
+    # This works because:
+    #   - dashboard-deploy.yml's `site_admins:` provisions Kratos
+    #     identities with known emails; only those identities can log
+    #     in (registration disabled).
+    #   - On first login by the first admin, F-079 creates exactly one
+    #     `users` row. SQL promotes it.
+    #   - Subsequent logins by additional site_admins create more rows
+    #     with role='user'; those rows are NOT auto-promoted by this
+    #     task (they get promoted via the dashboard UI by the first
+    #     admin). Avoids the "second self-signup race-promotes a bad
+    #     actor" attack surface even if registration is ever enabled.
+    #
+    # Idempotent:
+    #   - Re-runs after first admin exists → COUNT(admins) > 0 → no-op.
+    #   - Pre-first-login → users table empty → UPDATE matches 0 rows.
+    #
+    # Operator workflow on a fresh site:
+    #   1. ory-deploy.yml runs → site_admins identities in Kratos +
+    #      bootstrap passwords on disk.
+    #   2. dashboard-deploy.yml runs → SQL fires but matches 0 rows
+    #      (no one logged in yet). Operator sees the debug task's
+    #      "log in first" hint.
+    #   3. Operator logs in via browser with bootstrap password.
+    #      F-079 auto-creates netbird users row with role='user'.
+    #   4. Operator re-runs dashboard-deploy.yml (or invokes the
+    #      first-admin-promote.yml mini-playbook). SQL promotes the
+    #      earliest non-service user to admin.
+    #   5. Refresh browser → full admin UI.
+    # ===================================================================
+    - name: first-admin | Check netbird user/admin count
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - postgres-a
+          - psql
+          - -U
+          - postgres
+          - -d
+          - netbird
+          - -tAc
+          - >-
+            SELECT
+              COUNT(*) FILTER (WHERE NOT COALESCE(is_service_user, false)),
+              COUNT(*) FILTER (WHERE role = 'admin' AND NOT COALESCE(is_service_user, false))
+            FROM users;
+      register: user_count_query
+      changed_when: false
+      when: site_admins | default([]) | length > 0
+
+    - name: first-admin | Parse user/admin counts
+      ansible.builtin.set_fact:
+        netbird_user_count: "{{ ((user_count_query.stdout | default('0|0')).split('|') | first) | int }}"
+        netbird_admin_count: "{{ ((user_count_query.stdout | default('0|0')).split('|') | last) | int }}"
+      when:
+        - site_admins | default([]) | length > 0
+        - user_count_query is defined
+        - user_count_query.stdout is defined
+
+    - name: first-admin | Promote earliest non-service user to admin (idempotent)
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - postgres-a
+          - psql
+          - -U
+          - postgres
+          - -d
+          - netbird
+          - -c
+          - >-
+            UPDATE users SET role = 'admin'
+            WHERE id = (
+              SELECT id FROM users
+              WHERE NOT COALESCE(is_service_user, false)
+              ORDER BY created_at ASC LIMIT 1
+            )
+            AND role = 'user';
+      register: first_admin_promote
+      changed_when: "'UPDATE 1' in first_admin_promote.stdout"
+      when:
+        - site_admins | default([]) | length > 0
+        - netbird_user_count is defined
+        - (netbird_user_count | int) > 0
+        - (netbird_admin_count | int) == 0
+
+    # ===================================================================
+    # F-129 — Kratos `groups` → netbird-mgmt `role` reconciler.
+    #
+    # DELIBERATELY NOT HERE ANYMORE. This used to be an inline four-task
+    # block; it now lives in `roles/netbird-admin-reconcile` as a systemd
+    # timer, installed by `netbird-admin-reconcile.yml`.
+    #
+    # Why it moved, and why re-adding it here would be a regression:
+    #   1. Inline, it ran ONLY when someone deployed the dashboard. A person
+    #      onboarded between deploys kept correct Ory groups and zero NetBird
+    #      rights, with no signal anywhere.
+    #   2. Every inline task was gated on `site_admins | length > 0`. That was
+    # a proxy for "this site has Ory" and it was the WRONG proxy: a goatnet can
+    # seed no site_admins (founding its NetBird account from the operator's own
+    # first dashboard login), which leaves the whole feature silently inert.
+    #
+    # The timer reconciles every `netbird_admin_reconcile_interval` (5min
+    # default) on every goatnet with nobody in the loop, and it never demotes
+    # the account owner. `netbird_mgmt_admin_groups` still selects which Kratos
+    # groups entitle the netbird `admin` role; it is now read by the role.
+    #
+    # Install/refresh + run once on demand:
+    #   ansible-playbook netbird-admin-reconcile.yml -e target=<site>_hosts
+    # ===================================================================
+
+    - name: first-admin | Summary + operator-fired next steps
+      ansible.builtin.debug:
+        msg: |
+          {% set users = netbird_user_count | default(0) | int %}
+          {% set admins = netbird_admin_count | default(0) | int %}
+          {% set promoted = first_admin_promote is defined and first_admin_promote.changed %}
+          {% if site_admins | default([]) | length == 0 %}
+          (skipped: no site_admins configured in group_vars)
+          {% elif users == 0 %}
+          ============================================================
+          DASHBOARD UP — first-login pending.
+          ============================================================
+          No netbird user-rows exist yet (no one has signed in).
+          Workflow:
+            1. SSH to {{ inventory_hostname }} and read the bootstrap
+               password file:
+                 sudo cat /opt/mgmt-host/.bootstrap-passwords/<email>.txt
+            2. Browse to https://dashboard.{{ site_id }}.{{ site_dns_zone }}/
+            3. Log in with email + bootstrap password.
+            4. Refresh the browser → full admin UI; change password via
+               account-settings; sudo rm the bootstrap-password file.
+          Role promotion needs NO playbook re-run: the
+          netbird-admin-reconcile timer promotes any Kratos identity
+          holding {{ netbird_mgmt_admin_groups | default(['PLATFORM-ADMIN']) }}
+          within {{ netbird_admin_reconcile_interval | default('5min') }} of
+          that first sign-in. If it has not, check on the host:
+            systemctl list-timers netbird-admin-reconcile.timer
+            journalctl -u netbird-admin-reconcile.service -n 20
+          ============================================================
+          {% elif promoted %}
+          ============================================================
+          BOOTSTRAP ADMIN PROMOTED — earliest non-service user → admin.
+          ============================================================
+          Refresh the dashboard browser tab to pick up the new role;
+          /api/policies + /api/users should now return 200.
+
+          Every SUBSEQUENT admin is handled by the netbird-admin-reconcile
+          timer, not by this playbook.
+          ============================================================
+          {% else %}
+          (netbird users={{ users }}, admins={{ admins }}; bootstrap-promote
+           not needed. Ongoing Kratos→netbird role sync belongs to the
+           netbird-admin-reconcile timer — see
+           `ansible-playbook netbird-admin-reconcile.yml -e target=<site>_hosts`)
+          {% endif %}
+      when: site_admins | default([]) | length > 0

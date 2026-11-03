@@ -1,0 +1,51 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy / refresh the ntp-health-agent (host systemd daemon) on a trial-fabric
+# host (ADR 1037, F-184 — docs/design/universal-ntp-hygiene.md §4). The agent
+# reads chrony's verdict over the local control socket and serves a signed
+# attestation on :9753/health, which goat-ntp-health-pub then republishes on
+# ops/time/attest/<host_id>.
+#
+# WHY a standalone playbook: the ntp-health-agent role normally runs only inside
+# site-bootstrap.yml (Phase 1A, after ntp-hygiene installs chrony). Refreshing
+# just the agent binary + unit on an already-bootstrapped host (e.g. to ship a
+# rebuilt signing-capable binary) does not warrant a full bootstrap. This is the
+# agent analogue of ntp-health-pub-deploy.yml.
+#
+# Prerequisite: chrony is already installed + synchronising on the target (the
+# ntp-hygiene role, part of bootstrap). This play deploys ONLY the agent.
+#
+# Run from any laptop on the netbird mesh, from your track worktree (off latest
+# main — so the role copies the freshly-built binary + current unit template):
+#
+#   cd ops/time-hygiene && make build      # builds bin/linux-{amd64,arm64}/ntp-health-agent
+#   cd ../ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       ntp-health-agent-deploy.yml
+#
+#   # ZAGROS sibling goatnet:  add  -e target=zagros_hosts
+#
+# The role asserts the installed binary supports -attestation-key before
+# enabling the signed-attestation gate (ntp_health_agent_attestation_enabled,
+# default true), then smoke-tests :9753/health. After it returns, confirm the
+# verdict is real (NOT ntp_class=unknown) and signed:
+#
+#   ssh goat@<host> 'curl -s localhost:9753/health | jq "{ntp_class_str, attested, selected_source, stratum}"'
+#
+# A pre-2026-06-11 binary bound its chrony client socket in /tmp, which the
+# stock AppArmor-confined chronyd cannot reply to (it is granted @{run}/chrony/
+# only) — the round-trip failed with EACCES and every verdict silently degraded
+# to ntp_class=unknown regardless of how well chrony was actually syncing. The
+# current binary binds alongside the chronyd socket. See F-194.
+
+- name: deploy ntp-health-agent signing daemon (ADR 1037, F-184/F-194)
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: ntp-health-agent

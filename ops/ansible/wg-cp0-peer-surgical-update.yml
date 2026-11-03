@@ -1,0 +1,151 @@
+---
+# wg-cp0-peer-surgical-update.yml — Block 50J starter / Block 22-class
+# surgical peer-allowlist update on wg-cp0 relays WITHOUT restarting the
+# wg-cp0 listener (so existing peer sessions are not disrupted, unlike
+# the full wg-cp0-bootstrap.yml flow).
+#
+# WHEN TO USE
+#
+#   - A peer's pubkey drifted from the allowlist (bundle re-issuance
+#     ceremony rotated the device-side keypair but the allowlist on
+#     the relays + master JSON-of-record was not updated).
+#   - Adding/removing one peer without the fleet-wide listener restart
+#     that the bootstrap playbook triggers.
+#
+# WHAT IT DOES PER RELAY
+#
+#   1. Remove the OLD peer entry (by pubkey) if `peer_old_pubkey` is set
+#      and present.
+#   2. Add the NEW peer entry: pubkey + allowed-ips + persistent-keepalive.
+#   3. `wg-quick save wg-cp0` to persist the change to
+#      /etc/wireguard/wg-cp0.conf so it survives reboot.
+#
+# WHAT IT DOES NOT DO
+#
+#   - Does NOT restart wg-quick@wg-cp0 (the whole point — surgical).
+#   - Does NOT regenerate the wg-cp0.conf from scratch (that's
+#     wg-cp0-bootstrap.yml's job).
+#   - Does NOT update master's allowlist JSON — operator must do that
+#     separately so the JSON-of-record matches what's on the relays.
+#
+# REQUIRED VARS (pass via -e)
+#
+#   peer_name            human-readable name (for logs)
+#   peer_new_pubkey      new Curve25519 pubkey (base64)
+#   peer_allowed_ips     comma-separated CIDRs (e.g. "198.18.0.6/32")
+#   peer_old_pubkey      optional — old pubkey to remove; skip if unset
+#
+# OPTIONAL VARS
+#
+#   peer_keepalive       persistent-keepalive seconds (default 25)
+#
+# OPERATOR INVOCATION
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     direnv exec . aws-vault exec usareur-af --no-session -- \
+#     ansible-playbook \
+#       -i inventory/hosts-prod.ini \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/wg-cp0-prod.ini \
+#       wg-cp0-peer-surgical-update.yml \
+#       --limit wg_cp0_relay_hosts \
+#       -e peer_name=prov-rla \
+#       -e peer_new_pubkey=2c9oXChG/aoAcRirSxpnUnf8GK1a9JGfkoEw8FeeeGU= \
+#       -e peer_old_pubkey=vgNYxsGcSilkLqhHdUYCMS9eAYZoNpvZhAEe8UVzrSU= \
+#       -e peer_allowed_ips=198.18.0.6/32 \
+#       --check    # dry-run first; remove for real execution
+#
+# This is the manual-driven version of the Block 50J peer-allowlist API
+# named in backlog (cartoon-peer commit a4162c77). Net cost: ~5s per
+# relay, no listener restart, no fleet-wide disruption.
+
+- name: "wg-cp0 surgical peer update — no listener restart"
+  hosts: wg_cp0_relay_hosts
+  gather_facts: false
+  vars:
+    peer_keepalive: 25
+
+  pre_tasks:
+    - name: Validate required vars
+      ansible.builtin.assert:
+        that:
+          - peer_name is defined and peer_name | length > 0
+          - peer_new_pubkey is defined and peer_new_pubkey | length > 0
+          - peer_allowed_ips is defined and peer_allowed_ips | length > 0
+        fail_msg: "Required: peer_name, peer_new_pubkey, peer_allowed_ips (and optionally peer_old_pubkey)"
+
+    - name: Show plan (per host)
+      ansible.builtin.debug:
+        msg: >
+          {{ inventory_hostname }} will:
+          {% if peer_old_pubkey is defined and peer_old_pubkey | length > 0 %}
+          remove peer {{ peer_old_pubkey }} ;
+          {% endif %}
+          add peer {{ peer_new_pubkey }} ({{ peer_name }}) allowed-ips={{ peer_allowed_ips }} keepalive={{ peer_keepalive }}s ;
+          wg-quick save wg-cp0
+
+  tasks:
+    - name: Snapshot pre-state — wg show wg-cp0 for the target IP slot
+      ansible.builtin.shell: |
+        wg show wg-cp0 | grep -B1 -A4 -E '{{ peer_allowed_ips | replace(",", "|") | replace("/", "\\/") }}' || true
+      register: pre_state
+      changed_when: false
+      become: true
+
+    - name: Show pre-state
+      ansible.builtin.debug:
+        var: pre_state.stdout_lines
+
+    - name: Remove old peer (if specified + present)
+      ansible.builtin.command:
+        argv:
+          - wg
+          - set
+          - wg-cp0
+          - peer
+          - "{{ peer_old_pubkey }}"
+          - remove
+      when:
+        - peer_old_pubkey is defined
+        - peer_old_pubkey | length > 0
+      become: true
+      register: remove_result
+      changed_when: remove_result.rc == 0
+
+    - name: Add/update new peer
+      ansible.builtin.command:
+        argv:
+          - wg
+          - set
+          - wg-cp0
+          - peer
+          - "{{ peer_new_pubkey }}"
+          - allowed-ips
+          - "{{ peer_allowed_ips }}"
+          - persistent-keepalive
+          - "{{ peer_keepalive }}"
+      become: true
+      register: add_result
+      changed_when: add_result.rc == 0
+
+    - name: Persist to /etc/wireguard/wg-cp0.conf via wg-quick save
+      ansible.builtin.command:
+        argv:
+          - wg-quick
+          - save
+          - wg-cp0
+      become: true
+      register: save_result
+      changed_when: save_result.rc == 0
+
+    - name: Snapshot post-state — wg show wg-cp0 for the new peer
+      ansible.builtin.shell: |
+        wg show wg-cp0 | grep -B1 -A4 '{{ peer_new_pubkey }}' || echo "NEW-PEER-NOT-FOUND"
+      register: post_state
+      changed_when: false
+      become: true
+
+    - name: Show post-state
+      ansible.builtin.debug:
+        var: post_state.stdout_lines

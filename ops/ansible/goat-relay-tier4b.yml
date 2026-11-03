@@ -1,0 +1,622 @@
+---
+# ops/ansible/goat-relay-tier4b.yml
+#
+# Orchestrator for the Block 33B step 8 tier 4b throughput-verdict env.
+# Stands up a lean bench mgmt-plane + goat-relay on a single mgmt host, then
+# enrols 2 peers and outputs the setup-key plaintext for the iperf3 ramp.
+#
+# Acceptance bar (per ADR 0709 + M-006): goat-relay sustains ≥110 Mbps
+# single-flow on t3.micro through real netbird daemon traffic. <3× the
+# GOMAXPROCS=1 ceiling returns work to 33B for diagnosis (do not ship).
+#
+# Required -e vars:
+#   postgres_superuser_password   t3.small mgmt+relay node's PG superuser pw
+#   netbird_encryption_key        base64 32 bytes for DataStoreEncryptionKey
+#   goat_relay_image_archive      local path to `docker save | gzip` output of
+#                                 goat-relay:tier4b (built locally first)
+#   ssm_bucket                    S3 bucket reachable by the mgmt host's SSM role
+#                                 for transferring the image archive
+#
+# Inventory: ops/ansible/inventory/goat-relay-tier4b.ini
+#   (regenerate via gen-goat-relay-tier4b.sh after terraform apply)
+#
+# Run from ops/ansible/:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ansible-playbook \
+#       -i inventory/goat-relay-tier4b.ini \
+#       goat-relay-tier4b.yml \
+#       -e postgres_superuser_password=$(openssl rand -base64 24) \
+#       -e netbird_encryption_key=$(openssl rand -base64 32) \
+#       -e goat_relay_image_archive=/tmp/goat-relay-tier4b.tar.gz \
+#       -e ssm_bucket=example-legacy-ansible-ssm-20260405131504905400000001
+#
+# OPEN QUESTIONS at first fire:
+#   - management.json's relay-block schema for the netbird-mgmt version pinned
+#     in ops/compose/mgmt-host/docker-compose.yml. The base template at
+#     ops/ansible/templates/management.json.j2 currently has no Relay section
+#     (production uses env-var hint via NB_EXPOSED_ADDRESS on the relay
+#     container, not management.json). For tier 4b this needs explicit
+#     verification so peers actually take the relay path. See Phase 5 below.
+
+# =============================================================================
+# Phase 1 — image transfer (local → S3 → mgmt host)
+# =============================================================================
+- name: "tier-4b: push goat-relay image archive to S3"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Verify image archive exists locally
+      ansible.builtin.stat:
+        path: "{{ goat_relay_image_archive }}"
+      register: archive_stat
+      failed_when: not archive_stat.stat.exists
+
+    - name: Upload archive to S3 (overwrite, region-pinned)
+      ansible.builtin.command:
+        argv:
+          - aws
+          - s3
+          - cp
+          - "{{ goat_relay_image_archive }}"
+          - "s3://{{ ssm_bucket }}/goat-relay-tier4b.tar.gz"
+          - --region
+          - eu-central-1
+      changed_when: true
+
+    - name: Generate presigned URL (1h, region-pinned)
+      ansible.builtin.command:
+        argv:
+          - aws
+          - s3
+          - presign
+          - "s3://{{ ssm_bucket }}/goat-relay-tier4b.tar.gz"
+          - --expires-in
+          - "3600"
+          - --region
+          - eu-central-1
+      register: presigned
+      changed_when: false
+
+    - name: Stash presigned URL for later phases
+      ansible.builtin.set_fact:
+        goat_relay_image_url: "{{ presigned.stdout }}"
+
+# =============================================================================
+# Phase 2 — mgmt-plane stack on the bench host
+# =============================================================================
+# Imports the canonical mgmt-host.yml so we get postgres-spock + signal +
+# netbird-mgmt + mgmt-host-bootstrap (latest) without re-implementing.
+# Single-node Spock degenerates to a plain Postgres with the extension
+# loaded but no replication peers — which is exactly what tier 4b wants.
+- name: "tier-4b: mgmt-plane stack via canonical mgmt-host.yml"
+  import_playbook: mgmt-host.yml
+  vars:
+    phase2: false
+    site_name: tier4b
+    federation_peers: ""
+    # signal_uri filled per-host below at first fire — for tier 4b, the signal
+    # endpoint is the mgmt host's own EIP. Set in the mgmt inventory entry as
+    # `signal_uri=<mgmt_public_ip>:10000` after gen-goat-relay-tier4b.sh runs.
+
+# Phase 2 end-of-phase smoke — fail fast with the exact assertion (Discipline 2
+# of bench-test-as-a-service.md). Each probe sets `changed_when: false` and
+# asserts via `failed_when` — generic ansible failures get replaced by a
+# named symptom.
+- name: "tier-4b: smoke — assert mgmt-plane stack is live"
+  hosts: goat_relay_tier4b_mgmt
+  gather_facts: false
+  become: true
+  tasks:
+    # F-034 catch: cloud-init silently aborts apt batch on transient mirror 503,
+    # leaving docker-compose-v2 missing. A docker compose version probe surfaces
+    # that immediately rather than waiting for `docker compose pull` to fail.
+    - name: smoke — docker compose v2 plugin available
+      ansible.builtin.command: docker compose version
+      register: phase2_compose
+      changed_when: false
+      failed_when: phase2_compose.rc != 0
+
+    - name: smoke — postgres-a / signal-a / management-a containers Up
+      ansible.builtin.shell: |
+        set -e
+        for name in postgres-a signal-a management-a; do
+          status=$(docker ps --filter "name=^${name}$" --format '{{ "{{" }}.Status{{ "}}" }}' || true)
+          if [[ -z "$status" ]]; then
+            echo "MISSING: $name container not present"; exit 1
+          fi
+          if ! echo "$status" | grep -qE '^Up '; then
+            echo "NOT_UP: $name status=$status"; exit 1
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: phase2_containers
+      changed_when: false
+      failed_when: phase2_containers.rc != 0
+
+    - name: smoke — postgres pg_isready
+      ansible.builtin.command: docker exec postgres-a pg_isready -U postgres
+      register: phase2_pgready
+      changed_when: false
+      failed_when: phase2_pgready.rc != 0
+
+    - name: smoke — netbird DB exists + queryable
+      ansible.builtin.command:
+        argv: [docker, exec, postgres-a, psql, -U, postgres, -d, netbird, -tAc, "SELECT 1"]
+      register: phase2_db
+      changed_when: false
+      failed_when: phase2_db.rc != 0 or phase2_db.stdout | trim != '1'
+
+    - name: smoke — management-a TCP listener on 127.0.0.1:8080
+      ansible.builtin.shell: |
+        set -e
+        ss -tlnp | grep -E '127\.0\.0\.1:8080 ' || {
+          echo "MISSING: management-a not listening on 127.0.0.1:8080"; exit 1
+        }
+      args:
+        executable: /bin/bash
+      register: phase2_mgmt
+      changed_when: false
+      failed_when: phase2_mgmt.rc != 0
+
+# =============================================================================
+# Phase 3 — load goat-relay image, generate self-signed cert, run container
+# =============================================================================
+- name: "tier-4b: deploy goat-relay alongside the mgmt-plane"
+  hosts: goat_relay_tier4b_mgmt
+  gather_facts: true
+  become: true
+  vars:
+    # NOTE: vars here MUST NOT shadow role var names from roles/goat-relay/.
+    # When include_role's `vars:` references a play-level var with the same
+    # name as the role var, Jinja2 evaluates the role var as itself and
+    # hits a recursion-depth limit (caught run #6). Use `bench_*`
+    # prefix to keep them disjoint from the role's `goat_relay_*` namespace.
+    bench_image: goat-relay:tier4b
+    bench_cert_dir: /etc/goat-relay/tls
+    bench_bind_addr: "0.0.0.0:33073"
+    bench_hc_threshold: "3"
+  tasks:
+    - name: Ensure cert dir exists
+      ansible.builtin.file:
+        path: "{{ bench_cert_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Generate self-signed TLS cert for goat-relay (idempotent)
+      ansible.builtin.command:
+        cmd: >
+          openssl req -x509 -newkey rsa:2048 -nodes
+          -keyout {{ bench_cert_dir }}/key.pem
+          -out {{ bench_cert_dir }}/cert.pem
+          -days 30
+          -subj '/CN={{ hostvars[inventory_hostname].mgmt_public_ip }}'
+          -addext 'subjectAltName=IP:{{ hostvars[inventory_hostname].mgmt_public_ip }}'
+        creates: "{{ bench_cert_dir }}/cert.pem"
+
+    # The Chainguard glibc-dynamic runtime image runs as the `nonroot` user
+    # (uid 65532). openssl creates the key with 0600 root:root, so the
+    # container can't read it → 'Permission denied (os error 13)' loop.
+    # For an ephemeral bench env that'll be torn down within the hour,
+    # 0644 on the key is acceptable (host is single-tenant, no shared FS,
+    # SG blocks all inbound except 33073). Production deploys use real
+    # CA-signed certs delivered via secure channel (commented elsewhere in
+    # the role) and this perms bump does not apply to them.
+    - name: Chmod tier-4b cert + key readable by container nonroot user
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0644"
+      loop:
+        - "{{ bench_cert_dir }}/cert.pem"
+        - "{{ bench_cert_dir }}/key.pem"
+
+    - name: Pull image archive from S3 via presigned URL
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl -fsSL '{{ goat_relay_image_url | default(hostvars["localhost"].goat_relay_image_url) }}' \
+          | gunzip \
+          | docker load
+      args:
+        executable: /bin/bash
+      register: docker_load_out
+      changed_when: "'Loaded image' in (docker_load_out.stdout | default(''))"
+
+    - name: Apply the existing goat-relay role for the operational invariants
+      ansible.builtin.include_role:
+        name: goat-relay
+      vars:
+        goat_relay_image: "{{ bench_image }}"
+        goat_relay_cert_host_path: "{{ bench_cert_dir }}/cert.pem"
+        goat_relay_key_host_path: "{{ bench_cert_dir }}/key.pem"
+        goat_relay_bind_addr: "{{ bench_bind_addr }}"
+        # F-032 codification: peers receive `rels://<advertised>:33073`
+        # in AuthResponse. On a cloud-fronted bench host, the bind addr
+        # is `0.0.0.0` (catch-all) but peers must dial the public IP.
+        goat_relay_advertised_addr: "{{ hostvars[inventory_hostname].mgmt_public_ip }}:33073"
+        goat_relay_hc_attempt_threshold: "{{ bench_hc_threshold }}"
+        # Block 33C.1 lever L8: leave shards at default (cores.len() = 2
+        # on t3.micro). Set to a specific integer here if a sweep needs
+        # to compare N=1 vs N=2 for the M-NNN re-test.
+        goat_relay_shards: ""
+        # F-041 mitigation — bench env wants deterministic QUIC selection
+        # so M-NNN runs measure the QUIC code path consistently. Production
+        # value is also 100ms (cost is one-time per daemon lifetime).
+        # Override via `-e goat_relay_prefer_quic_bias_ms=0` for explicit
+        # WS benches.
+        goat_relay_prefer_quic_bias_ms: "{{ bench_prefer_quic_bias_ms | default(100) }}"
+
+    # ---- Phase 3 end-of-phase smoke (Discipline 2) ----
+    # Catches the L8 SO_REUSEPORT class of bug (zero shards bound), the F-038
+    # leftover-systemd-unit class (port held by another process), and Rust
+    # panics during boot. Probes are read-only against the live container.
+    - name: smoke — goat-relay container Up
+      ansible.builtin.shell: |
+        set -e
+        status=$(docker ps --filter 'name=^goat-relay$' --format '{{ "{{" }}.Status{{ "}}" }}' || true)
+        if [[ -z "$status" ]]; then echo "MISSING: goat-relay container not present"; exit 1; fi
+        if ! echo "$status" | grep -qE '^Up '; then echo "NOT_UP: goat-relay status=$status"; exit 1; fi
+      args:
+        executable: /bin/bash
+      register: phase3_container
+      changed_when: false
+      failed_when: phase3_container.rc != 0
+
+    - name: smoke — TCP :33073 bound (host network)
+      ansible.builtin.shell: |
+        set -e
+        ss -tlnp | grep -E ':33073 ' || { echo "MISSING: TCP :33073 not bound"; exit 1; }
+      args:
+        executable: /bin/bash
+      register: phase3_tcp
+      changed_when: false
+      failed_when: phase3_tcp.rc != 0
+
+    - name: smoke — UDP :33073 bound (QUIC datagram path)
+      ansible.builtin.shell: |
+        set -e
+        ss -ulnp | grep -E ':33073 ' || { echo "MISSING: UDP :33073 not bound"; exit 1; }
+      args:
+        executable: /bin/bash
+      register: phase3_udp
+      changed_when: false
+      failed_when: phase3_udp.rc != 0
+
+    - name: smoke — bind+log discipline (binds ≥ nproc, no panics, data-plane line present)
+      ansible.builtin.shell: |
+        set -e
+        logs=$(docker logs goat-relay 2>&1)
+        bind_count=$(echo "$logs" | grep -cE 'bind\(0\.0\.0\.0:33073\) ok' || true)
+        panic_count=$(echo "$logs" | grep -cE 'panicked' || true)
+        exited_count=$(echo "$logs" | grep -cE 'listener exited with error' || true)
+        data_plane=$(echo "$logs" | grep -cE 'ws data plane:' || true)
+        expected=$(nproc)
+        echo "bind_ok=$bind_count expected=$expected panicked=$panic_count exited_with_error=$exited_count data_plane_line=$data_plane"
+        # `>= expected` catches the L8 SO_REUSEPORT class (some shards fail to
+        # bind → bind_count < expected) and the F-038 leftover-systemd-unit
+        # class (zero shards bind). Tolerates re-bind scenarios where one shard
+        # rebinds and the count exceeds expected.
+        if [[ "$bind_count" -lt "$expected" ]]; then
+          echo "FAIL: bind_count=$bind_count < expected=$expected (L8 / F-038 partial-bind class)"
+          exit 1
+        fi
+        if [[ "$panic_count" -gt 0 ]]; then echo "FAIL: $panic_count panic(s) in goat-relay logs"; exit 1; fi
+        if [[ "$exited_count" -gt 0 ]]; then echo "FAIL: $exited_count listener-exited-with-error line(s)"; exit 1; fi
+        if [[ "$data_plane" -lt 1 ]]; then echo "FAIL: 'ws data plane:' startup line missing"; exit 1; fi
+      args:
+        executable: /bin/bash
+      register: phase3_logs
+      changed_when: false
+      failed_when: phase3_logs.rc != 0
+
+# =============================================================================
+# Phase 3.5 — expose mgmt API on EIP via socat sidecar
+# =============================================================================
+# Base mgmt-host compose binds management-a on 127.0.0.1:${MGMT_CONTAINER_HOST_PORT:-8080}
+# (loopback-only; production terminates TLS via Traefik). For tier 4b validation
+# we need peers to reach the mgmt API on port 80 of the mgmt EIP. socat is the
+# validated workaround from cgnat-validation.yml Phase 2 (attempt-1 findings
+# §2.4) — no changes to base compose, easy teardown.
+- name: "tier-4b: expose mgmt API via socat sidecar"
+  hosts: goat_relay_tier4b_mgmt
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Stop any prior mgmt-expose container (idempotent re-run)
+      ansible.builtin.command:
+        argv: [docker, rm, -f, mgmt-expose]
+      register: socat_rm
+      changed_when: socat_rm.rc == 0
+      failed_when: false
+
+    - name: Run socat container bridging 0.0.0.0:80 -> 127.0.0.1:8080
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - -d
+          - --name
+          - mgmt-expose
+          - --restart
+          - unless-stopped
+          - --network
+          - host
+          - alpine/socat:latest
+          - TCP-LISTEN:80,fork,reuseaddr
+          - TCP:127.0.0.1:8080
+      changed_when: true
+
+    # ---- Phase 3.5 end-of-phase smoke (Discipline 2) ----
+    - name: smoke — port 80 reachable from mgmt host loopback
+      ansible.builtin.shell: |
+        set -e
+        # The smoke targets the public EIP because that is the surface peers
+        # will dial. From the mgmt host itself, packets to its own EIP are
+        # routed back through the local stack — equivalent reachability proof.
+        nc -z -w3 {{ hostvars[inventory_hostname].mgmt_public_ip }} 80 \
+          || { echo "FAIL: nothing answers on {{ hostvars[inventory_hostname].mgmt_public_ip }}:80"; exit 1; }
+      args:
+        executable: /bin/bash
+      register: phase35_nc
+      changed_when: false
+      failed_when: phase35_nc.rc != 0
+
+# =============================================================================
+# Phase 4 — seed bench account + setup-key via mgmt-host-bootstrap CLI
+# =============================================================================
+# Idempotency contract (ADR 1008 spirit, validated by repeated runs):
+#  - Account: DB is source of truth. Probe first; fall back to create-account
+#    CLI if DB is empty. Tolerant of "already exists" output on race.
+#  - Setup-key: ALWAYS regenerated on every phase4 run. Why: phase3 may have
+#    recreated postgres-a, wiping setup_keys; or a host reboot may have
+#    cleared /tmp. The simplest convergence is "always create + always write
+#    the file," accepting a small cumulative rowcount in setup_keys (newest
+#    row wins, older ones are harmless).
+#  - regex_search returns None when no match → `| first` crashes with
+#    'NoneType' object is not iterable. Fixed via `default([], true) | first
+#    | default('')` chain so missing match yields '' rather than crashing.
+- name: "tier-4b: create bench account + setup-key (idempotent)"
+  hosts: goat_relay_tier4b_mgmt
+  gather_facts: false
+  become: true
+  tasks:
+    # Source of truth: DB. Tolerant of "table doesn't exist" on a never-
+    # bootstrapped postgres (rc != 0 → fall through to create-account).
+    - name: probe DB for existing account
+      ansible.builtin.command:
+        argv: [docker, exec, postgres-a, psql, -U, postgres, -d, netbird, -tAc, "SELECT id FROM accounts LIMIT 1"]
+      register: account_probe
+      changed_when: false
+      failed_when: false
+
+    - name: use existing account if DB has one
+      ansible.builtin.set_fact:
+        bench_account_id: "{{ account_probe.stdout | trim }}"
+      when: account_probe.rc == 0 and (account_probe.stdout | trim | length) > 0
+
+    - name: create bench account when DB is empty
+      ansible.builtin.command:
+        cmd: >
+          docker compose -f /opt/mgmt-host/docker-compose.yml
+          --profile bootstrap run --rm mgmt-host-bootstrap
+          create-account
+          --owner ops@goat.local
+          --site-name tier4b
+          --network 100.64.0.0/16
+      args:
+        chdir: /opt/mgmt-host
+      register: create_account
+      when: bench_account_id is not defined
+      changed_when: "'account_id:' in (create_account.stdout | default(''))"
+      failed_when: >
+        create_account.rc is defined and create_account.rc != 0 and
+        'duplicate' not in (create_account.stderr | default('')) and
+        'already exists' not in (create_account.stderr | default(''))
+
+    - name: parse account_id from create-account output (tolerant)
+      ansible.builtin.set_fact:
+        # `regex_search` returns None on no match; `default([], true)` substitutes
+        # an empty list when None is the value (true → handle Nones), so the
+        # subsequent `| first | default('')` produces an empty string rather
+        # than crashing with 'NoneType' object is not iterable.
+        bench_account_id: "{{ ((create_account.stdout | default('')) | regex_search('account_id:\\s+(\\S+)', '\\1')) | default([], true) | first | default('') }}"
+      when: bench_account_id is not defined and create_account is defined
+
+    - name: final account_id resolved from DB after create
+      ansible.builtin.command:
+        argv: [docker, exec, postgres-a, psql, -U, postgres, -d, netbird, -tAc, "SELECT id FROM accounts LIMIT 1"]
+      register: account_post
+      changed_when: false
+      failed_when: account_post.rc != 0 or (account_post.stdout | trim | length) == 0
+
+    - name: set bench_account_id from final DB read (canonical)
+      ansible.builtin.set_fact:
+        bench_account_id: "{{ account_post.stdout | trim }}"
+
+    # Setup-key idempotency: preserve-if-both-present.
+    # F-007 says netbird-mgmt hashes the plaintext at insert; we cannot
+    # re-derive plaintext from the DB. So:
+    #   - if DB has ≥1 setup_keys row for this account AND the file exists
+    #     with non-trivial size: trust the existing pair (idempotent re-run,
+    #     byte-identical file across phase4 invocations)
+    #   - otherwise: mint a new key and write the file in lockstep
+    # Per the bench-as-a-service acceptance bar — "second run must produce
+    # the same /tmp/tier4b-setup-key.txt content + zero errors."
+    - name: probe DB setup_keys count for this account
+      ansible.builtin.command:
+        argv: [docker, exec, postgres-a, psql, -U, postgres, -d, netbird, -tAc,
+               "SELECT count(*) FROM setup_keys WHERE account_id = '{{ bench_account_id }}'"]
+      register: existing_keys
+      changed_when: false
+      failed_when: existing_keys.rc != 0
+
+    - name: probe whether setup-key file exists on host
+      ansible.builtin.stat:
+        path: /tmp/tier4b-setup-key.txt
+      register: existing_file
+
+    - name: decide preserve-vs-mint
+      ansible.builtin.set_fact:
+        mint_new_key: "{{ (existing_keys.stdout | trim | int) < 1 or (not existing_file.stat.exists) or ((existing_file.stat.size | default(0)) | int) < 50 }}"
+
+    - name: create reusable peer setup-key (only when DB or file is missing)
+      ansible.builtin.command:
+        cmd: >
+          docker compose -f /opt/mgmt-host/docker-compose.yml
+          --profile bootstrap run --rm mgmt-host-bootstrap
+          create-setup-key
+          --account {{ bench_account_id }}
+          --role peer
+          --ttl 2160h
+          --usage 10
+          --name tier4b-peers
+      args:
+        chdir: /opt/mgmt-host
+      register: create_key
+      when: mint_new_key
+      changed_when: true
+      failed_when: create_key.rc != 0 or 'plaintext:' not in (create_key.stdout | default(''))
+
+    - name: parse setup-key plaintext (mint mode)
+      ansible.builtin.set_fact:
+        bench_setup_key_plaintext: "{{ ((create_key.stdout | default('')) | regex_search('plaintext:\\s+(\\S+)', '\\1')) | default([], true) | first | default('') }}"
+      when: mint_new_key
+      no_log: true
+
+    - name: read existing plaintext from file (preserve mode)
+      ansible.builtin.shell: grep '^plaintext=' /tmp/tier4b-setup-key.txt | cut -d= -f2
+      register: existing_plaintext
+      when: not mint_new_key
+      changed_when: false
+
+    - name: set plaintext fact from existing file (preserve mode)
+      ansible.builtin.set_fact:
+        bench_setup_key_plaintext: "{{ existing_plaintext.stdout | trim }}"
+      when: not mint_new_key
+      no_log: true
+
+    - name: assert plaintext was actually parsed
+      ansible.builtin.assert:
+        that:
+          - bench_setup_key_plaintext | length > 20
+        fail_msg: "setup-key plaintext is empty or too short (neither minted nor read from file)"
+
+    - name: persist setup-key to local file (mint mode only — preserve mode leaves file untouched)
+      ansible.builtin.copy:
+        dest: /tmp/tier4b-setup-key.txt
+        content: |
+          # Generated {{ ansible_date_time.iso8601 | default('') }}
+          # Use with: netbird up --management-url http://{{ hostvars[inventory_hostname].mgmt_public_ip }} --setup-key <plaintext>
+          plaintext={{ bench_setup_key_plaintext }}
+          mgmt_url=http://{{ hostvars[inventory_hostname].mgmt_public_ip }}
+        mode: "0600"
+      when: mint_new_key
+      no_log: true
+
+    # ---- Phase 4 end-of-phase smoke (Discipline 2) ----
+    - name: smoke — setup-key file exists with non-trivial size
+      ansible.builtin.stat:
+        path: /tmp/tier4b-setup-key.txt
+      register: phase4_keyfile
+      failed_when: not phase4_keyfile.stat.exists or phase4_keyfile.stat.size < 50
+
+    - name: smoke — DB has ≥1 setup_keys row for this account
+      ansible.builtin.command:
+        argv: [docker, exec, postgres-a, psql, -U, postgres, -d, netbird, -tAc,
+               "SELECT count(*) FROM setup_keys WHERE account_id = '{{ bench_account_id }}'"]
+      register: phase4_keycount
+      changed_when: false
+      failed_when: phase4_keycount.rc != 0 or (phase4_keycount.stdout | trim | int) < 1
+
+# =============================================================================
+# Phase 5 — re-render management.json with the Relay block + restart mgmt
+# =============================================================================
+# netbird-mgmt 0.68.3 reads its Relay config from management.json's top-level
+# "Relay" object (verified against
+# /Users/maintainer/src/github.com/goat-maintainer/netbird/management/internals/server/config/config.go:89,
+# example shape at management/server/testdata/management.json:23). The base
+# template at templates/management.json.j2 was extended (this session) with
+# an optional Relay block that activates when `relay_addresses` is defined.
+#
+# goat-relay does NOT validate the auth_payload HMAC at the protocol level
+# (the auth_payload is opaque per goat-relay-protocol/src/messages/auth.rs:13).
+# So Relay.Secret is shipped to peers but goat-relay accepts any value.
+# Still: set Relay.Secret to a fresh random so the wire-format conforms.
+- name: "tier-4b: inject Relay block into management.json + restart mgmt-a"
+  hosts: goat_relay_tier4b_mgmt
+  gather_facts: true
+  become: true
+  vars:
+    # NOTE: same recursion-avoidance discipline as Phase 3 — bench-side play
+    # vars use bench_* prefix so they don't shadow the template's expected
+    # var names (relay_addresses, relay_secret, relay_credentials_ttl).
+    compose_dir: /opt/mgmt-host
+    bench_relay_addresses:
+      - "rels://{{ hostvars[inventory_hostname].mgmt_public_ip }}:33073"
+    bench_relay_secret: "{{ tier4b_relay_secret | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits')) }}"
+    bench_relay_credentials_ttl: "24h"
+  tasks:
+    - name: Re-render management-a/management.json with the Relay block
+      ansible.builtin.template:
+        src: templates/management.json.j2
+        dest: "{{ compose_dir }}/management-a/management.json"
+        mode: "0644"
+      vars:
+        netbird_encryption_key: "{{ netbird_encryption_key }}"
+        signal_uri: "{{ hostvars[inventory_hostname].signal_uri }}"
+        relay_addresses: "{{ bench_relay_addresses }}"
+        relay_secret: "{{ bench_relay_secret }}"
+        relay_credentials_ttl: "{{ bench_relay_credentials_ttl }}"
+
+    - name: Restart management-a so it picks up the Relay block
+      ansible.builtin.command:
+        cmd: docker compose -f {{ compose_dir }}/docker-compose.yml restart management-a
+      args:
+        chdir: "{{ compose_dir }}"
+      changed_when: true
+
+    - name: Wait for management-a to be healthy + advertising the Relay block
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          if docker logs management-a 2>&1 | grep -q "Relay addresses:"; then
+            docker logs management-a 2>&1 | grep "Relay addresses:" | tail -1
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "FAIL: management-a did not log Relay addresses within 60s" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: mgmt_relay_log
+      changed_when: false
+
+    - name: Show management-a Relay addresses log line
+      ansible.builtin.debug:
+        msg: "{{ mgmt_relay_log.stdout }}"
+
+    # ---- Phase 5 end-of-phase smoke (Discipline 2) ----
+    - name: smoke — management.json contains Relay block
+      ansible.builtin.command:
+        argv: [grep, -q, '"Relay"', "{{ compose_dir }}/management-a/management.json"]
+      register: phase5_json
+      changed_when: false
+      failed_when: phase5_json.rc != 0
+
+    - name: smoke — management-a TCP listener still up after restart
+      ansible.builtin.shell: |
+        set -e
+        # netbird-mgmt has no public HTTP health endpoint — most paths
+        # require auth and return 404 unauthenticated. The smoke we actually
+        # want post-restart is "the listener is back" — the previous "Wait
+        # for management-a to be healthy + advertising the Relay block"
+        # task already validates the log signal. This adds the socket-level
+        # check.
+        ss -tlnp | grep -E '127\.0\.0\.1:8080 ' \
+          || { echo "FAIL: management-a not listening on 127.0.0.1:8080 after restart"; exit 1; }
+      args:
+        executable: /bin/bash
+      register: phase5_listener
+      changed_when: false
+      failed_when: phase5_listener.rc != 0

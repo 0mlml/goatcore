@@ -1,0 +1,40 @@
+---
+# ops/ansible/minio-bootstrap.yml
+#
+# Stand up MinIO on the host as the per-site object-storage substrate. First
+# consumer is goat-audit-subscriber (Block 82S) writing to the
+# audit-integrity bucket under Object-Lock COMPLIANCE 1y per ADR 0811.
+# telemetry-otlp + runtime-detection-archive buckets are created at the
+# same time for forward-compat with Block 27 (OpenObserve) + Block 18G
+# (Falco/osquery/auditd) when those land on the host; consumers are not
+# deployed today but the substrate is ready.
+#
+# Run from any laptop on the netbird mesh:
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ansible-playbook \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       minio-bootstrap.yml
+#
+# Pre-flight (operator-side):
+#   1. mgmt-host-baseline.yml + mgmt-host-luks.yml already applied to
+#      the host — /opt/docker-data exists on the LUKS-mounted NVMe (the data
+#      path is the same on a LUKS-deferred partition).
+#   2. <SITE>_MINIO_ROOT_USER + <SITE>_MINIO_ROOT_PASSWORD set in
+#      .envrc.local.d/30-site-services.envrc + direnv allowed.
+#   3. docker engine installed on the host (assumed; baseline playbook
+#      handles it).
+#
+# Idempotent. Re-running is safe: bucket creates use `mc mb
+# --ignore-existing` and Object-Lock retention re-application is a
+# no-op when settings match.
+
+- name: deploy MinIO per-site object storage substrate
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: minio

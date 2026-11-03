@@ -1,0 +1,415 @@
+---
+# goat-coredns.yml — generalized mesh-CoreDNS standup for ANY goatnet.
+#
+# Deploys CoreDNS on the target Thor's mesh IP + provisions the Netbird DNS
+# nameserver group so mesh peers resolve *.<site_dns_zone> via the mesh resolver
+# instead of public Cloudflare DNS. Everything derives from the target's
+# group_vars site identity (site_id / site_dns_zone / mesh_ip_a) — there are NO
+# hardcoded site literals, so a new goatnet gets its OWN resolver. Without this
+# step netbird hands peers another site's CoreDNS and nothing under the new
+# zone resolves.
+#
+# Sequencing within a turnkey standup (docs/design/goatnet-turnkey-standup.md):
+#   1. (this playbook) CoreDNS on the Thor serving *.<site_dns_zone> from
+#      ops/dns/<zone-dir>/mesh-hosts. Listens on mesh_ip_a:5353.
+#   2. (this playbook) Netbird DNS nameserver group `<site_id>-mesh-dns` pushes
+#      the resolver to all peers in the mesh.
+#
+# Pre-reqs:
+#   - <SITE>_NB_API_TOKEN env var (per-mgmt-server PAT; SITE = site_id upper-cased,
+# hyphens→underscores: acme→ACME). Mint at the site dashboard
+#     (dashboard.<site_id>.<site_dns_zone>) → User → API Tokens, stash in
+#     .envrc.local.d/30-site-services.envrc.
+#   - ops/dns/<zone-dir>/mesh-hosts exists (zone-dir defaults to site_id; override
+# with -e mesh_dns_zone_dir_name=<name> for sites whose dir differs).
+#   - Target Thor reachable on its mesh IP (operator's netbird daemon Connected
+#     on that site's profile).
+#
+# Apply:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -l <mgmt-host> goat-coredns.yml
+# (CoreDNS binds the host's mesh IP. Requires <SITE>_NB_API_TOKEN + the operator
+#  on a mesh that reaches the site's mgmt API.)
+
+- name: Deploy mesh CoreDNS + provision the Netbird nameserver group (per-site)
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    # Bind CoreDNS to this site's netbird mesh IP. The role's default port 5353
+    # stays — the netbird daemon owns :53 on the host.
+    mesh_coredns_bind_ip: "{{ mesh_ip_a }}"
+    # Zone-file source dir: ops/dns/<zone-dir>/mesh-hosts. Defaults to site_id;
+    # override for sites whose dir name differs from site_id.
+    mesh_dns_zone_dir_name: "{{ site_id }}"
+    mesh_coredns_zone_dir: "{{ playbook_dir }}/../dns/{{ mesh_dns_zone_dir_name }}"
+    # Smoke-test target: must exist in the site's mesh-hosts.
+    mesh_coredns_smoke_test_name: "dashboard.{{ site_id }}.{{ site_dns_zone }}"
+    # F-282: DNS-hosting nodes cannot receive the zone via netbird (management
+    # withholds a nameserver group from any peer that IS one of its nameservers,
+    # by design) — route the zone to the local CoreDNS listener instead.
+    # nethost-dns.yml / mesh-coredns.yml stay on the role's default-off
+    # until the route is verified on those goatnets.
+    mesh_coredns_host_zone_route_enabled: true
+
+    # Per-site PAT env var name (acme→ACME_NB_API_TOKEN).
+    netbird_api_token_envvar: "{{ site_id | upper | replace('-', '_') }}_NB_API_TOKEN"
+    netbird_api_token: "{{ lookup('env', netbird_api_token_envvar) }}"
+    # The mgmt API is fronted at the public apex (stays public for enrollment +
+    # API even when service hostnames move mesh-only).
+    netbird_api: "https://{{ site_dns_zone }}/api"
+    netbird_nameserver_group_name: "{{ site_id }}-mesh-dns"
+    netbird_nameserver_domain: "{{ site_dns_zone }}"
+
+    # Mesh DNS redundancy (ADR 1056 / docs/design/mesh-dns-redundancy.md).
+    # An ordered list of the CoreDNS replica hosts that back the netbird
+    # nameserver group — netbird accepts exactly 1 OR 3 servers (never 2), and
+    # its resolver fails over across them, so a 3-server group survives losing
+    # any one (or two) replica paths (the F-229 single-CoreDNS SPOF). Each entry
+    # is {host: <inventory hostname, must be in this play's -l set>, mesh_ip:
+    # <its netbird mesh IP>}. DEFAULT = the single targeted host (today's
+    # 1-server behavior, fully backward-compatible). For a 3-server group, set
+    # this in group_vars (or -e) AND run the play with -l covering all 3 hosts
+    # so each deploys its own CoreDNS replica on its own mesh IP.
+    mesh_dns_servers:
+      - host: "{{ inventory_hostname }}"
+        mesh_ip: "{{ mesh_ip_a }}"
+
+    # Zone-only mode: -e mesh_dns_register_group=false deploys the zone file +
+    # CoreDNS to the targeted hosts but leaves the live netbird nameserver
+    # group EXACTLY as it is. Use when the group's membership is deliberately
+    # different from this play's target set — e.g. a group repointed at dedicated
+    # DNS hosts: a routine zone push must not silently
+    # mesh-control-path Phase 3 gate) a routine zone push must not silently
+    # rewrite the group back to whatever -l targeted.
+    mesh_dns_register_group: true
+    # Handset DNS (ADR 1175 §2.4) — DEFAULT-OFF. Set `handset_dns_enabled: true`
+    # in the goatnet's group_vars to provision `<site_id>-handset-dns` for the
+    # `<SITE_PREFIX>-HANDSET` group. The prefix is the taxonomy convention
+    # site_prefix = site_id|upper (acme → ACME, acme-prod → ACME-PROD).
+    handset_dns_group_name: "{{ site_id }}-handset-dns"
+    handset_dns_group_member: "{{ netbird_site_prefix | default(site_id | upper) }}-HANDSET"
+
+  pre_tasks:
+    - name: Validate mesh_dns_servers is a 1-to-3-server group (netbird limit)
+      ansible.builtin.assert:
+        that:
+          - mesh_dns_servers | length >= 1
+          - mesh_dns_servers | length <= 3
+        fail_msg: >-
+          mesh_dns_servers has {{ mesh_dns_servers | length }} entries; a netbird
+          nameserver group accepts 1 to 3 servers. (netbird's validateNSList
+          rejects only 0 and >3 — its "should be 1 or 3" API message is
+          misleading; 2 IS accepted.) Provide 1 (single resolver) or 2-3
+          (redundant group per ADR 1056).
+
+    # F-254 drift guard. The range assert above accepts 1, so a goatnet that
+    # adopted a redundant group (ADR 1056) can silently fall back to a single
+    # point: mesh_dns_servers defaults to ONE server here, and a routine run that
+    # forgets the site's multi-server `-e` override re-registers the live group
+    # as one, a fleet-wide DNS outage. A goatnet that has
+    # adopted redundancy sets mesh_dns_redundancy_required=true in its inventory;
+    # from then on, registering a SINGLE-server group fails closed. Redundant =
+    # >= 2: netbird accepts 2 or 3 and both survive losing a server (3 survives
+    # losing two). The
+    # invariant is "never single-point," not "exactly 3." Zone-only pushes
+    # (mesh_dns_register_group=false) never touch the group, so they are exempt.
+    - name: Enforce declared DNS redundancy — refuse to register a single-point group
+      ansible.builtin.assert:
+        that:
+          - not (mesh_dns_redundancy_required | default(false) | bool)
+            or (mesh_dns_servers | length >= 2)
+            or (not (mesh_dns_register_group | default(true) | bool))
+        fail_msg: >-
+          This goatnet declares mesh_dns_redundancy_required (ADR 1056) but
+          mesh_dns_servers has {{ mesh_dns_servers | length }} entry (a single
+          point) and mesh_dns_register_group is true — registering this group
+          would reproduce the F-254 DNS outage. Pass the site's 2- or 3-server
+          mesh_dns_servers list (the `-e` override), or
+          -e mesh_dns_register_group=false for a zone-only push that leaves the
+          live nameserver group untouched.
+        success_msg: >-
+          DNS redundancy invariant satisfied — {{ mesh_dns_servers | length }}-server
+          nameserver group (>= 2, ADR 1056).
+
+    - name: Validate the per-site netbird API token is set
+      ansible.builtin.assert:
+        that: netbird_api_token | length > 0
+        fail_msg: |
+          {{ netbird_api_token_envvar }} is not set. Mint a PAT at
+          https://dashboard.{{ site_id }}.{{ site_dns_zone }}/ → User → API Tokens
+          and add it to .envrc.local.d/30-site-services.envrc.
+
+    # Deploy-time analog of the CI dns-registry-sync gate: refuse to
+    # push a zone that has drifted from the registry (isitup_services). The
+    # role's separate no-drop guard catches a stale checkout that would remove
+    # LIVE records; this catches a committed/hand-edited zone that no longer
+    # matches what the registry would generate. Override with
+    # -e skip_zone_registry_check=true only when intentionally deploying an
+    # un-regenerated zone.
+    - name: Verify the zone-to-push is in sync with the service registry
+      ansible.builtin.command:
+        cmd: "{{ ansible_playbook_python }} {{ playbook_dir }}/../dns/generate-mesh-hosts.py --check"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      register: mesh_dns_registry_check
+      failed_when: mesh_dns_registry_check.rc != 0
+      when: not (skip_zone_registry_check | default(false) | bool)
+
+  roles:
+    - role: mesh-coredns
+
+  tasks:
+    # -- Netbird DNS nameserver group: create-or-update --------------------
+    # First run: no group exists, POST. Subsequent runs: PUT to keep the
+    # server list + port in sync with the role's deploy. The whole block is
+    # `run_once` (delegated to localhost) so a 3-host play registers the group
+    # exactly once — the role apply above already deployed CoreDNS to each host.
+
+    # Each mesh_dns_servers entry is {host, mesh_ip}; the netbird API wants
+    # {ip, ns_type, port}. Accumulate the array with a portable loop (no
+    # community.general filter dependency). Reset to [] first so a re-run on a
+    # warm fact cache doesn't append duplicates.
+    - name: Reset the nameserver array
+      ansible.builtin.set_fact:
+        mesh_dns_ns_array: []
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool
+
+    - name: Build the netbird nameserver array from mesh_dns_servers (1 or 3)
+      ansible.builtin.set_fact:
+        mesh_dns_ns_array: >-
+          {{ mesh_dns_ns_array
+             + [{'ip': item.mesh_ip, 'ns_type': 'udp', 'port': mesh_coredns_port | int}] }}
+      loop: "{{ mesh_dns_servers }}"
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool
+
+    - name: Get existing Netbird DNS nameserver groups
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/dns/nameservers"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+        validate_certs: true
+        return_content: true
+      register: ns_groups
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool
+
+    - name: Look up this site's mesh-dns group (if it already exists)
+      ansible.builtin.set_fact:
+        mesh_dns_group: >-
+          {{ ns_groups.json
+             | selectattr('name', 'equalto', netbird_nameserver_group_name)
+             | first | default(None) }}
+      run_once: true
+      when: mesh_dns_register_group | bool
+
+    - name: Discover the "All" group ID (default catch-all in netbird-mgmt)
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/groups"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+        validate_certs: true
+        return_content: true
+      register: nb_groups
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool and mesh_dns_group is none
+
+    - name: Resolve the All group ID
+      ansible.builtin.set_fact:
+        all_group_id: >-
+          {{ (nb_groups.json | selectattr('name', 'equalto', 'All') | first).id }}
+      run_once: true
+      when: mesh_dns_register_group | bool and mesh_dns_group is none
+
+    - name: Create the <site_id>-mesh-dns nameserver group (first run)
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/dns/nameservers"
+        method: POST
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ netbird_nameserver_group_name }}"
+          description: "Mesh DNS — resolves *.{{ netbird_nameserver_domain }} via {{ mesh_dns_servers | length }} {{ site_id }} CoreDNS replica(s) over the netbird mesh (ADR 1056 redundancy). Services live ONLY here; no public Cloudflare A records."
+          nameservers: "{{ mesh_dns_ns_array }}"
+          domains:
+            - "{{ netbird_nameserver_domain }}"
+          groups:
+            - "{{ all_group_id }}"
+          enabled: true
+          primary: false
+          search_domains_enabled: false
+        status_code: 200
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool and mesh_dns_group is none
+      register: ns_create
+
+    - name: Update the existing nameserver group to current resolver (subsequent runs)
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/dns/nameservers/{{ mesh_dns_group.id }}"
+        method: PUT
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ mesh_dns_group.name }}"
+          description: "{{ mesh_dns_group.description }}"
+          nameservers: "{{ mesh_dns_ns_array }}"
+          domains: "{{ mesh_dns_group.domains }}"
+          groups: >-
+            {{ mesh_dns_group.groups
+               | map(attribute='id') | list
+               if (mesh_dns_group.groups | first) is mapping
+               else mesh_dns_group.groups }}
+          enabled: true
+          primary: "{{ mesh_dns_group.primary }}"
+          search_domains_enabled: "{{ mesh_dns_group.search_domains_enabled }}"
+        status_code: 200
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool and mesh_dns_group is not none
+      register: ns_update
+
+    # ------------------------------------------------------------------
+    # Handset nameserver group (ADR 1175 decision 5, mobile-device-onboarding.md
+    # §2.4). DEFAULT-OFF. NetBird documents match-domain nameserver groups as
+    # desktop-only; iOS resolved mesh names through the match-domain group
+    # anyway, Android is unmeasured. When a goatnet sets
+    # `handset_dns_enabled: true`, this block creates or updates
+    # `<site_id>-handset-dns`: the SAME resolvers as `<site_id>-mesh-dns`,
+    # but `primary: true` with no match domains, distributed ONLY to the
+    # `<SITE_PREFIX>-HANDSET` group (netbird_acl_taxonomy.yml; created by
+    # netbird-acl-bootstrap.yml). Phones on a handset key hold HANDSET beside
+    # OBSERVER, so every DNS query from a connected phone reaches CoreDNS, which
+    # forwards non-mesh names upstream. Desktops keep the match-domain group.
+    # ------------------------------------------------------------------
+    - name: Resolve the <SITE_PREFIX>-HANDSET group (handset DNS)
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/groups"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+        validate_certs: true
+        return_content: true
+      register: handset_nb_groups
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool and (handset_dns_enabled | default(false) | bool)
+
+    - name: Refuse when the HANDSET group does not exist on this goatnet
+      ansible.builtin.assert:
+        that:
+          - (handset_nb_groups.json | selectattr('name', 'equalto', handset_dns_group_member) | list | length) == 1
+        fail_msg: >-
+          handset_dns_enabled is true but NetBird has no group `{{ handset_dns_group_member }}`.
+          It is declared in netbird_acl_taxonomy.yml (suffix HANDSET); create it with
+          `netbird-acl-bootstrap.yml -e target_site={{ site_id }}` and re-run.
+      run_once: true
+      when: mesh_dns_register_group | bool and (handset_dns_enabled | default(false) | bool)
+
+    - name: Look up this site's handset-dns group (if it already exists)
+      ansible.builtin.set_fact:
+        handset_dns_group: >-
+          {{ ns_groups.json
+             | selectattr('name', 'equalto', handset_dns_group_name)
+             | first | default(None) }}
+        handset_group_id: >-
+          {{ (handset_nb_groups.json | selectattr('name', 'equalto', handset_dns_group_member) | first).id }}
+      run_once: true
+      when: mesh_dns_register_group | bool and (handset_dns_enabled | default(false) | bool)
+
+    - name: Create the <site_id>-handset-dns nameserver group (first run)
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/dns/nameservers"
+        method: POST
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ handset_dns_group_name }}"
+          description: "Handset DNS (ADR 1175) — PRIMARY resolver for phones and tablets in {{ handset_dns_group_member }}: the same {{ site_id }} CoreDNS replica(s) as {{ netbird_nameserver_group_name }}, no match domains, because NetBird's mobile clients do not apply match-domain groups. CoreDNS forwards non-mesh names upstream."
+          nameservers: "{{ mesh_dns_ns_array }}"
+          domains: []
+          groups:
+            - "{{ handset_group_id }}"
+          enabled: true
+          primary: true
+          search_domains_enabled: false
+        status_code: 200
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool and (handset_dns_enabled | default(false) | bool) and handset_dns_group is none
+      register: handset_ns_create
+
+    - name: Update the existing handset-dns group to current resolver (subsequent runs)
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/dns/nameservers/{{ handset_dns_group.id }}"
+        method: PUT
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ handset_dns_group.name }}"
+          description: "{{ handset_dns_group.description }}"
+          nameservers: "{{ mesh_dns_ns_array }}"
+          domains: []
+          groups:
+            - "{{ handset_group_id }}"
+          enabled: true
+          primary: true
+          search_domains_enabled: false
+        status_code: 200
+      run_once: true
+      delegate_to: localhost
+      when: mesh_dns_register_group | bool and (handset_dns_enabled | default(false) | bool) and handset_dns_group is not none
+      register: handset_ns_update
+
+    - name: Print handset-DNS summary
+      ansible.builtin.debug:
+        msg: >-
+          handset DNS on {{ site_id }}: {{ handset_dns_group_name }} → {{ handset_dns_group_member }}
+          ({{ 'created' if handset_ns_create is changed else 'updated' if handset_ns_update is changed else 'no-change' }}),
+          primary, no match domains, same replicas as {{ netbird_nameserver_group_name }}.
+      run_once: true
+      when: mesh_dns_register_group | bool and (handset_dns_enabled | default(false) | bool)
+
+    - name: Note that handset DNS is off for this goatnet
+      ansible.builtin.debug:
+        msg: "handset DNS (ADR 1175): off — set handset_dns_enabled: true in group_vars once the Android measurement (plan phase 0) needs it. iOS resolves mesh names through the match-domain group."
+      run_once: true
+      when: not (handset_dns_enabled | default(false) | bool)
+
+    - name: Print mesh-DNS substrate summary
+      ansible.builtin.debug:
+        msg: |
+          mesh CoreDNS on {{ site_id }} ({{ mesh_dns_servers | length }}-server group, ADR 1056):
+            replicas:       {{ mesh_dns_servers | map(attribute='mesh_ip') | map('regex_replace', '$', ':' ~ (mesh_coredns_port | string)) | join(', ') }}
+            this host bind: {{ mesh_coredns_bind_ip }}:{{ mesh_coredns_port }}
+            zone file:      {{ mesh_coredns_zone_dir }}/mesh-hosts (mesh-internal, identical on every replica)
+            domain pushed:  *.{{ netbird_nameserver_domain }}
+            ns group:       {{ netbird_nameserver_group_name }} ({{ 'created' if ns_create is changed else 'updated' if ns_update is changed else ('untouched — zone-only run' if not (mesh_dns_register_group | bool) else 'no-change') }})
+
+          Mesh peers resolve service hostnames via the {{ mesh_dns_servers | length }}-server group; netbird's
+          resolver fails over, so DNS survives losing {{ mesh_dns_servers | length - 1 }} of the replica paths.
+          DNS-cache TTL means clients may take a few minutes to pick up changes.
+          `netbird down && sudo netbird up` from the operator laptop forces an
+          immediate refresh.
+      run_once: true

@@ -1,0 +1,492 @@
+---
+# goat-client-install.yml
+#
+# One-command operator-laptop install of goat-client (the Block 76 cross-
+# platform daemon + GUI for wg-cp0 silent-control-plane onboarding). This
+# playbook is the alternative to the manual quickstart at
+# goat-client —
+# every step that doc walks through is automated here, idempotently.
+#
+# Authored right after goat-client-v0.1.0 shipped. Sister to
+# operator-laptop-onboarding.yml (which onboards the laptop onto the
+# netbird-prod mesh via wg-cp0-bundle-apply) — that ceremony and this
+# one are independent: you can run either without the other. Most
+# operators will run both: this one to get the goat-client app
+# installed; the other to make the wg-cp0 plumbing actually work.
+#
+# Sister artifacts:
+#   - docs/operations/goat-client-install.md (canonical runbook)
+#   - goat-client
+#     (the manual walkthrough this playbook replaces)
+#
+# Scope:
+#   IN  — download + cosign-verify the release archive, install BOTH
+#         binaries it carries (goat-clientd + the goat-client GUI) to
+#         /usr/local/bin, drop trust-roots PEM, optionally generate a
+#         per-user service (systemd-user on Linux, launchd LaunchAgent
+#         on macOS) so the daemon auto-starts on login.
+#
+#         The GUI used to be built from source here, because the v0.1.0
+#         archive shipped the daemon alone. It has not since v0.1.1 —
+#         `tar tzf goat-client-darwin-arm64.tar.gz` on the 0.3.7 asset
+#         lists `goat-clientd` AND `goat-client`. Building from source
+#         also threw away the thing this playbook just verified: the
+#         cosign signature covers the archive, not a local `go build`.
+#   OUT — bundle issuance (offline-CA ceremony, separate playbook),
+#         bundle import (interactive — operator drags the bundle.cbor
+#         onto the GUI window), peer-to-peer connectivity proof
+#         (depends on wg-cp0 being up which is operator-laptop-
+#         onboarding.yml's job).
+#
+# Platform support:
+#   - Linux (Ubuntu/Debian + RHEL family, amd64 + arm64): full path
+#   - macOS (Intel + Apple Silicon): full path with macOS-specific
+#     quarantine strip + launchd LaunchAgent
+#   - Windows: NOT supported by this playbook. Native Ansible on Windows
+#     needs WinRM setup that's heavier than the manual quickstart
+#     PowerShell snippet. Windows operators: follow the quickstart.
+#
+# Operator usage:
+#
+#   # One-shot, no inventory file:
+#   #
+#   # `-K` / `--ask-become-pass` is REQUIRED — Phase 3 + 5 + 6 become
+#   # root to install binaries to /usr/local/bin and (on Linux) to
+#   # apt-install Fyne build deps.
+#   #
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i localhost, --connection local -K \
+#       ops/ansible/goat-client-install.yml
+#
+#   # Skip the GUI install (daemon-only — useful on a server / headless box):
+#   ... -e goat_client_install_gui=false
+#
+#   # Skip cosign verification (cosign not installed; SHA256 still runs):
+#   ... -e goat_client_skip_cosign=true
+#
+#   # Skip per-user service generation (operator wants to run goat-clientd
+#   # in a foreground terminal):
+#   ... -e goat_client_install_service=false
+#
+#   # Pin a different version (default is v0.3.7):
+#   ... -e goat_client_version=v0.3.7
+#
+#   # Verify-only:
+#   ... --check
+#
+#   # `--check` reports the install state (Phase 1) and then FAILS at
+#   # Phase 2: check mode does not really create the cache dir, so the
+#   # download has nowhere to land. Fine for "is it installed and at
+#   # what version"; not a dry-run of the whole playbook. Verified
+#   # on macOS/arm64.
+#
+# Idempotency contract:
+#   - All apply tasks gate on a stat / version / running-state check
+#     before re-doing work. Re-running on a fully installed laptop is
+#     a no-op and prints "✓ goat-client v0.3.7 already installed".
+#   - Each phase emits a debug message naming the state it observed
+#     and the action it took (or skipped).
+
+- name: goat-client install (operator laptop)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    # === Tunables (override via -e) ===
+    # Keep this in step with the operator-laptop pin in
+    # operator-laptop-onboarding.yml (0.3.7, the assay-validated
+    # wedge-fix release) — two playbooks installing different clients
+    # on the same laptop is the drift this default exists to prevent.
+    goat_client_version: "v0.3.7"
+    goat_client_install_prefix: "/usr/local"
+    goat_client_install_gui: true
+    goat_client_skip_cosign: false
+    goat_client_install_service: true
+
+    # Whether to use sudo for installing binaries. True when prefix is a
+    # system path (/usr/local, /opt, /usr); False when prefix is in $HOME
+    # (e.g. $HOME/.local — operator-only install, no sudo needed).
+    # Auto-derived; override with -e goat_client_use_become=false to force.
+    goat_client_use_become: "{{ not goat_client_install_prefix.startswith(ansible_env.HOME) }}"
+
+    # The current dev-CA root, as an ECDSA P-256 SPKI extracted from
+    # ops/enrollment/ca/dev/root-cert.pem. Override -e for a different CA.
+    #
+    # MUST be P-256. goat-client's loader hard type-asserts *ecdsa.PublicKey
+    # (internal/trustanchor/anchor.go parseSPKI; internal/bundle/trust.go is
+    # ECDSA throughout) and a failed trust-root load is fatal at daemon start.
+    # This value was previously an **Ed25519** SPKI (prefix `MCowBQYDK2Vw`) —
+    # the root retired substrate-wide at Block 79 — so this playbook installed
+    # a daemon that could never start, crash-looping under systemd on every
+    # host it touched. Do not "restore" an Ed25519 anchor here: the flag help
+    # and package doc in goat-client that still mention Ed25519 are stale.
+    goat_client_trust_anchor_pem: |
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEbL9rt5sLRBrQABTU9PFbx+PrSwGa
+      oAcvQlrC53pZOy086qSvLMD5fZx9Q4+epTW15zrgVTmXxdv/4qvwaim/wQ==
+      -----END PUBLIC KEY-----
+
+    # === Derived (don't override) ===
+    goat_client_release_tag: "goat-client-{{ goat_client_version }}"
+    goat_client_release_url: "https://github.com/usareur-af/goat-client/releases/download/{{ goat_client_release_tag }}"
+    goat_client_repo_url: "https://github.com/usareur-af/goat-client"
+    # Kept so a stale `-e goat_client_build_gui=false` fails loudly in
+    # pre_tasks instead of silently installing a GUI the operator asked
+    # not to have. Renamed when Phase 6 stopped building.
+    goat_client_build_gui: null
+
+    goat_client_arch: >-
+      {%- if ansible_architecture in ['x86_64', 'amd64'] -%}amd64
+      {%- elif ansible_architecture in ['arm64', 'aarch64'] -%}arm64
+      {%- else -%}unsupported
+      {%- endif -%}
+
+    goat_client_os: >-
+      {%- if ansible_facts['system'] == 'Linux' -%}linux
+      {%- elif ansible_facts['system'] == 'Darwin' -%}darwin
+      {%- else -%}unsupported
+      {%- endif -%}
+
+    goat_client_archive_ext: "tar.gz"
+    goat_client_archive: "goat-client-{{ goat_client_os }}-{{ goat_client_arch }}.{{ goat_client_archive_ext }}"
+
+    goat_client_cache_dir: "{{ ansible_env.HOME }}/.cache/goat-client/{{ goat_client_version }}"
+
+    goat_client_config_dir: >-
+      {%- if ansible_facts['system'] == 'Darwin' -%}
+      {{ ansible_env.HOME }}/Library/Application Support/goat-client
+      {%- else -%}
+      {{ ansible_env.HOME }}/.config/goat-client
+      {%- endif -%}
+
+    goat_client_runtime_socket: >-
+      {%- if ansible_facts['system'] == 'Linux' and ansible_env.XDG_RUNTIME_DIR is defined -%}
+      {{ ansible_env.XDG_RUNTIME_DIR }}/goat-clientd.sock
+      {%- elif ansible_facts['system'] == 'Darwin' -%}
+      {{ ansible_env.HOME }}/.goat-client/goat-clientd.sock
+      {%- else -%}
+      {{ ansible_env.HOME }}/.goat-client/goat-clientd.sock
+      {%- endif -%}
+
+  pre_tasks:
+    - name: 'Pre-flight: retired goat_client_build_gui override'
+      fail:
+        msg: |
+          `goat_client_build_gui` is retired — Phase 6 installs the GUI from
+          the verified release archive instead of building it from source.
+          Use `-e goat_client_install_gui={{ goat_client_build_gui }}` instead.
+      when: goat_client_build_gui is not none
+
+    - name: 'Pre-flight: platform supported'
+      assert:
+        that:
+          - goat_client_os in ['linux', 'darwin']
+          - goat_client_arch in ['amd64', 'arm64']
+        fail_msg: |
+          goat-client-install supports Linux + macOS, amd64 + arm64.
+          Detected: {{ ansible_facts['system'] }}/{{ ansible_architecture }}.
+          For Windows, follow the manual quickstart at
+          https://github.com/usareur-af/goat-client/blob/main/docs/quickstart.md.
+
+    - name: 'Pre-flight: cosign present (warn-only)'
+      command: which cosign
+      register: cosign_check
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: 'Pre-flight: cosign missing → signature verification will be skipped'
+      debug:
+        msg: |
+          ⚠ cosign not on $PATH; skipping Sigstore signature verification.
+            Install with `brew install cosign` (macOS) or
+            `go install github.com/sigstore/cosign/v2/cmd/cosign@latest`.
+            SHA256 verification still runs.
+      when: cosign_check.rc != 0 and not goat_client_skip_cosign
+
+  tasks:
+    - name: 'already installed at the target version?'
+      block:
+        - name: Probe installed daemon version
+          command: "{{ goat_client_install_prefix }}/bin/goat-clientd --version"
+          register: installed_version
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Note observed state
+          debug:
+            msg: |
+              {% if installed_version.rc == 0 %}
+              Installed goat-clientd reports: {{ installed_version.stdout | default('') }}
+              {% else %}
+              No prior install detected at {{ goat_client_install_prefix }}/bin/goat-clientd
+              {% endif %}
+
+    - name: 'download release archive + sidecars'
+      block:
+        - name: Create cache dir
+          file:
+            path: "{{ goat_client_cache_dir }}"
+            state: directory
+            mode: '0755'
+
+        - name: Download archive + sha256 + cosign-bundle
+          get_url:
+            url: "{{ goat_client_release_url }}/{{ item }}"
+            dest: "{{ goat_client_cache_dir }}/{{ item }}"
+            mode: '0644'
+          loop:
+            - "{{ goat_client_archive }}"
+            - "{{ goat_client_archive }}.sha256"
+            - "{{ goat_client_archive }}.cosign-bundle"
+
+    - name: 'verify SHA256 + cosign signature'
+      block:
+        - name: Verify SHA256 (Linux)
+          command: sha256sum -c "{{ goat_client_archive }}.sha256"
+          args:
+            chdir: "{{ goat_client_cache_dir }}"
+          changed_when: false
+          when: ansible_facts['system'] == 'Linux'
+
+        - name: Verify SHA256 (macOS)
+          shell: |
+            set -euo pipefail
+            shasum -a 256 -c "{{ goat_client_archive }}.sha256"
+          args:
+            chdir: "{{ goat_client_cache_dir }}"
+            executable: /bin/bash
+          changed_when: false
+          when: ansible_facts['system'] == 'Darwin'
+
+        - name: Verify cosign keyless signature (Sigstore via GitHub OIDC)
+          command: >
+            cosign verify-blob
+              --bundle {{ goat_client_cache_dir }}/{{ goat_client_archive }}.cosign-bundle
+              --certificate-identity-regexp '^https://github.com/usareur-af/goat-client/'
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+              {{ goat_client_cache_dir }}/{{ goat_client_archive }}
+          register: cosign_verify
+          changed_when: false
+          when: cosign_check.rc == 0 and not goat_client_skip_cosign
+
+        - name: Note cosign verdict
+          debug:
+            msg: "✓ cosign signature verified"
+          when: cosign_check.rc == 0 and not goat_client_skip_cosign
+
+    - name: 'install goat-clientd to {{ goat_client_install_prefix }}/bin'
+      block:
+        - name: Extract archive (via tar; portable across BSD tar on macOS + GNU tar on Linux)
+          command: tar -xzf "{{ goat_client_archive }}"
+          args:
+            chdir: "{{ goat_client_cache_dir }}"
+            creates: "{{ goat_client_cache_dir }}/goat-clientd"
+
+        - name: Strip macOS quarantine attribute (best-effort)
+          command: xattr -d com.apple.quarantine "{{ goat_client_cache_dir }}/goat-clientd"
+          register: xattr_strip
+          changed_when: xattr_strip.rc == 0
+          failed_when: false
+          when: ansible_facts['system'] == 'Darwin'
+
+        - name: Ensure target bin dir exists
+          file:
+            path: "{{ goat_client_install_prefix }}/bin"
+            state: directory
+            mode: '0755'
+          become: "{{ goat_client_use_become }}"
+
+        - name: Install daemon binary
+          become: "{{ goat_client_use_become }}"
+          copy:
+            src: "{{ goat_client_cache_dir }}/goat-clientd"
+            dest: "{{ goat_client_install_prefix }}/bin/goat-clientd"
+            mode: '0755'
+            remote_src: true
+            # Only force root:wheel/root ownership when sudo'ing; otherwise
+            # leave ownership at the calling user (chown fails for non-root).
+            owner: "{{ 'root' if goat_client_use_become else omit }}"
+            group: "{{ ('wheel' if ansible_facts['system'] == 'Darwin' else 'root') if goat_client_use_become else omit }}"
+
+    - name: 'drop trust-roots PEM at {{ goat_client_config_dir }}'
+      block:
+        - name: Create config dir
+          file:
+            path: "{{ goat_client_config_dir }}"
+            state: directory
+            mode: '0700'
+
+        - name: Write trust-roots PEM
+          copy:
+            content: "{{ goat_client_trust_anchor_pem }}"
+            dest: "{{ goat_client_config_dir }}/trust-roots.pem"
+            mode: '0644'
+
+    - name: 'install GUI from the verified archive'
+      when: goat_client_install_gui
+      block:
+        # The archive extracted in Phase 4 carries both binaries. Nothing
+        # is built here: a local `go build` would produce a binary the
+        # Phase 3 cosign verification says nothing about.
+        - name: Confirm the archive carried a GUI binary
+          stat:
+            path: "{{ goat_client_cache_dir }}/goat-client"
+          register: gui_binary
+
+        - name: Bail out clearly if the archive has no GUI binary
+          fail:
+            msg: |
+              {{ goat_client_archive }} did not contain a `goat-client` GUI
+              binary. Releases have shipped both binaries since v0.1.1; only
+              v0.1.0 was daemon-only.
+              Either:
+                - pin a release ≥ v0.1.1 (default is {{ goat_client_version }}), OR
+                - re-run with -e goat_client_install_gui=false
+                  (daemon-only install, run goat-clientd in a terminal).
+          when: not gui_binary.stat.exists
+
+        - name: Strip macOS quarantine attribute from the GUI (best-effort)
+          command: xattr -d com.apple.quarantine "{{ goat_client_cache_dir }}/goat-client"
+          register: gui_xattr_strip
+          changed_when: gui_xattr_strip.rc == 0
+          failed_when: false
+          when: ansible_facts['system'] == 'Darwin'
+
+        - name: Install GUI binary
+          become: "{{ goat_client_use_become }}"
+          copy:
+            src: "{{ goat_client_cache_dir }}/goat-client"
+            dest: "{{ goat_client_install_prefix }}/bin/goat-client"
+            mode: '0755'
+            remote_src: true
+            owner: "{{ 'root' if goat_client_use_become else omit }}"
+            group: "{{ ('wheel' if ansible_facts['system'] == 'Darwin' else 'root') if goat_client_use_become else omit }}"
+
+    - name: 'generate per-user auto-start service'
+      when: goat_client_install_service
+      block:
+        # --- Linux: systemd --user unit ---
+        - name: Linux — systemd-user unit dir
+          file:
+            path: "{{ ansible_env.HOME }}/.config/systemd/user"
+            state: directory
+            mode: '0755'
+          when: ansible_facts['system'] == 'Linux'
+
+        - name: Linux — write systemd-user unit
+          copy:
+            dest: "{{ ansible_env.HOME }}/.config/systemd/user/goat-clientd.service"
+            mode: '0644'
+            content: |
+              [Unit]
+              Description=goat-client daemon (wg-cp0 outer tunnel)
+              Documentation=https://github.com/usareur-af/goat-client/blob/main/docs/quickstart.md
+              After=default.target
+
+              [Service]
+              Type=simple
+              ExecStart={{ goat_client_install_prefix }}/bin/goat-clientd \
+                --trust-roots {{ goat_client_config_dir }}/trust-roots.pem
+              Restart=on-failure
+              RestartSec=5
+
+              [Install]
+              WantedBy=default.target
+          when: ansible_facts['system'] == 'Linux'
+
+        - name: Linux — enable + start systemd-user unit
+          systemd:
+            scope: user
+            daemon_reload: true
+            name: goat-clientd.service
+            enabled: true
+            state: started
+          when: ansible_facts['system'] == 'Linux'
+
+        # --- macOS: launchd LaunchAgent ---
+        - name: macOS — LaunchAgents dir
+          file:
+            path: "{{ ansible_env.HOME }}/Library/LaunchAgents"
+            state: directory
+            mode: '0755'
+          when: ansible_facts['system'] == 'Darwin'
+
+        - name: macOS — write LaunchAgent plist
+          copy:
+            dest: "{{ ansible_env.HOME }}/Library/LaunchAgents/io.goat-maintainer.goat-clientd.plist"
+            mode: '0644'
+            content: |
+              <?xml version="1.0" encoding="UTF-8"?>
+              <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+              <plist version="1.0">
+              <dict>
+                <key>Label</key>            <string>io.goat-maintainer.goat-clientd</string>
+                <key>ProgramArguments</key>
+                <array>
+                  <string>{{ goat_client_install_prefix }}/bin/goat-clientd</string>
+                  <string>--trust-roots</string>
+                  <string>{{ goat_client_config_dir }}/trust-roots.pem</string>
+                </array>
+                <key>RunAtLoad</key>        <true/>
+                <key>KeepAlive</key>        <true/>
+                <key>StandardOutPath</key>  <string>{{ ansible_env.HOME }}/Library/Logs/goat-clientd.out.log</string>
+                <key>StandardErrorPath</key><string>{{ ansible_env.HOME }}/Library/Logs/goat-clientd.err.log</string>
+              </dict>
+              </plist>
+          when: ansible_facts['system'] == 'Darwin'
+
+        - name: macOS — load LaunchAgent (idempotent)
+          shell: |
+            set -euo pipefail
+            launchctl bootstrap gui/$(id -u) "{{ ansible_env.HOME }}/Library/LaunchAgents/io.goat-maintainer.goat-clientd.plist" 2>/dev/null || true
+            launchctl kickstart -k gui/$(id -u)/io.goat-maintainer.goat-clientd
+          args:
+            executable: /bin/bash
+          changed_when: false
+          when: ansible_facts['system'] == 'Darwin'
+
+  post_tasks:
+    - name: 'verify daemon up + report next steps'
+      block:
+        - name: Wait briefly for the daemon to listen
+          wait_for:
+            path: "{{ goat_client_runtime_socket }}"
+            timeout: 10
+          register: socket_wait
+          failed_when: false
+          when: goat_client_install_service
+
+        - name: 'Summary'
+          debug:
+            msg: |
+              ─── goat-client install complete ───────────────────────────────
+              Version:        {{ goat_client_version }}
+              Daemon binary:  {{ goat_client_install_prefix }}/bin/goat-clientd
+              GUI binary:     {{ goat_client_install_prefix }}/bin/goat-client {% if not goat_client_install_gui %}(SKIPPED — daemon-only install){% endif %}
+
+              Trust-roots:    {{ goat_client_config_dir }}/trust-roots.pem
+              IPC socket:     {{ goat_client_runtime_socket }}
+              Service:        {% if goat_client_install_service %}{{ 'systemd-user goat-clientd.service' if ansible_facts['system'] == 'Linux' else 'launchd LaunchAgent io.goat-maintainer.goat-clientd' }}{% else %}NOT installed (run `goat-clientd` in a terminal){% endif %}
+
+              ─── Next steps (manual; not automatable) ──────────────────────
+              1. Mint yourself a wg-cp0 enrollment bundle via the
+                 operator-side ceremony (separate playbook):
+                   docs/operations/operator-bundle-issuance.md
+
+              2. Launch the GUI:
+                   goat-client --daemon-addr "{{ goat_client_runtime_socket }}"
+
+              3. In the GUI: File → Import Bundle... → pick your bundle.cbor
+                 → click Connect.
+
+              4. Verify wg-cp0 interface up:
+                   {% if ansible_facts['system'] == 'Linux' %}ip addr show wg-cp0
+                   {% else %}ifconfig | grep -A2 utun{% endif %}
+
+              See https://github.com/usareur-af/goat-client/blob/main/docs/quickstart.md
+              for the manual equivalent of every step this playbook ran.
+              ────────────────────────────────────────────────────────────────

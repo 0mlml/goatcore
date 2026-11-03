@@ -1,0 +1,46 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-ntp-health-pub attestation republisher on nova-a (ADR 1036/1037,
+# F-184 — docs/design/universal-ntp-hygiene.md §9). A normal mTLS Zenoh client
+# peer that reads the local ntp-health-agent's signed verdict (:9753/health) and
+# republishes it verbatim on ops/time/attest/<host_id>. Persists nothing.
+#
+# Run from any laptop on the netbird mesh:
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       ntp-health-pub-deploy.yml
+#
+#   # ZAGROS sibling goatnet:  add  -e target=zagros_hosts
+#
+# Pre-flight (operator-side, one-time per fresh deploy):
+#   1. zenoh-router container Healthy on the target host (zenoh-deploy.yml).
+#   2. ntp-health-agent running on the host with the signing-capable binary
+#      (`cd ops/time-hygiene && make build` before the site bootstrap; the agent
+#      role asserts this) — serving the SIGNED verdict on :9753/health.
+#   3. Infra-class leaf cert + key minted via offline-CA cert-sign with Subject
+#      CN=ntp-health-pub-trial-peer, placed at:
+#        /opt/ntp-health-pub/certs/ntp-health-pub-cert.pem
+#        /opt/ntp-health-pub/certs/ntp-health-pub-key.pem
+#      (the zenoh ACL subject `infra-ntp-health-pub` is granted ingress write on
+#       ops/time/attest/** via rule `infra-w-time-attest`; a wrong CN = silent
+#       denial, F-177).
+#   4. The goat-ntp-health-pub image SHA-pinned in the role defaults +
+#      deploy-history.yml (replace the PENDING :latest placeholder with the
+#      digest the ntp-health-image workflow produced on merge).
+#
+# Live-fire after deploy: a live subscriber on `ops/time/attest/**` (panoscope
+# or `goat sub`) sees this host's signed verdict arrive every ~30s — verify via
+# a live subscriber, NOT a storage read-back (the attest topic is not persisted;
+# F-177 silent-denial trap). Then the goat-time-health roll-up consumes it.
+
+- name: deploy goat-ntp-health-pub republisher on nova trial fabric (ADR 1036/1037, F-184)
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: ntp-health-pub

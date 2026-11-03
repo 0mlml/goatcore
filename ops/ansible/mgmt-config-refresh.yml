@@ -1,0 +1,206 @@
+---
+# mgmt-config-refresh.yml — surgical management.json re-render + restart.
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       mgmt-config-refresh.yml -e target=<site>_hosts
+#
+# BOTH inventories, in that order. management.json.j2 reads per-host vars that
+# live only in mgmt-hosts.ini (`signal_uri` above all), while the mesh file
+# supplies the SSH-over-mesh connection vars and must load SECOND to win. Pass
+# the mesh file alone and the render dies on `'signal_uri' is undefined`; pass
+# the LAN file alone and the play tries to reach the Orin over an address the
+# operator laptop has no route to.
+#
+# WHY THIS EXISTS. `templates/management.json.j2` is rendered in exactly one
+# place — mgmt-host.yml, the ~30-minute bootstrap play that also writes .env,
+# lays down both compose files, and runs `docker compose up -d`. A one-line
+# config change (an auth flow, a signal URI, a relay secret) does not want any
+# of that: on a site carrying a Traefik overlay, mgmt-host.yml's plain
+# `docker compose up -d` recreates Traefik WITHOUT the overlay's flags and
+# takes the cert path down with it. This playbook is a surgical escape hatch,
+# generalized, parameterized on `target`, so the next surgical edit does not
+# grow a third copy.
+#
+# WHAT IT TOUCHES. management.json, and management-a only if the file actually
+# changed. Nothing else — no compose, no images, no .env. If the render is
+# byte-identical the play is a no-op and reports so.
+#
+# WHAT IT DOES NOT DO. It does not create anything management.json REFERENCES.
+# An auth flow pointed at an OAuth2 client that does not exist renders fine and
+# fails at first login; register the client first. It also does not restart
+# signal-a — a Signal change needs the pair bounced separately.
+#
+# PRE-FLIGHT. The group_vars for `target` must resolve, which means the env
+# lookups they contain must be populated: run under `direnv exec <repo-root>`
+# if the cwd is a worktree, because worktrees carry no .envrc.local.d and
+# every secret silently renders empty.
+
+- name: "mgmt-config-refresh — re-render management.json on {{ target | mandatory }}"
+  hosts: "{{ target | mandatory }}[0]"
+  become: true
+  gather_facts: false
+
+  vars:
+    compose_dir: /opt/mgmt-host
+    # The bootstrap playbooks take this on the command line rather than from
+    # group_vars (`-e netbird_encryption_key="$<SITE>_NB_ENCKEY"`), so it is
+    # absent from the group_vars this play inherits. Resolve it from the
+    # per-site env var the whole fleet already keys on — `<SITE_ID_UPPER>_NB_ENCKEY`
+    # — while still honouring an explicit -e override.
+    netbird_encryption_key: >-
+      {{ lookup('env', (site_id_upper | default(site_id | upper | replace('-', '_'))) ~ '_NB_ENCKEY') }}
+
+  tasks:
+    # The template renders empty strings rather than failing when a var is
+    # missing, so an unpopulated env produces a syntactically valid config that
+    # silently disables encryption or auth. Assert the two that have no safe
+    # empty value before writing anything.
+    - name: Pre-flight | target group was named
+      ansible.builtin.assert:
+        that: target is defined and target | length > 0
+        fail_msg: "pass -e target=<group>, e.g. -e target=zagros_prod_hosts"
+        quiet: true
+
+    - name: Pre-flight | netbird_encryption_key resolved from the environment
+      ansible.builtin.assert:
+        that: netbird_encryption_key | default('') | length >= 44
+        fail_msg: >-
+          netbird_encryption_key is empty or short. Its group_var is an
+          env lookup and worktrees have no .envrc.local.d — re-run under
+          `direnv exec <repo-root> ansible-playbook ...`. Writing it empty
+          makes management-a unable to decrypt existing setup keys.
+        quiet: true
+
+    # F-444 — the destructive case the assert above does NOT cover. An empty key
+    # is refused; a DIFFERENT non-empty key is written happily, and that is the
+    # one that destroys data. NetBird's DataStoreEncryptionKey is a single
+    # AES-256-GCM key with NO key identifier in the ciphertext and no fallback
+    # decrypt path, so changing it does not degrade anything — it makes every
+    # already-encrypted field permanently unreadable: user records, invite
+    # records, and the activity store's person identifiers. The mesh keeps
+    # running, nothing errors, and the damage surfaces whenever somebody next
+    # reads the audit log. There is no rotation procedure to fall back on.
+    #
+    # Compared by SHA-256 on both sides so neither value is ever rendered, put
+    # on a command line where `ps` can see it, or written to a log.
+    - name: Pre-flight | read the hash of the key this host already holds
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import hashlib, json, sys
+            try:
+                with open(sys.argv[1]) as fh:
+                    key = json.load(fh).get("DataStoreEncryptionKey") or ""
+            except FileNotFoundError:
+                print("ABSENT"); raise SystemExit(0)
+            except Exception:
+                print("UNREADABLE"); raise SystemExit(0)
+            print(hashlib.sha256(key.encode()).hexdigest() if key else "EMPTY")
+          - "{{ compose_dir }}/management-a/management.json"
+      register: _nb_enckey_onhost
+      changed_when: false
+      failed_when: false
+      # Runs under --check too: without this the read is skipped, the register
+      # is empty and the guard below refuses every dry run as a key mismatch
+      # even with the correct key in the environment.
+      check_mode: false
+
+    - name: Pre-flight | refuse a key that differs from the one this host holds
+      ansible.builtin.assert:
+        that:
+          - _nb_enckey_onhost.stdout | default('') in ['ABSENT', 'EMPTY', 'UNREADABLE']
+            or _nb_enckey_onhost.stdout | trim == (netbird_encryption_key | hash('sha256'))
+        fail_msg: >-
+          REFUSING: the netbird_encryption_key resolved here is NOT the key
+          {{ inventory_hostname }} is already running. Writing it would
+          make every existing encrypted field on this host permanently
+          unreadable — user records, invite records and the whole activity/audit
+          history — while the mesh carries on working and nothing errors.
+          There is no rotation path to undo it. Most likely your environment
+          resolved a different goatnet's *_NB_ENCKEY: check site_id and the
+          variable it derives, and re-run under
+          `direnv exec <repo-root> ansible-playbook ...`.
+          If you genuinely intend to change this key, that is a data migration
+          (decrypt-with-old, re-encrypt-with-new, offline, backup first), not a
+          deploy — see docs/findings/F-444-nb-enckey-cannot-be-rotated-and-the-failure-is-silent.md.
+          Override for that migration only with -e nb_enckey_change_is_intentional=true.
+        quiet: true
+      when: not (nb_enckey_change_is_intentional | default(false) | bool)
+
+    - name: Pre-flight | relay secret is the one this host already signs with
+      ansible.builtin.include_tasks: tasks/assert-relay-secret-unchanged.yml
+
+    - name: Back up the current management.json
+      ansible.builtin.copy:
+        src: "{{ compose_dir }}/management-a/management.json"
+        dest: "{{ compose_dir }}/management-a/management.json.bak"
+        remote_src: true
+        mode: "0644"
+
+    - name: Render management-a/management.json from the canonical template
+      ansible.builtin.template:
+        src: templates/management.json.j2
+        dest: "{{ compose_dir }}/management-a/management.json"
+        mode: "0644"
+      register: _mgmt_json
+
+    # management-a exits on a malformed config, and an exited management-a on a
+    # single-node site is a full control-plane outage. Parse before restarting,
+    # and put the backup back if the render is not valid JSON.
+    - name: Validate the rendered config parses as JSON
+      ansible.builtin.command:
+        cmd: python3 -c "import json,sys; json.load(open(sys.argv[1]))"
+          "{{ compose_dir }}/management-a/management.json"
+      changed_when: false
+      register: _mgmt_json_valid
+      failed_when: false
+
+    - name: Restore the backup when the render is not valid JSON
+      when: _mgmt_json_valid.rc != 0
+      block:
+        - name: Restore management.json
+          ansible.builtin.copy:
+            src: "{{ compose_dir }}/management-a/management.json.bak"
+            dest: "{{ compose_dir }}/management-a/management.json"
+            remote_src: true
+            mode: "0644"
+
+        - name: Fail with the parse error
+          ansible.builtin.fail:
+            msg: >-
+              Rendered management.json is not valid JSON; the previous file has
+              been restored and management-a was NOT restarted.
+              {{ _mgmt_json_valid.stderr }}
+
+    - name: Restart management-a to pick up the new config
+      ansible.builtin.command:
+        cmd: docker restart management-a
+        chdir: "{{ compose_dir }}"
+      when: _mgmt_json.changed
+
+    - name: Wait for management-a to report healthy again
+      ansible.builtin.command:
+        cmd: docker inspect -f '{{ "{{" }}.State.Status{{ "}}" }}' management-a
+      register: _mgmt_state
+      until: _mgmt_state.stdout | trim == "running"
+      retries: 15
+      delay: 2
+      changed_when: false
+      # Read-only inspect; run it under --check as well so a dry run reaches
+      # the recap instead of failing here with "would have run".
+      check_mode: false
+      when: _mgmt_json.changed
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'management.json changed; management-a restarted and is '
+             ~ (_mgmt_state.stdout | default('unknown') | trim)
+             if _mgmt_json.changed
+             else 'management.json unchanged; nothing restarted.' }}

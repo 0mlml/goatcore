@@ -1,0 +1,754 @@
+---
+# id-console-postgres-cutover.yml — move one goatnet's id console from its
+# SQLite files to Postgres (ADR 1165 step A, docs/design/island-mode-multi-writer.md §5).
+# Runbook: docs/operations/id-console-postgres-cutover.md. Run with the operator present.
+#
+# One driver, eight phases. Every phase is idempotent and the whole play is
+# safe to re-run: phases 2-4 skip once the host's store marker says postgres, so
+# a run that stopped anywhere resumes by running the same command again.
+#
+#   0 GATE  preflight — touches nothing. Runs on the router_role A host only
+#           (tasks/assert-admin-write-host.yml). Refuses unless: the
+#           goatnet declares id_admin_console_store: postgres (committed); the
+#           pinned image is Postgres-era (label); every env var the console
+#           deploy templates resolves; a pgBackRest backup newer than
+#           id_console_cutover_backup_max_age_hours; disk for the archive and
+#           the import; postgres-a up; both SQLite files present; the target
+#           databases empty.
+#   1 A     Postgres databases + login role + pg_hba (id-admin-console-store);
+#           ends on a GATE: both databases owned by the console role, empty.
+#   2 A     stop the console.
+#   3 A     checkpoint both SQLite files (store-migrate checkpoint), copy them
+#           into <archive root>/<UTC stamp>/ (0444, directory 0555), MANIFEST
+#           with sha256 + the image that was running + retain-until (28 days),
+#           originals made root-owned 0444 in place.
+#   4 A     store-migrate import from the archive copy. Any difference: nothing
+#           is committed, the console stays stopped, and the play prints the
+#           rollback command. Success: import-report.txt beside the archive and
+#           the host marker set to postgres.
+#   5 GATE  the goatnet's committed group_vars say postgres and the host says
+#           postgres.
+#   6 A     deploy the pinned Postgres-era image through the id-admin-console
+#           role — the same role the normal deploy runs, rollback-ledger row
+#           included.
+#   7 GATE  /healthz 200; the running image is the pin; the env file carries the
+#           DSNs and no SQLite path; onboard_proposals and orgs row counts in
+#           Postgres equal the import report.
+#
+# Plan mode: --list-tasks prints every phase and executes nothing.
+#
+# The group_vars change is the operator's, committed and merged before this
+# runs: `id_admin_console_store: postgres` in
+# group_vars/<group>/id-admin-console.yml. The play verifies it; it never writes
+# config. Until this play has run, that commit makes every routine console
+# deploy to the goatnet refuse (the store gate), which is the intended state.
+#
+# Usage (from ops/ansible, through the secret store — ADR 1186):
+#   ../scripts/with-secrets ../scripts/ansible-preflight.sh <inventory flags> \
+#     id-console-postgres-cutover.yml -e target=<group> \
+#     -e postgres_superuser_password="$<SITE>_PG_PASS"
+# <inventory flags> are the ones `ops/scripts/deploy-component.sh id-admin-console
+# --goatnet <key> --dry-run` prints for this laptop.
+
+- name: id console — SQLite to Postgres cutover (ADR 1165 step A)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    admin_write_surface: "goat-id-console (SQLite to Postgres cutover)"
+    idcc_container: goat-id-console
+    idcc_health_port: "{{ id_admin_console_host_port | default(8088) }}"
+    idcc_env_file: /opt/mgmt-host/id-admin-console.env
+    idcc_mgmt_env: /opt/mgmt-host/.env
+    idcc_repo: "{{ playbook_dir | dirname | dirname }}"
+    id_console_cutover_backup_max_age_hours: 26
+    idcc_stamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+    # Postgres-side row count of every console table in one database, one
+    # "table|rows" line each (query_to_xml runs the per-table count).
+    idcc_rows_sql: >-
+      SELECT table_name || '|' || (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text
+      FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> 'schema_migrations'
+      ORDER BY 1
+
+  tasks:
+    # ======================================================================
+    # Phase 0 — GATE: preflight. Reads only.
+    # ======================================================================
+    - name: "gate | the console host only — single-homed (ADR 1084 §D3); other members end here"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+      tags: [phase0]
+
+    - name: "gate | load the store facts (id-admin-console-store, no deploy dependency)"
+      ansible.builtin.include_role:
+        name: id-admin-console-store
+        tasks_from: facts.yml
+        public: true
+      tags: [always]
+
+    - name: "gate | the goatnet declares the Postgres store (committed group_vars)"
+      ansible.builtin.assert:
+        that:
+          - id_admin_console_store == 'postgres'
+          - id_admin_console_image is defined and id_admin_console_image | length > 0
+        fail_msg: >-
+          REFUSING: group_vars for {{ target }} declare id_admin_console_store:
+          {{ id_admin_console_store }}. Commit `id_admin_console_store: postgres` to
+          ops/ansible/group_vars/{{ target }}/id-admin-console.yml, merge it, and
+          re-run from a checkout of main. This play verifies the declaration; it
+          never writes it.
+        quiet: true
+      tags: [phase0]
+
+    - name: "gate | every env var the console deploy templates resolves here"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ idcc_repo }}/ops/scripts/deploy-secrets-needed.py"
+          - --repo
+          - "{{ idcc_repo }}"
+          - --component
+          - id-admin-console
+          - --play
+          - "{{ idcc_repo }}/ops/ansible/id-admin-console-deploy.yml"
+          - "{{ target }}"
+      register: idcc_secrets
+      changed_when: false
+      failed_when: idcc_secrets.rc != 0
+      delegate_to: localhost
+      become: false
+      run_once: true
+      tags: [phase0]
+
+    - name: "gate | the console's database password resolves here"
+      ansible.builtin.assert:
+        that:
+          - id_admin_console_db_password | default('') | length > 0
+          - postgres_superuser_password | default('') | length > 0
+        fail_msg: >-
+          REFUSING: {{ id_admin_console_db_password_env }} is empty in this
+          environment, or postgres_superuser_password was not passed. Run through
+          ops/scripts/with-secrets and pass -e postgres_superuser_password (ADR 1186).
+        quiet: true
+      tags: [phase0]
+
+    - name: "gate | read the host's store marker"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_store_marker }}"
+      register: idcc_marker
+      failed_when: false
+      tags: [always]
+
+    - name: "gate | derive whether the import has already been committed"
+      ansible.builtin.set_fact:
+        idcc_reuse: false
+        idcc_archive: ""
+        idcc_imported: >-
+          {{ (idcc_marker.content | default('') | length > 0)
+             and ((idcc_marker.content | b64decode).splitlines() | first | trim) == 'postgres' }}
+      tags: [always]
+
+    - name: "gate | pull the pinned image"
+      ansible.builtin.command:
+        argv: ["docker", "pull", "{{ id_admin_console_image }}"]
+      register: idcc_pull
+      changed_when: "'Downloaded newer image' in idcc_pull.stdout"
+      tags: [phase0]
+
+    - name: "gate | read the pinned image's store label"
+      ansible.builtin.command:
+        argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ id_admin_console_image }}"]
+      register: idcc_labels
+      changed_when: false
+      tags: [phase0]
+
+    - name: "gate | the pinned image is Postgres-era"
+      ansible.builtin.assert:
+        that:
+          - (idcc_labels.stdout | from_json | default({}, true))[id_admin_console_store_label] | default('') == 'postgres'
+        fail_msg: >-
+          REFUSING: the pin for {{ target }} ({{ id_admin_console_image }}) does not
+          carry {{ id_admin_console_store_label }}=postgres. Pin a console image
+          built from the Postgres server (ops/scripts/rc.sh lands the dev and
+          preprod pins) before cutting over.
+        quiet: true
+      tags: [phase0]
+
+    - name: "gate | read the env file (for the two paths)"
+      ansible.builtin.slurp:
+        src: "{{ idcc_env_file }}"
+      register: idcc_env_raw
+      when: not idcc_imported
+      tags: [always]
+
+    - name: "gate | the two SQLite files, by store"
+      ansible.builtin.set_fact:
+        idcc_onboard_sqlite: "{{ (idcc_env_lines | select('match', '^ONBOARD_DB_PATH=') | first | default('=')).split('=', 1)[1] }}"
+        idcc_org_sqlite: "{{ (idcc_env_lines | select('match', '^ORG_DB_PATH=') | first | default('=')).split('=', 1)[1] }}"
+      vars:
+        idcc_env_lines: "{{ (idcc_env_raw.content | b64decode).splitlines() if not idcc_imported else [] }}"
+      tags: [always]
+
+    - name: "gate | both SQLite paths are configured"
+      ansible.builtin.assert:
+        that:
+          - idcc_onboard_sqlite | length > 0
+          - idcc_org_sqlite | length > 0
+        fail_msg: >-
+          {{ idcc_env_file }} does not carry both ONBOARD_DB_PATH and ORG_DB_PATH, and
+          the host marker does not say postgres. The running console is not the
+          SQLite-era console this play expects.
+        quiet: true
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | stat both SQLite files"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop:
+        - "{{ idcc_onboard_sqlite }}"
+        - "{{ idcc_org_sqlite }}"
+      register: idcc_sqlite_stat
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | both SQLite files are present"
+      ansible.builtin.assert:
+        that:
+          - idcc_sqlite_stat.results | selectattr('stat.exists') | list | length == 2
+        fail_msg: >-
+          REFUSING: {{ idcc_sqlite_stat.results | rejectattr('stat.exists') | map(attribute='item') | list }}
+          missing on {{ inventory_hostname }}. A console with no SQLite rows needs no
+          cutover: a new goatnet declared postgres starts on Postgres through the
+          normal deploy.
+        quiet: true
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | the image the console is running now (the rollback target)"
+      ansible.builtin.command:
+        argv: ["docker", "inspect", "--format", !unsafe '{{.Config.Image}}', "{{ idcc_container }}"]
+      register: idcc_running_image
+      changed_when: false
+      when: not idcc_imported
+      tags: [always]
+
+    - name: "gate | the running image is SQLite-era"
+      ansible.builtin.command:
+        argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ idcc_running_image.stdout | trim }}"]
+      register: idcc_running_labels
+      changed_when: false
+      failed_when: >-
+        idcc_running_labels.rc != 0
+        or ((idcc_running_labels.stdout | from_json | default({}, true))[id_admin_console_store_label] | default('sqlite')) != 'sqlite'
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | newest pgBackRest backup"
+      ansible.builtin.command:
+        argv: ["docker", "exec", "{{ id_admin_console_db_container }}", "pgbackrest", "--stanza={{ pgbackrest_stanza | mandatory }}", "--output=json", "info"]
+      register: idcc_pgbr
+      changed_when: false
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | a pgBackRest backup completed within the window"
+      ansible.builtin.assert:
+        that:
+          - idcc_backups | length > 0
+          - (ansible_facts['date_time']['epoch'] | int) - (idcc_backups | last).timestamp.stop | int <= (id_console_cutover_backup_max_age_hours | int) * 3600
+        fail_msg: >-
+          REFUSING: stanza {{ pgbackrest_stanza }} has
+          {{ 'no backup' if idcc_backups | length == 0 else
+             'its newest backup finished ' ~ (((ansible_facts['date_time']['epoch'] | int) - (idcc_backups | last).timestamp.stop | int) // 3600) ~ ' h ago' }};
+          the cutover wants one within {{ id_console_cutover_backup_max_age_hours }} h.
+          Take one first: docker exec {{ id_admin_console_db_container }} pgbackrest --stanza={{ pgbackrest_stanza }} --type=incr backup
+        quiet: true
+      vars:
+        idcc_backups: "{{ (idcc_pgbr.stdout | from_json | first).backup | default([]) }}"
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | free space beside the SQLite files and in the Postgres data directory"
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          df -PB1 "{{ idcc_onboard_sqlite | dirname }}" | awk 'NR==2 {print $4}'
+          docker exec {{ id_admin_console_db_container }} sh -c 'df -PB1 "$PGDATA"' | awk 'NR==2 {print $4}'
+      register: idcc_df
+      changed_when: false
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | room for the archive, a rollback export and the import"
+      ansible.builtin.assert:
+        that:
+          - (idcc_df.stdout_lines[0] | int) >= 2 * idcc_bytes + 268435456
+          - (idcc_df.stdout_lines[1] | int) >= 3 * idcc_bytes + 1073741824
+        fail_msg: >-
+          REFUSING: the SQLite files total {{ idcc_bytes }} bytes. Free beside them:
+          {{ idcc_df.stdout_lines[0] }} (need 2x + 256 MiB: archive copy and a
+          rollback export); free in the Postgres data directory:
+          {{ idcc_df.stdout_lines[1] }} (need 3x + 1 GiB).
+        quiet: true
+      vars:
+        idcc_bytes: "{{ idcc_sqlite_stat.results | map(attribute='stat.size') | map('int') | sum }}"
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | postgres-a accepts connections"
+      ansible.builtin.command:
+        argv: ["docker", "exec", "{{ id_admin_console_db_container }}", "pg_isready", "-U", "postgres"]
+      changed_when: false
+      tags: [phase0]
+
+    - name: "gate | which target databases exist already"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ id_admin_console_db_container }}"
+          - psql
+          - -U
+          - postgres
+          - -tAc
+          - >-
+            SELECT datname FROM pg_database
+            WHERE datname IN ('{{ id_admin_console_onboard_db_name }}', '{{ id_admin_console_org_db_name }}')
+      register: idcc_existing_dbs
+      changed_when: false
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | rows already in an existing target database"
+      ansible.builtin.command:
+        argv: ["docker", "exec", "{{ id_admin_console_db_container }}", "psql", "-U", "postgres", "-d", "{{ item }}", "-tAc", "{{ idcc_rows_sql }}"]
+      loop: "{{ idcc_existing_dbs.stdout_lines | default([]) }}"
+      register: idcc_pre_rows
+      changed_when: false
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | the target databases hold no rows"
+      ansible.builtin.assert:
+        that:
+          - idcc_nonempty | length == 0
+        fail_msg: >-
+          REFUSING: {{ idcc_nonempty }} already hold rows, and the host marker does not
+          say postgres. Import only fills empty databases. If these rows are from an
+          earlier cutover that was rolled back, the runbook's "Cutting over again"
+          section says how to empty them; nothing here drops a database.
+        quiet: true
+      vars:
+        idcc_nonempty: >-
+          {{ idcc_pre_rows.results | default([])
+             | map(attribute='stdout_lines') | flatten
+             | reject('match', '.*[|]0$') | list }}
+      when: not idcc_imported
+      tags: [phase0]
+
+    - name: "gate | preflight passed"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'already imported (marker postgres) — phases 2-4 skip, 1 and 5-7 re-assert'
+             if idcc_imported else
+             'running ' ~ idcc_running_image.stdout | trim ~ '; SQLite ' ~ idcc_onboard_sqlite ~ ', ' ~ idcc_org_sqlite
+             ~ '; target ' ~ id_admin_console_image }}
+      tags: [phase0]
+
+    # ======================================================================
+    # Phase 1 — A: databases, role, pg_hba. Ends on a GATE.
+    # ======================================================================
+    - name: "Postgres databases, login role and pg_hba (id-admin-console-store)"
+      ansible.builtin.include_role:
+        name: id-admin-console-store
+        tasks_from: postgres-db.yml
+      tags: [phase1]
+
+    - name: "gate | rows in the target databases after provisioning"
+      ansible.builtin.command:
+        argv: ["docker", "exec", "{{ id_admin_console_db_container }}", "psql", "-U", "postgres", "-d", "{{ item }}", "-tAc", "{{ idcc_rows_sql }}"]
+      loop:
+        - "{{ id_admin_console_onboard_db_name }}"
+        - "{{ id_admin_console_org_db_name }}"
+      register: idcc_p1_rows
+      changed_when: false
+      failed_when: >-
+        idcc_p1_rows.rc != 0
+        or (not idcc_imported and (idcc_p1_rows.stdout_lines | reject('match', '.*[|]0$') | list | length > 0))
+      tags: [phase1]
+
+    # ======================================================================
+    # Phase 2 — A: stop the console.
+    # ======================================================================
+    - name: "stop the console"
+      ansible.builtin.command:
+        argv: ["docker", "stop", "{{ idcc_container }}"]
+      register: idcc_stop
+      changed_when: true
+      when: not idcc_imported
+      tags: [phase2]
+
+    - name: "gate | the console is not running"
+      ansible.builtin.command:
+        argv: ["docker", "inspect", "--format", !unsafe '{{.State.Running}}', "{{ idcc_container }}"]
+      register: idcc_running
+      changed_when: false
+      failed_when: idcc_running.stdout | trim != 'false'
+      when: not idcc_imported
+      tags: [phase2]
+
+    # ======================================================================
+    # Phase 3 — A: checkpoint, archive, make read-only.
+    # ======================================================================
+    - name: "an archive from an earlier run of this cutover"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_sqlite_archive_root }}/CURRENT"
+      register: idcc_current
+      failed_when: false
+      when: not idcc_imported
+      tags: [phase3, phase4, phase7]
+
+    - name: "read that archive's manifest"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_sqlite_archive_root }}/{{ idcc_current.content | b64decode | trim }}/MANIFEST.yml"
+      register: idcc_prev_manifest
+      failed_when: false
+      when: not idcc_imported and (idcc_current.content | default('') | length > 0)
+      tags: [phase3, phase4]
+
+    - name: "sha256 of the files at the original paths now"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ idcc_onboard_sqlite }}"
+        - "{{ idcc_org_sqlite }}"
+      register: idcc_orig_sum
+      when: not idcc_imported
+      tags: [phase3, phase4]
+
+    # Reuse the earlier archive only when it was made from exactly the bytes at
+    # the original paths now; otherwise archive afresh under a new stamp.
+    - name: "decide: reuse the earlier archive, or make one"
+      ansible.builtin.set_fact:
+        idcc_reuse: >-
+          {{ (idcc_prev_manifest.content | default('') | length > 0)
+             and (idcc_prev.onboard.sha256 | default('')) == idcc_orig_sum.results[0].stat.checksum
+             and (idcc_prev.org.sha256 | default('')) == idcc_orig_sum.results[1].stat.checksum }}
+        idcc_archive: >-
+          {{ id_admin_console_sqlite_archive_root ~ '/' ~
+             ((idcc_current.content | b64decode | trim)
+              if (idcc_prev_manifest.content | default('') | length > 0)
+                 and (idcc_prev.onboard.sha256 | default('')) == idcc_orig_sum.results[0].stat.checksum
+                 and (idcc_prev.org.sha256 | default('')) == idcc_orig_sum.results[1].stat.checksum
+              else idcc_stamp) }}
+      vars:
+        idcc_prev: "{{ (idcc_prev_manifest.content | b64decode | from_yaml) if (idcc_prev_manifest.content | default('') | length > 0) else {} }}"
+      when: not idcc_imported
+      tags: [phase3, phase4]
+
+    - name: "archive (skipped when the earlier archive matches)"
+      when: not idcc_imported and not idcc_reuse
+      tags: [phase3]
+      block:
+        # The console stopped cleanly normally leaves no WAL; checkpoint anyway so
+        # the file alone holds every committed row and opens read-only on its own.
+        - name: "checkpoint both SQLite files (store-migrate checkpoint)"
+          ansible.builtin.command:
+            argv: >-
+              {{ ['docker', 'run', '--rm', '--network', 'none', '--user', '65532:65532']
+                 + ([idcc_onboard_sqlite | dirname, idcc_org_sqlite | dirname] | unique
+                    | map('regex_replace', '^(.+)$', '--volume=\1:\1') | list)
+                 + ['--entrypoint', '/usr/local/bin/store-migrate', id_admin_console_image,
+                    'checkpoint', '--onboard-sqlite', idcc_onboard_sqlite, '--org-sqlite', idcc_org_sqlite] }}
+          register: idcc_checkpoint
+          changed_when: true
+
+        - name: "gate | no -wal, -shm or -journal beside either file"
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop: >-
+            {{ [idcc_onboard_sqlite, idcc_org_sqlite]
+               | product(['-wal', '-shm', '-journal']) | map('join') | list }}
+          register: idcc_sidecars
+          failed_when: idcc_sidecars.stat.exists
+
+        - name: "the archive directory"
+          ansible.builtin.file:
+            path: "{{ idcc_archive }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: "copy both files into the archive, read-only"
+          ansible.builtin.copy:
+            src: "{{ item.src }}"
+            dest: "{{ idcc_archive }}/{{ item.name }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0444"
+          loop:
+            - {src: "{{ idcc_onboard_sqlite }}", name: onboard.db}
+            - {src: "{{ idcc_org_sqlite }}", name: orgs.db}
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "sha256 of the originals and the copies"
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            checksum_algorithm: sha256
+          loop:
+            - "{{ idcc_onboard_sqlite }}"
+            - "{{ idcc_archive }}/onboard.db"
+            - "{{ idcc_org_sqlite }}"
+            - "{{ idcc_archive }}/orgs.db"
+          register: idcc_sums
+
+        - name: "gate | each copy is byte-identical to its original"
+          ansible.builtin.assert:
+            that:
+              - idcc_sums.results[0].stat.checksum == idcc_sums.results[1].stat.checksum
+              - idcc_sums.results[2].stat.checksum == idcc_sums.results[3].stat.checksum
+            fail_msg: "The archive copy differs from the original; the console is stopped and nothing else has changed."
+            quiet: true
+
+        - name: "MANIFEST.yml (what was archived, from which image, until when)"
+          ansible.builtin.copy:
+            dest: "{{ idcc_archive }}/MANIFEST.yml"
+            owner: root
+            group: root
+            mode: "0444"
+            content: |
+              # Written by ops/ansible/id-console-postgres-cutover.yml phase 3.
+              archived_at: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+              retain_until: "{{ '%Y-%m-%d' | strftime((ansible_facts['date_time']['epoch'] | int) + (id_admin_console_sqlite_archive_days | int) * 86400, utc=true) }}"
+              host: "{{ inventory_hostname }}"
+              previous_image: "{{ idcc_running_image.stdout | trim }}"
+              onboard:
+                original_path: "{{ idcc_onboard_sqlite }}"
+                file: onboard.db
+                sha256: "{{ idcc_sums.results[0].stat.checksum }}"
+                bytes: {{ idcc_sums.results[0].stat.size }}
+              org:
+                original_path: "{{ idcc_org_sqlite }}"
+                file: orgs.db
+                sha256: "{{ idcc_sums.results[2].stat.checksum }}"
+                bytes: {{ idcc_sums.results[2].stat.size }}
+
+        - name: "archive directory read-only"
+          ansible.builtin.file:
+            path: "{{ idcc_archive }}"
+            state: directory
+            mode: "0555"
+
+        # A SQLite-era console started on this host by any other path now fails
+        # loudly on the first write instead of taking writes Postgres never sees.
+        - name: "originals root-owned and read-only in place"
+          ansible.builtin.file:
+            path: "{{ item }}"
+            owner: root
+            group: root
+            mode: "0444"
+          loop:
+            - "{{ idcc_onboard_sqlite }}"
+            - "{{ idcc_org_sqlite }}"
+
+        - name: "point CURRENT at this archive"
+          ansible.builtin.copy:
+            dest: "{{ id_admin_console_sqlite_archive_root }}/CURRENT"
+            content: "{{ idcc_archive | basename }}\n"
+            owner: root
+            group: root
+            mode: "0644"
+
+    # ======================================================================
+    # Phase 4 — A: import. Fail-closed; prints the rollback on any difference.
+    # ======================================================================
+    - name: "import from the archive copy"
+      when: not idcc_imported
+      tags: [phase4]
+      block:
+        - name: "store-migrate import (per-table rows + sha256; nothing committed on a difference)"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - run
+              - --rm
+              - --network
+              - mgmt
+              - --user
+              - "65532:65532"
+              - -v
+              - "{{ idcc_archive }}:/archive:ro"
+              - -e
+              - ONBOARD_DB_DSN
+              - -e
+              - ORG_DB_DSN
+              - --entrypoint
+              - /usr/local/bin/store-migrate
+              - "{{ id_admin_console_image }}"
+              - import
+              - --onboard-sqlite
+              - /archive/onboard.db
+              - --org-sqlite
+              - /archive/orgs.db
+          environment:
+            ONBOARD_DB_DSN: "{{ id_admin_console_onboard_db_dsn }}"
+            ORG_DB_DSN: "{{ id_admin_console_org_db_dsn }}"
+          register: idcc_import
+          changed_when: true
+
+        - name: "the import report"
+          ansible.builtin.debug:
+            msg: "{{ idcc_import.stdout_lines }}"
+
+        - name: "keep the report beside the archive"
+          ansible.builtin.copy:
+            dest: "{{ idcc_archive }}/import-report.txt"
+            content: "{{ idcc_import.stdout }}\n"
+            owner: root
+            group: root
+            mode: "0444"
+
+        - name: "record on the host that this console's rows are in Postgres"
+          ansible.builtin.copy:
+            dest: "{{ id_admin_console_store_marker }}"
+            content: |
+              postgres
+              cut over {{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }} from {{ idcc_archive }} by ops/ansible/id-console-postgres-cutover.yml
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: "the import is committed"
+          ansible.builtin.set_fact:
+            idcc_imported: true
+      rescue:
+        - name: "import refused — console stopped, SQLite unchanged"
+          ansible.builtin.fail:
+            msg: |
+              IMPORT REFUSED on {{ inventory_hostname }}; nothing was committed to Postgres.
+              {{ idcc_import.stdout | default('') }}
+              {{ idcc_import.stderr | default(ansible_failed_result.msg | default('')) }}
+
+              The console is STOPPED. Its SQLite files are intact (read-only) at
+                {{ idcc_onboard_sqlite }}
+                {{ idcc_org_sqlite }}
+              with a byte-identical copy in {{ idcc_archive }}.
+
+              To put the SQLite console back exactly as it was, run (from ops/ansible):
+                ../scripts/with-secrets ../scripts/ansible-preflight.sh <inventory flags> \
+                  id-console-postgres-rollback.yml -e target={{ target }}
+              It sees no committed import, so it restores the files' ownership and
+              mode, re-pins {{ idcc_running_image.stdout | default('the previous image') | trim }}
+              and starts the console.
+
+    # ======================================================================
+    # Phase 5 — GATE: the declaration and the host agree.
+    # ======================================================================
+    - name: "gate | the committed group_vars and the host marker both say postgres"
+      ansible.builtin.assert:
+        that:
+          - id_admin_console_store == 'postgres'
+          - idcc_imported | bool
+        fail_msg: >-
+          group_vars say {{ id_admin_console_store }} and the import committed:
+          {{ idcc_imported }}. Both must hold before the Postgres console starts.
+        quiet: true
+      tags: [phase5]
+
+    # ======================================================================
+    # Phase 6 — A: deploy through the normal role.
+    # ======================================================================
+    - name: "deploy the pinned Postgres-era console (id-admin-console role)"
+      ansible.builtin.include_role:
+        name: id-admin-console
+      tags: [phase6]
+
+    # ======================================================================
+    # Phase 7 — GATE: verify.
+    # ======================================================================
+    - name: "gate | /healthz answers 200"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ idcc_health_port }}/healthz"
+        status_code: 200
+      register: idcc_health
+      until: idcc_health.status == 200
+      retries: 15
+      delay: 2
+      tags: [phase7]
+
+    - name: "gate | the running image is the pin"
+      ansible.builtin.command:
+        argv: ["docker", "inspect", "--format", !unsafe '{{.Config.Image}}', "{{ idcc_container }}"]
+      register: idcc_now_image
+      changed_when: false
+      failed_when: idcc_now_image.stdout | trim != id_admin_console_image
+      tags: [phase7]
+
+    - name: "gate | the server gets the two DSNs and no SQLite path"
+      ansible.builtin.command:
+        argv: ["grep", "-oE", "^(ONBOARD|ORG)_DB_(DSN|PATH)", "{{ idcc_env_file }}"]
+      register: idcc_env_names
+      changed_when: false
+      failed_when: (idcc_env_names.stdout_lines | sort) != ['ONBOARD_DB_DSN', 'ORG_DB_DSN']
+      tags: [phase7]
+
+    - name: "gate | the archive this host was cut over from"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_sqlite_archive_root }}/CURRENT"
+      register: idcc_current_after
+      tags: [phase7]
+
+    - name: "gate | the import report"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_sqlite_archive_root }}/{{ idcc_current_after.content | b64decode | trim }}/import-report.txt"
+      register: idcc_report
+      tags: [phase7]
+
+    - name: "gate | proposals and orgs in Postgres now"
+      ansible.builtin.command:
+        argv: ["docker", "exec", "{{ id_admin_console_db_container }}", "psql", "-U", "postgres", "-d", "{{ item.db }}", "-tAc", "SELECT count(*) FROM {{ item.table }}"]
+      loop:
+        - {store: onboard, db: "{{ id_admin_console_onboard_db_name }}", table: onboard_proposals}
+        - {store: org, db: "{{ id_admin_console_org_db_name }}", table: orgs}
+      loop_control:
+        label: "{{ item.db }}.{{ item.table }}"
+      register: idcc_counts
+      changed_when: false
+      tags: [phase7]
+
+    - name: "gate | counts equal the import report"
+      ansible.builtin.assert:
+        that:
+          - idcc_reported | length == 2
+          - idcc_reported[0] == (idcc_counts.results[0].stdout | trim)
+          - idcc_reported[1] == (idcc_counts.results[1].stdout | trim)
+        fail_msg: >-
+          Postgres holds onboard_proposals={{ idcc_counts.results[0].stdout | trim }},
+          orgs={{ idcc_counts.results[1].stdout | trim }}; the import report says
+          {{ idcc_reported }}. The console is up on Postgres: read its log
+          (docker logs {{ idcc_container }}) before deciding to roll back.
+        quiet: true
+      vars:
+        idcc_report_lines: "{{ (idcc_report.content | b64decode).splitlines() | map('split') | list }}"
+        # report columns: store table sqlite-rows postgres-rows sqlite-sha postgres-sha result
+        idcc_reported: >-
+          {{ (idcc_report_lines | selectattr('0', 'equalto', 'onboard') | selectattr('1', 'equalto', 'onboard_proposals') | map(attribute='3') | list)
+             + (idcc_report_lines | selectattr('0', 'equalto', 'org') | selectattr('1', 'equalto', 'orgs') | map(attribute='3') | list) }}
+      tags: [phase7]
+
+    - name: "done"
+      ansible.builtin.debug:
+        msg: |
+          CUT OVER: {{ inventory_hostname }} serves the id console from Postgres
+          ({{ id_admin_console_onboard_db_name }}, {{ id_admin_console_org_db_name }}).
+          SQLite archive: {{ id_admin_console_sqlite_archive_root }}/{{ idcc_current_after.content | b64decode | trim }} (read-only).
+          Rollback, usable until the MANIFEST's retain_until: id-console-postgres-rollback.yml -e target={{ target }}
+          Ledger check: ops/scripts/deploy-component.sh id-admin-console --goatnet <key> --verify-only
+      tags: [phase7]

@@ -1,0 +1,119 @@
+---
+# goat-relay-rathole.yml — deploy the rathole reverse-tunnel SERVER onto the
+# all-Rust goat-relay tier.
+#
+# WHY THIS EXISTS: relay-server-rathole.yml is a tasks file imported only by
+# the legacy relay-server.yml (hosts: relay_servers), which also deploys the
+# legacy Go netbird-relay + Coturn. An all-Rust relay tier (ZAGROS — ADR 0709/
+# 0712, "no legacy relay anywhere") runs goat-relay via goat-relay-deploy.yml,
+# which has NO rathole import — so there was no path to deploy rathole-server
+# on Rust relays. That left netbird.<zone>:443 closed and BLOCKED all off-LAN
+# enrollment (the mesh is behind CGNAT; rathole is the only public reverse
+# path). ZAGROS is the first all-Rust standalone tier, so it surfaced first.
+# This play closes the gap; pairs with zagros-rathole-client.yml (Thor side).
+#
+# RUN (ZAGROS):
+#   cd ops/ansible
+#   AWS_VAULT=1 AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_PROD \
+#     AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_PROD \
+#     ../scripts/ansible-preflight.sh \
+#     -i inventory/hosts-zagros.ini -i inventory/zagros-goat-relay-alias.ini \
+#     goat-relay-rathole.yml
+#   (AWS_VAULT=1 makes aws_cmd a bare `aws` so the delegate_to:localhost SM
+#    put-secret-value uses the raw usareur-af keys, not aws-vault. Connection
+#    to the relays is SSM — needs community.aws + session-manager-plugin.)
+#
+# rathole_bin/url/config_dir come from group_vars/all.yml; per-relay
+# rathole_secret_name + aws_region + ansible_aws_ssm_* come from the relay
+# inventory (inventory/hosts-zagros.ini). Idempotent: re-runs reuse the
+# persisted server.pubkey + existing token (relay-server-rathole.yml logic).
+
+- name: Deploy rathole reverse-tunnel server on the goat-relay tier
+  hosts: "{{ target | mandatory }}"
+  become: true
+
+  tasks:
+    # -- F-188 guard: rathole ingress is ONLY meaningful colocated on a LIVE
+    # goat-relay data plane. ZAGROS shipped with rathole running (:443/:2333) but
+    # the goat-relay container was never deployed, so enrollment worked while
+    # every peer's relay-fallback failed (Relays 0/N, nothing on :33073). Catch
+    # that half-built state HERE instead of letting it look healthy. Deploy the
+    # data plane first (goat-relay-deploy.yml) or run both in one pass via
+    # goat-relay-colocated.yml. Waive for a deliberate ingress-only host with
+    # -e allow_rathole_without_relay=true.
+    - name: F-188 guard — detect the goat-relay data plane on this host
+      ansible.builtin.shell: >-
+        docker ps --filter name=goat-relay --filter status=running -q
+      register: goat_relay_running
+      changed_when: false
+      failed_when: false
+
+    - name: F-188 guard — require the goat-relay data plane (or explicit waiver)
+      ansible.builtin.assert:
+        that:
+          - (goat_relay_running.stdout | trim | length > 0) or (allow_rathole_without_relay | default(false) | bool)
+        fail_msg: |
+          No running goat-relay container on {{ inventory_hostname }}.
+          Rathole ingress alone leaves :443 enrollment working but NO :33073
+          data-plane relay — the ZAGROS F-188 failure (peers enroll, then reach
+          nothing; Relays 0/N). Deploy the data plane first:
+            ansible-playbook ... goat-relay-deploy.yml
+          or run both in one pass: goat-relay-colocated.yml. For a deliberate
+          ingress-only host, re-run with -e allow_rathole_without_relay=true.
+        success_msg: "goat-relay data plane present — rathole colocation valid."
+
+    # Public IP (IMDSv2) — stored in the SM secret as relay_ip, informational
+    # for the client. Same fetch the legacy relay play uses unconditionally.
+    - name: Detect public IP from EC2 metadata (IMDSv2)
+      ansible.builtin.shell: |
+        TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 30")
+        curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+          http://169.254.169.254/latest/meta-data/public-ipv4
+      register: public_ip_result
+      changed_when: false
+
+    - name: Set public IP fact
+      ansible.builtin.set_fact:
+        vps_public_ip: "{{ public_ip_result.stdout | trim }}"
+
+    # rathole-server: install binary + generate/read Noise keypair + token +
+    # write server.toml (:443 service, :2333 control) + systemd unit. Gated
+    # so a tier can opt out via deploy_rathole: false in inventory vars.
+    - name: Rathole server stack
+      ansible.builtin.import_tasks: relay-server-rathole.yml
+      when: deploy_rathole | default(true) | bool
+
+    # Persist pubkey + token to Secrets Manager so the rathole CLIENT (the
+    # mgmt-host, zagros-rathole-client.yml) can fetch them and dial in. NO
+    # turn_secret field here — coturn's static-auth-secret is managed by the
+    # coturn role on-host, not threaded through this rathole SM-put.
+    # (The all-Rust tier DOES run coturn STUN now via the coturn role /
+    # goat-relay-coturn.yml — the prior "no Coturn" note is obsolete.)
+    - name: Store rathole credentials in Secrets Manager
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: >
+        {{ aws_cmd }} aws secretsmanager put-secret-value
+        --region "{{ aws_region }}"
+        --secret-id "{{ rathole_secret_name }}"
+        --secret-string '{"token":"{{ rathole_auth_token }}","public_key":"{{ rathole_public_key }}","relay_ip":"{{ vps_public_ip }}"}'
+      changed_when: false
+      when:
+        - deploy_rathole | default(true) | bool
+        - rathole_secret_name is defined
+        - rathole_public_key | default('') | length > 0
+
+    - name: Rathole server status
+      ansible.builtin.debug:
+        msg: >-
+          rathole-server on {{ inventory_hostname }} — :443 public + :2333
+          control ; SM secret {{ rathole_secret_name | default('n/a') }} ;
+          pubkey={{ rathole_public_key[:16] | default('?') }}...
+
+  handlers:
+    - name: Restart rathole server
+      ansible.builtin.systemd:
+        name: rathole-server
+        state: restarted
+        daemon_reload: true

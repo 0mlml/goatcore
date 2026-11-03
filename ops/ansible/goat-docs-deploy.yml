@@ -1,0 +1,50 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Operator-fired playbook to bring up the goat-cli docs site
+# (`docs.<site_dns_zone>`) on a mgmt host.
+# nginx:alpine serves the mdBook field guide (the `goat-docs.tar.gz`
+# release asset, unpacked) mesh-internally so on-mesh vendors can read the
+# docs that match the binary the get surface serves. A near-clone of
+# goat-get-deploy.yml.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN \
+#     GOAT_CLI_RELEASE_TOKEN=$GOAT_CLI_RELEASE_TOKEN \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     -l <mgmt-host> goat-docs-deploy.yml
+#
+# Pre-flight (operator-side):
+#   1. The goat-cli release `goat_docs_release_tag` exists on
+#      usareur-af/goatcore with the `goat-docs.tar.gz` + `.sha256`
+#      assets (built by the `docs` job in goat-cli-release.yml — re-dispatch
+#      the workflow on an existing tag to backfill them).
+#   2. GOAT_CLI_RELEASE_TOKEN (or GH_TOKEN) env var exported with
+#      contents:read on the repo so the host can pull the asset.
+#   3. docs.<site_dns_zone> is PUBLISHED in the mesh CoreDNS. The record
+#      lives in ops/dns/<site>/mesh-hosts (committed), but a brand-new
+#      surface only resolves for mesh peers AFTER the zone is re-synced:
+#        ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#          -l <mgmt-host> mesh-coredns.yml
+#      Skipping this is the #1 "the server is up but my browser shows
+#      nothing" gotcha — the binary/cert work, but DNS doesn't resolve.
+#      (Peers may need `netbird down && sudo netbird up` to drop a stale
+#      negative cache.) The `le` resolver mints the cert on first request
+# (same on-demand pattern as the get surface — no static SAN edit needed).
+#
+# Cross-refs:
+# - docs/design/goat-cli-hosted-docs.md
+# - docs/design/goat-cli-mesh-download.md (the sibling get surface)
+
+- name: goat-docs | deploy
+  # Site-agnostic: `-e target=<site>_hosts` deploys docs.<site>.<zone> on any
+  # goatnet (the role keys hostname off site_id/site_dns_zone). The role does
+  # not use a Cloudflare token (cert via the pre-configured `le` resolver), so
+  # no play-var here to shadow the per-site group_var.
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - goat-docs

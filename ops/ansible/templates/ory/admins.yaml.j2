@@ -1,0 +1,31 @@
+{# ops/ansible/templates/ory/admins.yaml.j2
+   Initial admin identities imported into Kratos by the `ory` Ansible role.
+   ADR 0411. Block 21C.
+
+   Pattern: one entry per admin per site. The role iterates this list and
+   runs `kratos identity import` for each. Re-runs are idempotent (Kratos
+   ON CONFLICT skips existing IDs).
+
+   Required vars (passed by playbook):
+     site_admins   list of {email, name, password_hash, groups[]}
+
+   The password_hash should be a bcrypt hash; generate with:
+     htpasswd -bnBC 12 "" "<password>" | sed 's/^://'
+   Long-term, password is bootstrap-only; admins switch to FIDO2 within 24h.
+#}
+{% for admin in site_admins | default([]) %}
+- schema_id: default
+  state: active
+  traits:
+    email: "{{ admin.email }}"
+    name: "{{ admin.name }}"
+    site: "{{ site_name }}"
+    groups:
+      {% for g in admin.groups | default(['admin']) %}
+      - "{{ g }}"
+      {% endfor %}
+  credentials:
+    password:
+      config:
+        hashed_password: "{{ admin.password_hash }}"
+{% endfor %}

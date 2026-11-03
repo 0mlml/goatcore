@@ -1,0 +1,558 @@
+---
+# relay-server.yml — Bootstrap VPS relay (rathole + Coturn + Netbird relay)
+#
+# Configures an AWS EC2 instance with three services:
+#   - rathole:       forwards TCP 443 (Netbird management) to the mgmt host
+#   - Coturn:        local STUN server on UDP 3478 for NAT traversal
+#   - Netbird relay: local data relay on TCP 33073 when P2P fails (optional)
+#
+# Usage:
+#   ansible-playbook relay-server.yml
+#   ansible-playbook relay-server.yml --limit relay-rla
+#   ansible-playbook relay-server.yml -e shared_turn_secret=abc123
+#
+# Required host vars (set by inventory/generate.sh):
+#   - aws_region           — AWS region for this relay
+#   - rathole_secret_name  — Secrets Manager key for credentials
+#
+# Optional extra-vars:
+#   - shared_turn_secret    — all Coturn instances use the same secret.
+#                             If not set, reads from existing config or generates new.
+#   - nb_relay_auth_secret  — enables Netbird relay container (TCP 33073).
+#                             Same as management server's authSecret.
+#
+# Prerequisites:
+#   - VPS deployed via Terraform
+#   - inventory/generate.sh run (populates hosts.ini + SSH keys)
+#
+# Idempotent — safe to re-run. Only regenerates credentials on fresh install.
+
+- name: Bootstrap VPS relays
+  hosts: relay_servers
+  become: true
+
+  tasks:
+    # ==================================================================
+    # Public IP discovery (used by both rathole + Coturn — set
+    # unconditionally so the Coturn config has `external-ip` regardless
+    # of whether rathole is being deployed).
+    # ==================================================================
+    - name: Detect public IP from EC2 metadata (IMDSv2)
+      ansible.builtin.shell: |
+        TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 30")
+        curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+          http://169.254.169.254/latest/meta-data/public-ipv4
+      register: public_ip_result
+      changed_when: false
+
+    - name: Set public IP fact
+      ansible.builtin.set_fact:
+        vps_public_ip: "{{ public_ip_result.stdout | trim }}"
+
+    # ==================================================================
+    # Rathole — management forwarding (TCP 443 → mgmt host).
+    #
+    # Gated via `deploy_rathole` (default true). Set `deploy_rathole: false`
+    # in inventory `[relay_servers:vars]` to skip — the right setting on
+    # relays where wg-cp0 silent-control-plane replaces rathole's mgmt-API
+    # forwarding role per ADR 0313 / 0314. The default stays true for
+    # goatnets still using rathole on the public-DNS path.
+    #
+    # Tasks live in relay-server-rathole.yml (extracted).
+    # ==================================================================
+    - name: Rathole stack — gated by deploy_rathole
+      ansible.builtin.import_tasks: relay-server-rathole.yml
+      when: deploy_rathole | default(true) | bool
+
+    # ==================================================================
+    # Coturn — STUN server (UDP 3478, local)
+    # ==================================================================
+    # CVE-2026-98432 (IPv4 TCP request-socket use-after-free, CVSS 9.8). The
+    # published exploit needs an MPTCP listener, and Go 1.24+ listeners request
+    # MPTCP by default. Ubuntu 24.04 and 22.04 had no fixed kernel on 2026-11-02
+    # (ubuntu.com/security/CVE-2026-98432: "in progress"). MPTCP stays off until
+    # the fixed kernel is live on the host, then this task is removed. Tegra
+    # kernels do not build MPTCP, so the key is absent there and the task skips.
+    - name: CVE-2026-98432 mitigation — MPTCP off until the fixed kernel ships
+      ansible.posix.sysctl:
+        name: net.mptcp.enabled
+        value: "0"
+        sysctl_file: /etc/sysctl.d/98-goat-cve-2026-98432.conf
+        state: present
+        reload: true
+      when: ansible_kernel is not search('tegra')
+
+    - name: Install Coturn
+      ansible.builtin.apt:
+        name: coturn
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+
+    # Resolve TURN secret: explicit > existing config > generate new
+    - name: Read existing TURN secret
+      ansible.builtin.shell: "grep static-auth-secret /etc/turnserver.conf | cut -d= -f2"
+      register: existing_turn_secret
+      changed_when: false
+      failed_when: false
+
+    - name: Set TURN secret fact
+      ansible.builtin.set_fact:
+        turn_secret: >-
+          {{ shared_turn_secret | default('') |
+             ternary(shared_turn_secret | default(''),
+                     existing_turn_secret.stdout | default('') |
+                     ternary(existing_turn_secret.stdout | default(''),
+                             lookup('pipe', 'openssl rand -hex 32'))) }}
+
+    - name: Write turnserver.conf
+      ansible.builtin.template:
+        src: templates/turnserver.conf.j2
+        dest: /etc/turnserver.conf
+        mode: "0600"
+      notify: Restart coturn
+
+    - name: Enable TURNSERVER_ENABLED
+      ansible.builtin.lineinfile:
+        path: /etc/default/coturn
+        regexp: "^#?TURNSERVER_ENABLED="
+        line: "TURNSERVER_ENABLED=1"
+      notify: Restart coturn
+
+    - name: Enable and start Coturn
+      ansible.builtin.systemd:
+        name: coturn
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ==================================================================
+    # Netbird Relay — data relay when P2P fails (TCP 33073, local)
+    # ==================================================================
+    - name: Deploy Netbird relay container
+      when: nb_relay_auth_secret is defined and nb_relay_auth_secret | length > 0
+      block:
+        - name: Check Docker installed
+          ansible.builtin.command: docker --version
+          register: docker_check
+          ignore_errors: true
+          changed_when: false
+
+        - name: Install Docker
+          when: docker_check.rc | default(1) != 0
+          block:
+            - name: Install Docker prerequisites
+              ansible.builtin.apt:
+                name: [ca-certificates, curl, gnupg]
+                state: present
+
+            - name: Add Docker GPG key
+              ansible.builtin.shell: |
+                install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                chmod a+r /etc/apt/keyrings/docker.gpg
+              args:
+                creates: /etc/apt/keyrings/docker.gpg
+
+            - name: Add Docker repository
+              ansible.builtin.shell: |
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+                  > /etc/apt/sources.list.d/docker.list
+              args:
+                creates: /etc/apt/sources.list.d/docker.list
+
+            - name: Install Docker CE
+              ansible.builtin.apt:
+                name: [docker-ce, docker-ce-cli, containerd.io]
+                state: present
+                update_cache: true
+
+            - name: Enable Docker
+              ansible.builtin.systemd:
+                name: docker
+                enabled: true
+                state: started
+
+        - name: Deploy Docker log rotation config
+          ansible.builtin.copy:
+            dest: /etc/docker/daemon.json
+            content: |
+              {
+                "log-driver": "json-file",
+                "log-opts": {
+                  "max-size": "50m",
+                  "max-file": "3"
+                }
+              }
+            mode: "0644"
+          register: daemon_json
+
+        - name: Restart Docker if config changed
+          ansible.builtin.systemd:
+            name: docker
+            state: restarted
+          when: daemon_json.changed
+
+        # Relay DNS name comes from the inventory's per-host
+        # `relay_dns_name` var (emitted by generate-relays.sh from the
+        # terraform `relays.<name>.relay_url` output). Falls back to the
+        # legacy hardcoded mapping for backward compat with inventories
+        # written before the var existed.
+        - name: Set relay DNS name (fallback for legacy inventories)
+          ansible.builtin.set_fact:
+            relay_dns_name: "{{ 'relay.legacy.example' if inventory_hostname == 'relay-rla' else inventory_hostname + '.legacy.example' }}"
+          when: relay_dns_name is not defined
+
+        # TLS for the relay uses certbot, NOT the relay binary's built-in
+        # Let's Encrypt (its TLS-ALPN-01 wants port 443, which rathole
+        # occupies). Two challenge methods, selected by `relay_cert_dns01`:
+        #
+        #   DNS-01 via Cloudflare (relay_cert_dns01=true) — works with port
+        #     80 CLOSED and renews without it. REQUIRED for the closed-port
+        #     posture (http_port_open=false, DNS-01-only). Auto-set by
+        #     generate-relays.sh for environments with that posture. Needs
+        #     cloudflare_api_token.
+        #
+        #   HTTP-01 standalone (default) — legacy path; needs
+        #     inbound port 80 + a brief relay-container stop to free it.
+        #
+        # Either way certbot renews via its systemd timer — the renewal conf
+        # records the method, so DNS-01 renews unattended too. A timer can fire on
+        # schedule and FAIL on schedule when its credentials are wrong, so the
+        # `--dry-run` task below checks this rather than believing it.
+
+        - name: Install certbot (+ Cloudflare DNS-01 plugin when relay_cert_dns01)
+          ansible.builtin.apt:
+            name: "{{ ['certbot'] + (['python3-certbot-dns-cloudflare'] if (relay_cert_dns01 | default(false) | bool) else []) }}"
+            state: present
+            update_cache: true
+
+        - name: Check if relay TLS cert exists
+          ansible.builtin.stat:
+            path: "/etc/letsencrypt/live/{{ relay_dns_name }}/fullchain.pem"
+          register: relay_cert
+
+        # ---- DNS-01 (Cloudflare) — port-80-closed posture ----
+        - name: Require a plausible cloudflare_api_token for DNS-01
+          ansible.builtin.assert:
+            that:
+              - cloudflare_api_token is defined
+              - (cloudflare_api_token | trim | length) >= 30
+            fail_msg: >-
+              relay_cert_dns01=true needs
+              -e cloudflare_api_token=$CLOUDFLARE_API_TOKEN_<ENV>. Got
+              {{ (cloudflare_api_token | default('') | trim | length) }} characters —
+              a Cloudflare API token is 40+. A short or empty value does not fail
+              this deploy, it fails every renewal 60 days later.
+          when: relay_cert_dns01 | default(false) | bool
+
+        # WRITTEN EVERY RUN, not only on first issuance. Once a cert exists, a
+        # first-issuance-only condition would never reconcile this file again: a token
+        # that was wrong when the relay was first built stays wrong forever, a rotated
+        # token never lands, and renewal fails until the cert expires. The credential
+        # is not the certificate; it does not inherit the certificate's lifecycle.
+        - name: Write Cloudflare DNS-01 credentials (0600)
+          ansible.builtin.copy:
+            dest: /etc/letsencrypt/cloudflare.ini
+            content: "dns_cloudflare_api_token = {{ cloudflare_api_token }}\n"
+            owner: root
+            group: root
+            mode: "0600"
+          when: relay_cert_dns01 | default(false) | bool
+
+        - name: Obtain TLS cert via certbot DNS-01 (Cloudflare)
+          ansible.builtin.shell: |
+            certbot certonly --dns-cloudflare \
+              --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+              --dns-cloudflare-propagation-seconds 30 \
+              -d {{ relay_dns_name }} \
+              --email {{ relay_certbot_email | default('person-35@example.org') }} \
+              --agree-tos --non-interactive
+          when:
+            - relay_cert_dns01 | default(false) | bool
+            - not relay_cert.stat.exists
+          register: certbot_dns01_result
+
+        # PROVE RENEWAL WORKS, rather than proving the pieces exist.
+        #
+        # Every upstream signal — token set, file written, certbot installed, timer
+        # enabled — can be TRUE while renewal fails, because each of them passes
+        # whether or not renewal can complete. `--dry-run` runs the real ACME
+        # flow against the staging directory: it authenticates to Cloudflare,
+        # writes and cleans up the DNS challenge record, and fails if any step
+        # cannot be done.
+        #
+        # It fails the DEPLOY on purpose. A relay that cannot renew will take
+        # the mesh's relay fallback down within 90 days, and the deploy is the
+        # last moment anyone is looking at it.
+        - name: Prove unattended renewal actually works (certbot --dry-run)
+          ansible.builtin.command: certbot renew --dry-run --non-interactive
+          register: relay_le_dryrun
+          changed_when: false
+          failed_when: relay_le_dryrun.rc != 0
+          async: 600
+          poll: 15
+          # async/poll, not a plain command: a full ACME staging round-trip
+          # includes a 30s DNS propagation wait and routinely outruns the SSM
+          # exec timeout. Without this the task returns UNREACHABLE and the
+          # play stops BEFORE the tasks that start the relay container — which
+          # is worse than no check, because it half-deploys: certificates issued,
+          # relay never started, nothing listening on 33073.
+          when: relay_cert_dns01 | default(false) | bool
+
+        # ---- HTTP-01 standalone — legacy path (port 80 open) ----
+        - name: Stop relay container before certbot HTTP-01 (frees port 80)
+          ansible.builtin.shell: |
+            docker stop netbird-relay 2>/dev/null || true
+            docker rm -f netbird-relay 2>/dev/null || true
+          when:
+            - not (relay_cert_dns01 | default(false) | bool)
+            - not relay_cert.stat.exists
+          changed_when: false
+
+        - name: Obtain TLS cert via certbot HTTP-01
+          ansible.builtin.shell: |
+            certbot certonly --standalone --preferred-challenges http \
+              -d {{ relay_dns_name }} \
+              --email {{ relay_certbot_email | default('person-35@example.org') }} \
+              --agree-tos --non-interactive --force-renewal
+          when:
+            - not (relay_cert_dns01 | default(false) | bool)
+            - not relay_cert.stat.exists
+          register: certbot_result
+
+        - name: Verify cert was obtained
+          ansible.builtin.stat:
+            path: "/etc/letsencrypt/live/{{ relay_dns_name }}/fullchain.pem"
+          register: relay_cert_after
+          failed_when: not relay_cert_after.stat.exists
+
+        - name: Deploy Netbird relay container (with TLS cert from certbot)
+          # GOMAXPROCS=1: on a 2-vCPU relay, default GOMAXPROCS=NumCPU=2 causes
+          # inter-thread futex contention that caps single-flow throughput.
+          # GOMAXPROCS=1 collapses to a single OS thread and eliminates that
+          # synchronization overhead, raising single-flow throughput by ~25%.
+          # Multi-flow performance is unchanged. Retest the GOMAXPROCS sweep on
+          # any relay shape with ≥4 vCPU — the optimal point may shift.
+          # See docs/operations/relay-throughput-ceiling.md for details.
+          ansible.builtin.shell: |
+            docker rm -f netbird-relay 2>/dev/null || true
+            docker run -d \
+              --name netbird-relay \
+              --restart unless-stopped \
+              -e NB_LOG_LEVEL=info \
+              -e NB_LISTEN_ADDRESS=:33073 \
+              -e "NB_EXPOSED_ADDRESS=rels://{{ relay_dns_name }}:33073" \
+              -e "NB_AUTH_SECRET={{ nb_relay_auth_secret }}" \
+              -e GOMAXPROCS=1 \
+              -p 33073:33073/tcp \
+              -p 33073:33073/udp \
+              -v /etc/letsencrypt:/etc/letsencrypt:ro \
+              netbirdio/relay:0.82.0@sha256:8f6b9e4193653ede89e83dd4aa4e2cf2562579b3e2481dcf259a7ab28bcd5fa1 \
+              --tls-cert-file /etc/letsencrypt/live/{{ relay_dns_name }}/fullchain.pem \
+              --tls-key-file /etc/letsencrypt/live/{{ relay_dns_name }}/privkey.pem
+
+        - name: Wait for relay to start
+          ansible.builtin.pause:
+            seconds: 3
+
+        - name: Verify relay has TLS (QUIC listener)
+          ansible.builtin.shell: |
+            docker logs netbird-relay 2>&1 | grep -q 'QUIC server listening'
+          register: relay_tls_check
+          changed_when: false
+          failed_when: relay_tls_check.rc != 0
+
+    # ==================================================================
+    # dnsmasq — redundant mesh DNS (see deploy_dnsmasq)
+    # ==================================================================
+    # On a single-resolver topology: serves the same mesh-hosts file as the
+    # network host's dnsmasq instance — peers fall back to VPS relays for DNS
+    # when that host is unreachable.
+    #
+    # Where each site runs its own CoreDNS for mesh-internal DNS, the relay-side
+    # dnsmasq is vestigial: its `addn-hosts` zone is unreachable from those
+    # mesh peers and would be wrong anyway.
+    #
+    # `deploy_dnsmasq` defaults to true. An inventory using per-site CoreDNS
+    # sets it to false (parity with `deploy_rathole=false`), which (a) skips
+    # the install/configure tasks below and (b) fires the explicit
+    # stop+disable+uninstall block at the tail to clear any earlier install.
+    - name: Configure dnsmasq (when deploy_dnsmasq | default(true))
+      when: deploy_dnsmasq | default(true) | bool
+      block:
+        - name: Disable systemd-resolved stub listener (frees port 53)
+          ansible.builtin.lineinfile:
+            path: /etc/systemd/resolved.conf
+            regexp: "^#?DNSStubListener="
+            line: "DNSStubListener=no"
+          notify: Restart systemd-resolved
+
+        - name: Flush handlers (ensure resolved restarts before dnsmasq)
+          ansible.builtin.meta: flush_handlers
+
+        - name: Install dnsmasq
+          ansible.builtin.apt:
+            name: dnsmasq
+            state: present
+
+        - name: Ensure dnsmasq only loads drop-in configs
+          ansible.builtin.copy:
+            dest: /etc/dnsmasq.conf
+            mode: "0644"
+            content: |
+              # Managed by Ansible — all config in /etc/dnsmasq.d/
+              conf-dir=/etc/dnsmasq.d/,*.conf
+          notify: Restart dnsmasq
+
+        - name: Create DNS config directory
+          ansible.builtin.file:
+            path: /etc/goat-dns
+            state: directory
+            mode: "0755"
+
+        - name: Deploy mesh-hosts
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../dns/mesh-hosts"
+            dest: /etc/goat-dns/mesh-hosts
+            mode: "0644"
+          notify: Restart dnsmasq
+
+        - name: Write dnsmasq config
+          ansible.builtin.copy:
+            dest: /etc/dnsmasq.d/goat.conf
+            mode: "0644"
+            content: |
+              # Mesh DNS fallback
+              # Same zone as the network host's dnsmasq. Peers use this when that host is unreachable.
+              # Bind to private interface IP (AWS NATs Elastic IP → private IP on ens5)
+              # and localhost. Never bind 0.0.0.0 — UFW alone is not sufficient defense.
+              listen-address={{ ansible_facts['default_ipv4']['address'] }}
+              listen-address=127.0.0.1
+              bind-interfaces
+              addn-hosts=/etc/goat-dns/mesh-hosts
+              server=1.1.1.1
+              server=8.8.8.8
+              no-resolv
+              no-hosts
+              cache-size=500
+              domain-needed
+              bogus-priv
+          notify: Restart dnsmasq
+
+        - name: Enable and start dnsmasq
+          ansible.builtin.systemd:
+            name: dnsmasq
+            enabled: true
+            state: started
+            daemon_reload: true
+
+    # ==================================================================
+    # dnsmasq removal path — fires when deploy_dnsmasq is explicitly
+    # false. Idempotent: stops + disables + purges the package + cleans
+    # config dir. Re-enable systemd-resolved's stub listener so port 53
+    # has a default resolver again. Safe on relays that never had
+    # dnsmasq installed (apt purge is a no-op).
+    # ==================================================================
+    - name: Remove dnsmasq (when deploy_dnsmasq is explicitly false)
+      when: not (deploy_dnsmasq | default(true) | bool)
+      block:
+        - name: Stop + disable dnsmasq
+          ansible.builtin.systemd:
+            name: dnsmasq
+            state: stopped
+            enabled: false
+          failed_when: false
+          changed_when: false
+
+        - name: Purge dnsmasq package
+          ansible.builtin.apt:
+            name: dnsmasq
+            state: absent
+            purge: true
+
+        - name: Remove dnsmasq config drop-in directory
+          ansible.builtin.file:
+            path: /etc/dnsmasq.d/goat.conf
+            state: absent
+
+        - name: Remove goat-dns staging directory
+          ansible.builtin.file:
+            path: /etc/goat-dns
+            state: absent
+
+        - name: Re-enable systemd-resolved stub listener (gives :53 a default)
+          ansible.builtin.lineinfile:
+            path: /etc/systemd/resolved.conf
+            regexp: "^#?DNSStubListener="
+            line: "#DNSStubListener=yes"
+          notify: Restart systemd-resolved
+
+    # ==================================================================
+    # Firewall — AWS Security Groups are the primary firewall.
+    # No host-level firewall (UFW/iptables) needed on EC2 instances.
+    # SG rules are managed in Terraform (modules/relay/main.tf).
+    # ==================================================================
+
+    # ==================================================================
+    # Credential storage — persist to Secrets Manager.
+    # Rathole-only (turn_secret + relay_ip can live in env if Coturn-only
+    # secrets storage becomes a need; not today). Gated on deploy_rathole
+    # because rathole_public_key is undefined when the rathole stack is
+    # skipped.
+    # ==================================================================
+    - name: Store rathole credentials in Secrets Manager
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: >
+        {{ aws_cmd }} aws secretsmanager put-secret-value
+        --region "{{ aws_region }}"
+        --secret-id "{{ rathole_secret_name }}"
+        --secret-string '{"token":"{{ rathole_auth_token }}","public_key":"{{ rathole_public_key }}","relay_ip":"{{ vps_public_ip }}","turn_secret":"{{ turn_secret }}"}'
+      changed_when: false
+      when:
+        - deploy_rathole | default(true) | bool
+        - rathole_secret_name is defined
+        - rathole_public_key | default('') | length > 0
+
+    # ==================================================================
+    # Verify
+    # ==================================================================
+    - name: Print relay status
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+            VPS RELAY {{ inventory_hostname }} COMPLETE
+          ========================================
+          IP:         {{ vps_public_ip }}
+          {% if deploy_rathole | default(true) | bool %}
+          Rathole:    token={{ rathole_auth_token[:8] }}... pubkey={{ rathole_public_key[:16] }}...
+          {% else %}
+          Rathole:    SKIPPED (deploy_rathole=false; wg-cp0 replaces this role)
+          {% endif %}
+          Coturn:     stun:{{ vps_public_ip }}:3478
+          Relay:      {{ 'rels://' + relay_dns_name + ':33073 (TLS via LE)' if (nb_relay_auth_secret | default('') | length > 0) else 'not deployed' }}
+          ========================================
+
+  handlers:
+    - name: Restart rathole server
+      ansible.builtin.systemd:
+        name: rathole-server
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart coturn
+      ansible.builtin.systemd:
+        name: coturn
+        state: restarted
+
+    - name: Restart systemd-resolved
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: restarted
+
+    - name: Restart dnsmasq
+      ansible.builtin.systemd:
+        name: dnsmasq
+        state: restarted

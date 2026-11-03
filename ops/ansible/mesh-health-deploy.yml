@@ -1,0 +1,36 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-mesh-health meter (ADR 1042/1036 —
+# docs/design/environment-health-surface.md, the mesh domain). A host-side
+# systemd timer snapshots `netbird status --json`; the containerized meter
+# grades each WireGuard link and publishes ops/mesh/health/<site>. Passive;
+# persists nothing.
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       mesh-health-deploy.yml
+#
+#   # ZAGROS sibling goatnet:  add  -e target=zagros_hosts
+#
+# Pre-flight (operator-side):
+#   1. zenoh-router Healthy on the target host with the infra-mesh-health
+#      subject + infra-w-mesh-health rule LIVE (template since ADR 1042; live
+#      only after a router restart — F-156).
+#   2. netbird daemon enrolled + running on the host.
+#   3. Infra leaf cert + key minted (Subject CN=goat-mesh-health-trial-peer) at
+#      /opt/mesh-health/certs/mesh-health-{cert,key}.pem.
+#   4. goat-mesh-health image SHA-pinned in the role defaults + deploy-history.yml
+#      (replace the PENDING :latest placeholder with the built digest).
+#
+# Live-fire: a live subscriber on ops/mesh/health/<site> sees the per-site
+# EnvHealthV1{domain:"mesh"} (`goat sub --context zagros 'ops/mesh/health/**' --take 2`).
+
+- name: deploy goat-mesh-health meter on nova trial fabric (ADR 1042/1036)
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: mesh-health

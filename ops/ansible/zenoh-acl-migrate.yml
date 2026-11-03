@@ -1,0 +1,40 @@
+---
+# goat-zenoh-acl-migrate.yml — F-258 one-time migration of a LIVE per-vendor
+# router to the seed + org-fragment model. Thin wrapper over the role's
+# acl-migrate.yml task file (import_role so role defaults + group_vars resolve at
+# the correct precedence and the seed renders with the SAME context as a real
+# deploy). The render context (listen_host / rest_host) is set here IDENTICALLY
+# to zenoh-deploy.yml — keep the two in lockstep.
+#
+# NON-DISRUPTIVE + self-verifying: renders the seed, extracts the live config's
+# per-vendor content into the org fragment, and BYTE-VERIFIES assemble(seed,
+# fragment) == the current live config before installing anything. The live
+# config is never changed; aborts with the diff on base drift.
+#
+# Usage (nova-a over the tailscale side-channel — supply an inventory that maps the
+# host into nova_hosts at a reachable IP):
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i <inventory> ops/ansible/goat-zenoh-acl-migrate.yml -l mgmt-nova-01-thor
+#
+# Slot-pool goatnets (ZAGROS/hobby) are refused inside the role task (their ACL is
+# template-rendered, not fragment-managed).
+
+- name: F-258 migrate live per-vendor router to seed + org fragment
+  hosts: "{{ target | mandatory }}"
+  become: true
+  # facts REQUIRED: the seed render must reproduce the live base exactly, and
+  # zenoh-deploy.yml derives listen_host from the wt0 fact + rest_host from the
+  # default-IPv4 fact. Connection channel (tailscale vs netbird) does not affect
+  # gathered facts — they come from the target host.
+  gather_facts: true
+  vars:
+    # --- render context, IDENTICAL to zenoh-deploy.yml (keep in lockstep) ---
+    goat_zenoh_listen_host: "{{ zenoh_listen_host_override | default(ansible_facts['wt0']['ipv4']['address'] | default(ansible_facts['default_ipv4']['address'] | default('0.0.0.0'))) }}"
+    # F-364: host-local, never a deploy-time-resolved address baked into the
+    # compose file. Rationale in zenoh-deploy.yml.
+    goat_zenoh_rest_host: "127.0.0.1"
+  tasks:
+    - name: Run the F-258 migration task file with full role var context
+      ansible.builtin.import_role:
+        name: goat-zenoh
+        tasks_from: acl-migrate

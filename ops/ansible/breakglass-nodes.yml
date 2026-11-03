@@ -1,0 +1,39 @@
+---
+# Converge a site's BREAKGLASS nodes (ADR 1114).
+#
+#   cd ops/ansible
+#   ../scripts/ansible-preflight.sh -i inventory/<site>-breakglass-nodes.ini \
+#     -e target=<site>_breakglass_hosts breakglass-nodes.yml
+#
+# TARGET IS REQUIRED AND HAS NO DEFAULT. This play is called by
+# goat-standup.sh phase 14 for whichever site declares a break-glass node
+# (ADR 1183), so it cannot name one goatnet's group in its own hosts: line.
+#
+# Reaches the nodes over the netbird mesh — the normal-day path — so a
+# successful run is itself evidence that path works. The tailscale side is the
+# bad-day path and is not used for routine convergence.
+- name: breakglass nodes
+  hosts: "{{ target }}"
+  become: true
+  gather_facts: true
+  pre_tasks:
+    # A node is converged only once someone has decided to adopt it. Two
+    # inventories can declare the breakglass group with different membership, so
+    # loading both widens the target set
+    # silently. An unadopted node is a live production box with hand-made
+    # config; converging it as a side effect of an inventory choice is the
+    # change nobody asked for.
+    - name: breakglass-nodes | skip a node that has not been adopted for management
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} carries breakglass_node_adopted=false — not
+          converging it. Adopt it deliberately (ADR 1183) by removing that fact.
+      when: not (breakglass_node_adopted | default(true) | bool)
+
+    - name: breakglass-nodes | end on an unadopted node
+      ansible.builtin.meta: end_host
+      when: not (breakglass_node_adopted | default(true) | bool)
+  roles:
+    - role: breakglass-node
+    - role: netbird-client-pin
+    - role: netbird-boot-selfheal

@@ -1,0 +1,211 @@
+---
+# netbird-acl-bootstrap.yml
+#
+# Idempotently ensures the per-site NetBird group taxonomy declared in
+# netbird_acl_taxonomy.yml exists on the target site's mgmt-server.
+# Safe to re-run: GETs existing groups, POSTs only the ones that are
+# missing. Never deletes or renames groups.
+#
+# Block 83C.1 — enables operator-onboard.yml Phase 1 to resolve manifest
+# suffix names ('VENDOR') into NetBird group UUIDs at setup-key mint
+# time so vendor peers auto-land in the right ACL group + are
+# identifiable in the dashboard.
+#
+# Usage:
+#
+#   # Apply a site's group taxonomy
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     netbird-acl-bootstrap.yml -e target_site=<site>
+#
+#   # Dry-run (prints which groups would be created)
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     netbird-acl-bootstrap.yml -e target_site=<site> --check
+#
+# Required env: <SITE>_NB_API_TOKEN.
+#
+# Design: docs/design/operator-onboard-utilities.md §"Group taxonomy".
+# Taxonomy: ops/ansible/netbird_acl_taxonomy.yml.
+
+- name: NetBird ACL group taxonomy bootstrap (Block 83C.1)
+  hosts: localhost
+  connection: local
+  # ansible.cfg sets become = true for the fleet; this play runs on the
+  # operator's own machine and only makes HTTPS calls, so root would be
+  # pointless -- and a laptop without passwordless sudo hangs on the prompt.
+  become: false
+  # The API may serve a certificate from the goatnet's own CA (a LAN goatnet
+  # does). When that CA's root is in the repository, verify against it; a
+  # goatnet behind a public CA verifies as before. Never turn verification off.
+  module_defaults:
+    ansible.builtin.uri:
+      ca_path: "{{ (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') if (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') is exists else omit }}"
+  gather_facts: false
+
+  vars:
+    target_site: "{{ target_site | default('') }}"
+    repo_root: "{{ playbook_dir | dirname | dirname }}"
+    taxonomy_path: "{{ playbook_dir }}/netbird_acl_taxonomy.yml"
+
+    # Mirror operator-onboard.yml's site→URL + site→env-var maps so the
+    # operator runs the same `target_site` token across both playbooks.
+    netbird_site_url_map:
+      vega: https://mgmt.vega.netbird-prod.goat.example
+      legacy: https://netbird.legacy.example
+      zagros: https://netbird.zagros.example
+      zagros-prod: https://netbird.zagros-prod.example
+      zagros-dev: https://netbird.zagros-dev.example
+
+    netbird_site_env_var_map:
+      vega: VEGA_NB_API_TOKEN
+      legacy: LEGACY_NB_API_TOKEN
+      zagros: ZAGROS_NB_API_TOKEN
+      zagros-prod: ZAGROS_PROD_NB_API_TOKEN
+      zagros-dev: ZAGROS_DEV_NB_API_TOKEN
+
+  tasks:
+
+    # --------------------------------------------------------------
+    # Phase 0 — Pre-flight
+    # --------------------------------------------------------------
+
+    - name: "Assert target_site is provided"
+      ansible.builtin.assert:
+        that:
+          - target_site | length > 0
+        fail_msg: |
+          target_site is required.
+
+          Usage:
+            ansible-playbook netbird-acl-bootstrap.yml -e target_site=zagros
+
+    - name: "Load NetBird ACL taxonomy"
+      ansible.builtin.include_vars:
+        file: "{{ taxonomy_path }}"
+
+    - name: "Expand exercise group-sets into site entries"
+      ansible.builtin.include_tasks: tasks/netbird-exercise-expand.yml
+
+    - name: "Assert target_site is declared in the taxonomy"
+      ansible.builtin.assert:
+        that:
+          - target_site in netbird_acl_taxonomy
+        fail_msg: |
+          Site '{{ target_site }}' is not declared in {{ taxonomy_path }}.
+
+          Either add a stanza for it, or pick from the declared set:
+            {{ netbird_acl_taxonomy.keys() | list | join(', ') }}
+
+    - name: "Assert site URL + env-var are mapped"
+      ansible.builtin.assert:
+        that:
+          - (target_site in netbird_site_url_map) or (target_site is match('^[a-z][a-z0-9-]+[a-z0-9]$'))
+        fail_msg: |
+          Site '{{ target_site }}' is in the taxonomy but missing URL / env-var
+          mapping. Add it to netbird_site_url_map + netbird_site_env_var_map
+          in this playbook AND in ops/ansible/operator-onboard.yml.
+
+    - name: "Assert API token env var is set"
+      ansible.builtin.assert:
+        that:
+          - lookup('env', netbird_site_env_var_map.get(target_site, (target_site | upper | replace('-','_')) ~ '_NB_API_TOKEN')) | length > 0
+        fail_msg: |
+          NetBird PAT env var {{ netbird_site_env_var_map.get(target_site, (target_site | upper | replace('-','_')) ~ '_NB_API_TOKEN') }}
+          is empty.
+
+          Mint via:
+            1. Open https://dashboard.{{ target_site }}.<site-zone>/
+            2. Users → Personal Access Tokens → Create
+            3. Add to .envrc.local.d/30-site-services.envrc as
+               {{ netbird_site_env_var_map.get(target_site, (target_site | upper | replace('-','_')) ~ '_NB_API_TOKEN') }}=<token>
+
+    # --------------------------------------------------------------
+    # Phase 1 — Survey existing groups
+    # --------------------------------------------------------------
+
+    - name: "GET existing groups from mgmt-server"
+      ansible.builtin.uri:
+        url: "{{ (netbird_mgmt_url | default(netbird_site_url_map.get(target_site, 'https://netbird.' ~ target_site ~ '.net'), true)) }}/api/groups"
+        method: GET
+        headers:
+          Authorization: "Token {{ lookup('env', netbird_site_env_var_map.get(target_site, (target_site | upper | replace('-','_')) ~ '_NB_API_TOKEN')) }}"
+          Accept: application/json
+        status_code: [200]
+        return_content: true
+      register: existing_groups_resp
+      check_mode: false   # read-only — safe in --check, downstream tasks need .json
+
+    - name: "Compute name→id map for existing groups"
+      ansible.builtin.set_fact:
+        existing_group_name_to_id: "{{ dict(existing_groups_resp.json | map(attribute='name') | zip(existing_groups_resp.json | map(attribute='id'))) }}"
+
+    - name: "Compute desired group full names"
+      ansible.builtin.set_fact:
+        desired_group_full_names: >-
+          {{
+            netbird_acl_taxonomy[target_site].groups
+            | map(attribute='suffix')
+            | map('regex_replace', '^', netbird_acl_taxonomy[target_site].site_prefix + '-')
+            | list
+          }}
+
+    - name: "Compute missing groups"
+      ansible.builtin.set_fact:
+        missing_group_names: >-
+          {{
+            desired_group_full_names
+            | difference(existing_group_name_to_id.keys() | list)
+          }}
+
+    - name: "Summary"
+      ansible.builtin.debug:
+        msg: |
+          Site:     {{ target_site }}
+          Prefix:   {{ netbird_acl_taxonomy[target_site].site_prefix }}
+          Existing: {{ existing_group_name_to_id.keys() | list | sort }}
+          Desired:  {{ desired_group_full_names | sort }}
+          Missing:  {{ missing_group_names | sort }}
+
+    # --------------------------------------------------------------
+    # Phase 2 — Create missing groups
+    # --------------------------------------------------------------
+
+    - name: "POST missing groups to mgmt-server"
+      ansible.builtin.uri:
+        url: "{{ (netbird_mgmt_url | default(netbird_site_url_map.get(target_site, 'https://netbird.' ~ target_site ~ '.net'), true)) }}/api/groups"
+        method: POST
+        headers:
+          Authorization: "Token {{ lookup('env', netbird_site_env_var_map.get(target_site, (target_site | upper | replace('-','_')) ~ '_NB_API_TOKEN')) }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "{{ item }}"
+          peers: []
+        status_code: [200, 201]
+        return_content: true
+      loop: "{{ missing_group_names }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - missing_group_names | length > 0
+        - not ansible_check_mode
+      register: created_groups
+
+    - name: "Created-groups summary"
+      ansible.builtin.debug:
+        msg: |
+          {% if missing_group_names | length == 0 %}
+          No groups created (all desired groups already exist).
+          {% elif ansible_check_mode %}
+          [--check] Would create {{ missing_group_names | length }} group(s):
+            {% for n in missing_group_names %}
+            - {{ n }}
+            {% endfor %}
+          {% else %}
+          Created {{ missing_group_names | length }} group(s):
+            {% for r in created_groups.results | default([]) %}
+            - {{ r.json.name }} (id={{ r.json.id }})
+            {% endfor %}
+          {% endif %}

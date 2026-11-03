@@ -1,0 +1,31 @@
+---
+# netbird-boot-selfheal-deploy.yml — install the NetBird boot-wedge self-heal
+# (network-online ordering drop-in + watchdog timer) on mesh hosts.
+#
+# WHY: stock netbird.service waits only on network.target, so after a reboot
+# netbird can start before the network path to mgmt/relays is usable, wedge at a
+# fraction of its peers and never recover. Peers cannot reach the host — a
+# reachability lockout, not an outage. A single `systemctl restart netbird`, once
+# the network is ready, clears it. This role keeps that from staying broken: it waits for
+# network-online.target (root-cause mitigation) and auto-restarts a
+# control-plane-up-but-peers-wedged netbird once, rate-limited, emitting a
+# textfile metric so the wedge is visible off-host.
+#
+# Required group_vars (per host group, e.g. group_vars/<site>_hosts/vars.yml):
+#   netbird_selfheal_enabled: true
+#   netbird_selfheal_min_peers: <~half healthy steady-state connected count>
+#
+# Apply (mesh hosts over mesh SSH; tiny + idempotent):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -e target=<site>_hosts:<site>_hosts netbird-boot-selfheal-deploy.yml
+#
+# Cross-refs: docs/design/netbird-boot-selfheal.md, docs/findings F-262,
+#   ops/netbird/netbird-boot-selfheal.sh (the watchdog).
+
+- name: Deploy NetBird boot-wedge self-heal (mesh hosts)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  roles:
+    - netbird-boot-selfheal

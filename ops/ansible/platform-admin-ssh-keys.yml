@@ -1,0 +1,212 @@
+---
+# platform-admin-ssh-keys.yml — the host-shell leg of
+# `goat admin platform-admin grant|revoke` (docs/design/platform-admin-lifecycle.md).
+#
+# Adds (pa_state=present) or removes (pa_state=absent) one person's SSH public
+# keys on a goatnet's hosts, then reads every target back and FAILS the run if
+# the hosts do not match the requested state. The CLI drives it; the console
+# state changes (approve / installed / revoked) stay in the CLI, where they are
+# attributed to the operator.
+#
+# Targets come from the goatnet's group_vars, never from the caller:
+#   present  the hosts PLATFORM-ADMIN is scoped to (tasks/operator-ssh-scope.yml)
+#   absent   operator_ssh_hosts (the union of every scope) plus
+#            operator_ssh_revoke_extra_hosts — removal is safe to over-apply,
+#            and a key left on one host is a live shell after a revoke.
+#
+# absent removes matching lines from EVERY authorized_keys file a login could
+# read or an operator could restore from: /home/*/.ssh/authorized_keys{,2},
+# their .bak* copies, root's, and the dropbear initramfs key file (rebuilding
+# the initramfs when that file changed, or the removal would not reach the
+# unlock prompt). Lines match on key BODY, never the comment: comments are
+# hand-edited and a comment match misses the key it was meant to remove.
+#
+# Run (the CLI builds this; by hand only for break-glass):
+#   cd ops/ansible
+#   ../scripts/ansible-preflight.sh -i localhost, platform-admin-ssh-keys.yml \
+#     -e '{"pa_env":"zagros","pa_state":"absent","pa_keys":["ssh-ed25519 AAAA... who@x"]}'
+#   add "pa_check": true to report without writing.
+#   add "pa_ssh_common_args": "-o ProxyCommand=\"ssh -p 12201 -W %h:%p goat@127.0.0.1\""
+#   to reach the goatnet through its env door (docs/design/env-doors.md).
+
+- name: platform-admin SSH keys — resolve targets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    pa_check: false
+    pa_ssh_common_args: ""
+  tasks:
+    - name: "K0 — refuse an incomplete request"
+      ansible.builtin.assert:
+        that:
+          - pa_env is defined and (pa_env | length) > 0
+          - pa_state is defined and pa_state in ['present', 'absent']
+          - pa_keys is defined and (pa_keys | length) > 0
+        fail_msg: >-
+          Pass pa_env=<goatnet>, pa_state=present|absent and a non-empty pa_keys
+          list. With no keys there is nothing to add or remove, and a run that
+          reports success over an empty list would read as "keys removed".
+
+    - name: "K0.1 — every key is `<type> <body> [comment]`"
+      ansible.builtin.assert:
+        that:
+          - (item.split() | length) >= 2
+          - item.split()[0] is match('^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)$') # oss-allow: key algorithm name
+          - item.split()[1] is match('^[A-Za-z0-9+/=]{60,}$')
+        fail_msg: "not a public key line: {{ item | truncate(40) }}"
+      loop: "{{ pa_keys }}"
+      loop_control:
+        label: "{{ item.split()[0] | default('?') }} {{ (item.split()[1] | default(''))[:16] }}…"
+
+    - name: "K1 — load the goatnet's group_vars (host lists live there)"
+      ansible.builtin.include_vars:
+        file: "group_vars/{{ pa_env | replace('-', '_') }}_hosts/vars.yml"
+
+    - name: "K2 — grant: resolve PLATFORM-ADMIN's scoped hosts"
+      ansible.builtin.include_tasks: tasks/operator-ssh-scope.yml
+      vars:
+        op_ssh_groups: ["PLATFORM-ADMIN"]
+      when: pa_state == 'present'
+
+    - name: "K2.1 — pick the target list for this direction"
+      ansible.builtin.set_fact:
+        pa_targets: >-
+          {{ (pa_state == 'present')
+             | ternary(op_ssh_targets | default([]),
+                       ((operator_ssh_hosts | default([])) + (operator_ssh_revoke_extra_hosts | default([]))) | unique) }}
+
+    - name: "K2.2 — refuse when the goatnet declares no host for this direction"
+      ansible.builtin.assert:
+        that: (pa_targets | length) > 0
+        fail_msg: >-
+          {{ pa_env }} resolves no SSH target hosts for pa_state={{ pa_state }}
+          (operator_ssh_scopes / operator_ssh_hosts in group_vars/{{ pa_env | replace('-', '_') }}_hosts/vars.yml).
+          Nothing was changed. Declare the hosts first; never report a key as
+          placed or removed on zero hosts.
+
+    - name: "K3 — register each target host"
+      ansible.builtin.add_host:
+        name: "pa-{{ item.ssh_host }}{{ ('-via-' ~ item.ssh_jump) if item.ssh_jump | default('') else '' }}"
+        ansible_host: "{{ item.ssh_host }}"
+        ansible_user: "{{ item.ssh_user }}"
+        ansible_connection: ssh
+        # An entry may carry `ssh_jump` (a breakglass-path scope reaches site-LAN
+        # addresses through the site's breakglass node, so the grant lands on the
+        # path that still works when the mesh is down).
+        ansible_ssh_common_args: "-o ConnectTimeout=20 -o ServerAliveInterval=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new {{ pa_ssh_common_args }}{{ (' -o ProxyJump=' ~ item.ssh_jump) if item.ssh_jump | default('') else '' }}"
+        pa_login_user: "{{ item.ssh_user }}"
+        groups: pa_targets
+      changed_when: false
+      loop: "{{ pa_targets }}"
+      loop_control:
+        label: "{{ item.ssh_user }}@{{ item.ssh_host }}"
+
+    - name: "K3.1 — plan"
+      ansible.builtin.debug:
+        msg: >-
+          {{ pa_state | upper }} {{ pa_keys | length }} key(s) on {{ pa_env }}:
+          {{ pa_targets | map(attribute='ssh_host') | join(', ') }}{{ pa_check | ternary(' (CHECK — nothing will be written)', '') }}
+
+- name: platform-admin SSH keys — apply and verify on each host
+  hosts: pa_targets
+  gather_facts: false
+  become: true
+  vars:
+    pa_check: false
+    pa_keys_remote: "/tmp/.goat-pa-keys-{{ 99999999 | random(seed=inventory_hostname) }}"
+  tasks:
+    - name: "K4 — stage the key bodies (bodies only; comments never match)"
+      ansible.builtin.copy:
+        dest: "{{ pa_keys_remote }}"
+        content: "{{ hostvars['localhost'].pa_keys | map('regex_replace', '^\\S+\\s+(\\S+).*$', '\\1') | join('\n') }}\n"
+        mode: "0600"
+      changed_when: false
+
+    - name: "K5 — revoke: strip the keys from every authorized_keys a login or a restore could use"
+      ansible.builtin.shell: |
+        set -eu
+        keys="{{ pa_keys_remote }}"
+        check="{{ pa_check | bool | ternary('1', '0') }}"
+        hit=0; dropbear=0
+        for f in /home/*/.ssh/authorized_keys /home/*/.ssh/authorized_keys2 \
+                 /home/*/.ssh/authorized_keys.bak* /home/*/.ssh/authorized_keys2.bak* \
+                 /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 \
+                 /etc/dropbear/initramfs/authorized_keys /etc/dropbear-initramfs/authorized_keys; do
+          [ -f "$f" ] || continue
+          n=$(grep -c -F -f "$keys" "$f" || true)
+          [ "$n" -gt 0 ] || continue
+          echo "MATCH $n line(s) in $f"
+          hit=$((hit + n))
+          case "$f" in /etc/dropbear*) dropbear=1 ;; esac
+          [ "$check" = 1 ] && continue
+          grep -v -F -f "$keys" "$f" > "$f.goat-pa-tmp" || true
+          chmod --reference="$f" "$f.goat-pa-tmp"
+          chown --reference="$f" "$f.goat-pa-tmp"
+          mv -f "$f.goat-pa-tmp" "$f"
+          echo "REMOVED from $f"
+        done
+        if [ "$dropbear" = 1 ] && [ "$check" = 0 ] && command -v update-initramfs >/dev/null 2>&1; then
+          update-initramfs -u >/dev/null
+          echo "REBUILT initramfs (dropbear key file changed)"
+        fi
+        echo "TOTAL $hit"
+      args:
+        executable: /bin/bash
+      register: pa_revoke
+      changed_when: "'REMOVED' in pa_revoke.stdout"
+      when: hostvars['localhost'].pa_state == 'absent'
+
+    - name: "K6 — grant: place each key in the login account's authorized_keys"
+      ansible.builtin.lineinfile:
+        path: "~{{ pa_login_user }}/.ssh/authorized_keys"
+        regexp: "^{{ item.split()[0] | regex_escape }}\\s+{{ item.split()[1] | regex_escape }}(\\s|$)"
+        line: "{{ item }}"
+        create: true
+        owner: "{{ pa_login_user }}"
+        mode: "0600"
+      loop: "{{ hostvars['localhost'].pa_keys }}"
+      loop_control:
+        label: "{{ item.split()[0] }} {{ item.split()[1][:16] }}…"
+      check_mode: "{{ pa_check | bool }}"
+      when: hostvars['localhost'].pa_state == 'present'
+
+    - name: "K7 — read back what the host now holds"
+      ansible.builtin.shell: |
+        set -eu
+        keys="{{ pa_keys_remote }}"
+        if [ "{{ hostvars['localhost'].pa_state }}" = absent ]; then
+          cat /home/*/.ssh/authorized_keys /home/*/.ssh/authorized_keys2 \
+              /home/*/.ssh/authorized_keys.bak* /home/*/.ssh/authorized_keys2.bak* \
+              /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 \
+              /etc/dropbear/initramfs/authorized_keys /etc/dropbear-initramfs/authorized_keys 2>/dev/null \
+            | grep -c -F -f "$keys" || true
+        else
+          f=~{{ pa_login_user }}/.ssh/authorized_keys
+          missing=0
+          while read -r body; do
+            [ -n "$body" ] || continue
+            grep -q -F "$body" "$f" 2>/dev/null || missing=$((missing + 1))
+          done < "$keys"
+          echo "$missing"
+        fi
+      args:
+        executable: /bin/bash
+      register: pa_readback
+      changed_when: false
+
+    - name: "K8 — remove the staged bodies"
+      ansible.builtin.file:
+        path: "{{ pa_keys_remote }}"
+        state: absent
+      changed_when: false
+
+    - name: "K9 — the host must match the requested state"
+      ansible.builtin.assert:
+        that: (pa_readback.stdout | trim | int) == 0
+        fail_msg: >-
+          {{ inventory_hostname }}: {{ pa_readback.stdout | trim }}
+          {{ (hostvars['localhost'].pa_state == 'absent') | ternary('key line(s) are STILL present', 'key(s) are MISSING from authorized_keys') }}.
+        success_msg: >-
+          {{ inventory_hostname }} VERIFIED {{ (hostvars['localhost'].pa_state == 'absent') | ternary('none of the keys remain', 'every key is present') }}
+      when: not (pa_check | bool)

@@ -1,0 +1,753 @@
+---
+# obs.yml — minimal observability stack co-resident on a single mgmt Thor.
+#
+# For sites with has_obs_host=false. A site with a dedicated
+# obs node uses its own bootstrap instead.
+#
+# Block 82 sub-block. Inspired by — not extending — the production
+# obs-host role + docker-compose.obs.yml overlay. Co-resident on the host
+# alongside the mgmt-host stack: one host, one compose project per
+# concern. Source-of-truth tree at ops/compose/goat-obs/.
+#
+# Trade-off acknowledged: this breaks the "obs must not co-fail with
+# the thing it observes" rule. Accepted on a single-host goatnet.
+#
+# What this playbook does on the host:
+#   1. Asserts site identity and required env vars are set.
+#   2. Creates the 'monitoring' Postgres role in postgres-a (idempotent,
+#      `pg_monitor` membership for postgres-exporter).
+#   3. Registers the Grafana OAuth2 client at the SITE Hydra (loopback
+#      :4445 on the host — deviation from prod where Grafana talks to a
+#      dedicated operator-IdP Hydra). Uses the existing
+#      grafana-oidc-client role with var overrides.
+#   4. Syncs ops/compose/goat-obs/ → /opt/<site>-obs/ on the Thor.
+#   5. Renders /opt/<site>-obs/.env from operator env vars (mode 0600).
+#   6. Brings up the stack: docker compose -f /opt/<site>-obs/docker-compose.yml
+#      up -d. The stack joins the existing `mgmt` docker network so
+#      Traefik (mgmt-host compose project) can route to grafana:3000.
+#   7. Polls Grafana /api/health for readiness.
+#
+# What this playbook does NOT do (operator follow-ups):
+#   - ops/dns/<site>/mesh-hosts: ensure a "grafana.<zone>" entry exists so
+#     mesh CoreDNS resolves the hostname for netbird peers. Re-run the CoreDNS
+#     play after any mesh-hosts edit. (Hostname is mesh-only.)
+#   - traefik-acme.yml: re-run after adding grafana.* to the
+#     master SAN list + grafana router in
+#     templates/traefik-acme/mgmt-dynamic.yml.j2.
+#
+# Operator usage (after terraform + traefik-acme):
+#   cd ops/ansible
+#   export ANSIBLE_SSH_COMMON_ARGS='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/mgmt-hosts.ini obs.yml \
+#       -e postgres_superuser_password="$<SITE>_PG_PASS"
+#
+# Required env vars in .envrc.local (sourced via direnv) before invocation:
+#   <SITE>_PG_PASS                       — Postgres superuser (existing)
+#   <SITE>_POSTGRES_EXPORTER_PASS        — 32+ char random; postgres-exporter login
+#   <SITE>_GRAFANA_ADMIN_PASS            — 32+ char random; Grafana local-admin
+#   <SITE>_GRAFANA_OIDC_CLIENT_SECRET    — 32+ char random; OAuth2 client secret
+#
+# Rollback: `docker compose -f /opt/<site>-obs/docker-compose.yml down -v`
+#   removes containers + volumes. The 'monitoring' PG role survives;
+#   drop manually if needed.
+
+- name: observability stack (Block 82 sub-block)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  vars:
+    # Per-goatnet stack name: <site>-obs. OBS_PREFIX
+    # (rendered into .env) names every container + volume; the dest dir matches.
+    obs_prefix: "{{ site_id }}-obs"
+    compose_src_dir: "{{ playbook_dir }}/../compose/goat-obs"
+    compose_dest_dir: "/opt/{{ obs_prefix }}"
+    # public_mgmt_fqdn / site_dns_zone are DELIBERATELY NOT SET HERE.
+    #
+    # A play `vars:` entry OUTRANKS group_vars, so a pin here silently overrides
+    # the goatnet's own group_vars: every name still renders, anchored on the wrong
+    # goatnet, and every blackbox probe built from these two fails (prometheus.yml,
+    # job blackbox-https). Every goatnet defines both facts in its own group_vars, so
+    # omitting them here is not a gap — it is the one-fact-one-home rule being honoured.
+    # If you re-add a default, make it derive from site_id, never a literal.
+    # PagerDuty Events-API-v2 integration key (ADR 1059). Empty -> the
+    # alertmanager critical route collapses to webhook-noop (valid, no paging).
+    pagerduty_integration_key: "{{ lookup('env', 'PAGERDUTY_INTEGRATION_KEY') | default('', true) }}"
+
+    grafana_server_domain: "grafana.{{ site_id }}.{{ site_dns_zone }}"
+
+    # grafana-oidc-client role overrides — point at SITE Hydra (the host
+    # loopback :4445), not the operator-IdP Hydra the role's defaults
+    # target.
+    grafana_oidc_hydra_admin: "http://127.0.0.1:4445"
+    grafana_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}"
+    grafana_oidc_redirect_uri: "https://{{ grafana_server_domain }}/login/generic_oauth"
+
+    # Read secrets at controller side; never write plaintext into the
+    # repo or onto the host outside of /opt/<site>-obs/.env (mode 0600).
+    # Env var names are site-parameterized off site_id (<SITE>_*) so a
+    # sibling goatnet reads ITS OWN secrets.
+    _site_env_prefix: "{{ site_id | upper | replace('-', '_') }}"
+    operator_idp_grafana_client_secret: "{{ lookup('env', _site_env_prefix ~ '_GRAFANA_OIDC_CLIENT_SECRET') }}"
+    grafana_admin_password: "{{ lookup('env', _site_env_prefix ~ '_GRAFANA_ADMIN_PASS') }}"
+    postgres_exporter_password: "{{ lookup('env', _site_env_prefix ~ '_POSTGRES_EXPORTER_PASS') }}"
+
+    pg_monitoring_role: monitoring
+
+  pre_tasks:
+    - name: Pre-flight | site_id is a legacy on-mgmt-host obs site
+      ansible.builtin.assert:
+        that:
+          - site_id is defined
+          # Legacy on-mgmt-host obs (grafana+prometheus on the Thor) for sites
+          # without a dedicated obs Orin (has_obs_host=false). Container/host
+          # names still derive per-site below via site_id.
+          - site_id in ['nova', 'zagros', 'zagros-dev']
+        fail_msg: "This playbook targets on-mgmt-host obs sites (nova, zagros, zagros-dev)."
+
+    # The DNS zone must come from the target's own group_vars and must belong to
+    # the site being deployed. A pin in this play's `vars:` block outranks group_vars
+    # and silently anchors probes on names that render perfectly and resolve nowhere.
+    # Every probe fails and the certificate countdown goes dark, with nothing in the
+    # recap to say so (the play reports `changed`, not `wrong`).
+    #
+    # Asserting the pair matches is what makes the failure loud: a zone from the
+    # wrong goatnet cannot satisfy both halves at once.
+    - name: Pre-flight | DNS zone comes from this site's group_vars, not another goatnet's
+      ansible.builtin.assert:
+        that:
+          - site_dns_zone is defined
+          - public_mgmt_fqdn is defined
+          - (site_id == 'nova') == ('nova.example' in site_dns_zone)
+          - (site_id == 'zagros') == ('zagros.example' in site_dns_zone)
+          - (site_id == 'zagros-dev') == ('zagros-dev.example' in site_dns_zone)
+          - public_mgmt_fqdn.endswith(site_dns_zone.split('.', 1)[1]) or public_mgmt_fqdn == site_dns_zone
+        fail_msg: |
+          site_dns_zone / public_mgmt_fqdn do not match site_id={{ site_id }}.
+            site_dns_zone   = {{ site_dns_zone | mandatory }}
+            public_mgmt_fqdn = {{ public_mgmt_fqdn | default('<undefined>') }}
+          These must come from group_vars/{{ target | mandatory }}/vars.yml.
+          Do NOT paper over this with -e; a wrong zone renders a blackbox target
+          list for a goatnet this host cannot reach, and every probe fails silently.
+
+    - name: Pre-flight | required env vars present
+      ansible.builtin.assert:
+        that:
+          - (postgres_superuser_password | default('')) | length > 0
+          - (postgres_exporter_password | length) >= 16
+          - (grafana_admin_password | length) >= 16
+          - (operator_idp_grafana_client_secret | length) >= 32
+        fail_msg: |
+          One or more required inputs missing. Set:
+            -e postgres_superuser_password="$NOVA_PG_PASS"
+          And in .envrc.local:
+            NOVA_POSTGRES_EXPORTER_PASS (16+ chars)
+            NOVA_GRAFANA_ADMIN_PASS (16+ chars)
+            NOVA_GRAFANA_OIDC_CLIENT_SECRET (32+ chars; openssl rand -hex 32)
+
+    - name: Pre-flight | mgmt-host compose is up (postgres-a expected to be healthy)
+      ansible.builtin.command: docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' postgres-a
+      register: _pg_health
+      changed_when: false
+      failed_when: _pg_health.rc != 0 or 'healthy' not in _pg_health.stdout
+
+    - name: Pre-flight | mgmt docker network exists
+      ansible.builtin.command: docker network inspect mgmt
+      register: _mgmt_net
+      changed_when: false
+      failed_when: _mgmt_net.rc != 0
+
+  tasks:
+    # ---------------------------------------------------------------------
+    # 1. Least-privilege monitoring role in postgres.
+    # ---------------------------------------------------------------------
+    - name: Create 'monitoring' PG role if missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ postgres_superuser_password }}"
+          - postgres-a
+          - psql
+          - -U
+          - postgres
+          - -d
+          - postgres
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - |
+            DO $$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ pg_monitoring_role }}') THEN
+                CREATE ROLE {{ pg_monitoring_role }} LOGIN;
+              END IF;
+            END $$;
+            GRANT pg_monitor TO {{ pg_monitoring_role }};
+            ALTER ROLE {{ pg_monitoring_role }} WITH PASSWORD '{{ postgres_exporter_password }}';
+      changed_when: true
+      no_log: true
+
+    # ---------------------------------------------------------------------
+    # 2. Register Grafana OAuth2 client at site Hydra.
+    # ---------------------------------------------------------------------
+    - name: Provision Grafana OAuth2 client at site Hydra
+      ansible.builtin.include_role:
+        name: grafana-oidc-client
+      when: grafana_enabled | default(true) | bool
+
+    # ---------------------------------------------------------------------
+    # 3. Sync compose tree to /opt/<site>-obs/.
+    # ---------------------------------------------------------------------
+    - name: Ensure /opt/<site>-obs/ exists
+      ansible.builtin.file:
+        path: "{{ compose_dest_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # Stage grafana datasources FIRST (before the verbatim tree-copy below) so
+    # THIS task is the one that detects a datasource change and notifies the
+    # grafana restart — provisioned datasources only load at boot. Run after the
+    # main copy, it would always find the file already in place (no change, no
+    # restart). Carries the Alertmanager datasource that surfaces alert state in
+    # the Ory-gated grafana mesh page.
+    - name: Stage grafana datasources (notify grafana restart on change)
+      ansible.builtin.copy:
+        src: "{{ compose_src_dir }}/grafana/provisioning/datasources/"
+        dest: "{{ compose_dest_dir }}/grafana/provisioning/datasources/"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart obs grafana
+
+    # Use ansible.builtin.copy (NOT ansible.posix.synchronize): synchronize
+    # spawns its own rsync-over-ssh that targets the inventory host on LAN
+    # port 22 and does NOT honor the mesh SSH override (ProxyJump / mesh-IP)
+    # the rest of this play uses — so it times out on a mesh-only-SSH host
+    # with 22 closed. copy uses the active connection plugin, so it
+    # works on both LAN-reachable and mesh-only hosts.
+    # .env is generated on the host (never in the src tree); prometheus.yml is
+    # re-staged by the focused F-137 task below; README.md is harmless.
+    # Portal registry on Postgres (ADR 1165 step A): rules/registry-wal.yml
+    # watches a SQLite WAL the goatnet no longer has, so it is not loaded there.
+    # portal_store is the goat-zenoh-portal-store role's variable; this play
+    # runs on the portal's own host (has_obs_host=false), so the goatnet's
+    # group_vars give it. Read before the tree copy below re-stages the file:
+    # Prometheus restarts only when the file was being loaded, not on every run.
+    - name: Registry WAL rules — present before the tree copy? (Postgres-era portal only)
+      ansible.builtin.stat:
+        path: "{{ compose_dest_dir }}/prometheus/rules/registry-wal.yml"
+        get_checksum: false
+      register: _registry_wal_rules_before
+      when: portal_store | default('sqlite') == 'postgres'
+
+    - name: Sync compose tree (docker-compose.yml + prometheus/ + grafana/)
+      ansible.builtin.copy:
+        src: "{{ compose_src_dir }}/"
+        dest: "{{ compose_dest_dir }}/"
+        owner: root
+        group: root
+        mode: preserve
+      register: _sync
+      # dormancy-report tag: a `--tags dormancy-report` run must still stage
+      # the script tree it installs the cron for.
+      tags: [dormancy-report]
+
+    - name: Registry WAL rules — not loaded on a Postgres-era portal
+      ansible.builtin.file:
+        path: "{{ compose_dest_dir }}/prometheus/rules/registry-wal.yml"
+        state: absent
+      changed_when: _registry_wal_rules_before.stat.exists | default(false)
+      notify: Restart obs prometheus
+      when: portal_store | default('sqlite') == 'postgres'
+
+    # F-137 closure: prometheus.yml is bind-mounted as a single file
+    # (not a directory) into <site>-obs-prometheus. Any sync that gives the
+    # destination path a new inode leaves the container reading the
+    # pre-sync content. Using ansible.builtin.copy here keeps the
+    # focused-update behavior and pairs with the Restart-prometheus
+    # handler so a content change forces a container restart that
+    # re-resolves the bind mount.
+    # prometheus.yml + blackbox.yml carry per-site probe targets / DNS names —
+    # TEMPLATED (not copied) so site_id/site_dns_zone render per-goatnet instead
+    # of bleeding another site's hosts into a fork. The verbatim dir-sync above stages
+    # the raw-Jinja copies; these tasks overwrite them with the rendered files
+    # before the stack comes up.
+    - name: Stage prometheus.yml (rendered per-site; notify-restart on change; closes F-137)
+      ansible.builtin.template:
+        src: "{{ compose_src_dir }}/prometheus/prometheus.yml"
+        dest: "{{ compose_dest_dir }}/prometheus/prometheus.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart obs prometheus
+
+    # Notifies BLACKBOX, not prometheus. This said "Restart obs prometheus"
+    # previously which is a plausible-looking line that does nothing:
+    # blackbox.yml is bind-mounted into the blackbox-exporter container, so
+    # restarting prometheus converges the file on the host and leaves the
+    # PROBER running its old config indefinitely.
+    #
+    # Caught adding the ADR 1133 probe modules. The host file had http_gate and
+    # http_app; the running container did not (host md5 fd6cd7cc, in-container
+    # 9ac47016), so every new probe target asked for a module blackbox had
+    # never heard of. blackbox answers that with 400 and emits no probe_*
+    # series at all — which reads exactly like "the target does not exist"
+    # rather than "the prober is stale". The playbook reported changed and
+    # green throughout.
+    #
+    # Same F-137 single-file bind-mount shape as prometheus.yml above, and the
+    # same fix (restart re-resolves the inode; a HUP would not).
+    - name: Stage blackbox.yml (rendered per-site)
+      ansible.builtin.template:
+        src: "{{ compose_src_dir }}/blackbox/blackbox.yml"
+        dest: "{{ compose_dest_dir }}/blackbox/blackbox.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart obs blackbox
+
+    # Alertmanager config — rendered from the proven observability-role template
+    # (the PagerDuty/ntfy/slack fanout, ADR 1059). The PD key (the only secret)
+    # comes from env; an empty key collapses critical → webhook-noop, so the
+    # stack is valid with or without PagerDuty. Rendered AFTER the verbatim tree
+    # copy (the src tree carries no alertmanager.yml — only the dir).
+    - name: Ensure alertmanager dir exists in the dest tree
+      ansible.builtin.file:
+        path: "{{ compose_dest_dir }}/alertmanager"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Render alertmanager.yml per-site (PD key from env; ADR 1059)
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/roles/observability/templates/alertmanager.yml.j2"
+        dest: "{{ compose_dest_dir }}/alertmanager/alertmanager.yml"
+        owner: root
+        group: root
+        mode: "0640"
+      no_log: true
+      notify: Reload obs alertmanager
+
+    # ---------------------------------------------------------------------
+    # Single-file bind-mount drift check.
+    # ---------------------------------------------------------------------
+    # The handlers above only fire when the TEMPLATE task reports changed. Once
+    # a host file is already correct — because a previous run wrote it and its
+    # handler was mis-wired, or because a run was interrupted after the write
+    # and before the restart — every subsequent run reports ok/changed=0,
+    # notifies nothing, and the container keeps serving the inode it was
+    # created with. Convergence is not achieved by re-running, which is the
+    # assumption this whole playbook otherwise rests on. THE TRAP IS THE
+    # REPORT: changed=0 is exactly what a correctly-converged host prints.
+    #
+    # Hit here : blackbox.yml's staging task notified "Restart obs
+    # prometheus" (the wrong container), so the prober ran a config without the
+    # ADR 1133 probe modules while the host file had them for as long as anyone
+    # cared to re-run. Fixing the notify heals it going forward; this heals the
+    # hosts already in that state, and catches the next mis-wire regardless of
+    # which handler is wrong.
+    #
+    # Compares the RUNNING container's copy against the host copy by checksum
+    # and names both, so the output is evidence rather than an assertion.
+    - name: Detect stale single-file bind mounts in the obs containers
+      ansible.builtin.shell: |
+        set -uo pipefail
+        for triple in \
+          "{{ obs_prefix }}-prometheus:{{ compose_dest_dir }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml" \
+          "{{ obs_prefix }}-blackbox:{{ compose_dest_dir }}/blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml"; do
+          cname="${triple%%:*}"; rest="${triple#*:}"
+          host_file="${rest%%:*}"; in_container="${rest##*:}"
+          [ -f "$host_file" ] || continue
+          want=$(md5sum "$host_file" | awk '{print $1}')
+          got=$(docker exec "$cname" md5sum "$in_container" 2>/dev/null | awk '{print $1}' || true)
+          # No container yet, or unreadable: `compose up -d` below creates it,
+          # so absence is not drift and must not be reported as such.
+          [ -n "$got" ] || continue
+          if [ "$want" != "$got" ]; then
+            echo "STALE ${cname}:${in_container} (running ${got}, on disk ${want})"
+          fi
+        done
+        exit 0
+      args:
+        executable: /bin/bash
+      register: obs_bindmount_drift
+      changed_when: "'STALE' in obs_bindmount_drift.stdout"
+      failed_when: false
+      notify:
+        - Restart obs prometheus
+        - Restart obs blackbox
+
+    - name: Report which files the obs containers were still running
+      ansible.builtin.debug:
+        msg: "{{ obs_bindmount_drift.stdout_lines }}"
+      when: "'STALE' in (obs_bindmount_drift.stdout | default(''))"
+
+    - name: Tighten ownership on synced tree
+      ansible.builtin.file:
+        path: "{{ compose_dest_dir }}"
+        owner: root
+        group: root
+        recurse: true
+        state: directory
+
+    # Grafana runs as UID/GID 472 inside the container; the bind-mounted
+    # provisioning + dashboards dirs need to be readable by that UID.
+    # World-readable (0644 files / 0755 dirs) is fine since they contain
+    # no secrets — datasource URL, dashboard JSON, provider config.
+    - name: Set readable mode on grafana provisioning + dashboards
+      ansible.builtin.file:
+        path: "{{ compose_dest_dir }}/grafana"
+        recurse: true
+        mode: u=rwX,g=rX,o=rX
+
+    # ---------------------------------------------------------------------
+    # 4. Render /opt/<site>-obs/.env from the operator's env vars.
+    # ---------------------------------------------------------------------
+    # node-exporter runs with network_mode:host (host-NIC visibility) and
+    # must bind an address containers can reach but LAN/mesh cannot: the
+    # default docker bridge gateway — the same IP compose's host-gateway
+    # resolves host.docker.internal to for the prometheus scrape.
+    - name: Discover default docker bridge gateway (node-exporter bind addr)
+      ansible.builtin.command: >-
+        docker network inspect bridge
+        -f '{{ "{{" }}(index .IPAM.Config 0).Gateway{{ "}}" }}'
+      register: _docker_bridge_gw
+      changed_when: false
+      failed_when: _docker_bridge_gw.rc != 0 or (_docker_bridge_gw.stdout | trim | length) == 0
+
+    - name: Render /opt/nova-obs/.env (mode 0600)
+      ansible.builtin.copy:
+        dest: "{{ compose_dest_dir }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Rendered by ops/ansible/obs.yml — do not edit by hand.
+          SITE_NAME={{ site_id }}
+          OBS_PREFIX={{ obs_prefix }}
+          GRAFANA_ADMIN_USER=admin
+          GRAFANA_ADMIN_PASSWORD={{ grafana_admin_password }}
+          GRAFANA_SERVER_DOMAIN={{ grafana_server_domain }}
+          GRAFANA_OIDC_CLIENT_SECRET={{ operator_idp_grafana_client_secret }}
+          GRAFANA_OIDC_ISSUER_URL={{ grafana_oidc_issuer_url }}
+          # Grafana's server-side token exchange must resolve the mesh Hydra host
+          # from inside the container — derived per-site so it can't bleed.
+          GRAFANA_OIDC_HYDRA_HOST=oauth2.{{ site_id }}.{{ site_dns_zone }}:{{ mesh_ip_a }}
+          POSTGRES_EXPORTER_PASSWORD={{ postgres_exporter_password }}
+          NODE_EXPORTER_LISTEN_ADDR={{ _docker_bridge_gw.stdout | trim }}
+          # Blackbox probes mesh-zone names from inside a container, which cannot
+          # reach mesh CoreDNS on :5353 — map the portal probe target to
+          # the mgmt host's mesh IP (F-282; same F-188 idiom as the Hydra host
+          # above). Portal-less goatnets render the no-op .invalid entry.
+          BLACKBOX_EXTRA_PROBE_HOST={{ (portal_traefik_host ~ ':' ~ mesh_ip_a) if (portal_traefik_host is defined and (portal_traefik_host | length) > 0) else 'blackbox-extra-probe-host-unused.invalid:127.0.0.1' }}
+      no_log: true
+
+    # ---------------------------------------------------------------------
+    # 4b. Host-side textfile metrics cron (bucket quotas + container map).
+    # ---------------------------------------------------------------------
+    # Emits minio_bucket_quota_bytes (the F-169 Phase B gap — replaces the
+    # never-built minio-quota-scraper sidecar) and goat_container_info (the
+    # id→name join for raw-cgroup cadvisor series) into the textfile dir
+    # node-exporter already mounts. Script lives in the synced compose tree.
+    - name: Install goat-obs textfile cron (*/5)
+      ansible.builtin.cron:
+        name: "goat-obs-textfile ({{ obs_prefix }})"
+        minute: "*/5"
+        job: >-
+          {{ compose_dest_dir }}/textfile-cron/goat-obs-textfile.sh
+          {{ compose_dest_dir }}/expected-vendors/textfile
+          2>&1 | logger -t goat-obs-textfile
+
+    - name: Run goat-obs textfile script once now (metrics exist before first scrape)
+      ansible.builtin.command:
+        cmd: >-
+          {{ compose_dest_dir }}/textfile-cron/goat-obs-textfile.sh
+          {{ compose_dest_dir }}/expected-vendors/textfile
+      changed_when: true
+
+    # Declared link capacity (ADR 1128) — THE DENOMINATOR for every
+    # percent-of-pipe panel. Config, not a probe: it is a declared fact about
+    # the host's link, so re-rendering it is how it changes.
+    #
+    # Template is referenced across from the node-exporter role rather than
+    # copied. One fact, one home: the standalone role and this obs stack must
+    # render byte-identical metrics or a host that moves between them would
+    # silently change shape. The two stacks differ only in WHERE the collector
+    # dir is — /var/lib/node_exporter/textfile there, the compose tree here.
+    - name: Publish declared link capacity into the textfile collector dir
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/roles/node-exporter/templates/link-capacity.prom.j2"
+        dest: "{{ compose_dest_dir }}/expected-vendors/textfile/goat_link_capacity.prom"
+        owner: root
+        group: root
+        mode: "0644"
+
+    # ---------------------------------------------------------------------
+    # 4c. Identity-reconcile cron — live-vs-declared stray detection (the
+    #     user209x backstop; docs/design/data-access-cop.md §reconcile).
+    # ---------------------------------------------------------------------
+    # reconcile.py queries the portal's already-computed /api/access/roster and
+    # writes goat_identity_reconcile.prom into the same textfile dir. It needs a
+    # portal operator token — kept in a mode-0600 env file (never inline in the
+    # crontab), rendered from the controller env, same posture as the obs .env.
+    # The whole block is inert unless identity_reconcile_portal_url is defined
+    # (set per-env), so other invocations are unaffected.
+    - name: Identity-reconcile — install (portal-configured envs only)
+      when: identity_reconcile_portal_url is defined
+      block:
+        # Site-prefixed only (<SITE>_PORTAL_OPERATOR_API_KEY), so a goatnet reads
+        # its own key and never whichever one happens to be exported.
+        - name: Resolve the portal operator key for this site
+          ansible.builtin.set_fact:
+            _identity_reconcile_key: >-
+              {{ lookup('env', _site_env_prefix ~ '_PORTAL_OPERATOR_API_KEY') }}
+          no_log: true
+
+        - name: Assert a portal operator key is present in the controller env
+          ansible.builtin.assert:
+            that:
+              - _identity_reconcile_key | length > 0
+            fail_msg: >-
+              identity_reconcile_portal_url is set but
+              {{ _site_env_prefix }}_PORTAL_OPERATOR_API_KEY is not set in the
+              controller environment. Each goatnet reads its own key; the bare
+              PORTAL_OPERATOR_API_KEY is never used.
+
+        - name: Render the identity-reconcile secret env file (mode 0600)
+          ansible.builtin.copy:
+            dest: /etc/goat-identity-reconcile.env
+            mode: "0600"
+            owner: root
+            group: root
+            content: |
+              PORTAL_URL={{ identity_reconcile_portal_url }}
+              PORTAL_OPERATOR_API_KEY={{ _identity_reconcile_key }}
+              GOAT_ENV={{ identity_reconcile_env | default(obs_prefix | regex_replace('-obs$', '')) }}
+              IDENTITY_RECONCILE_ALLOWLIST={{ compose_dest_dir }}/identity-reconcile/identity-reconcile-allowlist.txt
+              KRATOS_ADMIN_URL={{ identity_reconcile_kratos_admin_url | default('http://127.0.0.1:4434') }}
+              ORY_SOT_GROUPS={{ (lookup('file', playbook_dir + '/../permissions/group-permissions.yml') | from_yaml).groups | map(attribute='name') | join(',') }}
+          no_log: true
+
+        - name: Install identity-reconcile cron (*/30)
+          ansible.builtin.cron:
+            name: "identity-reconcile ({{ obs_prefix }})"
+            minute: "*/30"
+            job: >-
+              set -a; . /etc/goat-identity-reconcile.env; set +a;
+              python3 {{ compose_dest_dir }}/identity-reconcile/reconcile.py
+              {{ compose_dest_dir }}/expected-vendors/textfile
+              2>&1 | logger -t identity-reconcile
+
+        - name: Run identity-reconcile once now (metrics exist before first scrape)
+          ansible.builtin.shell:
+            cmd: >-
+              set -a; . /etc/goat-identity-reconcile.env; set +a;
+              python3 {{ compose_dest_dir }}/identity-reconcile/reconcile.py
+              {{ compose_dest_dir }}/expected-vendors/textfile
+          register: identity_reconcile_run
+          changed_when: true
+          # exit 2 = strays found (a real signal, not a task failure); 1 = config/fetch error.
+          failed_when: identity_reconcile_run.rc not in [0, 2]
+
+    # ---------------------------------------------------------------------
+    # 4d. Dormancy-report cron — REPORT-ONLY dormancy census (ADR 1089
+    #     Stage 3.2; identity-reconcile sibling). Reads NetBird peer
+    #     last-seen + Kratos session recency, writes goat_dormancy_report.prom
+    #     + journald names. Moves NOTHING — the shed leg stays behind
+    #     probation_enforce until the counts are calibrated across at least
+    #     one threshold window (membership-lifecycle-plan.md Stage 3).
+    #     Inert unless dormancy_report_netbird_mgmt_url is defined (per-env).
+    # ---------------------------------------------------------------------
+    - name: Dormancy-report — install (configured envs only)
+      when: dormancy_report_netbird_mgmt_url is defined
+      tags: [dormancy-report]
+      block:
+        - name: Assert the NetBird API token is present in the controller env
+          ansible.builtin.assert:
+            that:
+              - lookup('env', site_id_upper | default(site_id | upper) + '_NB_API_TOKEN') | length > 0
+            fail_msg: >-
+              dormancy_report_netbird_mgmt_url is set but
+              {{ site_id_upper | default(site_id | upper) }}_NB_API_TOKEN is unset
+              in the controller environment.
+
+        # The env var is per-OPERATOR: whatever token the deploying operator
+        # carries gets baked into the cron's env file. that
+        # stamped a human admin's personal PAT into this job for six weeks —
+        # the job's reads audited as that person, and its lifecycle rode on
+        # their account. Resolve the token against the mgmt API and refuse
+        # anything that is not a service user.
+        - name: Resolve which NetBird identity the controller token authenticates as
+          ansible.builtin.uri:
+            url: "{{ dormancy_report_netbird_mgmt_url }}/api/users"
+            headers:
+              Authorization: "Token {{ lookup('env', site_id_upper | default(site_id | upper) + '_NB_API_TOKEN') }}"
+            return_content: true
+          register: dormancy_nb_whoami
+          no_log: true
+
+        - name: Refuse to render a personal PAT into the dormancy-report env
+          ansible.builtin.assert:
+            that:
+              - >-
+                dormancy_nb_whoami.json | selectattr('is_current', 'defined')
+                | selectattr('is_current') | map(attribute='is_service_user')
+                | list | first | default(false)
+            fail_msg: >-
+              {{ site_id_upper | default(site_id | upper) }}_NB_API_TOKEN resolves
+              to a human account's personal PAT, not a service user. The
+              dormancy-report cron must run on a service-user token
+              (svc-<site>-netbird-infra class): a personal token records the
+              job's actions as that person and dies with their account. Point
+              the controller env var at the service token and re-run.
+            quiet: true
+
+        - name: Render the dormancy-report secret env file (mode 0600)
+          ansible.builtin.copy:
+            dest: /etc/goat-dormancy-report.env
+            mode: "0600"
+            owner: root
+            group: root
+            content: |
+              NETBIRD_MGMT_URL={{ dormancy_report_netbird_mgmt_url }}
+              NETBIRD_API_TOKEN={{ lookup('env', site_id_upper | default(site_id | upper) + '_NB_API_TOKEN') }}
+              KRATOS_ADMIN_URL={{ dormancy_report_kratos_admin_url | default('http://127.0.0.1:4434') }}
+              GOAT_ENV={{ site_id }}
+              DORMANCY_THRESHOLDS={{ dormancy_report_thresholds | default('7,14,30') }}
+          no_log: true
+
+        - name: Install dormancy-report cron (hourly)
+          ansible.builtin.cron:
+            name: "dormancy-report ({{ obs_prefix }})"
+            minute: "12"
+            job: >-
+              set -a; . /etc/goat-dormancy-report.env; set +a;
+              python3 {{ compose_dest_dir }}/dormancy-report/dormancy_report.py
+              {{ compose_dest_dir }}/expected-vendors/textfile
+              2>&1 | logger -t dormancy-report
+
+        - name: Run dormancy-report once now (metrics exist before first scrape)
+          ansible.builtin.shell:
+            cmd: >-
+              set -a; . /etc/goat-dormancy-report.env; set +a;
+              python3 {{ compose_dest_dir }}/dormancy-report/dormancy_report.py
+              {{ compose_dest_dir }}/expected-vendors/textfile
+          register: dormancy_report_run
+          changed_when: true
+
+    # ---------------------------------------------------------------------
+    # 5. Bring the stack up.
+    # ---------------------------------------------------------------------
+    # Declared end state (ADR 1206): the site's flags choose which of the
+    # stack's services run. A site with `grafana_enabled: false` (likewise
+    # prometheus_enabled, alertmanager_enabled, obs_exporters_enabled) gets
+    # the rest of the stack and no Grafana; unset means on. A service already
+    # running that the site now declares off is left for `goatbuilder
+    # endstate` to report as left over, never removed by a deploy.
+    - name: Declared end state | the obs services this site runs
+      ansible.builtin.set_fact:
+        _obs_services: >-
+          {{ (['prometheus'] if (prometheus_enabled | default(true) | bool) else [])
+           + (['alertmanager'] if (alertmanager_enabled | default(true) | bool) else [])
+           + (['grafana'] if (grafana_enabled | default(true) | bool) else [])
+           + (['node-exporter', 'cadvisor', 'process-exporter', 'blackbox-exporter', 'postgres-exporter']
+              if (obs_exporters_enabled | default(true) | bool) else []) }}
+
+    - name: docker compose pull (refresh pinned images)
+      ansible.builtin.command:
+        chdir: "{{ compose_dest_dir }}"
+        cmd: "docker compose pull {{ _obs_services | join(' ') }}"
+      register: _compose_pull
+      changed_when: "'Pull complete' in _compose_pull.stdout or 'Downloaded' in _compose_pull.stdout"
+      when: _obs_services | length > 0
+
+    - name: docker compose up -d
+      ansible.builtin.command:
+        chdir: "{{ compose_dest_dir }}"
+        cmd: "docker compose up -d {{ _obs_services | join(' ') }}"
+      when: _obs_services | length > 0
+      register: _compose_up
+      changed_when: "'Started' in _compose_up.stderr or 'Created' in _compose_up.stderr or 'Recreated' in _compose_up.stderr"
+
+    # ---------------------------------------------------------------------
+    # 6. Readiness — Grafana health endpoint.
+    # ---------------------------------------------------------------------
+    # Grafana isn't host-published — it sits behind Traefik on the shared mgmt
+    # network. Probe it from INSIDE its own container so liveness depends on
+    # neither Traefik nor cross-container name resolution.
+    #
+    # It used to probe `http://grafana:3000` from the prometheus container, which
+    # cannot work on a goatnet whose obs containers all sit on the shared `mgmt`
+    # network: the compose service alias `grafana` only exists on a compose
+    # project's own default network, so the name is simply absent: the play fails
+    # 30/30 retries with "wget: bad address 'grafana:3000'" while Grafana serves
+    # `"database": "ok"` the whole time. Probing `{{ obs_prefix }}-grafana` instead would not have helped —
+    # busybox wget in prom/prometheus resolves nothing under Docker's `search .`
+    # resolv.conf option, even though Prometheus's own Go resolver is fine and
+    # every scrape target was up.
+    - name: Wait for Grafana to become healthy
+      ansible.builtin.command:
+        cmd: docker exec {{ obs_prefix }}-grafana wget -qO- http://127.0.0.1:3000/api/health
+      register: _grafana_health
+      retries: 30
+      delay: 2
+      until: '_grafana_health.rc == 0 and (''"database": "ok"'' in _grafana_health.stdout)'
+      changed_when: false
+      when: grafana_enabled | default(true) | bool
+
+    - name: Surface obs access summary
+      ansible.builtin.debug:
+        msg: |
+          {{ obs_prefix }} is up.
+            Grafana:    https://{{ grafana_server_domain }}     (Traefik + Ory)
+            Prometheus: http://127.0.0.1:9192   (SSH tunnel from operator laptop)
+
+          Next steps if not already done:
+            1. Confirm grafana.nova.* in ops/dns/nova/mesh-hosts +
+               ansible-playbook -i inventory/mgmt-hosts-mesh.ini mesh-coredns.yml
+               (mesh CoreDNS resolves grafana.nova.* for netbird peers; no public DNS)
+            2. ansible-playbook -i inventory/mgmt-hosts.ini traefik-acme.yml
+               (mints LE cert with grafana.nova.* SAN via DNS-01 ACME, adds router)
+            3. Visit Grafana, click "Sign in with Ory (nova)" → Kratos login.
+
+  handlers:
+    # F-137: prometheus.yml is bind-mounted as a single file. Any
+    # content change to /opt/<site>-obs/prometheus/prometheus.yml needs a
+    # container restart so the bind mount re-resolves against the new
+    # host inode; `kill -HUP 1` alone reloads the old inode.
+    - name: Restart obs prometheus
+      ansible.builtin.command: "docker restart {{ obs_prefix }}-prometheus"
+
+    # Same reasoning as prometheus above, for the prober's own config. A
+    # blackbox module the running container has never loaded makes its targets
+    # emit NO probe_* series, which is indistinguishable from a target that was
+    # never configured — the failure is silent in exactly the direction that
+    # matters.
+    - name: Restart obs blackbox
+      ansible.builtin.command: "docker restart {{ obs_prefix }}-blackbox"
+      changed_when: true
+
+    # Alertmanager re-reads its config on SIGHUP (no inode re-resolve needed —
+    # it's a dir mount, not a single-file bind). On the first deploy the
+    # container doesn't exist yet (compose up creates it with the config), so
+    # tolerate a missing container.
+    # RESTART, not SIGHUP. alertmanager.yml is a SINGLE-FILE bind mount and the
+    # template task writes atomically (tmp + rename), so the file on disk gets a
+    # new inode while the container keeps the old one open. A HUP then re-reads
+    # the OLD content and logs "Completed loading of configuration file" — which
+    # is what happens: the rendered file carries the new receivers, the running
+    # process keeps routing to the old ones, and only a restart closes the gap.
+    - name: Reload obs alertmanager
+      ansible.builtin.command: "docker restart {{ obs_prefix }}-alertmanager"
+      changed_when: true
+      failed_when: false
+
+    # Grafana loads provisioned datasources at boot; restart to pick up a change.
+    - name: Restart obs grafana
+      ansible.builtin.command: "docker restart {{ obs_prefix }}-grafana"
+      changed_when: true
+      failed_when: false

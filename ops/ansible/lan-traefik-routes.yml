@@ -1,0 +1,158 @@
+---
+# lan-traefik-routes.yml — mgmt-identity Traefik surface for a LAN-enrollment
+# goatnet (internal-CA file certs, no ACME). The LAN sibling of
+# traefik-acme.yml; generalized (no site literals) — parameterized by
+# `-e target=<site>_hosts` + per-site group_vars.
+#
+# What it does on the mgmt host:
+#   1. Delivers the internal-CA multi-SAN mgmt-identity leaf (minted on the
+#      controller at ops/enrollment/<site_id>/mgmt-identity-{cert,key}.pem —
+#      gitignored operator state) to {{ traefik_tls_root }}/mgmt-identity/.
+#   2. Renders templates/lan-traefik/lan-mgmt-dynamic.yml.j2 →
+#      /etc/traefik/dynamic/lan-mgmt-<site_id>.yml (routers for the apex,
+#      signal gRPC mux, Ory, dashboard — TLS from the file cert).
+#   3. Renders the docker-compose.lan-tls.yml override (mounts the cert tree
+#      into traefik; volumes merge additively) and re-ups traefik with it.
+#   4. Verifies: on-host TLS handshake against the apex SNI shows the
+#      internal-CA-issued cert (issuer != TRAEFIK DEFAULT CERT).
+#
+# Pre-reqs: site-bootstrap.yml has brought up the mgmt stack (traefik
+# container exists); the mgmt-identity leaf is minted (cert-sign, SANs =
+# apex + *.<site_id>.<zone> + *.auth.<site_id>.<zone>).
+
+- name: "lan-traefik-routes: internal-CA mgmt-identity surface"
+  hosts: "{{ target | mandatory('pass -e target=<site>_hosts') }}"
+  become: true
+  gather_facts: false
+  vars:
+    lan_cert_src: "{{ 'mgmt-identity-cert.pem' | goat_leaf(site_id) }}"   # state dir first, checkout fallback (#2165)
+    lan_key_src: "{{ 'mgmt-identity-key.pem' | goat_leaf(site_id) }}"
+    tls_root: "{{ traefik_tls_root | default('/etc/goat/tls') }}"
+  tasks:
+    - name: lan-routes | assert controller-side cert material exists
+      delegate_to: localhost
+      become: false
+      ansible.builtin.assert:
+        that:
+          - lan_cert_src is exists
+          - lan_key_src is exists
+        fail_msg: >-
+          GB-071 mgmt-identity leaf not found at {{ lan_cert_src }} (the site
+          manifest's out_dir). Mint it: {{ 'mgmt-identity-cert.pem' | goat_leaf_mint(site_id) }}
+          (or by hand, docs/operations/hobby-bringup.md §cert mints: cert-sign with
+          SANs {{ public_mgmt_fqdn }}, *.{{ site_id }}.{{ site_dns_zone }},
+          *.auth.{{ site_id }}.{{ site_dns_zone }}).
+
+    - name: lan-routes | ensure cert dir
+      ansible.builtin.file:
+        path: "{{ tls_root }}/mgmt-identity"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: "lan-routes | deliver leaf cert (chain = leaf + CA root, appended at mint)"
+      ansible.builtin.copy:
+        src: "{{ lan_cert_src }}"
+        dest: "{{ tls_root }}/mgmt-identity/cert.pem"
+        mode: "0644"
+        owner: root
+        group: root
+      register: lan_cert_copied
+
+    - name: lan-routes | deliver leaf key
+      ansible.builtin.copy:
+        src: "{{ lan_key_src }}"
+        dest: "{{ tls_root }}/mgmt-identity/key.pem"
+        mode: "0600"
+        owner: root
+        group: root
+      register: lan_key_copied
+
+    - name: lan-routes | read the system CA store for the trust bundle
+      ansible.builtin.slurp:
+        src: /etc/ssl/certs/ca-certificates.crt
+      register: lan_system_cas
+
+    - name: lan-routes | read the delivered leaf cert for the trust bundle
+      ansible.builtin.slurp:
+        src: "{{ tls_root }}/mgmt-identity/cert.pem"
+      register: lan_leaf_cert
+
+    - name: lan-routes | assemble the LAN trust bundle (system CAs + site root)
+      # Consumed by the compose override's management-a SSL_CERT_FILE so the
+      # JWT validator's JWKS fetch (via the public issuer URL through traefik)
+      # trusts the internal CA. Bundle keeps the system CAs so outbound
+      # public-TLS calls (version checks) keep working. Written via copy so
+      # the change verdict is checksum-based — an unchanged bundle must not
+      # re-fire the traefik/management-a re-up below (#308).
+      ansible.builtin.copy:
+        content: "{{ (lan_system_cas.content | b64decode) ~ (lan_leaf_cert.content | b64decode) }}"
+        dest: "{{ tls_root }}/lan-trust-bundle.pem"
+        mode: "0644"
+        owner: root
+        group: root
+      register: lan_trust_bundle
+
+    - name: lan-routes | ensure /etc/traefik/dynamic exists
+      ansible.builtin.file:
+        path: /etc/traefik/dynamic
+        state: directory
+        mode: "0755"
+
+    - name: lan-routes | render lan-mgmt dynamic config
+      ansible.builtin.template:
+        src: templates/lan-traefik/lan-mgmt-dynamic.yml.j2
+        dest: "/etc/traefik/dynamic/lan-mgmt-{{ site_id }}.yml"
+        mode: "0644"
+      register: lan_dynamic_rendered
+
+    - name: lan-routes | render docker-compose.lan-tls.yml override
+      ansible.builtin.template:
+        src: templates/lan-traefik/docker-compose.lan-tls.yml.j2
+        dest: /opt/mgmt-host/docker-compose.lan-tls.yml
+        mode: "0644"
+      register: lan_override_rendered
+
+    - name: lan-routes | re-up traefik + management-a with the lan-tls override
+      ansible.builtin.command:
+        cmd: docker compose -f docker-compose.yml -f docker-compose.lan-tls.yml up -d traefik management-a
+        chdir: /opt/mgmt-host
+      when: lan_cert_copied is changed or lan_key_copied is changed or
+            lan_override_rendered is changed or lan_trust_bundle is changed
+      register: lan_traefik_up
+      changed_when: true
+
+    - name: lan-routes | wait for traefik websecure
+      ansible.builtin.wait_for:
+        port: 443
+        host: "127.0.0.1"
+        timeout: 60
+
+    - name: lan-routes | verify apex serves the internal-CA cert (not TRAEFIK DEFAULT)
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        echo QUIT | openssl s_client -connect 127.0.0.1:443
+        -servername {{ public_mgmt_fqdn }} 2>/dev/null
+        | openssl x509 -noout -nameopt RFC2253 -issuer -subject
+      args:
+        executable: /bin/bash
+      register: lan_tls_verify
+      changed_when: false
+      # The re-up recreates traefik, and the file provider loads the dynamic
+      # config after :443 already accepts connections — an immediate verify
+      # reads TRAEFIK DEFAULT CERT. Poll for the reload instead of racing it.
+      # The assertion is POSITIVE (issuer line present) on purpose: openssl
+      # failing to connect yields empty stdout, which satisfies any
+      # absence-of-failure check and would end the loop on its first try.
+      # -nameopt RFC2253 pins the name format: default output prints
+      # "CN = x" or "CN=x" depending on the openssl build, and the fleet
+      # has produced both.
+      retries: 12
+      delay: 5
+      until: "'CN=' in lan_tls_verify.stdout and 'TRAEFIK DEFAULT' not in lan_tls_verify.stdout"
+      failed_when: "'CN=' not in lan_tls_verify.stdout or 'TRAEFIK DEFAULT' in lan_tls_verify.stdout"
+
+    - name: lan-routes | verification result
+      ansible.builtin.debug:
+        msg: "{{ lan_tls_verify.stdout_lines }}"

@@ -1,0 +1,44 @@
+---
+# relay-health-cloud-deploy.yml — cloud-resident relay-health surface (ADR 1061).
+#
+# Deploys the relay-health role in STANDALONE mode to an always-on cloud host
+# (the goatnet's relay_health_host Terraform module): a self-contained nginx
+# dashboard + an EXTERNAL-vantage prober timer, mesh-only behind an egress-only
+# SG. No oauth2-proxy/Ory gate — that is the gated PHASE 2 public flip (EIP +
+# :443 + Dex), tracked in ADR 1061 + docs/design/relay-health-dashboard.md.
+#
+# Why a cloud vantage: the relays are cloud infra, and an on-site mesh host is
+# the worst vantage to watch them from (a NATed uplink makes :443 probes
+# hairpin) and the most fragile node. A cloud prober has the honest peer-eye view
+# and survives a site or mesh outage.
+#
+# Reached via SSM (port 22 closed); the operator need not be on the goatnet's mesh.
+#
+# PREFLIGHT — run this FIRST; it is not optional folklore:
+#
+#   ./ops/scripts/gated-service-preflight.sh <goatnet> relay_health --fqdn <public-fqdn>
+#
+# It encodes, as executable checks, the failures that surface when standing this
+# service up: an undeclared enable flag that DELETES the surface, secrets present
+# in an envrc but absent from the shell, a cookie secret of an illegal length, a
+# gate allowlist holding a guessed address, a mesh IP pinned into extra_hosts, one
+# half of a publisher/ingest pair, an environment-specific role default inherited
+# wholesale, a Dex callback committed but never applied, and EIP exhaustion
+# mid-apply. Most are invisible to CI because they are properties of LIVE state,
+# not of the repo.
+#
+# Apply (PHASE 1):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/<site>-relay-health.ini \
+#       relay-health-cloud-deploy.yml
+#
+# Cross-refs: ADR 1061, docs/design/relay-health-dashboard.md, ADR 1058
+#   (relay self-publish — vantage-independent).
+
+- name: Deploy cloud-resident relay-health (ADR 1061, standalone, PHASE 1)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  roles:
+    - relay-health

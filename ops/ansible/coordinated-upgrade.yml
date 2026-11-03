@@ -1,0 +1,271 @@
+---
+# coordinated-upgrade.yml — Coordinated Netbird upgrade for multi-master Spock cluster
+#
+# Implements the deterministic upgrade procedure from:
+#   docs/design/ha-multi-site.md §6 (DDL coordination)
+#   docs/design/ha-multi-site.md §5.8.1 (skipMigration plumbing)
+#
+# What this does:
+#   1. Stop management on ALL sites.
+#   2. Pull new image on ALL sites.
+#   3. Touch the migration marker on ONE designated migrator node.
+#   4. Start migrator (entrypoint detects marker -> AutoMigrate runs).
+#   5. Verify Spock replication health.
+#   6. Remove marker, start remaining sites serially (entrypoint sets
+#      NETBIRD_SKIP_MIGRATIONS=true -> AutoMigrate suppressed).
+#
+# Aligns with the compose layout rendered by ops/ansible/mgmt-host.yml:
+#   compose dir:        /opt/mgmt-host/
+#   management service: management-a   (single instance per site in Phase 3+)
+#   postgres service:   postgres-a
+#   migration marker:   /opt/mgmt-host/management-a/marker/migrations.allow
+#                       (bind-mounted into the container at
+#                       /opt/netbird/migrations.allow via the entrypoint's
+#                       NETBIRD_MIGRATION_MARKER path; see ops/netbird/entrypoint.sh)
+#
+# Required:
+#   target_image:   Docker image tag to upgrade to
+#                   (e.g. ghcr.io/{{ ghcr_org }}/netbird-mgmt:patched-<sha|tag>)
+#   migrator_host:  Inventory hostname that owns the migration this run
+#                   (e.g. mgmt-host-region-b)
+#
+# Optional:
+#   spock_lag_max_seconds:  Acceptable Spock replay lag (default 30)
+#   health_retries:         Health-check retry count per site (default 30)
+#   health_delay_seconds:   Delay between health checks (default 5)
+#
+# Usage:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy \
+#     --no-session -- ansible-playbook \
+#     -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#     coordinated-upgrade.yml \
+#     -e target_image=ghcr.io/{{ ghcr_org }}/netbird-mgmt:patched-53b04e5 \
+#     -e migrator_host=mgmt-host-region-b
+#
+# Safety:
+#   - Aborts on first failure. Mid-procedure failures leave sites stopped;
+#     manual intervention required.
+#   - Spock down-migrations are NOT supported; schema changes are forward
+#     only. Rollback means re-running with the prior target_image (which
+#     might fail if new schema columns are NOT NULL with no default).
+#   - Test every Netbird version bump in the two-instance pilot cluster
+#     BEFORE running this against production.
+
+# ============================================================================
+# Phase 1: stop management on all sites
+# ============================================================================
+- name: "coordinated-upgrade: stop management across all sites"
+  hosts: mgmt_hosts
+  gather_facts: false
+  tasks:
+    - name: Pre-flight — assert required vars
+      ansible.builtin.assert:
+        that:
+          - target_image is defined
+          - migrator_host is defined
+          - migrator_host in groups['mgmt_hosts']
+        fail_msg: >-
+          Required: target_image AND migrator_host (must be in mgmt_hosts group).
+          Current: target_image={{ target_image | default('UNSET') }},
+          migrator_host={{ migrator_host | default('UNSET') }}
+
+    - name: Snapshot current image tag (for rollback reference)
+      ansible.builtin.shell:
+        cmd: docker inspect management-a --format '{% raw %}{{.Config.Image}}{% endraw %}'
+      register: current_image
+      changed_when: false
+      failed_when: false  # tolerate first-time deployments
+
+    - name: Record current image
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} currently running: {{ current_image.stdout | default('NOT RUNNING') }}"
+
+    - name: Stop management-a container
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml stop management-a
+      changed_when: true
+
+# ============================================================================
+# Phase 2: pull new image on all sites
+# ============================================================================
+- name: "coordinated-upgrade: pull new image"
+  hosts: mgmt_hosts
+  gather_facts: false
+  tasks:
+    - name: Pull target image
+      ansible.builtin.command:
+        cmd: "docker pull {{ target_image }}"
+
+    - name: Set NETBIRD_MGMT_IMAGE in /opt/mgmt-host/.env
+      # docker-compose.yml renders management-a.image as
+      # ${NETBIRD_MGMT_IMAGE:-netbirdio/management:0.68.3}, so flipping
+      # the image is a one-line .env change that works regardless of
+      # which image the container is currently running. Previously this
+      # task used lineinfile + a regex requiring 'netbird-mgmt' in the
+      # current image name, which silently no-op'd the first upgrade
+      # from the upstream stock image.
+      ansible.builtin.lineinfile:
+        path: /opt/mgmt-host/.env
+        regexp: '^NETBIRD_MGMT_IMAGE='
+        line: "NETBIRD_MGMT_IMAGE={{ target_image }}"
+        create: false
+
+# ============================================================================
+# Phase 3: start the migrator (AutoMigrate runs on this node only)
+# ============================================================================
+- name: "coordinated-upgrade: start migrator with marker"
+  hosts: "{{ migrator_host }}"
+  gather_facts: false
+  tasks:
+    - name: Touch migration marker (entrypoint will enable AutoMigrate this startup)
+      ansible.builtin.file:
+        path: /opt/mgmt-host/management-a/marker/migrations.allow
+        state: touch
+        mode: '0644'
+
+    - name: Start management-a on the migrator
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml up -d management-a
+
+    - name: Wait for management server to accept TCP connections
+      # Netbird management does not expose an HTTP /health endpoint in
+      # v0.68.3 (or in our patched build) — it serves gRPC + http on one
+      # port, and all HTTP paths return 404. wait_for's state: started
+      # is the correct readiness signal: the container closes the port
+      # on a crash/exit, so "port accepts connections" == "process ran
+      # past migrations and registered listeners". Verified with
+      # `grep -r 'management-a.*Up' + 'running HTTP server'` during
+      # Wave 2 debugging.
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8080
+        state: started
+        timeout: "{{ (health_retries | default(30) | int) * (health_delay_seconds | default(5) | int) }}"
+
+    - name: Remove migration marker (avoid re-trigger on future restarts)
+      ansible.builtin.file:
+        path: /opt/mgmt-host/management-a/marker/migrations.allow
+        state: absent
+
+# ============================================================================
+# Phase 4: verify Spock replication is healthy before starting peer sites
+# ============================================================================
+- name: "coordinated-upgrade: verify Spock health"
+  hosts: "{{ migrator_host }}"
+  gather_facts: false
+  vars:
+    spock_lag_max_seconds: "{{ spock_lag_max_seconds | default(30) }}"
+  tasks:
+    - name: Query Spock subscription state
+      # spock.sub_show_status() is the canonical view in Spock 5.0.6;
+      # the spock.subscription *table* has columns sub_name/sub_enabled,
+      # not subscription_name/status. Discovered Wave 1 §1.5 run.
+      ansible.builtin.command:
+        cmd: >-
+          docker exec postgres-a psql -U postgres -d netbird -t -A -F'|' -c
+          "SELECT subscription_name, status FROM spock.sub_show_status();"
+      register: spock_state
+      changed_when: false
+
+    - name: Display Spock subscriptions
+      ansible.builtin.debug:
+        msg: "Spock state on migrator: {{ spock_state.stdout_lines }}"
+
+    - name: Abort if any subscription is not 'replicating'
+      ansible.builtin.assert:
+        that:
+          - "'down' not in spock_state.stdout"
+          - "'error' not in spock_state.stdout"
+        fail_msg: >-
+          Spock unhealthy after migrator startup. Peer sites NOT started.
+          Investigate spock.sub_show_status() and `docker logs postgres-a |
+          grep CONFLICT:` before re-running with --start-at-task or manual
+          recovery.
+
+    - name: Check Postgres log for recent Spock conflicts
+      # Spock 5.0.6 logs conflicts to the Postgres stderr stream (no
+      # SQL-queryable conflict_log table — verified Wave 1 §1.5). Count
+      # messages in the last 5 minutes via docker logs --since.
+      ansible.builtin.shell:
+        cmd: >-
+          docker logs --since 5m postgres-a 2>&1 | grep -c 'CONFLICT:' || true
+      register: recent_conflicts
+      changed_when: false
+
+    - name: Warn if recent Spock conflicts present
+      ansible.builtin.debug:
+        msg: "WARN: {{ recent_conflicts.stdout | trim }} CONFLICT lines in postgres log in last 5min — review `docker logs postgres-a | grep CONFLICT:` before continuing."
+      when: recent_conflicts.stdout | trim | int > 0
+
+# ============================================================================
+# Phase 5: start remaining sites serially (AutoMigrate suppressed)
+# ============================================================================
+- name: "coordinated-upgrade: start non-migrator sites"
+  hosts: "mgmt_hosts:!{{ migrator_host }}"
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Confirm migration marker is absent (defense-in-depth)
+      ansible.builtin.stat:
+        path: /opt/mgmt-host/management-a/marker/migrations.allow
+      register: marker
+
+    - name: Fail if marker accidentally present on non-migrator
+      ansible.builtin.fail:
+        msg: >-
+          Marker file present on non-migrator {{ inventory_hostname }} —
+          refusing to start. Remove /opt/mgmt-host/management-a/marker/migrations.allow first.
+      when: marker.stat.exists
+
+    - name: Start management-a (entrypoint will set NETBIRD_SKIP_MIGRATIONS=true)
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml up -d management-a
+
+    - name: Wait for management server to accept TCP connections
+      # Netbird management does not expose an HTTP /health endpoint in
+      # v0.68.3 (or in our patched build) — it serves gRPC + http on one
+      # port, and all HTTP paths return 404. wait_for's state: started
+      # is the correct readiness signal: the container closes the port
+      # on a crash/exit, so "port accepts connections" == "process ran
+      # past migrations and registered listeners". Verified with
+      # `grep -r 'management-a.*Up' + 'running HTTP server'` during
+      # Wave 2 debugging.
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8080
+        state: started
+        timeout: "{{ (health_retries | default(30) | int) * (health_delay_seconds | default(5) | int) }}"
+
+# ============================================================================
+# Phase 6: post-upgrade verification
+# ============================================================================
+- name: "coordinated-upgrade: final verification"
+  hosts: "{{ migrator_host }}"
+  gather_facts: false
+  tasks:
+    - name: Re-check Spock subscription state across all peers
+      ansible.builtin.command:
+        cmd: >-
+          docker exec postgres-a psql -U postgres -d netbird -t -A -F'|' -c
+          "SELECT subscription_name, status FROM spock.sub_show_status();"
+      register: final_state
+      changed_when: false
+
+    - name: Display final state
+      ansible.builtin.debug:
+        msg: "Post-upgrade Spock state: {{ final_state.stdout_lines }}"
+
+    - name: Final conflict check (last 10 minutes of postgres log)
+      ansible.builtin.shell:
+        cmd: >-
+          docker logs --since 10m postgres-a 2>&1 | grep -c 'CONFLICT:' || true
+      register: final_conflicts
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          Coordinated upgrade complete to {{ target_image }} via migrator
+          {{ migrator_host }}. CONFLICT lines in postgres log last 10min:
+          {{ final_conflicts.stdout | trim }}. If non-zero, review
+          `docker logs postgres-a | grep CONFLICT:` immediately.

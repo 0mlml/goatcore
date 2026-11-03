@@ -1,0 +1,648 @@
+---
+# external-service.yml — the golden path for an EXTERNAL, NON-CORE service
+# that borrows a goatnet's identity plane (ADR 1178,
+# docs/design/external-service-golden-path.md).
+#
+# THE CONTRACT. A service owner writes ONE file,
+# group_vars/<site>_hosts/external-service-<name>.yml, holding one mapping
+# `external_service_<name>`, and runs this play. With `state=present` the
+# goatnet then provides, in order:
+#
+#   1. a pre-flight that the service's host answers on its health path over
+#      the mesh (edge only: a partner's certificate comes from this run, so its
+#      probe is reported, not required), holds the EXTERNAL-INFRA tier (the class every role group
+#      reaches one-way, mesh-and-ory-roles.md), and that the committed mesh
+#      zone already carries the name (F-197: declared-but-unresolvable
+#      deploys dark — the generator is a laptop step, see below);
+#   2. an OAuth2 client at the site Hydra, when the declaration carries a
+# `client:` block (GET-then-POST-or-PUT, the OIDC-clients playbook
+#      shape; Hydra v2 omits client_secret from GET so an existing client is
+#      always re-PUT, which is also how a secret is rolled);
+#   3. the mgmt-host Traefik router + mesh-only cert SAN (traefik-acme.yml,
+#      whose template renders every enabled declaration from one loop);
+#   4. the mesh DNS zone pushed to the site resolver (mesh-coredns role,
+#      zone-only shape);
+#   5. the status page re-rendered with the derived row (isitup-deploy.yml).
+#
+# For `tls: partner` the play also keeps the public certificate-validation
+# delegation: one `_acme-challenge.<label>.<site>.<zone>` CNAME per certificate
+# name into the partner's `acme_delegate`, so the partner proves control with
+# ACME DNS-01 and serves nothing publicly. Absent, or a move to edge, removes
+# them (records are owned by a comment tag, not by the declaration).
+#
+# With `state=absent` — after the owner has set `enabled: false` in the
+# declaration — it deletes the Hydra client and re-runs 3–5, which drop the
+# router, SAN, record and row because the loop no longer sees the service. The
+# play REFUSES `absent` while the declaration is still enabled: withdrawing a
+# live service is the owner's edit, not a flag. ORDER MATTERS: `enabled: false`
+# → regenerate + re-sign the zone → run absent → THEN delete the file. A file
+# deleted first leaves the play no client id to delete; pass
+# `-e client_id=<id>` in that case and it deletes that client.
+#
+# NOTHING HERE IS NAMED FOR ANY SERVICE. A new service is a file; this play
+# does not change. ops/ci/check-external-service-footprint.sh keeps it that
+# way for temporary services (those declaring `retire_after`).
+#
+# LAPTOP STEP FIRST (both directions). The mesh zone and the signed name
+# snapshot are committed, generated files:
+#     python3 ops/dns/generate-mesh-hosts.py        # then re-sign the snapshot
+#     bash ops/ci/check-name-snapshot-sig.sh          # (ADR 1082, operator key)
+# Commit both; the pre-flight below refuses a zone that does not match the
+# declaration, in either direction.
+#
+# RUN (one command; the door-opening shape every other mgmt-host play uses):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -e target=<site>_hosts -e service=<name> -e state=present \
+#       external-service.yml
+#
+#   -e target=<site>_hosts   the mgmt group every imported play renders for
+#   -e service=<name>        the declaration's suffix (external_service_<name>)
+#   -e state=present|absent  default present
+#   -e skip_reach_check=true skip the mesh-group assertion (no site PAT to hand)
+#
+# ENV it reads, all the same values the site's existing deploys already use:
+#   <SITE>_NB_API_TOKEN                the mgmt-API PAT (reach check + DNS push)
+#   CLOUDFLARE_API_TOKEN_<SITE>        via the group's cloudflare_api_token
+#   <SITE>_ISITUP_OIDC_CLIENT_SECRET / <SITE>_ISITUP_COOKIE_SECRET (isitup)
+#   $<client.secret_env>               the service's OAuth2 client secret, when
+#                                      the declaration carries a client block
+#
+# ROLLBACK is `state=absent`. A Hydra client left behind is harmless; a route
+# left behind is not (a 502 on the shared edge and a re-minted shared cert on
+# the next apply), which is why absent re-renders the edge before anything else.
+
+- name: External service — read the declaration, pre-flight, manage the Hydra client
+  hosts: "{{ target | mandatory }}"
+  become: false
+  gather_facts: false
+
+  vars:
+    external_service_state: "{{ state | default('present') }}"
+    external_service_var: "external_service_{{ service | mandatory | replace('-', '_') }}"
+    hydra_admin: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}"
+    site_env_prefix: "{{ site_id | upper | replace('-', '_') }}"
+    nb_token_envvar: "{{ site_env_prefix }}_NB_API_TOKEN"
+    door_values: [group-gated, authenticated, in-app, mesh-only]
+    # The tier an off-box service host holds: reachable by every role group
+    # one-way, initiates only toward INFRA (mesh-and-ory-roles.md). Prefixed
+    # per goatnet like every other group name.
+    external_infra_group: "{{ site_env_prefix }}-EXTERNAL-INFRA"
+
+  tasks:
+    - name: The state is present or absent
+      ansible.builtin.assert:
+        that: external_service_state in ['present', 'absent']
+        fail_msg: "-e state= must be present or absent, got {{ external_service_state }}"
+      run_once: true
+
+    - name: Read the declaration
+      ansible.builtin.set_fact:
+        ext: "{{ lookup('vars', external_service_var, default={}) }}"
+
+    # ---- present: the declaration must exist and be well-formed ----------
+    - name: A present service has a declaration (group_vars/{{ target }}/external-service-*.yml)
+      ansible.builtin.assert:
+        that:
+          - ext | length > 0
+          - ext.enabled | default(true) | bool
+        fail_msg: >-
+          {{ external_service_var }} is not declared for {{ target }} (or is
+          enabled: false). Write group_vars/{{ target }}/external-service-{{
+          service | replace('_', '-') }}.yml with an `{{ external_service_var }}:`
+          mapping — docs/design/external-service-golden-path.md has the schema.
+      when: external_service_state == 'present'
+
+    - name: The declaration is well-formed
+      # `hostnames` (default [name]) lets ONE declaration carry several names:
+      # a partner platform whose api/audit/authentication surfaces are one
+      # service with one withdrawal. Each entry is the service's own: `<name>`,
+      # `<name>-<surface>`, or nested ONE level as `<surface>.<name>`, so a platform
+      # never claims `api`, `policy` or `user` as bare labels in a namespace every
+      # goatnet tenant shares. `name` stays ONE label: it is
+      # the service's identity, its default row id and its default guard token.
+      # There is no wildcard: mesh DNS is a flat file of literal records, so
+      # every name wanted is an entry somebody wrote. `tls` picks who terminates:
+      #   edge    (default) goat's Traefik does, from `backend_url` over the mesh
+      #   partner           the partner does, on their own host at `mesh_ip`
+      # In partner mode goat renders no router, no backend and no SAN, so
+      # `backend_url` is not required — there is nothing to proxy to.
+      ansible.builtin.assert:
+        that:
+          - ext.name is defined and (ext.name is match('^[a-z0-9][a-z0-9-]{0,62}$'))
+          - (ext.hostnames is not defined) or ((ext.hostnames | type_debug == 'list') and (ext.hostnames | length > 0))
+          # Every hostname belongs to THIS service, and is either flat or nested one
+          # level: <name>, <name>-<surface>, or <surface>.<name>. Flat names ride the
+          # mesh-only cert's *.<site>.<zone>; a nested one adds *.<name>.<site>.<zone>
+          # once per service. That shape is what bounds the cert (at most 100 names)
+          # by the number of services that nest rather than by hostnames. It also
+          # stops one declaration claiming another service's name or prefix.
+          - ext.name is defined and ((ext.hostnames | default([ext.name])) | reject('match', '^(' ~ (ext.name | regex_escape) ~ '(-[a-z0-9-]+)?|[a-z0-9][a-z0-9-]{0,62}\.' ~ (ext.name | regex_escape) ~ ')$') | list | length == 0)
+          # ... and no label in any of them is longer than DNS allows.
+          - ((ext.hostnames | default([ext.name])) | join('.')).split('.') | map('length') | max <= 63
+          # Every name still has to fit DNS's 253 characters once the site and
+          # zone are on it. The '' keeps `max` defined for `hostnames: []` — the
+          # condition above refuses that, but assert evaluates every item, so
+          # this one has to survive the bad input too.
+          - ([''] + (ext.hostnames | default([ext.name]))) | map('length') | max <= (253 - (site_id ~ '.' ~ site_dns_zone) | length - 1)
+          - (ext.tls | default('edge')) in ['edge', 'partner']
+          - ((ext.tls | default('edge')) == 'partner') or (ext.backend_url is defined and (ext.backend_url is match('^https?://')))
+          - ((ext.tls | default('edge')) == 'partner') or ((ext.backend_url | urlsplit('hostname')) is match('^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'))
+          - ((ext.tls | default('edge')) == 'edge') or (ext.mesh_ip is defined and (ext.mesh_ip is match('^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.')))
+          # A partner serves its own certificate, and the only way it can get a
+          # publicly trusted one for names in our zone is DNS-01 delegation: a
+          # public _acme-challenge CNAME into a zone the partner controls. So a
+          # partner names that target, the target is outside our zone (inside it
+          # would delegate nothing), and only a partner may name one.
+          - ((ext.tls | default('edge')) == 'edge') or (ext.acme_delegate is defined and (ext.acme_delegate | string | lower is match('^([a-z0-9_]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\.?$')))
+          - (ext.acme_delegate is not defined) or ((ext.tls | default('edge')) == 'partner')
+          - (ext.acme_delegate is not defined) or not ((ext.acme_delegate | string | lower | regex_replace('\.$', '')) is match('^(.+\.)?' ~ (site_dns_zone | regex_escape) ~ '$'))
+          - (ext.mesh_peer is not defined) or (ext.mesh_peer | string is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$'))
+          - ext.door is defined and (ext.door in door_values)
+          - ext.owner is defined and (ext.owner | string | length > 0)
+          - (ext.client is not defined) or (ext.client.id is defined and ext.client.secret_env is defined)
+          - (ext.retire_after is not defined) or (ext.retire_after | string is match('^\d{4}-\d{2}-\d{2}$'))
+        fail_msg: >-
+          {{ external_service_var }}: `name` is one lowercase DNS label; every
+          entry of `hostnames` (default [name]) is `<name>`, `<name>-<surface>`
+          or `<surface>.<name>` (one level of nesting, under this service's own
+          name), no label exceeds 63 characters, and the name it
+          builds under {{ site_id }}.{{ site_dns_zone }} fits in 253
+          characters; `tls` is edge or partner;
+          in edge mode `backend_url` is http(s)://<MESH IP>:<port> (a 100.64/10
+          address — the mesh is the outer gate, never a LAN or public address);
+          in partner mode `mesh_ip` is the partner host's 100.64/10 address,
+          they terminate TLS themselves, and `acme_delegate` is the hostname in a
+          zone THEY control that our _acme-challenge records point at (outside
+          {{ site_dns_zone }}; edge services name none); `mesh_peer`, when set, is
+          a NetBird peer name; `door` is one of {{ door_values }};
+          `owner` names who to call; a `client:` block needs `id` and
+          `secret_env`; `retire_after` is YYYY-MM-DD.
+      when: external_service_state == 'present'
+
+    - name: The edge hostname and the mesh name agree on this goatnet
+      # The Traefik loop builds the SAN and Host() rule from public_mgmt_fqdn,
+      # like every other SAN on the mesh-only cert anchor; the DNS record, the
+      # status row and the redirect URI use site_dns_zone. They are one string on
+      # most groups and differ on some; a service published on a
+      # group where they differ would have a route on one name and a record on
+      # another, so refuse rather than deploy half.
+      ansible.builtin.assert:
+        that: (public_mgmt_fqdn | default('')) == site_dns_zone
+        fail_msg: >-
+          {{ target }}: public_mgmt_fqdn ({{ public_mgmt_fqdn | default('unset') }})
+          and site_dns_zone ({{ site_dns_zone }}) differ; the external-service path
+          publishes an edge name under the first and a mesh record under the second.
+          Not supported on this group.
+      run_once: true
+
+    - name: A retired-by date in the past is a service that should be absent, not present
+      ansible.builtin.assert:
+        that: (ext.retire_after | string) >= (lookup('pipe', 'date -u +%Y-%m-%d'))
+        fail_msg: >-
+          {{ external_service_var }} declares retire_after {{ ext.retire_after }},
+          which has passed. Set enabled: false and run with -e state=absent, or
+          move the date with the owner's agreement.
+      when:
+        - external_service_state == 'present'
+        - ext.retire_after is defined
+
+    # ---- absent: refuse while the owner has not withdrawn the declaration --
+    - name: An absent service has been withdrawn in its declaration first
+      ansible.builtin.assert:
+        that: (ext | length == 0) or (not (ext.enabled | default(true) | bool))
+        fail_msg: >-
+          {{ external_service_var }} is still enabled. Withdrawing a live service
+          is the owner's edit: set `enabled: false` in the declaration (or delete
+          the file), regenerate + re-sign the mesh zone, then re-run with
+          -e state=absent.
+      when: external_service_state == 'absent'
+
+    # ---- the committed zone matches the declaration ----
+    # EVERY declared name, not just the first. A declaration may carry several
+    # via `hostnames:` (default [name]); checking only `name` let the extra
+    # names deploy dark — the exact failure F-197 put this assertion here for.
+    - name: The committed mesh zone carries every declared name exactly when the service is present
+      vars:
+        _zone_file: "{{ playbook_dir }}/../dns/{{ mesh_dns_zone_dir_name | default(site_id) }}/mesh-hosts"
+        _fqdn: "{{ item }}.{{ site_id }}.{{ site_dns_zone }}"
+        _in_zone: "{{ (lookup('file', _zone_file) | regex_search('(?m)^\\S+\\s+' ~ (_fqdn | regex_escape) ~ '\\s*$')) is not none }}"
+      ansible.builtin.assert:
+        that: (_in_zone | bool) == (external_service_state == 'present')
+        fail_msg: >-
+          {{ _zone_file | basename }} for {{ site_id }} {{ 'does not carry' if external_service_state == 'present' else 'still carries' }}
+          {{ _fqdn }}. Run `python3 ops/dns/generate-mesh-hosts.py`, re-sign the
+          name snapshot (ops/ci/check-name-snapshot-sig.sh), commit both, then
+          re-run — the resolver ships the committed file, so a stale zone deploys
+          the name dark.
+      loop: "{{ ext.hostnames | default([ext.name]) }}"
+      delegate_to: localhost
+      run_once: true
+      when: ext.name is defined
+
+    # ---- partner: a delegated name is the partner's and nobody else's ------
+    # The delegation below lets the partner obtain certificates for <label> and
+    # *.<label>. If any name under that label already resolves somewhere other
+    # than the partner's host — `oauth2`, another service's front door — the
+    # partner could get a trusted certificate for a name it does not serve. So
+    # every committed record at or under each delegated label must point at
+    # mesh_ip, before a single public record is written.
+    - name: Every name under a delegated label resolves to the partner's host
+      vars:
+        _zone_file: "{{ playbook_dir }}/../dns/{{ mesh_dns_zone_dir_name | default(site_id) }}/mesh-hosts"
+        _under: "{{ item ~ '.' ~ site_id ~ '.' ~ site_dns_zone }}"
+        _hits: "{{ lookup('file', _zone_file) | regex_findall('(?m)^(\\S+)\\s+((?:[A-Za-z0-9_-]+[.])*' ~ (_under | regex_escape) ~ ')\\s*$') }}"
+        _elsewhere: "{{ _hits | rejectattr('0', 'equalto', ext.mesh_ip) | map('join', ' ') | list }}"
+      ansible.builtin.assert:
+        that: _elsewhere | length == 0
+        fail_msg: >-
+          {{ _under }} is delegated to {{ ext.acme_delegate }} for certificates,
+          but the committed zone resolves [{{ _elsewhere | join('; ') }}] under it,
+          not {{ ext.mesh_ip }}. A partner may only certify names it serves: choose
+          a `name` no other service uses.
+      loop: "{{ (ext.hostnames | default([ext.name])) | map('regex_replace', '^.*[.]', '') | unique | list }}"
+      delegate_to: localhost
+      run_once: true
+      when:
+        - external_service_state == 'present'
+        - (ext.tls | default('edge')) == 'partner'
+        - ext.acme_delegate is defined
+
+    # ---- present: the host answers, and holds the right tier --------------
+    # In `tls: partner` there is no backend_url: the requester's host is `mesh_ip`
+    # and it serves TLS itself. The reach check below reads that address.
+    - name: The service answers on its health path over the mesh (from the mgmt host)
+      ansible.builtin.uri:
+        url: "{{ ext.backend_url }}{{ ext.health_path | default('/') }}"
+        status_code: [200]
+        validate_certs: false
+        # A mesh ACL drops silently, so a dead or unreachable backend looks like
+        # a hang; bound each attempt, because a backend whose stack is down
+        # stalls the run for the whole default timeout.
+        timeout: 10
+      register: _ext_health
+      retries: 3
+      delay: 5
+      until: _ext_health.status == 200
+      when:
+        - external_service_state == 'present'
+        - (ext.tls | default('edge')) == 'edge'
+
+    # A partner is NOT gated on answering. Its certificate comes from the
+    # delegation this very run publishes, so before the first run it may have
+    # no certificate and serve no TLS at all, waiting for a certificate the run itself enables.
+    # The probe reports; the status page carries the live answer afterwards.
+    - name: The partner's health path, reported not required (it may not have its certificate yet)
+      ansible.builtin.uri:
+        url: "https://{{ ext.mesh_ip }}{{ ext.health_path | default('/') }}"
+        status_code: [200]
+        validate_certs: false
+        timeout: 10
+      register: _ext_partner_health
+      failed_when: false
+      when:
+        - external_service_state == 'present'
+        - (ext.tls | default('edge')) == 'partner'
+
+    - name: Say so when the partner does not answer yet
+      ansible.builtin.debug:
+        msg: >-
+          https://{{ ext.mesh_ip }}{{ ext.health_path | default('/') }} did not
+          answer 200 ({{ _ext_partner_health.msg | default(_ext_partner_health.status) }}).
+          Expected until the partner installs the certificate the delegation below
+          lets them obtain; publishing continues.
+      when:
+        - external_service_state == 'present'
+        - (ext.tls | default('edge')) == 'partner'
+        - (_ext_partner_health.status | default(-1)) != 200
+
+    - name: The site's NetBird PAT is in the env for the reach check
+      ansible.builtin.assert:
+        that: lookup('env', nb_token_envvar) | length > 0
+        fail_msg: >-
+          export {{ nb_token_envvar }} (the per-site mgmt-API PAT) to run the reach
+          check, or pass -e skip_reach_check=true to skip it.
+      delegate_to: localhost
+      run_once: true
+      when:
+        - external_service_state == 'present'
+        - not (skip_reach_check | default(false) | bool)
+
+    - name: Read the mesh peers from the mgmt API
+      ansible.builtin.uri:
+        url: "https://{{ site_dns_zone }}/api/peers"
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_envvar) }}"
+        validate_certs: true
+        return_content: true
+      register: _ext_peers
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+      when:
+        - external_service_state == 'present'
+        - not (skip_reach_check | default(false) | bool)
+
+    - name: The service host is a mesh peer in {{ external_infra_group }}
+      vars:
+        _ext_ip: "{{ ext.mesh_ip if (ext.tls | default('edge')) == 'partner' else (ext.backend_url | urlsplit('hostname')) }}"
+        _ext_peer: "{{ _ext_peers.json | selectattr('ip', 'equalto', _ext_ip) | list }}"
+        _ext_groups: "{{ ((_ext_peer | first | default({})).groups | default([])) | map(attribute='name') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _ext_peer | length == 1
+          - external_infra_group in _ext_groups
+          # The declaration names its peer, so a re-enrolled host with a new
+          # address is caught here instead of publishing names at the wrong IP.
+          - (ext.mesh_peer is not defined) or (((_ext_peer | first | default({})).name | default('')) == ext.mesh_peer)
+        fail_msg: >-
+          {{ _ext_ip }}: {{ _ext_peer | length }} mesh peer(s) carry that address
+          (named {{ _ext_peer | map(attribute='name') | list }}{{ ', declared ' ~ ext.mesh_peer if ext.mesh_peer is defined else '' }}),
+          groups [{{ _ext_groups | join(', ') }}]. An external service host holds
+          {{ external_infra_group }}. No node class mints that tier yet:
+          ops/scripts/external-service-finish.py moves the declared peer there and
+          records it in ops/ci/membership-declared-deviations.yaml. Fix the HOST's
+          membership, never the participants'.
+        success_msg: "{{ _ext_ip }} holds [{{ _ext_groups | join(', ') }}]"
+      delegate_to: localhost
+      run_once: true
+      when:
+        - external_service_state == 'present'
+        - not (skip_reach_check | default(false) | bool)
+
+    # ---- the Hydra client, when the declaration carries one ---------------
+    - name: The client secret is in the env
+      ansible.builtin.assert:
+        that: lookup('env', ext.client.secret_env) | length >= 32
+        fail_msg: >-
+          export {{ ext.client.secret_env }} (32+ chars, e.g. openssl rand -hex 32).
+          The service's own fence must be configured from the SAME variable — two
+          values here is a login loop that looks like an Ory fault and is not.
+      delegate_to: localhost
+      run_once: true
+      when:
+        - external_service_state == 'present'
+        - ext.client is defined
+
+    - name: Hydra admin is reachable on loopback
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/health/ready"
+        status_code: 200
+      retries: 5
+      delay: 2
+      register: _hydra_ready
+      until: _hydra_ready is succeeded
+      when: ext.client is defined
+
+    - name: Check whether the client exists at Hydra
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/admin/clients/{{ ext.client.id }}"
+        status_code: [200, 404]
+        return_content: true
+      register: _ext_client_get
+      when: ext.client is defined
+
+    - name: Create or re-sync the client (present)
+      vars:
+        _scopes: "{{ ext.client.scopes | default(['openid', 'profile', 'email', 'groups']) }}"
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/admin/clients{{ '' if _ext_client_get.status == 404 else '/' ~ ext.client.id }}"
+        method: "{{ 'POST' if _ext_client_get.status == 404 else 'PUT' }}"
+        body_format: json
+        body:
+          client_id: "{{ ext.client.id }}"
+          client_name: "{{ ext.client.id }} ({{ site_id }})"
+          client_secret: "{{ lookup('env', ext.client.secret_env) }}"
+          # offline_access in the scopes is what asks Hydra for a refresh
+          # token; a fence with COOKIE_REFRESH=0 has no use for one.
+          grant_types: "{{ ['authorization_code'] + (['refresh_token'] if 'offline_access' in _scopes else []) }}"
+          response_types: [code]
+          scope: "{{ _scopes | join(' ') }}"
+          redirect_uris:
+            - "https://{{ ext.name }}.{{ site_id }}.{{ site_dns_zone }}{{ ext.client.redirect_path | default('/oauth2/callback') }}"
+          token_endpoint_auth_method: client_secret_post
+          skip_consent: true
+          access_token_strategy: jwt
+          audience: ["{{ ext.client.id }}"]
+        status_code: [200, 201]
+      no_log: true
+      when:
+        - external_service_state == 'present'
+        - ext.client is defined
+
+    - name: Pin the client's token lifespans (present, when declared)
+      # A fence that holds no refresh token turns every request into a 401
+      # the moment the id_token expires under a still-valid cookie; pin both
+      # lifespans to the fence's cookie lifetime.
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/admin/clients/{{ ext.client.id }}/lifespans"
+        method: PUT
+        body_format: json
+        body:
+          authorization_code_grant_id_token_lifespan: "{{ ext.client.token_lifespan }}"
+          authorization_code_grant_access_token_lifespan: "{{ ext.client.token_lifespan }}"
+        status_code: 200
+      when:
+        - external_service_state == 'present'
+        - ext.client is defined
+        - ext.client.token_lifespan is defined
+
+    - name: Delete the client (absent)
+      # The id comes from the withdrawn declaration, or from -e client_id= when
+      # the file is already gone. With neither, say so rather than leave a client
+      # behind silently: a client outlives the service until somebody deletes it.
+      vars:
+        _absent_client_id: "{{ ext.client.id if (ext.client is defined) else (client_id | default('')) }}"
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/admin/clients/{{ _absent_client_id }}"
+        method: DELETE
+        status_code: [204, 404]
+      when:
+        - external_service_state == 'absent'
+        - _absent_client_id | length > 0
+
+    - name: No client id to delete (absent, declaration already deleted)
+      ansible.builtin.debug:
+        msg: >-
+          The declaration is gone and no -e client_id= was given, so no Hydra
+          client was deleted. If the service had one, re-run with
+          -e client_id=<its id>, or delete it at the admin API.
+      when:
+        - external_service_state == 'absent'
+        - ext | length == 0
+        - (client_id | default('')) | length == 0
+      run_once: true
+
+    # ---- partner: the public certificate-validation delegation ------------
+    # A partner serves its own certificate. The only publicly trusted one it can
+    # get for names in our zone, without ever serving on the public internet, is
+    # an ACME DNS-01 challenge answered in a zone THEY control. So for each
+    # certificate name we publish ONE public record and nothing else:
+    #   _acme-challenge.<label>.<site>.<zone>  CNAME  <acme_delegate>
+    # <label> is the first label under the site: `<name>` (also the challenge
+    # name for *.<name>, which covers every nested `<x>.<name>`) and each flat
+    # `<name>-<surface>`. No address is published; the service still resolves
+    # only in mesh DNS. The records are ours by comment tag, so the sweep reads
+    # ownership from Cloudflare, not from a declaration that may be gone: an edge
+    # service, an absent run, or a deleted file all converge to zero records.
+    - name: The Cloudflare token is in the env for the certificate delegation records
+      ansible.builtin.assert:
+        that: (cloudflare_api_token | default('')) | length > 0
+        fail_msg: >-
+          cloudflare_api_token is empty for {{ target }} (the group reads it from
+          the env, e.g. CLOUDFLARE_API_TOKEN_{{ site_env_prefix }}). It manages the
+          public _acme-challenge records a partner-TLS service validates with.
+      delegate_to: localhost
+      run_once: true
+
+    - name: Work out the delegation records this service should have
+      vars:
+        _cf_sfx: "{{ site_id }}.{{ site_dns_zone }}"
+        _cf_partner: "{{ external_service_state == 'present' and (ext.tls | default('edge')) == 'partner' and ext.acme_delegate is defined }}"
+        _cf_labels: "{{ (ext.hostnames | default([ext.name | default('')])) | map('regex_replace', '^.*[.]', '') | unique | list }}"
+        _cf_names: "{{ _cf_labels | map('regex_replace', '^', '_acme-challenge.') | map('regex_replace', '$', '.' ~ _cf_sfx) | list }}"
+        _cf_target: "{{ ext.acme_delegate | default('') | string | lower | regex_replace('[.]$', '') }}"
+      ansible.builtin.set_fact:
+        _cf_zone_name: "{{ external_service_cloudflare_zone | default(site_dns_zone.split('.')[-2:] | join('.')) }}"
+        _cf_suffix: "{{ _cf_sfx }}"
+        _cf_tag: "goat external-service {{ service | replace('_', '-') }} (ADR 1178)"
+        _cf_want: "{{ dict(_cf_names | zip(_cf_names | map('regex_replace', '^.*$', _cf_target))) if (_cf_partner | bool) else {} }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Look up the public zone at Cloudflare
+      ansible.builtin.uri:
+        url: "https://api.cloudflare.com/client/v4/zones?name={{ _cf_zone_name }}"
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+        return_content: true
+      register: _cf_zone
+      failed_when: _cf_zone.status != 200 or (_cf_zone.json.result | length) != 1
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Read the delegation records under the site at Cloudflare
+      ansible.builtin.uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ _cf_zone.json.result[0].id }}/dns_records?type=CNAME&name.endswith=.{{ _cf_suffix }}&per_page=1000"
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+        return_content: true
+      register: _cf_records
+      no_log: true
+      delegate_to: localhost
+      run_once: true
+
+    - name: Split them into this service's records and names someone else holds
+      ansible.builtin.set_fact:
+        _cf_ours: "{{ _cf_records.json.result | selectattr('comment', 'equalto', _cf_tag) | list }}"
+        _cf_taken: "{{ _cf_records.json.result | rejectattr('comment', 'equalto', _cf_tag) | map(attribute='name') | select('in', _cf_want.keys() | list) | list }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: No other record already holds a delegation name
+      ansible.builtin.assert:
+        that: _cf_taken | length == 0
+        fail_msg: >-
+          {{ _cf_taken | join(', ') }} already exist at Cloudflare without this
+          service's tag ({{ _cf_tag }}). Another service or a hand-made record owns
+          the name; resolve that before delegating it.
+      delegate_to: localhost
+      run_once: true
+
+    - name: Create or repoint a delegation record
+      ansible.builtin.uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ _cf_zone.json.result[0].id }}/dns_records{{ ('/' ~ _cf_have.id) if _cf_have else '' }}"
+        method: "{{ 'PUT' if _cf_have else 'POST' }}"
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+        body_format: json
+        body:
+          type: CNAME
+          name: "{{ item.key }}"
+          content: "{{ item.value }}"
+          ttl: 300
+          proxied: false
+          comment: "{{ _cf_tag }}"
+        status_code: [200]
+      vars:
+        _cf_have: "{{ _cf_ours | selectattr('name', 'equalto', item.key) | first | default({}) }}"
+      loop: "{{ _cf_want | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} -> {{ item.value }}"
+      when: (_cf_have.content | default('')) != item.value
+      no_log: false
+      delegate_to: localhost
+      run_once: true
+
+    - name: Remove a delegation record the declaration no longer asks for
+      ansible.builtin.uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ _cf_zone.json.result[0].id }}/dns_records/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+        status_code: [200, 404]
+      loop: "{{ _cf_ours | rejectattr('name', 'in', _cf_want.keys() | list) | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: What the service owner configures on their side
+      ansible.builtin.debug:
+        msg:
+          - "state:        {{ external_service_state }}"
+          - "hostname:     https://{{ ext.name | default('?') }}.{{ site_id }}.{{ site_dns_zone }}"
+          - "issuer:       https://oauth2.{{ site_id }}.{{ site_dns_zone }}/   (trailing slash is load-bearing)"
+          - "jwks:         https://oauth2.{{ site_id }}.{{ site_dns_zone }}/.well-known/jwks.json"
+          - "issuer pin:   oauth2.{{ site_id }}.{{ site_dns_zone }} -> {{ mesh_ip_a }}   (hosts on the mesh without mesh DNS)"
+          - "client_id:    {{ ext.client.id | default('(none — goat manages no client for this service)') }}"
+          - "redirect_uri: {{ ('https://' ~ ext.name ~ '.' ~ site_id ~ '.' ~ site_dns_zone ~ (ext.client.redirect_path | default('/oauth2/callback'))) if ext.client is defined else '-' }}"
+          - "secret:       ${{ ext.client.secret_env | default('-') }}  (same variable on both sides)"
+          - "door:         {{ ext.door | default('?') }}   (what the service's own fence decides; recorded, not enforced here)"
+          - "tls:          {{ ext.tls | default('edge') }}{{ ('   (you terminate TLS; validate with ACME DNS-01 answered at ' ~ ext.acme_delegate ~ ')') if ((ext.tls | default('edge')) == 'partner' and ext.acme_delegate is defined) else '' }}"
+          - "delegation:   {{ (_cf_want | dict2items | map(attribute='key') | join(', ')) if (_cf_want | default({})) else '-' }}"
+      run_once: true
+
+# ---- the edge: router + mesh-only cert SAN, from the loop ------------------
+- name: Publish the mgmt-host Traefik edge for every enabled external service
+  ansible.builtin.import_playbook: traefik-acme.yml
+
+# ---- the mesh zone: push the committed file to this site's resolver --------
+- name: Push the mesh DNS zone to the site resolver (zone-only)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+  vars:
+    mesh_coredns_bind_ip: "{{ mesh_ip_a }}"
+    mesh_dns_zone_dir_name: "{{ site_id }}"
+    mesh_coredns_zone_dir: "{{ playbook_dir }}/../dns/{{ mesh_dns_zone_dir_name }}"
+    # Smoke-test a declared hostname on present, not the bare service name. A
+    # service can declare only nested hostnames (ADR 1178), for example
+    # console.<service>, so the bare name has no mesh record and the test fails on a
+    # healthy resolver. Use the first declared hostname, which is the front door;
+    # it defaults to the service name when the declaration lists none. On absent
+    # the name is gone by design, so test the status page's own name instead (the
+    # role fails on an empty answer, which would stop the play before the status
+    # page re-render).
+    mesh_coredns_smoke_test_name: >-
+      {{ ((lookup('vars', 'external_service_' ~ (service | replace('-', '_')), default={}).hostnames
+            | default([ lookup('vars', 'external_service_' ~ (service | replace('-', '_')), default={}).name | default('isitup') ])) | first)
+         if (state | default('present')) == 'present' else 'isitup' }}.{{ site_id }}.{{ site_dns_zone }}
+    mesh_coredns_host_zone_route_enabled: true
+  pre_tasks:
+    - name: The zone-to-push is in sync with the service registry
+      ansible.builtin.command:
+        cmd: "{{ ansible_playbook_python }} {{ playbook_dir }}/../dns/generate-mesh-hosts.py --check"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+  roles:
+    - role: mesh-coredns
+
+# ---- the status page: derived row appears (present) or goes (absent) -------
+- name: Re-render the status page
+  ansible.builtin.import_playbook: isitup-deploy.yml

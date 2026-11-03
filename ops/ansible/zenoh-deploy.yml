@@ -1,0 +1,88 @@
+---
+# ops/ansible/zenoh-deploy.yml
+#
+# Operator-fired deploy of the trial-fabric Zenoh router on a mgmt host.
+# Sequenced AFTER:
+#   1. The goatnet's CA and router leaf cert + key exist
+#      (cert-sign --uri-san + ops/enrollment/ca/<site>/).
+#   2. The site bootstrap has stood up the host with the
+#      mgmt-stack + netbird-mgmt + signal-server.
+#
+# Pre-flight gates in the goat-zenoh role itself refuse to run
+# without the Track A substrate; this playbook is a thin wrapper over
+# the role so the operator's command line stays single.
+#
+# Reads goat_zenoh_listen_host + goat_zenoh_rest_host from
+# group_vars/<site>_hosts/vars.yml (or extra-vars). Default is the netbird
+# mesh interface (wt0) IP — per ADR 0844 ("v1: one logical mesh,
+# routers on mgmt-hosts binding mesh IP"). ansible_default_ipv4.address
+# would pick the LAN interface and lock out every mesh-external Zenoh client.
+#
+# Run:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/mgmt-hosts.ini \
+#     -e site_id=<site> ops/ansible/zenoh-deploy.yml
+
+- name: Deploy Zenoh trial fabric (per-uuid/per-vendor router)
+  # Host scope parameterized so any trial-fabric goatnet can reuse this
+  # playbook: `-e target=<site>_hosts` targets that goatnet's router host.
+  # The listen-host /
+  # cleanup logic below is host-generic (derives wt0 mesh IP per host).
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    # Bind the host-port-publish target to the netbird mesh interface IP
+    # (wt0) — that's what makes mesh peers see the router. ADR 0844
+    # canon. Fall through
+    # to the LAN IP if wt0 is absent for any reason (lab spike, fact
+    # collection failure), then to 0.0.0.0 as last resort. The
+    # container-internal bind stays tcp/0.0.0.0:7447; only the published
+    # host port changes.
+    # zenoh_listen_host_override (group_vars) wins when set — needed on hosts
+    # where wt0 belongs to a DIFFERENT goatnet than the router being deployed
+    # (wt0 is an uplink to another goatnet and the router binds the LAN IP).
+    # A play-level literal here would shadow group_vars
+    # (the goatnet-turnkey-standup "no play-var shadows group_vars" gotcha),
+    # so the override is threaded explicitly. Unset ⇒ byte-identical wt0
+    # derivation.
+    goat_zenoh_listen_host: "{{ zenoh_listen_host_override | default(ansible_facts['wt0']['ipv4']['address'] | default(ansible_default_ipv4.address | default('0.0.0.0'))) }}"
+    # REST stays HOST-LOCAL. It's unauthenticated; the portal consumes it via
+    # docker DNS (portal_zenoh_rest_url=http://<stack>-router:8000), not via a
+    # host port, and every other consumer (this play's health probe, the
+    # topic-decode guard, an operator on the box) runs ON the host.
+    #
+    # Not `ansible_default_ipv4.address`: that is a DECAYING FACT baked into a
+    # file. docker-compose stores the literal it resolved to at deploy time, so
+    # when a site's LAN moves the compose file keeps pointing at an address the
+    # host no longer has. The container survives only while docker-proxy still
+    # holds the old bind, and the next `compose up` fails to bind and does NOT
+    # bring the router back. A health probe on the same address is just as dead.
+    #
+    # 127.0.0.1 cannot rot, and it shrinks an unauthenticated admin surface
+    # instead of publishing it. Override per-host only if something genuinely
+    # off-box must reach the admin tree, and then use a stable name, never a
+    # fact resolved at deploy time.
+    goat_zenoh_rest_host:   "127.0.0.1"
+  pre_tasks:
+    # The canonical zenoh role + this trial-fabric role both bind TCP 7447.
+    # site-bootstrap.yml no longer deploys any router (it fails closed on a
+    # surviving `zenoh_enabled`), so nothing can bring the canonical container
+    # back; this pre_task one-shot-removes any such container left from an
+    # earlier bootstrap. Idempotent — exit-0 if no container by that name exists.
+    - name: One-shot — stop canonical zenoh-router if present
+      ansible.builtin.shell: |
+        set -eu
+        if docker inspect zenoh-router >/dev/null 2>&1; then
+          docker stop zenoh-router || true
+          docker rm zenoh-router || true
+          echo "removed"
+        else
+          echo "absent"
+        fi
+      args:
+        executable: /bin/bash
+      register: canonical_zenoh_cleanup
+      changed_when: "'removed' in canonical_zenoh_cleanup.stdout"
+  roles:
+    - role: goat-zenoh

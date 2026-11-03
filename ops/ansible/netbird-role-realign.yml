@@ -1,0 +1,237 @@
+---
+# netbird-role-realign.yml — lower any human NetBird user whose role is ABOVE
+# what their Ory groups entitle them to under netbird_mgmt_role_map.
+#
+# docs/design/mesh-change-control.md §2. The netbird-admin-reconcile timer only
+# ever RAISES a role (user < auditor < admin), because an automatic demotion
+# fired by a group typo, a map edit or a Kratos outage would strip every admin
+# on the goatnet at once. Lowering is this play, run on purpose by a named
+# operator: once when a goatnet adopts a role map (everyone who was admin under
+# PLATFORM-ADMIN -> admin becomes auditor unless they hold NETBIRD-ADMIN), and
+# afterwards whenever the reconcile reports a STRAY admin.
+#
+# DRY RUN BY DEFAULT. Without -e apply=true it reads and prints the table and
+# changes nothing.
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       netbird-role-realign.yml -e target=<site>_hosts                 # dry run
+#   ... netbird-role-realign.yml -e target=<site>_hosts \
+#       -e apply=true -e operator=<your-operator-handle>                 # act
+#
+# What it will never do:
+#   * touch the account `owner` (ownership can only be handed back by the
+#     current owner; a lowered owner is a lockout);
+#   * touch a service user (their roles are ops/netbird/service-identities.yaml's
+#     business, every one `admin` by design);
+#   * RAISE anyone — that is the reconcile timer's job;
+#   * move a role that is off the user/auditor/admin ladder (billing_admin,
+#     network_admin): printed, left alone.
+#
+# Token: the goatnet's infrastructure PAT, <SITE>_NB_API_TOKEN (the
+# netbird-infra identity in ops/netbird/service-identities.yaml), the same one
+# netbird-acl-bootstrap.yml and external-service.yml read.
+#
+# Each change is recorded as one OperatorActionV1 (netbird.role.realign) via
+# `goat audit emit` on the mgmt host when the goat binary is installed there;
+# the NetBird activity log records it regardless.
+#
+# Single-active: Kratos lives on the A host. Every task runs once.
+
+- name: NetBird role realign — lower users above their mapped role
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    realign_apply: "{{ apply | default(false) | bool }}"
+    realign_token_env: "{{ site_id | upper | replace('-', '_') }}_NB_API_TOKEN"
+    realign_token: "{{ lookup('env', realign_token_env) }}"
+    realign_api_url: "{{ netbird_role_realign_api_url | default(mesh_membership_reconcile_api_url | default('')) }}"
+    realign_operator: "{{ operator | default(lookup('env', 'GOAT_OPERATOR_HANDLE'), true) }}"
+    realign_kratos_admin: "http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}"
+    realign_goat_bin: /usr/local/bin/goat
+    realign_goat_context: "{{ netbird_role_realign_goat_context | default(site_id ~ '-op') }}"
+    # Same derivation as roles/netbird-admin-reconcile/defaults/main.yml. Role
+    # defaults are not visible to a play that does not run the role, so it is
+    # restated here; a goatnet that sets netbird_mgmt_role_map in group_vars
+    # gets exactly the map its reconcile timer uses.
+    realign_map: >-
+      {{ netbird_mgmt_role_map | default(dict(netbird_mgmt_admin_groups | default(['PLATFORM-ADMIN'])
+      | zip_longest([], fillvalue='admin')) | dict2items(key_name='group', value_name='role')) }}
+    realign_rank: {user: 1, auditor: 2, admin: 3}
+
+  tasks:
+    - name: Pre-flight — token, API URL, map, operator
+      ansible.builtin.assert:
+        that:
+          - realign_token | length >= 20
+          - realign_api_url | length > 0
+          - realign_map | length > 0
+          - realign_map | map(attribute='role') | reject('in', ['user', 'auditor', 'admin']) | list | length == 0
+          - (not realign_apply) or (realign_operator | length > 0)
+        fail_msg: >-
+          Needs {{ realign_token_env }} exported (the goatnet's netbird-infra
+          PAT), a management API URL (mesh_membership_reconcile_api_url in
+          group_vars, or -e netbird_role_realign_api_url=...), a well-formed
+          netbird_mgmt_role_map, and with -e apply=true an operator handle
+          (-e operator=<handle> or GOAT_OPERATOR_HANDLE) for the audit record.
+        quiet: true
+      run_once: true
+
+    - name: Read Kratos identities
+      ansible.builtin.uri:
+        url: "{{ realign_kratos_admin }}/admin/identities?per_page=500"
+        return_content: true
+      register: realign_kratos
+      run_once: true
+
+    - name: Read human NetBird users
+      ansible.builtin.uri:
+        url: "{{ realign_api_url }}/api/users?service_user=false"
+        headers:
+          Authorization: "Token {{ realign_token }}"
+          Accept: application/json
+        return_content: true
+      register: realign_users
+      no_log: true
+      run_once: true
+
+    # Entitled role per Kratos identity id: the HIGHEST role any of its groups
+    # maps to. An inactive or absent identity is entitled to `user`. Login groups
+    # live in admin-managed metadata_public; a groups key
+    # there, even null, marks the identity migrated and its self-editable traits
+    # are never read. Only a not-yet-backfilled identity falls back to traits.
+    - name: Compute each person's entitled role
+      ansible.builtin.set_fact:
+        realign_entitled: >-
+          {%- set out = {} -%}
+          {%- for i in realign_kratos.json if i.state | default('') == 'active' -%}
+          {%-   set meta = i.metadata_public | default({}, true) -%}
+          {%-   set src = meta if 'groups' in meta else (i.traits | default({}, true)) -%}
+          {%-   set groups = src.get('groups') | default([], true) -%}
+          {%-   set ns = namespace(best='user') -%}
+          {%-   for e in realign_map if e.group in groups and realign_rank[e.role] > realign_rank[ns.best] -%}
+          {%-     set ns.best = e.role -%}
+          {%-   endfor -%}
+          {%-   set _ = out.update({i.id: ns.best}) -%}
+          {%- endfor -%}
+          {{ out }}
+      run_once: true
+
+    - name: Build the plan
+      ansible.builtin.set_fact:
+        realign_rows: >-
+          {%- set rows = [] -%}
+          {%- for u in realign_users.json if not (u.is_service_user | default(false)) -%}
+          {%-   set want = realign_entitled.get(u.id, 'user') -%}
+          {%-   if u.role == 'owner' -%}
+          {%-     set action = 'left (owner)' -%}
+          {%-   elif u.role not in realign_rank -%}
+          {%-     set action = 'left (off the ladder)' -%}
+          {%-   elif realign_rank[u.role] > realign_rank[want] -%}
+          {%-     set action = 'LOWER' -%}
+          {%-   elif realign_rank[u.role] < realign_rank[want] -%}
+          {%-     set action = 'below (the reconcile timer raises it)' -%}
+          {%-   else -%}
+          {%-     set action = 'ok' -%}
+          {%-   endif -%}
+          {%-   set _ = rows.append({'id': u.id, 'who': u.email | default(u.name | default(u.id), true),
+                                     'current': u.role, 'entitled': want, 'action': action,
+                                     'auto_groups': u.auto_groups | default([]),
+                                     'is_blocked': u.is_blocked | default(false)}) -%}
+          {%- endfor -%}
+          {{ rows }}
+      run_once: true
+
+    - name: Show the table
+      ansible.builtin.debug:
+        msg: >-
+          {%- set lines = ['%-44s %-8s %-9s %s' | format('user', 'current', 'entitled', 'action')] -%}
+          {%- for r in realign_rows -%}
+          {%-   set _ = lines.append('%-44s %-8s %-9s %s' | format(r.who, r.current, r.entitled, r.action)) -%}
+          {%- endfor -%}
+          {%- set n = realign_rows | selectattr('action', 'eq', 'LOWER') | list | length -%}
+          {%- set _ = lines.append(n ~ ' to lower; ' ~ ('APPLYING' if realign_apply else 'dry run, nothing changed; re-run with -e apply=true to act')) -%}
+          {{ lines }}
+      run_once: true
+
+    - name: Lower each user to their entitled role
+      ansible.builtin.uri:
+        url: "{{ realign_api_url }}/api/users/{{ item.id }}"
+        method: PUT
+        headers:
+          Authorization: "Token {{ realign_token }}"
+          Content-Type: application/json
+        body_format: json
+        # PUT /api/users/{id} replaces the user record: the same three fields
+        # crates/panoscope-core/src/netbird.rs update_user sends. auto_groups
+        # and is_blocked are carried through unchanged; only the role moves.
+        body:
+          role: "{{ item.entitled }}"
+          auto_groups: "{{ item.auto_groups }}"
+          is_blocked: "{{ item.is_blocked }}"
+        status_code: [200, 204]
+      loop: "{{ realign_rows | selectattr('action', 'eq', 'LOWER') | list }}"
+      loop_control:
+        label: "{{ item.who }} {{ item.current }} -> {{ item.entitled }}"
+      register: realign_put
+      no_log: true
+      changed_when: true
+      run_once: true
+      when: realign_apply
+
+    - name: Is the goat CLI on this host?
+      ansible.builtin.stat:
+        path: "{{ realign_goat_bin }}"
+      register: realign_goat
+      run_once: true
+      when: realign_apply
+
+    - name: Record each change (OperatorActionV1 netbird.role.realign)
+      ansible.builtin.command:
+        argv:
+          - "{{ realign_goat_bin }}"
+          - audit
+          - emit
+          - --actor
+          - "{{ realign_operator }}"
+          - --surface
+          - ansible
+          - --action
+          - netbird.role.realign
+          - --target
+          - "{{ item.item.who }}"
+          - --env
+          - "{{ site_id }}"
+          - --outcome
+          - ok
+          - --args-digest
+          - "{{ item.item.current }}->{{ item.item.entitled }}"
+      environment:
+        GOAT_CONTEXT: "{{ realign_goat_context }}"
+      loop: "{{ realign_put.results | default([]) | selectattr('status', 'defined') | list }}"
+      loop_control:
+        label: "{{ item.item.who }}"
+      register: realign_audit
+      changed_when: false
+      failed_when: false
+      run_once: true
+      when:
+        - realign_apply
+        - realign_goat.stat.exists | default(false)
+
+    - name: Say whether every change reached the audit trail
+      ansible.builtin.debug:
+        msg: >-
+          {{ ((realign_audit.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'eq', 0) | list | length)
+              == (realign_put.results | default([]) | selectattr('status', 'defined') | list | length))
+             | ternary('every change recorded as netbird.role.realign',
+                       'NOT every change reached the operator-action audit (no goat binary at '
+                       ~ realign_goat_bin ~ ', or an emit failed; see the task above). The NetBird activity log still holds them.') }}
+      run_once: true
+      when:
+        - realign_apply
+        - (realign_put.results | default([]) | selectattr('status', 'defined') | list | length) > 0

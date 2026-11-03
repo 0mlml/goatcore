@@ -1,0 +1,412 @@
+---
+# ops/ansible/cgnat-validation.yml
+#
+# Orchestrator for the CGNAT-aware signal federation validation env
+# (attempt-2, Path C — 100 x t2.nano native netbird peers, 50 per site).
+#
+# Supersedes attempt-1's nested-container peer swarm — see
+# docs/reports/2026-04-24-cgnat-validation-attempt-1-findings.md §3
+# for the architectural decision. "One peer per EC2 with stock netbird
+# on systemd" matches production (Orin + Karbon) and removes a whole
+# class of container-init release-churn flakes.
+#
+# Design: docs/design/cgnat-validation-env.md
+# Runbook: docs/operations/cgnat-validation-runbook.md
+# Terraform: terraform/cgnat-validation.tf
+#
+# Required -e vars:
+#   postgres_superuser_password       Both sites' PG superuser pw
+#   netbird_encryption_key            base64 32 bytes (shared across cluster)
+#   cgnat_site_a_setup_key            UUID setup key site α — must match the
+#                                     -var passed to terraform apply (peers
+#                                     have it baked into user_data already)
+#   cgnat_site_b_setup_key            UUID setup key site β — same constraint
+#
+# Inventory: ops/ansible/inventory/cgnat-validation.ini (regenerate
+# after terraform apply via inventory/gen-cgnat-validation.sh).
+# signal_uri + cgnat_mgmt_{a,b}_public_ip are set per-host in inventory.
+#
+# Speed-up posture: peer enrollment moved to cloud-init user_data (Path C
+# refactor). Ansible now only orchestrates the 2 mgmt hosts —
+# Phase 1 (mgmt-plane), Phase 2 (socat sidecar), Phase 3 (DB seed),
+# Phase 5 (smoke). Phase 4 (per-peer install via SSM) is deleted; peers
+# self-enroll on first boot. See docs/design/cgnat-validation-env.md.
+#
+# Run (from ops/ansible/):
+#   SETUP_A=$(uuidgen); SETUP_B=$(uuidgen)
+#   # 1) terraform apply with the same setup keys (so peer user_data has them)
+#   aws-vault exec legacy --no-session -- terraform apply \
+#     -var=cgnat_site_a_setup_key=$SETUP_A \
+#     -var=cgnat_site_b_setup_key=$SETUP_B \
+#     # ... -target= flags per cgnat-validation-runbook.md §1
+#   # 2) regenerate inventory + run mgmt-plane orchestration
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+#     ansible-playbook \
+#       -i inventory/cgnat-validation.ini \
+#       cgnat-validation.yml \
+#       -e postgres_superuser_password=... \
+#       -e netbird_encryption_key=... \
+#       -e cgnat_site_a_setup_key=$SETUP_A \
+#       -e cgnat_site_b_setup_key=$SETUP_B
+
+# =============================================================================
+# Phase 1 — mgmt-plane stack on both sites
+# =============================================================================
+# mgmt-host.yml targets hosts: mgmt_hosts. Inventory puts both
+# cgnat-mgmt-a and cgnat-mgmt-b in that group and sets per-host
+# signal_uri + site_name via host_vars, so a single import deploys
+# both sites with distinct federation endpoints.
+- name: "cgnat-validation: mgmt-plane (both sites)"
+  import_playbook: mgmt-host.yml
+  vars:
+    phase2: false
+
+# =============================================================================
+# Phase 2 — expose mgmt API externally via socat sidecar
+# =============================================================================
+# Base mgmt-host compose binds management-a on 127.0.0.1:${MGMT_CONTAINER_HOST_PORT:-8080}
+# (loopback-only; production terminates TLS via Traefik). For validation we
+# need the peers (in private NATGW-egress subnets) to reach the mgmt API on
+# port 80 of the mgmt EIP. socat is the validated workaround from attempt-1
+# findings §2.4 — no changes to base compose, easy teardown.
+- name: "cgnat-validation: expose mgmt API via socat"
+  hosts: cgnat_mgmt_a_hosts:cgnat_mgmt_b_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Stop any prior mgmt-expose container (idempotent re-run)
+      ansible.builtin.command:
+        argv: [docker, rm, -f, mgmt-expose]
+      register: socat_rm
+      changed_when: socat_rm.rc == 0
+      failed_when: false
+
+    - name: Run socat container bridging 0.0.0.0:80 -> 127.0.0.1:8080
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - -d
+          - --name
+          - mgmt-expose
+          - --restart
+          - unless-stopped
+          - --network
+          - host
+          - alpine/socat:latest
+          - TCP-LISTEN:80,fork,reuseaddr
+          - TCP:127.0.0.1:8080
+      changed_when: true
+
+# =============================================================================
+# Phase 3 — seed account + setup-key + All group in each site's mgmt DB
+# =============================================================================
+# Validated against netbird-mgmt 0.68.3 (locally + in cgnat-validation
+# cloud env). Reproduces what netbird's `types.NewAccountWithId()` Go function
+# writes when an admin first logs in via the dashboard / API. The DB-direct
+# pattern is *tactical* — superseded by ADR 0410's mgmt-host-bootstrap Go CLI
+# in Phase 1 of Block 21. Until then, this pattern is the codified path.
+#
+# Critical fields (each one cost us a debug round in attempt-2):
+#   - setup_keys.key      = base64(sha256(UPPER(uuid_plaintext))) — NOT plaintext.
+#                           Computed from cgnat_site_{a,b}_setup_key var.
+#   - setup_keys.key_secret = first-5-chars of UPPER plaintext + "****"
+#                             (masked-display, not validation).
+#   - accounts.network_net  = JSON-encoded net.IPNet, mixed format:
+#                             {"IP":"100.64.0.0","Mask":"//8AAA=="}
+#                             (Go's net.IP marshals to quoted string, IPMask
+#                             falls through to base64).
+#   - accounts.settings_network_range = NULL (it's *netip.Prefix, nullable).
+#   - accounts.settings_jwt_groups_claim_name = '' (string, not nullable; '' is fine).
+#   - accounts.network_identifier, network_dns, etc. — all populated.
+#   - groups: a default 'All' group MUST exist for the account, else mgmt
+#             rejects enrollment with "group 'All' not found".
+#   - users: do NOT insert. netbird creates user rows on first enrollment.
+#            An incomplete users row with NULL columns triggers
+#            "can't scan into dest[N]: cannot scan NULL into *string".
+#
+# Source-of-truth code paths in netbird:
+#   management/server/types/setupkey.go:168-174 (key hash)
+#   management/server/types/account.go:1863+ (newAccountWithId)
+#   management/server/types/network.go:113 (Net IPNet json:serializer)
+#
+# Pattern fully captured in docs/design/identity-architecture.md §11.3 + the
+# attempt-1 findings doc §1.3 (corrected). When ADR 0410's Go CLI
+# ships, this Phase 3 is REPLACED by:
+#   docker exec mgmt-host-runtime mgmt-host-bootstrap create-account ...
+#   docker exec mgmt-host-runtime mgmt-host-bootstrap create-setup-key ...
+
+- name: "cgnat-validation: seed account + setup-key + All group (site α)"
+  hosts: cgnat_mgmt_a_hosts
+  gather_facts: false
+  become: true
+  vars:
+    site_uuid_upper: "{{ cgnat_site_a_setup_key | upper }}"
+    site_account_id: "acc_cgnat_a_000001"
+    site_key_id: "sk_cgnat_a_001"
+    site_group_id: "grp_cgnat_a_all"
+    site_domain: "cgnat-a.local"
+    site_net_id: "cgnat-a-net"
+    site_network_net: '{"IP":"100.64.0.0","Mask":"//8AAA=="}'
+  tasks:
+    - name: Compute setup-key hash + mask
+      ansible.builtin.set_fact:
+        site_key_hash: "{{ lookup('pipe', 'echo -n ' + site_uuid_upper + ' | sha256sum | xxd -r -p | base64') }}"
+        site_key_mask: "{{ site_uuid_upper[:5] }}****"
+    - name: Render seed SQL
+      ansible.builtin.copy:
+        dest: /tmp/cgnat-a-seed.sql
+        mode: "0644"
+        content: |
+          -- Account row — all NOT-NULL-expected columns populated; nullable *netip.Prefix kept NULL.
+          INSERT INTO accounts (
+            id, created_by, created_at,
+            domain, domain_category, is_domain_primary_account,
+            network_identifier, network_net, network_dns, network_serial,
+            dns_settings_disabled_management_groups,
+            settings_peer_login_expiration_enabled, settings_peer_login_expiration,
+            settings_peer_inactivity_expiration_enabled, settings_peer_inactivity_expiration,
+            settings_regular_users_view_blocked,
+            settings_groups_propagation_enabled,
+            settings_jwt_groups_enabled, settings_jwt_groups_claim_name, settings_jwt_allow_groups,
+            settings_routing_peer_dns_resolution_enabled,
+            settings_dns_domain, settings_network_range,
+            settings_peer_expose_enabled, settings_peer_expose_groups,
+            settings_extra_peer_approval_enabled, settings_extra_user_approval_required,
+            settings_extra_integrated_validator, settings_extra_integrated_validator_groups,
+            settings_lazy_connection_enabled, settings_auto_update_version, settings_auto_update_always,
+            reverse_proxy_free_domain_nonce
+          ) VALUES (
+            '{{ site_account_id }}', 'bootstrap', NOW(),
+            '{{ site_domain }}', 'private', true,
+            '{{ site_net_id }}', '{{ site_network_net }}', '{{ site_domain }}', 1,
+            '[]',
+            false, 86400000000000,
+            false, 600000000000,
+            false,
+            false,
+            false, '', '[]',
+            false,
+            '', NULL,
+            false, '[]',
+            false, false,
+            '', '[]',
+            false, 'disabled', false,
+            ''
+          ) ON CONFLICT (id) DO UPDATE SET
+            network_net = EXCLUDED.network_net,
+            settings_network_range = NULL;
+
+          -- Default 'All' group required for peer enrollment.
+          INSERT INTO groups (id, account_id, name, issued)
+            VALUES ('{{ site_group_id }}', '{{ site_account_id }}', 'All', 'api')
+            ON CONFLICT (id) DO NOTHING;
+
+          -- Setup key — `key` column = base64(sha256(UPPER(uuid))), NOT plaintext.
+          INSERT INTO setup_keys (
+            id, account_id, key, key_secret, name, type,
+            created_at, expires_at, updated_at,
+            revoked, used_times, usage_limit, ephemeral
+          ) VALUES (
+            '{{ site_key_id }}', '{{ site_account_id }}',
+            '{{ site_key_hash }}', '{{ site_key_mask }}',
+            'cgnat-a-bootstrap', 'reusable',
+            NOW(), NOW() + INTERVAL '2 days', NOW(),
+            false, 0, 200, false
+          ) ON CONFLICT (id) DO UPDATE SET
+            key = EXCLUDED.key, key_secret = EXCLUDED.key_secret,
+            expires_at = EXCLUDED.expires_at, updated_at = NOW();
+
+          -- Do NOT insert into users — netbird creates them on first enrollment.
+          -- Stale user rows from earlier broken seeds break gRPC scan with
+          -- "can't scan NULL into *string". Clear them defensively.
+          DELETE FROM users WHERE account_id = '{{ site_account_id }}'
+            AND name = '' AND email = '';
+    - name: Apply seed SQL via psql
+      ansible.builtin.shell: |
+        docker cp /tmp/cgnat-a-seed.sql postgres-a:/tmp/seed.sql
+        docker exec -e PGPASSWORD='{{ postgres_superuser_password }}' postgres-a \
+          psql -U postgres -d netbird -f /tmp/seed.sql
+      changed_when: true
+
+- name: "cgnat-validation: seed account + setup-key + All group (site β)"
+  hosts: cgnat_mgmt_b_hosts
+  gather_facts: false
+  become: true
+  vars:
+    site_uuid_upper: "{{ cgnat_site_b_setup_key | upper }}"
+    site_account_id: "acc_cgnat_b_000001"
+    site_key_id: "sk_cgnat_b_001"
+    site_group_id: "grp_cgnat_b_all"
+    site_domain: "cgnat-b.local"
+    site_net_id: "cgnat-b-net"
+    # Different /16 to keep the two sites' WG IP ranges disjoint.
+    site_network_net: '{"IP":"100.65.0.0","Mask":"//8AAA=="}'
+  tasks:
+    - name: Compute setup-key hash + mask
+      ansible.builtin.set_fact:
+        site_key_hash: "{{ lookup('pipe', 'echo -n ' + site_uuid_upper + ' | sha256sum | xxd -r -p | base64') }}"
+        site_key_mask: "{{ site_uuid_upper[:5] }}****"
+    - name: Render seed SQL
+      ansible.builtin.copy:
+        dest: /tmp/cgnat-b-seed.sql
+        mode: "0644"
+        content: |
+          INSERT INTO accounts (
+            id, created_by, created_at,
+            domain, domain_category, is_domain_primary_account,
+            network_identifier, network_net, network_dns, network_serial,
+            dns_settings_disabled_management_groups,
+            settings_peer_login_expiration_enabled, settings_peer_login_expiration,
+            settings_peer_inactivity_expiration_enabled, settings_peer_inactivity_expiration,
+            settings_regular_users_view_blocked,
+            settings_groups_propagation_enabled,
+            settings_jwt_groups_enabled, settings_jwt_groups_claim_name, settings_jwt_allow_groups,
+            settings_routing_peer_dns_resolution_enabled,
+            settings_dns_domain, settings_network_range,
+            settings_peer_expose_enabled, settings_peer_expose_groups,
+            settings_extra_peer_approval_enabled, settings_extra_user_approval_required,
+            settings_extra_integrated_validator, settings_extra_integrated_validator_groups,
+            settings_lazy_connection_enabled, settings_auto_update_version, settings_auto_update_always,
+            reverse_proxy_free_domain_nonce
+          ) VALUES (
+            '{{ site_account_id }}', 'bootstrap', NOW(),
+            '{{ site_domain }}', 'private', true,
+            '{{ site_net_id }}', '{{ site_network_net }}', '{{ site_domain }}', 1,
+            '[]',
+            false, 86400000000000,
+            false, 600000000000,
+            false,
+            false,
+            false, '', '[]',
+            false,
+            '', NULL,
+            false, '[]',
+            false, false,
+            '', '[]',
+            false, 'disabled', false,
+            ''
+          ) ON CONFLICT (id) DO UPDATE SET
+            network_net = EXCLUDED.network_net,
+            settings_network_range = NULL;
+
+          INSERT INTO groups (id, account_id, name, issued)
+            VALUES ('{{ site_group_id }}', '{{ site_account_id }}', 'All', 'api')
+            ON CONFLICT (id) DO NOTHING;
+
+          INSERT INTO setup_keys (
+            id, account_id, key, key_secret, name, type,
+            created_at, expires_at, updated_at,
+            revoked, used_times, usage_limit, ephemeral
+          ) VALUES (
+            '{{ site_key_id }}', '{{ site_account_id }}',
+            '{{ site_key_hash }}', '{{ site_key_mask }}',
+            'cgnat-b-bootstrap', 'reusable',
+            NOW(), NOW() + INTERVAL '2 days', NOW(),
+            false, 0, 200, false
+          ) ON CONFLICT (id) DO UPDATE SET
+            key = EXCLUDED.key, key_secret = EXCLUDED.key_secret,
+            expires_at = EXCLUDED.expires_at, updated_at = NOW();
+
+          DELETE FROM users WHERE account_id = '{{ site_account_id }}'
+            AND name = '' AND email = '';
+    - name: Apply seed SQL via psql
+      ansible.builtin.shell: |
+        docker cp /tmp/cgnat-b-seed.sql postgres-a:/tmp/seed.sql
+        docker exec -e PGPASSWORD='{{ postgres_superuser_password }}' postgres-a \
+          psql -U postgres -d netbird -f /tmp/seed.sql
+      changed_when: true
+
+# =============================================================================
+# Phase 4 — DELETED. Peer enrollment now happens at first-boot via cloud-init
+# user_data — see terraform/cgnat-peer-cloud-init.yaml.tpl. Each peer self-
+# enrolls with retry loop, so Ansible no longer fans out across 100 hosts.
+# Cuts wall-clock from ~25 min to ~0 min for this phase. Pattern documented
+# at docs/design/cgnat-validation-env.md "validation-env bootstrap pattern".
+# Backup path: install-netbird.sh stays SSM-invokable for debug + recovery.
+
+# =============================================================================
+# Phase 5 — smoke: confirm enrollment + signal-federation flowing
+# =============================================================================
+- name: "cgnat-validation: smoke (site α)"
+  hosts: cgnat_mgmt_a_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Wait 5 min for cloud-init self-enrollment to converge
+      # Peers started self-enrolling at first-boot via cloud-init user_data
+      # and have been retrying against the mgmt URL with backoff. Once
+      # Phase 2 (socat) + Phase 3 (DB seed) finish, retries succeed
+      # within seconds. 5 min covers the slowest backoff window (60s) +
+      # a buffer for any peers in mid-attempt.
+      ansible.builtin.pause:
+        minutes: 5
+
+    - name: Fetch signal-a /metrics
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9090/metrics"
+        return_content: true
+      register: signal_a_metrics
+
+    - name: Surface connected-peers + forward_sent_total
+      ansible.builtin.debug:
+        msg: "{{ (signal_a_metrics.content.split('\n') | select('match', '^signal_server_(connected_peers|forward_sent_total).*') | list) }}"
+
+    - name: Query enrolled peer count (site α)
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ postgres_superuser_password }}"
+          - postgres-a
+          - psql
+          - -U
+          - postgres
+          - -d
+          - netbird
+          - -tAc
+          - "SELECT COUNT(*) FROM peers;"
+      register: peers_a
+      changed_when: false
+
+    - name: Report site-α peer count
+      ansible.builtin.debug:
+        msg: "Site α enrolled peer count: {{ peers_a.stdout | trim }} (expected: ~50)"
+
+- name: "cgnat-validation: smoke (site β)"
+  hosts: cgnat_mgmt_b_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Fetch signal-b /metrics
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:9090/metrics"
+        return_content: true
+      register: signal_b_metrics
+
+    - name: Surface connected-peers + forward_sent_total
+      ansible.builtin.debug:
+        msg: "{{ (signal_b_metrics.content.split('\n') | select('match', '^signal_server_(connected_peers|forward_sent_total).*') | list) }}"
+
+    - name: Query enrolled peer count (site β)
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ postgres_superuser_password }}"
+          - postgres-a
+          - psql
+          - -U
+          - postgres
+          - -d
+          - netbird
+          - -tAc
+          - "SELECT COUNT(*) FROM peers;"
+      register: peers_b
+      changed_when: false
+
+    - name: Report site-β peer count
+      ansible.builtin.debug:
+        msg: "Site β enrolled peer count: {{ peers_b.stdout | trim }} (expected: ~50)"

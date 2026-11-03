@@ -1,0 +1,68 @@
+---
+# teardown-compose.yml — stop one service's compose projects on a site, keeping
+# their volumes, and prove it from the host (ops/goatbuilder/teardown.yaml,
+# `goatbuilder teardown`, ops/scripts/goat-teardown.sh).
+#
+#   ansible-playbook teardown-compose.yml -e target=<group> \
+#     -e teardown_component=<name> -e 'teardown_dirs=[{"var":"x_dir","default":"/opt/x"}]'
+#
+# Volumes are kept (`down` without `-v`), so the next standup or deploy brings the
+# service back with its data. A directory with no compose file is reported and
+# skipped. The proof is the host's own answer: `docker compose ps -q` lists
+# nothing for every project afterwards, or the play fails. One row per run goes
+# to /var/lib/goat/<component>/teardown.jsonl; deploy-history.jsonl is never
+# touched, so rollback's history is unchanged.
+- name: teardown — stop a service's compose projects (volumes kept)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: teardown | resolve each compose directory (the site's value, else the role default)
+      ansible.builtin.set_fact:
+        _teardown_dirs: >-
+          {{ _teardown_dirs | default([]) + [ lookup('vars', item.var, default=item.default) ] }}
+      loop: "{{ teardown_dirs | mandatory }}"
+
+    - name: teardown | find the compose files
+      ansible.builtin.stat:
+        path: "{{ item }}/docker-compose.yml"
+      loop: "{{ _teardown_dirs }}"
+      register: _teardown_stat
+
+    - name: teardown | directories with no compose file (nothing to stop)
+      ansible.builtin.debug:
+        msg: "{{ item.item }} has no docker-compose.yml — nothing to stop"
+      loop: "{{ _teardown_stat.results }}"
+      when: not item.stat.exists
+
+    - name: teardown | stop the project, volumes kept
+      ansible.builtin.command:
+        cmd: docker compose -f {{ item.item }}/docker-compose.yml down --remove-orphans
+      loop: "{{ _teardown_stat.results }}"
+      when: item.stat.exists
+      changed_when: true
+
+    - name: teardown | read what still runs
+      ansible.builtin.command:
+        cmd: docker compose -f {{ item.item }}/docker-compose.yml ps -q
+      loop: "{{ _teardown_stat.results }}"
+      when: item.stat.exists
+      register: _teardown_ps
+      changed_when: false
+
+    - name: teardown | nothing of the service may still run
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | default('') | trim | length) == 0
+        fail_msg: "{{ item.item.item }} still runs containers after down: {{ item.stdout }}"
+        quiet: true
+      loop: "{{ _teardown_ps.results }}"
+      when: item.stdout is defined
+
+    - name: teardown | record it (deploy-history.jsonl is not touched)
+      ansible.builtin.shell:
+        cmd: >-
+          mkdir -p /var/lib/goat/{{ teardown_component | mandatory }} &&
+          printf '%s\n' '{"ts":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","component":"{{ teardown_component }}","action":"teardown","volumes":"kept","dirs":{{ _teardown_dirs | to_json }}}'
+          >> /var/lib/goat/{{ teardown_component }}/teardown.jsonl
+      changed_when: true

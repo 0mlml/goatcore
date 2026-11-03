@@ -1,0 +1,158 @@
+---
+# obs-host-bootstrap.yml — bring up a goatnet's OBSERVABILITY host (the ADR
+# 0826 "Orin-C": Prometheus + Alertmanager + Grafana + node-exporter via the
+# obs-host role). Generic: `-e target=<site>_obs_hosts` is mandatory and the
+# play refuses without it, so a fleet-wide name can never quietly pick an
+# environment.
+#
+# WHERE IT SITS IN THE GOLDEN PATH. goat-standup.sh runs this as the obs leg,
+# in PARALLEL with the core-host phases, whenever the site declares
+# `has_obs_host: true`, has a `group_vars/<site>_obs_hosts/` surface and has at
+# least one host in the `[<site>_obs_hosts]` inventory group. It is still a
+# stand-alone play (this file) for a re-run, a config-drift converge, or a
+# goatnet that adds its obs host later (node-addition.md). Per-site wrappers
+# (<site>-obs-bootstrap.yml) import this file with `target` set, so the
+# old entry points keep working and there is ONE body.
+#
+# What the obs host is NOT: it runs no mgmt-stack — no postgres-spock, no
+# netbird-mgmt, no signal-server, no Traefik enrollment ingress, no Spock
+# subscription, no account or setup-key seed. It is MESH-PEER-ONLY: no
+# public-internet ingress, not in the DNS round-robin for any external
+# service. Its host group is deliberately not a child of [mgmt_hosts:children].
+#
+# Scope: the Phase-1 obs stack only. The ADR 0826 Phase-2 storage tier
+# (OpenObserve + MinIO + OTel Collector) is DEFERRED and not here. The fleet
+# UTILITY services the same host carries (Forgejo — the pub/sub state-of-record
+# primary tier) are utility-host-bootstrap.yml, run right after this one.
+#
+# Pre-flight the driver (or the operator, by hand) owns:
+#   1. Host racked, on the LAN, Phase -2 complete (no prior identity, keys,
+#      LUKS volume or mesh enrollment from an earlier life).
+#   2. ops/scripts/seed-ssh-key.sh against it.
+#   3. mgmt-host-baseline.yml -e target=<site>_obs_hosts  (apt, docker,
+#      hostname, F-182 non-local bind).
+#   4. mgmt-host-luks.yml     -e target=<site>_obs_hosts  (NVMe LUKS at
+#      /opt/docker-data — the docker data-root MUST be on it, F-093).
+#   5. The sentinels below filled (ansible_host, obs_scrape_targets).
+# Steps 1-4 are per-host and independent of the core pair, which is why the
+# driver runs them concurrently — that is where the standup hour is won.
+#
+# Usage (by hand):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       obs-host-bootstrap.yml -e target=<site>_obs_hosts
+#
+# Idempotent — re-run to apply config drift (Prometheus and Alertmanager pick
+# up config edits via reload, no restart).
+
+# ============================================================================
+# Phase 0 — sentinel gate (fail-closed)
+#
+# `connection: local` on purpose: this still works when ansible_host is itself
+# a sentinel and no SSH is possible.
+#
+# obs_scrape_targets is the one most likely to be forgotten. A fresh
+# group_vars/<site>_obs_hosts/vars.yml ships WITHOUT it, because the targets
+# are the core hosts' mesh addresses and on an internet-profile site those do
+# not exist until phase 10. An obs host with no scrape targets comes up green
+# and watches nothing — precisely the shape this gate exists to stop. The
+# driver therefore starts this play only after phase 9.
+# ============================================================================
+- name: "obs-host-bootstrap: sentinel gate"
+  hosts: "{{ target | mandatory }}"
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: "refuse while a connection sentinel survives"
+      ansible.builtin.assert:
+        that:
+          - not (hostvars[inventory_hostname]['ansible_host'] | default('') | string).startswith('TBD_')
+        fail_msg: >-
+          {{ inventory_hostname }}: ansible_host is still a sentinel. Fill the
+          obs host's LAN IP in ops/ansible/inventory/mgmt-hosts.ini (and its
+          mesh IP in mgmt-hosts-mesh.ini once it enrolls), then re-run.
+        success_msg: "ansible_host is filled."
+        quiet: true
+
+    - name: "refuse without scrape targets"
+      ansible.builtin.assert:
+        that:
+          - obs_scrape_targets is defined
+          - obs_scrape_targets | length > 0
+        fail_msg: |
+          obs_scrape_targets is unset or empty in group_vars/{{ target }}/vars.yml.
+          The obs host exists to watch the core host(s). Deploying it with no
+          targets brings up a Prometheus that is green and blind. The targets
+          are the core hosts' node-exporter / postgres-exporter / signal /
+          Traefik endpoints on their mesh addresses, which on an internet
+          site do not exist until phase 10 — which is why the file ships
+          without them rather than with a guess. Add the list, then re-run
+          (goat-standup.sh <site> --obs-only).
+          Shape (one entry per host + exporter + port):
+            obs_scrape_targets:
+              - name: orin-a-node
+                addr: "<core-host-mesh-ip>:9100"
+                job: node_exporter
+        success_msg: "{{ obs_scrape_targets | length }} scrape target(s) declared."
+        quiet: true
+
+- name: "obs-host-bootstrap banner (no-op; informational)"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: obs-host-bootstrap | banner
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          {{ target }} — observability host (ADR 0826)
+          ============================================================
+          Phase 1 scope: Prometheus + Alertmanager + Grafana +
+          node-exporter. The Phase-2 storage tier (OpenObserve, MinIO,
+          OTel Collector) is DEFERRED and not in this play.
+          Confirm:
+            - the core host(s) are up (the obs host scrapes them)
+            - baseline + LUKS have run on the obs host
+            - the site's <SITE>_C_* env vars present + direnv allowed
+
+# ============================================================================
+# Phase 1 — NTP preflight + hygiene baseline
+#
+# ntp-hygiene before anything that cares about time (TLS to the pair, alert
+# timestamps). The obs host runs the same chrony hygiene as every other node.
+# ============================================================================
+- name: "obs-host-bootstrap: NTP preflight + hygiene baseline"
+  hosts: "{{ target | mandatory }}"
+  gather_facts: true
+  become: true
+  roles:
+    - ntp-hygiene
+    - ntp-health-agent
+
+# ============================================================================
+# Phase 2 — docker engine
+#
+# The docker-engine role writes daemon.json with data-root on the LUKS NVMe
+# (docker_engine_data_root from group_vars; the config preflight refuses the
+# group when it is undefined — row 27). Baseline installed the packages;
+# this pins the data-root and restarts the engine once.
+# ============================================================================
+- name: "obs-host-bootstrap: docker engine"
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  become: true
+  roles:
+    - docker-engine
+
+# ============================================================================
+# Phase 3 — obs stack (Prometheus + Alertmanager + Grafana + node-exporter)
+# ============================================================================
+- name: "obs-host-bootstrap: obs stack (Prometheus + Alertmanager + Grafana)"
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  become: true
+  roles:
+    - obs-host

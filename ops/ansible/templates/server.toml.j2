@@ -1,0 +1,34 @@
+# Rathole server — goat VPS relay
+# Managed by Ansible (relay-server.yml)
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "{{ rathole_auth_token }}"
+# Lowered 30 -> 10: the server only detects a dead control channel
+# when a heartbeat write fails, so a smaller interval evicts the stale
+# :443 binding faster. The rathole-watchdog.timer is the hard backstop for
+# wedges this doesn't catch. Override via rathole_server_heartbeat_interval.
+heartbeat_interval = {{ rathole_server_heartbeat_interval | default(10) }}
+
+[server.transport]
+type = "noise"
+
+[server.transport.noise]
+local_private_key = "{{ rathole_private_key }}"
+
+{% if rathole_ingress_dispatch_enabled | default(false) | bool %}
+# Ingress-dispatch mode (ADR 1085): one tunnel service PER mgmt-host backend,
+# bound to localhost only — haproxy owns the public :443 and dispatches across
+# these tunnels (docs/design/relay-ingress-dispatch.md). The first backend
+# keeps the historical `netbird-mgmt` service name so existing mgmt-host
+# rathole clients re-register with no client-side change.
+{% for b in rathole_ingress_backends %}
+[server.services.{{ b.service }}]
+type = "tcp"
+bind_addr = "127.0.0.1:{{ b.tunnel_port }}"
+{% endfor %}
+{% else %}
+[server.services.netbird-mgmt]
+type = "tcp"
+bind_addr = "0.0.0.0:443"
+{% endif %}

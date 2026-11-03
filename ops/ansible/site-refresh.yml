@@ -1,0 +1,105 @@
+---
+# site-refresh.yml — generic per-site refresh wrapper for routine drift
+# updates over SSH-over-mesh. Block 22K. Companion to site-bootstrap.yml.
+#
+# Per the bootstrap-vs-refresh pattern (CLAUDE.md "Bootstrap vs refresh"),
+# this is the SSH-over-Netbird-mesh path. Connects via mesh IPs (loaded
+# from `inventory/mgmt-hosts-mesh.ini`), runs only drift-prone phases,
+# fast (~3-5 min vs ~30-40 min bootstrap).
+#
+# Skips one-time installs:
+#   - LUKS format (already done at first boot)
+#   - replicator role creation (handled by basebackup detection)
+#   - first-time account seed (Phase 3)
+#   - Docker repo install (Phase 2)
+#
+# Re-runs drift-prone phases:
+#   - Traefik config + cert delivery (Phase 2.5)
+#   - admit-audit policy + sidecar (Phase 6)
+#   - observability scrape configs (delegated)
+#   - smoke check (Phase 7)
+#
+# (Phase 6B keepalived REMOVED per F-062 — VRRP-on-Orins
+# was non-canonical; canonical path is VRRP-on-9200CX-switch when
+# procurement lands; today operator-fired failover.)
+#
+# Usage:
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       site-refresh.yml \
+#       -e site_id=<site>
+#
+# (Note the -i ordering: mesh-ini AFTER the SSM ini so its host-vars
+# override the SSM connection settings.)
+
+- name: "site-refresh: drift-prone refresh"
+  hosts: "{{ site_id | replace('-', '_') ~ '_hosts' }}"
+  # gather_facts: TRUE — the id-admin-console role below derives the container
+  # platform from ansible_facts['architecture']. Running this play factless made
+  # that derivation guess amd64, and the compose overlay DEMANDS the platform it
+  # is given, so both Jetson consoles crash-looped with `exec format error` on
+  # . The role now asserts rather than guesses; this makes the assert
+  # unnecessary rather than merely survivable.
+  gather_facts: true
+  become: true
+  vars:
+    site_id_upper: "{{ site_id | upper | replace('-', '_') }}"
+  pre_tasks:
+    - name: "site-refresh | site_id provided"
+      ansible.builtin.assert:
+        that:
+          - site_id is defined
+          - site_id | length > 0
+        fail_msg: "site_id is required. Pass it via -e site_id=<name>."
+
+  roles:
+    # Refresh Traefik config / certs (idempotent — only updates on cert
+    # rotation or service-list change). Skipped when traefik_services is empty:
+    # trial-fabric sites INTENTIONALLY keep it `[]` (their services self-register their
+    # own dynamic Traefik configs; ingress is the LE/ACME terminator, not this
+    # offline-CA central role), so running it in refresh has nothing to do and
+    # its `length > 0` pre-flight would otherwise hard-fail the whole refresh.
+    # The role's bootstrap-time fail-fast assertion is left intact — this guard
+    # is refresh-only. (Sites that DO use central traefik have a non-empty list and
+    # run normally.)
+    - role: traefik
+      when: traefik_services | default([]) | length > 0
+
+    # Refresh admit-audit sidecar policy (idempotent).
+    - role: admit-audit
+
+    # Refresh the id-admin-console + its oauth2-proxy sidecar, so an image-pin
+    # bump is actually picked up by the play whose header promises exactly that.
+    #
+    # Refresh has to include the services: a header promising "picks up role-config
+    # changes and image-pin bumps" is read, reasonably, as "deploys the services", and
+    # a console pin bump must not report success having changed nothing about the console.
+    #
+    # Guarded like traefik above, and for the same reason: the role ASSERTS on
+    # id_admin_console_enabled rather than skipping, so an unguarded include
+    # hard-fails every refresh on a site that does not run the console.
+    # The OIDC-client role is deliberately NOT here — it upserts a Hydra client
+    # and belongs to the one-time deploy, not a routine re-apply.
+    - role: id-admin-console
+      when: id_admin_console_enabled | default(false) | bool
+    - role: oauth2-proxy-id-console
+      when:
+        - id_admin_console_enabled | default(false) | bool
+        - id_admin_console_oauth2_proxy_enabled | default(false) | bool
+    # Card sign-in from a sovereign PKI (ADR 1209). A routine re-apply re-reads the
+    # registry, the staged trust anchors and the site certificate. Off everywhere the
+    # flag is not set; `--tags icam-mtls-proxy` runs only this role.
+    - role: icam-mtls-proxy
+      when: icam_mtls_proxy_enabled | default(false) | bool
+      tags: [icam-mtls-proxy]
+
+  tasks:
+    - name: "site-refresh | smoke check on the mgmt-stack invariants"
+      ansible.builtin.command:
+        cmd: docker ps --filter name=management-a --format '{{ "{{" }}.Status{{ "}}" }}'
+      register: mgmt_status
+      changed_when: false
+      failed_when: mgmt_status.stdout is not search('Up')

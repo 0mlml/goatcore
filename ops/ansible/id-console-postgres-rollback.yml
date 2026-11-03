@@ -1,0 +1,408 @@
+---
+# id-console-postgres-rollback.yml — put one goatnet's id console back on SQLite
+# after id-console-postgres-cutover.yml (ADR 1165 step A,
+# docs/design/island-mode-multi-writer.md §5 step A6). Runbook:
+# docs/operations/id-console-postgres-cutover.md §Rollback. Run with the operator present.
+#
+# Usable while the cutover archive is inside its retain_until (28 days). Every
+# input is read from the host: the archive CURRENT points at, its MANIFEST (the
+# original paths and the image that ran before the cutover), and the store marker.
+#
+#   0 GATE  router_role A host only; an archive with a MANIFEST, inside retain_until;
+#           the previous image is SQLite-era; the env vars the console deploy
+#           templates resolve. Decides the mode from the marker:
+#             postgres  -> export: Postgres holds rows written since the cutover
+#             otherwise -> restore: the import never committed (or this host was
+#                          already rolled back), the files in place are the
+#                          archived bytes
+#   1 A     stop the console.
+#   2 A     export (export mode only): store-migrate export to fresh SQLite files
+#           in <archive>/rollback-<UTC stamp>/, compared table by table with
+#           Postgres (rows + sha256); report kept beside them.
+#   3 A     put the files at the original paths, owned by the console user,
+#           0644; any -wal/-shm/-journal moved aside first; the host marker set
+#           to sqlite.
+#   4 A     re-pin the previous image and start it through the id-admin-console
+#           role with the store set to sqlite (ledger row included).
+#   5 GATE  /healthz 200; the running image is the previous image; the env file
+#           carries the two SQLite paths and no DSN.
+#
+# The Postgres databases are left as they are. The committed config still says
+# postgres and still pins the Postgres-era image; until the operator reverts both
+# (or cuts over again), the store gate refuses every routine console deploy to
+# this goatnet, which keeps it from starting a Postgres console on stale data.
+#
+# Usage (from ops/ansible):
+#   ../scripts/with-secrets ../scripts/ansible-preflight.sh <inventory flags> \
+#     id-console-postgres-rollback.yml -e target=<group>
+
+- name: id console — Postgres to SQLite rollback (ADR 1165 step A)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    admin_write_surface: "goat-id-console (Postgres to SQLite rollback)"
+    idcr_container: goat-id-console
+    idcr_health_port: "{{ id_admin_console_host_port | default(8088) }}"
+    idcr_env_file: /opt/mgmt-host/id-admin-console.env
+    idcr_repo: "{{ playbook_dir | dirname | dirname }}"
+    idcr_console_uid: "65532"
+
+  tasks:
+    # ======================================================================
+    # Phase 0 — GATE. Reads only.
+    # ======================================================================
+    - name: "gate | the console host only — single-homed (ADR 1084 §D3); other members end here"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+      tags: [phase0]
+
+    - name: "gate | load the store facts (id-admin-console-store, no deploy dependency)"
+      ansible.builtin.include_role:
+        name: id-admin-console-store
+        tasks_from: facts.yml
+        public: true
+      tags: [always]
+
+    - name: "gate | which archive the cutover made"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_sqlite_archive_root }}/CURRENT"
+      register: idcr_current
+      tags: [always]
+
+    - name: "gate | its manifest"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_sqlite_archive_root }}/{{ idcr_current.content | b64decode | trim }}/MANIFEST.yml"
+      register: idcr_manifest_raw
+      tags: [always]
+
+    - name: "gate | read the store marker"
+      ansible.builtin.slurp:
+        src: "{{ id_admin_console_store_marker }}"
+      register: idcr_marker
+      failed_when: false
+      tags: [always]
+
+    - name: "gate | archive, manifest, mode"
+      ansible.builtin.set_fact:
+        idcr_archive: "{{ id_admin_console_sqlite_archive_root }}/{{ idcr_current.content | b64decode | trim }}"
+        idcr_manifest: "{{ idcr_manifest_raw.content | b64decode | from_yaml }}"
+        idcr_mode: >-
+          {{ 'export'
+             if (idcr_marker.content | default('') | length > 0)
+                and ((idcr_marker.content | b64decode).splitlines() | first | trim) == 'postgres'
+             else 'restore' }}
+        idcr_stamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+      tags: [always]
+
+    - name: "gate | the archive is inside its retention window"
+      ansible.builtin.assert:
+        that:
+          - (ansible_facts['date_time']['date']) <= idcr_manifest.retain_until
+        fail_msg: >-
+          REFUSING: the cutover archive {{ idcr_archive }} was kept until
+          {{ idcr_manifest.retain_until }}; today is {{ ansible_facts['date_time']['date'] }}.
+          The rollback this playbook performs is the 28-day one in
+          docs/design/island-mode-multi-writer.md §5; past it, Postgres
+          point-in-time restore is the way back.
+        quiet: true
+      tags: [phase0]
+
+    - name: "gate | every env var the console deploy templates resolves here"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ idcr_repo }}/ops/scripts/deploy-secrets-needed.py"
+          - --repo
+          - "{{ idcr_repo }}"
+          - --component
+          - id-admin-console
+          - --play
+          - "{{ idcr_repo }}/ops/ansible/id-admin-console-deploy.yml"
+          - "{{ target }}"
+      register: idcr_secrets
+      changed_when: false
+      failed_when: idcr_secrets.rc != 0
+      delegate_to: localhost
+      become: false
+      run_once: true
+      tags: [phase0]
+
+    - name: "gate | export mode needs the console's database password"
+      ansible.builtin.assert:
+        that:
+          - id_admin_console_db_password | default('') | length > 0
+        fail_msg: >-
+          REFUSING: {{ id_admin_console_db_password_env }} is empty here, and this host's
+          rows are in Postgres. Run through ops/scripts/with-secrets (ADR 1186).
+        quiet: true
+      when: idcr_mode == 'export'
+      tags: [phase0]
+
+    - name: "gate | pull the previous image"
+      ansible.builtin.command:
+        argv: ["docker", "pull", "{{ idcr_manifest.previous_image }}"]
+      register: idcr_pull
+      changed_when: "'Downloaded newer image' in idcr_pull.stdout"
+      tags: [phase0]
+
+    - name: "gate | the previous image is SQLite-era"
+      ansible.builtin.command:
+        argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ idcr_manifest.previous_image }}"]
+      register: idcr_prev_labels
+      changed_when: false
+      failed_when: >-
+        idcr_prev_labels.rc != 0
+        or ((idcr_prev_labels.stdout | from_json | default({}, true))[id_admin_console_store_label] | default('sqlite')) != 'sqlite'
+      tags: [phase0]
+
+    - name: "gate | export mode: the image that runs store-migrate (the current pin)"
+      ansible.builtin.command:
+        argv: ["docker", "inspect", "--format", !unsafe '{{.Config.Image}}', "{{ idcr_container }}"]
+      register: idcr_running_image
+      changed_when: false
+      when: idcr_mode == 'export'
+      tags: [always]
+
+    - name: "gate | export mode: the running image carries store-migrate (Postgres-era)"
+      ansible.builtin.command:
+        argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ idcr_running_image.stdout | trim }}"]
+      register: idcr_running_labels
+      changed_when: false
+      failed_when: >-
+        idcr_running_labels.rc != 0
+        or ((idcr_running_labels.stdout | from_json | default({}, true))[id_admin_console_store_label] | default('')) != 'postgres'
+      when: idcr_mode == 'export'
+      tags: [phase0]
+
+    - name: "gate | preflight passed"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: mode {{ idcr_mode }}; archive {{ idcr_archive }}
+          (retain until {{ idcr_manifest.retain_until }}); back to {{ idcr_manifest.previous_image }}
+      tags: [phase0]
+
+    # ======================================================================
+    # Phase 1 — A: stop the console.
+    # ======================================================================
+    - name: "stop the console"
+      ansible.builtin.command:
+        argv: ["docker", "stop", "{{ idcr_container }}"]
+      register: idcr_stop
+      changed_when: true
+      failed_when: idcr_stop.rc != 0 and 'No such container' not in idcr_stop.stderr
+      tags: [phase1]
+
+    # ======================================================================
+    # Phase 2 — A: export Postgres to fresh SQLite files.
+    # ======================================================================
+    - name: "export (export mode)"
+      when: idcr_mode == 'export'
+      tags: [phase2]
+      block:
+        - name: "a fresh directory beside the archive, writable by the console user"
+          ansible.builtin.file:
+            path: "{{ idcr_archive }}-rollback-{{ idcr_stamp }}"
+            state: directory
+            owner: "{{ idcr_console_uid }}"
+            group: "{{ idcr_console_uid }}"
+            mode: "0755"
+
+        - name: "store-migrate export (per-table rows + sha256; refuses on any difference)"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - run
+              - --rm
+              - --network
+              - mgmt
+              - --user
+              - "{{ idcr_console_uid }}:{{ idcr_console_uid }}"
+              - -v
+              - "{{ idcr_archive }}-rollback-{{ idcr_stamp }}:/out"
+              - -e
+              - ONBOARD_DB_DSN
+              - -e
+              - ORG_DB_DSN
+              - --entrypoint
+              - /usr/local/bin/store-migrate
+              - "{{ idcr_running_image.stdout | trim }}"
+              - export
+              - --onboard-sqlite
+              - /out/onboard.db
+              - --org-sqlite
+              - /out/orgs.db
+          environment:
+            ONBOARD_DB_DSN: "{{ id_admin_console_onboard_db_dsn }}"
+            ORG_DB_DSN: "{{ id_admin_console_org_db_dsn }}"
+          register: idcr_export
+          changed_when: true
+
+        - name: "the export report"
+          ansible.builtin.debug:
+            msg: "{{ idcr_export.stdout_lines }}"
+
+        - name: "keep the report beside the exported files"
+          ansible.builtin.copy:
+            dest: "{{ idcr_archive }}-rollback-{{ idcr_stamp }}/export-report.txt"
+            content: "{{ idcr_export.stdout }}\n"
+            owner: root
+            group: root
+            mode: "0444"
+      rescue:
+        - name: "export refused — console stopped, nothing moved"
+          ansible.builtin.fail:
+            msg: |
+              EXPORT REFUSED on {{ inventory_hostname }}; no file was moved.
+              {{ idcr_export.stdout | default('') }}
+              {{ idcr_export.stderr | default(ansible_failed_result.msg | default('')) }}
+              The console is STOPPED. Postgres is unchanged. To bring the Postgres
+              console back as it was: re-run the normal deploy
+              (ops/scripts/deploy-component.sh id-admin-console --goatnet <key>);
+              the host marker still says postgres, so the store gate admits it.
+
+    # ======================================================================
+    # Phase 3 — A: files at the original paths, marker to sqlite.
+    # ======================================================================
+    - name: "WAL, shared-memory or journal files beside the original paths"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: >-
+        {{ [idcr_manifest.onboard.original_path, idcr_manifest.org.original_path]
+           | product(['-wal', '-shm', '-journal']) | map('join') | list }}
+      register: idcr_sidecars
+      tags: [phase3]
+
+    - name: "move them aside (a stale WAL would be replayed into the restored file)"
+      ansible.builtin.command:
+        argv: ["mv", "{{ item.item }}", "{{ idcr_archive }}-rollback-{{ idcr_stamp }}-{{ item.item | basename }}"]
+      loop: "{{ idcr_sidecars.results | selectattr('stat.exists') | list }}"
+      loop_control:
+        label: "{{ item.item }}"
+      changed_when: true
+      tags: [phase3]
+
+    - name: "export mode: the exported files replace the originals"
+      ansible.builtin.copy:
+        src: "{{ idcr_archive }}-rollback-{{ idcr_stamp }}/{{ item.file }}"
+        dest: "{{ item.original_path }}"
+        remote_src: true
+        owner: "{{ idcr_console_uid }}"
+        group: "{{ idcr_console_uid }}"
+        mode: "0644"
+      loop:
+        - "{{ idcr_manifest.onboard }}"
+        - "{{ idcr_manifest.org }}"
+      loop_control:
+        label: "{{ item.original_path }}"
+      when: idcr_mode == 'export'
+      tags: [phase3]
+
+    - name: "restore mode: sha256 of the files in place"
+      ansible.builtin.stat:
+        path: "{{ item.original_path }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ idcr_manifest.onboard }}"
+        - "{{ idcr_manifest.org }}"
+      loop_control:
+        label: "{{ item.original_path }}"
+      register: idcr_inplace
+      when: idcr_mode == 'restore'
+      tags: [phase3]
+
+    # Restore mode either follows a refused import (the files in place are the
+    # archived bytes, made 0444) or re-runs after an earlier rollback (they are
+    # that rollback's export, already 0644). Either is fine to start on; a file
+    # that is neither is not, and the archive copy is put back in its place.
+    - name: "restore mode: a file that is neither the archive nor writable comes from the archive"
+      ansible.builtin.copy:
+        src: "{{ idcr_archive }}/{{ item.item.file }}"
+        dest: "{{ item.item.original_path }}"
+        remote_src: true
+        owner: "{{ idcr_console_uid }}"
+        group: "{{ idcr_console_uid }}"
+        mode: "0644"
+      loop: "{{ idcr_inplace.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.original_path }}"
+      when:
+        - idcr_mode == 'restore'
+        - not item.stat.exists or (item.stat.checksum != item.item.sha256 and item.stat.mode != '0644')
+      tags: [phase3]
+
+    - name: "the files at the original paths belong to the console user, 0644"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: "{{ idcr_console_uid }}"
+        group: "{{ idcr_console_uid }}"
+        mode: "0644"
+      loop:
+        - "{{ idcr_manifest.onboard.original_path }}"
+        - "{{ idcr_manifest.org.original_path }}"
+      tags: [phase3]
+
+    - name: "record on the host that this console's rows are in SQLite"
+      ansible.builtin.copy:
+        dest: "{{ id_admin_console_store_marker }}"
+        content: |
+          sqlite
+          rolled back {{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }} ({{ idcr_mode }}) by ops/ansible/id-console-postgres-rollback.yml; archive {{ idcr_archive }}
+        owner: root
+        group: root
+        mode: "0644"
+      tags: [phase3]
+
+    # ======================================================================
+    # Phase 4 — A: previous image, SQLite store, through the normal role.
+    # ======================================================================
+    - name: "re-pin the previous image and the SQLite store for this run"
+      ansible.builtin.set_fact:
+        id_admin_console_image: "{{ idcr_manifest.previous_image }}"
+        id_admin_console_store: sqlite
+      tags: [phase4, phase5]
+
+    - name: "deploy the previous console (id-admin-console role)"
+      ansible.builtin.include_role:
+        name: id-admin-console
+      tags: [phase4]
+
+    # ======================================================================
+    # Phase 5 — GATE: verify.
+    # ======================================================================
+    - name: "gate | /healthz answers 200"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ idcr_health_port }}/healthz"
+        status_code: 200
+      register: idcr_health
+      until: idcr_health.status == 200
+      retries: 15
+      delay: 2
+      tags: [phase5]
+
+    - name: "gate | the running image is the previous image"
+      ansible.builtin.command:
+        argv: ["docker", "inspect", "--format", !unsafe '{{.Config.Image}}', "{{ idcr_container }}"]
+      register: idcr_now_image
+      changed_when: false
+      failed_when: idcr_now_image.stdout | trim != idcr_manifest.previous_image
+      tags: [phase5]
+
+    - name: "gate | the server gets the two SQLite paths and no DSN"
+      ansible.builtin.command:
+        argv: ["grep", "-oE", "^(ONBOARD|ORG)_DB_(DSN|PATH)", "{{ idcr_env_file }}"]
+      register: idcr_env_names
+      changed_when: false
+      failed_when: (idcr_env_names.stdout_lines | sort) != ['ONBOARD_DB_PATH', 'ORG_DB_PATH']
+      tags: [phase5]
+
+    - name: "done — what the operator commits next"
+      ansible.builtin.debug:
+        msg: |
+          ROLLED BACK: {{ inventory_hostname }} serves the id console from SQLite on
+          {{ idcr_manifest.previous_image }} ({{ idcr_mode }}).
+          Postgres databases {{ id_admin_console_onboard_db_name }} and {{ id_admin_console_org_db_name }} are untouched.
+          The committed config still says postgres; until it changes, every routine
+          console deploy to {{ target }} refuses. Commit, in one PR:
+            - group_vars/{{ target }}/id-admin-console.yml: id_admin_console_store: sqlite (or delete the line)
+            - the {{ target }} pin back to {{ idcr_manifest.previous_image }}
+      tags: [phase5]

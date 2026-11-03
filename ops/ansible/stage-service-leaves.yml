@@ -1,0 +1,139 @@
+---
+# Stage minted leaf cert+key pairs onto a host for the Zenoh publisher services.
+#
+# WHY THIS EXISTS: every publisher role — fabric-health, mesh-health,
+# presence-health, time-health, consistency-health, fabric-crawler — FAILS CLOSED
+# when its leaf is absent, pointing at the offline-CA ceremony. But nothing in the
+# repo ever put the ceremony's OUTPUT on the host. Previously that hop was a
+# hand-run scp, undocumented, and it is the single reason a joiner node cannot be
+# stood up from the plays alone. This play is that missing hop.
+#
+# It is deliberately dumb: it copies files the CA ceremony already produced. It
+# never mints, never touches the CA, and refuses rather than deploying a service
+# with no identity.
+#
+# Usage (after ops/scripts/mint-site-certs.sh <site>):
+#   ansible-playbook -i inventory/mgmt-hosts.ini -e target=<group> stage-service-leaves.yml \
+#     -e leaf_src_dir=~/.goat/state/<site>-leaves
+# where <group> is the goatnet's host group (e.g. zagros_dev_hosts). Narrow to one
+# host within it with `-l <host>` if the group has more than one.
+#
+# `target` is MANDATORY and has no default: the leaf set is goatnet-scoped (its
+# CN and URI-SAN name one goatnet), so a run with no target that fell through to
+# `hosts: all` would write one goatnet's leaves over every goatnet's hosts in the
+# inventory. Binding the play to `{{ target | mandatory }}`, like the other
+# site-scoped deploy plays (audit-subscriber-deploy.yml, brief-deploy.yml), makes
+# that mistake a parse-time failure instead of a cross-goatnet overwrite.
+#
+# Idempotent: re-running with unchanged leaves reports ok, not changed. Rotation
+# is the same command — a new leaf in the source dir replaces the old one and the
+# service deploy that follows picks it up.
+- name: Stage service leaf certificates
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    # Where mint-site-certs.sh wrote the leaves, on the CONTROL node.
+    leaf_src_dir: ""
+
+    # service -> where its role looks. Keep in step with each role's
+    # <service>_cert_dir default; the crawler deliberately shares fabric-health's
+    # directory (it reuses that mount).
+    service_leaf_map:
+      fabric-health: /opt/fabric-health/certs
+      mesh-health: /opt/mesh-health/certs
+      presence-health: /opt/presence-health/certs
+      time-health: /opt/time-health/certs
+      consistency-health: /opt/consistency-health/certs
+      fabric-crawler: /opt/fabric-health/certs
+      goat-topology: /opt/goat-topology/certs
+
+    # Stage only these services (e.g. -e '{"leaf_only": ["goat-topology"]}'); empty = all.
+    leaf_only: []
+
+    # Chainguard images run as uid 65532; the roles normalize to this too.
+    leaf_owner: "65532"
+
+  tasks:
+    - name: assert a source directory was given
+      ansible.builtin.assert:
+        that:
+          - leaf_src_dir | length > 0
+        fail_msg: >-
+          stage-service-leaves: pass -e leaf_src_dir=<dir> pointing at the output of
+          ops/scripts/mint-site-certs.sh (default ~/.goat/state/<site>-leaves).
+        quiet: true
+
+    - name: resolve the source directory on the control node
+      ansible.builtin.set_fact:
+        leaf_src_resolved: "{{ leaf_src_dir | expanduser }}"
+        leaf_map: >-
+          {{ service_leaf_map if (leaf_only | length == 0)
+             else (service_leaf_map | dict2items | selectattr('key', 'in', leaf_only) | items2dict) }}
+
+    - name: refuse a leaf_only name the map does not know
+      ansible.builtin.assert:
+        that:
+          - (leaf_only | difference(service_leaf_map.keys() | list)) | length == 0
+        fail_msg: >-
+          stage-service-leaves: leaf_only names {{ leaf_only | difference(service_leaf_map.keys() | list) | join(', ') }},
+          which service_leaf_map does not carry.
+        quiet: true
+
+    - name: refuse when a leaf is missing on the control node
+      ansible.builtin.stat:
+        path: "{{ leaf_src_resolved }}/{{ item.key }}-cert.pem"
+      delegate_to: localhost
+      become: false
+      register: leaf_src_stat
+      loop: "{{ leaf_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: report which leaves are absent
+      ansible.builtin.assert:
+        that:
+          - leaf_src_stat.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          stage-service-leaves: no leaf in {{ leaf_src_resolved }} for
+          {{ leaf_src_stat.results | rejectattr('stat.exists')
+             | map(attribute='item.key') | join(', ') }}.
+          Add them to the site's ops/enrollment/manifests/<site>-certs.yaml and
+          re-run mint-site-certs.sh — do not hand-copy from another site, the CN
+          and URI-SAN are goatnet-scoped.
+        quiet: true
+
+    - name: ensure each cert directory exists
+      ansible.builtin.file:
+        path: "{{ item.value }}"
+        state: directory
+        owner: "{{ leaf_owner }}"
+        group: "{{ leaf_owner }}"
+        mode: "0750"
+      loop: "{{ leaf_map | dict2items }}"
+      loop_control:
+        label: "{{ item.value }}"
+
+    - name: stage leaf certificates
+      ansible.builtin.copy:
+        src: "{{ leaf_src_resolved }}/{{ item.key }}-cert.pem"
+        dest: "{{ item.value }}/{{ item.key }}-cert.pem"
+        owner: "{{ leaf_owner }}"
+        group: "{{ leaf_owner }}"
+        mode: "0644"
+      loop: "{{ leaf_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: stage leaf private keys
+      ansible.builtin.copy:
+        src: "{{ leaf_src_resolved }}/{{ item.key }}-key.pem"
+        dest: "{{ item.value }}/{{ item.key }}-key.pem"
+        owner: "{{ leaf_owner }}"
+        group: "{{ leaf_owner }}"
+        mode: "0400"
+      loop: "{{ leaf_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      no_log: true

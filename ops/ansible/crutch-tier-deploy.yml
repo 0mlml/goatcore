@@ -1,0 +1,56 @@
+---
+# crutch-tier-deploy.yml — Block 80 / ADR 0843 public mTLS-gated crutch tier.
+#
+# Substrate-as-code apply playbook for the three crutch VPSes (rla/rlb/rlc).
+# Order:
+#   1. wg-cp0-client — silent control-plane tunnel to the inner mgmt-plane
+#      so this host can dial mgmt + signal + relay backends without ever
+#      touching the public internet.
+#   2. goat-public-mtls-crutch — Traefik with RequireAndVerifyClientCert,
+#      per-route map, CRL refresh, and post-deploy strict-required self-test.
+#
+# Both roles are gated on `crutch_tier_enabled: true` set per-host. When
+# the gate is false (the default on every host in trunk), running this
+# playbook is a no-op.
+#
+# Pre-flight (operator-fired BEFORE this playbook):
+#   1. terraform-prod with `crutch_tier_enabled = true` applied → three
+#      crutch VPSes exist + are reachable via SSM.
+#   2. Per-VPS server cert + key pair minted offline by `cert-sign` with
+#      SAN covering `mgmt.<fqdn>`, `signal.<fqdn>`, `relay.<fqdn>`,
+#      staged at the host paths matching `crutch_server_cert_path` +
+#      `crutch_server_key_path` (defaults under /etc/goat/tls).
+#   3. wg-cp0 enrollment bundle minted for each crutch host (via the
+#      existing bundle-create + offline-CA flow); the bundle path is set
+#      per-host as `wg_cp0_bundle_path` per the wg-cp0-client role's
+#      defaults.
+#   4. (Optional, until Block 80D lands) `crutch_crl_endpoint` set so the
+#      CRL refresh timer actually pulls something. Left blank = noop.
+#
+# Apply pattern:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec usareur-af --no-session -- \
+#     ansible-playbook -i inventory/hosts.ini \
+#       -l crutch_tier crutch-tier-deploy.yml
+#
+# Idempotent. Re-runs re-render the configs, recreate the container only
+# if the config changed, and re-assert the strict-required gate.
+#
+# Design: docs/design/public-mtls-crutch-tier.md
+# Runbook: docs/operations/block-80-crutch-activate.md
+
+- name: Block 80 — Public mTLS crutch tier
+  hosts: crutch_tier
+  become: true
+  gather_facts: true
+
+  roles:
+    # docker-engine — installs Docker CE + Compose plugin. The crutch VPS
+    # is a vanilla Ubuntu image with no orchestrator pre-installed; without
+    # this, the goat-public-mtls-crutch role's `community.docker.docker_compose_v2`
+    # task fails with "Cannot find docker CLI in path".
+    - role: docker-engine
+      when: crutch_tier_enabled | bool
+    - role: wg-cp0-client
+      when: crutch_tier_enabled | bool
+    - role: goat-public-mtls-crutch

@@ -1,0 +1,67 @@
+---
+# isitup-deploy.yml — canonical isitup deploy onto any mgmt-host site.
+#
+# Idempotent. Re-runs upsert the Hydra OIDC client, re-render configs, and
+# `docker compose up -d` the isitup + oauth2-proxy services.
+#
+# Required group_vars (in group_vars/<site>_hosts/vars.yml or via -e):
+#   site_id, site_dns_zone              standard per-site identity
+#   isitup_enabled: true                master gate
+#   isitup_services: [...]              per-site service list (see role defaults)
+#   isitup_oidc_client_secret           env-sourced; 32+ chars
+#   isitup_cookie_secret                env-sourced; 16, 24, or 32 random bytes
+#                                       base64-encoded (oauth2-proxy requirement)
+#
+# Pre-flight (operator-fired BEFORE this playbook):
+#   1. Ory deployed at this site (ory-deploy.yml + dashboard-deploy.yml ran).
+#   2. {{ isitup_fqdn }} is in the master tls.domains SAN list. For
+#      a site: re-run `traefik-acme.yml` with `isitup_enabled: true` in
+#      group_vars; it adds the SAN to the master cert on signal.
+#   3. Generate fresh secrets if first deploy:
+#        export <SITE>_ISITUP_OIDC_CLIENT_SECRET=$(openssl rand -hex 32)
+#        export <SITE>_ISITUP_COOKIE_SECRET=$(openssl rand -base64 32)
+#      Stored in 1Password under "isitup OIDC client secret / cookie secret".
+#
+# Apply pattern:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -l <mgmt-host> isitup-deploy.yml
+#
+# Cross-refs:
+# - docs/operations (isitup deploy step)
+# - docs/project/implementation-plan.md Block 82 sub-task
+# - ADR 0411 Ory IdP MVP (the OIDC server isitup consumes)
+
+- name: Deploy isitup behind oauth2-proxy + Hydra
+  # Was `hosts: all`. Imported by site-services.yml that fans out to every host
+  # in the inventory, so it can reach unrelated goatnets. `-l` is not a fix: this
+  # playbook's own guard
+  # rejects `-e target=` under `-l`, so the two conventions cannot both be
+  # satisfied. Defaulting to `all` keeps every existing caller working.
+  hosts: "{{ target | default('all') }}"
+  become: true
+  # Facts ARE needed: the isitup role's easy-rollback ledger task (ADR 0859)
+  # templates ansible_date_time + ansible_user_id. With gather_facts:false
+  # those were undefined and the deploy failed at its very last task
+  # (after the real work had already applied), every run. Matches the
+  # fleet pattern — every other service-deploy playbook gathers facts.
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify Ory Hydra is running (admin port reachable on loopback)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}/health/ready"
+        status_code: [200]
+      register: hydra_alive_check
+
+    - name: Verify the Traefik service is up (mgmt-host base stack alive)
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml ps -q traefik
+      register: traefik_check
+      changed_when: false
+      failed_when: traefik_check.stdout == ""
+
+  roles:
+    - role: isitup-oidc-client
+    - role: isitup

@@ -1,0 +1,232 @@
+---
+# relay-ingress-add-site.yml — wire a joining second host site (ADR 1084) into a
+# founder goatnet's relay ingress dispatch (ADR 1085), on rails.
+#
+# THE GAP THIS CLOSES. Joining a second host site (e.g. `uk`) to a founder
+# goatnet (`zagros`) requires the joiner's mgmt API to be reachable through the
+# founder's relay fleet. Until now that was a MANUAL live-zagros edit: hand-edit
+# ops/ansible/inventory/zagros-goat-relay-alias.ini to add a `netbird-mgmt-<site>`
+# backend to the rathole_ingress_backends Python-literal, then redeploy the
+# relays — no precondition, no post-check (docs/operations/uk-second-site-bringup.md
+# Stage 3, "Relay ingress (live zagros edit)"). This play makes it:
+#   preconditions (fail-closed gate) -> one driven action -> post-action check.
+#
+# WHAT IT DOES (idempotent, re-runnable):
+#   1. Gate (play A, localhost): the joiner declares its rathole service name,
+#      the founder alias file exists with dispatch enabled, the founder relay
+#      fleet's public apex answers on :443. Fails closed before touching anything.
+#   2. Merge (play A): relay-ingress-add-backend.py adds the joiner backend to
+#      the COMMITTED founder alias file, by name, no-op if already present. It is
+#      persisted (not a runtime-only override) so a routine relay re-render never
+#      drops it — the same "config is the source of truth" invariant ADR 1085
+#      records for zagros-b's weight:0 drain. Commit the changed file after the run.
+#   3. Re-render (imported goat-relay-rathole.yml): re-renders server.toml
+#      (one tunnel service per backend) + haproxy.cfg (the joiner joins the
+#      dispatch) on every founder relay, and records the deploy in the per-relay
+#      rollback ledger. This is the EXISTING relay ingress play — no parallel
+#      mechanism is introduced.
+#   4. Post-check (play C, founder relays): the joiner backend is present in each
+#      relay's live haproxy config (stats socket). Deterministic proof the alias
+#      was wired fleet-wide.
+#
+# THE JOINER SIDE (companion, NOT this play). For the backend to go UP rather
+# than sit DOWN, the joiner's mgmt host must ALSO dial the relays and register
+# the service — deploy that with the existing client play:
+#   <founder>-rathole-client.yml -e rathole_client_target=<site>_hosts
+# and the joiner's Traefik must already serve the public apex end-to-end (ADR
+# 1085 §"A second mgmt host must serve the apex before it takes weight"), which
+# in the standup is true after the public-TLS phase. This play is founder-side.
+#
+# WEIGHT. New backends default to weight 0 — present in the dispatcher (health-
+# checked, serving any SNI pinned to it) but taking NO balanced-pool apex hash
+# traffic. That is the safe default: raising a second site's balanced weight
+# scatters signalling peers across shards and is exactly the cross-shard
+# federation hazard ADR 1085 / F-259 / F-265 warn about, so it is a separate
+# reviewed change (-e join_ingress_weight=N, or edit the committed backend).
+#
+# REVERSE OP (remove a site's ingress):
+#   python3 inventory/relay-ingress-add-backend.py \
+#     --alias-file inventory/<founder>-goat-relay-alias.ini --site <site> --remove
+#   then re-run goat-relay-rathole.yml against the founder relays (steps 3-4 below)
+#   to re-render without that backend. Commit the file. It refuses to remove the
+#   last backend (an empty list would leave haproxy owning :443 with nothing).
+#
+# RUN (founder = zagros; joiner = uk). Needs the founder's relay inventory + alias
+# file, and — because the relays live in the founder's cloud account, reached
+# over SSM — the founder account's AWS context (same as goat-relay-rathole.yml):
+#   cd ops/ansible
+#   AWS_VAULT=1 AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_PROD \
+#     AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_PROD \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/hosts-zagros.ini -i inventory/zagros-goat-relay-alias.ini \
+#       relay-ingress-add-site.yml \
+#       -e target=goat_relay_hosts -e founder_site=zagros -e join_site=uk
+# goat-standup.sh drives this as a joiner phase — see ops/scripts/goat-standup.sh.
+#
+# Vars:
+#   join_site            (required) backend name for the joiner, e.g. uk
+#   founder_site         (required) founder goatnet id, e.g. zagros
+#   target               (required) founder relay host group, e.g. goat_relay_hosts
+#   join_ingress_weight  (default 0) balanced-pool weight for the new backend
+#   skip_relay_reach_check (default false) bypass the apex reachability precondition
+
+- name: "Relay ingress add-site — gate + merge the joiner backend (founder side)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    join_ingress_weight: 0
+    skip_relay_reach_check: false
+    _adder: "{{ playbook_dir }}/inventory/relay-ingress-add-backend.py"
+    _alias_file: "{{ playbook_dir }}/inventory/{{ founder_site }}-goat-relay-alias.ini"
+    _join_gv: "{{ playbook_dir }}/group_vars/{{ join_site }}_hosts/vars.yml"
+  tasks:
+    - name: Gate — join_site and founder_site are set
+      ansible.builtin.assert:
+        that:
+          - join_site is defined and (join_site | string | length) > 0
+          - founder_site is defined and (founder_site | string | length) > 0
+        fail_msg: >-
+          relay-ingress-add-site needs -e join_site=<site> and
+          -e founder_site=<founder> (and -e target=<founder relay group>).
+        quiet: true
+
+    - name: Gate — founder relay-alias inventory file exists
+      ansible.builtin.stat:
+        path: "{{ _alias_file }}"
+      register: _alias_stat
+
+    - name: Gate — the founder runs relay ingress dispatch (else nothing to add to)
+      ansible.builtin.assert:
+        that:
+          - _alias_stat.stat.exists
+          - "'rathole_ingress_dispatch_enabled=true' in (lookup('file', _alias_file))"
+        fail_msg: >-
+          {{ _alias_file }} is missing or does not set
+          rathole_ingress_dispatch_enabled=true. The relay ingress dispatcher
+          (ADR 1085) is how a founder multi-homes mgmt hosts behind its relays;
+          without it there is no backend list to add a joiner to.
+        quiet: true
+
+    - name: Gate — joiner group_vars exist
+      ansible.builtin.stat:
+        path: "{{ _join_gv }}"
+      register: _gv_stat
+
+    - name: Gate — the joiner declares its rathole ingress backend (dry-run the merge)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ _adder }}"
+          - --check
+          - --alias-file
+          - "{{ _alias_file }}"
+          - --join-gv
+          - "{{ _join_gv }}"
+          - --site
+          - "{{ join_site }}"
+          - --weight
+          - "{{ join_ingress_weight }}"
+      register: _dry
+      changed_when: false
+      failed_when: _dry.rc != 0
+      # The helper fails closed (rc 2) when the joiner is new AND no service name
+      # is derivable from its group_vars (rathole_client_service_name) — i.e. the
+      # "joiner alias target is defined" precondition.
+
+    - name: Gate — show what the merge will do
+      ansible.builtin.debug:
+        msg: "{{ _dry.stdout_lines }}"
+
+    - name: Gate — the founder's public relay apex answers on :443
+      when: not (skip_relay_reach_check | bool)
+      block:
+        - name: Read the founder enrollment apex from the joiner group_vars
+          ansible.builtin.command:
+            argv: [grep, -E, '^site_enrollment_dns:', "{{ _join_gv }}"]
+          register: _apex_line
+          changed_when: false
+          failed_when: false
+
+        - name: Derive the apex host
+          ansible.builtin.set_fact:
+            _founder_apex: "{{ (_apex_line.stdout | regex_replace('^[^:]+:\\s*', '') | regex_replace('[\"\\x27]', '')) | trim }}"
+
+        - name: Probe the founder relay fleet's public :443 (fail-closed precondition)
+          ansible.builtin.wait_for:
+            host: "{{ _founder_apex }}"
+            port: 443
+            timeout: 15
+          when: (_founder_apex | default('') | length) > 0
+          # If this times out the founder relay ingress is not answering — fix
+          # that (or -e skip_relay_reach_check=true for an air-gapped dry-run)
+          # before wiring a new backend into it.
+
+    - name: Driven action — merge the joiner backend into the committed alias file
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ _adder }}"
+          - --alias-file
+          - "{{ _alias_file }}"
+          - --join-gv
+          - "{{ _join_gv }}"
+          - --site
+          - "{{ join_site }}"
+          - --weight
+          - "{{ join_ingress_weight }}"
+      register: _merge
+      changed_when: "'CHANGED' in _merge.stdout_lines"
+
+    - name: Note — commit the alias file if it changed
+      ansible.builtin.debug:
+        msg: >-
+          {{ _alias_file | basename }} updated ({{ _merge.stdout_lines[-2]
+          | default(_merge.stdout) }}). This is committed config — commit the
+          change so a future relay re-render keeps the {{ join_site }} backend.
+      when: _merge is changed
+
+    - name: Reload inventory so the relay re-render sees the merged backend
+      ansible.builtin.meta: refresh_inventory
+
+# Re-render the founder relay ingress with the merged backend list. This is the
+# EXISTING all-Rust relay rathole/haproxy play — it reads the now-merged
+# rathole_ingress_backends from the refreshed inventory, re-renders server.toml +
+# haproxy.cfg on every founder relay, reloads haproxy, and records the rollback
+# ledger row. `target` (the founder relay group) is supplied by the caller.
+- name: Re-render founder relay ingress
+  ansible.builtin.import_playbook: goat-relay-rathole.yml
+
+- name: "Relay ingress add-site — post-check the joiner backend is live on the relays"
+  hosts: "{{ target | mandatory }}"
+  gather_facts: false
+  become: false
+  vars:
+    _stats_port: "{{ rathole_ingress_dispatch_stats_port | default(8404) }}"
+  tasks:
+    - name: Read the relay's live haproxy stats (localhost socket)
+      ansible.builtin.command:
+        argv: [curl, -s, "http://127.0.0.1:{{ _stats_port }}/;csv"]
+      register: _stats
+      changed_when: false
+      retries: 6
+      delay: 5
+      until: >-
+        _stats.rc == 0 and
+        ('balanced,' + (join_site | string) + ',') in _stats.stdout
+
+    - name: Assert the joiner backend is wired into this relay's dispatcher
+      ansible.builtin.assert:
+        that:
+          - "('balanced,' + (join_site | string) + ',') in _stats.stdout"
+        fail_msg: >-
+          {{ inventory_hostname }} does not carry a `{{ join_site }}` server in
+          its haproxy `balanced` backend after the re-render — the alias was not
+          applied here. Check the merge landed in
+          inventory/{{ founder_site }}-goat-relay-alias.ini and re-run.
+        success_msg: >-
+          {{ inventory_hostname }}: `{{ join_site }}` backend present in the
+          dispatcher. (UP requires the joiner's rathole client to be dialing —
+          see the play header "THE JOINER SIDE".)
+        quiet: true

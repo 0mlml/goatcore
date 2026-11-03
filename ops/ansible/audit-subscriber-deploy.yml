@@ -1,0 +1,66 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the external goat-audit-subscriber service on the host — Block 82S.2
+# observe-only dual-run step. Runs alongside the still-running in-process
+# audit-logger plugin; comparison validates the subscriber sees the flow
+# before any retention policy gets flipped.
+#
+# Run from any laptop on the netbird mesh:
+#
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ansible-playbook \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       audit-subscriber-deploy.yml
+#
+# Pre-flight (operator-side, one-time per fresh deploy):
+#   1. zenoh-router container Healthy on the host
+#      (zenoh-deploy.yml has run).
+#   2. Operator-class leaf cert + key minted via offline-CA cert-sign
+#      with URI-SAN `urn:goat-<site>:infra:audit-subscriber` and placed at:
+#        /opt/audit-subscriber/certs/audit-subscriber-cert.pem
+#        /opt/audit-subscriber/certs/audit-subscriber-key.pem
+#        /opt/audit-subscriber/certs/ca-root.pem  (CA root)
+#      See docs/operations/audit-subscriber-deploy.md §2 for the exact
+#      cert-sign invocation.
+#   3. ghcr.io/{{ ghcr_org }}/goat-audit-subscriber:latest published — first
+#      build was triggered by .github/workflows/audit-subscriber-image.yml
+#      on PR-#165 merge.
+#
+# Default mode: OBSERVE-ONLY (audit_subscriber_s3_endpoint empty). Events
+# are counted in Prometheus metrics but not written durably. Cut over to
+# durable-write mode by setting `audit_subscriber_s3_endpoint`,
+# `audit_subscriber_s3_access_key_envvar` + `audit_subscriber_s3_secret_key_envvar`
+# in <site>_hosts group_vars and re-running this playbook — but only AFTER
+# the operator pre-creates the audit-integrity bucket with Object-Lock
+# COMPLIANCE 1y per ADR 0811 (Block 82S.3 — irreversible).
+
+- name: deploy goat-audit-subscriber (Block 82S.2)
+  hosts: "{{ target | mandatory }}"   # -e target=zagros_hosts for the ZAGROS sibling goatnet
+  become: true
+  gather_facts: true
+  vars:
+    admin_write_surface: "goat-audit-subscriber (audit-integrity WORM writer)"
+  pre_tasks:
+    # The audit subscriber is single-homed for the same reason the portal is
+    # (ADR 1084 §D3): it is the one writer into the Object-Locked
+    # audit-integrity bucket, and a goatnet's deploy-history ledger records one
+    # host for it. A goatnet's host group can hold two.
+    #
+    # Without this guard a group-targeted run reaches Orin-B and dies on the
+    # leaf-cert pre-flight — "mint one via the offline-CA ceremony" — which
+    # reads as a missing prerequisite on a host that should never have been in
+    # scope. Observed deploying F-374: Orin-A ok=30 changed=7,
+    # Orin-B failed=1, so the play exited non-zero for having done exactly the
+    # right thing on the right host.
+    #
+    # The guard `end_host`s Orin-B cleanly instead, which is what portal-deploy
+    # already does on the identical inventory. Two writers into a WORM store is
+    # a worse outcome than a confusing error, so this is a correctness guard
+    # first and an ergonomics fix second.
+    - name: "Guard — the audit writer is single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+
+  roles:
+    - role: audit-subscriber

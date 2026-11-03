@@ -1,0 +1,36 @@
+---
+# Run before publishing a base Compose definition that can recreate postgres-a.
+# Read metadata only. An existing config must already match the role's owner
+# contract; running a different play must not silently repair/rotate secrets.
+- name: Require the pgBackRest paths supported by the base Compose mount
+  ansible.builtin.assert:
+    that:
+      - (pgbackrest_conf_dir | default('/etc/pgbackrest')) == '/etc/pgbackrest'
+      - (pgbackrest_conf_path | default('/etc/pgbackrest/pgbackrest.conf')) == '/etc/pgbackrest/pgbackrest.conf'
+    fail_msg: >-
+      The base Compose file mounts /etc/pgbackrest. Custom pgBackRest config
+      paths need a matching reviewed Compose definition before convergence.
+
+- name: Inspect the existing host pgBackRest configuration without reading secrets
+  ansible.builtin.stat:
+    path: /etc/pgbackrest/pgbackrest.conf
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: _pgbackrest_host_conf
+
+- name: Refuse unsafe pgBackRest config before publishing a recreate-capable Compose file
+  ansible.builtin.assert:
+    that:
+      - >-
+        not _pgbackrest_host_conf.stat.exists or
+        (_pgbackrest_host_conf.stat.isreg | default(false) and
+         not (_pgbackrest_host_conf.stat.islnk | default(false)) and
+         _pgbackrest_host_conf.stat.uid == 26 and
+         _pgbackrest_host_conf.stat.gid == 0 and
+         _pgbackrest_host_conf.stat.mode == '0640')
+    fail_msg: >-
+      Existing pgbackrest.conf is not a regular 26:0 mode-0640 file. Refusing
+      to publish the new Compose mount before PostgreSQL can be recreated.
+      Converge the pgbackrest role's configuration with its existing cipher
+      passphrase first; do not rotate the key or widen file permissions.

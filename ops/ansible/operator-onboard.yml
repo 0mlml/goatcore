@@ -1,0 +1,2599 @@
+---
+# operator-onboard.yml
+#
+# Block 83 — unified operator onboarding orchestrator across the three
+# identity surfaces (NetBird mesh credential + Ory site Kratos + Ory
+# operator-IdP Kratos + Zenoh wire-layer cert).
+#
+# Design: docs/design/operator-onboard-utilities.md (resolved decisions
+# Q1-Q5 land).
+#
+# Architecture: three-layer composable.
+#   Layer 3 — Per-operator manifest at ops/operators/<handle>.yml
+#   Layer 2 — This playbook (Phase 0 → 6)
+#   Layer 1 — Per-surface utilities (mostly exist; mgmt-host-bootstrap,
+#             cert-sign, operator-idp-enroll.sh, add-vendor.sh)
+#
+# Current scope (83B skeleton): Phase 0 pre-flight + Phase 5 OOB bundle
+# placeholder + Phase 6 audit log. Surface-dispatch phases (1-4) are
+# wired by 83C (NetBird), 83D (Ory cross-cluster), 83E (Zenoh).
+#
+# Operator usage:
+#
+#   # Dry-run — validates manifest, prints planned bundle, no mints.
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     operator-onboard.yml -e operator=alice-smith --check
+#
+#   # Real run — same plus actual surface dispatch.
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     operator-onboard.yml -e operator=alice-smith
+#
+#   # Revoke — same playbook, walks surfaces backward.
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     operator-onboard.yml -e operator=alice-smith -e action=revoke
+#
+# Required env vars: per-surface, resolved at Phase 0.
+#   - NetBird:       <SITE>_NB_API_TOKEN per site in manifest (see
+#                    netbird_site_env_var_map below for the alias map)
+#   - Ory site:      <SITE>_KRATOS_ADMIN_TOKEN per site
+#   - Ory IdP:       <SITE>_OPERATOR_IDP_KRATOS_ADMIN_TOKEN per site
+#   - Zenoh:         age identity at ~/.config/age/keys.txt (for offline-CA
+#                    signing); SSH access to Zenoh router host(s) for ACL apply
+#
+# Sibling artifacts:
+#   - ops/operators/README.md              — directory overview
+#   - ops/operators/schema/*.json          — manifest jsonschema
+#   - ops/operators/example.yml.example    — manifest template
+#   - ops/operators/validate.py            — pre-flight validator
+
+- name: Operator onboarding orchestrator (Block 83)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    # Repo root computed from playbook path so this works from any cwd.
+    repo_root: "{{ playbook_dir | dirname | dirname }}"
+
+    # Layer-3 input — the per-operator manifest. `operator` is the handle
+    # (kebab-case slug). Manifests are organized per-env (per goatnet):
+    #   ops/operators/<env>/<handle>.yml   when -e operator_env=<env> is set
+    #   ops/operators/<handle>.yml         flat legacy layout (no env)
+    # `goat admin onboard <handle> --env <env>` passes operator_env through.
+    # onboard_env (play var) shadows the extra-var so the self-reference is
+    # safe; it also keys the per-site maps below (zenoh_trial_site etc.) so a
+    # single -e selects the goatnet end to end. The env is required (no default).
+    operator_handle: "{{ operator | default('') }}"
+    onboard_env: "{{ operator_env | default('') }}"
+    manifest_path: "{{ repo_root }}/ops/operators/{{ (onboard_env ~ '/') if (onboard_env | length > 0) else '' }}{{ operator_handle }}.yml"
+    schema_path: "{{ repo_root }}/ops/operators/schema/operator-manifest.schema.json"
+    validator_bin: "{{ repo_root }}/ops/operators/validate.py"
+
+    # Action: enroll (default) | revoke. Revoke walks surfaces backward
+    # per Q3 resolved decision (Option A only — symmetric, no separate
+    # kill-switch). Variable named onboard_action (not action) because
+    # 'action' is an Ansible reserved name. Operator passes -e action=...
+    # (the override layer); we copy it into onboard_action here.
+    onboard_action: "{{ action | default('enroll') }}"
+
+    # P1.5 — `--repair` orchestration runs revoke then enroll as two playbook
+    # invocations to re-mint a partial bundle (every surface freshly minted +
+    # rendered together). The revoke leg is invoked with `-e onboard_repair=true`
+    # so it frees the surfaces but does NOT flip the manifest status to 'revoked'
+    # (R5.3) — the immediately-following enroll leg must read it as 'active'.
+    onboard_repair: "{{ false }}"
+
+    # Output directory — OOB bundles + revoke receipts. Gitignored.
+    out_dir: "{{ repo_root }}/ops/operators/out"
+    bundle_path: "{{ out_dir }}/{{ operator_handle }}-bundle.md"
+    audit_log_path: "{{ repo_root }}/ops/operators/audit.log"
+
+    # NetBird per-site PAT env-var alias map. Most sites follow
+    # <SITE_UPPERCASE_UNDERSCORE>_NB_API_TOKEN. See .envrc.local.d/30-site-services.envrc.
+    # The orchestrator falls back to the mechanical default if no alias.
+    netbird_site_env_var_map:
+      vega: VEGA_NB_API_TOKEN
+      legacy: LEGACY_NB_API_TOKEN
+      zagros: ZAGROS_NB_API_TOKEN
+      zagros-prod: ZAGROS_PROD_NB_API_TOKEN
+      # Add via dashboard mint (Q1 decision: PAT issuance stays dashboard-only).
+
+    # NetBird per-site mgmt-API URL map. The mgmt-API host names are
+    # per-site config that operator manifests don't carry (manifests are
+    # operator-facing; URLs are fleet-config). Add a new site here when
+    # it stands up its mgmt-stack. The URL is the base — paths like
+    # /api/setup-keys are appended at task-time.
+    netbird_site_url_map:
+      vega: https://mgmt.vega.netbird-prod.goat.example
+      legacy: https://netbird.legacy.example
+      zagros: https://netbird.zagros.example
+      # A goatnet's apex can be a round-robin across its relays, which
+      # rathole-forward to the active node's Traefik, not an mgmt.<site>. host.
+      # The token env var derives from the site name by the default rule below,
+      # minted after the account seed, so this entry is inert until then.
+      zagros-prod: https://netbird.zagros-prod.example
+
+    # Per-role TTL defaults per docs/operations/setup-key-rotation.md.
+    netbird_role_ttl_days_default:
+      bootstrap: 1
+      admin: 7
+      operator: 30
+      # 7, not 90, . A welcome package is meant to be acted on
+      # the day it lands, so a three-month window only leaves a live mesh
+      # credential in a mailbox. Per-person exception: set `netbird.ttl_days`
+      # in the manifest (pre-provisioning ahead of a move). See
+      # docs/operations/setup-key-rotation.md.
+      peer: 7
+
+    # How many devices ONE person's setup key may enrol when the manifest does
+    # not say. Matches the `netbird.usage_limit` default in the console's
+    # onboard-intake-form.json, which is where a console-driven onboard picks
+    # its number up; this is the fallback for a hand-written manifest that
+    # omits the field.
+    #
+    # This used to be a bare `| default(1)` inline, which made silence mean a
+    # SINGLE-USE key. The first enrolment consumed it, and every attempt after
+    # — a second machine, a reinstall, native Windows after the client was
+    # installed under WSL — was refused with "couldn't add peer: setup key is
+    # invalid". A person is normally issued one key for their own devices, so
+    # the honest fallback is a small reusable allowance, not one shot. A
+    # manifest that genuinely wants a single-use key still says so explicitly,
+    # and Phase 1.3 below announces it.
+    netbird_setup_key_usage_limit_default: 5
+
+    # Ory site-Kratos per-site config. Phase 2 reaches each site's Kratos
+    # admin API (bound to localhost on the mgmt-host) via SSH delegate_to.
+    # ory_site_kratos_admin_host_map names the inventory host. The host's
+    # connection params are injected via add_host at Phase 2.0 so this
+    # playbook stays runnable with `-i localhost,`.
+    ory_site_kratos_admin_host_map:
+      zagros-dev:
+        # Reached at its own mesh IP through the goatnet's door (doors.yaml).
+        delegate_host_name: kratos-admin-zagros-dev
+        ssh_host: 100.127.0.152
+        ssh_user: goat
+        kratos_admin_url: http://127.0.0.1:4434
+        auth_url: https://auth.zagros-dev.examplebird.zagros-dev.example
+      zagros:
+        # A single-host goatnet. Kratos admin API binds 127.0.0.1:4434
+        # in-container; reach it via SSH delegate to the host's mesh IP
+        # (see group_vars). The onboarding host must be on that mesh to SSH this address.
+        delegate_host_name: kratos-admin-zagros
+        ssh_host: 100.127.0.179
+        ssh_user: goat
+        kratos_admin_url: http://127.0.0.1:4434
+        auth_url: https://auth.zagros.netbird.zagros.example
+      zagros-prod:
+        # A two-node goatnet's active mgmt node. Kratos admin binds 127.0.0.1:4434
+        # in-container; reach it by SSH delegate to the node's mesh IP. The
+        # onboarding host must be on that mesh. Without this entry Phase 0.14
+        # fails with an unhelpful templating error rather than a clear
+        # "site not mapped" message.
+        delegate_host_name: kratos-admin-zagros-prod
+        ssh_host: 100.127.0.221
+        ssh_user: goat
+        kratos_admin_url: http://127.0.0.1:4434
+        auth_url: https://auth.zagros-prod.examplebird.zagros-prod.example
+
+    # ADR 1117 env doors — onboard into a goatnet WITHOUT flipping the laptop's
+    # netbird profile. The map above hardcodes each host's mesh IP on port
+    # 22, which would require the laptop to be on that mesh. The netbird
+    # profile is a single shared resource: switching
+    # it to onboard one person silently cuts every other session off the goatnet
+    # it was using. env-door.sh exists exactly so transport and profile are
+    # independent; this makes the onboard play honor that.
+    #
+    #   ops/scripts/env-door.sh <site>          # opens 127.0.0.1:12202
+    #   ansible-playbook ... operator-onboard.yml -e operator=<handle> \
+    #     -e operator_env=<site> \
+    #     -e onboard_delegate_host_override=127.0.0.1 \
+    #     -e onboard_delegate_port_override=12202
+    #
+    # POINT IT AT A DOOR FOR THE GOATNET IN THE MANIFEST AND NOTHING ELSE. The
+    # override replaces the delegate endpoint for every site in the run, so it
+    # is only safe for a single-site manifest — which is what a per-goatnet
+    # manifest is. Unset (the default) is byte-identical to the previous
+    # behaviour.
+    onboard_delegate_host_override: ""
+    onboard_delegate_port_override: ""
+
+    # Zone map for the bundle template's Ory section.
+    ory_site_zone_map:
+      vega: goat.example
+      legacy: legacy.example
+      zagros: zagros.example
+      zagros-prod: zagros-prod.example
+
+    # Per-site host suffix for mesh-internal service URLs. The site name
+    # (e.g. `site-a`) can differ from the DNS subdomain (e.g. `sa`)
+    # — this map names the actual `<subdomain>.netbird.<zone>` tail that
+    # mesh-internal services live under, used by the bundle template's
+    # "Services reachable on the mesh" section so the rendered URLs match
+    # the real Caddyfile / Traefik routing rules.
+    services_host_suffix_map:
+      # A site's services live under <service>.<site_id>.netbird.<zone>,
+      # resolved by mesh CoreDNS.
+      zagros: zagros.netbird.zagros.example
+      zagros-prod: zagros-prod.examplebird.zagros-prod.example
+
+    # Defaults for ory_site.credentials when the manifest doesn't override.
+    # password=true (immediate-use credential vendor can log in with day 1).
+    # passkey=false (opt-in until the site's Kratos webauthn flow is
+    # verified end-to-end and it serves the recovery link UI).
+    ory_site_credentials_default:
+      password: true
+      passkey: false
+
+    # Length / charset for the auto-generated password. 24 chars from
+    # ascii_letters + digits + select-safe punctuation. Random source =
+    # Ansible's `lookup('password', '/dev/null length=24 chars=...')`.
+    ory_site_password_length: 24
+    ory_site_password_chars: "ascii_letters,digits,!@#%^*-_=+"
+
+    # Inject the `aff` (affiliation) trait into the Kratos identity? Default OFF
+    # (P1.7). Affiliation is authoritatively carried by the cert URI-SAN (born-as
+    # attribution, ADR 1051) + the issuance registry — the Ory identity trait is
+    # informational and redundant. A Kratos identity schema that hasn't been
+    # migrated to include `aff` rejects the create with HTTP 400, which silently
+    # breaks the Ory-login half of onboarding. Flip
+    # to true per-env ONLY once that env's deployed identity schema includes the
+    # affiliation trait. See docs/design/onboard-rotate-revoke-streamlining.md.
+    # This scalar is the fleet default; the map below overrides it per site.
+    ory_site_affiliation_trait_enabled: false
+    # Per-site override, keyed like ory_site_kratos_admin_host_map. A site absent
+    # here inherits the scalar above.
+    #
+    # A sandbox goatnet can turn this ON (ADR 1043 Phase D) once its deployed
+    # schema carries traits.aff and its consent UI forwards the trait into the id_token as the
+    # `aff` claim (patch 0004), so a relying party beside the goatnet can
+    # authorize on aff.id; a token without the claim carries no affiliation. The
+    # deployed runner mints with the same switch (onboard_runner_aff_trait_enabled);
+    # identities minted before the flip get the trait from
+    # ops/identity/backfill-aff-trait.py.
+    ory_site_affiliation_trait_enabled_map:
+      zagros: true
+
+    # Zenoh portal — Phase 4 dispatches vendor registration to the
+    # goat-zenoh-portal's POST /api/vendors endpoint, which encapsulates
+    # X.509 leaf mint via cert-sign (--uri-san), vendor-row create, ACL
+    # rule append + zenohd reload, and one-time bundle URL issuance.
+    # See docs/design/operator-onboard-utilities.md §83E.
+    #
+    # Per-site portal URLs.
+    zenoh_portal_url_map:
+      # A portal is mesh-internal, resolved by mesh CoreDNS. The onboarding host must
+      # be on the mesh to reach it. A per-uuid slot-pool portal (ADR 1025) records the
+      # requested `prefix` below but assigns a uuid slot anchor as the write namespace + cert CN.
+      zagros: https://portal.zagros.netbird.zagros.example
+      zagros-dev: https://portal.zagros-dev.examplebird.zagros-dev.example
+      # A goatnet missing from this map dies at the Phase 0.13.b assert on
+      # `goat admin onboard <handle> --env <env>`. The SSH half of the mesh constraint
+      # is lifted by onboard_delegate_*_override above; this HTTPS call is not,
+      # because it resolves through mesh CoreDNS.
+      zagros-prod: https://portal.zagros-prod.examplebird.zagros-prod.example
+
+    # Per-site Zenoh router endpoint. The router is mesh-internal; vendors
+    # connect their Zenoh client to this endpoint at session establishment.
+    # The bundle template renders this into the smoke commands + first-
+    # publisher example so vendors don't have to ask the operator (per
+    # F-DOG-6/8 surfaced by the vendor-dogfood walk).
+    #
+    # A router can bind the wt0 mesh IP per ADR 0844 (and per
+    # F-143 fix — see zenoh-deploy.yml's goat_zenoh_listen_host
+    # default which now resolves to the same address from the ansible_facts
+    # 'wt0' fact at that host's deploy time).
+    zenoh_router_endpoint_map:
+      # A router cert that carries a DNS SAN lets vendors dial the mesh hostname
+      # (resolved by CoreDNS) and keep verify_name_on_connect — matches
+      # portal_router_endpoint in the goatnet's group_vars.
+      zagros: tls/zenoh.zagros.netbird.zagros.example:7447
+      zagros-prod: tls/zenoh.zagros-prod.examplebird.zagros-prod.example:7447
+
+    # Per-site portal operator API key env var. The portal expects this
+    # as the Bearer token on POST /api/vendors (see
+    # ops/goat-zenoh-portal/internal/api/auth.go). Same env var the
+    # portal role itself reads (PORTAL_OPERATOR_API_KEY) — operator
+    # sets it once in .envrc.local.d/30-site-services.envrc.
+    zenoh_portal_operator_api_key_env_var_map:
+      zagros: ZAGROS_PORTAL_OPERATOR_API_KEY
+      zagros-dev: ZAGROS_DEV_PORTAL_OPERATOR_API_KEY
+      zagros-prod: ZAGROS_PROD_PORTAL_OPERATOR_API_KEY
+
+    # Site → trial-portal mapping. Used by Phase 0.13 to resolve
+    # zenoh.trial.vendor to the right portal. Derived from the env the
+    # manifest belongs to (goat admin onboard --env <env>), with a legacy default
+    # for the flat layout. A manifest mints against its own goatnet's portal.
+    zenoh_trial_site: "{{ onboard_env | mandatory('onboard_env (--env <goatnet>) is required: the nova default was retired 2026-09-09') }}"
+
+    # --- Durable resolution: derive per-goatnet values from site_id by CONVENTION,
+    # so a conventional <site>.net goatnet needs NO hand-edit here. The maps above
+    # remain as OVERRIDES only for legacy-irregular goatnets. New goatnets fall
+    # through to the derived default.
+    zenoh_trial_portal_url: >-
+      {{ zenoh_portal_url_map[zenoh_trial_site]
+         if zenoh_trial_site in zenoh_portal_url_map
+         else 'https://portal.' ~ zenoh_trial_site ~ '.netbird.' ~ zenoh_trial_site ~ '.net' }}
+    zenoh_trial_portal_key_var: >-
+      {{ zenoh_portal_operator_api_key_env_var_map[zenoh_trial_site]
+         if zenoh_trial_site in zenoh_portal_operator_api_key_env_var_map
+         else (zenoh_trial_site | upper | replace('-', '_')) ~ '_PORTAL_OPERATOR_API_KEY' }}
+
+    # Site → cert URI-SAN scheme. The portal mints the AUTHORITATIVE URI-SAN
+    # (returned in the POST response). This map is only the FALLBACK + check-mode
+    # display string, so a missing-uri_san response (HTTP 409 already-registered)
+    # or --check does not hardcode one goatnet's literal on another's mint: a 409
+    # (prefix already registered) must not emit another goatnet's URN into the bundle.
+    # Each value MUST equal that goatnet's own `portal_cert_sign_uri_prefix` in
+    # group_vars — the freeze-critical Class-A cert-identity fact (CI-gated by
+    # ops/ci/check-portal-cert-identity-override.sh). Never derive one from the
+    # goatnet name; read it from the goatnet.
+    zenoh_uri_san_scheme_map:
+      zagros: 'urn:goat:zagros:org='
+      zagros-prod: 'urn:goat:zagros-prod:org='
+    zenoh_observer_uri_san_scheme_map:
+      zagros: 'urn:goat:zagros:observer='
+      zagros-prod: 'urn:goat:zagros-prod:observer='
+
+    # ADR 1019 — goat-cli operator-profile bundle. Phase 4.5 mints a
+    # signed CBOR bundle the operator drops into ~/.goat/contexts/
+    # via `goat profile init <bundle.cbor>`. Per-site CA paths added as CAs come online.
+    #
+    # The CA private key lives OUTSIDE the repo (operator state, not
+    # session-worktree-shared) per ops/enrollment/ca/<goatnet>/README.md.
+    # Distribute OOB to operators who need to mint bundles.
+    # A goatnet signs under its own root.
+    goat_cli_ca_id_map:
+      nova: dev-nova-ca-ecdsa-2026-05-14
+      zagros: dev-zagros-ca-ecdsa-2026-09-03
+      # Each goatnet has its OWN root CA. Copying a CA
+      # across fabrics is the fork-free violation the runbook names.
+      zagros-prod: dev-zagros-prod-ca-ecdsa-2026-08-03
+    goat_cli_ca_key_path_map:
+      nova: "{{ lookup('env', 'HOME') }}/.goat/state/nova-ca/ca.key.age"
+      zagros: "{{ lookup('env', 'HOME') }}/.goat/state/zagros-ca/ca.key.age"
+      zagros-prod: "{{ lookup('env', 'HOME') }}/.goat/state/zagros-prod-ca/ca.key.age"
+    # The public half of that signing key, the file a recipient passes to
+    # `goat ca add` before `goat profile init`. goat ships trusting no CA, so
+    # without it the first init fails with E_BUNDLE_INVALID. get.<site> serves
+    # the same file under /ca-roots/.
+    goat_cli_ca_public_key_path: "{{ repo_root }}/ops/enrollment/public-keys/{{ goat_cli_ca_id_map[zenoh_trial_site] }}.pem"
+    goat_cli_age_identity_path: "{{ lookup('env', 'HOME') }}/.config/age/keys.txt"
+
+    # Observer flavor (manifest.zenoh.observer). A read-only fabric
+    # watcher — NOT a vendor: no portal vendor row, no publish ACL. The
+    # leaf is minted directly with `cert-sign` (a non-`<vendor>-trial-peer`
+    # CN, so it matches only the universal-read `trial-peer-read` ACL
+    # subject — see ops/ansible/roles/goat-zenoh/templates/config.json5.j2),
+    # then packaged by `bundle-create`. Because there's no portal response
+    # to read the router endpoint + CA root from (those come back with a
+    # vendor mint), an observer needs them statically:
+    # (router endpoint reuses the existing `zenoh_router_endpoint_map`.)
+    # This map is the issuing root: Phase 4o.2 passes it to cert-sign as
+    # --root-cert, so the observer leaf chains to it. What the bundle
+    # ships as ca_roots is the next map, not this one.
+    goat_cli_root_cert_path_map:
+      nova: "{{ repo_root }}/ops/enrollment/ca/nova/root-cert.pem"
+      zagros: "{{ repo_root }}/ops/enrollment/ca/zagros/root-cert.pem"
+    # The roots the bundle ships as ca_roots, concatenated in order, which a
+    # client verifies the router with. Kept apart from the signing root, as in
+    # step 3 of the CA-separation runbook: a goatnet can ship both roots while the
+    # router's own server certificate still chains to the shared one.
+    goat_cli_trust_roots_path_map:
+      nova:
+        - "{{ repo_root }}/ops/enrollment/ca/nova/root-cert.pem"
+      zagros:
+        - "{{ repo_root }}/ops/enrollment/ca/nova/root-cert.pem"
+        - "{{ repo_root }}/ops/enrollment/ca/zagros/root-cert.pem"
+    # Observer leaf lifetime + audit log (mirrors the cert-sign ceremony).
+    goat_cli_observer_validity: "720h"
+    goat_cli_ca_audit_log: "{{ lookup('env', 'HOME') }}/.goat/state/{{ zenoh_trial_site }}-ca/ca-audit-{{ zenoh_trial_site }}.jsonl"
+
+    # OBSERVER-PATH ONLY. Where the locally-minted observer CBOR bundle
+    # lands (Phase 4o), next to bundle.md in ops/operators/out/ (gitignored).
+    # The vendor/publish path does NOT use this — the portal mints that
+    # .cbor into the vendor's one-time tarball and it is never extracted to
+    # the laptop (no duplicated private-key material at rest). Observers
+    # have no portal tarball, so their .cbor must be produced + delivered
+    # laptop-side; this is its path.
+    goat_cli_bundle_path: "{{ out_dir }}/{{ operator_handle }}-goat-cli.cbor"
+
+  tasks:
+    # --------------------------------------------------------------
+    # Phase 0 — Pre-flight
+    # --------------------------------------------------------------
+    # Validates the manifest against the jsonschema (Block 83A), loads
+    # it into facts, resolves required env vars per enabled surface.
+    # No backend contact in this phase; failures here halt cleanly
+    # before any mint.
+    # --------------------------------------------------------------
+
+    - name: "Assert operator handle was passed"
+      ansible.builtin.assert:
+        that:
+          - operator_handle | length > 0
+        fail_msg: |
+          Pass the operator handle with -e operator=<handle>. The handle
+          is a kebab-case slug matching the manifest filename
+          (ops/operators/<handle>.yml). Example:
+            ansible-playbook operator-onboard.yml -e operator=alice-smith
+
+    - name: "Assert action is enroll or revoke"
+      ansible.builtin.assert:
+        that:
+          - onboard_action in ['enroll', 'revoke']
+        fail_msg: "action must be 'enroll' or 'revoke' (got '{{ onboard_action }}')"
+
+    # ------------------------------------------------------------------
+    # Phase 0.2b — THE ENROLL LEG IS RETIRED. FAIL CLOSED.
+    #
+    # This play's ENROLL half is the pre-cutover path: an operator hand-writes
+    # a manifest, the play mints every surface directly, and it emits an OOB
+    # bundle (cert + PRIVATE KEY) for the operator to carry to the person by
+    # hand. That was replaced in July 2026 and MUST NOT be used again.
+    #
+    # The live path is the three-stage candidate flow (ADR 1062):
+    #
+    #     goat admin invite …            -> goat-id-console (the onboarding
+    #                                        ENGINE; the portal is only the
+    #                                        cert-mint leg)
+    #     candidate accepts in console
+    #     onboard-runner claims + mints  -> person collects their own creds
+    #     ops/scripts/sync-onboarded-manifests.py writes the manifest
+    #
+    # Note the direction: under the live path `ops/operators/<env>/<handle>.yml`
+    # is an OUTPUT, written FROM the portal/console DB to make the declared
+    # roster agree with what the runner actually minted. It is NOT an input you
+    # author. Every such file says so in its own header. If you find yourself
+    # copying one as a template, you are about to do what this gate exists to
+    # stop.
+    #
+    # Why fail-closed and not deleted: the REVOKE half of this play is still
+    # the live offboarding mechanism (ADR 1031) and native revoke is unfinished
+    # (track `native-revoke`). So revoke passes here untouched; only enroll is
+    # fenced. Delete the enroll half outright once revoke is native.
+    #
+    # WHY THIS GATE EXISTS: this enroll leg, run against a hand-authored manifest,
+    # mints real identities and private keys onto an operator laptop with nothing in
+    # the tooling objecting. Hand-authoring from a generated manifest must be refused.
+    #
+    # The escape hatch is deliberately ugly and deliberately not a flag you
+    # would pass by habit. If you are using it, you should be able to say in
+    # one sentence why the console path cannot serve, and you should expect to
+    # be asked.
+    - name: "refuse the retired enroll leg (ADR 1062 cutover)"
+      ansible.builtin.fail:
+        msg: |
+          REFUSED: operator-onboard.yml's ENROLL leg is retired (July 2026).
+
+          It hand-mints every surface and emits an out-of-band bundle carrying
+          a PRIVATE KEY for an operator to hand-carry. The live path never
+          puts a person's key in an operator's hands.
+
+          Use the three-stage candidate flow (ADR 1062,
+          docs/design/three-stage-candidate-onboarding.md):
+
+            goat admin invite --env {{ operator_env | default('<env>') }} …
+
+          then the candidate accepts in goat-id-console and onboard-runner
+          mints. Afterwards reconcile the declared roster with:
+
+            ops/scripts/sync-onboarded-manifests.py --env {{ operator_env | default('<env>') }} …
+
+          The manifest at {{ manifest_path }} is an OUTPUT of that flow, not an
+          input to this one.
+
+          REVOKE still runs here and is unaffected:  -e action=revoke
+
+          If you genuinely must enroll this way (bootstrapping a goatnet with
+          no console yet is the only case anyone has produced), re-run with:
+
+            -e i_understand_the_enroll_leg_is_retired=true \
+            -e onboard_bootstrap_no_console=true
+
+          BOTH flags are required, and the second is a promise you can keep: it
+          means this goatnet has NO id-admin console yet, so the three-stage flow
+          literally cannot run. On a goatnet whose console is up (any live env —
+          zagros, zagros-dev, zagros-prod), the enroll leg stays refused even with the
+          retired-flag, because the canonical path IS available and must be used.
+          Passing onboard_bootstrap_no_console=true when a console exists is
+          lying to the guard — do not.
+
+          and say why in the PR. See F-364 and the note at the top of this task.
+      when:
+        - onboard_action == 'enroll'
+        # ARCHIVED: the retired-flag alone is no longer enough — an
+        # agent proved a documented STOP sign is not a barrier if the override is
+        # one habitual flag away (it re-ran this leg on a LIVE goatnet, minted 14
+        # out-of-process identities + sent wrong recovery emails to real people,
+        # then had to revoke/remove/restart). The leg now ALSO requires an
+        # explicit no-console bootstrap assertion, scoping the ONLY legitimate
+        # use (bootstrap a goatnet before its console exists) and fencing off
+        # every live goatnet. Behavioural prevention lives in the goat-onboarding
+        # skill; this is the mechanical backstop.
+        - not (i_understand_the_enroll_leg_is_retired | default(false) | bool
+               and onboard_bootstrap_no_console | default(false) | bool)
+
+    - name: "Assert manifest file exists"
+      ansible.builtin.stat:
+        path: "{{ manifest_path }}"
+      register: manifest_stat
+
+    - name: "Fail loud if manifest not found"
+      ansible.builtin.assert:
+        that:
+          - manifest_stat.stat.exists
+        fail_msg: |
+          Manifest not found at {{ manifest_path }}.
+          Copy ops/operators/example.yml.example to ops/operators/{{ operator_handle }}.yml
+          and edit. Then re-run.
+
+    - name: "Validate manifest against schema (Block 83A)"
+      ansible.builtin.command:
+        argv:
+          - "{{ validator_bin }}"
+          - "{{ manifest_path }}"
+      register: validate_result
+      changed_when: false
+      failed_when: validate_result.rc != 0
+      check_mode: false       # validator is read-only; run even in --check
+
+    - name: "Load manifest into facts"
+      ansible.builtin.include_vars:
+        file: "{{ manifest_path }}"
+        name: manifest
+
+    - name: "Normalize org/vendor noun (ADR 1052 dual-read)"
+      # A manifest may be authored with the going-forward `org:` / `zenoh.trial.org`
+      # noun (what `goat admin onboard --native` and new authors use) or the legacy
+      # `vendor:` / `zenoh.trial.vendor`. Every task below reads the legacy `vendor`
+      # key, so backfill it from `org` when only `org` is present — additive and
+      # back-compat, so this 90-task play works unchanged for BOTH nouns instead of
+      # failing on an `org:`-authored manifest. Fills only when the new noun is
+      # present AND the legacy is absent, so a manifest with neither (e.g. an
+      # internal operator with no vendor block) is left untouched. `manifest.vendor`
+      # is used below purely as the INTERNAL resolved-value carrier; the Kratos trait
+      # itself is now written under `traits.org` (ADR 1052 Phase 4 — the trait rename
+      # this play originally deferred). The cert URI-SAN stays as-is (ADR 1052
+      # §"explicitly NOT renamed").
+      ansible.builtin.set_fact:
+        manifest: "{{ manifest | combine(_org_noun_backfill, recursive=True) }}"
+      vars:
+        _org_noun_backfill: >-
+          {{
+            ({'vendor': manifest.org}
+             if (manifest.vendor is not defined and manifest.org is defined)
+             else {})
+            | combine(
+                {'zenoh': {'trial': {'vendor': manifest.zenoh.trial.org}}}
+                if (manifest.zenoh is defined and manifest.zenoh.trial is defined
+                    and manifest.zenoh.trial.vendor is not defined
+                    and manifest.zenoh.trial.org is defined)
+                else {},
+                recursive=True
+              )
+          }}
+
+    - name: "Display manifest summary"
+      ansible.builtin.debug:
+        msg: |
+          Operator:        {{ manifest.identity.handle }} ({{ manifest.identity.name }})
+          Email:           {{ manifest.identity.email }}
+          Status:          {{ manifest.identity.status }}
+          Action:          {{ onboard_action }}
+          NetBird:         {{ 'enabled (sites: ' + manifest.netbird.sites | join(', ') + ', role: ' + manifest.netbird.role + ')' if manifest.netbird.enabled else 'disabled' }}
+          Ory site:        {{ 'enabled (sites: ' + manifest.ory_site.sites | join(', ') + ')' if manifest.ory_site.enabled else 'disabled' }}
+          Ory operator-IdP: {{ 'enabled (sites: ' + manifest.ory_idp.sites | join(', ') + ', groups: ' + manifest.ory_idp.groups | join(', ') + ')' if manifest.ory_idp.enabled else 'disabled' }}
+          Zenoh:           {{ 'enabled (' + (manifest.zenoh.trial.vendor if manifest.zenoh.trial is defined else ('observer' if manifest.zenoh.observer | default(false) else 'prod ' + manifest.zenoh.prod.role + '@' + manifest.zenoh.prod.site)) + ')' if manifest.zenoh.enabled else 'disabled' }}
+          Check mode:      {{ ansible_check_mode }}
+
+    # Phase 0.8 (per-site fact materialization) was here in an earlier
+    # draft but got dropped — 83C's actual surface dispatch fetches each
+    # site's token from env via `lookup('env', VAR)` at task-time. The
+    # existence check at Phase 0.9 below is the only pre-flight gate
+    # needed at this stage.
+
+    - name: "Assert per-site NetBird PAT env vars are set"
+      ansible.builtin.assert:
+        that:
+          - lookup('env', _env_var) | length > 0
+        fail_msg: |
+          NetBird PAT env var {{ _env_var }} for site '{{ item }}' is empty.
+          Per Q1 decision (2026-05-15), PATs stay dashboard-mint:
+            1. Open https://dashboard.{{ item }}.netbird-prod.<zone>/
+            2. Log in as a site admin.
+            3. Users → Personal Access Tokens → Create Token.
+            4. Export the value into .envrc.local.d/30-site-services.envrc
+               under {{ _env_var }}.
+            5. direnv reload + re-run this playbook.
+      vars:
+        _env_var: "{{ netbird_site_env_var_map[item] | default(item | upper | replace('-', '_') + '_NB_API_TOKEN') }}"
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }} → {{ _env_var }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    # --------------------------------------------------------------
+    # Phase 0.10-0.12 — NetBird ACL taxonomy validation (Block 83C.1)
+    # --------------------------------------------------------------
+    # Loads the per-site group taxonomy from netbird_acl_taxonomy.yml
+    # and validates that every suffix in manifest.netbird.auto_groups
+    # is declared for every site in manifest.netbird.sites. Typos fail
+    # at pre-flight, before any API contact, with a clear pointer to
+    # the offending field + the valid suffix set per site.
+    # --------------------------------------------------------------
+
+    - name: "Load NetBird ACL taxonomy"
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/netbird_acl_taxonomy.yml"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    # Phase 0.10c — Resolve the taxonomy for CONVENTIONAL goatnets. A manifest
+    # site not explicitly declared inherits the `_default` template with its
+    # site_prefix derived as site_id|upper (ACME-DEV) — so a new <site>.net
+    # goatnet needs no hand-authored stanza (same derive-with-override posture as
+    # the NB-token and portal maps). Explicitly declared goatnets win.
+    - name: "Resolve taxonomy (derive-with-override for new goatnets)"
+      ansible.builtin.set_fact:
+        netbird_acl_taxonomy_resolved: >-
+          {{ (netbird_acl_taxonomy_resolved | default(netbird_acl_taxonomy))
+             | combine({ item: (netbird_acl_taxonomy['_default']
+                                | combine({'site_prefix': item | upper})) }) }}
+      loop: "{{ manifest.netbird.sites | difference(netbird_acl_taxonomy.keys() | list) }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    # Exercise group-sets are synthetic taxonomy sites (one row in
+    # netbird_exercises); expand them so `--env <exercise>` onboarding
+    # validates + resolves like any site (exercise-group-sets tee-up).
+    - name: "Expand exercise group-sets into site entries"
+      ansible.builtin.include_tasks: tasks/netbird-exercise-expand.yml
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    - name: "Assert every NetBird site is declared in the taxonomy"
+      ansible.builtin.assert:
+        that:
+          - item in (netbird_acl_taxonomy_resolved | default(netbird_acl_taxonomy))
+        fail_msg: |
+          Site '{{ item }}' (from manifest.netbird.sites) is not declared in
+          ops/ansible/netbird_acl_taxonomy.yml. Add a stanza for it before
+          minting keys against that site, or pick a declared site from:
+            {{ netbird_acl_taxonomy.keys() | list | join(', ') }}
+      loop: "{{ manifest.netbird.sites }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+        - manifest.netbird.auto_groups | length > 0
+
+    - name: "Assert every manifest auto_groups suffix is declared in the taxonomy"
+      ansible.builtin.assert:
+        that:
+          - item.1 in ((netbird_acl_taxonomy_resolved | default(netbird_acl_taxonomy))[item.0].groups | map(attribute='suffix') | list)
+        fail_msg: |
+          manifest.netbird.auto_groups suffix '{{ item.1 }}' is not declared
+          in ops/ansible/netbird_acl_taxonomy.yml for site '{{ item.0 }}'.
+          Valid suffixes for {{ item.0 }}:
+            {{ (netbird_acl_taxonomy_resolved | default(netbird_acl_taxonomy))[item.0].groups | map(attribute='suffix') | list }}
+      loop: "{{ manifest.netbird.sites | product(manifest.netbird.auto_groups) | list }}"
+      loop_control:
+        label: "{{ item.0 }} / {{ item.1 }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+        - manifest.netbird.auto_groups | length > 0
+
+    # --------------------------------------------------------------
+    # Phase 0.13 — Zenoh portal pre-flight (Block 83E)
+    # --------------------------------------------------------------
+    # When manifest.zenoh.enabled + manifest.zenoh.trial, Phase 4 will
+    # POST to the goat-zenoh-portal's vendor-create endpoint. Validate
+    # the prerequisites here so failure surfaces before any backend
+    # contact:
+    #   (a) trial-only path for now — zenoh.prod is a stub awaiting
+    #       ADR 0844 prod portal; reject explicitly with a clear pointer
+    #   (b) portal URL mapped for the trial site
+    #   (c) PORTAL_OPERATOR_API_KEY env var present + non-empty
+    #   (d) portal /api/health reachable (2s timeout — fast fail if the
+    #       portal is down or you're off-mesh)
+    # --------------------------------------------------------------
+
+    - name: "Zenoh: reject zenoh.prod (ADR 0844 prod portal not yet built)"
+      ansible.builtin.fail:
+        msg: |
+          manifest.zenoh.prod is set but the production-shape portal is
+          not yet built. 83E currently wires only the trial-fabric path
+          (manifest.zenoh.trial.vendor). Drop zenoh.prod for now, or
+          land the ADR 0844 prod portal first.
+          See docs/design/operator-onboard-utilities.md §Q4 + §83E.
+      when:
+        - manifest.zenoh.enabled
+        - onboard_action == 'enroll'
+        - manifest.zenoh.prod is defined
+
+    - name: "Zenoh: assert trial-portal URL mapped"
+      ansible.builtin.assert:
+        that:
+          - zenoh_trial_site in zenoh_portal_url_map
+        fail_msg: |
+          Zenoh trial-portal URL not mapped for site '{{ zenoh_trial_site }}'.
+          Add an entry to zenoh_portal_url_map in ops/ansible/operator-onboard.yml.
+      when:
+        - manifest.zenoh.enabled
+        - onboard_action == 'enroll'
+        - manifest.zenoh.trial is defined
+
+    - name: "Zenoh: assert portal-operator API key env var is set"
+      ansible.builtin.assert:
+        that:
+          - lookup('env', zenoh_trial_portal_key_var) | length > 0
+        fail_msg: |
+          Portal operator API key env var
+          '{{ zenoh_trial_portal_key_var }}'
+          is empty. This is the Bearer token the orchestrator presents
+          to the portal's POST /api/vendors endpoint.
+
+          Set it in .envrc.local.d/30-site-services.envrc:
+            export {{ zenoh_trial_portal_key_var }}='<operator-key-value>'
+
+          The value is the same one the goat-zenoh-portal role uses
+          (PORTAL_OPERATOR_API_KEY) — share with that deploy.
+          direnv reload + re-run this playbook.
+      when:
+        - manifest.zenoh.enabled
+        - onboard_action == 'enroll'
+        - manifest.zenoh.trial is defined
+
+    - name: "Zenoh: portal /api/health reachable"
+      ansible.builtin.uri:
+        url: "{{ zenoh_trial_portal_url }}/api/health"
+        method: GET
+        timeout: 5
+        status_code: [200]
+        return_content: true
+      register: zenoh_portal_health
+      when:
+        - manifest.zenoh.enabled
+        - onboard_action == 'enroll'
+        - manifest.zenoh.trial is defined
+        - not ansible_check_mode
+      failed_when: false  # Surface a friendlier message in the next task than uri-module's raw stderr.
+
+    - name: "Zenoh: assert portal answered the health check"
+      ansible.builtin.assert:
+        that:
+          - zenoh_portal_health.status is defined
+          - zenoh_portal_health.status == 200
+        fail_msg: |
+          Portal /api/health at {{ zenoh_trial_portal_url }}
+          did not answer 200 (got {{ zenoh_portal_health.status | default('n/a') }}).
+          Likely causes: off-mesh, portal container down, DNS resolver
+          not pushed to your peer, or you haven't joined the mesh yet.
+
+          Smoke from a known-good shell:
+            curl -fsS {{ zenoh_trial_portal_url }}/api/health
+      when:
+        - manifest.zenoh.enabled
+        - onboard_action == 'enroll'
+        - manifest.zenoh.trial is defined
+        - not ansible_check_mode
+
+    - name: "Ory site: assert each delegated Thor is reachable before the mint (P1.2)"
+      # Fail fast if a site Thor (the Kratos admin host the Phase 2 + cert phases
+      # delegate to) isn't reachable, instead of running half the mint and then
+      # hanging / half-provisioning on the delegated calls. TCP-probe
+      # the SSH port over the mesh with a short timeout. Guarded to the ssh path
+      # so the local-connection integration test skips it.
+      ansible.builtin.wait_for:
+        host: "{{ onboard_delegate_host_override or ory_site_kratos_admin_host_map[item].ssh_host }}"
+        port: "{{ onboard_delegate_port_override or ory_site_kratos_admin_host_map[item].ssh_port | default(22) }}"
+        timeout: 15
+        msg: >-
+          Site Thor for '{{ item }}'
+          ({{ onboard_delegate_host_override or ory_site_kratos_admin_host_map[item].ssh_host }}:{{ onboard_delegate_port_override or ory_site_kratos_admin_host_map[item].ssh_port | default(22) }})
+          is not reachable within 15s. The Ory + Zenoh-cert phases delegate
+          to it; onboarding can't complete until it is on the mesh. Check
+          `netbird status` (green) and that the Thor is up, then re-run.
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }} → {{ ory_site_kratos_admin_host_map[item].ssh_host }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+        - (ory_site_kratos_admin_host_map[item].connection | default('ssh', true)) == 'ssh'
+        - not ansible_check_mode
+
+    # --------------------------------------------------------------
+    # Phase 1 — NetBird (83C, wired; 83C.1 adds group-UUID resolution)
+    # --------------------------------------------------------------
+    # Per-site loop calling POST /api/setup-keys with the
+    # <SITE>_NB_API_TOKEN PAT from env. Idempotent via key name + the
+    # mgmt-host's own setup-key state (re-running with the same handle
+    # + date returns a new key — the API does not de-dupe by name; we
+    # accept that). Single-use keys (type=one-off, usage_limit=1) so
+    # the operator can hand off without worrying about second-use.
+    #
+    # 83C.1 — manifest.netbird.auto_groups carries SUFFIX names (e.g.
+    # 'VENDOR'); the NetBird API requires per-site group UUIDs. We
+    # GET /api/groups per site, expand each suffix into the
+    # fully-qualified '<PREFIX>-<SUFFIX>' name, look up its UUID, and
+    # substitute the UUIDs into the POST body. Fails loud if any
+    # expected group is not present on the mgmt-server (operator
+    # remedy: run netbird-acl-bootstrap.yml for that site first).
+    # Setup-key 'name' field also includes the site so the dashboard
+    # shows who-and-where at a glance.
+    # --------------------------------------------------------------
+
+    - name: "NetBird: assert per-site URL is mapped"
+      ansible.builtin.assert:
+        that:
+          - (item in netbird_site_url_map) or (item is match('^[a-z][a-z0-9-]+[a-z0-9]$'))
+        fail_msg: |
+          NetBird mgmt-API URL not mapped for site '{{ item }}'.
+          Add an entry to netbird_site_url_map in ops/ansible/operator-onboard.yml.
+      loop: "{{ manifest.netbird.sites }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    - name: "NetBird: GET existing groups per site"
+      ansible.builtin.uri:
+        url: "{{ netbird_site_url_map.get(item, 'https://netbird.' ~ item ~ '.net') }}/api/groups"
+        method: GET
+        headers:
+          Authorization: "Token {{ lookup('env', netbird_site_env_var_map[item] | default(item | upper | replace('-', '_') + '_NB_API_TOKEN')) }}"
+          Accept: application/json
+        status_code: [200]
+        return_content: true
+      register: netbird_groups_results
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      check_mode: false   # read-only — safe in --check; downstream resolves UUIDs
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    - name: "NetBird: build per-site group name→UUID map"
+      ansible.builtin.set_fact:
+        netbird_site_group_maps: >-
+          {{
+            netbird_site_group_maps | default({}) | combine({
+              item.item: dict(
+                item.json | map(attribute='name') | zip(item.json | map(attribute='id'))
+              )
+            })
+          }}
+      loop: "{{ netbird_groups_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    - name: "NetBird: resolve manifest auto_groups → UUIDs per site"
+      ansible.builtin.set_fact:
+        netbird_resolved_auto_groups: >-
+          {{
+            netbird_resolved_auto_groups | default({}) | combine({
+              item: (
+                manifest.netbird.auto_groups
+                | map('regex_replace', '^', (netbird_acl_taxonomy_resolved | default(netbird_acl_taxonomy))[item].site_prefix + '-')
+                | map('extract', netbird_site_group_maps[item])
+                | list
+              )
+            })
+          }}
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+        - manifest.netbird.auto_groups | length > 0
+
+    - name: "NetBird: assert every resolved auto_group has a UUID"
+      ansible.builtin.assert:
+        that:
+          - (netbird_resolved_auto_groups[item] | length) == (manifest.netbird.auto_groups | length)
+          - "netbird_resolved_auto_groups[item] | reject('string') | list | length == 0"
+        fail_msg: |
+          Could not resolve one or more manifest auto_groups to UUIDs for site '{{ item }}'.
+
+          Manifest suffixes:        {{ manifest.netbird.auto_groups }}
+          Expected full names:      {{ manifest.netbird.auto_groups | map('regex_replace', '^', (netbird_acl_taxonomy_resolved | default(netbird_acl_taxonomy))[item].site_prefix + '-') | list }}
+          Groups on '{{ item }}':   {{ netbird_site_group_maps[item].keys() | list | sort }}
+          Resolved (None=missing):  {{ netbird_resolved_auto_groups[item] }}
+
+          Remediation:
+            cd ops/ansible
+            ansible-playbook -i localhost, --connection local \
+              netbird-acl-bootstrap.yml -e target_site={{ item }}
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+        - manifest.netbird.auto_groups | length > 0
+
+    - name: "NetBird: compute vendor short_tag segment + cross-check vs zenoh.trial.vendor"
+      ansible.builtin.set_fact:
+        # _vendor_short_tag_segment is either '' (no vendor.short_tag set,
+        # OR a tag equal to the handle) or '-<short_tag>' (e.g. '-acme-corp').
+        # Threaded into the canonical peer-label so a vendor-affiliated peer
+        # reads as `peer-<handle>-<short_tag>-<site>-<date>-<hostname>`
+        # end-to-end without needing the dashboard reader to cross-reference
+        # any external map.
+        #
+        # A TAG EQUAL TO THE HANDLE IS OMITTED (grammar v1.1.0). It carries no
+        # information, and on per-uuid goatnets the drift-check immediately
+        # below FORCES short_tag == zenoh.trial.vendor, which is itself the
+        # handle — so this playbook would mint
+        # `peer-jane-doe-jane-doe-acme-2030-01-05`. The
+        # Rust minter and this playbook are two implementations of one grammar,
+        # and fixing only the Rust one would have left onboarding producing
+        # them forever. Same degenerate value `org_trait_short_tag` already
+        # corrects for the Ory trait.
+        _vendor_short_tag_segment: >-
+          {{
+            ('-' + manifest.vendor.short_tag)
+            if (manifest.vendor is defined
+                and manifest.vendor.short_tag is defined
+                and manifest.vendor.short_tag | trim != manifest.identity.handle | trim)
+            else ''
+          }}
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    - name: "NetBird: drift-check vendor.short_tag vs zenoh.trial.vendor"
+      ansible.builtin.fail:
+        msg: |
+          Manifest drift: vendor.short_tag='{{ manifest.vendor.short_tag }}'
+          does not equal zenoh.trial.vendor='{{ manifest.zenoh.trial.vendor }}'.
+          One URI-SAN authority per vendor — set them to the same string
+          (or omit vendor.short_tag to derive from zenoh.trial.vendor).
+      when:
+        - manifest.vendor is defined
+        - manifest.vendor.short_tag is defined
+        - manifest.zenoh is defined
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - manifest.zenoh.trial.vendor is defined
+        - manifest.vendor.short_tag != manifest.zenoh.trial.vendor
+
+    # A single-use key is a legitimate thing to mint deliberately — a one-shot
+    # hand-off, a throwaway probe. It is NOT a thing to mint by accident, which
+    # is what a missing manifest field used to produce silently. Say it out loud
+    # so the operator running the onboard sees the shape before the person does.
+    - name: "NetBird: announce setup-key shape (single-use keys are never silent)"
+      ansible.builtin.debug:
+        msg: >-
+          {{ manifest.identity.handle }} @ {{ item }}:
+          {{ 'SINGLE-USE key (usage_limit=1) — the FIRST successful enrolment consumes it.
+          Every attempt after that is refused with "couldn''t add peer: setup key is invalid",
+          including a second machine, a reinstall, or native Windows after a WSL install.
+          Intended? A manifest that omits netbird.usage_limit gets'
+          ~ ' ' ~ netbird_setup_key_usage_limit_default ~ ', not 1.'
+          if (_announce_limit | int) == 1
+          else ('reusable key, usage_limit=' ~ _announce_limit ~ ' — enrols up to that many of their own devices.') }}
+      vars:
+        _announce_limit: "{{ manifest.netbird.usage_limit | default(netbird_setup_key_usage_limit_default) }}"
+      loop: "{{ manifest.netbird.sites }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+
+    - name: "NetBird: mint setup-key per site"
+      ansible.builtin.uri:
+        url: "{{ _site_url }}/api/setup-keys"
+        method: POST
+        headers:
+          Authorization: "Token {{ lookup('env', _env_var) }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "peer-{{ manifest.identity.handle }}{{ _vendor_short_tag_segment }}-{{ item }}-{{ ansible_date_time.date }}"
+          type: "{{ 'reusable' if _usage_limit | int > 1 else 'one-off' }}"
+          expires_in: "{{ _ttl_days * 86400 }}"
+          revoked: false
+          auto_groups: "{{ netbird_resolved_auto_groups[item] | default([]) }}"
+          usage_limit: "{{ _usage_limit | int }}"
+          ephemeral: false
+          # AutoPeerName (Block 83C.3) — operator-assigned label prefix.
+          # The patched goat-maintainer/netbird-mgmt image combines this with the
+          # joining peer's reported hostname at registration as
+          # "<auto_peer_name>-<hostname>". Both halves preserved so a peer
+          # named `dale` enrolled via this key shows up as
+          # `peer-jane-site-a-2030-01-05-dale` (or
+          # `peer-jane-acme-corp-site-a-2030-01-05-dale` when
+          # vendor.short_tag is set) in the dashboard Peers tab, matching
+          # the setup-key name in the Setup Keys tab. Requires the
+          # patched mgmt image; other sites pin upstream until they're cut over.
+          auto_peer_name: "peer-{{ manifest.identity.handle }}{{ _vendor_short_tag_segment }}-{{ item }}-{{ ansible_date_time.date }}"
+        status_code: [200, 201]
+        return_content: true
+      vars:
+        _env_var: "{{ netbird_site_env_var_map[item] | default(item | upper | replace('-', '_') + '_NB_API_TOKEN') }}"
+        _site_url: "{{ netbird_site_url_map.get(item, 'https://netbird.' ~ item ~ '.net') }}"
+        _ttl_days: "{{ manifest.netbird.ttl_days | default(netbird_role_ttl_days_default[manifest.netbird.role]) }}"
+        _usage_limit: "{{ manifest.netbird.usage_limit | default(netbird_setup_key_usage_limit_default) }}"
+      register: netbird_mint_results
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }} → {{ _site_url }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+      no_log: false   # response includes the key value; we capture it for the bundle
+
+    - name: "NetBird: --check mode summary"
+      ansible.builtin.debug:
+        msg: |
+          [--check] Would POST {{ netbird_site_url_map.get(item, 'https://netbird.' ~ item ~ '.net') }}/api/setup-keys with:
+            name=peer-{{ manifest.identity.handle }}{{ _vendor_short_tag_segment | default('') }}-{{ item }}-{{ ansible_date_time.date }}
+            type={{ 'reusable' if (manifest.netbird.usage_limit | default(netbird_setup_key_usage_limit_default) | int) > 1 else 'one-off' }}  usage_limit={{ manifest.netbird.usage_limit | default(netbird_setup_key_usage_limit_default) }}
+            expires_in={{ (manifest.netbird.ttl_days | default(netbird_role_ttl_days_default[manifest.netbird.role])) * 86400 }}s
+            (role={{ manifest.netbird.role }})
+            auto_groups={{ manifest.netbird.auto_groups | map('regex_replace', '^', (netbird_acl_taxonomy_resolved | default(netbird_acl_taxonomy))[item].site_prefix + '-') | list if manifest.netbird.auto_groups | length > 0 else '[] (site default group only)' }}
+              → UUIDs={{ netbird_resolved_auto_groups[item] | default([]) }}
+            auto_peer_name=peer-{{ manifest.identity.handle }}{{ _vendor_short_tag_segment | default('') }}-{{ item }}-{{ ansible_date_time.date }}
+              (peers named <auto_peer_name>-<hostname> per Block 83C.3 fork-patch;
+               vendor.short_tag segment present when set — Block 83C.4)
+      loop: "{{ manifest.netbird.sites }}"
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+        - ansible_check_mode
+
+    - name: "NetBird: build per-site setup-key map for bundle render"
+      ansible.builtin.set_fact:
+        netbird_minted_keys: >-
+          {{
+            dict(
+              (netbird_mint_results.results | default([]))
+              | map(attribute='item')
+              | zip(
+                  (netbird_mint_results.results | default([]))
+                  | map(attribute='json', default={})
+                )
+            )
+          }}
+      when:
+        - manifest.netbird.enabled
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    # --------------------------------------------------------------
+    # Phase 2 — Ory site Kratos identity provisioning (83D)
+    # --------------------------------------------------------------
+    # For each site in manifest.ory_site.sites:
+    #   1. add_host the site's Kratos admin SSH endpoint (so we can
+    #      delegate_to without needing the host in -i inventory).
+    #   2. GET /admin/identities?credentials_identifier=<email> to check
+    #      idempotency (existing identity = skip create + emit
+    #      'already-provisioned' marker in bundle).
+    #   3. If missing AND credentials.password=true: generate random
+    #      24-char password via lookup('password', ...), bcrypt-hash via
+    #      Ansible's password_hash filter (passlib), POST /admin/identities
+    #      with structured body — bcrypt hash never touches a shell string.
+    #   4. If missing AND credentials.passkey=true: POST /admin/recovery/link
+    #      to mint a one-shot recovery link (15min TTL). Vendor clicks it,
+    #      lands in account-settings, enrolls a WebAuthn passkey.
+    #   5. Set ory_site_provisioned[site] fact for bundle template.
+    #
+    # Closes F-131 (bcrypt-via-shell footgun) by using Ansible uri-module
+    # with structured body throughout. No shell pipeline anywhere.
+    # --------------------------------------------------------------
+
+    - name: "Ory site: assert per-site Kratos admin host is mapped"
+      ansible.builtin.assert:
+        that:
+          - item in ory_site_kratos_admin_host_map
+        fail_msg: |
+          Site '{{ item }}' is missing from ory_site_kratos_admin_host_map
+          in ops/ansible/operator-onboard.yml. Add the {delegate_host_name,
+          ssh_host, ssh_user, kratos_admin_url, auth_url} entry before
+          re-running.
+      loop: "{{ manifest.ory_site.sites }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+
+    - name: "Ory site: add_host for SSH-delegated Kratos admin calls"
+      ansible.builtin.add_host:
+        name: "{{ ory_site_kratos_admin_host_map[item].delegate_host_name }}"
+        ansible_host: "{{ onboard_delegate_host_override or ory_site_kratos_admin_host_map[item].ssh_host }}"
+        ansible_port: "{{ onboard_delegate_port_override or ory_site_kratos_admin_host_map[item].ssh_port | default(22) }}"
+        ansible_user: "{{ ory_site_kratos_admin_host_map[item].ssh_user }}"
+        ansible_connection: ssh
+        # P1.4 — bound the SSH transport so a flapping site Thor fails fast
+        # instead of hanging the whole onboard (a revoke sat >2 min
+        # with no output). ConnectTimeout caps the connect; ServerAlive detects
+        # a dead session in ~30s; BatchMode refuses an interactive prompt.
+        ansible_ssh_common_args: "-o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes"
+        groups: kratos_admin_targets
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }} → {{ ory_site_kratos_admin_host_map[item].ssh_host }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+      changed_when: false
+
+    - name: "Ory site: GET existing Kratos identity by email"
+      ansible.builtin.uri:
+        url: "{{ ory_site_kratos_admin_host_map[item].kratos_admin_url }}/admin/identities?credentials_identifier={{ manifest.identity.email | urlencode }}"
+        method: GET
+        status_code: [200]
+        return_content: true
+      delegate_to: "{{ ory_site_kratos_admin_host_map[item].delegate_host_name }}"
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      register: ory_existing_identity_lookups
+      check_mode: false   # read-only — safe in --check; downstream resolves create-or-skip
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+
+    - name: "Ory site: compute per-site create-vs-skip decisions"
+      ansible.builtin.set_fact:
+        ory_site_decisions: >-
+          {{
+            ory_site_decisions | default({}) | combine({
+              item.item: {
+                'existing_id': (item.json | default([]) | first | default({})).id | default(none),
+                'needs_create': (item.json | default([]) | length) == 0,
+                'credentials_requested': manifest.ory_site.credentials | default(ory_site_credentials_default),
+              }
+            })
+          }}
+      loop: "{{ ory_existing_identity_lookups.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+
+    - name: "Ory site: assert at least one credential method requested per site needing create"
+      ansible.builtin.assert:
+        that:
+          - ory_site_decisions[item].credentials_requested.password | default(false) or ory_site_decisions[item].credentials_requested.passkey | default(false)
+        fail_msg: |
+          Site '{{ item }}' has manifest.ory_site.enabled=true and identity
+          needs provisioning but neither credentials.password nor
+          credentials.passkey is true. Set at least one in the manifest
+          or omit the credentials block to accept the default
+          ({{ ory_site_credentials_default }}).
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+        - ory_site_decisions[item].needs_create
+
+    - name: "Ory site: generate random passwords per site (only when needed)"
+      ansible.builtin.set_fact:
+        ory_site_generated_passwords: >-
+          {{
+            ory_site_generated_passwords | default({}) | combine({
+              item: lookup('password',
+                           '/dev/null length=' + (ory_site_password_length | string)
+                           + ' chars=' + ory_site_password_chars)
+            })
+          }}
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+        - ory_site_decisions[item].needs_create
+        - ory_site_decisions[item].credentials_requested.password | default(false)
+        - not ansible_check_mode
+      no_log: true
+
+    - name: "Ory site: POST /admin/identities (create new identity per site)"
+      ansible.builtin.uri:
+        url: "{{ ory_site_kratos_admin_host_map[item].kratos_admin_url }}/admin/identities"
+        method: POST
+# Send the body as raw, pre-serialized JSON with ensure_ascii=False so a
+        # non-ASCII name (diacritics — č, ä, …) crosses the wire as literal
+        # UTF-8 bytes. ansible's body_format=json serializes with
+        # ensure_ascii=True, escaping them to \uXXXX — and Kratos then rejects
+        # the identity-create with HTTP 500 (Postgres SQLSTATE 22P05,
+        # "unsupported Unicode escape sequence"):
+        # literal UTF-8 → 201, \u-escaped → 500. This lets foreign partners
+        # keep their real spelling (no transliteration needed).
+        body_format: raw
+        body: "{{ _identity_body | to_json(ensure_ascii=False) }}"
+        headers:
+          Content-Type: "application/json; charset=utf-8"
+        status_code: [200, 201]
+        return_content: true
+      vars:
+        _password_credential:
+          password:
+            config:
+              hashed_password: "{{ ory_site_generated_passwords[item] | password_hash('bcrypt', rounds=12) }}"
+        # traits.vendor is set when manifest.vendor is declared (vendor shape;
+        # required for vendor-class identities per 83C.1) — carries short_tag +
+        # display_name into Kratos for the id-admin-console identity-detail view.
+        # org.short_tag is the real ORG (affiliation.id, e.g. acme-corp), NOT
+        # vendor.short_tag — which on per-uuid goatnets is forced to equal the
+        # handle (the Zenoh prefix) by the short_tag==zenoh.trial.vendor
+        # drift-check. Prefer affiliation.id; fall back to vendor.short_tag only
+        # when the manifest carries no affiliation. Mirrors the native path's
+        # org_trait_short_tag() (crates/goat-cli/src/cmd/admin.rs).
+        #
+        # NOTE: the explanation above USED to live inside the {{ }}
+        # expression as `#` lines. Jinja has no `#` comment syntax inside an
+        # expression; ansible-core's newer templating engine rejects it outright
+        # with "Syntax error in template: unexpected char '#'", so the whole
+        # onboard failed at identity-create on any control node with a current
+        # ansible. Keep prose OUTSIDE the braces.
+        #
+        # aff.kind: ADR 1151 deprecated affiliation.kind and derives it from
+        # `sector`, so a manifest that declares only the target block carries no
+        # kind for the trait to copy — and an aff of {id} alone says WHO but not
+        # WHAT. An explicit kind still wins (the migration is additive); with
+        # none, derive what sector alone decides through
+        # filter_plugins/affiliation_kind.py, which calls gen-roster.py's
+        # derive_kind (the table coalition.DeriveKind is held to) rather than
+        # keep a copy here: commercial → vendor, the civil-society family → civil.
+        #
+        # A `state` sector is deliberately NOT derived here. organic-vs-partner
+        # is the affiliation's nation against the goatnet's OPERATING_SOVEREIGN,
+        # which this play (localhost, no site sovereign in scope) cannot answer,
+        # so the filter gets none and derive_kind returns "cannot decide" rather
+        # than guess, because guessing reclassifies a nation's own units — the
+        # fault ADR 1151 exists to fix. kind is then omitted.
+        _aff_kind: >-
+          {{ (manifest.affiliation.kind | default('') | trim)
+             or (manifest.affiliation.sector | default('') | affiliation_derive_kind) }}
+        _identity_body: >-
+          {{
+            {
+              'schema_id': 'default',
+              'state': 'active',
+              'traits': {
+                  'email': manifest.identity.email,
+                  'name': manifest.identity.name,
+              },
+              'metadata_public': (
+                {
+                  # Ory role groups are UNPREFIXED — the goatnet/site prefix belongs
+                  # ONLY on the mesh (netbird) plane. oauth2-proxy allow-lists match the
+                  # bare role name (PLATFORM-ADMIN, IAM-ADMIN, ...); prefixing here (with
+                  # <SITE>- etc) makes every per-service authz 403 "no allowed groups"
+                  # even though the identity looks correct. Two planes, two vocabularies
+                  # (mesh-and-ory-roles.md): mesh=prefixed, Ory=bare.
+                  'groups': manifest.ory_site.groups | default([]) | list,
+                }
+                | combine(
+                    {'org': {
+                      'short_tag': (manifest.affiliation.id
+                                    if (manifest.affiliation is defined and (manifest.affiliation.id | default('') | trim | length > 0))
+                                    else manifest.vendor.short_tag),
+                      'display_name': manifest.vendor.display_name,
+                    }}
+                    if (manifest.vendor is defined and manifest.vendor.short_tag is defined)
+                    else (
+                      {'org': {'display_name': manifest.vendor.display_name}}
+                      if (manifest.vendor is defined)
+                      else {}
+                    )
+                  )
+                | combine(
+                    {'aff': (
+                      {'id': manifest.affiliation.id}
+                      | combine(
+                          {'kind': _aff_kind}
+                          if (_aff_kind | length > 0)
+                          else {}
+                        )
+                      | combine(
+                          {'nation': manifest.affiliation.nation}
+                          if (manifest.affiliation.nation | default('') | trim | length > 0)
+                          else {}
+                        )
+                    )}
+                    if (manifest.affiliation is defined
+                        and (manifest.affiliation.id | default('') | trim | length > 0)
+                        and (ory_site_affiliation_trait_enabled_map[item] | default(ory_site_affiliation_trait_enabled)))
+                    else {}
+                  )
+              ),
+              'credentials': (_password_credential if ory_site_decisions[item].credentials_requested.password | default(false) else {}),
+              'verifiable_addresses': [
+                {'value': manifest.identity.email, 'via': 'email', 'verified': true,
+                 'verified_at': '1970-01-01T00:00:00Z', 'status': 'completed'}
+              ],
+              'recovery_addresses': [
+                {'value': manifest.identity.email, 'via': 'email'}
+              ],
+            }
+          }}
+      delegate_to: "{{ ory_site_kratos_admin_host_map[item].delegate_host_name }}"
+      register: ory_create_results
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }} → {{ manifest.identity.email }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+        - ory_site_decisions[item].needs_create
+        - not ansible_check_mode
+      no_log: true   # body contains bcrypt-hashed password
+
+    - name: "Ory site: mint passkey-enrollment recovery link (when requested)"
+      ansible.builtin.uri:
+        url: "{{ ory_site_kratos_admin_host_map[item].kratos_admin_url }}/admin/recovery/link"
+        method: POST
+        body_format: json
+        body:
+          identity_id: "{{ ory_site_decisions[item].existing_id or (ory_create_results.results | selectattr('item', 'equalto', item) | map(attribute='json.id') | first | default('')) }}"
+          expires_in: 15m
+        status_code: [200, 201]
+        return_content: true
+      delegate_to: "{{ ory_site_kratos_admin_host_map[item].delegate_host_name }}"
+      register: ory_recovery_results
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+        - ory_site_decisions[item].credentials_requested.passkey | default(false)
+        - not ansible_check_mode
+
+    - name: "Ory site: assemble ory_site_provisioned fact for bundle template"
+      ansible.builtin.set_fact:
+        ory_site_provisioned: >-
+          {{
+            ory_site_provisioned | default({}) | combine({
+              item: {
+                'password': (ory_site_generated_passwords | default({}))[item] | default(omit),
+                'recovery_link': ((ory_recovery_results.results | default([]) | selectattr('item', 'equalto', item) | map(attribute='json.recovery_link') | first) | default(omit) if ory_site_decisions[item].credentials_requested.passkey | default(false) else omit),
+                'recovery_link_expires': '15min' if ory_site_decisions[item].credentials_requested.passkey | default(false) else omit,
+                'already_provisioned': not ory_site_decisions[item].needs_create,
+              }
+            })
+          }}
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    - name: "Ory site: --check mode summary"
+      ansible.builtin.debug:
+        msg: |
+          [--check] Phase 2 site-Kratos at '{{ item }}':
+            email={{ manifest.identity.email }}
+            existing_id={{ ory_site_decisions[item].existing_id | default('<none>') }}
+            would_create={{ ory_site_decisions[item].needs_create }}
+            password_requested={{ ory_site_decisions[item].credentials_requested.password | default(false) }}
+            passkey_requested={{ ory_site_decisions[item].credentials_requested.passkey | default(false) }}
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - manifest.ory_site.enabled
+        - onboard_action == 'enroll'
+        - ansible_check_mode
+
+    # --------------------------------------------------------------
+    # Phase 3 — Ory operator-IdP Kratos (83D operator-IdP path pending)
+    # --------------------------------------------------------------
+
+    - name: "NOT YET WIRED (83D-idp pending)"
+      ansible.builtin.debug:
+        msg: |
+          Phase 3 (Ory IdP):  {{ 'will provision identity at ' + manifest.ory_idp.sites | join(', ') if manifest.ory_idp.enabled else 'skipped (disabled)' }}
+
+          Deferred to track 83D-idp. Internal operators needing
+          observability access (Grafana, OpenObserve) currently
+          provision via operator-idp-enroll.sh out-of-band.
+
+    # --------------------------------------------------------------
+    # Phase 4 — Zenoh wire-layer cert + ACL via goat-zenoh-portal (83E)
+    # --------------------------------------------------------------
+    # Dispatches vendor registration to the portal's POST /api/vendors
+    # endpoint, which encapsulates: (a) X.509 leaf mint via cert-sign
+    # --uri-san, (b) vendor-row create in the portal registry, (c) ACL
+    # rule append + zenohd reload, (d) one-time bundle tarball URL
+    # issuance, (e) portal API key generation (for the vendor's later
+    # topic-registration calls). Bearer-auth as operator via
+    # PORTAL_OPERATOR_API_KEY (see ops/goat-zenoh-portal/internal/api/
+    # auth.go).
+    #
+    # Footgun captured in the design memo: portal_response.api_key is
+    # ONE-SHOT — it appears nowhere else in the system after this
+    # response. If the bundle render in Phase 5 fails before the key
+    # is written to disk, the key is lost. Mitigation: Phase 4.2
+    # echoes the key + bundle_url into the orchestrator's stdout
+    # immediately on success so even a Phase 5 crash leaves the
+    # operator with what they need to deliver the bundle by hand.
+    #
+    # Idempotency: portal returns 409 ("vendor prefix already exists")
+    # if you re-run for an already-registered vendor. The api_key for
+    # an existing vendor is unrecoverable (it's bcrypt-hashed). Phase
+    # 4.3 detects 409, fetches the vendor row to confirm, and renders
+    # a bundle that points the vendor at "use the prior bundle, or
+    # revoke + re-mint".
+    # --------------------------------------------------------------
+
+    - name: "Zenoh: POST /api/vendors to mint leaf + register vendor"
+      ansible.builtin.uri:
+        url: "{{ zenoh_trial_portal_url }}/api/vendors"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ lookup('env', zenoh_trial_portal_key_var) }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          prefix: "{{ manifest.zenoh.trial.vendor }}"
+          # Portal display_name is the VENDOR (company/org), NOT the
+          # person. Pull from manifest.vendor.display_name when set;
+          # fall back to identity.name for legacy manifests that pre-
+          # date the vendor-vs-person split. New manifests should set
+          # vendor.display_name explicitly.
+          display_name: "{{ manifest.vendor.display_name | default(manifest.identity.name) }}"
+          synthetic: false
+          auto_approve: true
+          # Sponsorship annotation (ADR 1071) from the manifest's optional
+          # sponsorship: block — written onto the registry row so the
+          # invite/vouch gates enforce it (mirrors the goat-cli native path).
+          sponsor_authorized: "{{ manifest.sponsorship.authorized | default(false) | bool }}"
+          sponsor_max_tier: "{{ manifest.sponsorship.max_tier | default('') }}"
+          sponsor_email: "{{ manifest.sponsorship.email | default('') }}"
+        # 201 = fresh mint, 409 = vendor already exists. 200 = portal
+        # partial success (vendor created in DB but ACL render or storage
+        # provisioning failed); accept it here so Phase 4.0a can fail
+        # loudly with the portal's note_to_share rather than halt
+        # mid-orchestrator with a generic "Status code was 200" error.
+        status_code: [200, 201, 409]
+        return_content: true
+      register: zenoh_portal_response
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+      no_log: false  # the api_key in the response body is needed for the bundle
+
+    - name: "Zenoh: fail loudly on portal partial-success (HTTP 200 + note_to_share)"
+      ansible.builtin.fail:
+        msg: |
+          Portal returned HTTP 200 with a partial-success note — vendor was
+          created in the DB but a follow-on step failed (likely ACL render
+          or per-vendor storage provisioning). The api_key returned would
+          NOT authorize writes against the router until an operator fixes
+          the underlying issue.
+
+          Portal said:
+            {{ zenoh_portal_response.json.note_to_share }}
+
+          Common cause: /etc/goat-zenoh/ not group-writable by the
+          portal container (UID 65532). Re-run
+            ansible-playbook ops/ansible/zenoh-deploy.yml
+          to reapply the perm fix, then
+            curl -X DELETE -H "Authorization: Bearer $PORTAL_OPERATOR_API_KEY" \
+              {{ zenoh_trial_portal_url }}/api/vendors/{{ manifest.zenoh.trial.vendor }}
+          to clear the half-state, then re-run this orchestrator.
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - zenoh_portal_response.status == 200
+        - (zenoh_portal_response.json.note_to_share | default('')) | length > 0
+
+    - name: "Zenoh: capture portal response into facts"
+      ansible.builtin.set_fact:
+        zenoh_vendor_provisioned:
+          status: "{{ zenoh_portal_response.status }}"
+          prefix: "{{ manifest.zenoh.trial.vendor }}"
+          # 201 path — fresh mint, response carries api_key + bundle_url
+          # 409 path — vendor already exists; api_key + bundle_url unrecoverable
+          api_key: "{{ zenoh_portal_response.json.api_key | default('') }}"
+          bundle_url: "{{ zenoh_portal_response.json.bundle_url | default('') }}"
+          bundle_token: "{{ zenoh_portal_response.json.bundle_token | default('') }}"
+          uri_san: "{{ zenoh_portal_response.json.uri_san | default(zenoh_uri_san_scheme_map[zenoh_trial_site] + manifest.zenoh.trial.vendor) }}"
+          approved: "{{ zenoh_portal_response.json.approved | default(true) }}"
+          note_to_share: "{{ zenoh_portal_response.json.note_to_share | default('') }}"
+          portal_url: "{{ zenoh_trial_portal_url }}"
+          router_endpoint: "{{ zenoh_router_endpoint_map[zenoh_trial_site] }}"
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    - name: "Zenoh: echo credentials immediately"
+      ansible.builtin.debug:
+        msg: |
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          ZENOH VENDOR CREDENTIAL — CAPTURE NOW IF YOU CAN'T WAIT FOR
+          PHASE 5'S BUNDLE FILE. The portal's api_key is one-shot.
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+          Vendor prefix:  {{ manifest.zenoh.trial.vendor }}
+          URI-SAN:        {{ zenoh_vendor_provisioned.uri_san }}
+          Portal:         {{ zenoh_vendor_provisioned.portal_url }}
+          HTTP status:    {{ zenoh_vendor_provisioned.status }}{{ ' (newly minted)' if zenoh_vendor_provisioned.status == 201 else ' (vendor already registered; api_key + bundle_url not regenerable)' }}
+
+          {% if zenoh_vendor_provisioned.status == 201 %}
+          api_key:        {{ zenoh_vendor_provisioned.api_key }}
+          bundle_url:     {{ zenoh_vendor_provisioned.bundle_url }}
+          {% else %}
+          A prior bundle was issued. If you don't have it: revoke the
+          vendor row via the portal + re-run this playbook.
+          {% endif %}
+
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    - name: "Zenoh: --check mode summary"
+      ansible.builtin.debug:
+        msg: |
+          [--check] Would POST {{ zenoh_trial_portal_url }}/api/vendors with:
+            prefix={{ manifest.zenoh.trial.vendor }}
+            display_name={{ manifest.identity.name }}
+            synthetic=false  auto_approve=true
+          → portal mints X.509 leaf with URI-SAN
+            {{ zenoh_uri_san_scheme_map[zenoh_trial_site] }}{{ manifest.zenoh.trial.vendor }},
+            appends ACL allow rule for {{ manifest.zenoh.trial.vendor }}/**,
+            reloads zenohd, returns one-time api_key + bundle_url.
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - ansible_check_mode
+
+    # --------------------------------------------------------------
+    # Phase 4.5 — goat-cli operator-profile bundle (ADR 1019)
+    # --------------------------------------------------------------
+    # Mint a signed CBOR bundle carrying the operator's portal
+    # endpoint + token + Zenoh router endpoint + mTLS cert/key/CA-
+    # roots. The operator runs `goat profile init <bundle.cbor>` once
+    # to land everything in ~/.goat/contexts/default/ with the right
+    # perms, instead of cobbling together env vars + cert paths by
+    # hand from the tarball + Phase 4.2 stdout capture.
+    #
+    # The integrity property motivating Path B over Path A: the
+    # offline-CA signature covers the (cert, key, ca-roots, endpoint
+    # set, token) tuple together. An attacker who intercepts the
+    # bundle file in transit can't swap the portal endpoint while
+    # keeping a valid cert — the CA verifier rejects.
+    #
+    # Idempotency: skipped when Phase 4 returned 409 (vendor already
+    # exists). For 409, the portal's api_key + tarball URL are
+    # unrecoverable (api_key is bcrypt-hashed in the registry), so a
+    # fresh CBOR bundle would carry stale credentials. Bundle.md will
+    # surface the "use prior bundle, or revoke + re-run" note.
+    # --------------------------------------------------------------
+
+    - name: "goat-cli: create tempdir for staging tarball + intermediates"
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: goat-cli-onboard
+      register: goat_cli_tmp
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - zenoh_vendor_provisioned is defined
+        - zenoh_vendor_provisioned.status == 201
+
+    - name: "goat-cli: download per-vendor bundle tarball"
+      ansible.builtin.get_url:
+        url: "{{ zenoh_vendor_provisioned.portal_url }}{{ zenoh_vendor_provisioned.bundle_url }}"
+        dest: "{{ goat_cli_tmp.path }}/vendor-bundle.tar.gz"
+        mode: "0600"
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - zenoh_vendor_provisioned is defined
+        - zenoh_vendor_provisioned.status == 201
+
+    - name: "goat-cli: extract vendor bundle tarball"
+      # Use `tar -xzf` rather than ansible.builtin.unarchive because
+      # the unarchive handler-detection rejects BSD tar (macOS default)
+      # for gzipped tarballs even when the tar invocation itself works
+      # fine. `tar -xzf` is portable across BSD + GNU tar.
+      ansible.builtin.command:
+        cmd: "tar -xzf {{ goat_cli_tmp.path }}/vendor-bundle.tar.gz"
+        chdir: "{{ goat_cli_tmp.path }}"
+      changed_when: true
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - zenoh_vendor_provisioned is defined
+        - zenoh_vendor_provisioned.status == 201
+
+    - name: "goat-cli: locate the portal-minted CBOR profile in the tarball"
+      # The portal mints the goat-cli .cbor INTO the vendor tarball
+      # (ops/goat-zenoh-portal/internal/certmint), signed by the same
+      # CA the portal uses for cert-sign. The operator no longer
+      # mints it laptop-side — we lift it out of the extracted tarball. If
+      # absent (portal not yet redeployed with bundle-create-bin), bundle.md
+      # omits the goat-cli section (graceful, same as pre-ADR-1019).
+      ansible.builtin.stat:
+        path: "{{ goat_cli_tmp.path }}/{{ manifest.zenoh.trial.vendor }}-goat-cli.cbor"
+      register: goat_cli_cbor_stat
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - zenoh_vendor_provisioned is defined
+        - zenoh_vendor_provisioned.status == 201
+
+    # NOTE: the portal-minted .cbor is NOT extracted to the operator
+    # laptop. It rides the vendor's one-time tarball (already carries the
+    # vendor's private key); the vendor runs `goat profile init` from the
+    # unpacked tarball dir. We do not keep a laptop-side copy — that would
+    # be duplicated private-key material at rest with no audit value (the
+    # audit record is audit.log + the portal CA ledger, neither of which
+    # needs the key). Phase 4.5.3's stat only confirms the .cbor is present
+    # in the tarball so bundle.md renders the goat-cli section. The observer
+    # flavor (Phase 4o) is the ONLY path that mints + keeps a local .cbor,
+    # because it has no portal tarball to ride.
+
+    - name: "goat-cli: set bundle-minted fact for the bundle template"
+      ansible.builtin.set_fact:
+        goat_cli_bundle_minted: true
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - zenoh_vendor_provisioned is defined
+        - zenoh_vendor_provisioned.status == 201
+        - goat_cli_cbor_stat is defined
+        - goat_cli_cbor_stat.stat.exists | default(false)
+
+    - name: "goat-cli: zeroize staging tempdir (cert + key + token + tarball)"
+      ansible.builtin.file:
+        path: "{{ goat_cli_tmp.path }}"
+        state: absent
+      when:
+        - goat_cli_tmp is defined
+        - goat_cli_tmp.path is defined
+        - not ansible_check_mode
+
+    - name: "goat-cli: --check mode summary"
+      ansible.builtin.debug:
+        msg: |
+          [--check] Portal would mint the goat-cli CBOR profile INTO the
+          vendor's one-time tarball (not copied to this laptop), carrying:
+            portal_endpoint = {{ zenoh_trial_portal_url }}
+            router_endpoint = {{ zenoh_router_endpoint_map[zenoh_trial_site] }}
+            mtls_cert + key + ca_roots from vendor tarball
+            portal_token from Phase 4 response
+          Vendor runs (from their unpacked tarball dir):
+            goat ca add {{ manifest.zenoh.trial.vendor }}-goat-cli-ca.pem    # trust the CA that signed the bundle, once per workstation
+            goat profile init {{ manifest.zenoh.trial.vendor }}-goat-cli.cbor
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.trial is defined
+        - onboard_action == 'enroll'
+        - ansible_check_mode
+
+    # --------------------------------------------------------------
+    # Phase 4o — Observer (read-only) goat-cli bundle
+    # --------------------------------------------------------------
+    # For manifest.zenoh.observer (a read-only fabric watcher, e.g. a
+    # cluster admin): NO portal vendor row, NO publish ACL. The leaf is
+    # minted directly with `cert-sign` (CN observer-<handle>, which is
+    # NOT a `<vendor>-trial-peer` CN, so it matches only the universal-
+    # read `trial-peer-read` ACL subject — subscribe-everywhere, publish-
+    # nowhere). This is the durable form of the cert that M-048's picker/
+    # Tail live-fire had to hand-mint. Mutually exclusive with
+    # `zenoh.trial` (schema-asserted in Phase 0). Mirrors Phase 4.5's
+    # staging/zeroize discipline.
+    # --------------------------------------------------------------
+
+    - name: "observer: create staging tempdir"
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: goat-cli-observer
+      register: observer_tmp
+      when: &observer_when
+        - manifest.zenoh.enabled
+        - manifest.zenoh.observer is defined
+        - manifest.zenoh.observer
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    - name: "observer: build cert-sign + bundle-create"
+      ansible.builtin.command:
+        cmd: "go build -o {{ observer_tmp.path }}/{{ item }} ./cmd/{{ item }}"
+        chdir: "{{ repo_root }}/ops/enrollment"
+      changed_when: true
+      loop:
+        - cert-sign
+        - bundle-create
+      when: *observer_when
+
+    - name: "observer: mint read-only leaf via cert-sign"
+      # CN observer-<handle> matches no vendor/operator ACL subject →
+      # universal-read only. clientAuth + ecdsa-p256 per F-071/F-089.
+      ansible.builtin.command:
+        argv:
+          - "{{ observer_tmp.path }}/cert-sign"
+          - "--root-cert"
+          - "{{ goat_cli_root_cert_path_map.get(zenoh_trial_site, repo_root ~ '/ops/enrollment/ca/' ~ zenoh_trial_site ~ '/root-cert.pem') }}"
+          - "--root-key"
+          - "{{ goat_cli_ca_key_path_map[zenoh_trial_site] }}"
+          - "--age-identity"
+          - "{{ goat_cli_age_identity_path }}"
+          - "--ca-id"
+          - "{{ goat_cli_ca_id_map[zenoh_trial_site] }}"
+          - "--site-id"
+          - "nova-trial"
+          - "--cn"
+          - "observer-{{ manifest.identity.handle }}"
+          - "--san"
+          - "observer-{{ manifest.identity.handle }}.nova.peer"
+          - "--uri-san"
+          - "{{ zenoh_observer_uri_san_scheme_map[zenoh_trial_site] }}{{ manifest.identity.handle }}"
+          - "--eku"
+          - "clientAuth"
+          - "--key-type"
+          - "ecdsa-p256"
+          - "--validity"
+          - "{{ goat_cli_observer_validity }}"
+          - "--out-cert"
+          - "{{ observer_tmp.path }}/observer-cert.pem"
+          - "--out-key"
+          - "{{ observer_tmp.path }}/observer-key.pem"
+          - "--audit-log"
+          - "{{ goat_cli_ca_audit_log }}"
+      changed_when: true
+      when: *observer_when
+
+    - name: "observer: stage CA trust roots + operator portal token"
+      # Trust roots from the repo (public, see
+      # goat_cli_trust_roots_path_map), concatenated into ca-roots.pem,
+      # which Phase 4o.5 passes as --goat-cli-ca-roots; portal token is
+      # the operator's admin key (read-only fabric ⊕ portal browse — an
+      # observer reads declared state, never mutates it).
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        mode: "0600"
+      loop:
+        - content: "{{ query('file', *goat_cli_trust_roots_path_map.get(zenoh_trial_site, [repo_root ~ '/ops/enrollment/ca/' ~ zenoh_trial_site ~ '/root-cert.pem'])) | join('\n') }}"
+          dest: "{{ observer_tmp.path }}/ca-roots.pem"
+        - content: "{{ lookup('env', zenoh_trial_portal_key_var) }}"
+          dest: "{{ observer_tmp.path }}/portal-api-key"
+      loop_control:
+        label: "{{ item.dest | basename }}"
+      no_log: true  # the portal token is sensitive
+      when: *observer_when
+
+    - name: "observer: ensure ops/operators/out/ exists"
+      ansible.builtin.file:
+        path: "{{ out_dir }}"
+        state: directory
+        mode: "0700"
+      when: *observer_when
+
+    - name: "observer: mint signed observer CBOR bundle"
+      ansible.builtin.command:
+        argv:
+          - "{{ observer_tmp.path }}/bundle-create"
+          - "--site"
+          - "{{ zenoh_trial_site }}"
+          - "--device-id"
+          - "observer-{{ manifest.identity.handle }}"
+          - "--acl-groups"
+          - "OBSERVERS"
+          - "--ca-id"
+          - "{{ goat_cli_ca_id_map[zenoh_trial_site] }}"
+          - "--ca-key"
+          - "{{ goat_cli_ca_key_path_map[zenoh_trial_site] }}"
+          - "--age-identity"
+          - "{{ goat_cli_age_identity_path }}"
+          - "--goat-cli-portal-endpoint"
+          - "{{ zenoh_trial_portal_url }}"
+          - "--goat-cli-portal-token"
+          - "{{ observer_tmp.path }}/portal-api-key"
+          - "--goat-cli-router-endpoint"
+          - "{{ zenoh_router_endpoint_map[zenoh_trial_site] }}"
+          - "--goat-cli-mtls-cert"
+          - "{{ observer_tmp.path }}/observer-cert.pem"
+          - "--goat-cli-mtls-key"
+          - "{{ observer_tmp.path }}/observer-key.pem"
+          - "--goat-cli-ca-roots"
+          - "{{ observer_tmp.path }}/ca-roots.pem"
+          - "--out"
+          - "{{ goat_cli_bundle_path }}"
+      register: observer_mint_result
+      changed_when: true
+      when: *observer_when
+
+    - name: "observer: set bundle-minted fact for the bundle template"
+      ansible.builtin.set_fact:
+        goat_cli_bundle_minted: true
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.observer is defined
+        - manifest.zenoh.observer
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - observer_mint_result is defined
+        - observer_mint_result.rc == 0
+
+    - name: "observer: zeroize staging tempdir (cert + key + token)"
+      ansible.builtin.file:
+        path: "{{ observer_tmp.path }}"
+        state: absent
+      when:
+        - observer_tmp is defined
+        - observer_tmp.path is defined
+        - not ansible_check_mode
+
+    - name: "observer: --check mode summary"
+      ansible.builtin.debug:
+        msg: |
+          [--check] Would mint READ-ONLY observer CBOR bundle at {{ goat_cli_bundle_path }}
+          carrying:
+            cn              = observer-{{ manifest.identity.handle }} (universal-read only; no publish ACL)
+            portal_endpoint = {{ zenoh_trial_portal_url }}
+            router_endpoint = {{ zenoh_router_endpoint_map[zenoh_trial_site] }}
+            mtls leaf minted via cert-sign
+            ca_roots from {{ goat_cli_trust_roots_path_map.get(zenoh_trial_site, [repo_root ~ '/ops/enrollment/ca/' ~ zenoh_trial_site ~ '/root-cert.pem']) | join(' + ') }}
+          Operator runs:
+            goat ca add {{ goat_cli_ca_public_key_path }}    # trust the CA that signs the bundle, once per workstation; check the printed fingerprint out of band
+            goat profile init {{ goat_cli_bundle_path }} && goat doctor
+      when:
+        - manifest.zenoh.enabled
+        - manifest.zenoh.observer is defined
+        - manifest.zenoh.observer
+        - onboard_action == 'enroll'
+        - ansible_check_mode
+
+    # --------------------------------------------------------------
+    # ==============================================================
+    # REVOKE PATH (Stage 1 — person scope) — onboard_action == 'revoke'
+    # ==============================================================
+    # Walks the enroll surfaces backward, inventory-driven enumerate-
+    # and-cut. Mesh-first: NetBird peer delete + setup-key revoke, Ory
+    # deactivate (reversible; -e revoke_purge=true for hard delete),
+    # Zenoh vendor de-authorization under the last-one-out rule
+    # (-e revoke_scope=org forces the shared-vendor delete). Every task
+    # gates on onboard_action == 'revoke' so the enroll path is
+    # untouched; idempotent (already-absent artifact = no-op); GET/scan
+    # tasks run in --check so the plan is printable without executing.
+    # See ADR 1031 + docs/design/credential-revocation-and-offboarding.md.
+    # --------------------------------------------------------------
+
+    - name: "revoke: principal label segment + scope/purge flags"
+      ansible.builtin.set_fact:
+        _vendor_short_tag_segment: >-
+          {{ ('-' + manifest.vendor.short_tag)
+             if (manifest.vendor is defined and manifest.vendor.short_tag is defined)
+             else '' }}
+        _revoke_purge: "{{ revoke_purge | default(false) | bool }}"
+        _revoke_scope: "{{ revoke_scope | default('person') }}"
+        # The ORG is the affiliation dimension (identity grammar / ADR 1043),
+        # NOT vendor.short_tag (which the grammar backfill made per-identity —
+        # keying org on it silently degrades an org-scope revoke to person-scope
+        # because no sibling shares the per-person tag). Resolve from
+        # affiliation.id, falling back to the legacy short_tag only for
+        # un-migrated manifests. The org *cascade* enumerates members by this id;
+        # the shared-CN orphan guard (Phase R4.3) stays keyed on the actual CN.
+        _revoke_org_id: >-
+          {{ manifest.affiliation.id
+             if (manifest.affiliation is defined and manifest.affiliation.id is defined)
+             else (manifest.vendor.short_tag
+                   if (manifest.vendor is defined and manifest.vendor.short_tag is defined)
+                   else '') }}
+      when: onboard_action == 'revoke'
+
+    # Read-only enumeration of the affiliation org's blast radius. This is the
+    # registry-resolved "who else is in this unit" the org selector cascades
+    # over (docs/design/credential-revocation-and-offboarding.md). Recursive
+    # find so per-env manifests (ops/operators/<env>/*.yml) are included. The
+    # ACTUAL per-sibling cut is the next increment (B.4); today this surfaces
+    # the cascade scope in the plan + receipt so org-scope is never a silent
+    # under-cut, and the operator sees exactly what a full cascade would touch.
+    - name: "revoke/org: list all operator manifests (recursive)"
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/../operators"
+        patterns: "*.yml"
+        recurse: true
+      register: _revoke_all_manifests
+      check_mode: false
+      when:
+        - onboard_action == 'revoke'
+        - _revoke_org_id | length > 0
+
+    - name: "revoke/org: read all manifests"
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: _revoke_all_contents
+      check_mode: false
+      loop: "{{ _revoke_all_manifests.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when:
+        - onboard_action == 'revoke'
+        - _revoke_org_id | length > 0
+
+    - name: "revoke/org: resolve active affiliation siblings (cascade scope)"
+      ansible.builtin.set_fact:
+        _revoke_org_active_siblings: >-
+          {{ _revoke_all_contents.results | default([])
+             | map(attribute='content') | map('b64decode') | map('from_yaml')
+             | selectattr('identity', 'defined')
+             | selectattr('affiliation', 'defined')
+             | selectattr('identity.handle', 'defined')
+             | selectattr('identity.handle', 'ne', manifest.identity.handle)
+             | selectattr('identity.status', 'defined')
+             | selectattr('identity.status', 'eq', 'active')
+             | selectattr('affiliation.id', 'defined')
+             | selectattr('affiliation.id', 'eq', _revoke_org_id)
+             | map(attribute='identity.handle') | list }}
+      when:
+        - onboard_action == 'revoke'
+        - _revoke_org_id | length > 0
+
+    # ---- R1.0 — the preflight that makes a miss loud -----------------------
+    # R1.2 below selects peers by matching `^peer-<handle><tag>-<site>-`. That
+    # is the only signal it has, and it is assembled by whoever minted the key:
+    # the person-onboard path and the CLI set `auto_peer_name`, the portal's
+    # machine mint did not previously and a hand-mint through the NetBird
+    # dashboard cannot — the UI has no such field. A peer that misses the
+    # pattern is not selected, not deleted, and stays on the mesh in its groups,
+    # and this play prints success. On a revoke that is the worst possible
+    # failure mode: a credential that was supposed to be cut is still live and
+    # the output says otherwise.
+    #
+    # The management server knows the answer regardless of the name. Every
+    # setup-key enrolment writes a `peer.setupkey.add` event carrying the peer
+    # id and the key that admitted it. peer-attribution.py joins the two and
+    # exits non-zero when a peer belongs to this person but would not be cut.
+    # The name grammar alone misses peers and so does the event log; only the union
+    # covers all of them, and without it a person's device can escape the cut.
+    #
+    # Refusing is the point. Set `revoke_allow_uncuttable_peers=true` only when
+    # you have read the list and intend to handle those peers by id yourself;
+    # the override still prints them.
+    - name: "revoke/NetBird: refuse if this person owns a peer the cut cannot select"
+      ansible.builtin.command:
+        argv:
+          - "{{ playbook_dir }}/../scripts/peer-attribution.py"
+          - "{{ item }}"
+          - "--handle"
+          - "{{ manifest.identity.handle }}"
+          - "--site"
+          - "{{ item }}"
+      environment: "{{ {_tokvar: lookup('env', _tokvar)} }}"
+      vars:
+        _tokvar: "{{ netbird_site_env_var_map[item] | default(item | upper | replace('-', '_') + '_NB_API_TOKEN') }}"
+      register: revoke_attribution
+      changed_when: false
+      check_mode: false
+      failed_when:
+        - revoke_attribution.rc != 0
+        - not (revoke_allow_uncuttable_peers | default(false) | bool)
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.netbird.enabled
+
+    - name: "revoke/NetBird: show the attribution the cut is acting on"
+      ansible.builtin.debug:
+        msg: "{{ (item.stdout | default('')).split('\n') }}"
+      loop: "{{ revoke_attribution.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('?') }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.netbird.enabled
+        - item.stdout is defined
+
+    - name: "revoke/NetBird: GET all peers per site"
+      ansible.builtin.uri:
+        url: "{{ netbird_site_url_map.get(item, 'https://netbird.' ~ item ~ '.net') }}/api/peers"
+        method: GET
+        headers:
+          Authorization: "Token {{ lookup('env', netbird_site_env_var_map[item] | default(item | upper | replace('-', '_') + '_NB_API_TOKEN')) }}"
+        status_code: [200]
+        return_content: true
+      register: revoke_nb_peer_lists
+      check_mode: false
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.netbird.enabled
+
+    - name: "revoke/NetBird: select peers matching peer-<handle><tag>-<site>-*"
+      ansible.builtin.set_fact:
+        revoke_nb_targets: >-
+          {{ revoke_nb_targets | default([])
+             + (item.json | default([])
+                | selectattr('name', 'match', _prefix)
+                | map('combine', {'site': item.item})
+                | list) }}
+      vars:
+        _prefix: "^peer-{{ manifest.identity.handle }}{{ _vendor_short_tag_segment }}-{{ item.item }}-"
+      loop: "{{ revoke_nb_peer_lists.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.netbird.enabled
+
+    - name: "revoke/NetBird: DELETE each matched peer (the cut that disconnects)"
+      ansible.builtin.uri:
+        url: "{{ netbird_site_url_map.get(item.site, 'https://netbird.' ~ item.site ~ '.net') }}/api/peers/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Token {{ lookup('env', netbird_site_env_var_map[item.site] | default(item.site | upper | replace('-', '_') + '_NB_API_TOKEN')) }}"
+        status_code: [200, 204, 404]
+      loop: "{{ revoke_nb_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.site }})"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.netbird.enabled
+        - not ansible_check_mode
+
+    - name: "revoke/NetBird: GET setup-keys per site"
+      ansible.builtin.uri:
+        url: "{{ netbird_site_url_map.get(item, 'https://netbird.' ~ item ~ '.net') }}/api/setup-keys"
+        method: GET
+        headers:
+          Authorization: "Token {{ lookup('env', netbird_site_env_var_map[item] | default(item | upper | replace('-', '_') + '_NB_API_TOKEN')) }}"
+        status_code: [200]
+        return_content: true
+      register: revoke_nb_key_lists
+      check_mode: false
+      loop: "{{ manifest.netbird.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.netbird.enabled
+
+    - name: "revoke/NetBird: revoke the principal's setup-keys (best-effort hygiene)"
+      ansible.builtin.uri:
+        url: "{{ netbird_site_url_map.get(item.0.item, 'https://netbird.' ~ item.0.item ~ '.net') }}/api/setup-keys/{{ item.1.id }}"
+        method: PUT
+        headers:
+          Authorization: "Token {{ lookup('env', netbird_site_env_var_map[item.0.item] | default(item.0.item | upper | replace('-', '_') + '_NB_API_TOKEN')) }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "{{ item.1.name }}"
+          auto_groups: "{{ item.1.auto_groups | default([]) }}"
+          revoked: true
+        status_code: [200]
+      # Deleting the peers above is what disconnects existing tunnels;
+      # revoking the keys only stops new joins, so tolerate API shape
+      # drift rather than fail the whole offboarding on it.
+      failed_when: false
+      loop: "{{ revoke_nb_key_lists.results | default([]) | subelements('json', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.item }} / {{ item.1.name | default(item.1.id) }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.netbird.enabled
+        - item.1.name is defined
+        # BOTH forms, and this is a migration requirement rather than
+        # leniency. Phase 1.3.5 stopped emitting a tag equal to the handle
+        # (grammar v1.1.0), so _vendor_short_tag_segment is now '' for those
+        # principals — but every peer minted BEFORE that still carries the
+        # doubled segment. Matching only the new shape would silently skip
+        # them, and THIS IS THE REVOKE CUT: a miss here leaves a credential
+        # live that was supposed to be cut. Mirrors peername.BelongsTo's dual accept, which has the
+        # same comment and the same live-name regression test; retire both when
+        # no peer carries the doubled form.
+        - >-
+          item.1.name is match('^peer-' + manifest.identity.handle + _vendor_short_tag_segment + '-' + item.0.item + '-')
+          or item.1.name is match('^peer-' + manifest.identity.handle + '-' + manifest.identity.handle + '-' + item.0.item + '-')
+        - not ansible_check_mode
+
+    # ---- R1.6 — the HOST SHELL cut ----------------------------------------
+    # Revoke used to cut three surfaces (mesh peer + setup key, Ory identity,
+    # Zenoh slot) and leave `authorized_keys` untouched, so an offboarded
+    # platform-admin keeps a WORKING SHELL on every mgmt host. Shipping an easy
+    # add-path over a missing remove-path is a one-way ratchet, so the cut lands first.
+    #
+    # Keyed on the PUBKEY BODY, not the whole line: the comment field is
+    # cosmetic and often edited by hand, and matching on it would silently
+    # miss the key it was supposed to remove. `regexp` also means a key added
+    # under a different comment is still cut.
+    - name: "revoke/host shell: add_host for each operator SSH target"
+      ansible.builtin.add_host:
+        name: "revoke-op-host-{{ item.ssh_host }}"
+        ansible_host: "{{ item.ssh_host }}"
+        ansible_user: "{{ item.ssh_user }}"
+        ansible_connection: ssh
+        groups: revoke_op_hosts
+      changed_when: false
+      loop: "{{ operator_ssh_hosts | default([]) }}"
+      loop_control:
+        label: "{{ item.ssh_user }}@{{ item.ssh_host }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.operator is defined
+        - manifest.operator.ssh_pubkey is defined
+
+    - name: "revoke/host shell: REMOVE the operator SSH key from authorized_keys"
+      ansible.builtin.lineinfile:
+        path: "~{{ item.ssh_user }}/.ssh/authorized_keys"
+        # Match the key TYPE + BODY only; the trailing comment is ignored.
+        regexp: "{{ (manifest.operator.ssh_pubkey.split() | length >= 2) | ternary(manifest.operator.ssh_pubkey.split()[0] ~ '\\s+' ~ (manifest.operator.ssh_pubkey.split()[1] | regex_escape), manifest.operator.ssh_pubkey | regex_escape) }}"
+        state: absent
+      delegate_to: "revoke-op-host-{{ item.ssh_host }}"
+      loop: "{{ operator_ssh_hosts | default([]) }}"
+      loop_control:
+        label: "{{ item.ssh_user }}@{{ item.ssh_host }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.operator is defined
+        - manifest.operator.ssh_pubkey is defined
+        - not ansible_check_mode
+
+    - name: "revoke/host shell: WARN when no key could be cut"
+      ansible.builtin.debug:
+        msg: >-
+          host-shell cut SKIPPED for {{ manifest.identity.handle }}: no
+          manifest.operator.ssh_pubkey recorded, so this playbook cannot know
+          which line to remove. If this person was ever given a shell, remove
+          their key by hand on {{ (operator_ssh_hosts | default([]))
+          | map(attribute='ssh_host') | join(', ') | default('the mgmt hosts', true) }}
+          and record the key in their manifest so the next revoke is complete.
+      when:
+        - onboard_action == 'revoke'
+        - manifest.operator is not defined or manifest.operator.ssh_pubkey is not defined
+
+    - name: "revoke/Ory site: add_host for SSH-delegated Kratos admin calls"
+      # Mirror of enroll Phase 2.0 — the R2.x tasks delegate_to this host,
+      # and the enroll add_host is enroll-gated, so revoke must register it
+      # itself or delegate_to fails 'host not found'. The optional
+      # `connection` field lets the integration test run the delegate
+      # locally against a mock (default = ssh, the production path).
+      ansible.builtin.add_host:
+        name: "{{ ory_site_kratos_admin_host_map[item].delegate_host_name }}"
+        ansible_host: "{{ onboard_delegate_host_override or ory_site_kratos_admin_host_map[item].ssh_host }}"
+        ansible_port: "{{ onboard_delegate_port_override or ory_site_kratos_admin_host_map[item].ssh_port | default(22) }}"
+        ansible_user: "{{ ory_site_kratos_admin_host_map[item].ssh_user }}"
+        # Explicit 'ssh' fallback, NOT default(omit): omit does not cleanly
+        # drop this host var, which collapses the delegate to a local
+        # connection and hits 127.0.0.1:4434 on the controller. The integration test overrides this to 'local'.
+        ansible_connection: "{{ ory_site_kratos_admin_host_map[item].connection | default('ssh', true) }}"
+        # P1.4 — bound the SSH transport (see enroll Phase 2.0); harmless when
+        # the test overrides connection to 'local'.
+        ansible_ssh_common_args: "-o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes"
+        groups: kratos_admin_targets
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }} → {{ ory_site_kratos_admin_host_map[item].ssh_host }}"
+      changed_when: false
+      when:
+        - onboard_action == 'revoke'
+        - manifest.ory_site.enabled
+
+    - name: "revoke/Ory site: GET identity by email per site"
+      ansible.builtin.uri:
+        url: "{{ ory_site_kratos_admin_host_map[item].kratos_admin_url }}/admin/identities?credentials_identifier={{ manifest.identity.email | urlencode }}"
+        method: GET
+        status_code: [200]
+        return_content: true
+      delegate_to: "{{ ory_site_kratos_admin_host_map[item].delegate_host_name }}"
+      register: revoke_ory_lookups
+      check_mode: false
+      loop: "{{ manifest.ory_site.sites }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.ory_site.enabled
+
+    - name: "revoke/Ory site: deactivate identity (default, reversible)"
+      ansible.builtin.uri:
+        url: "{{ ory_site_kratos_admin_host_map[item.item].kratos_admin_url }}/admin/identities/{{ (item.json | first).id }}"
+        method: PATCH
+        body_format: json
+        body:
+          - {op: replace, path: /state, value: inactive}
+        status_code: [200]
+      delegate_to: "{{ ory_site_kratos_admin_host_map[item.item].delegate_host_name }}"
+      loop: "{{ revoke_ory_lookups.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.ory_site.enabled
+        - not _revoke_purge
+        - (item.json | default([])) | length > 0
+        - not ansible_check_mode
+
+    - name: "revoke/Ory site: DELETE identity (--purge, terminal)"
+      ansible.builtin.uri:
+        url: "{{ ory_site_kratos_admin_host_map[item.item].kratos_admin_url }}/admin/identities/{{ (item.json | first).id }}"
+        method: DELETE
+        status_code: [204, 404]
+      delegate_to: "{{ ory_site_kratos_admin_host_map[item.item].delegate_host_name }}"
+      loop: "{{ revoke_ory_lookups.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.ory_site.enabled
+        - _revoke_purge
+        - (item.json | default([])) | length > 0
+        - not ansible_check_mode
+
+    - name: "revoke/Ory IdP: NOT YET WIRED (symmetric with the enroll Ory step)"
+      ansible.builtin.debug:
+        msg: |
+          Ory operator-IdP revoke deferred to 83D-idp (enroll Phase 3 is
+          also a stub). If this operator has obs access, deprovision via
+          operator-idp-enroll.sh out-of-band.
+      when:
+        - onboard_action == 'revoke'
+        - manifest.ory_idp.enabled | default(false)
+
+    - name: "revoke/Zenoh: list sibling operator manifests"
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/../operators"
+        patterns: "*.yml"
+      register: revoke_operator_manifests
+      check_mode: false
+      when:
+        - onboard_action == 'revoke'
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - manifest.vendor is defined
+        - manifest.vendor.short_tag is defined
+
+    - name: "revoke/Zenoh: read sibling manifests"
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: revoke_sibling_contents
+      check_mode: false
+      loop: "{{ revoke_operator_manifests.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when:
+        - onboard_action == 'revoke'
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - manifest.vendor is defined
+        - manifest.vendor.short_tag is defined
+
+    - name: "revoke/Zenoh: count OTHER active teammates sharing the vendor tag"
+      ansible.builtin.set_fact:
+        _revoke_other_active_sharing_tag: >-
+          {{ revoke_sibling_contents.results | default([])
+             | map(attribute='content') | map('b64decode') | map('from_yaml')
+             | selectattr('identity.handle', 'ne', manifest.identity.handle)
+             | selectattr('identity.status', 'eq', 'active')
+             | selectattr('vendor.short_tag', 'defined')
+             | selectattr('vendor.short_tag', 'eq', manifest.vendor.short_tag)
+             | list | length }}
+      when:
+        - onboard_action == 'revoke'
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - manifest.vendor is defined
+        - manifest.vendor.short_tag is defined
+
+    - name: "revoke/Zenoh: DELETE vendor (last active member, or org scope)"
+      ansible.builtin.uri:
+        url: "{{ zenoh_trial_portal_url }}/api/vendors/{{ manifest.zenoh.trial.vendor }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ lookup('env', zenoh_trial_portal_key_var) }}"
+        status_code: [200, 204, 404]
+      register: revoke_zenoh_delete
+      when:
+        - onboard_action == 'revoke'
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - _revoke_scope == 'org' or (_revoke_other_active_sharing_tag | default(0) | int) == 0
+        - not ansible_check_mode
+
+    - name: "revoke/Zenoh: skip-note when teammates still share the vendor"
+      ansible.builtin.debug:
+        msg: |
+          Vendor '{{ manifest.zenoh.trial.vendor }}' left intact:
+          {{ _revoke_other_active_sharing_tag }} active teammate(s) still share its CN.
+          {{ manifest.identity.handle }}'s mesh peers were cut in Phase R1, so this
+          person is off the fabric regardless. Pass -e revoke_scope=org to delete
+          the shared vendor (cuts every publisher under that CN).
+      when:
+        - onboard_action == 'revoke'
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - _revoke_scope != 'org'
+        - (_revoke_other_active_sharing_tag | default(0) | int) > 0
+
+    - name: "revoke/Zenoh: GET /api/aliases to verify the org/slot is gone (P1.3a)"
+      ansible.builtin.uri:
+        url: "{{ zenoh_trial_portal_url }}/api/aliases"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ lookup('env', zenoh_trial_portal_key_var) }}"
+        return_content: true
+        status_code: [200]
+      register: revoke_alias_check
+      when:
+        - onboard_action == 'revoke'
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - _revoke_scope == 'org' or (_revoke_other_active_sharing_tag | default(0) | int) == 0
+        - not ansible_check_mode
+
+    - name: "revoke/Zenoh: FAIL if the org alias survived the delete"
+      # Catch the orphan: the portal used to key delete on the uuid
+      # anchor, so a DELETE-by-handle 404'd and left the row + slot, which then
+      # 409'd the next onboard. P1.3b makes the portal accept delete-by-handle;
+      # this asserts the delete actually took, so a silent orphan can never reach
+      # the next operator. See docs/design/onboard-rotate-revoke-streamlining.md.
+      ansible.builtin.fail:
+        msg: |
+          Revoke did NOT free the Zenoh slot for '{{ manifest.zenoh.trial.vendor }}'
+          — its alias is still present in the portal /api/aliases. The org row /
+          slot survived the delete (orphan); the next onboard of this handle will
+          409. If the P1.3b portal fix isn't deployed yet, delete the org row by
+          its uuid anchor in the portal, then re-run this revoke to re-verify.
+      when:
+        - onboard_action == 'revoke'
+        - manifest.zenoh.enabled | default(false)
+        - manifest.zenoh.trial is defined
+        - _revoke_scope == 'org' or (_revoke_other_active_sharing_tag | default(0) | int) == 0
+        - not ansible_check_mode
+        - manifest.zenoh.trial.vendor in (revoke_alias_check.json.aliases | default([]) | map(attribute='alias') | list)
+
+    - name: "revoke: ensure output dir exists"
+      ansible.builtin.file:
+        path: "{{ out_dir }}"
+        state: directory
+        mode: "0700"
+      when:
+        - onboard_action == 'revoke'
+        - not ansible_check_mode
+
+    - name: "revoke: write revoke receipt"
+      ansible.builtin.copy:
+        dest: "{{ out_dir }}/{{ manifest.identity.handle }}-revoke-receipt-{{ ansible_date_time.iso8601_basic_short }}.md"
+        mode: "0600"
+        content: |
+          # Revoke receipt — {{ manifest.identity.handle }}
+          ts:     {{ ansible_date_time.iso8601 }}
+          actor:  {{ lookup('env', 'USER') | default('unknown') }}
+          scope:  {{ _revoke_scope }}
+          org:    {{ _revoke_org_id | default('(none)') }}  (affiliation)
+          purge:  {{ _revoke_purge }}
+          {% if _revoke_scope == 'org' %}
+          org cascade — active affiliation siblings ({{ _revoke_org_active_siblings | default([]) | length }}): {{ _revoke_org_active_siblings | default([]) | join(', ') }}
+          (blast radius; per-sibling cut pending the cascade-execution increment — revoke each explicitly until then)
+          {% endif %}
+
+          NetBird peers cut ({{ revoke_nb_targets | default([]) | length }}):
+          {% for p in revoke_nb_targets | default([]) %}
+            - {{ p.name }}  ({{ p.site }})  id={{ p.id }}
+          {% endfor %}
+
+          Ory site identity: {{ 'DELETED' if _revoke_purge else 'deactivated' }} at {{ manifest.ory_site.sites | default([]) | join(', ') if manifest.ory_site.enabled else 'n/a' }}
+          Zenoh vendor: {{ manifest.zenoh.trial.vendor | default('n/a') if (manifest.zenoh.enabled | default(false) and manifest.zenoh.trial is defined) else 'n/a' }} — {{ 'DELETED (de-authorized at router)' if (revoke_zenoh_delete.status | default(0)) in [200, 204] else 'left intact (' ~ (_revoke_other_active_sharing_tag | default(0)) ~ ' active teammates)' }}
+
+          Residual: any peer enrolled out-of-band (not via this playbook) is
+          not in this enumeration; reconcile via the peer-naming probe.
+      when:
+        - onboard_action == 'revoke'
+        - not ansible_check_mode
+
+    - name: "revoke: flip manifest status active -> revoked (reversible path)"
+      # Use the env-aware manifest_path (honors operator_env -> the per-env
+      # subfolder ops/operators/<env>/<handle>.yml), NOT a hardcoded flat path.
+      # The flat path silently fails to find per-env manifests, so a revoke
+      # errors at the status flip after the mesh cut has already run.
+      ansible.builtin.replace:
+        path: "{{ manifest_path }}"
+        regexp: '^(\s*status:\s*)active\s*$'
+        replace: '\g<1>revoked'
+      when:
+        - onboard_action == 'revoke'
+        - not _revoke_purge
+        - not ansible_check_mode
+        # P1.5 — repair's revoke leg must leave status active for the enroll leg.
+        - not (onboard_repair | bool)
+
+    - name: "Phase R — revoke: --check plan summary"
+      ansible.builtin.debug:
+        msg: |
+          [--check] REVOKE plan for {{ manifest.identity.handle }} (scope={{ _revoke_scope }}, purge={{ _revoke_purge }}):
+            org (affiliation): {{ _revoke_org_id | default('(none)') }}
+            NetBird peers to cut: {{ revoke_nb_targets | default([]) | map(attribute='name') | list }}
+            Ory site identities:  {{ 'DELETE' if _revoke_purge else 'deactivate' }} at {{ manifest.ory_site.sites | default([]) | join(', ') if manifest.ory_site.enabled else 'n/a' }}
+            Zenoh vendor {{ manifest.zenoh.trial.vendor | default('n/a') }}: {{ 'DELETE' if (_revoke_scope == 'org' or (_revoke_other_active_sharing_tag | default(0) | int) == 0) else 'leave intact (teammates active)' }}
+          {% if _revoke_scope == 'org' %}
+            ORG CASCADE — active affiliation siblings ({{ _revoke_org_active_siblings | default([]) | length }}): {{ _revoke_org_active_siblings | default([]) }}
+            NOTE: per-sibling cut is not yet executed (the cascade-execution increment is pending). This person + the shared-CN delete are applied now; the siblings above are the blast radius a full cascade WILL cut — revoke each explicitly until cascade-execution lands.
+          {% endif %}
+      when:
+        - onboard_action == 'revoke'
+        - ansible_check_mode
+
+    # --------------------------------------------------------------
+    # Phase 5 — OOB bundle assembly
+    # --------------------------------------------------------------
+    # Renders a markdown bundle the operator delivers out-of-band to
+    # the new person. Bundle is gitignored (ops/operators/out/).
+    # In --check mode, bundle content is printed to stdout instead of
+    # written to disk.
+    # --------------------------------------------------------------
+
+    - name: "Ensure output directory exists"
+      ansible.builtin.file:
+        path: "{{ out_dir }}"
+        state: directory
+        mode: "0700"
+      when:
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    - name: "Render OOB bundle"
+      ansible.builtin.template:
+        src: operator-onboard/bundle.md.j2
+        dest: "{{ bundle_path }}"
+        mode: "0600"
+      when:
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    - name: "Display bundle path"
+      ansible.builtin.debug:
+        msg: |
+          OOB bundle: {{ bundle_path }}
+          Deliver this file to {{ manifest.identity.name }} ({{ manifest.identity.email }})
+          out-of-band. Do NOT commit. Do NOT email plaintext. Use Matrix DM
+          / signal / 1Password share with an expiring link.
+      when:
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+
+    - name: "Bundle-completeness gate (fail loud on silent partials)"
+      # Convert the silent-partial failure into a hard error: assert
+      # that every surface the manifest ENABLES actually rendered into the bundle
+      # (no per-surface 'not provisioned' / 'Provisioning gap' / 'not in this
+      # bundle' marker). Surface-specific strings only — the generic 'not
+      # provisioned' also covers the optional Operator-IdP section, which is a
+      # different surface and is NOT gated here.
+      # See docs/design/onboard-rotate-revoke-streamlining.md (P1.1).
+      vars:
+        _bundle_text: "{{ lookup('file', bundle_path) }}"
+        _incomplete: >-
+          {{
+            ((['NetBird mesh'] if 'NetBird mesh access not provisioned' in _bundle_text else [])
+              if manifest.netbird.enabled else [])
+            + ((['Ory login'] if ('Provisioning gap' in _bundle_text
+                                   or 'Site-Kratos identity not provisioned' in _bundle_text) else [])
+              if manifest.ory_site.enabled else [])
+            + ((['Zenoh portal key'] if ('not in this bundle' in _bundle_text
+                                         or 'Zenoh access not provisioned' in _bundle_text) else [])
+              if manifest.zenoh.enabled else [])
+          }}
+      ansible.builtin.fail:
+        msg: |
+          Bundle is INCOMPLETE for enabled surface(s): {{ _incomplete | join(', ') }}.
+          A surface the manifest enables did not provision, so the bundle at
+          {{ bundle_path }} would be delivered half-broken (the silent-partial
+          failure mode of 2026-06-23). Do NOT deliver it.
+
+          Likely causes + fixes:
+            - operator env tokens not loaded -> run the onboard under direnv
+              (e.g. `direnv exec . goat admin onboard ...`)
+            - site Thor / portal unreachable -> check the mesh + portal /api/health
+            - Ory identity-create 400 (affiliation-trait cutover wedge) -> see
+              docs/design/onboard-rotate-revoke-streamlining.md (P1.7)
+          To repair: clear the partial server-side state for this principal
+          (revoke + verify the NetBird peer / Kratos identity / portal org row are
+          gone), then re-run so all enabled surfaces mint together in one render.
+      when:
+        - onboard_action == 'enroll'
+        - not ansible_check_mode
+        - _incomplete | length > 0
+
+    - name: "Print planned bundle (--check mode)"
+      ansible.builtin.debug:
+        msg: |
+          [--check mode] Would render bundle at {{ bundle_path }}.
+          Re-run without --check to actually mint + write.
+      when: ansible_check_mode
+
+    # --------------------------------------------------------------
+    # Phase 6 — Audit log
+    # --------------------------------------------------------------
+    # Append a row to ops/operators/audit.log (gitignored). One JSON
+    # line per orchestrator invocation. Stable schema so the file is
+    # grep-able + jq-queryable for cohort + access reviews.
+    # --------------------------------------------------------------
+
+    - name: "Append audit row"
+      ansible.builtin.lineinfile:
+        path: "{{ audit_log_path }}"
+        line: >-
+          {
+            "ts": "{{ ansible_date_time.iso8601 }}",
+            "actor": "{{ lookup('env', 'USER') | default('unknown') }}",
+            "operator_handle": "{{ manifest.identity.handle }}",
+            "operator_email": "{{ manifest.identity.email }}",
+            "action": "{{ onboard_action }}",
+            "check_mode": {{ ansible_check_mode | lower }},
+            "netbird_sites": {{ manifest.netbird.sites | default([]) | to_json }},
+            "ory_site_sites": {{ manifest.ory_site.sites | default([]) | to_json }},
+            "ory_idp_sites": {{ manifest.ory_idp.sites | default([]) | to_json }},
+            "zenoh_enabled": {{ manifest.zenoh.enabled | lower }},
+            "zenoh_vendor": "{{ manifest.zenoh.trial.vendor | default('', true) if manifest.zenoh.enabled else '' }}",
+            "zenoh_portal_status": {{ zenoh_vendor_provisioned.status | default('null') }}
+          }
+        create: true
+        mode: "0600"
+        insertafter: EOF
+      when: not ansible_check_mode
+
+    - name: "Regenerate the sanitized roster index from the manifests"
+      # Replaces the old manual "add a line to roster.md" step. Runs for
+      # both enroll (new member) and revoke (status flipped to revoked in
+      # Phase R5.3) — Phase 6 executes on both actions. The manifests are
+      # the SoT; roster.md is the derived, committed, public-safe index
+      # (the Data-Access COP's declared half). See ops/operators/gen-roster.py.
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../operators/gen-roster.py"
+      changed_when: true
+      when: not ansible_check_mode
+
+    - name: "Final summary"
+      ansible.builtin.debug:
+        msg: |
+          {{ '[--check]' if ansible_check_mode else '[DONE]' }} {{ onboard_action }} for {{ manifest.identity.handle }} ({{ manifest.identity.email }}).
+          {{ 'Bundle path: ' + bundle_path if not ansible_check_mode else 'No bundle written (--check).' }}
+          {{ 'Audit log: ' + audit_log_path if not ansible_check_mode else '' }}
+
+          Next steps (manual, not part of this playbook per Q1 decision):
+          - Stash the bundle in 1Password under goat-cluster-secrets/operators/{{ manifest.identity.handle }}
+          - Commit the regenerated docs/operators/roster.md (Phase 6.1b ran
+            gen-roster.py from the manifests; review the diff first).

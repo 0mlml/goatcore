@@ -1,0 +1,97 @@
+# Install the SSH keys an admin APPROVED in the console, and report back what
+# actually landed. This is the third leg of the self-service flow
+# (docs/design/ssh-key-self-service.md):
+#
+#   person submits  ->  admin approves  ->  THIS installs  ->  console says installed
+#
+# It exists so that `approved` and `installed` stay different words. Approval is
+# a decision; installation is a fact about a host. Collapsing them is how the
+# old welcome email came to tell people they had access they did not have.
+#
+# Run:
+#   ansible-playbook -i inventory/mgmt-hosts-mesh.ini operator-ssh-key-install.yml \
+#     -e onboard_env=<site>
+#   add -e ssh_key_install_check=true to see what WOULD be installed and skip
+#   every write and every state change.
+#
+# It is idempotent: lineinfile converges, and a row already `installed` is not
+# re-fetched because the queue is filtered to `approved`.
+- name: Install approved SSH keys on the hosts each operator's role may reach
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ssh_key_install_check: false
+    # Where the manifests live on the runner host. Groups come from the
+    # manifest, not from the key row: the key row records WHO submitted, the
+    # manifest records what they ARE, and scope is a property of the latter.
+    operator_manifest_root: "{{ onboard_runner_repo | default('/var/lib/onboard-runner/repo') }}/ops/operators"
+    # Operator API key — either supplied as an extra-var (`-e onboard_api_key=<key>`)
+    # or read from the ONBOARD_API_KEY environment variable. The CLI wrapper
+    # deliberately uses the env path so the key never appears on argv. Extra-vars
+    # still override this default per Ansible precedence.
+    onboard_api_key: "{{ lookup('env', 'ONBOARD_API_KEY') }}"
+  tasks:
+    - name: "S0 — refuse to run without a target goatnet"
+      ansible.builtin.assert:
+        that:
+          - onboard_env is defined
+          - onboard_env | length > 0
+        fail_msg: >-
+          Pass -e onboard_env=<goatnet>. Without it this would read one
+          goatnet's approved keys and install them using another goatnet's
+          host list.
+
+    # NOT derived from a container name. `http://goat-id-console:8080` resolves
+    # only inside the mgmt host's docker network; from anywhere else it fails,
+    # and a wrong-but-plausible default would have this run against the wrong
+    # goatnet's console. Supply it explicitly:
+    #
+    #   -e onboard_api_base=https://<console fqdn on the mesh>
+    #   -e onboard_api_key="$YOUR_ONBOARD_API_KEY"
+    #
+    # or run the play on the mgmt host itself with the internal URL.
+    #
+    # Use your PERSONAL onboard API key, not the shared runner key: the console
+    # attributes every installed / skip-report event to the handle the key
+    # resolves to, and "onboard-runner-<env>" in the audit trail says
+    # nothing about who actually ran the play.
+    - name: "S0.1 — refuse to run without an explicit console endpoint and key"
+      ansible.builtin.assert:
+        that:
+          - onboard_api_base is defined and (onboard_api_base | length) > 0
+          - onboard_api_key is defined and (onboard_api_key | length) > 0
+        fail_msg: >-
+          Pass -e onboard_api_base=<console url> and set the operator API key
+          in the environment (ONBOARD_API_KEY=<key>) or as -e onboard_api_key=<key>.
+          There is deliberately no default: the container-internal URL only works
+          from the mgmt host, and a guessed one could point this run at another
+          goatnet's console.
+
+    - name: "S1 — load this goatnet's group_vars (scopes live there)"
+      ansible.builtin.include_vars:
+        file: "group_vars/{{ onboard_env | replace('-', '_') }}_hosts/vars.yml"
+
+    - name: "S2 — fetch the approved queue from the console"
+      ansible.builtin.uri:
+        url: "{{ onboard_api_base }}/api/onboard/ssh-keys?status=approved"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ onboard_api_key }}"
+        status_code: [200]
+        return_content: true
+      register: approved_q
+      no_log: true
+
+    - name: "S3 — report the queue depth"
+      ansible.builtin.debug:
+        msg: >-
+          {{ (approved_q.json | default([])) | length }} approved key(s) awaiting
+          install on {{ onboard_env }}{{ ssh_key_install_check | ternary(' (CHECK MODE — nothing will be written)', '') }}
+
+    - name: "S4 — install each approved key"
+      when: (approved_q.json | default([])) | length > 0
+      loop: "{{ approved_q.json }}"
+      loop_control:
+        loop_var: key_row
+        label: "{{ key_row.handle }} {{ key_row.fingerprint }}"
+      ansible.builtin.include_tasks: tasks/operator-ssh-key-install-one.yml

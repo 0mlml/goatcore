@@ -1,0 +1,38 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# onboard-runner-deploy.yml — operator-fired deploy of the onboard-runner
+# auto-executor on the site Thor. Thin wrapper around the role.
+# Design: docs/design/operator-onboard-intake.md §"Fast-follow".
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini \
+#     onboard-runner-deploy.yml -e target=<site>_hosts
+#
+# Prerequisites (operator-side):
+#   1. The onboard-runner container image built + pushed (the onboard-runner-image
+#      workflow), digest pinned in group_vars (onboard_runner_image).
+#   2. goat >= 0.4.15 already installed on the Thor at onboard_runner_goat_bin_host
+#      (bind-mounted into the container; from the get.<site> surface / release).
+#   3. <SITE>_ONBOARD_RUNNER_PORTAL_KEY + <SITE>_NB_API_TOKEN in the deploy env, and
+#      the runner key added to the portal's PORTAL_OPERATOR_API_KEYS as
+#      onboard-runner-<site>:<key>.
+#
+# GO-LIVE: default-off. This deploy renders the compose + creds but leaves the
+# container DOWN. Re-run with `-e onboard_runner_enabled=true` to bring it up.
+
+- name: Deploy onboard-runner
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    admin_write_surface: "onboard-runner (executes onboarding mutations against the portal + mgmt API)"
+  pre_tasks:
+    # Single-homed per ADR 1084 §D3 — the ledger lists one host. Two
+    # runners on one goatnet would each auto-execute the same intake queue.
+    - name: "Guard — admin surfaces are single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+  roles:
+    - onboard-runner

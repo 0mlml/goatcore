@@ -1,0 +1,430 @@
+---
+# portal-postgres-rollback.yml — put one goatnet's portal registry back on
+# SQLite after portal-postgres-cutover.yml (ADR 1165 step A,
+# docs/design/island-mode-multi-writer.md §5 step A6). Runbook:
+# docs/operations/portal-postgres-cutover.md §Rollback. Run with the operator present.
+#
+# Usable while the cutover archive is inside its retain_until (28 days). Every
+# input is read from the host: the archive CURRENT points at, its MANIFEST (the
+# original path and the image that ran before the cutover), and the store marker.
+#
+#   0 GATE  router_role A host only; an archive with a MANIFEST, inside retain_until;
+#           the previous image is SQLite-era; the env vars the portal deploy
+#           templates resolve. Decides the mode from the marker:
+#             postgres  -> export: Postgres holds rows written since the cutover
+#             otherwise -> restore: the import never committed (or this host was
+#                          already rolled back), the file in place is the
+#                          archived bytes
+#   1 A     stop the portal and budget-notify (its Postgres reader would read
+#           rows the SQLite portal no longer writes).
+#   2 A     export (export mode only): store-migrate export to a fresh SQLite
+#           file in <archive>-rollback-<UTC stamp>/, compared table by table with
+#           Postgres (rows + sha256); report kept beside it.
+#   3 A     put the file at the original path, owned by the portal user, 0644;
+#           any -wal/-shm/-journal moved aside first; the host marker set to
+#           sqlite.
+#   4 A     re-pin the previous image and start it through the goat-zenoh-portal
+#           role with the store set to sqlite (ledger row included); restart the
+#           registry-wal-signals timer where its unit is still installed.
+#   5 GATE  /api/health healthy; the running image is the previous image; the
+#           compose command carries --db=<original path> and the env no DSN.
+#
+# Schema files, bundles and recipient certs never moved, and export keeps every
+# id, so the SQLite portal finds each file where it was.
+#
+# The Postgres database is left as it is. The committed config still says
+# postgres and still pins the Postgres-era image; until the operator reverts both
+# (or cuts over again), the store gate refuses every routine portal deploy to
+# this goatnet, which keeps it from starting a Postgres portal on stale data.
+#
+# Usage (from ops/ansible):
+#   ../scripts/with-secrets ../scripts/ansible-preflight.sh <inventory flags> \
+#     portal-postgres-rollback.yml -e target=<group>
+
+- name: portal — registry Postgres to SQLite rollback (ADR 1165 step A)
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    admin_write_surface: "goat-zenoh-portal (registry Postgres to SQLite rollback)"
+    gzpr_container: "{{ portal_container_name | default('goat-zenoh-portal') }}"
+    gzpr_data_dir: "{{ portal_data_dir | default('/opt/goat-zenoh-portal') }}"
+    gzpr_env_file: "{{ gzpr_data_dir }}/.env"
+    gzpr_compose_file: "{{ gzpr_data_dir }}/docker-compose.yml"
+    gzpr_listen_port: "{{ portal_listen_port | default(8090) }}"
+    gzpr_network: "{{ portal_traefik_network | default('mgmt') }}"
+    gzpr_repo: "{{ playbook_dir | dirname | dirname }}"
+    gzpr_portal_uid: "65532"
+
+  tasks:
+    # ======================================================================
+    # Phase 0 — GATE. Reads only.
+    # ======================================================================
+    - name: "gate | the portal host only — single-homed (ADR 1084 §D3); other members end here"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+      tags: [phase0]
+
+    - name: "gate | load the store facts (goat-zenoh-portal-store, no deploy dependency)"
+      ansible.builtin.include_role:
+        name: goat-zenoh-portal-store
+        tasks_from: facts.yml
+        public: true
+      tags: [always]
+
+    - name: "gate | which archive the cutover made"
+      ansible.builtin.slurp:
+        src: "{{ portal_sqlite_archive_root }}/CURRENT"
+      register: gzpr_current
+      tags: [always]
+
+    - name: "gate | its manifest"
+      ansible.builtin.slurp:
+        src: "{{ portal_sqlite_archive_root }}/{{ gzpr_current.content | b64decode | trim }}/MANIFEST.yml"
+      register: gzpr_manifest_raw
+      tags: [always]
+
+    - name: "gate | read the store marker"
+      ansible.builtin.slurp:
+        src: "{{ portal_store_marker }}"
+      register: gzpr_marker
+      failed_when: false
+      tags: [always]
+
+    - name: "gate | archive, manifest, mode"
+      ansible.builtin.set_fact:
+        gzpr_archive: "{{ portal_sqlite_archive_root }}/{{ gzpr_current.content | b64decode | trim }}"
+        gzpr_manifest: "{{ gzpr_manifest_raw.content | b64decode | from_yaml }}"
+        gzpr_mode: >-
+          {{ 'export'
+             if (gzpr_marker.content | default('') | length > 0)
+                and ((gzpr_marker.content | b64decode).splitlines() | first | trim) == 'postgres'
+             else 'restore' }}
+        gzpr_stamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+      tags: [always]
+
+    - name: "gate | the archive is inside its retention window"
+      ansible.builtin.assert:
+        that:
+          - (ansible_facts['date_time']['date']) <= gzpr_manifest.retain_until
+        fail_msg: >-
+          REFUSING: the cutover archive {{ gzpr_archive }} was kept until
+          {{ gzpr_manifest.retain_until }}; today is {{ ansible_facts['date_time']['date'] }}.
+          The rollback this playbook performs is the 28-day one in
+          docs/design/island-mode-multi-writer.md §5; past it, Postgres
+          point-in-time restore is the way back.
+        quiet: true
+      tags: [phase0]
+
+    - name: "gate | every env var the portal deploy templates resolves here"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ gzpr_repo }}/ops/scripts/deploy-secrets-needed.py"
+          - --repo
+          - "{{ gzpr_repo }}"
+          - --component
+          - portal
+          - --ledger
+          - goat-zenoh-portal
+          - --play
+          - "{{ gzpr_repo }}/ops/ansible/portal-deploy.yml"
+          - "{{ target }}"
+      register: gzpr_secrets
+      changed_when: false
+      failed_when: gzpr_secrets.rc != 0
+      delegate_to: localhost
+      become: false
+      run_once: true
+      tags: [phase0]
+
+    - name: "gate | export mode needs the portal's database password"
+      ansible.builtin.assert:
+        that:
+          - portal_db_password | default('') | length > 0
+        fail_msg: >-
+          REFUSING: {{ portal_db_password_env }} is empty here, and this host's rows
+          are in Postgres. Run through ops/scripts/with-secrets (ADR 1186).
+        quiet: true
+      when: gzpr_mode == 'export'
+      tags: [phase0]
+
+    - name: "gate | pull the previous image"
+      ansible.builtin.command:
+        argv: ["docker", "pull", "{{ gzpr_manifest.previous_image }}"]
+      register: gzpr_pull
+      changed_when: "'Downloaded newer image' in gzpr_pull.stdout"
+      tags: [phase0]
+
+    - name: "gate | the previous image is SQLite-era"
+      ansible.builtin.command:
+        argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ gzpr_manifest.previous_image }}"]
+      register: gzpr_prev_labels
+      changed_when: false
+      failed_when: >-
+        gzpr_prev_labels.rc != 0
+        or ((gzpr_prev_labels.stdout | from_json | default({}, true))[portal_store_label] | default('sqlite')) != 'sqlite'
+      tags: [phase0]
+
+    - name: "gate | export mode: the image that runs store-migrate (the current pin)"
+      ansible.builtin.command:
+        argv: ["docker", "inspect", "--format", !unsafe '{{.Config.Image}}', "{{ gzpr_container }}"]
+      register: gzpr_running_image
+      changed_when: false
+      when: gzpr_mode == 'export'
+      tags: [always]
+
+    - name: "gate | export mode: the running image carries store-migrate (Postgres-era)"
+      ansible.builtin.command:
+        argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ gzpr_running_image.stdout | trim }}"]
+      register: gzpr_running_labels
+      changed_when: false
+      failed_when: >-
+        gzpr_running_labels.rc != 0
+        or ((gzpr_running_labels.stdout | from_json | default({}, true))[portal_store_label] | default('')) != 'postgres'
+      when: gzpr_mode == 'export'
+      tags: [phase0]
+
+    - name: "gate | preflight passed"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: mode {{ gzpr_mode }}; archive {{ gzpr_archive }}
+          (retain until {{ gzpr_manifest.retain_until }}); back to {{ gzpr_manifest.previous_image }}
+      tags: [phase0]
+
+    # ======================================================================
+    # Phase 1 — A: stop the portal and the Postgres-side registry reader.
+    # ======================================================================
+    - name: "stop budget-notify (absent is fine)"
+      ansible.builtin.command:
+        argv: ["systemctl", "stop", "budget-notify.timer"]
+      register: gzpr_bn_stop
+      changed_when: gzpr_bn_stop.rc == 0
+      # 5 = unit not loaded: a goatnet that never ran it.
+      failed_when: gzpr_bn_stop.rc not in [0, 5]
+      tags: [phase1]
+
+    - name: "stop the portal"
+      ansible.builtin.command:
+        argv: ["docker", "stop", "{{ gzpr_container }}"]
+      register: gzpr_stop
+      changed_when: true
+      failed_when: gzpr_stop.rc != 0 and 'No such container' not in gzpr_stop.stderr
+      tags: [phase1]
+
+    # ======================================================================
+    # Phase 2 — A: export Postgres to a fresh SQLite file.
+    # ======================================================================
+    - name: "export (export mode)"
+      when: gzpr_mode == 'export'
+      tags: [phase2]
+      block:
+        - name: "a fresh directory beside the archive, writable by the portal user"
+          ansible.builtin.file:
+            path: "{{ gzpr_archive }}-rollback-{{ gzpr_stamp }}"
+            state: directory
+            owner: "{{ gzpr_portal_uid }}"
+            group: "{{ gzpr_portal_uid }}"
+            mode: "0755"
+
+        - name: "store-migrate export (per-table rows + sha256; refuses on any difference)"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - run
+              - --rm
+              - --network
+              - "{{ gzpr_network }}"
+              - --user
+              - "{{ gzpr_portal_uid }}:{{ gzpr_portal_uid }}"
+              - -v
+              - "{{ gzpr_archive }}-rollback-{{ gzpr_stamp }}:/out"
+              - -e
+              - PORTAL_DB_DSN
+              - --entrypoint
+              - /usr/local/bin/store-migrate
+              - "{{ gzpr_running_image.stdout | trim }}"
+              - export
+              - --sqlite
+              - /out/registry.db
+          environment:
+            PORTAL_DB_DSN: "{{ portal_db_dsn }}"
+          register: gzpr_export
+          changed_when: true
+
+        - name: "the export report"
+          ansible.builtin.debug:
+            msg: "{{ gzpr_export.stdout_lines }}"
+
+        - name: "keep the report beside the exported file"
+          ansible.builtin.copy:
+            dest: "{{ gzpr_archive }}-rollback-{{ gzpr_stamp }}/export-report.txt"
+            content: "{{ gzpr_export.stdout }}\n"
+            owner: root
+            group: root
+            mode: "0444"
+      rescue:
+        - name: "export refused — portal stopped, nothing moved"
+          ansible.builtin.fail:
+            msg: |
+              EXPORT REFUSED on {{ inventory_hostname }}; no file was moved.
+              {{ gzpr_export.stdout | default('') }}
+              {{ gzpr_export.stderr | default(ansible_failed_result.msg | default('')) }}
+              The portal is STOPPED. Postgres is unchanged. To bring the Postgres
+              portal back as it was: re-run the normal deploy
+              (ops/scripts/deploy-component.sh portal --goatnet <key>), then
+              budget-notify-deploy.yml; the host marker still says postgres, so the
+              store gate admits it.
+
+    # ======================================================================
+    # Phase 3 — A: file at the original path, marker to sqlite.
+    # ======================================================================
+    - name: "WAL, shared-memory or journal files beside the original path"
+      ansible.builtin.stat:
+        path: "{{ gzpr_manifest.registry.original_path }}{{ item }}"
+      loop: ['-wal', '-shm', '-journal']
+      register: gzpr_sidecars
+      tags: [phase3]
+
+    - name: "move them aside (a stale WAL would be replayed into the restored file)"
+      ansible.builtin.command:
+        argv: ["mv", "{{ item.stat.path }}", "{{ gzpr_archive }}-rollback-{{ gzpr_stamp }}-{{ item.stat.path | basename }}"]
+      loop: "{{ gzpr_sidecars.results | selectattr('stat.exists') | list }}"
+      loop_control:
+        label: "{{ item.stat.path }}"
+      changed_when: true
+      tags: [phase3]
+
+    - name: "export mode: the exported file replaces the original"
+      ansible.builtin.copy:
+        src: "{{ gzpr_archive }}-rollback-{{ gzpr_stamp }}/registry.db"
+        dest: "{{ gzpr_manifest.registry.original_path }}"
+        remote_src: true
+        owner: "{{ gzpr_portal_uid }}"
+        group: "{{ gzpr_portal_uid }}"
+        mode: "0644"
+      when: gzpr_mode == 'export'
+      tags: [phase3]
+
+    - name: "restore mode: sha256 of the file in place"
+      ansible.builtin.stat:
+        path: "{{ gzpr_manifest.registry.original_path }}"
+        checksum_algorithm: sha256
+      register: gzpr_inplace
+      when: gzpr_mode == 'restore'
+      tags: [phase3]
+
+    # Restore mode either follows a refused import (the file in place is the
+    # archived bytes, made 0444) or re-runs after an earlier rollback (it is that
+    # rollback's export, already 0644). Either is fine to start on; a file that
+    # is neither is not, and the archive copy is put back in its place.
+    - name: "restore mode: a file that is neither the archive nor writable comes from the archive"
+      ansible.builtin.copy:
+        src: "{{ gzpr_archive }}/{{ gzpr_manifest.registry.file }}"
+        dest: "{{ gzpr_manifest.registry.original_path }}"
+        remote_src: true
+        owner: "{{ gzpr_portal_uid }}"
+        group: "{{ gzpr_portal_uid }}"
+        mode: "0644"
+      when:
+        - gzpr_mode == 'restore'
+        - >-
+          not gzpr_inplace.stat.exists
+          or (gzpr_inplace.stat.checksum != gzpr_manifest.registry.sha256 and gzpr_inplace.stat.mode != '0644')
+      tags: [phase3]
+
+    - name: "the file at the original path belongs to the portal user, 0644"
+      ansible.builtin.file:
+        path: "{{ gzpr_manifest.registry.original_path }}"
+        owner: "{{ gzpr_portal_uid }}"
+        group: "{{ gzpr_portal_uid }}"
+        mode: "0644"
+      tags: [phase3]
+
+    - name: "record on the host that the registry's rows are in SQLite"
+      ansible.builtin.copy:
+        dest: "{{ portal_store_marker }}"
+        content: |
+          sqlite
+          rolled back {{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }} ({{ gzpr_mode }}) by ops/ansible/portal-postgres-rollback.yml; archive {{ gzpr_archive }}
+        owner: root
+        group: root
+        mode: "0644"
+      tags: [phase3]
+
+    # ======================================================================
+    # Phase 4 — A: previous image, SQLite store, through the normal role.
+    # ======================================================================
+    - name: "re-pin the previous image, the SQLite store and its path for this run"
+      ansible.builtin.set_fact:
+        portal_image: "{{ gzpr_manifest.previous_image }}"
+        portal_store: sqlite
+        portal_db_path: "{{ gzpr_manifest.registry.original_path }}"
+      tags: [phase4, phase5]
+
+    - name: "deploy the previous portal (goat-zenoh-portal role)"
+      ansible.builtin.include_role:
+        name: goat-zenoh-portal
+      tags: [phase4]
+
+    # The cutover stopped it; relay-health removes it only on a goatnet whose
+    # group_vars say postgres, so it is usually still installed here.
+    - name: "restart the registry WAL gauges where the unit is still installed"
+      ansible.builtin.command:
+        argv: ["systemctl", "start", "registry-wal-signals.timer"]
+      register: gzpr_wal_start
+      changed_when: gzpr_wal_start.rc == 0
+      # 5 = unit not loaded: relay-health re-installs it once group_vars say sqlite.
+      failed_when: gzpr_wal_start.rc not in [0, 5]
+      tags: [phase4]
+
+    # ======================================================================
+    # Phase 5 — GATE: verify.
+    # ======================================================================
+    - name: "gate | /api/health answers healthy (the binary probes itself)"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ gzpr_container }}"
+          - /usr/local/bin/goat-zenoh-portal
+          - healthcheck
+          - "--url=http://127.0.0.1:{{ gzpr_listen_port }}/api/health"
+      register: gzpr_health
+      changed_when: false
+      until: gzpr_health.rc == 0
+      retries: 15
+      delay: 2
+      tags: [phase5]
+
+    - name: "gate | the running image is the previous image"
+      ansible.builtin.command:
+        argv: ["docker", "inspect", "--format", !unsafe '{{.Config.Image}}', "{{ gzpr_container }}"]
+      register: gzpr_now_image
+      changed_when: false
+      failed_when: gzpr_now_image.stdout | trim != gzpr_manifest.previous_image
+      tags: [phase5]
+
+    - name: "gate | the server gets the SQLite path and no DSN"
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          grep -c '^PORTAL_DB_DSN=' {{ gzpr_env_file | quote }} || true
+          grep -c -- '--db={{ gzpr_manifest.registry.original_path }}$' {{ gzpr_compose_file | quote }} || true
+      register: gzpr_store_inputs
+      changed_when: false
+      failed_when: gzpr_store_inputs.stdout_lines != ['0', '1']
+      tags: [phase5]
+
+    - name: "done — what the operator commits next"
+      ansible.builtin.debug:
+        msg: |
+          ROLLED BACK: {{ inventory_hostname }} serves the portal registry from SQLite on
+          {{ gzpr_manifest.previous_image }} ({{ gzpr_mode }}).
+          Postgres database {{ portal_db_name }} is untouched. budget-notify is STOPPED.
+          The committed config still says postgres; until it changes, every routine
+          portal deploy to {{ target }} refuses. Commit, in one PR:
+            - group_vars/{{ target }}: portal_store: sqlite (or delete the line)
+            - the {{ target }} pin back to {{ gzpr_manifest.previous_image }}
+          then run budget-notify-deploy.yml (SQLite reader), the relay-health deploy
+          (registry-wal-signals) and obs.yml (rules/registry-wal.yml).
+      tags: [phase5]

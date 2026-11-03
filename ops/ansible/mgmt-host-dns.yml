@@ -1,0 +1,186 @@
+---
+# mgmt-host-dns.yml — Deploy mesh DNS (CoreDNS) on a mgmt-host site +
+# add this site's mesh CoreDNS to the Netbird nameserver group (additive,
+# multi-site pattern).
+#
+# Generic for ANY site (vega, future region B, future Karbon swaps).
+# Per-site bind IP is derived from inventory `mesh_ip_a` (Router-A) or
+# `mesh_ip_b` (Router-B); pick which Router runs CoreDNS via `--limit`.
+#
+# Usage:
+#   # for vega Router-A:
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -i inventory/mgmt-hosts-mesh.ini \
+#       -l mgmt-vega-01-orin mgmt-host-dns.yml
+#
+# Pre-requisites:
+#   - Host has a netbird mesh IP (`netbird up` already enrolled it)
+#   - mesh_ip_a (or mesh_ip_b) populated in group_vars/<site>_hosts/vars.yml
+#   - inventory/mgmt-hosts-mesh.ini overrides ansible_host to mesh IP
+#   - NETBIRD_API_TOKEN set in env / .envrc.local
+#   - Docker installed (handled by mgmt-host-baseline.yml)
+#
+# Idempotent — safe to re-run. Adds the host's mesh IP to the netbird
+# nameserver group if not already present; otherwise no-op on the API side.
+#
+# Convention:
+#   - One netbird nameserver group per mesh ("goat-mesh-dns").
+#   - Each site's mgmt CoreDNS adds itself as an entry; peers query
+#     whichever resolver they're closest to (netbird picks one).
+#   - This is "additive" rather than "replace" — NETHOST's resolver remains
+#     in the group alongside vega's, etc.
+
+- name: Deploy mesh DNS (CoreDNS) on mgmt-host site + register with Netbird
+  hosts: "{{ target | mandatory }}"
+  become: true
+
+  vars:
+    # Two possible binds, both optional; at least one MUST be set:
+    # 1) mesh_coredns_bind_ip — netbird-mesh IP (legacy NETHOST + future
+    #    netbird-enrolled mgmt-hosts). "TBD" or empty for goat-prod Orins
+    #    which are NOT netbird peers — in that case the role binds only
+    #    on the wg-cp0 IP.
+    # 2) mesh_coredns_wg_cp0_bind_ip — Block 79 silent-control-plane bind.
+    #    Sourced from inventory's wg_cp0_client_address (set per-host in
+    #    inventory/wg-cp0-prod.ini). When set, allows operator laptops on
+    #    wg-cp0 to resolve mesh-internal hostnames pre-netbird-enrollment.
+    mesh_ip_resolved: "{{ (mesh_ip_a if (router_role | upper == 'A') else (mesh_ip_b | default(''))) | default('') }}"
+    mesh_coredns_bind_ip: "{{ '' if (mesh_ip_resolved in ['TBD', '']) else mesh_ip_resolved }}"
+    mesh_coredns_wg_cp0_bind_ip: "{{ wg_cp0_client_address | default('') }}"
+    netbird_api_token: "{{ lookup('env', 'NETBIRD_API_TOKEN') }}"
+    netbird_api: "https://netbird.legacy.example/api"
+    netbird_nameserver_group_name: "goat-mesh-dns"
+
+  pre_tasks:
+    - name: Validate at least one bind IP is resolvable (netbird-mesh OR wg-cp0)
+      ansible.builtin.assert:
+        that:
+          - (mesh_coredns_bind_ip | length > 0) or
+            (mesh_coredns_wg_cp0_bind_ip | length > 0)
+        fail_msg: >-
+          {{ inventory_hostname }} has neither a netbird mesh IP
+          (mesh_ip_a/b in group_vars) nor a wg-cp0 IP
+          (wg_cp0_client_address in inventory/wg-cp0-prod.ini).
+          One of them must be set before mesh-coredns can bind.
+
+    - name: Validate NETBIRD_API_TOKEN (only when registering with netbird-mesh)
+      ansible.builtin.assert:
+        that: netbird_api_token | length > 0
+        fail_msg: "NETBIRD_API_TOKEN is not set. Export it or add to .envrc.local"
+      when: mesh_coredns_bind_ip | length > 0
+
+  roles:
+    - role: mesh-coredns
+
+  tasks:
+    # -- Additively register this host's mesh CoreDNS in the Netbird group ----
+    # Block 79: skip the netbird-side registration entirely when the host
+    # binds only on wg-cp0 (e.g. goat-prod Orins not on netbird-mesh).
+    # The wg-cp0-bind path is reachable directly by operator laptops via
+    # the silent control plane and doesn't need netbird-side discovery.
+
+    - name: Get existing nameserver groups
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/dns/nameservers"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+        validate_certs: true
+        return_content: true
+      register: ns_groups
+      when: mesh_coredns_bind_ip | length > 0
+
+    - name: Find {{ netbird_nameserver_group_name }} group
+      ansible.builtin.set_fact:
+        mesh_dns_group: >-
+          {{ ns_groups.json
+             | selectattr('name', 'equalto', netbird_nameserver_group_name)
+             | first | default(None) }}
+      when: mesh_coredns_bind_ip | length > 0
+
+    # Block 79 closure: when mesh_coredns_bind_ip is empty
+    # (host is wg-cp0-only — vega-A/B/C, prov-rla/jdn/conus), the
+    # set_fact above is skipped and downstream `when: mesh_dns_group
+    # is not none` evaluates against an UNDEFINED variable → fatal.
+    # Default to None here so the downstream guards behave as designed.
+    - name: Default mesh_dns_group to None when not netbird-mesh-enrolled
+      ansible.builtin.set_fact:
+        mesh_dns_group: null
+      when: mesh_dns_group is not defined
+
+    - name: Compute updated nameservers list (additive, deduped)
+      ansible.builtin.set_fact:
+        ns_existing: "{{ mesh_dns_group.nameservers | map(attribute='ip') | list }}"
+        ns_new_entry:
+          ip: "{{ mesh_coredns_bind_ip }}"
+          ns_type: udp
+          port: "{{ mesh_coredns_port | default(5353) }}"
+      when: mesh_dns_group is not none
+
+    - name: Skip API update if this resolver IP is already in the group
+      ansible.builtin.debug:
+        msg: >-
+          Nameserver group already contains {{ mesh_coredns_bind_ip }}:
+          {{ ns_existing | join(', ') }} — no API update needed.
+      when:
+        - mesh_dns_group is not none
+        - mesh_coredns_bind_ip in (ns_existing | default([]))
+
+    - name: Add this resolver to the nameserver group
+      ansible.builtin.uri:
+        url: "{{ netbird_api }}/dns/nameservers/{{ mesh_dns_group.id }}"
+        method: PUT
+        headers:
+          Authorization: "Token {{ netbird_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ mesh_dns_group.name }}"
+          description: "Mesh DNS — resolves *.netbird.legacy.example via mesh CoreDNS over WireGuard (multi-site)."
+          nameservers: "{{ (mesh_dns_group.nameservers + [ns_new_entry]) }}"
+          domains: "{{ mesh_dns_group.domains }}"
+          groups: >-
+            {{ mesh_dns_group.groups
+               | map(attribute='id')
+               | list
+               if (mesh_dns_group.groups | first) is mapping
+               else mesh_dns_group.groups }}
+          enabled: true
+          primary: "{{ mesh_dns_group.primary }}"
+          search_domains_enabled: "{{ mesh_dns_group.search_domains_enabled }}"
+        status_code: 200
+      when:
+        - mesh_dns_group is not none
+        - mesh_coredns_bind_ip not in (ns_existing | default([]))
+      register: ns_update
+
+    - name: Show nameserver group additive update result
+      ansible.builtin.debug:
+        msg: >-
+          Added {{ mesh_coredns_bind_ip }}:{{ mesh_coredns_port | default(5353) }}
+          to nameserver group {{ mesh_dns_group.name }}.
+          Resolvers now: {{ (ns_existing + [mesh_coredns_bind_ip]) | join(', ') }}
+      when:
+        - mesh_dns_group is not none
+        - ns_update is defined and ns_update is changed
+
+    - name: Warn if nameserver group not found
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: No nameserver group named '{{ netbird_nameserver_group_name }}' found.
+          Create it via the Netbird dashboard or `nethost-dns.yml`.
+          Available groups: {{ ns_groups.json | map(attribute='name') | list }}
+      when:
+        - mesh_coredns_bind_ip | length > 0
+        - mesh_dns_group is none
+
+    - name: Skipped netbird registration (wg-cp0-only host)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} binds CoreDNS only on wg-cp0
+          ({{ mesh_coredns_wg_cp0_bind_ip }}); skipping netbird
+          nameserver-group registration. Operator laptops resolve
+          mesh-internal hostnames via the per-laptop split-DNS config
+          set up by docs/operations/operator-laptop-onboarding.md.
+      when: mesh_coredns_bind_ip | length == 0

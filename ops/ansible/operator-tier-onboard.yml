@@ -1,0 +1,458 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# operator-tier-onboard.yml — provision the BACKEND-OPERATOR tier for a person
+# who already has (or will get) a participant identity. Codifies the operator
+# ceremony (admin-operator-guide):
+#
+#   1. mint the operator Zenoh leaf  (CN operator-trial-peer → writes ops/**)
+#   2. install the operator's host SSH key
+#   3. grant the Ory ADMINS group     (PATCH — works on an EXISTING identity,
+#                                       unlike the participant orchestrator's
+#                                       create-or-skip Phase 2)
+#   4. assemble the operator bundle    (cert + key + CA root + NOTES)
+#   5. PRINT the two blast-radius additions the operator applies by hand:
+#      the portal operator key (→ PORTAL_OPERATOR_API_KEYS + a portal redeploy)
+#      and the age recipient (→ 40-dev-ca-operators.envrc). These touch secret
+#      files + need a redeploy/ceremony, so they are printed, never auto-edited.
+#
+# ADDITIVE + SAFE: this is a NEW playbook, separate from operator-onboard.yml —
+# it never touches the live participant-onboarding path. The eventual
+# `goat admin operator onboard <handle>` wraps this (P2 of F-212 follow-ups).
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/ansible-preflight.sh \
+#     -i localhost, --connection local \
+#     operator-tier-onboard.yml -e operator=<handle> -e operator_env=<env>
+#
+# Manifest: ops/operators/<env>/<handle>.yml MUST carry an `operator:` block:
+#   operator:
+#     enabled: true
+#     ssh_pubkey: "ssh-ed25519 AAAA... handle@<env>-operator"
+#     age_recipient: "age1..."        # printed for the audit roster
+#     portal_admin: true              # mint + print a portal operator key
+#     zenoh_operator_cert: true       # mint the operator-trial-peer leaf
+#     groups: [ADMINS]                # Ory admin groups to PATCH on
+#
+# Status: syntax-validated, codifies proven manual steps.
+
+- name: "operator-tier onboard"
+  hosts: localhost
+  connection: local
+  # ansible.cfg sets `become = true` globally; the operator-tier work needs NO
+  # root — local cert-sign + bundle files must be owned by the operator running
+  # this (else they can't read their own bundle), the SSH-key install edits
+  # goat's own authorized_keys, and the Kratos calls curl localhost.
+  # Without this the bundle dir + key came out root-owned (caught in e2e).
+  become: false
+  gather_facts: false
+  vars:
+    repo_root: "{{ playbook_dir }}/.."
+    onboard_env: "{{ operator_env | default('nova') }}"
+    operator_handle: "{{ operator }}"
+    manifest_path: >-
+      {{ repo_root }}/operators/{{ (onboard_env ~ '/') if (operator_env is defined and operator_env | length > 0) else '' }}{{ operator_handle }}.yml
+    out_dir: "{{ repo_root }}/operators/out"
+    op_bundle_dir: "{{ out_dir }}/{{ operator_handle }}-operator"
+
+    # ---- per-goatnet maps (mirror operator-onboard.yml; keep in lock-step) ----
+    # The offline CA the leaf is signed by. A goatnet signs under its own root.
+    op_ca_root_path_map:
+      nova: "{{ repo_root }}/enrollment/ca/nova/root-cert.pem"
+      zagros: "{{ repo_root }}/enrollment/ca/zagros/root-cert.pem"
+    # What ships in the bundle as <env>-ca-root.pem, concatenated in order: the
+    # roots a client verifies the router with. Kept apart from the signing
+    # root, as in the runbook's step 3: a goatnet can ship both roots while the
+    # router's own server certificate still chains to the shared one.
+    op_ca_trust_roots_path_map:
+      nova:
+        - "{{ repo_root }}/enrollment/ca/nova/root-cert.pem"
+      zagros:
+        - "{{ repo_root }}/enrollment/ca/nova/root-cert.pem"
+        - "{{ repo_root }}/enrollment/ca/zagros/root-cert.pem"
+    op_ca_key_path_map:
+      nova: "{{ lookup('env','HOME') }}/.goat/state/nova-ca/ca.key.age"
+      zagros: "{{ lookup('env','HOME') }}/.goat/state/zagros-ca/ca.key.age"
+    op_ca_id_map:
+      nova: dev-nova-ca-ecdsa-2026-05-14
+      zagros: dev-zagros-ca-ecdsa-2026-09-03
+    op_age_identity_path: "{{ lookup('env','HOME') }}/.config/age/keys.txt"
+    op_ca_audit_log: "{{ lookup('env','HOME') }}/.goat/ca-audit.jsonl"
+    # The operator leaf's identity. CN is the SHARED operator ACL subject
+    # (matches `operator` subject cert_common_names: ["operator-trial-peer"]);
+    # URI-SAN is per-goatnet (cosmetic — the ACL keys on CN, not URI-SAN).
+    op_cn: "operator-trial-peer"
+    op_dns_suffix_map:
+      nova: "nova.peer"
+      zagros: "zagros.peer"
+    op_uri_san_map:
+      nova: "urn:goat-nova:operator"
+      zagros: "urn:goat:zagros:operator"
+    op_validity: "8760h"
+    # Router endpoint (for the NOTES) + Ory Kratos admin host (for the ADMINS PATCH).
+    op_router_endpoint_map:
+      nova: "tls/zenoh.nova.netbird.nova.example:7447"
+      zagros: "tls/zenoh.zagros.netbird.zagros.example:7447"
+    op_kratos_admin_host_map:
+      nova: {ssh_host: "100.127.0.190", ssh_user: "goat", kratos_admin_url: "http://127.0.0.1:4434", auth_url: "https://auth.nova.netbird.nova.example"}
+      zagros: {ssh_host: "100.127.0.179", ssh_user: "goat", kratos_admin_url: "http://127.0.0.1:4434", auth_url: "https://auth.zagros.netbird.zagros.example"}
+    # Host(s) the operator gets shell on (for the SSH-key install).
+    op_host_map:
+      nova: {ssh_host: "100.127.0.190", ssh_user: "goat"}
+      zagros: {ssh_host: "100.127.0.179", ssh_user: "goat"}
+    # ntfy pager admin host per env (ADR 1168) — the relay-health cloud box,
+    # reached over SSM (port 22 is closed to the internet). Absent for an env
+    # means "no pager here yet" and the paging step is skipped, not failed.
+    op_ntfy_map:
+      zagros:
+        instance_id: "i-0000000f58150972e"
+        region: "eu-central-1"
+        ssm_bucket: "example-zagros-ansible-ssm-20260608180451703600000001"
+        fqdn: "ntfy.sandbox.zagros.goat.example"
+        goatnet: "zagros"
+        topics: ["critical", "warning"]
+    # Ory groups whose grant means "you are on the pager". ADMINS is the legacy
+    # name of PLATFORM-ADMIN (mesh-and-ory-roles.md), dual-accepted.
+    op_paging_groups: ["PLATFORM-ADMIN", "ADMINS"]
+
+  tasks:
+    - name: "O0 — load + validate the operator manifest"
+      ansible.builtin.set_fact:
+        manifest: "{{ lookup('file', manifest_path) | from_yaml }}"
+
+    - name: "O0.1 — assert an operator: block is present + enabled"
+      ansible.builtin.assert:
+        that:
+          - manifest.operator is defined
+          - manifest.operator.enabled | default(false)
+        fail_msg: >-
+          {{ manifest_path }} has no `operator: {enabled: true}` block. This
+          playbook provisions the backend-operator tier; add the block (see the
+          header) or use operator-onboard.yml for the participant tier.
+
+    - name: "O0.2 — resolve env facts"
+      ansible.builtin.set_fact:
+        op_dns_suffix: "{{ op_dns_suffix_map[onboard_env] }}"
+        op_uri_san: "{{ op_uri_san_map[onboard_env] }}"
+        op_router_endpoint: "{{ op_router_endpoint_map[onboard_env] }}"
+        op_kratos: "{{ op_kratos_admin_host_map[onboard_env] }}"
+        op_host: "{{ op_host_map[onboard_env] }}"
+
+    - name: "O0.3 — ensure the operator bundle dir exists (0700)"
+      ansible.builtin.file:
+        path: "{{ op_bundle_dir }}"
+        state: directory
+        mode: "0700"
+
+    # ---- 1. operator Zenoh leaf -------------------------------------------
+    - name: "O1.0a — tempdir for the cert-sign build (keep the 6MB binary OUT of the bundle)"
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -op-build
+      register: op_build_tmp
+      when: manifest.operator.zenoh_operator_cert | default(true)
+
+    - name: "O1.0 — build cert-sign"
+      ansible.builtin.command:
+        cmd: "go build -o {{ op_build_tmp.path }}/cert-sign ./cmd/cert-sign"
+        chdir: "{{ repo_root }}/enrollment"
+      changed_when: true
+      when: manifest.operator.zenoh_operator_cert | default(true)
+
+    - name: "O1.1 — mint the operator-trial-peer leaf"
+      # CN operator-trial-peer matches the `operator` ACL subject → writes ops/**.
+      ansible.builtin.command:
+        argv:
+          - "{{ op_build_tmp.path }}/cert-sign"
+          - "--root-cert"
+          - "{{ op_ca_root_path_map[onboard_env] }}"
+          - "--root-key"
+          - "{{ op_ca_key_path_map[onboard_env] }}"
+          - "--age-identity"
+          - "{{ op_age_identity_path }}"
+          - "--ca-id"
+          - "{{ op_ca_id_map[onboard_env] }}"
+          - "--site-id"
+          - "{{ onboard_env }}"
+          - "--cn"
+          - "{{ op_cn }}"
+          - "--san"
+          - "{{ op_cn }}.{{ op_dns_suffix }}"
+          - "--uri-san"
+          - "{{ op_uri_san }}"
+          - "--eku"
+          - "clientAuth"
+          - "--validity"
+          - "{{ op_validity }}"
+          - "--out-cert"
+          - "{{ op_bundle_dir }}/operator-cert.pem"
+          - "--out-key"
+          - "{{ op_bundle_dir }}/operator-key.pem"
+          - "--audit-log"
+          - "{{ op_ca_audit_log }}"
+      changed_when: true
+      when: manifest.operator.zenoh_operator_cert | default(true)
+
+    - name: "O1.2 — lock the operator key + stage the per-goatnet CA root"
+      ansible.builtin.file:
+        path: "{{ op_bundle_dir }}/operator-key.pem"
+        mode: "0400"
+      when: manifest.operator.zenoh_operator_cert | default(true)
+
+    - name: "O1.3 — stage the CA trust roots under the per-goatnet name"
+      ansible.builtin.copy:
+        content: "{{ query('file', *op_ca_trust_roots_path_map[onboard_env]) | join('\n') }}"
+        dest: "{{ op_bundle_dir }}/{{ onboard_env }}-ca-root.pem"
+        mode: "0644"
+      when: manifest.operator.zenoh_operator_cert | default(true)
+
+    - name: "O1.4 — remove the cert-sign build tempdir (don't ship the binary)"
+      ansible.builtin.file:
+        path: "{{ op_build_tmp.path }}"
+        state: absent
+      when:
+        - manifest.operator.zenoh_operator_cert | default(true)
+        - op_build_tmp.path is defined
+
+    # ---- 2. host SSH key ---------------------------------------------------
+    - name: "O2.0 — add_host for the SSH-key install delegate"
+      ansible.builtin.add_host:
+        name: "op-host-{{ onboard_env }}"
+        ansible_host: "{{ op_host.ssh_host }}"
+        ansible_user: "{{ op_host.ssh_user }}"
+        ansible_connection: ssh
+        groups: op_targets
+      changed_when: false
+      when: manifest.operator.ssh_pubkey is defined
+
+    # Install to the hosts this operator's ROLE may reach — not to every host
+    # the goatnet has. A site network admin (ADR 1113) gets the bearer gear
+    # they enroll and must NOT get the mgmt pair; delegating network
+    # administration is not delegating the platform.
+    #
+    # `operator_ssh_scopes` + `operator_ssh_role_scopes` are the source of
+    # truth. Goatnets that have not declared scopes yet fall back to the flat
+    # `operator_ssh_hosts` list.
+    - name: "O2.0b — resolve the role-scoped SSH blast radius"
+      ansible.builtin.include_tasks: tasks/operator-ssh-scope.yml
+      vars:
+        op_ssh_groups: "{{ manifest.operator.groups | default([]) }}"
+
+    # FAIL CLOSED, AND LOUDLY. A key that installs nowhere while the run
+    # reports success is the defect this whole track exists to remove: the
+    # person is told they have a shell and does not. If a role carries no
+    # scope, that is a config gap to fix, not a silent no-op to ship.
+    - name: "O2.0d — refuse a grant that would land nowhere"
+      ansible.builtin.fail:
+        msg: |
+          {{ manifest.identity.email | default('this operator') }} has an SSH public key
+          but NO host to install it on, so the grant would silently do nothing.
+
+          groups on the manifest : {{ manifest.operator.groups | default([]) | join(', ') | default('(none)', true) }}
+          roles that map to scopes: {{ operator_ssh_role_scopes | default({}) | list | join(', ') | default('(none declared)', true) }}
+          scopes resolved         : {{ op_ssh_scope_names | default([]) | join(', ') | default('(none)', true) }}
+
+          Either the role is missing from `operator_ssh_role_scopes`, or every
+          scope it maps to is empty (e.g. no NETWORK-class gear is enrolled on
+          this goatnet yet). Fix the group_vars — do not hand-install the key.
+      when:
+        - manifest.operator.ssh_pubkey is defined
+        - (op_ssh_targets | default([])) | length == 0
+        - (operator_ssh_scopes | default({})) | length > 0
+
+    - name: "O2.1a — add_host for each operator SSH target (role-scoped)"
+      ansible.builtin.add_host:
+        name: "op-host-multi-{{ item.ssh_host }}"
+        ansible_host: "{{ item.ssh_host }}"
+        ansible_user: "{{ item.ssh_user }}"
+        ansible_connection: ssh
+        groups: op_targets_multi
+      changed_when: false
+      loop: "{{ op_ssh_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.ssh_user }}@{{ item.ssh_host }}"
+      when: manifest.operator.ssh_pubkey is defined
+
+    - name: "O2.1 — install the operator's SSH key on every in-scope host"
+      ansible.builtin.lineinfile:
+        path: "~{{ item.ssh_user }}/.ssh/authorized_keys"
+        line: "{{ manifest.operator.ssh_pubkey }}"
+        state: present
+        create: true
+        mode: "0600"
+      delegate_to: "op-host-multi-{{ item.ssh_host }}"
+      loop: "{{ op_ssh_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.ssh_user }}@{{ item.ssh_host }}"
+      when:
+        - manifest.operator.ssh_pubkey is defined
+        - (op_ssh_targets | default([])) | length > 0
+
+    - name: "O2.1-legacy — install on the single mapped host (goatnets with no operator_ssh_hosts)"
+      ansible.builtin.lineinfile:
+        path: "~{{ op_host.ssh_user }}/.ssh/authorized_keys"
+        line: "{{ manifest.operator.ssh_pubkey }}"
+        state: present
+        create: true
+        mode: "0600"
+      delegate_to: "op-host-{{ onboard_env }}"
+      when:
+        - manifest.operator.ssh_pubkey is defined
+        - (operator_ssh_hosts | default([])) | length == 0
+
+    # ---- 3. Ory ADMINS grant (PATCH on the existing identity) --------------
+    - name: "O3.0 — add_host for the Kratos admin delegate"
+      ansible.builtin.add_host:
+        name: "op-kratos-{{ onboard_env }}"
+        ansible_host: "{{ op_kratos.ssh_host }}"
+        ansible_user: "{{ op_kratos.ssh_user }}"
+        ansible_connection: ssh
+        groups: op_kratos_targets
+      changed_when: false
+      when: (manifest.operator.groups | default([])) | length > 0
+
+    - name: "O3.1 — look up the Ory identity by email"
+      ansible.builtin.uri:
+        url: "{{ op_kratos.kratos_admin_url }}/admin/identities?credentials_identifier={{ manifest.identity.email | urlencode }}"
+        method: GET
+        status_code: [200]
+        return_content: true
+      delegate_to: "op-kratos-{{ onboard_env }}"
+      register: op_identity_lookup
+      when: (manifest.operator.groups | default([])) | length > 0
+
+    - name: "O3.2 — PATCH each admin group onto the identity (idempotent — skips groups already present)"
+      ansible.builtin.uri:
+        url: "{{ op_kratos.kratos_admin_url }}/admin/identities/{{ (op_identity_lookup.json | first).id }}"
+        method: PATCH
+        body_format: json
+        # Login groups live in admin-managed metadata_public.
+        # A migrated identity (metadata_public.groups present) takes an append;
+        # one the backfill has not reached gets the whole metadata_public object
+        # added — its other keys kept, groups = its traits groups + every grant
+        # in the manifest at once (the lookup is not refreshed between loop
+        # items, so a per-item object would drop the previous grant) — because
+        # an append under a missing parent fails.
+        body: >-
+          {{
+            [{'op': 'add', 'path': '/metadata_public/groups/-', 'value': item}]
+            if _op_meta.groups is defined else
+            [{'op': 'add', 'path': '/metadata_public',
+              'value': _op_meta | combine({'groups': (_op_current_groups + (manifest.operator.groups | list)) | unique})}]
+          }}
+        headers:
+          Content-Type: "application/json"
+        status_code: [200]
+      delegate_to: "op-kratos-{{ onboard_env }}"
+      loop: "{{ manifest.operator.groups | default([]) }}"
+      when:
+        - (manifest.operator.groups | default([])) | length > 0
+        - op_identity_lookup.json | length > 0
+        - item not in _op_current_groups
+      vars:
+        _op_meta: "{{ (op_identity_lookup.json | first).metadata_public | default({}, true) }}"
+        # Prefer metadata_public.groups when the key exists,
+        # else fall back to traits.groups for a not-yet-backfilled identity.
+        _op_current_groups: >-
+          {{
+            _op_meta.groups
+            if _op_meta.groups is defined
+            else ((op_identity_lookup.json | first).traits.groups | default([]))
+          }}
+
+    # ---- 3b. paging enrolment (ADR 1168) ----------------------------------
+    # Being granted the platform-admin tier is what puts a person on the pager.
+    # Keyed off the group the manifest grants — not where the identity came
+    # from — so a federated PLATFORM-ADMIN enrols by this same path. No phone
+    # number or address is involved: the person gets a per-user ntfy login and
+    # read access to the goatnet's paging topics, and subscribes their own
+    # device in the ntfy app.
+    - name: "O3.3 — does this grant put the person on the pager?"
+      ansible.builtin.set_fact:
+        op_pages: >-
+          {{ ((manifest.operator.groups | default([])) | intersect(op_paging_groups) | length > 0)
+             and (op_ntfy_map[onboard_env] is defined) }}
+
+    - name: "O3.4 — per-operator ntfy password (generated once into the bundle, 0600)"
+      ansible.builtin.set_fact:
+        op_ntfy_password: "{{ lookup('password', op_bundle_dir ~ '/ntfy.pass chars=ascii_letters,digits length=24') }}"
+      no_log: true
+      when: op_pages | bool
+
+    - name: "O3.5 — add_host for the ntfy admin delegate (SSM)"
+      ansible.builtin.add_host:
+        name: "op-ntfy-{{ onboard_env }}"
+        ansible_host: "{{ op_ntfy_map[onboard_env].instance_id }}"
+        ansible_connection: community.aws.aws_ssm
+        ansible_aws_ssm_region: "{{ op_ntfy_map[onboard_env].region }}"
+        ansible_aws_ssm_bucket_name: "{{ op_ntfy_map[onboard_env].ssm_bucket }}"
+        ansible_aws_ssm_s3_addressing_style: virtual
+        ansible_user: ubuntu
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_remote_tmp: /tmp/.ansible/tmp
+        groups: op_ntfy_targets
+      changed_when: false
+      when: op_pages | bool
+
+    - name: "O3.6 — create or re-key the operator's ntfy user, read-only on the goatnet's paging topics"
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          u="{{ operator_handle }}"
+          if docker exec relay-health-ntfy ntfy user list 2>&1 | grep -qE "^user $u "; then
+            docker exec -e NTFY_PASSWORD relay-health-ntfy ntfy user change-pass "$u" >/dev/null; echo "rekeyed $u"
+          else
+            docker exec -e NTFY_PASSWORD relay-health-ntfy ntfy user add --role=user "$u" >/dev/null; echo "created $u"
+          fi
+          {% for t in op_ntfy_map[onboard_env].topics %}
+          docker exec relay-health-ntfy ntfy access "$u" "goat-{{ op_ntfy_map[onboard_env].goatnet }}-{{ t }}" read-only >/dev/null
+          {% endfor %}
+        executable: /bin/bash
+      environment:
+        NTFY_PASSWORD: "{{ op_ntfy_password }}"
+      become: true
+      delegate_to: "op-ntfy-{{ onboard_env }}"
+      register: op_ntfy_enrol
+      changed_when: "'created' in (op_ntfy_enrol.stdout | default(''))"
+      no_log: true
+      when: op_pages | bool
+
+    # ---- 4. bundle NOTES ---------------------------------------------------
+    - name: "O4 — render the operator bundle NOTES.md"
+      ansible.builtin.template:
+        src: "templates/operator-tier/NOTES.md.j2"
+        dest: "{{ op_bundle_dir }}/NOTES.md"
+        mode: "0600"
+
+    # ---- 5. print the blast-radius additions (never auto-edit secrets) -----
+    - name: "O5 — print the manual additions the operator applies"
+      ansible.builtin.debug:
+        msg: |
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          OPERATOR TIER for {{ operator_handle }} ({{ manifest.identity.email }}) — {{ onboard_env }}
+          Bundle: {{ op_bundle_dir }}/  (cert + key + {{ onboard_env }}-ca-root.pem + NOTES.md)
+
+          TWO follow-ups. The first is now self-service; the second still
+          touches a secret file and is intentionally NOT auto-edited.
+
+          1. Portal operator key (attributed portal admin) — NO LONGER a hand
+             edit plus a portal redeploy. The person requests one on their own
+             profile (no handle — the console binds it to them, their vp_ token
+             is enough), a DIFFERENT admin approves, and the person collects it
+             on that same profile; the portal re-reads its key directory while
+             running, so the key is live within seconds:
+               {{ operator_handle }}:  goat admin operator-key request --reason "..."
+               another admin:  goat admin operator-key approve <id>   (op_ key)
+               {{ operator_handle }}:  goat admin operator-key collect <id>
+             or the console at /operator-key and /onboarding/operator-keys.
+             Revoke the same way; do NOT hand-edit the key directory.
+          {% if manifest.operator.age_recipient is defined %}
+          2. Audit-read roster. Add this age recipient to
+             .envrc.local.d/40-dev-ca-operators.envrc (DEV_CA_AGE_RECIPIENTS):
+               {{ manifest.operator.age_recipient }}
+          {% else %}
+          2. Audit-read roster: no age_recipient in the manifest — ask the
+             operator for their `age1…` pubkey + add it to the roster.
+          {% endif %}
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

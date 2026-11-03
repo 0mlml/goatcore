@@ -1,0 +1,1199 @@
+# netbird-acl-cutover.yml
+#
+# Block 83C.2-L4 cutover playbook — replaces NetBird's Default `All→All
+# accept` policy on a target site with the explicit per-group permits
+# declared in netbird_acl_matrix.yml. Closes the L4 portion of F-132.
+#
+# Three modes (operator chooses; default is `propose`, NO-OP-on-mgmt-API):
+#
+#   mode=propose    DEFAULT. Read-only. Surveys current peer+group state,
+#                   synthesizes the policy set programmatically, prints a
+#                   detailed plan + a peer-coverage report (which peers
+#                   would lose connectivity), and EXITS without touching
+#                   the mgmt-API. Run this first.
+#
+#   mode=apply      ADDITIVE. Creates the explicit permits in netbird-mgmt
+#                   but leaves the Default `All→All accept` policy
+#                   enabled. The mesh continues to work exactly as before
+#                   (Default still permits everything); the new explicit
+#                   policies are dormant. Safe burn-in step; you can
+#                   verify the policies render correctly in the dashboard,
+#                   exercise mesh traffic, and confirm peers still talk
+#                   to each other. Undo: git revert the rule PR and
+#                   re-run mode=apply (ADR 1185; mode=rollback is retired).
+#
+#   mode=enforce    THE CUTOVER. Requires --extra-vars confirm_cutover=YES
+#                   (literal). Creates any missing explicit permits + then
+#                   applies the site's declared `cutover.default_policy_action`
+#                   to the Default policy: `disable` sets `enabled: false`
+#                   (the classic cutover); `delete` REMOVES the policy row
+#                   entirely (post-cutover cleanup of the dormant foot-gun —
+#                   issue #178; tolerates already-absent, so re-runs are
+#                   idempotent); `keep` refuses enforce outright. Anything
+#                   not explicitly permitted is dropped at NetBird L4 from
+#                   this point forward. The point of no easy return for the
+#                   live mesh.
+#
+#   ORPHANS. A policy carrying this site's tag whose name no longer
+#                   appears in the matrix — left behind by DELETING a rule from
+#                   ops/warrant/, or by RENAMING one (the new name is created,
+#                   the old policy keeps running). Every mode REPORTS them,
+#                   including propose. Only `apply` can remove them, and only
+#                   with `-e reap_orphans=true`; the default is report-only.
+#                   This matters because an orphan is an `accept`: it fails
+#                   OPEN, granting reach the registry does not declare.
+#
+#     # See what is orphaned, change nothing (this is also plain propose)
+#     ansible-playbook netbird-acl-cutover.yml -e target_site=<site>
+#
+#     # Remove them
+#     ansible-playbook netbird-acl-cutover.yml \
+#       -e target_site=<site> -e mode=apply -e reap_orphans=true
+#
+#   mode=rollback   RETIRED (ADR 1185). It restored a wide-open Default
+#                   All->All, which no goatnet may carry, even in an
+#                   emergency. It now refuses and prints the undo: git
+#                   revert the rule PR, then mode=apply.
+#
+# Usage:
+#
+#   # Survey first — always start here (idempotent, read-only)
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     netbird-acl-cutover.yml -e target_site=<site>
+#
+#   # Additive burn-in — adds explicit permits, leaves Default enabled
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     netbird-acl-cutover.yml -e target_site=<site> -e mode=apply
+#
+#   # Cutover — applies the site's declared default_policy_action to the
+#   # Default policy (disable flips the row off; delete removes it).
+#   # Requires confirm_cutover=YES.
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     netbird-acl-cutover.yml -e target_site=<site> \
+#       -e mode=enforce -e confirm_cutover=YES
+#
+#   # Undo a bad ACL change — revert the rule PR, then re-apply the matrix
+#   # (ADR 1185; there is no wide-open emergency mode)
+#   git revert <rule PR merge commit> && ops/warrant/generate.py
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook \
+#     -i localhost, --connection local \
+#     netbird-acl-cutover.yml -e target_site=<site> -e mode=apply
+#
+# Required env: <SITE>_NB_API_TOKEN.
+#
+# Closes: F-132 L4 portion; tracked at Block 83C.2-L4.
+# Composes with: ops/ansible/netbird_acl_taxonomy.yml + netbird_acl_matrix.yml.
+# Reference: docs/design/mesh-acl-posture.md §"Policy posture (v1 vs follow-on)".
+
+- name: NetBird L4 ACL cutover (Block 83C.2-L4)
+  hosts: localhost
+  connection: local
+  # ansible.cfg sets become = true for the fleet; this play runs on the
+  # operator's own machine and only makes HTTPS calls, so root would be
+  # pointless -- and a laptop without passwordless sudo hangs on the prompt.
+  become: false
+  module_defaults:
+    ansible.builtin.uri:
+      ca_path: "{{ (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') if (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') is exists else omit }}"
+  gather_facts: false
+
+  vars:
+    # NOTE: these three used to be declared as self-referencing
+    # play vars — `mode: "{{ mode | default('propose') }}"`. ansible-core 2.20
+    # treats that as a recursive template and the playbook aborted at Phase 0.2
+    # with "Recursive loop detected in template" on EVERY invocation that did
+    # not pass all three via -e. Pre-existing and unrelated to ADR 1124; found
+    # running the first propose. Defaults now come from `default()` at each use
+    # site, which cannot recurse.
+    repo_root: "{{ playbook_dir | dirname | dirname }}"
+    taxonomy_path: "{{ playbook_dir }}/netbird_acl_taxonomy.yml"
+    matrix_path: "{{ playbook_dir }}/netbird_acl_matrix.yml"
+
+    # Reuse the same site→URL + site→env-var maps as netbird-acl-bootstrap.yml
+    # + operator-onboard.yml — single token across all three playbooks.
+    netbird_site_url_map:
+      vega: https://mgmt.vega.netbird-prod.goat.example
+      legacy: https://netbird.legacy.example
+      zagros: https://netbird.zagros.example
+      zagros-prod: https://netbird.zagros-prod.example
+      zagros-dev: https://netbird.zagros-dev.example
+
+    netbird_site_env_var_map:
+      vega: VEGA_NB_API_TOKEN
+      legacy: LEGACY_NB_API_TOKEN
+      zagros: ZAGROS_NB_API_TOKEN
+      zagros-prod: ZAGROS_PROD_NB_API_TOKEN
+      zagros-dev: ZAGROS_DEV_NB_API_TOKEN
+
+    # Which mgmt API and which token (ADR 1185: the standup must be able to
+    # apply the ACL to a goatnet this file has never heard of). Precedence:
+    # -e netbird_mgmt_url / -e netbird_token_env (goat-standup.sh passes
+    # https://<public_mgmt_fqdn> from the site's group_vars) > the map above >
+    # an exercise's host site > nothing (Phase 0.6 refuses). The token env var
+    # defaults to <SITE>_NB_API_TOKEN, the name every standup mints.
+    nb_site_key: "{{ netbird_exercises[target_site].host_site if target_site in (netbird_exercises | default({})) else target_site }}"
+    nb_url: "{{ netbird_mgmt_url | default(netbird_site_url_map.get(nb_site_key, ''), true) }}"
+    nb_token_env: "{{ netbird_token_env | default(netbird_site_env_var_map.get(nb_site_key, (nb_site_key | upper | replace('-', '_')) ~ '_NB_API_TOKEN'), true) }}"
+
+    # Tag-line included in every policy this playbook creates so the
+    # rollback path can find + delete its own work without touching
+    # operator-authored policies that may share a site. Exercise sites get a
+    # SITE-SCOPED tag so teardown can only ever match its own exercise's
+    # policies (lazy-evaluated: netbird_exercises loads in Phase 0.4, first
+    # use is Phase 1.7).
+    policy_tag: "{{ '[L4-exercise ' ~ target_site ~ ' via netbird-acl-cutover.yml]' if target_site in (netbird_exercises | default({})) else '[L4-cutover via netbird-acl-cutover.yml]' }}"
+
+  tasks:
+
+    - name: "Normalize optional inputs"
+      # Replaces the self-referencing play vars removed . set_fact is
+      # evaluated once as a task, so `mode | default(...)` here cannot recurse;
+      # and set_fact sits BELOW extra-vars in precedence, so `-e mode=apply`
+      # still wins. Without this, mode/confirm_cutover are undefined whenever
+      # the caller omits them and every conditional reading them errors.
+      ansible.builtin.set_fact:
+        target_site: "{{ target_site | default('', true) }}"
+        mode: "{{ mode | default('propose', true) }}"
+        confirm_cutover: "{{ confirm_cutover | default('', true) }}"
+
+    # =================================================================
+    # Phase 0 — Pre-flight
+    # =================================================================
+
+    - name: "Assert target_site is provided"
+      ansible.builtin.assert:
+        that:
+          - target_site | length > 0
+        fail_msg: "target_site is required. e.g. -e target_site=zagros"
+
+    - name: "Assert mode is valid"
+      ansible.builtin.assert:
+        that:
+          - mode in ['propose', 'apply', 'enforce', 'rollback', 'teardown']
+        fail_msg: "mode must be one of: propose, apply, enforce, rollback, teardown. Got: {{ mode }}"
+
+    # This gate fires BEFORE Phase 0.4 loads the matrix, so the site's
+    # declared action is not yet readable here — the message states both
+    # behaviors rather than interpolating a fact that does not exist yet.
+    - name: "Assert confirm_cutover for enforce mode"
+      ansible.builtin.assert:
+        that:
+          - confirm_cutover == 'YES'
+        fail_msg: |
+          mode=enforce requires -e confirm_cutover=YES (literal, uppercase).
+          This step applies the site's declared cutover.default_policy_action
+          to the Default `All→All accept` policy on the live mesh: `disable`
+          flips the row off; `delete` REMOVES the policy row. Neither is
+          undone by restoring the Default (ADR 1185): a bad rule is undone by
+          reverting its PR and re-running mode=apply. Confirm you've
+          completed mode=propose + mode=apply + verified peer coverage before
+          flipping the kill switch.
+      when: mode == 'enforce'
+
+    - name: "Load taxonomy + matrix"
+      ansible.builtin.include_vars:
+        file: "{{ item }}"
+      loop:
+        - "{{ taxonomy_path }}"
+        - "{{ matrix_path }}"
+
+    - name: "Expand exercise group-sets into site entries"
+      ansible.builtin.include_tasks: tasks/netbird-exercise-expand.yml
+
+    - name: "Exercises never touch the host site's Default policy"
+      ansible.builtin.assert:
+        that:
+          - mode not in ['enforce', 'rollback']
+        fail_msg: |
+          `{{ target_site }}` is an exercise group-set on host site
+          `{{ netbird_exercises[target_site].host_site }}`. enforce/rollback
+          operate on the HOST site's Default policy, which is not the
+          exercise's to touch. Exercise lifecycle: bootstrap → mode=apply →
+          (absorb via `goat admin members move`) → mode=teardown.
+      when: target_site in (netbird_exercises | default({}))
+
+    - name: "Assert target_site is declared in both files"
+      ansible.builtin.assert:
+        that:
+          - target_site in netbird_acl_taxonomy
+          - target_site in netbird_acl_matrix
+        fail_msg: "Site '{{ target_site }}' must be declared in BOTH netbird_acl_taxonomy.yml AND netbird_acl_matrix.yml."
+
+    # The keep-refusal must fire BEFORE Phase 4: in enforce mode Phase 4 runs
+    # first and POSTs/PUTs explicit permits, so refusing only at Phase 5 would
+    # refuse AFTER mutating — an enforce against a keep-declared site would
+    # have silently done everything mode=apply does. Pre-flight keeps
+    # "refuses enforce outright" literally true. Phase 5 consumes the fact.
+    - name: "Read the site's declared Default-policy action"
+      ansible.builtin.set_fact:
+        cutover_action: "{{ netbird_acl_matrix[target_site].cutover.default_policy_action | default('disable') }}"
+
+    - name: "Refuse enforce on a keep-declared site (pre-flight, pre-mutation)"
+      ansible.builtin.assert:
+        that:
+          - cutover_action in ['disable', 'delete']
+        fail_msg: |
+          '{{ target_site }}' declares cutover.default_policy_action={{ cutover_action }}.
+          `keep` (or an unrecognized value) means this site's Default policy is
+          not this playbook's to touch — mode=enforce contradicts the declared
+          posture. Change the declaration in ops/warrant/rule-intents/ first
+          (routes through CODEOWNERS), regenerate the matrix, then re-run.
+          Nothing was written: this check runs before any permit is created.
+      when: mode == 'enforce'
+
+    - name: "Assert mgmt-API URL configured"
+      ansible.builtin.assert:
+        that:
+          - nb_url | length > 0
+        fail_msg: >-
+          No mgmt API URL for '{{ target_site }}'. Pass
+          -e netbird_mgmt_url=https://<public_mgmt_fqdn from its group_vars>
+          (goat-standup.sh does), or add the site to netbird_site_url_map.
+
+    - name: "Assert PAT env var present"
+      ansible.builtin.assert:
+        that:
+          - lookup('env', nb_token_env) | length > 0
+        fail_msg: |
+          Environment variable {{ nb_token_env }} is empty.
+          Mint a PAT via dashboard → Users → Personal Access Tokens; add to
+          .envrc.local.d/30-site-services.envrc.
+
+    # =================================================================
+    # Phase 1 — Survey current state (group UUIDs, peer roster, current policies)
+    # =================================================================
+
+    - name: "GET groups (need UUIDs for policy synth)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/groups"
+        method: GET
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+          Accept: application/json
+        status_code: [200]
+        return_content: true
+      register: groups_resp
+      check_mode: false
+
+    - name: "Compute group name→id map"
+      ansible.builtin.set_fact:
+        group_name_to_id: "{{ dict(groups_resp.json | map(attribute='name') | zip(groups_resp.json | map(attribute='id'))) }}"
+
+    # ADR 1124 — scope-qualified references (`HOST:INFRA`). `HOST` resolves to
+    # the prefix of the scope this one declares as its `host_site`. A scope
+    # with no host_site (a concrete goatnet site) resolves to '' and any
+    # qualified reference then fails loudly in the resolver rather than
+    # silently prefixing locally. The resolver + its constraint set live in
+    # filter_plugins/acl_scope.py and are shared with the CI parity guard.
+    - name: "Resolve this scope's host_site prefix (ADR 1124)"
+      ansible.builtin.set_fact:
+        _acl_host_prefix: >-
+          {{ netbird_acl_taxonomy[netbird_exercises[target_site].host_site].site_prefix
+             if (target_site in (netbird_exercises | default({}))
+                 and netbird_exercises[target_site].host_site in netbird_acl_taxonomy)
+             else '' }}
+        _acl_scope_prefixes: >-
+          {{ dict(netbird_acl_taxonomy | dict2items
+                  | map(attribute='key') | zip(netbird_acl_taxonomy | dict2items
+                  | map(attribute='value.site_prefix'))) }}
+
+    - name: "Refuse any rule violating the ADR 1124 constraints"
+      ansible.builtin.assert:
+        that:
+          - (item | acl_rule_violations(target_site in (netbird_exercises | default({})))) | length == 0
+        fail_msg: |
+          {{ (item | acl_rule_violations(target_site in (netbird_exercises | default({})))) | join('
+          ') }}
+
+          ADR 1124 governs scope-qualified references. Fix the rule in
+          netbird_acl_matrix.yml; do not work around it here.
+      loop: "{{ netbird_acl_matrix[target_site].rules }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "Assert every matrix-referenced group exists"
+      ansible.builtin.assert:
+        that:
+          - item in group_name_to_id
+        fail_msg: |
+          Group '{{ item }}' is referenced in the matrix but does not exist on the mgmt-server.
+          Run netbird-acl-bootstrap.yml first to create the canonical taxonomy.
+          (A '<PREFIX>-' name from another scope means an ADR 1124 qualified
+          reference resolved to a group the host site has not created.)
+      loop: >-
+        {{ (netbird_acl_matrix[target_site].rules | map(attribute='sources') | flatten
+            | union(netbird_acl_matrix[target_site].rules | map(attribute='destinations') | flatten)
+            | unique | list)
+           | acl_resolve_refs(netbird_acl_taxonomy[target_site].site_prefix,
+                              _acl_host_prefix, _acl_scope_prefixes) }}
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "GET peers (for coverage report)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/peers"
+        method: GET
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+          Accept: application/json
+        status_code: [200]
+        return_content: true
+      register: peers_resp
+      check_mode: false
+
+    - name: "GET existing policies (need Default policy id + any prior cutover work)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies"
+        method: GET
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+          Accept: application/json
+        status_code: [200]
+        return_content: true
+      register: policies_resp
+      check_mode: false
+
+    - name: "Find Default policy (by name pattern from matrix)"
+      ansible.builtin.set_fact:
+        default_policy: >-
+          {{
+            (policies_resp.json
+              | selectattr('name', 'match', netbird_acl_matrix[target_site].cutover.default_policy_name_pattern)
+              | list
+              | first)
+            | default({})
+          }}
+
+    - name: "Find prior cutover policies (by tag)"
+      ansible.builtin.set_fact:
+        prior_cutover_policies: >-
+          {{
+            policies_resp.json
+            | selectattr('description', 'defined')
+            | selectattr('description', 'search', policy_tag | regex_escape)
+            | list
+          }}
+
+    - name: "Compute group name set referenced by all peers"
+      ansible.builtin.set_fact:
+        peer_coverage_report: >-
+          {{
+            peers_resp.json | map(attribute='name')
+            | zip(peers_resp.json | map(attribute='groups')
+                  | map('default', [])
+                  | map('map', attribute='name')
+                  | map('list'))
+            | list
+          }}
+
+    # =================================================================
+    # Phase 2 — Synthesize the policy set programmatically from the matrix
+    # =================================================================
+
+    # Policy NAME is site-unique: exercise sites prefix theirs (`EX-DEMO ·
+    # infra → all …`) because multiple logical sites share one mgmt server and
+    # NAME is how apply-mode matches existing policies — the F-257 hijack was
+    # an exercise apply matching the HOST site's same-named policies and
+    # PUTting exercise group ids over them. Belt AND suspenders: Phase 4.x
+    # additionally scopes all matching by this site's policy_tag.
+    - name: "Synthesize policy bodies from matrix rules"
+      ansible.builtin.set_fact:
+        synthesized_policies: "{{ synthesized_policies | default([]) + [_policy] }}"
+      loop: "{{ netbird_acl_matrix[target_site].rules }}"
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        _pname: "{{ (netbird_acl_taxonomy[target_site].site_prefix ~ ' · ' ~ item.name) if target_site in (netbird_exercises | default({})) else item.name }}"
+        _policy:
+          name: "{{ _pname }}"
+          description: "{{ item.description }} {{ policy_tag }}"
+          enabled: true
+          rules:
+            - name: "{{ item.name }}"
+              description: "{{ item.description }}"
+              enabled: true
+              sources: "{{ item.sources | acl_resolve_refs(netbird_acl_taxonomy[target_site].site_prefix, _acl_host_prefix, _acl_scope_prefixes) | map('extract', group_name_to_id) | list }}"
+              destinations: "{{ item.destinations | acl_resolve_refs(netbird_acl_taxonomy[target_site].site_prefix, _acl_host_prefix, _acl_scope_prefixes) | map('extract', group_name_to_id) | list }}"
+              protocol: "{{ item.protocol }}"
+              ports: "{{ item.ports | default(omit) }}"
+              action: "{{ item.action }}"
+              bidirectional: "{{ item.bidirectional | default(true) }}"
+
+    # Phase 2.2 — ORPHANS: policies we own that the matrix no longer declares.
+    #
+    # F-349. Until this existed, apply mode only ever ADDED: Phase 4.1 POSTs
+    # what is missing and Phase 4.2b PUTs what drifted, both matched BY NAME.
+    # Nothing looked for the inverse — a policy carrying our tag whose name is
+    # not in the matrix at all. So deleting a rule from ops/warrant/ removed it
+    # from the generated file and left it running on the mesh, and RENAMING one
+    # created the new name while the old policy kept permitting traffic.
+    #
+    # It fails OPEN, which is why it gets its own phase rather than a footnote:
+    # the object left behind is an `accept`. Additive-only reconciliation is
+    # safe when what you fail to remove is a denial. Here every missed deletion
+    # silently grants more reach than the registry declares, indefinitely.
+    #
+    # Scoped to our_tagged/prior_cutover set, so a policy this play did not
+    # create can never be selected — the tag is written by Phase 4.2 and by
+    # nothing else. Reporting is unconditional and happens in propose mode too,
+    # because propose is the survey people actually run first and reporting
+    # alone would have caught this.
+    - name: "Compute orphaned policies (ours by tag, undeclared by the matrix)"
+      ansible.builtin.set_fact:
+        orphan_policies: >-
+          {{
+            prior_cutover_policies
+            | rejectattr('name', 'in', synthesized_policies | map(attribute='name') | list)
+            | list
+          }}
+
+    # =================================================================
+    # Phase 3 — Print summary (every mode hits this; propose mode stops here)
+    # =================================================================
+
+    - name: "Plan summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          NetBird L4 ACL cutover — {{ target_site }} — mode={{ mode }}
+          ============================================================
+          Site prefix:    {{ netbird_acl_taxonomy[target_site].site_prefix }}
+          Groups (live):  {{ group_name_to_id.keys() | list | sort }}
+          Peers (live):   {{ peers_resp.json | length }} total
+
+          Default policy (site's declared default_policy_action={{ cutover_action }} - disable keeps and disables the row, delete removes it and treats absence as the end state, keep refuses mode=enforce pre-flight):
+            id:       {{ default_policy.id | default('(none found by pattern: ' + netbird_acl_matrix[target_site].cutover.default_policy_name_pattern + ')') }}
+            name:     {{ default_policy.name | default('') }}
+            enabled:  {{ default_policy.enabled | default('') }}
+
+          Prior cutover policies (created by this playbook, identified by tag):
+            count:    {{ prior_cutover_policies | length }}
+          {% for p in prior_cutover_policies %}
+            - id={{ p.id }}  name="{{ p.name }}"  enabled={{ p.enabled }}
+          {% endfor %}
+
+          Synthesized policies (would be created in apply / enforce mode):
+            count:    {{ synthesized_policies | length }}
+          {% for p in synthesized_policies %}
+            - "{{ p.name }}"
+              sources={{ p.rules[0].sources }}
+              destinations={{ p.rules[0].destinations }}
+              proto={{ p.rules[0].protocol }}{% if p.rules[0].ports is defined %} ports={{ p.rules[0].ports }}{% endif %}
+              action={{ p.rules[0].action }}
+              bidir={{ p.rules[0].bidirectional }}
+          {% endfor %}
+
+    - name: "ORPHAN report: live policies the matrix no longer declares"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          ORPHANED POLICIES — {{ orphan_policies | length }}
+          ============================================================
+          {% if orphan_policies | length == 0 %}
+          None. Every policy carrying this site's tag is declared by the matrix.
+          {% else %}
+          These carry this site's tag ({{ policy_tag }}) but NO rule in the
+          matrix declares them. They are LIVE and still being enforced.
+
+          {% for p in orphan_policies %}
+            - id={{ p.id }}  enabled={{ p.enabled }}
+              name="{{ p.name }}"
+          {% for r in p.rules | default([]) %}
+              {{ r.sources | default([]) | map(attribute='name') | list }}
+                -> {{ r.destinations | default([]) | map(attribute='name') | list }}
+                proto={{ r.protocol | default('?') }}{% if r.ports is defined %} ports={{ r.ports }}{% endif %} action={{ r.action | default('?') }}
+          {% endfor %}
+          {% endfor %}
+
+          HOW THEY GET HERE: a rule DELETED from ops/warrant/ (the policy is
+          never removed from NetBird), or a rule RENAMED (the new name is
+          created and the old policy keeps running beside it).
+
+          THIS FAILS OPEN. An orphaned `accept` grants reach the registry does
+          not declare, and nothing else looks for it.
+
+          {% if mode == 'propose' %}
+          To remove them:  -e mode=apply -e reap_orphans=true
+          {% elif not (reap_orphans | default(false) | bool) %}
+          NOT removed — this run is report-only for orphans.
+          Re-run with -e reap_orphans=true to delete them.
+          {% endif %}
+          {% endif %}
+
+    - name: "Peer coverage report (which live peers would lose connectivity)"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          PEER COVERAGE REPORT — pre-cutover
+          ============================================================
+          For each live peer, the group(s) it belongs to + whether
+          those groups appear as a SOURCE in any synthesized rule
+          (i.e., does the peer have any explicit permit at all post-cutover?).
+          Peers with no covering rule will be cut off when Default is {{ 'deleted' if cutover_action == 'delete' else 'disabled' }} at enforce.
+
+          {# ADR 1124: sources may be scope-qualified (a downward
+             `HOST:PLATFORM-ADMIN -> gear` support rule), so this must go
+             through the resolver. Prefixing blindly would build the garbage
+             name '<PREFIX>-HOST:PLATFORM-ADMIN' and silently UNDER-report
+             coverage — reading as "this peer is uncovered" when it is not. #}
+          {% set source_suffixes = netbird_acl_matrix[target_site].rules | map(attribute='sources') | flatten | unique | list %}
+          {% set covered_full_names = source_suffixes | acl_resolve_refs(netbird_acl_taxonomy[target_site].site_prefix, _acl_host_prefix, _acl_scope_prefixes) | list %}
+          {% for peer_name, peer_groups in peer_coverage_report %}
+            {% set covered = peer_groups | intersect(covered_full_names) %}
+            {% if covered | length > 0 %}
+            COVERED   peer="{{ peer_name }}"  groups={{ peer_groups }}  covering={{ covered }}
+            {% else %}
+            UNCOVERED peer="{{ peer_name }}"  groups={{ peer_groups }}  ← would lose connectivity at enforce
+            {% endif %}
+          {% endfor %}
+
+          If any peer is UNCOVERED, do NOT proceed to enforce mode without
+          either (a) adding the peer to a covered group, (b) extending the
+          matrix to cover its current group, or (c) accepting the cutoff.
+
+    # =================================================================
+    # Phase 4 — Apply (mode=apply OR mode=enforce)
+    # =================================================================
+
+    - name: "Mode gate (skip if propose / rollback / teardown)"
+      ansible.builtin.meta: end_play
+      when: mode in ['propose', 'rollback', 'teardown']
+
+    # Matching is scoped to THIS site's policy_tag: on a shared mgmt
+    # server, a same-named policy without our tag belongs to another logical
+    # site and must never be treated as ours — not skipped-as-existing, not
+    # drift-reconciled. A name collision with a foreign policy fails loud.
+    - name: "Partition existing policies by tag ownership"
+      ansible.builtin.set_fact:
+        our_tagged_policies: >-
+          {{
+            policies_resp.json
+            | selectattr('description', 'defined')
+            | selectattr('description', 'search', policy_tag | regex_escape)
+            | list
+          }}
+        foreign_policy_names: >-
+          {{
+            policies_resp.json | map(attribute='name') | list
+            | difference(policies_resp.json
+                         | selectattr('description', 'defined')
+                         | selectattr('description', 'search', policy_tag | regex_escape)
+                         | map(attribute='name') | list)
+          }}
+
+    - name: "Refuse foreign-name collisions"
+      ansible.builtin.assert:
+        that:
+          - synthesized_policies | map(attribute='name') | intersect(foreign_policy_names) | length == 0
+        fail_msg: |
+          F-257 GUARD: synthesized policy name(s) collide with policies on this
+          mgmt server that do NOT carry this site's tag ({{ policy_tag }}):
+            {{ synthesized_policies | map(attribute='name') | intersect(foreign_policy_names) | join(', ') }}
+          Applying would risk hijacking another logical site's policies.
+          Rename the colliding rules (exercise sites auto-prefix; persistent
+          sites must use distinct rule names per site on a shared server).
+
+    - name: "Compute which policies are missing (idempotent re-run)"
+      ansible.builtin.set_fact:
+        existing_policy_names: "{{ our_tagged_policies | map(attribute='name') | list }}"
+        policies_to_create: >-
+          {{
+            synthesized_policies
+            | rejectattr('name', 'in', our_tagged_policies | map(attribute='name') | list)
+            | list
+          }}
+
+    - name: "POST missing policies"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies"
+        method: POST
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+          Content-Type: application/json
+        body_format: json
+        body: "{{ item }}"
+        status_code: [200, 201]
+        return_content: true
+      loop: "{{ policies_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: created_policies
+
+    # Matrix drift reconcile (added with ADR 1091/1092): a rule whose NAME
+    # already exists live but whose group lists / ports / proto / action /
+    # bidir changed in the matrix SoT was previously skipped silently by
+    # Phase 4.1 (POST-missing-only), so live policies drifted from the SoT.
+    # Compare each existing-name policy's live rule against the synthesized
+    # one and PUT the synthesized body over it on mismatch. (Synthesized
+    # bodies already carry group-ID strings — the PUT shape NetBird
+    # requires; the GET body's group objects 400, live-verified .)
+    - name: "Compute policies needing update (matrix drift reconcile)"
+      ansible.builtin.set_fact:
+        policies_to_update: "{{ policies_to_update | default([]) + [{'live_id': _live.id, 'body': item}] }}"
+      loop: "{{ synthesized_policies }}"
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        _live_list: "{{ our_tagged_policies | selectattr('name', 'equalto', item.name) | list }}"
+        _live: "{{ _live_list | first | default({}) }}"
+        _live_rule: "{{ (_live.rules | default([])) | first | default({}) }}"
+        _synth_rule: "{{ item.rules | first }}"
+        _same: >-
+          {{ (_live_rule.sources | default([]) | map(attribute='id') | sort | list) == (_synth_rule.sources | sort | list)
+             and (_live_rule.destinations | default([]) | map(attribute='id') | sort | list) == (_synth_rule.destinations | sort | list)
+             and (_live_rule.ports | default([]) | sort | list) == (_synth_rule.ports | default([]) | sort | list)
+             and (_live_rule.protocol | default('')) == _synth_rule.protocol
+             and (_live_rule.action | default('')) == _synth_rule.action
+             and (_live_rule.bidirectional | default(true) | bool) == (_synth_rule.bidirectional | bool) }}
+      when: (_live_list | length > 0) and not (_same | bool)
+
+    - name: "PUT drifted policies (synthesized body wins)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies/{{ item.live_id }}"
+        method: PUT
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+          Content-Type: application/json
+        body_format: json
+        body: "{{ item.body }}"
+        status_code: [200]
+        return_content: true
+      loop: "{{ policies_to_update | default([]) }}"
+      loop_control:
+        label: "{{ item.body.name }}"
+      register: updated_policies
+
+    # Phase 4.2d — REAP orphans. Opt-in, never the default.
+    #
+    # Report-before-reap, the same posture Phase 3.1b and mode=propose already
+    # take: the first thing anyone should see is the list, not the deletion.
+    # An operator who has read it re-runs with reap_orphans=true.
+    #
+    # Ordering matters and is deliberate: this runs AFTER 4.2 (create) and
+    # 4.2c (update). A rename is a create plus a reap, and doing the create
+    # first means there is never an instant where neither policy exists — the
+    # replacement is live before the old one goes. Reaping first would open a
+    # gap in which the traffic the rule governs is denied.
+    - name: "DELETE orphaned policies"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+        status_code: [200, 204]
+      loop: "{{ orphan_policies }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: reaped_policies
+      when: reap_orphans | default(false) | bool
+
+    # The dormancy claim below is CONDITIONAL, and it did not used to be.
+    # "The mesh continues to work as before because the Default All→All accept
+    # policy is still enabled" was printed unconditionally — but on a goatnet
+    # that has already cut over, Default is DISABLED and the explicit policies
+    # are the whole permission surface. There, apply is NOT a dormant burn-in:
+    # every policy it creates takes effect immediately. A safety message that is false on
+    # production is worse than no message.
+    - name: "Apply-mode summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          APPLY MODE — explicit permits added; Default policy UNCHANGED
+          ============================================================
+          Created {{ policies_to_create | length }} new policy(ies).
+          Updated {{ policies_to_update | default([]) | length }} drifted policy(ies) to match the matrix SoT.
+          Skipped {{ synthesized_policies | length - (policies_to_create | length) - (policies_to_update | default([]) | length) }} already in sync.
+          {% if orphan_policies | length > 0 %}
+          Orphans (ours by tag, undeclared by the matrix): {{ orphan_policies | length }}
+            {{ 'DELETED' if (reap_orphans | default(false) | bool) else 'LEFT IN PLACE — re-run with -e reap_orphans=true' }}
+          {% endif %}
+
+          {% if default_policy.enabled | default(false) %}
+          Default All→All is ENABLED, so the mesh continues to work as before
+          and everything created above is DORMANT. Verify the new policies
+          render correctly in the dashboard before running mode=enforce.
+
+          To complete the cutover ({{ 'DELETE' if cutover_action == 'delete' else 'DISABLE' }} Default):
+            ansible-playbook netbird-acl-cutover.yml \
+              -e target_site={{ target_site }} -e mode=enforce -e confirm_cutover=YES
+          {% else %}
+          *** Default All→All is {{ 'ABSENT or disabled' if cutover_action == 'delete' else 'DISABLED' }} — this goatnet is ALREADY ENFORCING. ***
+
+          Nothing above is dormant. Every policy created or updated took effect
+          the moment it was written, because the explicit policies ARE the
+          permission surface here. Re-read the created/updated counts above as
+          LIVE AUTHORIZATION CHANGES, not as a staged burn-in.
+
+          If a created policy's SOURCE group has no members it grants no
+          effective reach yet — but that is a property of today's membership,
+          not of this mode, and it stops being true the moment someone is
+          enrolled into that group.
+
+          There is no mode=enforce step to run: the cutover already happened.
+          To undo: git revert the rule PR, then mode=apply (ADR 1185).
+          {% endif %}
+
+    # =================================================================
+    # Phase 5 — Enforce cutover (mode=enforce only; apply the declared
+    # default_policy_action: disable | delete). `keep` never reaches here —
+    # Phase 0.5c refused it pre-flight, before Phase 4 wrote anything.
+    # =================================================================
+
+    - name: "Mode gate (skip if not enforce)"
+      ansible.builtin.meta: end_play
+      when: mode != 'enforce'
+
+    # `disable` requires the policy to exist — enforcing on a site whose
+    # Default is already gone means the pattern is wrong or the cutover
+    # already happened; either way a human should look. `delete` deliberately
+    # tolerates absence: the desired end state IS "no Default policy", so an
+    # already-deleted policy makes the re-run an idempotent no-op (Phase 5.2b
+    # skips, Phase 5.3 says so).
+    - name: "Assert Default policy was found (disable only)"
+      ansible.builtin.assert:
+        that:
+          - default_policy.id is defined
+          - default_policy.id | length > 0
+        fail_msg: |
+          No Default policy found matching pattern
+          '{{ netbird_acl_matrix[target_site].cutover.default_policy_name_pattern }}'.
+          Either it was already disabled/deleted in a prior cutover, or
+          the pattern doesn't match the actual policy name. Inspect with:
+            curl -H "Authorization: Token $NOVA_NB_API_TOKEN" \
+              {{ nb_url }}/api/policies | jq '.[] | {id,name,enabled}'
+      when: cutover_action == 'disable'
+
+    # NetBird PUT rejects the GET body verbatim: GET returns rule
+    # sources/destinations as group OBJECTS, PUT requires group-ID STRINGS
+    # (400 "couldn't parse JSON" otherwise).
+    - name: "id-map rule groups for PUT body"
+      ansible.builtin.set_fact:
+        default_policy_put_rules: "{{ default_policy_put_rules | default([]) + [item | combine({'sources': item.sources | map(attribute='id') | list, 'destinations': item.destinations | map(attribute='id') | list})] }}"
+      loop: "{{ default_policy.rules | default([], true) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: cutover_action == 'disable'
+
+    - name: "DISABLE Default policy (the cutover moment)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies/{{ default_policy.id }}"
+        method: PUT
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+          Content-Type: application/json
+        body_format: json
+        # NetBird requires full PUT body (name + rules + enabled). Send back
+        # the existing policy with enabled flipped to false + id-mapped rules.
+        body: "{{ default_policy | combine({'enabled': false, 'rules': default_policy_put_rules}) }}"
+        status_code: [200]
+        return_content: true
+      register: default_disabled
+      when: cutover_action == 'disable'
+
+    # DELETE tolerates an already-absent policy (skips) — the end state is
+    # "no Default policy row", so a re-run after success is a no-op, and a
+    # site cleaned up by hand before this knob existed converges the same way.
+    - name: "DELETE Default policy (post-cutover cleanup)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies/{{ default_policy.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Token {{ lookup('env', nb_token_env) }}"
+        status_code: [200, 204]
+      register: default_deleted
+      when: cutover_action == 'delete' and default_policy.id is defined
+
+    # not_null() guards every list the query walks: NetBird's Go mgmt-server
+    # marshals nil slices as JSON `null`, and JMESPath's length(null) /
+    # contains(null, ...) are hard TypeErrors, not falsy — an ENABLED policy
+    # with `rules: null` would turn this guard into a Jinja traceback instead
+    # of its fail_msg. Runtime dependency: the jmespath python library on the
+    # controller (ships with the Homebrew ansible env; absence fails this
+    # task loudly, never silently passes).
+    - name: "Assert no enabled All-to-All accept Default-shaped policy remains under a different name"
+      vars:
+        all_to_all_query: "[?enabled==`true` && length(not_null(rules, `[]`)[?action=='accept' && protocol=='all' && contains(not_null(sources, `[]`)[].name, 'All') && contains(not_null(destinations, `[]`)[].name, 'All')]) > `0`]"
+        all_to_all_enabled_policies: "{{ policies_resp.json | default([]) | json_query(all_to_all_query) }}"
+      ansible.builtin.assert:
+        that:
+          - all_to_all_enabled_policies | length == 0
+        fail_msg: |
+          An ENABLED All-to-All accept policy still exists under a name that does
+          not match the declared Default pattern
+          '{{ netbird_acl_matrix[target_site].cutover.default_policy_name_pattern }}'.
+          Offending policy name(s): "{{ all_to_all_enabled_policies | map(attribute='name') | join(', ') }}"
+          Fix default_policy_name_pattern (or this policy's declaration) in
+          ops/warrant/rule-intents/, regenerate the matrix, then re-run; do not
+          edit the live NetBird policy directly.
+      when: cutover_action == 'delete' and default_policy.id is not defined
+
+    - name: "Cutover complete"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          {% if cutover_action == 'delete' and default_policy.id is defined -%}
+          CUTOVER COMPLETE — Default policy DELETED (id was {{ default_policy.id }})
+          {% elif cutover_action == 'delete' -%}
+          NOTHING TO DO — no policy matches the Default pattern; the declared
+          end state (deleted) already holds. This run was an idempotent no-op.
+          {% else -%}
+          CUTOVER COMPLETE — Default policy DISABLED
+          {% endif -%}
+          ============================================================
+          From this point forward, L4 traffic is gated by the explicit
+          permits in this playbook's matrix. Anything not permitted is
+          dropped at the NetBird WireGuard layer.
+
+          Verify by:
+            - Operator laptop (ADMIN) still reaches every service: yes
+            - Synth-vendor publishers (VENDOR) still reach Zenoh :7447: yes
+            - Panoscope subscriber still receives Zenoh traffic: yes
+            - An unauthorized peer attempting SSH to nova-a: connection refused
+
+          To undo if anything is broken: git revert the rule PR, then
+            ansible-playbook netbird-acl-cutover.yml \
+              -e target_site={{ target_site }} -e mode=apply
+
+          F-132 L4 portion is now closed pending these verifications.
+
+    # =================================================================
+    # Phase 6 — Rollback (mode=rollback): RETIRED by ADR 1185; the play
+    # below refuses and prints the undo (git revert + mode=apply)
+    # =================================================================
+    # NOTE: handled in a sibling play below because the meta: end_play
+    # in Phase 4.0 prevents flow control from reaching here when mode=rollback.
+
+- name: NetBird L4 ACL cutover — rollback play
+  hosts: localhost
+  connection: local
+  become: false   # local HTTPS calls; ansible.cfg's become = true would demand sudo on the laptop
+  # The API may serve a certificate from the goatnet's own CA (a LAN goatnet
+  # does). When that CA's root is in the repository, verify against it; a
+  # goatnet behind a public CA verifies as before. Never turn verification off.
+  module_defaults:
+    ansible.builtin.uri:
+      ca_path: "{{ (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') if (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') is exists else omit }}"
+  gather_facts: false
+
+  vars:
+    # NOTE: these three used to be declared as self-referencing
+    # play vars — `mode: "{{ mode | default('propose') }}"`. ansible-core 2.20
+    # treats that as a recursive template and the playbook aborted at Phase 0.2
+    # with "Recursive loop detected in template" on EVERY invocation that did
+    # not pass all three via -e. Pre-existing and unrelated to ADR 1124; found
+    # running the first propose. Defaults now come from `default()` at each use
+    # site, which cannot recurse.
+    repo_root: "{{ playbook_dir | dirname | dirname }}"
+    taxonomy_path: "{{ playbook_dir }}/netbird_acl_taxonomy.yml"
+    matrix_path: "{{ playbook_dir }}/netbird_acl_matrix.yml"
+
+    netbird_site_url_map:
+      vega: https://mgmt.vega.netbird-prod.goat.example
+      legacy: https://netbird.legacy.example
+      zagros: https://netbird.zagros.example
+      zagros-prod: https://netbird.zagros-prod.example
+      zagros-dev: https://netbird.zagros-dev.example
+
+    netbird_site_env_var_map:
+      vega: VEGA_NB_API_TOKEN
+      legacy: LEGACY_NB_API_TOKEN
+      zagros: ZAGROS_NB_API_TOKEN
+      zagros-prod: ZAGROS_PROD_NB_API_TOKEN
+      zagros-dev: ZAGROS_DEV_NB_API_TOKEN
+
+    # Which mgmt API and which token (ADR 1185: the standup must be able to
+    # apply the ACL to a goatnet this file has never heard of). Precedence:
+    # -e netbird_mgmt_url / -e netbird_token_env (goat-standup.sh passes
+    # https://<public_mgmt_fqdn> from the site's group_vars) > the map above >
+    # an exercise's host site > nothing (Phase 0.6 refuses). The token env var
+    # defaults to <SITE>_NB_API_TOKEN, the name every standup mints.
+    nb_site_key: "{{ netbird_exercises[target_site].host_site if target_site in (netbird_exercises | default({})) else target_site }}"
+    nb_url: "{{ netbird_mgmt_url | default(netbird_site_url_map.get(nb_site_key, ''), true) }}"
+    nb_token_env: "{{ netbird_token_env | default(netbird_site_env_var_map.get(nb_site_key, (nb_site_key | upper | replace('-', '_')) ~ '_NB_API_TOKEN'), true) }}"
+
+    policy_tag: "[L4-cutover via netbird-acl-cutover.yml]"
+
+  tasks:
+
+    - name: "Normalize optional inputs"
+      # Replaces the self-referencing play vars removed . set_fact is
+      # evaluated once as a task, so `mode | default(...)` here cannot recurse;
+      # and set_fact sits BELOW extra-vars in precedence, so `-e mode=apply`
+      # still wins. Without this, mode/confirm_cutover are undefined whenever
+      # the caller omits them and every conditional reading them errors.
+      ansible.builtin.set_fact:
+        target_site: "{{ target_site | default('', true) }}"
+        mode: "{{ mode | default('propose', true) }}"
+        confirm_cutover: "{{ confirm_cutover | default('', true) }}"
+
+    - name: "Rollback — skip unless mode=rollback"
+      ansible.builtin.meta: end_play
+      when: mode != 'rollback'
+
+    # ADR 1185: no goatnet ever carries a Default All->All policy, and that
+    # includes an emergency one. This mode used to re-enable or recreate the
+    # Default and delete every declared policy, i.e. undo a bad cutover by
+    # making the whole goatnet flat. The undo for a bad rule is the declared
+    # ACL at the previous commit: `git revert` the rule PR, then mode=apply.
+    - name: "Rollback — refused (ADR 1185: no Default All->All, not even in an emergency)"
+      ansible.builtin.fail:
+        msg: |
+          mode=rollback is retired (ADR 1185). It restored a Default All->All
+          policy, which no goatnet may carry. To undo a bad ACL change on
+          '{{ target_site }}':
+            1. git revert the PR that changed ops/warrant/ and merge it
+            2. ops/warrant/generate.py (the revert already carries the matrix)
+            3. ansible-playbook netbird-acl-cutover.yml -e target_site={{ target_site }} -e mode=apply
+          apply re-creates or re-shapes the declared policies to the reverted
+          matrix; nothing ever goes wide open. Nothing was written.
+
+- name: NetBird L4 ACL cutover — exercise teardown play
+  hosts: localhost
+  connection: local
+  become: false   # local HTTPS calls; ansible.cfg's become = true would demand sudo on the laptop
+  # The API may serve a certificate from the goatnet's own CA (a LAN goatnet
+  # does). When that CA's root is in the repository, verify against it; a
+  # goatnet behind a public CA verifies as before. Never turn verification off.
+  module_defaults:
+    ansible.builtin.uri:
+      ca_path: "{{ (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') if (playbook_dir ~ '/../enrollment/ca/' ~ target_site ~ '/root-cert.pem') is exists else omit }}"
+  gather_facts: false
+
+  vars:
+    # NOTE: these three used to be declared as self-referencing
+    # play vars — `mode: "{{ mode | default('propose') }}"`. ansible-core 2.20
+    # treats that as a recursive template and the playbook aborted at Phase 0.2
+    # with "Recursive loop detected in template" on EVERY invocation that did
+    # not pass all three via -e. Pre-existing and unrelated to ADR 1124; found
+    # running the first propose. Defaults now come from `default()` at each use
+    # site, which cannot recurse.
+    confirm_teardown: "{{ confirm_teardown | default('') }}"
+    repo_root: "{{ playbook_dir | dirname | dirname }}"
+    taxonomy_path: "{{ playbook_dir }}/netbird_acl_taxonomy.yml"
+    matrix_path: "{{ playbook_dir }}/netbird_acl_matrix.yml"
+
+    netbird_site_url_map:
+      vega: https://mgmt.vega.netbird-prod.goat.example
+      legacy: https://netbird.legacy.example
+      zagros: https://netbird.zagros.example
+      zagros-prod: https://netbird.zagros-prod.example
+      zagros-dev: https://netbird.zagros-dev.example
+
+    netbird_site_env_var_map:
+      vega: VEGA_NB_API_TOKEN
+      legacy: LEGACY_NB_API_TOKEN
+      zagros: ZAGROS_NB_API_TOKEN
+      zagros-prod: ZAGROS_PROD_NB_API_TOKEN
+      zagros-dev: ZAGROS_DEV_NB_API_TOKEN
+
+    # Which mgmt API and which token (ADR 1185: the standup must be able to
+    # apply the ACL to a goatnet this file has never heard of). Precedence:
+    # -e netbird_mgmt_url / -e netbird_token_env (goat-standup.sh passes
+    # https://<public_mgmt_fqdn> from the site's group_vars) > the map above >
+    # an exercise's host site > nothing (Phase 0.6 refuses). The token env var
+    # defaults to <SITE>_NB_API_TOKEN, the name every standup mints.
+    nb_site_key: "{{ netbird_exercises[target_site].host_site if target_site in (netbird_exercises | default({})) else target_site }}"
+    nb_url: "{{ netbird_mgmt_url | default(netbird_site_url_map.get(nb_site_key, ''), true) }}"
+    nb_token_env: "{{ netbird_token_env | default(netbird_site_env_var_map.get(nb_site_key, (nb_site_key | upper | replace('-', '_')) ~ '_NB_API_TOKEN'), true) }}"
+
+    policy_tag: "[L4-exercise {{ target_site }} via netbird-acl-cutover.yml]"
+
+  tasks:
+
+    - name: "Normalize optional inputs"
+      # Replaces the self-referencing play vars removed . set_fact is
+      # evaluated once as a task, so `mode | default(...)` here cannot recurse;
+      # and set_fact sits BELOW extra-vars in precedence, so `-e mode=apply`
+      # still wins. Without this, mode/confirm_cutover are undefined whenever
+      # the caller omits them and every conditional reading them errors.
+      ansible.builtin.set_fact:
+        target_site: "{{ target_site | default('', true) }}"
+        mode: "{{ mode | default('propose', true) }}"
+        confirm_cutover: "{{ confirm_cutover | default('', true) }}"
+
+    - name: "Teardown — skip unless mode=teardown"
+      ansible.builtin.meta: end_play
+      when: mode != 'teardown'
+
+    - name: "Teardown 0.1 — Load taxonomy + matrix"
+      ansible.builtin.include_vars:
+        file: "{{ item }}"
+      loop:
+        - "{{ taxonomy_path }}"
+        - "{{ matrix_path }}"
+
+    - name: "Teardown 0.2 — Expand exercise site entries"
+      ansible.builtin.include_tasks: tasks/netbird-exercise-expand.yml
+
+    - name: "Teardown 0.3 — Teardown applies to exercise sites ONLY"
+      ansible.builtin.assert:
+        that:
+          - target_site in (netbird_exercises | default({}))
+        fail_msg: |
+          mode=teardown only operates on exercise group-sets declared in
+          netbird_acl_taxonomy.yml → netbird_exercises. `{{ target_site }}`
+          is not one. Persistent sites are never torn down by this play.
+
+    # ADR 1158. `netbird_exercises` holds persistent OPERATIONAL sites as well
+    # as exercises, and a comment in the taxonomy saying never to run this against
+    # them is not protection, while 0.3 above accepts every declared row
+    # equally. `kind:` is required by tasks/netbird-exercise-expand.yml, so an
+    # unset value cannot reach here and be read as "not operational".
+    - name: "Teardown 0.3b — Teardown REFUSES an operational site"
+      ansible.builtin.assert:
+        that:
+          - (netbird_exercises[target_site].kind | default('')) != 'operational'
+        fail_msg: |
+          `{{ target_site }}` declares kind: operational — it is a live site,
+          not an exercise. Teardown DELETES its tagged policies and prefixed
+          groups, which against a site carrying gear is an outage, not a
+          cleanup. There is no override flag: if the site is genuinely being
+          decommissioned, absorb its members first
+          (`goat admin members move --from {{ netbird_exercises[target_site].site_prefix }}-<role> --to <role> --apply`),
+          then change `kind:` in netbird_acl_taxonomy.yml in a reviewed commit.
+
+    - name: "Teardown 0.4 — Require confirm_teardown=YES"
+      ansible.builtin.assert:
+        that:
+          - confirm_teardown == 'YES'
+        fail_msg: |
+          mode=teardown requires -e confirm_teardown=YES (literal, uppercase).
+          This DELETES exercise `{{ target_site }}`'s policies + groups from
+          the {{ netbird_exercises[target_site].host_site }} mgmt server.
+
+    - name: "Teardown 0.5 — Facts: prefix + API base"
+      ansible.builtin.set_fact:
+        ex_prefix: "{{ netbird_exercises[target_site].site_prefix }}"
+        nb_auth: "Token {{ lookup('env', nb_token_env) }}"
+
+    - name: "Teardown 1.1 — GET groups"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/groups"
+        method: GET
+        headers: { Authorization: "{{ nb_auth }}", Accept: application/json }
+        status_code: [200]
+        return_content: true
+      register: td_groups_resp
+
+    - name: "Teardown 1.2 — Compute this exercise's groups"
+      ansible.builtin.set_fact:
+        ex_groups: "{{ td_groups_resp.json | selectattr('name', 'match', '^' ~ (ex_prefix | regex_escape) ~ '-') | list }}"
+        ex_group_names: "{{ td_groups_resp.json | selectattr('name', 'match', '^' ~ (ex_prefix | regex_escape) ~ '-') | map(attribute='name') | list }}"
+        ex_group_ids: "{{ td_groups_resp.json | selectattr('name', 'match', '^' ~ (ex_prefix | regex_escape) ~ '-') | map(attribute='id') | list }}"
+
+    - name: "Teardown 1.3 — GET peers (coverage gate input)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/peers"
+        method: GET
+        headers: { Authorization: "{{ nb_auth }}", Accept: application/json }
+        status_code: [200]
+        return_content: true
+      register: td_peers_resp
+
+    - name: "Teardown 1.4 — Coverage gate: evaluate per peer"
+      ansible.builtin.set_fact:
+        td_orphans: "{{ td_orphans | default([]) + [item.0] }}"
+      loop: "{{ td_peers_resp.json | map(attribute='name') | zip(td_peers_resp.json | map(attribute='groups') | map('default', []) | map('map', attribute='name') | map('list')) | list }}"
+      loop_control:
+        label: "{{ item.0 }}"
+      vars:
+        _holds_exercise: "{{ item.1 | intersect(ex_group_names) | length > 0 }}"
+        _other_covering: "{{ item.1 | difference(ex_group_names) | difference(['All']) }}"
+      when: (_holds_exercise | bool) and (_other_covering | length == 0)
+
+    - name: "Teardown 1.4c — Refuse while peers would go uncovered"
+      ansible.builtin.assert:
+        that:
+          - (td_orphans | default([])) | length == 0
+        fail_msg: |
+          COVERAGE GATE: {{ (td_orphans | default([])) | length }} peer(s) hold ONLY
+          {{ target_site }} groups and would be left in no policy-bearing group:
+            {{ (td_orphans | default([])) | join(', ') }}
+          Absorb them back first (`goat admin members move --from {{ ex_prefix }}-<role>
+          --to <role> --apply`) or remove the peers, then re-run teardown.
+
+    - name: "Teardown 1.5 — GET setup keys (key-hygiene gate input)"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/setup-keys"
+        method: GET
+        headers: { Authorization: "{{ nb_auth }}", Accept: application/json }
+        status_code: [200]
+        return_content: true
+      register: td_keys_resp
+
+    - name: "Teardown 1.6 — Refuse while live setup keys mint exercise groups"
+      ansible.builtin.assert:
+        that:
+          - >-
+            td_keys_resp.json
+            | rejectattr('revoked', 'truthy')
+            | selectattr('auto_groups', 'defined')
+            | selectattr('auto_groups', 'truthy')
+            | map(attribute='auto_groups')
+            | map('intersect', ex_group_ids)
+            | map('length')
+            | select('gt', 0)
+            | list
+            | length == 0
+        fail_msg: |
+          KEY-HYGIENE GATE: non-revoked setup key(s) still auto-group into
+          {{ target_site }}'s groups; revoke them first (they would re-mint
+          peers into deleted groups):
+            {{ td_keys_resp.json | rejectattr('revoked', 'truthy') | selectattr('auto_groups', 'defined') | selectattr('auto_groups', 'truthy') | list | map(attribute='name') | join(', ') }}
+
+    - name: "Teardown 2.1 — GET policies"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies"
+        method: GET
+        headers: { Authorization: "{{ nb_auth }}", Accept: application/json }
+        status_code: [200]
+        return_content: true
+      register: td_policies_resp
+
+    - name: "Teardown 2.2 — Identify this exercise's policies (by site-scoped tag)"
+      ansible.builtin.set_fact:
+        td_policies_to_delete: >-
+          {{
+            td_policies_resp.json
+            | selectattr('description', 'defined')
+            | selectattr('description', 'search', policy_tag | regex_escape)
+            | list
+          }}
+
+    - name: "Teardown 2.3 — DELETE the exercise's tagged policies"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/policies/{{ item.id }}"
+        method: DELETE
+        headers: { Authorization: "{{ nb_auth }}" }
+        status_code: [200, 204]
+      loop: "{{ td_policies_to_delete }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "Teardown 3.1 — DELETE the exercise's groups"
+      ansible.builtin.uri:
+        url: "{{ nb_url }}/api/groups/{{ item.id }}"
+        method: DELETE
+        headers: { Authorization: "{{ nb_auth }}" }
+        status_code: [200, 204]
+      loop: "{{ ex_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "Teardown 4 — Summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          TEARDOWN COMPLETE — exercise {{ target_site }} ({{ ex_prefix }})
+          ============================================================
+          Policies deleted: {{ td_policies_to_delete | length }} (by tag: {{ policy_tag }})
+          Groups deleted:   {{ ex_groups | length }} ({{ ex_group_names | join(', ') }})
+          Host site {{ netbird_exercises[target_site].host_site }} policies/groups: untouched.
+
+          Re-stamp any time:
+            ansible-playbook netbird-acl-bootstrap.yml -e target_site={{ target_site }}
+            ansible-playbook netbird-acl-cutover.yml -e target_site={{ target_site }} -e mode=apply

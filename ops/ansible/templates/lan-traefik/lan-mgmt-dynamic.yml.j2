@@ -1,0 +1,185 @@
+# Traefik dynamic config — mgmt-identity surface for a LAN-enrollment goatnet.
+# Rendered by ops/ansible/lan-traefik-routes.yml to
+# /etc/traefik/dynamic/lan-mgmt-{{ site_id }}.yml.
+#
+# GENERALIZED (no site literals): the LAN sibling of the nova/ZAGROS
+# mgmt-dynamic.yml.j2 overlay. Differences from the ACME original:
+#   - TLS comes from ONE internal-CA multi-SAN file cert (ADR 0407 path,
+#     tls.certificates below) — no certResolver, no ACME, no cert-split
+#     (there is no public/mesh cert boundary: nothing here is
+#     internet-reachable; the LAN is the perimeter, nova-lan posture).
+#   - No `enrollment` entrypoint / rathole: peers enroll over the LAN on
+#     websecure. The apex + signal routers therefore carry NO source
+#     allowlist (peers dial pre-mesh from LAN addresses).
+#   - Backends are identical to the public-DNS overlay (same mgmt-host compose).
+#
+# A LAN instance reuses this file untouched via its own group_vars.
+#
+# DO NOT EDIT ON THE HOST — re-run lan-traefik-routes.yml.
+
+tls:
+  certificates:
+    # Internal-CA multi-SAN leaf covering the apex + <svc>.{{ site_id }}.{{ site_dns_zone }}
+    # (+ admin.auth second-level). Minted at bootstrap; delivered by
+    # lan-traefik-routes.yml.
+    - certFile: "{{ traefik_tls_root | default('/etc/goat/tls') }}/mgmt-identity/cert.pem"
+      keyFile: "{{ traefik_tls_root | default('/etc/goat/tls') }}/mgmt-identity/key.pem"
+
+http:
+  middlewares:
+    # LAN + own-mesh + on-host containers. Defense-in-depth for the identity
+    # surfaces (auth/oauth2/dashboard/mgmt-alias); the apex + signal routers
+    # deliberately do NOT carry it (pre-mesh enrollment dials).
+    # goat-inflight: the per-source concurrency ceiling every portal route
+    # references. The internet profile defines it in the traefik role's
+    # dynamic.yml; a LAN goatnet skips that role, so the LAN surface defines
+    # the same middleware under the same name.
+    goat-inflight:
+      inFlightReq:
+        amount: {{ goat_inflight_amount | default(24) }}
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+
+    # goat-ratelimit: the per-router request ceiling the portal's request
+    # routers also reference (the traefik role's dynamic.yml defines it on
+    # the internet profile). Without it Traefik drops the portal router on a
+    # LAN goatnet with "middleware goat-ratelimit@file does not exist" and
+    # the portal answers 404.
+    goat-ratelimit:
+      rateLimit:
+        average: {{ goat_ratelimit_average | default(50) }}
+        burst: {{ goat_ratelimit_burst | default(100) }}
+        period: 1s
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+
+    lan-mesh-allowlist:
+      ipAllowList:
+        sourceRange:
+          - "{{ lan_allowlist_cidr | mandatory('lan_allowlist_cidr is unset — set the site LAN CIDR in group_vars/<site>_hosts (e.g. 192.168.8.0/24)') }}"
+          - "100.64.0.0/10"  # own-mesh peers (netbird CGNAT)
+          - "172.16.0.0/12"  # Docker bridge — on-host containers
+
+    dashboard-root-to-access-control:
+      redirectRegex:
+        # Single-quoted: backslash escapes are literal in single-quoted YAML;
+        # double quotes would treat \. as an (invalid) escape sequence.
+        regex: '^https://dashboard\.{{ site_id }}\.{{ site_dns_zone | regex_replace("\.", "\\.") }}/?$'
+        replacement: "https://dashboard.{{ site_id }}.{{ site_dns_zone }}/access-control"
+
+  routers:
+    lan-signal:
+      priority: 100
+      rule: "Host(`{{ public_mgmt_fqdn }}`) && PathPrefix(`/signalexchange.SignalExchange/`)"
+      entryPoints:
+        - websecure
+      service: lan-signal
+      tls: {}
+
+    lan-mgmt-public:
+      priority: 10
+      rule: "Host(`{{ public_mgmt_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: lan-mgmt
+      tls: {}
+
+    lan-mgmt-mesh:
+      priority: 10
+      rule: "Host(`mgmt.{{ site_id }}.{{ site_dns_zone }}`)"
+      entryPoints:
+        - websecure
+      service: lan-mgmt
+      middlewares:
+        - lan-mesh-allowlist
+      tls: {}
+
+    lan-kratos-api:
+      priority: 100
+      rule: >
+        Host(`auth.{{ site_id }}.{{ site_dns_zone }}`) &&
+        (PathPrefix(`/sessions`) ||
+         PathPrefix(`/self-service`) ||
+         PathPrefix(`/.well-known`) ||
+         PathPrefix(`/schemas`) ||
+         PathPrefix(`/health`))
+      entryPoints:
+        - websecure
+      service: lan-kratos-api
+      middlewares:
+        - lan-mesh-allowlist
+      tls: {}
+
+    lan-selfservice:
+      priority: 10
+      rule: "Host(`auth.{{ site_id }}.{{ site_dns_zone }}`)"
+      entryPoints:
+        - websecure
+      service: lan-selfservice
+      middlewares:
+        - lan-mesh-allowlist
+      tls: {}
+
+    lan-hydra:
+      priority: 50
+      rule: "Host(`oauth2.{{ site_id }}.{{ site_dns_zone }}`)"
+      entryPoints:
+        - websecure
+      service: lan-hydra
+      middlewares:
+        - lan-mesh-allowlist
+      tls: {}
+
+    lan-dashboard:
+      priority: 50
+      rule: "Host(`dashboard.{{ site_id }}.{{ site_dns_zone }}`)"
+      entryPoints:
+        - websecure
+      service: lan-dashboard
+      middlewares:
+        - lan-mesh-allowlist
+        - dashboard-root-to-access-control
+      tls: {}
+
+  services:
+    lan-signal:
+      loadBalancer:
+        servers:
+          # signal-server container in the mgmt-host compose project
+          # (`--grpc-addr=:10000`); h2c for HTTP/2 cleartext gRPC framing.
+          - url: "h2c://signal-a:10000"
+
+    lan-mgmt:
+      loadBalancer:
+        servers:
+          # netbird management API (h2c gRPC + REST on :80 in-container).
+          - url: "h2c://management-a:80"
+
+    lan-kratos-api:
+      loadBalancer:
+        servers:
+          - url: "http://kratos:4433"
+
+    lan-selfservice:
+      loadBalancer:
+        servers:
+          - url: "http://selfservice-ui:3000"
+
+    lan-hydra:
+      loadBalancer:
+        servers:
+          - url: "http://hydra:4444"
+
+    lan-dashboard:
+      loadBalancer:
+        servers:
+{% if dashboard_oauth2_proxy_enabled | default(false) %}
+          # L7 admin-fence — oauth2-proxy-dashboard gates on the ADMINS group
+          # claim before forwarding to dashboard:80.
+          - url: "http://oauth2-proxy-dashboard:4180"
+{% else %}
+          # netbirdio/dashboard container (nginx-served React SPA, :80).
+          - url: "http://dashboard:80"
+{% endif %}

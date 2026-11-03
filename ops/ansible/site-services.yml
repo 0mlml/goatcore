@@ -1,0 +1,161 @@
+---
+# site-services.yml — the service tier for ANY goatnet, from one file.
+#
+# site-bootstrap.yml stops at the management plane (phases 0-7D). Everything a
+# person actually opens in a browser — the fabric router, the DNS zone, the TLS
+# routes, the dashboard, STUN — otherwise lives only inside each goatnet's own
+# bootstrap playbook, and building a new goatnet's service playbook means copying
+# one with text tools. A copy carries the source goatnet's identity, and a sed
+# that rewrites one goatnet's name cannot know which of the strings it did NOT
+# match were also identity.
+#
+# This file replaces that extraction. It is site-agnostic: every play is
+# parameterised on site_id and the host group, so standing up a new goatnet
+# runs the SAME file every other goatnet runs, and a fix here reaches all of
+# them at once.
+#
+# Contract:
+#   -e target=<host group>     which hosts (e.g. <site>_hosts)
+#   -e site_id=<site>          which goatnet
+#   plus the two Phase-6 secrets the management re-render needs.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts.ini site-services.yml \
+#       -e target=<site>_hosts -e site_id=<site> \
+#       -e postgres_superuser_password="$SITE_PG_PASS" \
+#       -e netbird_encryption_key="$SITE_NB_ENCKEY"
+#
+# Ordering follows the handbook's own phase arc (docs/operations/
+# goatnet-standup.md, phases 9-12), which is the part of that document
+# worth keeping: router first because the surfaces publish to it, then the LAN
+# surface, then the mesh account baseline that needs the dashboard to exist.
+#
+# Idempotent, like every phase it composes. Re-runnable.
+
+- name: "site-services: pre-flight — the two things every play below assumes"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: site_id and target are both provided
+      ansible.builtin.assert:
+        that:
+          - site_id is defined and site_id | length > 0
+          - target is defined and target | length > 0
+        fail_msg: >
+          site-services.yml needs BOTH -e site_id=<site> and -e target=<group>.
+          site_id names the goatnet (zagros-dev); target names the inventory group
+          (zagros_dev_hosts). They are separate because a goatnet can have more
+          than one host group.
+
+    - name: Refuse to run against anything but the named group
+      ansible.builtin.assert:
+        that:
+          - target != "all"
+          - target in groups
+        fail_msg: >-
+          target must be a real inventory GROUP, never "all". This playbook
+          imports plays that declare `hosts: all`, and an unguarded run reaches
+          every host in the inventory — it touched two other goatnets' hosts
+          once already.
+
+    - name: Announce
+      ansible.builtin.debug:
+        msg:
+          - "site-services for {{ site_id }} on group {{ target }}."
+          - "Phase 11 zenoh router -> Phase 12 LAN surface -> Phase 13 mesh baseline."
+          - "This is the same file every goatnet runs. Do not copy it per site."
+
+# ---------------------------------------------------------------- Phase 11 --
+# The fabric router first: every surface below publishes to it, and a surface
+# that comes up without a router to reach presents as healthy and empty, which
+# is the F-177 silent-denial shape.
+- name: "site-services: Zenoh data-fabric router"
+  ansible.builtin.import_playbook: zenoh-deploy.yml
+
+# ---------------------------------------------------------------- Phase 12 --
+# The LAN service surface, parameterised instead of copied.
+- name: "site-services: LAN service surface"
+  hosts: "{{ target | mandatory }}"
+  gather_facts: true
+  roles:
+    # Authoritative DNS for the goatnet's mesh zone. Every service name below
+    # resolves through this, so it precedes the things that publish names.
+    - role: lan-coredns
+      tags: [lan-dns]
+      vars:
+        # Set here rather than in each goatnet's group_vars because the role
+        # needs them and NO goatnet defines them — they were set inline in each
+        # site's own bootstrap playbook, which is precisely the per-site copy
+        # this file replaces. Derived from facts + site_id so they are correct
+        # for any goatnet without being restated per goatnet.
+        #
+        # bind_ip must be the LAN address, NOT the mesh or wg-cp0 one: this
+        # server answers for hosts on the local segment.
+        # The role's own default is a hardcoded single-site directory. Point it at this site's.
+        lan_coredns_zone_dir: "{{ playbook_dir }}/../dns/{{ site_id }}"
+        lan_coredns_bind_ip: "{{ lan_bind_ip | default(ansible_default_ipv4.address) }}"
+        lan_coredns_zone_name: "{{ lan_dns_zone | default(site_id ~ '.lan') }}"
+        lan_coredns_smoke_test_name: "{{ 'mgmt-' ~ site_id ~ '-01.' ~ (lan_dns_zone | default(site_id ~ '.lan')) }}"
+        lan_coredns_smoke_test_expect: "{{ lan_bind_ip | default(ansible_default_ipv4.address) }}"
+    # TLS routes serving the site's own certificates for every web name.
+    #
+    # Skipped when traefik_services is empty, which is how site-bootstrap's
+    # Phase 2.5 already behaves — the empty list is a DELIBERATE state meaning
+    # "the operator has not yet chosen which services get an offline-CA cert",
+    # and the mgmt-host Traefik from Phase 2.5 is already terminating TLS. A
+    # hard failure here would block the whole service tier on a decision that
+    # has its own runbook step.
+    - role: traefik
+      tags: [traefik]
+      when: (traefik_services | default([]) | length) > 0
+    # STUN, so peers can find each other without a cloud relay.
+    - role: coturn
+      tags: [stun]
+
+# ---------------------------------------------------------------- Phase 13 --
+# The mesh account baseline. Needs the dashboard and Ory from phases above, so
+# it runs last.
+# isitup-deploy.yml declares `hosts: all`. Imported unguarded it reaches EVERY
+# host in the inventory, including hosts belonging to other goatnets. A site
+# playbook must never be able to do that.
+#
+# `-l` is not protection either: it is an operator flag, and a file that is only
+# safe when someone remembers a flag is not safe. The limit is pinned here.
+- name: "site-services: service registry + isitup surface"
+  ansible.builtin.import_playbook: isitup-deploy.yml
+  vars:
+    isitup_target_group: "{{ target }}"
+
+# ---------------------------------------------------------------- Phase 14 --
+# The surfaces. Every one of these has its own *-deploy.yml already and every
+# one takes `target`; this list is what stops a new goatnet from depending on an
+# operator knowing which playbook to run.
+#
+# Ordered so a surface never comes up before what it reads:
+#   portal + registry -> observability -> operator surfaces -> content
+#
+# Each is skipped when the goatnet does not declare it, so a smaller goatnet
+# runs the same file and gets a smaller site.
+
+- name: "site-services: portal and identity surfaces"
+  ansible.builtin.import_playbook: portal-deploy.yml
+- name: "site-services: id-admin console"
+  ansible.builtin.import_playbook: id-admin-console-deploy.yml
+- name: "site-services: minio console"
+  ansible.builtin.import_playbook: minio-console-deploy.yml
+
+- name: "site-services: consistency console"
+  ansible.builtin.import_playbook: consistency-console-deploy.yml
+
+- name: "site-services: content and demo surfaces"
+  ansible.builtin.import_playbook: goat-docs-deploy.yml
+- name: "site-services: goat CLI download"
+  ansible.builtin.import_playbook: goat-get-deploy.yml
+
+- name: "site-services: compliance proxy"
+  ansible.builtin.import_playbook: compliance-proxy-deploy.yml
+- name: "site-services: relay-fleet health surface"
+  ansible.builtin.import_playbook: relay-health-deploy.yml

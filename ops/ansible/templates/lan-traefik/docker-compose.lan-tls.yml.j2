@@ -1,0 +1,29 @@
+# Compose OVERRIDE for a LAN-enrollment goatnet's Traefik — mounts the
+# internal-CA cert tree (ADR 0407) into the traefik container so the
+# lan-mgmt dynamic config's tls.certificates paths resolve.
+#
+# Rendered by ops/ansible/lan-traefik-routes.yml to
+# /opt/mgmt-host/docker-compose.lan-tls.yml. Applied as:
+#   docker compose -f docker-compose.yml -f docker-compose.lan-tls.yml up -d traefik
+#
+# Unlike the nova ACME override this does NOT touch `command:` — compose
+# merges `volumes:` lists additively, so the base traefik service is
+# otherwise unchanged (no ACME flags, no /letsencrypt).
+services:
+  traefik:
+    volumes:
+      - {{ traefik_tls_root | default('/etc/goat/tls') }}:{{ traefik_tls_root | default('/etc/goat/tls') }}:ro
+
+  # Internal-CA trust for management-a's JWKS fetch: hydra's discovery doc
+  # advertises the PUBLIC issuer (https://oauth2.<site>.<zone>/...jwks.json),
+  # so the JWT validator fetches signing keys THROUGH traefik's internal-CA
+  # cert. On ACME sites the chain is publicly trusted; on a LAN/internal-CA
+  # site the fetch fails ("unable to find appropriate key" → every dashboard
+  # call 401s Token invalid — hobby standup 2026-07-16). Go honors
+  # SSL_CERT_FILE; the bundle = system CAs + the site root, assembled by
+  # lan-traefik-routes.yml.
+  management-a:
+    environment:
+      SSL_CERT_FILE: /etc/netbird/lan-trust-bundle.pem
+    volumes:
+      - {{ traefik_tls_root | default('/etc/goat/tls') }}/lan-trust-bundle.pem:/etc/netbird/lan-trust-bundle.pem:ro

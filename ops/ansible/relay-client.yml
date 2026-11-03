@@ -1,0 +1,130 @@
+---
+# relay-client.yml — Install rathole client on the router
+#
+# Usage:
+#   ansible-playbook -i inventory.ini relay-client.yml \
+#     -e vps_relay_ip=203.0.113.2 \
+#     -e vps_relay_token=<token> \
+#     -e vps_relay_pubkey=<pubkey>
+#
+# Or source .envrc.local first and pass from env:
+#   source .envrc.local
+#   ansible-playbook -i inventory.ini relay-client.yml \
+#     -e vps_relay_ip=$VPS_RELAY_IP \
+#     -e vps_relay_token=$VPS_RELAY_TOKEN \
+#     -e vps_relay_pubkey=$VPS_RELAY_PUBKEY
+
+- name: Install rathole relay client
+  hosts: router
+  become: true
+  vars:
+    rathole_version: "v0.5.0"
+    rathole_url: "https://github.com/rapiz1/rathole/releases/download/{{ rathole_version }}/rathole-x86_64-unknown-linux-gnu.zip"
+    rathole_config_dir: /etc/rathole
+    rathole_bin: /usr/local/bin/rathole
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - vps_relay_ip is defined and vps_relay_ip | length > 0
+          - vps_relay_token is defined and vps_relay_token | length > 0
+          - vps_relay_pubkey is defined and vps_relay_pubkey | length > 0
+        fail_msg: "Missing required variables: vps_relay_ip, vps_relay_token, vps_relay_pubkey"
+
+  tasks:
+    - name: Install dependencies
+      ansible.builtin.apt:
+        name: [unzip]
+        state: present
+        update_cache: true
+
+    - name: Download rathole
+      ansible.builtin.get_url:
+        url: "{{ rathole_url }}"
+        dest: /tmp/rathole.zip
+        mode: "0644"
+
+    - name: Create extraction directory
+      ansible.builtin.file:
+        path: /tmp/rathole-extract
+        state: directory
+        mode: "0755"
+
+    - name: Extract rathole
+      ansible.builtin.unarchive:
+        src: /tmp/rathole.zip
+        dest: /tmp/rathole-extract
+        remote_src: true
+
+    - name: Install rathole binary
+      ansible.builtin.copy:
+        src: /tmp/rathole-extract/rathole
+        dest: "{{ rathole_bin }}"
+        mode: "0755"
+        remote_src: true
+
+    - name: Clean up download
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/rathole.zip
+        - /tmp/rathole-extract
+
+    - name: Create config directory
+      ansible.builtin.file:
+        path: "{{ rathole_config_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Write client config
+      ansible.builtin.template:
+        src: client.toml.j2
+        dest: "{{ rathole_config_dir }}/client.toml"
+        mode: "0600"
+      notify: Restart rathole client
+
+    # One home for this unit: templates/rathole-client@.service.j2.
+    # Single-tunnel shape, so no %i instance and a fixed config name.
+    - name: Install systemd service
+      ansible.builtin.template:
+        src: templates/rathole-client@.service.j2
+        dest: /etc/systemd/system/rathole-client.service
+        mode: "0644"
+      vars:
+        rathole_client_label: goat
+        rathole_client_instance: ""
+        rathole_client_config: client.toml
+      notify: Restart rathole client
+
+    - name: Enable and start rathole client
+      ansible.builtin.systemd:
+        name: rathole-client
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Test connectivity to VPS
+      ansible.builtin.wait_for:
+        host: "{{ vps_relay_ip }}"
+        port: 2333
+        timeout: 10
+      register: connectivity_test
+      ignore_errors: true
+
+    - name: Report status
+      ansible.builtin.debug:
+        msg: |
+          Rathole client installed and running.
+          VPS control channel: {{ 'reachable' if connectivity_test is succeeded else 'UNREACHABLE — check VPS UFW and AWS security group' }}
+
+          Test from any machine:
+            curl -sk --resolve netbird.legacy.example:443:{{ vps_relay_ip }} https://netbird.legacy.example/api/accounts
+
+  handlers:
+    - name: Restart rathole client
+      ansible.builtin.systemd:
+        name: rathole-client
+        state: restarted
+        daemon_reload: true

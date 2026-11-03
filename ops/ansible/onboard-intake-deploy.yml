@@ -1,0 +1,35 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# onboard-intake-deploy.yml — deploy the public candidate-onboarding front desk
+# (ADR 1062 stage 1, decision #1): a thin nginx allowlist collector on the
+# enrollment ingress that serves the candidate form + the two token-gated
+# candidate endpoints and forwards them to the mesh-only portal. Everything else
+# 404s, so the portal's operator surfaces stay unreachable from the public
+# internet. See docs/design/three-stage-candidate-onboarding.md.
+#
+# Usage (ZAGROS):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini \
+#     onboard-intake-deploy.yml -e target=zagros_hosts
+#
+# Prereqs: public DNS for onboard_intake_public_fqdn → the relays (terraform-zagros),
+# and the portal deployed with PORTAL_INTAKE_BASE_URL set so mint links point at
+# the public front desk.
+
+- name: "onboarding | public intake front desk"
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+  vars:
+    admin_write_surface: "onboard-intake-collector (the intake queue the runner executes from)"
+  pre_tasks:
+    # Single-homed per ADR 1084 §D3: the intake collector holds the queue the
+    # onboard-runner drains, and one goatnet with two front desks means two
+    # queues — a submission landing on whichever host DNS resolved to.
+    - name: "Guard — admin surfaces are single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+  roles:
+    - onboard-intake-collector
+    - intake-mesh-advisory

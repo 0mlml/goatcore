@@ -1,0 +1,142 @@
+---
+# trust-sandbox-oidc-client.yml — the Zero-Trust Sandbox's gate client at the
+# site Hydra skips the consent page, like every other first-party door.
+#
+#   ansible-playbook -i inventory/mgmt-hosts-mesh.ini trust-sandbox-oidc-client.yml \
+#     -e target=<site>_hosts
+#
+# WHY THIS EXISTS. Every other door on a goatnet has its Hydra client written
+# by a role (`*-oidc-client`, `oauth2-proxy-surface`, `external-service.yml`),
+# and every one of them sets `skip_consent: true`: the client is first-party,
+# so asking the person to "Allow" a service the goatnet itself runs is noise.
+# The sandbox's client is the exception. It lives on a cloud VM that self-hosts
+# its gate, so its client is made by a person typing `hydra create client`
+# (ops/serve/trust-sandbox/deploy/README.md §3), and that command carries no
+# `--skip-consent`. A flag a runbook asks someone to type is enforced by
+# nothing, so this play sets it and removes the sandbox's reason to show the
+# consent page.
+#
+# SAFE FOR THIS CLIENT. Hydra v2.3.0 strips claims from /userinfo for a
+# skip_consent client. The sandbox's gate is oauth2-proxy, which reads
+# `sub` and `groups` from the id_token, exactly as every other oauth2-proxy
+# door on the goatnet does with the same setting.
+#
+# FOUND BY REDIRECT URI, NOT BY ID. The client id is whatever Hydra generated
+# on the day the runbook was followed, and it is recorded only on the VM. The
+# callback URL is the one fact about the client this repo does own.
+#
+# ONE FIELD, BY JSON PATCH. Hydra omits client_secret from GET, so a PUT of the
+# whole client would need the secret, which lives on the VM and not here.
+# PATCH changes `skip_consent` and nothing else.
+#
+# IDEMPOTENT. A client that already skips consent is left alone. ROLLBACK is
+# the same PATCH with `false`.
+
+- name: Trust sandbox — the gate's Hydra client skips the consent page
+  hosts: "{{ target | mandatory }}[0]"
+  gather_facts: false
+  become: false
+
+  vars:
+    hydra_admin: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}"
+    # One shared instance is the shipped shape; `-b` is the scratch instance the
+    # runbook still describes. A hostname with no client is not an error.
+    trust_sandbox_hostnames:
+      - trust-sandbox
+      - trust-sandbox-b
+    trust_sandbox_callbacks: >-
+      {%- set out = [] -%}
+      {%- for h in trust_sandbox_hostnames -%}
+      {%- set _ = out.append('https://' ~ h ~ '.' ~ site_id ~ '.' ~ site_dns_zone ~ '/oauth2/callback') -%}
+      {%- endfor -%}
+      {{ out }}
+
+  tasks:
+    - name: Hydra admin is reachable on loopback
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/health/ready"
+        status_code: 200
+      register: _ts_hydra_ready
+      retries: 5
+      delay: 3
+      until: _ts_hydra_ready is succeeded
+
+    - name: List the clients at the site Hydra
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/admin/clients?page_size=500"
+        return_content: true
+        status_code: 200
+      register: _ts_clients_get
+
+    - name: One page holds every client
+      ansible.builtin.assert:
+        that: (_ts_clients_get.json | length) < 500
+        fail_msg: >-
+          The site Hydra returned a full page of 500 clients, so the sandbox's
+          client may be on a later page. Follow the Link header here before
+          trusting the result.
+
+    - name: Pick out the sandbox's gate clients by their callback URL
+      ansible.builtin.set_fact:
+        _ts_gate_clients: >-
+          {%- set out = [] -%}
+          {%- for c in _ts_clients_get.json
+                if (c.redirect_uris | default([]) | intersect(trust_sandbox_callbacks) | length) > 0 -%}
+          {%- set _ = out.append(c) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: The sandbox has a client at this Hydra
+      ansible.builtin.assert:
+        that: _ts_gate_clients | length > 0
+        fail_msg: >-
+          No Hydra client at {{ site_id }} has a redirect URI in
+          {{ trust_sandbox_callbacks }}. Create it first —
+          ops/serve/trust-sandbox/deploy/README.md §3, which now passes
+          --skip-consent — and this play has nothing left to do.
+
+    - name: Set skip_consent on each gate client that lacks it
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/admin/clients/{{ item.client_id }}"
+        method: PATCH
+        body_format: json
+        body:
+          - op: add
+            path: /skip_consent
+            value: true
+        status_code: 200
+      loop: "{{ _ts_gate_clients | rejectattr('skip_consent', 'equalto', true) | list }}"
+      loop_control:
+        label: "{{ item.client_id }}"
+      changed_when: true
+
+    - name: Read each gate client back
+      ansible.builtin.uri:
+        url: "{{ hydra_admin }}/admin/clients/{{ item.client_id }}"
+        return_content: true
+        status_code: 200
+      register: _ts_verify
+      loop: "{{ _ts_gate_clients }}"
+      loop_control:
+        label: "{{ item.client_id }}"
+
+    - name: Every gate client skips the consent page, and nothing else moved
+      ansible.builtin.assert:
+        that:
+          - item.json.skip_consent is true
+          - item.json.redirect_uris == item.item.redirect_uris
+          - item.json.scope == item.item.scope
+          - item.json.token_endpoint_auth_method == item.item.token_endpoint_auth_method
+        fail_msg: >-
+          Client {{ item.item.client_id }} does not read back as expected after
+          the PATCH: skip_consent={{ item.json.skip_consent | default('absent') }}.
+      loop: "{{ _ts_verify.results }}"
+      loop_control:
+        label: "{{ item.item.client_id }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ site_id }}: {{ _ts_gate_clients | length }} sandbox gate client(s),
+          all with skip_consent true
+          ({{ _ts_gate_clients | map(attribute='client_id') | join(', ') }}).

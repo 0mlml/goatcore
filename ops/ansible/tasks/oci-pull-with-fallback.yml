@@ -1,0 +1,72 @@
+---
+# ops/ansible/tasks/oci-pull-with-fallback.yml
+#
+# Cascading image pull across the OCI distribution substrate's tier
+# ladder per ADR 0838 + docs/design/oci-goat-substrate.md §5.
+#
+# Tries each tier in priority order; first success wins. Empty tier
+# entries are skipped (lets us declare the tier list shape today even
+# though T1 R2 + T1 ECR aren't wired yet).
+#
+# Records the winning tier in `oci_pull_winning_tier` so the caller
+# can render the resolved URL into compose .env (caller's compose
+# stack then pulls from local cache — image bits already present).
+#
+# Usage:
+#   - name: Pull admit-audit with cascading fallback
+#     ansible.builtin.include_tasks: ../tasks/oci-pull-with-fallback.yml
+#     vars:
+#       service_name: admit-audit
+#       image_tiers: "{{ admit_audit_image_tiers }}"
+#
+# After include, caller can use `{{ oci_pull_winning_tier }}` as the
+# image reference for compose .env / blockinfile.
+
+- name: oci-pull-with-fallback | sanity-check inputs
+  ansible.builtin.assert:
+    that:
+      - service_name is defined
+      - image_tiers is defined
+      - (image_tiers | select | list | length) > 0
+    quiet: true
+    msg: |
+      oci-pull-with-fallback requires:
+        service_name: <string>   (e.g. admit-audit)
+        image_tiers:  <list>     (priority order; empty entries skipped)
+
+- name: oci-pull-with-fallback | filter empty tier entries
+  ansible.builtin.set_fact:
+    _oci_tiers_filtered: "{{ image_tiers | select | list }}"
+
+- name: oci-pull-with-fallback | iterate tiers, first success wins
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      WINNING_TIER=""
+      for tier in {{ _oci_tiers_filtered | map('quote') | join(' ') }}; do
+        echo "[oci-pull] trying: $tier" >&2
+        if docker pull "$tier" >>/var/log/oci-pull.log 2>&1; then
+          WINNING_TIER="$tier"
+          echo "[oci-pull] success: $tier" >&2
+          break
+        else
+          echo "[oci-pull] failed: $tier" >&2
+        fi
+      done
+      if [ -z "$WINNING_TIER" ]; then
+        echo "FATAL: all {{ _oci_tiers_filtered | length }} tiers failed for {{ service_name }}" >&2
+        exit 1
+      fi
+      printf '%s' "$WINNING_TIER"
+    executable: /bin/bash
+  register: _oci_pull_result
+  changed_when: false   # docker pull is idempotent if image already local
+  become: true
+
+- name: oci-pull-with-fallback | record winning tier
+  ansible.builtin.set_fact:
+    oci_pull_winning_tier: "{{ _oci_pull_result.stdout }}"
+
+- name: oci-pull-with-fallback | log result
+  ansible.builtin.debug:
+    msg: "oci-pull: {{ service_name }} resolved via {{ oci_pull_winning_tier }} (tier {{ _oci_tiers_filtered.index(oci_pull_winning_tier) + 1 }} of {{ _oci_tiers_filtered | length }})"

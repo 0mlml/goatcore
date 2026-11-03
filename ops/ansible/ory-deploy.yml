@@ -1,0 +1,104 @@
+---
+# ory-deploy.yml — Block 21C-production Ory wire-up against an existing
+# mgmt-host site. Runs AFTER site-bootstrap.yml (which brings up the
+# mgmt-stack: postgres-spock + signal-server + netbird-mgmt + Traefik +
+# admit-audit). Idempotent — re-runs are safe.
+#
+# Single-active deployment per ADR 1010 D1 (operator-fired failover, same
+# model as netbird-mgmt). Kratos + Hydra run only on Orin-A. B's Ory
+# containers stay stopped until operator-fired postgres failover per
+# the postgres failover runbook.
+#
+# Required group_vars (in group_vars/<site>_hosts/vars.yml or via -e):
+#   site_id                  per-group identifier (e.g. "site-a")
+#   site_dns_zone            mesh DNS zone (default: netbird.legacy.example)
+#   kratos_cookie_secret     ≥32 chars (env-sourced via lookup)
+#   kratos_cipher_secret     =32 chars; IDENTICAL across HA pair
+#   hydra_secrets_system     ≥32 chars
+#   hydra_secrets_cookie     ≥32 chars
+#   site_admins              list of {email, name, password_hash, groups}
+#                            (empty list = skip first-admin import)
+#   mgmt_host_compose_watch_services  allowlist for the watcher (REQUIRED
+#                                     when Ory loads to prevent migration
+#                                     revival loop; see role README +
+#                                     docs/findings/F-013-*)
+#
+# Apply pattern:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+#       -l <mgmt-host> ory-deploy.yml \
+#       -e postgres_superuser_password="$PG_PASS"
+#
+# Cross-refs:
+# - ADR 0411 — Ory IdP MVP (Accepted final)
+# - ADR 1010 — Ory-on-Spock mindful operation (D1 updated)
+# - docs/project/idp-decision-review.md §6 v7 verdict — PASS
+# - docs/project/implementation-plan.md Block 21C-production
+# - docs/findings/F-013-* — restart recovery (mgmt-host-compose-watch
+#   allowlist required when Ory loads)
+
+- name: Deploy Ory (Kratos + Hydra) to mgmt-host
+  hosts: all
+  become: true
+  # gather_facts: true is required because the secondary mgmt-host-compose-watch
+  # role (line 74 below) reads ansible_os_family in a `when:` conditional and
+  # fails the play when facts are missing. The play failing mid-run means the
+  # `restart kratos` / `restart hydra` handlers DON'T flush at end-of-play —
+  # the on-disk kratos.yaml + hydra.yml get the new content but the containers
+  # keep running the old config until an operator manually restarts. Flipped
+  # because a config apply otherwise hits this exact failure mode.
+  gather_facts: true
+
+  # Single-active per ADR 1010 D1: Kratos + Hydra run ONLY on the primary
+  # (router_role A). On an A/B pair the B node's Postgres is a read-only
+  # streaming standby (site-bootstrap Phase 6A), so every DB-mutating task in
+  # the ory role — CREATE DATABASE, kratos-migrate, hydra-migrate, the network
+  # pre-seed, the admin import — would fail with "cannot execute ... in a
+  # read-only transaction" if run there. The B node's Ory containers stay
+  # stopped until an operator-fired failover.
+  #
+  # This gate is on the PLAY, not on the caller, so any invocation is safe:
+  # `--limit <pair-group>` (goat-standup phase 6) skips B on its own rather
+  # than relying on the caller to name the primary host. Single-Orin sites
+  # leave router_role unset → default 'A' → the sole host runs, unchanged.
+  vars:
+    _ory_is_primary: "{{ (router_role | default('A') | upper) == 'A' }}"
+
+  pre_tasks:
+    - name: "Skip Ory on non-primary (router_role != A) — B's Ory stays stopped until failover"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is router_role={{ router_role | default('A') }};
+          Ory is single-active (ADR 1010 D1). Nothing to do here — Kratos/Hydra
+          run only on the primary. Its Postgres is a read-only standby.
+      when: not (_ory_is_primary | bool)
+
+    - name: Verify mgmt-host base stack is up (postgres-a)
+      ansible.builtin.command:
+        cmd: docker compose -f /opt/mgmt-host/docker-compose.yml ps -q postgres-a
+      register: postgres_check
+      changed_when: false
+      failed_when: postgres_check.stdout == ""
+      when: _ory_is_primary | bool
+
+    - name: Copy docker-compose.ory.yml overlay to /opt/mgmt-host/
+      ansible.builtin.copy:
+        src: ../compose/mgmt-host/docker-compose.ory.yml
+        dest: /opt/mgmt-host/docker-compose.ory.yml
+        owner: root
+        group: root
+        mode: '0644'
+      when: _ory_is_primary | bool
+
+  roles:
+    - role: ory
+      when: _ory_is_primary | bool
+    # mgmt-host-compose-watch role re-applies its drop-in to pick up
+    # mgmt_host_compose_watch_services from group_vars (allowlist must
+    # be set when Ory loads — kratos-migrate / hydra-migrate exit 0 by
+    # design and unfiltered watcher revives them every poll cycle).
+    # Primary-only for the same reason: it exists here to guard the Ory
+    # one-shots, which only run on A. B's base watcher comes from site-bootstrap.
+    - role: mgmt-host-compose-watch
+      when: _ory_is_primary | bool

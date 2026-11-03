@@ -1,0 +1,76 @@
+---
+# site-preflight.yml — standalone pre-flight gate for any site bringup.
+# Block 22K. Asserts every <SITE>_* env var the chain depends on is
+# present, refuses to declare PASS if any are missing.
+#
+# Usage:
+#
+#   ansible-playbook site-preflight.yml -e site_id=vega
+#
+# Exits 0 = all env vars present. Exits non-zero = at least one missing
+# (the assert task names the var).
+#
+# The same gate runs as Phase 0 of site-bootstrap.yml; this standalone
+# wrapper exists so an operator can verify their .envrc.local is ready
+# without committing to a full chain run.
+#
+# Profile-aware as of Block 22L.4: the env-var requirement
+# list is selected from `profile_required_env_vars[mgmt_stack_profile]`,
+# loaded from the shared file ops/ansible/vars/site-required-env-vars.yml.
+# Per-site group_vars MAY override `required_env_vars` directly to
+# declare an explicit list (e.g. prov-rla uses single-Orin var names
+# without an A/B router-role suffix).
+
+- name: "site-preflight: env var gate"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "vars/site-required-env-vars.yml"
+    - "group_vars/{{ site_id | replace('-', '_') }}_hosts/vars.yml"
+  vars:
+    site_id_upper: "{{ site_id | upper | replace('-', '_') }}"
+    effective_required_env_vars: >-
+      {{ required_env_vars
+         | default(profile_required_env_vars[mgmt_stack_profile]) }}
+  tasks:
+    - name: "site-preflight | site_id provided"
+      ansible.builtin.assert:
+        that:
+          - site_id is defined
+          - site_id | length > 0
+        fail_msg: "site_id is required. Pass it via -e site_id=<name>."
+
+    - name: "site-preflight | mgmt_stack_profile is declared"
+      ansible.builtin.assert:
+        that:
+          - mgmt_stack_profile is defined
+          - mgmt_stack_profile in ['full', 'postgres-spock-only']
+        fail_msg: |
+          mgmt_stack_profile must be declared in
+          group_vars/{{ site_id | replace('-', '_') }}_hosts/vars.yml.
+          Today's accepted values: full | postgres-spock-only.
+
+    - name: "site-preflight | all env vars present"
+      ansible.builtin.assert:
+        that:
+          - "lookup('env', item) | length > 0"
+        fail_msg: "Missing env var: {{ item }} (must be set in .envrc.local)."
+        success_msg: "{{ item }} present."
+        quiet: true
+      loop: "{{ effective_required_env_vars }}"
+      no_log: true
+
+    - name: "site-preflight | summary"
+      ansible.builtin.debug:
+        msg: |
+          PASS — operator environment is ready for {{ site_id }} bringup.
+          mgmt_stack_profile: {{ mgmt_stack_profile }}
+          {{ effective_required_env_vars | length }} env vars present.
+          You may now run:
+            ansible-playbook -i inventory/hosts.ini -i inventory/mgmt-hosts.ini \
+              site-bootstrap.yml -e site_id={{ site_id }}{% if mgmt_stack_profile == 'full' %} \
+              -e postgres_superuser_password="${{ '{' }}{{ site_id_upper }}_PG_PASS{{ '}' }}" \
+              -e netbird_encryption_key="${{ '{' }}{{ site_id_upper }}_NB_ENCKEY{{ '}' }}" \
+              -e pgbackrest_cipher_pass="${{ '{' }}{{ site_id_upper }}_BKP_KEY{{ '}' }}" \
+              -e bootstrap_owner_email="person-85@example.org"{% else %} \
+              -e postgres_superuser_password="${{ '{' }}{{ site_id_upper }}_PG_PASS{{ '}' }}"{% endif %}

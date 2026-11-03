@@ -1,0 +1,485 @@
+---
+# ============================================================================
+# !!! DEPRECATED — USE `wg-cp0` ORCHESTRATOR INSTEAD — !!!
+# ============================================================================
+#
+# This playbook is FENCED. It carries the F-120 structural ordering bug:
+# Pass 3 restarts wg-quick@wg-cp0 on each peer BEFORE Pass 4 pushes the
+# relay-side allowlist with the new pubkeys. The restart drops the wg-cp0
+# session that is driving the play (each peer's ansible_host is its
+# wg-cp0 IP), so Pass 3 records the host as UNREACHABLE and the
+# playbook-level Pass 4 import never fires. Every peer that got past the
+# restart step is then bricked from wg-cp0 (new privkey on disk, no relay
+# accepts that pubkey) until a separate `wg-cp0-bootstrap.yml --limit
+# wg_cp0_relay_hosts -e wg_cp0_skip_client_pass=true` run is manually
+# fired.
+#
+# THE REPLACEMENT HAS LANDED. Use the `wg-cp0` orchestrator binary at
+# ops/enrollment/cmd/wg-cp0/ (Block 22R.2, all three sessions merged
+# PRs #44 / #45 / #47). Operator runbook:
+# docs/operations/wg-cp0-ceremony-v2.md. Substrate composes:
+#
+#   - Block 22R.1 (✅) — single declarative source-of-truth
+#     at ops/enrollment/wg-cp0-bundle-allowlist.json + accessor library.
+#   - Block 22R.2 (✅) — reconcile-not-rewrite orchestrator
+#     with dry-run-by-default, structured diff, upsert-only allowlist
+#     sync, atomic ceremony with checkpoint rollback.
+#   - Block 22R.3 (✅) — `wg syncconf` handler split + change-
+#     shape classifier so allowlist-only changes no longer drop existing
+#     peer sessions. The "restart drops the ssh that's driving the play"
+#     class is structurally gone from the new path.
+#
+# Common operations on the new substrate:
+#   - Onboard a peer:           wg-cp0 onboard <peer-name>
+#   - Rotate a peer's key:      wg-cp0 rotate <peer-name> --reason "..."
+#   - Add a relay's endpoint:   wg-cp0 update-endpoints <peer-name>
+#   - Extend a bundle's TTL:    wg-cp0 update-ttl <peer-name>
+#   - Reconcile fleet to JSON:  wg-cp0 reconcile (dry-run; --apply commits)
+#   - List / show:              wg-cp0 list / wg-cp0 show <peer-name>
+#
+# ADR 0322 (substrate spec) is Proposed pending one end-to-end
+# ceremony through the new orchestrator, which then retires this file
+# to ops/ansible/deprecated/.
+#
+# IF YOU MUST RUN THIS PLAYBOOK ANYWAY (emergency only, e.g. orchestrator
+# itself broken): fire bundle-create + per-peer manual wg-cp0-bundle-apply
+# over LAN ssh per docs/operations/wg-cp0-bundle-ceremony.md, THEN fire
+# wg-cp0-bootstrap.yml --limit wg_cp0_relay_hosts -e
+# wg_cp0_skip_client_pass=true as the relay-side allowlist push, THEN
+# restart wg-cp0 on each peer over LAN (NOT over wg-cp0). The brick class
+# above still applies if you skip any of those steps.
+#
+# ============================================================================
+#
+# wg-cp0-rotate-bundles.yml — turnkey wg-cp0 bundle rotation across the
+# fleet. Block 22P substrate.
+#
+# WHAT THIS DOES
+#
+# Replaces the per-peer `bundle-create` + `wg-cp0-bundle-apply` ceremony
+# that the operator otherwise drives by hand for every peer. After this play
+# completes:
+#
+#   - Every wg_cp0_clients peer has a freshly-issued offline-CA-signed
+#     bundle carrying the current 6-server (or N-server) wg-cp0 mesh.
+#   - Per ADR 0321 (wg-cp0 perimeter, not ACL), every relay peer
+#     block in every bundle carries [MeshAddr/32, 198.18.0.0/24] as
+#     AllowedIPs. The `wg_cp0_active_forwarder_tier` inventory var
+#     controls the *ordering* of relays in the bundle — peers prefer
+#     the first relay they can reach via WireGuard endpoint switching.
+#     Flip + re-run = forwarder *preference* change; every relay
+#     remains a valid forwarder for the fleet /24.
+#   - Each peer's `/etc/wireguard/wg-cp0.conf` reflects the new bundle.
+#   - The relay-side allowlist is unchanged by this play (it's already
+#     in force from a prior wg-cp0-bootstrap.yml run).
+#
+# WHEN TO RUN IT
+#
+#   1. Block 22O cutover step: bring up wg-cp0 server on a new tier,
+#      run wg-cp0-bootstrap.yml against the new tier (Pass 1A captures
+#      pubkeys), then run THIS playbook to push the new endpoint set
+#      to every peer in one shot.
+#
+#   2. Tier failover (Block 22P): edit the
+#      `wg_cp0_active_forwarder_tier` inventory var (or pass via -e),
+#      re-run THIS playbook. Every peer's bundle is re-issued with
+#      the new ordering; forwarder shifts within ~few seconds of the
+#      bundle-apply per device.
+#
+#   3. Adding a new peer (operator laptop, new mgmt-host): inventory
+#      gets the [wg_cp0_clients] entry; this playbook issues the new
+#      peer's bundle alongside re-issuing existing peers' bundles.
+#
+# WHAT THIS DOES NOT DO
+#
+#   - Bring up wg-cp0 server on a NEW relay tier — that's
+#     wg-cp0-bootstrap.yml's job.
+#   - Push allowlist changes to relay-side wg-cp0.conf — also
+#     wg-cp0-bootstrap.yml's job.
+#   - Issue the very FIRST bundle for a peer that has no enrollment
+#     state on its filesystem yet — that's the offline-CA ceremony at
+#     docs/operations/wg-cp0-bundle-ceremony.md (operator-fired with
+#     YubiKey or age-identity sign-off). This playbook expects
+#     existing peers; it ROTATES bundles, not bootstraps them.
+#
+# OPERATOR INVOCATION
+#
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     direnv exec . aws-vault exec usareur-af --no-session -- \
+#     ansible-playbook \
+#       -i inventory/hosts-prod.ini \
+#       -i inventory/mgmt-hosts.ini \
+#       -i inventory/wg-cp0-prod.ini \
+#       wg-cp0-rotate-bundles.yml \
+#       -e ca_id=$DEV_CA_ID \
+#       -e ca_key_path=$(pwd)/../enrollment/ca/ca.key.age \
+#       -e age_identity_path=$HOME/.config/age/keys.txt \
+#       -e wg_cp0_allowlist_file=$(pwd)/../enrollment/wg-cp0-bundle-allowlist.json
+#
+#   Override forwarder tier on a failover run:
+#     -e wg_cp0_active_forwarder_tier=goat_relay_hosts
+#
+#   Override forwarder host (within active tier):
+#     -e wg_cp0_active_forwarder_host=goat-relay-rlb
+#
+# DEPENDENCIES
+#
+#   - bundle-create binary at ops/enrollment/cmd/bundle-create/
+#     (built locally via `cd ops/enrollment && go build ./cmd/bundle-create`).
+#   - wg-cp0-bundle-apply binary already deployed to peers (Block 22K).
+#   - Each wg_cp0_relay_hosts member already has /etc/wireguard/wg-cp0-pub.key
+#     (i.e., wg-cp0-bootstrap.yml Pass 1A already ran against this tier).
+#   - Operator dev-CA age identity OR YubiKey-PIV (per ADR 0406 mode).
+#   - Each peer reachable via Ansible's existing connection
+#     (SSM for cloud, SSH-over-LAN/mesh for on-prem Orins).
+
+# ============================================================================
+# Pass 1 — gather tier metadata + per-host wg-cp0 pubkeys from relay servers
+# ============================================================================
+
+- name: "wg-cp0-rotate pass 1 — derive wg-cp0 server pubkeys from priv keys"
+  hosts: wg_cp0_relay_hosts
+  become: true
+  gather_facts: false
+  tasks:
+    # The wg-cp0-server role writes /etc/wireguard/wg-cp0-priv.key (mode 0600)
+    # but does NOT persist the pubkey to a separate file — the conf template
+    # consumes pubkey-via-host-fact (`wg_cp0_pubkey_b64`) computed at apply
+    # time. For rotate-bundles we need the same value, so derive it here
+    # the same way (`wg pubkey` reading the priv key on stdin).
+    - name: Derive wg-cp0 pubkey via `wg pubkey` from /etc/wireguard/wg-cp0-priv.key
+      ansible.builtin.shell: |
+        set -o pipefail
+        cat /etc/wireguard/wg-cp0-priv.key | wg pubkey
+      args:
+        executable: /bin/bash
+      register: wg_cp0_pubkey_cmd
+      changed_when: false
+      no_log: true
+
+    - name: Cache pubkey as a host fact
+      ansible.builtin.set_fact:
+        wg_cp0_pubkey_b64: "{{ wg_cp0_pubkey_cmd.stdout | trim }}"
+
+# ============================================================================
+# Pass 2 — assemble the relays JSON (ordered by tier-priority + the
+#          active-forwarder preference). Per ADR 0321 every relay peer
+#          block carries [MeshAddr/32, 198.18.0.0/24] regardless of
+#          ordering; the active-forwarder designation now affects
+#          WireGuard endpoint-switching preference, not reachability.
+# ============================================================================
+
+- name: "wg-cp0-rotate pass 2 — assemble relays JSON on the controller"
+  hosts: localhost
+  gather_facts: false
+  # Localhost writes to /tmp/wg-cp0-relays.json (operator-writable). No
+  # privileged ops here. Explicit `become: false` overrides any
+  # inventory-level become inheritance that would otherwise prompt sudo
+  # on the operator's laptop (ansible.cfg defaults + group_vars/all merges
+  # can set it).
+  become: false
+  vars:
+    # Default to the inventory-declared active forwarder tier if no
+    # operator override at -e level.
+    effective_active_tier: "{{ wg_cp0_active_forwarder_tier | default(hostvars[groups['wg_cp0_relay_hosts'][0]]['wg_cp0_active_forwarder_tier']) | default('relay_servers') }}"
+  tasks:
+    - name: "Sanity — wg_cp0_relay_hosts is non-empty"
+      ansible.builtin.assert:
+        that:
+          - groups['wg_cp0_relay_hosts'] | default([]) | length > 0
+        fail_msg: |
+          [wg_cp0_relay_hosts:children] in inventory/wg-cp0-prod.ini is empty.
+          Pickup at least one [<tier>_hosts] child group with members.
+
+    - name: "Sanity — effective_active_tier is a known child group"
+      ansible.builtin.assert:
+        that:
+          - effective_active_tier in (groups | dict2items | map(attribute='key') | list)
+          - groups[effective_active_tier] | default([]) | length > 0
+        fail_msg: |
+          wg_cp0_active_forwarder_tier={{ effective_active_tier }} is not a
+          recognized inventory group with members. Check
+          inventory/wg-cp0-prod.ini's [wg_cp0_relay_hosts:children] list +
+          [<tier>:vars] tier-priority declarations.
+
+    - name: "Compute tier-ordered host list"
+      # Order: (1) active-forwarder tier first, (2) then remaining tiers
+      # by ascending wg_cp0_tier_priority. Within a tier: inventory
+      # order (so relay-rla stays first within `relay_servers`, etc.).
+      ansible.builtin.set_fact:
+        wg_cp0_relay_ordered_hosts: >-
+          {{
+            (groups[effective_active_tier] | default([]))
+            +
+            (
+              groups['wg_cp0_relay_hosts'] | default([])
+              | difference(groups[effective_active_tier] | default([]))
+              | sort(attribute=none)
+            )
+          }}
+
+    - name: "Determine active forwarder host (within active tier)"
+      ansible.builtin.set_fact:
+        effective_active_host: >-
+          {{ wg_cp0_active_forwarder_host
+             | default(groups[effective_active_tier][0]) }}
+
+    - name: "Sanity — effective_active_host is in the active tier"
+      ansible.builtin.assert:
+        that:
+          - effective_active_host in groups[effective_active_tier]
+        fail_msg: |
+          wg_cp0_active_forwarder_host={{ effective_active_host }} is not a
+          member of the active tier ({{ effective_active_tier }}: {{
+          groups[effective_active_tier] | join(', ') }}).
+
+    - name: "Render relays JSON to /tmp/wg-cp0-relays.json"
+      # ADR 0321: bundle-create's loadRelaysFile reads name/endpoint/
+      # address/pubkey only — the `allowed_ips` per-relay field was
+      # never load-bearing here (bundle-create maintains its own
+      # canonical AllowedIPs invariant per ADR 0321 §"Decision" §1).
+      # The active-forwarder concept survives at the WireGuard
+      # endpoint-routing layer — every relay peer now carries the
+      # fleet /24 catchall on every bundle, so client-to-client
+      # traffic can transit any reachable relay, not only the
+      # designated active one.
+      ansible.builtin.copy:
+        dest: /tmp/wg-cp0-relays.json
+        mode: "0600"
+        content: |
+          [
+          {% for host in wg_cp0_relay_ordered_hosts %}
+            {
+              "name":     "{{ host }}",
+              "endpoint": "{{ hostvars[host].wg_cp0_public_endpoint }}",
+              "address":  "{{ hostvars[host].wg_cp0_relay_address }}",
+              "pubkey":   "{{ hostvars[host].wg_cp0_pubkey_b64 }}"
+            }{{ "," if not loop.last else "" }}
+          {% endfor %}
+          ]
+
+    - name: "Echo relays JSON for operator visibility"
+      ansible.builtin.debug:
+        msg: |
+          Relays JSON assembled. Active forwarder tier = {{ effective_active_tier }}
+          ({{ groups[effective_active_tier] | length }} hosts). Active
+          forwarder host = {{ effective_active_host }} (canonical AllowedIPs
+          per ADR 0321: every relay peer block now carries
+          {{ wg_cp0_subnet | default('198.18.0.0/24') }} — designation is for
+          endpoint-routing preference, not WireGuard-layer reachability).
+          Total wg-cp0 servers in the rotated bundle = {{ wg_cp0_relay_ordered_hosts | length }}.
+          Ordered hosts:
+          {% for host in wg_cp0_relay_ordered_hosts %}
+            - {{ host }} ({{ hostvars[host].wg_cp0_relay_address }}, {{ hostvars[host].wg_cp0_public_endpoint }}, tier_label={{ hostvars[host].wg_cp0_tier_label | default('?') }})
+          {% endfor %}
+
+# ============================================================================
+# Pass 3 — per-peer bundle issuance (controller-side bundle-create) +
+#          ship + apply (target-side wg-cp0-bundle-apply).
+# ============================================================================
+
+- name: "wg-cp0-rotate pass 3 — per-peer bundle-create + ship + apply"
+  hosts: wg_cp0_clients
+  gather_facts: false
+  # ansible.cfg defaults `become = true`. Override at play level so
+  # delegate_to: localhost tasks don't try to sudo on the operator's
+  # workstation. Device-side tasks below opt back in via per-task
+  # `become: true`.
+  become: false
+  vars:
+    bundle_create_bin: "{{ playbook_dir }}/../enrollment/cmd/bundle-create/bundle-create"
+    relays_json_path: /tmp/wg-cp0-relays.json
+    # Avoid self-referencing default expression. Use a fresh local name
+    # that defers to the operator-supplied value if any, falling back
+    # to the canonical /24.
+    bundle_route_subnet: "{{ wg_cp0_subnet_override | default('198.18.0.0/24') }}"
+  tasks:
+    # -------------------------------------------------------------------
+    # Pre-flight on the controller — fail loud if required inputs missing
+    # -------------------------------------------------------------------
+    - name: "Pre-flight | bundle-create binary exists"
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.stat:
+        path: "{{ bundle_create_bin }}"
+      register: bundle_create_stat
+      failed_when: not bundle_create_stat.stat.exists
+
+    - name: "Pre-flight | required inputs"
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ca_id is defined and ca_id | length > 0
+          - ca_key_path is defined and ca_key_path | length > 0
+          - age_identity_path is defined and age_identity_path | length > 0
+          - wg_cp0_allowlist_file is defined and wg_cp0_allowlist_file | length > 0
+        fail_msg: |
+          Missing -e variable. Required:
+            -e ca_id=<CA-ID>
+            -e ca_key_path=<path-to-ca.key.age>
+            -e age_identity_path=<path-to-age-identity>
+            -e wg_cp0_allowlist_file=<path-to-allowlist.json>
+
+    - name: "Pre-flight | required per-peer inventory vars"
+      ansible.builtin.assert:
+        that:
+          - wg_cp0_client_address is defined and wg_cp0_client_address | length > 0
+          - site_name is defined and site_name | length > 0
+        fail_msg: |
+          Peer {{ inventory_hostname }} is in [wg_cp0_clients] but is missing
+          required vars: wg_cp0_client_address={{ wg_cp0_client_address | default('UNSET') }},
+          site_name={{ site_name | default('UNSET') }}.
+
+    # -------------------------------------------------------------------
+    # Per-peer: derive site_id from site_name (strip A/B/C suffix)
+    # -------------------------------------------------------------------
+    - name: "Derive site_id from site_name"
+      ansible.builtin.set_fact:
+        peer_site_id: "{{ site_id | default(site_name | regex_replace('-[abc]$', '')) }}"
+
+    # -------------------------------------------------------------------
+    # Per-peer: bundle-create on controller (per-peer device-specific bundle)
+    # -------------------------------------------------------------------
+    - name: "Bundle | issue {{ inventory_hostname }} bundle on controller"
+      delegate_to: localhost
+      ansible.builtin.command:
+        argv:
+          - "{{ bundle_create_bin }}"
+          - "--site={{ peer_site_id }}"
+          - "--device-id={{ inventory_hostname }}"
+          - "--wg-cp0-address={{ wg_cp0_client_address }}/24"
+          - "--wg-cp0-relays={{ relays_json_path }}"
+          - "--acl-groups={{ peer_acl_groups | default(peer_site_id | upper) }}"
+          - "--ca-id={{ ca_id }}"
+          - "--mode={{ ca_mode | default('dev') }}"
+          - "--ca-key={{ ca_key_path }}"
+          - "--age-identity={{ age_identity_path }}"
+          # ADR 0321: bundle-create now emits AllowedIPs=[MeshAddr/32,
+          # 198.18.0.0/24] on every relay peer block by default.
+          # `--first-relay-route-subnet`/`--mesh-route-subnet` is no
+          # longer required for routine bundle issuance — the canonical
+          # pair is the default. Pass extras here ONLY when an operator
+          # needs a non-default subnet on top of the canonical pair.
+          - "--update-allowlist={{ wg_cp0_allowlist_file }}"
+          - "--ttl-days={{ bundle_ttl_days | default(90) }}"
+          - "--out=/tmp/{{ inventory_hostname }}.bundle.cbor"
+      register: bundle_create_result
+      changed_when: bundle_create_result.rc == 0
+      # no_log: true  # TEMPORARILY OFF for debugging — re-enable post-cutover
+
+    # -------------------------------------------------------------------
+    # Pre-flight | ensure ca.pub is on the device. A device missing
+    # /etc/wireguard/ca.pub fails the apply step late in the playbook with
+    # the relays already holding new pubkeys, which leaves it stranded.
+    # Idempotent: copy only re-fires when source hash differs.
+    # -------------------------------------------------------------------
+    - name: "Pre-flight | ensure /etc/wireguard/ca.pub present on {{ inventory_hostname }}"
+      become: true
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../enrollment/public-keys/{{ ca_id }}.pem"
+        dest: /etc/wireguard/ca.pub
+        mode: "0644"
+        owner: root
+        group: root
+
+    # -------------------------------------------------------------------
+    # Per-peer: ship bundle to device + apply
+    # -------------------------------------------------------------------
+    - name: "Ship | copy bundle to {{ inventory_hostname }}:/tmp/"
+      become: true
+      ansible.builtin.copy:
+        src: "/tmp/{{ inventory_hostname }}.bundle.cbor"
+        dest: "/tmp/{{ inventory_hostname }}.bundle.cbor"
+        mode: "0600"
+
+    - name: "Apply | run wg-cp0-bundle-apply on {{ inventory_hostname }}"
+      # CLI flag shape (verified against the deployed binary):
+      #   -in              CBOR bundle path (NOT --bundle)
+      #   -ca-pubkey       PEM-encoded CA public key
+      #   -out-conf        wg-cp0.conf output (REQUIRED)
+      #   -out-privkey     wg-cp0-priv.key output (REQUIRED)
+      become: true
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/wg-cp0-bundle-apply
+          - -in
+          - "/tmp/{{ inventory_hostname }}.bundle.cbor"
+          - -ca-pubkey
+          - /etc/wireguard/ca.pub
+          - -out-conf
+          - /etc/wireguard/wg-cp0.conf
+          - -out-privkey
+          - /etc/wireguard/wg-cp0-priv.key
+      register: bundle_apply_result
+      changed_when: bundle_apply_result.rc == 0
+
+    - name: "Apply | restart wg-quick@wg-cp0 to pick up the new conf + privkey"
+      become: true
+      ansible.builtin.systemd:
+        name: wg-quick@wg-cp0
+        state: restarted
+        daemon_reload: false
+
+    - name: "Cleanup | remove the staged bundle from /tmp"
+      become: true
+      ansible.builtin.file:
+        path: "/tmp/{{ inventory_hostname }}.bundle.cbor"
+        state: absent
+
+    - name: "Cleanup | remove the controller-side bundle copy"
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "/tmp/{{ inventory_hostname }}.bundle.cbor"
+        state: absent
+
+    - name: "Verify | wg show wg-cp0 reports {{ wg_cp0_relay_ordered_hosts | default([]) | length }}-peer mesh"
+      become: true
+      ansible.builtin.shell: |
+        set -o pipefail
+        wg show wg-cp0 | grep -c '^peer:' || true
+      register: wg_peer_count
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: "Verify | per-peer summary"
+      ansible.builtin.debug:
+        msg: |
+          {{ inventory_hostname }} bundle rotation complete.
+            site_id:       {{ peer_site_id }}
+            wg-cp0 addr:   {{ wg_cp0_client_address }}
+            peer count:    {{ wg_peer_count.stdout | trim }}
+            (expected:     {{ groups['wg_cp0_relay_hosts'] | length }} after handshakes propagate)
+
+# ============================================================================
+# Pass 4 — push the just-updated allowlist to every relay. A
+# partially-completed rotate leaves devices holding new privkeys whose
+# pubkeys are NOT in the relay allowlist yet, until a separate
+# `wg-cp0-bootstrap.yml` run finishes. Auto-fire that run here so the
+# relay-side accept and the device-side bundle-apply land atomically as
+# part of the same play.
+#
+# Implementation: re-import the existing wg-cp0-bootstrap.yml playbook
+# with wg_cp0_skip_client_pass=true so its Pass 2B (client-side role
+# re-invocation) is skipped — Pass 3 above already configured every
+# wg_cp0_clients peer end-to-end (bundle issued + applied + wg-cp0
+# restarted). Without the skip, Pass 2B re-runs wg-cp0-client on the
+# limited client without wg_cp0_bundle_path (Pass 3 shredded the
+# staged bundle post-apply) and falls into the deprecated legacy-flow
+# assertion. Pass 1A (relay key gen, idempotent), Pass 1B (deprecated,
+# already a no-op for non-legacy hosts), and Pass 2A (relay conf
+# re-render with the allowlist updated by Pass 3) are the work this
+# import is here to do.
+#
+# Operator note: pass `-e wg_cp0_bundle_allowlist_file=<path-to-allowlist.json>`
+# at the top of this playbook's invocation (same path as the rotate-
+# pass-3 `--update-allowlist` target) so Pass 2A in the imported play
+# reads the freshly-updated file.
+# ============================================================================
+
+- name: Import wg-cp0-bootstrap.yml — push allowlist to relays as final step
+  ansible.builtin.import_playbook: wg-cp0-bootstrap.yml
+  vars:
+    wg_cp0_skip_client_pass: true

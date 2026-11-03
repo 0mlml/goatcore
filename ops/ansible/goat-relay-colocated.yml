@@ -1,0 +1,50 @@
+---
+# goat-relay-colocated.yml — ONE-command deploy of a colocated relay host:
+# the goat-relay data plane (:33073) FIRST, then the rathole enrollment ingress
+# (:443/:2333). THIS is the canonical entry point for any all-Rust relay tier
+# with rathole_ingress_enabled=true — ZAGROS today, and any future goatnet whose
+# mgmt-host sits behind CGNAT with no public port-forward.
+#
+# WHY THIS EXISTS: the data plane and the ingress are two separate
+# playbooks (goat-relay-deploy.yml + goat-relay-rathole.yml). ZAGROS's standup ran
+# ONLY the rathole half, so a brand-new peer could enroll over :443 while every
+# peer's relay-fallback silently failed — nothing was listening on :33073
+# (Relays 0/N). Running them as one ordered unit makes that half-built state
+# impossible:
+#   1. goat-relay-deploy.yml brings up the Rust relay and (its own post-deploy
+#      task) ASSERTS a :33073 listener — the run fails loudly if the relay
+#      doesn't come up.
+#   2. goat-relay-rathole.yml then adds the ingress; its F-188 guard refuses to
+#      run if step 1's container isn't present, so you can't get ingress-only.
+#
+# Pre-reqs (same as the two sub-playbooks):
+#   - `terraform apply` done in the relay tree, then
+#     `inventory/generate-relays.sh <env> <tree> ...` regenerated so the relay
+#     hosts carry BOTH goat_relay_advertised_addr AND rathole_secret_name.
+#   - <SITE>_RELAY_SECRET set (the relay-client HMAC secret; MUST match the
+#     value the mgmt server signs relay tokens with).
+#
+# Apply (ZAGROS):
+#   cd ops/ansible
+#   # 1. (re)generate the relay inventory so hosts carry goat_relay_advertised_addr
+#   #    + goat_relay_le_dns01=true:
+#   inventory/generate-relays.sh zagros terraform-zagros aws-vault
+#   # 2. deploy data plane + ingress in one pass (cloudflare_api_token = the LE
+#   #    DNS-01 cert; the relay MUST present a publicly-trusted cert or no peer
+#   #    connects — F-188):
+#   AWS_VAULT=1 AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_PROD \
+#     AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_PROD \
+#     ../scripts/ansible-preflight.sh \
+#     -i inventory/hosts-zagros.ini -i inventory/zagros-goat-relay-alias.ini \
+#     goat-relay-colocated.yml \
+#     -e cloudflare_api_token=$CLOUDFLARE_API_TOKEN_ZAGROS
+#
+# For a data-plane-only tier with no rathole (nova-a, prod goat.example use the stock
+# Go relay / wg-cp0 instead), use goat-relay-deploy.yml directly — this umbrella
+# is specifically the all-Rust + rathole-colocated shape.
+
+- name: Colocated relay — data plane first (goat-relay :33073, asserts listener)
+  ansible.builtin.import_playbook: goat-relay-deploy.yml
+
+- name: Colocated relay — enrollment ingress (rathole :443/:2333)
+  ansible.builtin.import_playbook: goat-relay-rathole.yml

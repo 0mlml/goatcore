@@ -1,0 +1,56 @@
+# TAK Server Docker Compose — {{ inventory_hostname }}
+# Managed by Ansible (tak-server.yml)
+#
+# Host networking: TAK binds directly to wt0 (WireGuard) interface.
+# Clients connect to mesh IP on ports 8089/8443/8446.
+
+services:
+  tak-db:
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+    container_name: tak-db
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      POSTGRES_DB: cot
+      POSTGRES_USER: martiuser
+      POSTGRES_PASSWORD: ${TAK_PG_PASSWORD}
+    volumes:
+      - tak-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U martiuser -d cot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  takserver:
+    image: {{ tak_docker_image }}
+    container_name: takserver
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      tak-db:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: cot
+      POSTGRES_USER: martiuser
+      POSTGRES_PASSWORD: ${TAK_PG_PASSWORD}
+    volumes:
+      - {{ tak_config_dir }}/CoreConfig.xml:/opt/tak/CoreConfig.xml:ro
+      - {{ tak_certs_dir }}:/opt/tak/certs
+      - tak-logs:/opt/tak/logs
+      - tak-data:/opt/tak/data
+{% if federation_host is defined and federation_host != "" %}
+      - {{ tak_config_dir }}/federation.xml:/opt/tak/federation.xml:ro
+{% endif %}
+    # Ports (via host networking):
+    #   8089 — CoT streaming (mTLS)
+    #   8443 — WebTAK, REST API, Data Sync
+    #   8446 — Certificate enrollment
+    #   9000 — Admin / federation
+
+volumes:
+  tak-db-data:
+  tak-logs:
+  tak-data:

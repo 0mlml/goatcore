@@ -1,0 +1,79 @@
+# {{ ansible_managed }}
+# federation-proxy — Thor-local dual-path alias for the signal federation
+# peer (mesh-control-path Phase 3, ADR 1085 Amendment 1).
+#
+# signal-a dials federation-proxy:10001 (its only --federation-peers entry);
+# this haproxy decides per-connection which bearer carries the Forward
+# stream:
+#
+#   primary  — the peer signal-server's mesh IP :10000, plaintext gRPC
+#              (WireGuard encrypts the path; the bearer token in the RPC
+#              metadata is the authn either way).
+#   backup   — the public path: TLS toward the peer's SNI-pinned federation
+#              hostname via a relay; the relay dispatcher (haproxy-ingress,
+#              ADR 1085) pins that SNI to the peer's rathole tunnel; the
+#              peer's Traefik terminates TLS and h2c-forwards to its signal
+#              :10000. Used only while the mesh server is DOWN.
+#
+# This is the F-256 fix shape: a Thor⇄Thor P2P flap kills the primary,
+# health checks fail in ~4 s, and cross-shard signaling (including the
+# re-signal that heals the flapped tunnel) continues via the relays — the
+# healer no longer rides the patient.
+
+global
+    log stdout format raw local0 notice
+    maxconn 512
+
+# Runtime DNS via Docker's embedded resolver (127.0.0.11 on every compose
+# network). Two jobs: (1) `init-addr last,libc,none` lets haproxy START
+# with unresolved relay hostnames instead of exiting fatally — a proxy
+# restart during a WAN/DNS outage (exactly the conditions this stack
+# exists for) must not crash-loop and take the mesh-IP primary down with
+# it; (2) hold-obsolete keeps the last good address through transient
+# resolver failures instead of dropping the server.
+resolvers docker
+    nameserver dockerdns 127.0.0.11:53
+    resolve_retries 3
+    timeout resolve 2s
+    timeout retry 1s
+    hold valid 30s
+    hold obsolete 300s
+
+defaults
+    mode tcp
+    log global
+    option dontlognull
+    # Fast connect budget: a slow leg should fail visibly, not queue
+    # (the gRPC client's per-Forward deadline is finite).
+    timeout connect 3s
+    timeout client 300s
+    timeout server 300s
+    # The federation channel is one long-lived HTTP/2 conn kept warm by
+    # 30 s client keepalive pings (federation.go); once bytes flow both
+    # ways the tunnel timeout governs. Generous so haproxy never recycles
+    # a healthy channel.
+    timeout tunnel 24h
+    retries 2
+    option redispatch
+    default-server init-addr last,libc,none resolvers docker
+
+listen federation
+    bind :10001
+    # Primary — peer signal over the Thor⇄Thor mesh path (IP literal, no
+    # DNS dependency). Plain TCP connect probe: signal's gRPC listener
+    # accepting is the health signal. on-marked-up: when the mesh path
+    # heals, kill the sessions riding the backup leg — the gRPC channel
+    # is one long-lived conn that would otherwise stay on the public
+    # path indefinitely; killing it forces an immediate reconnect that
+    # lands back on the recovered primary.
+    server mesh {{ federation_peer_mesh_addr }} check inter 2s fall 2 rise 2 on-marked-up shutdown-backup-sessions
+    # Backup — public path via the relay fleet. check-ssl performs the full
+    # TLS handshake through relay→rathole→peer-Traefik, so a wedged tunnel
+    # marks the leg DOWN rather than blackholing
+    # forwards. verify required + verifyhost: the peer must present its LE
+    # cert for the federation hostname — the proxy never trusts an
+    # unauthenticated TLS endpoint with signal traffic. First healthy
+    # backup carries (no allbackups — one public leg at a time).
+{% for relay in federation_public_relays %}
+    server pub-{{ relay.split('.')[0] | replace('relay-', '') }} {{ relay }}:443 ssl sni str({{ federation_peer_public_sni }}) verify required verifyhost {{ federation_peer_public_sni }} ca-file /etc/ssl/certs/ca-certificates.crt alpn h2 backup check check-ssl check-sni {{ federation_peer_public_sni }} inter 3s fall 3 rise 2
+{% endfor %}

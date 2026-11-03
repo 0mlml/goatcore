@@ -1,0 +1,37 @@
+---
+# ADR 1118 — kernelspace WireGuard cutover on Jetson mgmt hosts.
+#
+# Installs the pinned out-of-tree wireguard.ko (+ lib/crypto deps) from a
+# local checkout of goat-wireguard-kmod, then restarts netbird,
+# which auto-selects kernel mode. One host at a time; a host that cannot
+# load the module is left untouched in userspace and the run aborts.
+#
+# Transport: env doors (ADR 1117) — open the door first, never flip the
+# laptop netbird profile:
+#   ops/scripts/env-door.sh <goatnet>
+#
+# Usage (from ops/ansible):
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec usareur-af --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/doors.ini wireguard-kmod.yml \
+#     -e target=<site>_door_hosts
+#
+# Revert to userspace:  ... -e wg_kmod_state=absent
+# Artifact checkout override:  -e wg_kmod_artifact_root=/path/to/goat-wireguard-kmod
+#
+# The artifact set also carries the tegra networking gap set (tcp_bbr, sch_fq,
+# xt_TCPMSS — see docs/design/jetson-kernel-wireguard.md). Making BBR the host
+# DEFAULT congestion control is a separate, default-off policy toggle, gated
+# on an A/B measurement:  ... -e wg_kmod_bbr_policy=true
+#
+# Expected per-host effect: one netbird restart = ~15-30 s mesh blip for
+# services on that host (the deploy's own transport rides it out via
+# wait_for_connection).
+
+- name: ADR 1118 — kernelspace WireGuard module install + netbird cutover
+  hosts: "{{ target }}"
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  roles:
+    - wireguard-kmod

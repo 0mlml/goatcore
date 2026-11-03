@@ -1,0 +1,45 @@
+---
+# peering-zenoh-edge.yml — stand up the sovereign EDGE ROUTER for one federated
+# partner: the zenoh half of a peering, on top of the transport that
+# peering-edge.yml opens.
+#
+#   Design:   docs/design/cross-sovereign-federation.md
+#   ADR:      docs/adr/1157-cross-sovereign-federation-edge-terminated.md
+#   Role:     roles/goat-zenoh-edge/
+#   Driver:   ops/scripts/peering-standup.sh   (this is its phase 12)
+#
+# WHY THIS FILE EXISTS. An edge configured by hand hides template defects: a
+# hand-written ACL is written by someone looking at the link, so it is
+# accidentally correct in the places the rendered template is not. This play
+# makes the role's own output the thing that runs.
+#
+# THE VARIABLES COME FROM `goat federate apply`. It writes
+# <work>/applied/ops/ansible/group_vars/<edge group>/federation-<partner>*.yml from
+# the composed agreement, and the driver's fed_work/fed_edge_group say where to read them;
+# the release set we forward and the prefix the far side admits therefore come
+# from one artifact and cannot drift apart by being typed twice. Everything the
+# role also needs — trust paths, both certificate pairs, the inward dial target,
+# the digest-pinned image — is a property of THIS deployment rather than of the
+# peering, and the role fails loud on any of them being empty. Leave it that way:
+# a half-configured edge looks deployed and is not.
+#
+# Run:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec <profile> --no-session -- \
+#     ../scripts/ansible-preflight.sh -i inventory/peering-edges.ini \
+#     --limit <edge group> peering-zenoh-edge.yml
+#
+# Rollback: revert the generated group_vars commit and re-run (config artifact,
+# ADR 1060). To cut the peering immediately without waiting for a play, stop the
+# edge container — the partner's only path terminates there, so stopping it is
+# local, immediate, and effective on established sessions.
+
+- name: Sovereign peering edge router (zenoh)
+  hosts: peering_edges
+  gather_facts: true
+  become: true
+  pre_tasks:
+    - name: Read what `goat federate apply` rendered for this run
+      ansible.builtin.include_tasks: tasks/peering-applied-vars.yml
+  roles:
+    - role: goat-zenoh-edge

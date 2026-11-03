@@ -1,0 +1,139 @@
+---
+# pubsub-state-mirror-deploy.yml — deploy the Block 86 pub/sub state-of-record
+# MIRROR (active-node half) for ANY goatnet. Site-agnostic: pass -e target=<group>
+# (like ory-deploy.yml / zenoh-deploy.yml). Config comes from that group's
+# group_vars/<group>/pubsub-state.yml (see group_vars/zagros_prod_hosts/ for the
+# reference). Design: docs/design/pubsub-state-as-code.md.
+#
+# Runs on the ACTIVE mgmt node only — router_role A on a three-Orin site, or the
+# sole mgmt node on a flat goatnet (no router_role => defaults to A => runs).
+#
+# What it does: drops the pubsub-state-mirror F-207 service operator key into the
+# portal's operator-keys.d, sets up the host MinIO backup tier (when the goatnet
+# declares its MinIO cred env-var names), then applies the pubsub-state-repo role
+# (mirror timer + first-run mirror commit to Forgejo + MinIO shadow).
+#
+# PRE-CONDITIONS (operator owns, one-time per goatnet):
+#   - Forgejo up for this goatnet (obs/utility host) with the pubsub-state-mirror
+#     ADMIN bot + PAT — mint with ops/scripts/forgejo-mint-pubsub-bot.sh <group>.
+#   - Secrets in the env (newsite-secrets.sh generates the portal key):
+#       FORGEJO_PUBSUB_TOKEN, <SITE>_PUBSUB_MIRROR_PORTAL_KEY, and the goatnet's
+#       MinIO root cred env vars if the MinIO tier is wanted.
+#
+# Usage:
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec usareur-af --no-session -- \
+#     ../scripts/ansible-preflight.sh \
+#       -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#       -e target=<group> pubsub-state-mirror-deploy.yml
+#   (add --limit <active-node> to skip fact-gather on the passive node)
+
+- name: Deploy pub/sub state-of-record mirror (active node)
+  hosts: "{{ target }}"
+  gather_facts: true
+  become: true
+  vars:
+    _is_active: "{{ (router_role | default('A')) == 'A' }}"
+
+  pre_tasks:
+    - name: Skip on the passive node
+      ansible.builtin.debug:
+        msg: "router_role={{ router_role | default('A') }} — mirror is active-node-only; skipping."
+      when: not (_is_active | bool)
+
+    - name: Active-node mirror setup
+      when: _is_active | bool
+      block:
+        - name: Pre-flight — mirror credentials present
+          ansible.builtin.assert:
+            that:
+              - pubsub_state_forgejo_token | length > 0
+              - pubsub_state_portal_api_key | length > 0
+            fail_msg: |
+              FORGEJO_PUBSUB_TOKEN and the portal service key
+              (pubsub_state_portal_api_key, from <SITE>_PUBSUB_MIRROR_PORTAL_KEY)
+              must be set in the environment. See this play's header.
+            quiet: true
+
+        # --- F-207 service operator key ---
+        - name: Stat an existing operator key (to match ownership)
+          ansible.builtin.find:
+            paths: "{{ pubsub_state_portal_keys_dir }}"
+            patterns: "*.key"
+            file_type: file
+          register: _existing_keys
+
+        - name: Derive key-file owner/group/mode from an existing key
+          ansible.builtin.set_fact:
+            _key_owner: "{{ _existing_keys.files[0].uid | default(0) }}"
+            _key_group: "{{ _existing_keys.files[0].gid | default(0) }}"
+            _key_mode: "{{ '0%o' % (_existing_keys.files[0].mode | int(base=8)) if _existing_keys.files | length > 0 else '0640' }}"
+          when: _existing_keys.files | length > 0
+
+        - name: Drop the pubsub-state-mirror service operator key
+          ansible.builtin.copy:
+            content: "{{ pubsub_state_service_key_handle }}:{{ pubsub_state_portal_api_key }}\n"
+            dest: "{{ pubsub_state_portal_keys_dir }}/{{ pubsub_state_service_key_handle }}.key"
+            owner: "{{ _key_owner | default(0) }}"
+            group: "{{ _key_group | default(0) }}"
+            mode: "{{ _key_mode | default('0640') }}"
+          no_log: true
+
+        - name: Wait for the portal to reload the key (30s reload interval)
+          ansible.builtin.pause:
+            seconds: 35
+
+        # --- MinIO backup tier (only when the goatnet declares its cred env vars) ---
+        - name: MinIO backup tier
+          when: pubsub_state_minio_root_user_envvar | length > 0
+          block:
+            - name: Pre-flight — MinIO cred env vars present
+              ansible.builtin.assert:
+                that:
+                  - lookup('env', pubsub_state_minio_root_user_envvar) | length > 0
+                  - lookup('env', pubsub_state_minio_root_pass_envvar) | length > 0
+                fail_msg: "{{ pubsub_state_minio_root_user_envvar }} / {{ pubsub_state_minio_root_pass_envvar }} unset."
+                quiet: true
+
+            - name: Install host mc client (arm64) if absent
+              ansible.builtin.get_url:
+                url: https://dl.min.io/client/mc/release/linux-arm64/mc
+                dest: /usr/local/bin/mc
+                mode: "0755"
+                force: false
+
+            - name: Configure mc alias for root
+              ansible.builtin.command:
+                cmd: >-
+                  /usr/local/bin/mc alias set {{ pubsub_state_minio_alias }}
+                  {{ pubsub_state_minio_endpoint }}
+                  {{ lookup('env', pubsub_state_minio_root_user_envvar) }}
+                  {{ lookup('env', pubsub_state_minio_root_pass_envvar) }}
+              environment:
+                MC_CONFIG_DIR: /root/.mc
+              no_log: true
+              changed_when: false
+
+            - name: Ensure snapshot bucket exists
+              ansible.builtin.command:
+                cmd: /usr/local/bin/mc mb --ignore-existing {{ pubsub_state_minio_alias }}/{{ pubsub_state_minio_bucket }}
+              environment:
+                MC_CONFIG_DIR: /root/.mc
+              register: _mb
+              changed_when: "'created' in _mb.stdout | lower"
+
+  roles:
+    - role: pubsub-state-repo
+      when: (router_role | default('A')) == 'A'
+
+  post_tasks:
+    - name: Echo next steps
+      when: (router_role | default('A')) == 'A'
+      ansible.builtin.debug:
+        msg: |
+          pubsub-state mirror live on {{ inventory_hostname }}.
+            Forgejo repo : {{ pubsub_state_forgejo_url }}/{{ pubsub_state_org }}/{{ pubsub_state_repo | default(pubsub_state_site_id) }}
+            MinIO bucket : {{ (pubsub_state_minio_alias ~ '/' ~ pubsub_state_minio_bucket) if (pubsub_state_minio_root_user_envvar | length > 0) else '(Forgejo-only)' }}
+            Timer        : pubsub-state-mirror.timer
+          Next: if this goatnet has a passive node, give it a warm checkout —
+            pubsub-state-checkout-deploy.yml -e target={{ target }}

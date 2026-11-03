@@ -1,0 +1,47 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# portal-deploy.yml — operator-fired deploy of the
+# goat-zenoh-portal on the site's portal host. Mirrors the demogame +
+# zenoh-deploy + panoscope pattern: thin wrapper around the role, single
+# command, Cloudflare DNS publish in the same fire.
+#
+# Usage (select this site's single authoritative portal host):
+#   cd ops/ansible
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/with-secrets ../scripts/ansible-preflight.sh \
+#     -i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini \
+#     -e target='<authoritative-portal-host>' portal-deploy.yml
+#
+# Pre-flight (operator-side):
+#   1. Image present at ghcr.io/{{ ghcr_org }}/goat-zenoh-portal (CI workflow
+#      ran on main, or first-time-only manual push from operator
+#      workstation).
+#   2. Resolved PORTAL_OPERATOR_API_KEY bearer or PORTAL_OPERATOR_API_KEYS
+#      handle:key CSV from existing store references. Never generate a new
+#      key on each deploy. Human grants use platform-admin + two-person
+#      approval; initial seed setup is documented in newsite-secret-generation.md.
+#   3. CLOUDFLARE_API_TOKEN env var (when portal_publish_cloudflare_dns
+#      is true in group_vars/<site>_hosts).
+#   4. When portal_cert_sign_fake: false (steady-state), the site's
+#      offline-CA root + age identity must already be present on the
+#      host at portal_nova_root_cert + portal_age_identity_path.
+#      In fake-mint mode (the first-deploy default), these aren't
+#      required — vendor cert tarballs are stubs.
+
+- name: "portal | deploy"
+  hosts: "{{ target | mandatory }}"   # -e target=<site>_hosts selects the goatnet
+  become: true
+  gather_facts: true
+  vars:
+    cloudflare_api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') | default('') }}"
+    admin_write_surface: "goat-zenoh-portal (registry.db — slot pool + custody registry)"
+  pre_tasks:
+    # The portal is single-homed BY INTENT (ADR 1084 §D3). An A/B group holds two
+    # hosts, so a group-targeted run over a transport reaching both would install a
+    # second portal with its OWN registry.db — a second slot pool and custody
+    # registry beside the authoritative one.
+    - name: "Guard — admin surfaces are single-homed (ADR 1084 §D3)"
+      ansible.builtin.include_tasks: tasks/assert-admin-write-host.yml
+  roles:
+    - goat-zenoh-portal

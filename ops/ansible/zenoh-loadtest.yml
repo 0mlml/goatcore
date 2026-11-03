@@ -1,0 +1,216 @@
+---
+# zenoh-loadtest.yml — provision the load-test stack on a mgmt host.
+#
+# Design: docs/design/zenoh-loadtest.md  ·  Apparatus: ops/loadtest/
+#
+# Stands up the dedicated `loadtest/**` namespace + its isolated persistence
+# sinks against the REAL router, and narrows the real audit-subscriber so
+# load bytes never reach the locked `audit-integrity` bucket:
+#
+#   1. ACL: register `loadtest` as a write vendor (loadtest/** put rule).
+#   2. rocksdb: add a dedicated storage on loadtest/** -> /opt/docker-data/zenoh/loadtest.
+#   3. MinIO: create the ephemeral, quota-capped, GOVERNANCE-locked bucket.
+#   4. Run a SECOND audit-subscriber instance subscribed to loadtest/** -> that bucket.
+#   5. Narrow the REAL audit-subscriber from `**` to the real-vendor prefix list.
+#
+# Operator-gated pre-reqs (PKI / secrets — supply before running):
+#   - loadgen write leaf cert with the loadtest URI-SAN, at {{ loadtest_loadgen_cert_dir }}
+#     (minted by the goatnet's offline-CA, same flow as synth-vendor leaf certs).
+#   - S3 creds for the ephemeral bucket in env: LOADTEST_S3_ACCESS_KEY / LOADTEST_S3_SECRET_KEY.
+#
+# Run (from ops/ansible):
+#   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES \
+#     ../scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zenoh-loadtest.yml
+#
+# Teardown of DATA is ops/loadtest/wipe-loadtest.sh. To remove the loadtest
+# namespace + subscriber entirely, re-run with `-e loadtest_state=absent`.
+
+# TARGET IS REQUIRED — see the note in cold-storage-bucket.yml. A hardcoded
+# group would make `-e target=` a no-op instead of an error.
+- name: Provision the load-test stack
+  hosts: "{{ target | mandatory }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    loadtest_state: present                      # present | absent
+    loadtest_lanes: 1                            # 1 = single lane; 2 = scaling check
+    loadtest_key_prefix: loadtest
+    loadtest_bucket: loadtest-ephemeral
+    loadtest_bucket_quota: 20GiB                 # hard cap so the rootfs can't fill
+    loadtest_retention_days: 1                   # short — wipe is the real cleanup
+    loadtest_storage_root: /opt/docker-data/zenoh
+    loadtest_storage_ttl_days: 1                 # rocksdb TTL for loadtest only (vs 7d real)
+
+    # Router REST admin endpoint (storage add). The role binds 127.0.0.1:8000.
+    loadtest_rest_base: "http://127.0.0.1:{{ goat_zenoh_rest_port | default(8000) }}"
+    loadtest_zenoh_container: goat-zenoh-router
+
+    # Loadtest audit-subscriber instance (second copy of the real binary).
+    loadtest_audit_dir: /opt/loadtest/audit-subscriber
+    loadtest_audit_metrics_port: 9305
+    loadtest_audit_image: "{{ audit_subscriber_image }}"
+    loadtest_audit_cert_dir: "{{ audit_subscriber_cert_dir | default('/opt/audit-subscriber/certs') }}"
+    loadtest_audit_ca_root: "{{ audit_subscriber_ca_root_src | default('/etc/goat-zenoh/tls/ca-root-cert.pem') }}"
+    loadtest_s3_endpoint: "{{ audit_subscriber_s3_endpoint }}"
+
+    loadtest_loadgen_cert_dir: /opt/loadtest/certs
+
+    # The real-vendor prefixes the production audit-subscriber should keep
+    # capturing once narrowed off `**`. Derived from the live seed/vendor set;
+    # override in group_vars if the vendor roster changes. `loadtest/**` is
+    # deliberately excluded.
+    loadtest_real_vendor_prefixes: >-
+      caracal/** ; community/** ; homemade-sensors/** ; pangolin/** ; attest/schema/**
+
+    # mc invocation prefix (mirror the minio role's mc-init pattern; override to
+    # match how mc is reachable on this host).
+    loadtest_mc: "mc"
+    loadtest_mc_alias: loadtest-minio
+
+  tasks:
+    # ---- 1. ACL: register loadtest as a write vendor ------------------------
+    - name: Register loadtest vendor ACL (loadtest/** write rule)
+      ansible.builtin.command:
+        cmd: "/usr/local/bin/goat-zenoh-add-vendor --vendor {{ loadtest_key_prefix }}"
+      register: _lt_addvendor
+      changed_when: "'\"action\":\"added\"' in _lt_addvendor.stdout"
+      when: loadtest_state == 'present'
+
+    # ---- 2. rocksdb: dedicated storage on loadtest/** -----------------------
+    # Add the storage via the zenohd admin REST API on the local router (no ZID
+    # needed — `@/local/router` targets this router). Mirrors the portal's
+    # vendor-mint storage-add. Dir is a dedicated subdir = the only thing the
+    # wipe removes.
+    - name: Add loadtest rocksdb storage entry
+      ansible.builtin.uri:
+        url: "{{ loadtest_rest_base }}/@/local/router/config/plugins/storage_manager/storages/{{ loadtest_key_prefix }}"
+        method: PUT
+        body_format: json
+        body:
+          key_expr: "{{ loadtest_key_prefix }}/**"
+          volume:
+            id: rocksdb
+            dir: "{{ loadtest_storage_root }}/{{ loadtest_key_prefix }}"
+            create_db: true
+            on_closure: do_nothing
+          garbage_collect_period: 86400
+          time_to_live: "{{ loadtest_storage_ttl_days | int * 86400 * 1000 }}"
+        status_code: [200, 201, 204]
+      when: loadtest_state == 'present'
+
+    # ---- 3. MinIO: ephemeral, quota-capped, GOVERNANCE bucket ---------------
+    - name: Create ephemeral loadtest bucket (object-lock GOVERNANCE)
+      ansible.builtin.command:
+        cmd: "{{ loadtest_mc }} mb --ignore-existing --with-lock {{ loadtest_mc_alias }}/{{ loadtest_bucket }}"
+      register: _lt_mb
+      changed_when: "'created' in _lt_mb.stdout"
+      when: loadtest_state == 'present'
+
+    - name: Set hard quota on the ephemeral bucket
+      ansible.builtin.command:
+        cmd: "{{ loadtest_mc }} quota set {{ loadtest_mc_alias }}/{{ loadtest_bucket }} --size {{ loadtest_bucket_quota }}"
+      changed_when: true
+      when: loadtest_state == 'present'
+
+    - name: Default GOVERNANCE retention on the ephemeral bucket
+      ansible.builtin.command:
+        cmd: "{{ loadtest_mc }} retention set --default GOVERNANCE {{ loadtest_retention_days }}d {{ loadtest_mc_alias }}/{{ loadtest_bucket }}"
+      changed_when: true
+      when: loadtest_state == 'present'
+
+    # ---- 4. Loadtest audit-subscriber instance(s) ---------------------------
+    - name: Ensure loadtest audit-subscriber dir
+      ansible.builtin.file:
+        path: "{{ loadtest_audit_dir }}"
+        state: directory
+        mode: "0750"
+      when: loadtest_state == 'present'
+
+    - name: Render loadtest audit-subscriber .env (S3 creds, mode 0600)
+      ansible.builtin.copy:
+        dest: "{{ loadtest_audit_dir }}/.env"
+        mode: "0600"
+        content: |
+          AUDIT_SUBSCRIBER_S3_ACCESS_KEY={{ lookup('env', 'LOADTEST_S3_ACCESS_KEY') }}
+          AUDIT_SUBSCRIBER_S3_SECRET_KEY={{ lookup('env', 'LOADTEST_S3_SECRET_KEY') }}
+      no_log: true
+      when: loadtest_state == 'present'
+
+    # Reuses the real audit-subscriber image + cert (universal-read covers
+    # loadtest/**); only the subscribe-key, bucket, port, and name differ.
+    - name: Render loadtest audit-subscriber compose
+      ansible.builtin.copy:
+        dest: "{{ loadtest_audit_dir }}/docker-compose.yml"
+        mode: "0644"
+        content: |
+          # Managed by ops/ansible/zenoh-loadtest.yml — do not edit.
+          services:
+            audit-subscriber-loadtest:
+              image: {{ loadtest_audit_image }}
+              container_name: audit-subscriber-loadtest
+              restart: unless-stopped
+              networks: [zenoh, mgmt]
+              ports: ["{{ loadtest_audit_metrics_port }}:9303"]
+              env_file: [.env]
+              environment:
+                AUDIT_SUBSCRIBER_ENDPOINT: "{{ audit_subscriber_zenoh_endpoint }}"
+                AUDIT_SUBSCRIBER_KEY: "{{ loadtest_key_prefix }}/**"
+                AUDIT_SUBSCRIBER_ID: "nova-a-loadtest"
+                AUDIT_SUBSCRIBER_METRICS_BIND: "0.0.0.0:9303"
+                AUDIT_SUBSCRIBER_S3_ENDPOINT: "{{ loadtest_s3_endpoint }}"
+                AUDIT_SUBSCRIBER_S3_BUCKET: "{{ loadtest_bucket }}"
+                AUDIT_SUBSCRIBER_S3_REGION: "{{ audit_subscriber_s3_region | default('us-east-1') }}"
+                AUDIT_SUBSCRIBER_S3_ACCESS_KEY_ENV: "AUDIT_SUBSCRIBER_S3_ACCESS_KEY"
+                AUDIT_SUBSCRIBER_S3_SECRET_KEY_ENV: "AUDIT_SUBSCRIBER_S3_SECRET_KEY"
+                AUDIT_SUBSCRIBER_CERT: "/certs/audit-subscriber-cert.pem"
+                AUDIT_SUBSCRIBER_KEY_FILE: "/certs/audit-subscriber-key.pem"
+                AUDIT_SUBSCRIBER_ROOT_CA: "/ca/ca-root.pem"
+              volumes:
+                - "{{ loadtest_audit_cert_dir }}:/certs:ro"
+                - "{{ loadtest_audit_ca_root }}:/ca/ca-root.pem:ro"
+          networks:
+            zenoh: {name: "{{ audit_subscriber_zenoh_network | default('goat-zenoh_default') }}", external: true}
+            mgmt: {name: mgmt, external: true}
+      when: loadtest_state == 'present'
+
+    - name: Bring up loadtest audit-subscriber
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ loadtest_audit_dir }}"
+      changed_when: true
+      when: loadtest_state == 'present'
+
+    # ---- 5. Narrow the REAL audit-subscriber off ** -------------------------
+    # Keeps load bytes out of the locked audit-integrity bucket. This sets the
+    # role var and re-applies the audit-subscriber role; persist the same value
+    # in group_vars/nova_hosts/audit-subscriber.yml so it survives future runs.
+    - name: Narrow real audit-subscriber to the real-vendor prefix list
+      ansible.builtin.debug:
+        msg: >-
+          Set `audit_subscriber_subscribe_key` to "{{ loadtest_real_vendor_prefixes }}"
+          in group_vars/nova_hosts/audit-subscriber.yml and re-run the audit-subscriber
+          role (or the nova-a refresh play). This is the one change that survives across
+          runs; leaving it narrowed is a hardening improvement (ADR 0844 ACL tightening).
+      when: loadtest_state == 'present'
+
+    # ---- Teardown (loadtest_state=absent) -----------------------------------
+    - name: Stop + remove loadtest audit-subscriber (absent)
+      ansible.builtin.command:
+        cmd: docker compose down
+        chdir: "{{ loadtest_audit_dir }}"
+      changed_when: true
+      failed_when: false
+      when: loadtest_state == 'absent'
+
+    - name: Drop loadtest rocksdb storage entry (absent)
+      ansible.builtin.uri:
+        url: "{{ loadtest_rest_base }}/@/local/router/config/plugins/storage_manager/storages/{{ loadtest_key_prefix }}"
+        method: DELETE
+        status_code: [200, 204, 404]
+      when: loadtest_state == 'absent'
+
+    - name: Reminder — run wipe-loadtest.sh to remove data (absent)
+      ansible.builtin.debug:
+        msg: "Run ops/loadtest/wipe-loadtest.sh --apply to remove the rocksdb subdir + ephemeral bucket data."
+      when: loadtest_state == 'absent'
