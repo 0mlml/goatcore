@@ -1,0 +1,452 @@
+# Data-access role architecture — the SoT (ADR 1074).
+#
+# This file defines the CLOSED GRAMMAR for data-access roles, the v1 role
+# lattice, the implication edges (hierarchy + cross-axis), the defaults,
+# the scope boundaries, and — critically — the per-plane enforcement point
+# of every role. It is the machine-readable half of
+# docs/design/data-access-roles.md; the doc is the narrative, this file is
+# the law. CI (ops/ci/check-data-access-roles.sh) validates: every role row
+# parses against the grammar; every role names at least one real
+# enforcement point (a role nothing enforces is rejected — aspirational
+# vocabulary is the disease this file exists to prevent); the implication
+# graph is acyclic; scope words are closed; the code constants and boundary
+# prefixes in the panoscope evaluator match this file; and the site Kratos
+# identity schema's `groups` pattern actually admits these values (the
+# transport reality the first pass never tested — see `transport`).
+#
+# SPRAWL GUARDS (the guiding patterns — see design doc §4 for the
+# best-practice grounding of each):
+#   G1 closed grammar   — a role is a sentence: <domain>.<action>.<scope>[:<param>].
+#                         Roles that don't parse don't exist. No free-form names.
+#   G2 orthogonal axes  — the data-access axis NEVER shares names with the
+#                         platform-admin axis (UPPERCASE legacy groups) or the
+#                         identity grammar (ADR 1043). Cross-axis links are
+#                         DECLARED implication edges only.
+#   G3 parametric roles are VIRTUAL — data.view.producer:<key> exists iff
+#                         the producer exists in the registry. Minting a producer
+#                         atomically creates its role and the org roll-up,
+#                         because the role IS the registry row seen through
+#                         this grammar. Nobody hand-creates instance roles.
+#   G4 implication, not enumeration — seniors inherit juniors via declared
+#                         edges (NIST RBAC1); grants never copy permission lists.
+#   G5 belt-and-suspenders apex — data.view.all is BOTH a wildcard predicate
+#                         AND expands to every sub-role at evaluation time;
+#                         the two mechanisms must agree, each covers the
+#                         other's failure.
+#   G6 deprecate-never-delete — issued role sentences stay valid forever
+#                         (SKOS discipline, same as ops/identity/grammar.yaml).
+#   G7 no role without an enforcement point — every role names where it is
+#                         enacted per plane; CI rejects rows without one.
+#   G8 every role names its ratifier — grants above the automatic defaults
+#                         require the named owner's decision.
+
+schema_version: 1
+
+grammar:
+  # G1: the closed sentence shape. `param` is a registry key, never free
+  # text. One param charset serves both parametric scopes because the
+  # registry uses two producer-key shapes TODAY: the deployed seed model
+  # keys producers by kebab vendor/org prefix (e.g. `org1-producer` — the
+  # live ZAGROS population), and the ADR 1025 slot-pool model keys them by
+  # 32-hex anchor (which the same charset covers). The first-pass regex
+  # ([a-f0-9]{8,32}) could not name a single live ZAGROS producer.
+  # NOTE the pattern is deliberately NOT the action×scope cross product:
+  # `write` pairs only with `producer` — data.write.all / .notional /
+  # .org:* would be sentences with no role row and no enforcement point
+  # (G7 applied inside the regex itself, so undefined vocabulary can
+  # never even ride the transport).
+  pattern: '^data\.(view\.(all|notional|org:[a-z0-9][a-z0-9-]{0,63}|producer:[a-z0-9][a-z0-9-]{0,63})|write\.producer:[a-z0-9][a-z0-9-]{0,63}|govern\.org:[a-z0-9][a-z0-9-]{0,63})$'
+  axes:
+    domain: [data]            # future: model., release. — new domains need an ADR
+    action: [view, write, govern]  # write is producer-only, cert-derived (the anchor holder writes its own <uuid>/** root — inviolable); govern is org-only (grant/revoke authority, ADR 1102 — its WRITE facet is the PUBSUB-ORG-ADMIN co-publish capability, ADR 1105: creating multi-publisher topics + adding publishers, NOT a data.write.producer role); future: export, replay — extend by ADR, not ad hoc
+    scope:                    # ordered: the v1 lattice, top to bottom
+      - all                   # apex — every producer, real and notional
+      - org                   # parametric: all producers rolled up under one org
+      - producer              # parametric: one producer's namespace
+      - notional              # the synthetic/notional fleet (cross-cutting class)
+
+# Scope boundaries the evaluator enforces (CI-checked against the
+# panoscope code constants so the divider can't drift into code):
+#   common_floor  — namespace prefixes every authenticated viewer sees
+#                   (environment health + control surfaces + schema
+#                   self-declarations): substrate, not mission data.
+#   platform_only — the platform-plane carve-out excluded even from
+#                   data.view.all (mission-data apex ≠ platform telemetry;
+#                   also deny-carved on the wire ACL per M-068).
+boundaries:
+  common_floor: ["ops/", "attest/"]
+  platform_only: ["ops/audit/"]
+
+# The wire read posture — deliberately NOT modeled as a grant or an
+# enforcement cell: the wire does not enforce view-scoping, and writing
+# "every cert holds view-all" into a role row would normalize what should
+# stay alarming. This section keeps the divergence a visible fact AND
+# carries the machine-plane plan: the grants/labels above are
+# plane-neutral policy with three enforcement backends arriving in
+# stages (decided: the model accounts and plans for both
+# planes even though they are not built in one pass).
+wire_read_posture:
+  status: flat community-read among ENROLLED MACHINES — every goatnet
+    cert can subscribe to any non-carved key (ADR 1025 decided posture;
+    F-181 upstream constraint). Not "wide open" — wire readers are
+    enrolled machine principals only (mesh membership + issued cert,
+    both revocable, population enumerable via the registry; universal
+    observers surface as badged nodes on the COP). Humans are
+    browser-only unless issued a cert, so surfaces enforce the
+    numerically dominant human path; the plan below is the machine path.
+  carve_outs: ["ops/audit/operator/** — the existence proof
+      that wire read-carves work today"]
+  plan:  # one policy layer (grants x labels), three enforcement backends
+    M0-now: >-
+      admission control — mesh + per-identity cert issuance, mesh-first
+      instant revocation, enumerable reader population,
+      universal-observer badges, the audit trail
+    M1-on-demand: >-
+      static wire read-carves for access=controlled streams — a
+      restricted prefix readable only by enumerated grant-holding cert
+      CNs.
+      Restart-per-change, so only for slow-changing, genuinely
+      sensitive streams.
+    M1.5-compliance-floor: >-
+      the goat client libraries/SDK refuse to subscribe beyond the
+      caller's grants (ADR 1076) — binds well-behaved code only, NOT
+      adversaries; every mention must say so. Raises the floor while
+      M2 lands.
+    M2-committed: >-
+      grant-keyed payload encryption (ADR 1027 arc, reserved releaseset
+      scope) — the router routes ciphertext under the same static ACL;
+      a grant-gated service distributes keys per THE SAME grant rows the
+      surfaces evaluate (human sessions via surfaces, workloads via
+      SPIFFE, ADR 0412). Revocation = key rotation. COMMITTED roadmap
+      item (ratified 2026-07-09, ADR 1076 — machine parity is the
+      goal, not a contingency), sequenced after the resolver + the
+      ADR 1075 grant-loop build-out whose rows it consumes.
+  hard_floor: The environment boundary is the machine-read trust boundary.
+    Each sovereign runs its own environment; cross-sovereign sharing goes
+    through release namespaces over federated boundary nodes; M2 is a
+    standard production control inside an environment (ADR 1208).
+  parity_principle: one policy, one language, both planes (ADR 1076) —
+    machines obey the same grant rows humans do; only the enforcement
+    transport differs (surface checks vs key possession), because read
+    grants are relational (consumer x producer) and cannot be pre-cut
+    into the static ACL the way per-identity write slots were.
+  no_third_shim: every enforcement backend — surface evaluators, the
+    carve renderer, the M2 key-distribution service — consumes the SAME
+    grant rows from the registry. Caches are freshness-stamped
+    projections, never a second store. A mapping table, sync job, or
+    parallel policy copy between planes is a design violation (ratified
+    invariant 2026-07-09; same rule that bans a human-to-cert mapping
+    table anywhere — the registry is the one dictionary).
+
+# The v1 role rows. `enforced_at` is G7 — how each plane enacts the role.
+# Planes: human (Ory claim -> app filter), wire (x509 cert -> router ACL),
+# future-key (payload-encryption key possession; listed where designed).
+roles:
+  - role: data.view.all
+    title: See all fabric data
+    ratified_by: identity-owner (2026-07-09 direction, this file)
+    grants: view of every producer namespace, real and notional. Excludes
+      the platform-plane carve-out (boundaries.platform_only — the
+      platform axis, not mission data).
+    enforced_at:
+      human: app viewer-scope DataAll (panoscope src/viewer.rs; every ADR 1073 surface as they convert)
+      wire: not enforced (flat community-read — see wire_read_posture)
+    notes: G5 apex — wildcard predicate AND full expansion, both evaluated.
+
+  - role: data.view.org:<org_prefix>
+    title: See one org's producers (roll-up)
+    virtual: true             # G3 — exists iff the org exists in the registry
+    auto_granted_to: every human member of the org (registry membership
+      edge — resolver-pending, see implications)
+    enforced_at:
+      human: app viewer-scope Scoped{anchors}. v1 enforces the value's own
+        prefix only — NOTE the live consequence, seed-model goatnets key
+        topics by MEMBER producer prefix (`org1-producer/**`), not the org
+        rollup (`org1/**`), so an org value alone typically matches
+        nothing there; grant explicit producer values until the registry
+        resolver (design doc §6 build item 1) expands org → member keys.
+      wire: not enforced (wire reads flat; wire writes are per-producer)
+
+  - role: data.view.producer:<producer_key>
+    title: See one producer's namespace
+    virtual: true             # G3 — exists iff the producer exists in the registry
+    auto_granted_to: the custodian person of the producer (registry custody
+      edge — resolver-pending, see implications); implied by data.view.org
+      of the owning org (G4)
+    enforced_at:
+      human: app viewer-scope Scoped{producer key}
+      wire: not enforced (flat reads)
+
+  - role: data.view.notional
+    title: See the notional/synthetic fleet
+    ratified_by: identity-owner (2026-07-09 — confirmed meaning, "default-on
+      = any logged-in viewer sees the practice/synthetic fleet without a
+      grant"; real data never rides this default)
+    default_grant: authenticated   # every logged-in human, per goatnet flag
+    enforced_at:
+      human: >-
+        app viewer-scope include_notional — nodes, edges, samples, and live
+        events of producers whose schema-decl carries `synthetic: true`
+        (already on every synth node)
+      wire: not enforced (flat reads)
+    notes: the demo-friendly floor-raiser — partners see the notional
+      ecosystem by default, never each other. Goatnets can turn the
+      default off (panoscope_rbac_notional_default). HONESTY GRADE — the
+      `synthetic` flag is the producer's SELF-declaration; a real producer
+      marking itself synthetic widens only its OWN surface visibility
+      (its wire reads were already flat), but mislabeled real data would
+      pollute the default view. Registry-ratified synthetic marking is
+      the named hardening if that vector ever matters.
+
+  - role: data.write.producer:<producer_key>
+    title: Publish into one producer's namespace
+    virtual: true
+    auto_granted_to: any process bearing the cert whose write anchor is the key
+    enforced_at:
+      wire: router static ACL slot rule (`<key>/**` + `volatile/<key>/**`)
+        — THE canonical enactment; the ACL render is generated from the same
+        registry rows this role derives from
+      human: not applicable (humans do not publish; operator publishes ride
+        operator leaf certs = their own anchors)
+    notes: this row makes the wire plane speak the same vocabulary — the
+      cert IS the role credential for writes.
+
+  - role: data.govern.org:<org_prefix>
+    title: Govern sharing for one org's producers
+    virtual: true             # G3 — exists iff the org exists in the registry
+    auto_granted_to: the org's NOMINATED data-governance admins (govern_admins
+      registry rows, POST /api/access/govern-admins, the U9 surface). This is
+      the CANONICAL model — governance is held only by named admins, and a new
+      org is seeded with its first member so it is never born locked out.
+      A per-goatnet default flag GovernBootstrapOpen (env
+      PORTAL_GOVERN_BOOTSTRAP_OPEN) chooses the starting posture — when OPEN
+      (the kick-start default, true today) any member of an org with NO
+      nominations also governs it, so the goatnet starts open and orgs narrow
+      themselves; when CLOSED (canonical) membership alone confers nothing.
+      Either way an org WITH nominations is governed ONLY by its nominees, and
+      last-admin removal is refused (monotonic; recovery is operator proxy
+      stewardship)
+    enforced_at:
+      human: portal grant/revoke/approve/decline gate — internal/api/data_access.go
+        `mayGovernProducer` + the U9 gate `mayGovernOrg`, both reading the ONE
+        source `Server.governedOrgs` (a browser-only org admin governs; no
+        producer cert required). THE canonical enactment.
+      wire: not applicable — governance is a surface-plane grant authority,
+        not a wire read or write
+    notes: authority to approve/decline/preemptively grant/revoke access to any
+      producer the org owns — NOT a view scope. SINGLE-SOURCED (ADR 1102) — NOT
+      emitted by the pure roster resolver; computed once in
+      `Server.governedOrgs` from the nomination store + the bootstrap-open
+      default, so the resolver surface (`goat access show`) and the grant/govern
+      gates read one definition. Its WRITE facet — creating a marked, discoverable,
+      org-scoped MULTI-PUBLISHER topic (multipub/<org-pool>/<topic>) and
+      adding the org's own publishers to it — is the PUBSUB-ORG-ADMIN capability
+      (ADR 1105). Single-owner <uuid>/** roots stay inviolable; a co-publish grant
+      can target ONLY a registered multi-publisher topic. The same authority (govern the
+      org), a distinct (more-scrutinized, separately-audited) action.
+
+# G4: the implication DAG. `a implies b` = holding a grants b. CI asserts
+# acyclicity. `status: enforced` = code evaluates this edge today;
+# `status: resolver-pending` = declared policy whose evaluation lands with
+# the registry data-roles resolver (design doc §6 build item 1) — the SoT
+# must not present an auto-grant no code performs.
+implications:
+  # In-axis hierarchy (the lattice)
+  - { holder: data.view.all,               implies: 'data.view.org:*',      status: enforced }
+  - { holder: data.view.all,               implies: 'data.view.notional',   status: enforced }
+  - { holder: 'data.view.org:<O>',         implies: 'data.view.producer:<K> for every producer K owned by O', status: resolver-pending }
+  # Cross-axis (platform -> data), the ONLY sanctioned mixing (G2).
+  # ADMINS is the single platform implication: the ratified requirement
+  # "any platform admin ⇒ admin view on all data", plus the practical fact
+  # that platform operators run the fabric and can read the wire regardless.
+  # IAM-ADMIN carries NO implication — ratified by the identity owner
+  # an identity administrator needs to control others' access
+  # well, not to see everything. IAM-ADMIN administers grants
+  # and identities (the access COP); it holds no standing data view. The
+  # matrix grants it panoscope `scoped`.
+  # PLATFORM-ADMIN mirrors ADMINS through the ADR 1043 §8 rename dual-accept
+  # window; the ADMINS edge retires with the group at contract.
+  - { holder: platform-group PLATFORM-ADMIN, implies: data.view.all, basis: 'rename mirror of ADMINS (same 2026-07-09 ratification)', status: enforced }
+  # Registry-derived (identity -> data), the atomic auto-grants (G3).
+  # ORG-HIERARCHY ROLL-UP (ratified ADR 1074 addendum): orgs NEST
+  # via ADR 1043 vertical `parent` containment, and the resolver (design doc §6
+  # build item 1) landed with a declared stance — holding data.view.org over a
+  # parent org covers every org whose parent-chain leads up to it, TRANSITIVELY,
+  # through VERTICAL parent containment ONLY. Lateral/time-bounded relationship
+  # edges (comrel, supports, data-authority) confer NOTHING by inference — the
+  # reserved data-authority edge is the explicit cross-org hook (design doc §8;
+  # recognition != authorization). The row below is phrased as the registry
+  # containment fact (not a data.* token) so the DAG check reads it as the
+  # registry-derived edge it is, never a data.view.org self-loop.
+  # Multi-org membership (a person under two orgs) is a resolver-time
+  # union — declared here so the resolver doesn't invent a precedence.
+  - { holder: registry org-membership of O,      implies: 'data.view.org:<O>',      status: resolver-pending }
+  # ADR 1102: a registry member of O governs sharing for every producer O owns.
+  # `enforced` — the resolver emits data.govern.org:<O> (dataroles.go) and the
+  # grant/revoke/approve/decline handlers read it via the ONE source
+  # Server.governedOrgs (data_access.go mayGovernProducer + data_govern_admins.go).
+  # CANONICAL edge: an org's NOMINATED governance admin governs it (always).
+  - { holder: active govern-admin nomination for O (govern_admins row), implies: 'data.govern.org:<O>', status: enforced }
+  # KICK-START edge, config-gated: under the bootstrap-open default
+  # (config.GovernBootstrapOpen, per-goatnet, default true today) a member of an
+  # org with NO nominations governs it — the goatnet starts open and orgs narrow
+  # themselves. Disabled when the goatnet is fail-closed (canonical). An org WITH
+  # nominations is governed ONLY by its nominees regardless of the flag.
+  - { holder: registry org-membership of O (when O has no nominations),      implies: 'data.govern.org:<O>',    status: enforced, config: 'gated on GovernBootstrapOpen; suspended for any O with active nominations (ADR 1102, U9)' }
+  - { holder: registry vertical parent-containment of a child org under a parent org a holder already views, implies: 'data.view.org:<child_org>', status: resolver-pending, basis: 'ratified 2026-07-09 (ADR 1074 addendum) — vertical parent containment only, transitive; lateral/time-bounded edges never confer view' }
+  # This custody row IS the ratified requirement "any developer => at
+  # least view of own data": a developer's data view derives from registry
+  # custody/ownership, never from the DEVELOPER platform role (G2).
+  - { holder: registry custody of producer K,    implies: 'data.view.producer:<K>', status: resolver-pending }
+  - { holder: cert with write anchor K,          implies: 'data.write.producer:<K>', status: enforced }
+  # ADR 1105 co-publish is deliberately NOT an implication into
+  # data.write.producer: a co-publish grant confers publish access to a
+  # registered MULTI-PUBLISHER multi-publisher topic (multipub/<pool>/<topic>),
+  # which is not a producer and whose slash-bearing key is not a valid producer
+  # param. It is surfaced as a distinct co-publish MEMBERSHIP (dataroles.go
+  # MergeGrants → DataRoleResult.CoPublish), enforced by the additive copub-w-*
+  # ACL allow — never a data.write.producer role, never touching a single-owner
+  # root. So there is no implication row here. Default (per-goatnet flag):
+  - { holder: any-authenticated,           implies: data.view.notional, default: true, status: enforced }
+
+# Where role values travel per plane (the interchange logic — design doc §5):
+transport:
+  human: Ory `groups` claim carries EXPLICIT grants only (namespaced
+    lowercase `data.*` values, disjoint from UPPERCASE platform groups in
+    the same claim). Everything else derives — registry membership/custody
+    edges resolve to virtual roles at evaluation; claims stay small.
+    DELIVERY CONSTRAINT (caught in adversarial review) — the site Kratos identity schema
+    (ops/ansible/roles/ory/templates/ory/identity-schema.json.j2) pattern-
+    validates every `groups` item; it now admits the data grammar as an
+    explicit second alternative alongside `^[A-Z][A-Z0-9-]{0,40}$`
+    (CI-checked against this file's pattern). Schema redeploy per goatnet
+    is part of the ADR 1073 live-fire. The operator-manifest pipeline
+    still cannot carry data.* values (ory_site.groups is an exact enum of
+    the platform matrix, by design) — explicit grants ride Kratos identity
+    edits until the manifest `data_access:` field lands (design doc §6
+    build item 2).
+  wire: the cert's write anchor is the role credential (data.write.producer).
+    No role strings ever appear in certs or the ACL — the registry is the
+    bilingual dictionary joining the planes (roles_of(person) and
+    roles_of(anchor) resolve through the same org hub).
+  # PRINCIPAL KEY DISCIPLINE (ADR 1051 spine + ADR 1069): the persistent
+  # key for a human is the identity UUID (Kratos identity id per goatnet;
+  # the spine anchor fleet-wide). Email is a login identifier, recovery
+  # channel, and pre-mint intake idempotency key (ADR 1048) — a LOOKUP
+  # ALIAS, never a stored join key. External subjects (EDIPI, PKI DNs,
+  # pairwise OIDC subs) are mapped attributes over the anchor, never keys.
+  # The data-roles resolver must key on identity id and accept email only
+  # as an alias parameter it resolves first.
+
+# ---------------------------------------------------------------------------
+# Producer data labels + the discover->request->approve loop (ADR 1075).
+# STATUS: DECLARED policy; enforcement is sequenced in the follow-ons tee-up
+# (portal label fields, catalog/request UI, grant rows in the resolver,
+# surface badges). Nothing below claims an enforcement point that exists
+# today except where the lane maps onto an already-built mode.
+#
+# Research-grounded (deep-research round claims 3-0 verified
+# against primary sources; refuted claims + coverage gaps recorded in the
+# design doc §9): tiny closed lanes (NIST SP 800-162 finite well-known
+# marking set; 70-84% producer marking-defect rates in DODIG-2013-142 /
+# GAO-06-706 argue for fewest machine-validated enums); label only what
+# needs restriction with a permissive default (SP 800-178/NGAC labeling
+# economy); friction on RESTRICTIVE application, not on openness (the
+# documented sharing damage is erroneous restrictive markings — NOFORN
+# misuse; labelers ratchet UP under doubt); grants as enumerable registry
+# relations, never rule formulas (SP 800-178: formula policy is
+# NP-complete to audit; rows answer who-can-see-X by reading); no central
+# PDP — surfaces evaluate cached registry snapshots with declared
+# staleness (SP 800-162 §3.3.1 disconnected-ops pattern; mesh revocation
+# stays the instant cut).
+data_labels:
+  grain: topic-namespace   # per producer namespace at portal registration,
+    # echoed by the attest schema-decl; NEVER per-message (marking burden)
+  lanes:
+    fidelity:
+      values: [notional, simulated, real]
+      default: unlabeled   # rendered honestly as unlabeled, never fabricated
+      note: generalizes the schema-decl `synthetic true` flag (notional
+        subsumes synthetic; migration additive). Advisory + the notional
+        access-default input; surfaces badge it.
+    context:
+      values: [experiment, exercise, operational]
+      default: unlabeled
+      note: operational data belongs on operational goatnets — the value
+        exists on every goatnet for parity, and context=operational on a
+        non-operational goatnet surfaces a LOUD wrong-fabric flag, never
+        silence.
+    access:
+      values: [community, org, controlled]
+      default: per-goatnet `data_label_access_default` — sandbox goatnets
+        (ZAGROS) = community (the full-access default tag when the producer
+        supplies none); operational goatnets choose org or controlled.
+      semantics:
+        community: surface-readable by every authenticated viewer (no grant)
+        org: the producer's own org only (registry membership/custody — the
+          existing Scoped mode)
+        controlled: requires an explicit grant row (see grants) — metadata
+          stays discoverable, payloads need the grant
+  guards:
+    - >-
+      restriction-needs-justification — applying access org|controlled
+      requires a producer-supplied justification string recorded in the
+      registry (the NAVADMIN 060/23 NOFORN-justification-gate pattern);
+      openness is frictionless, restriction is a deliberate recorded act
+    - >-
+      restrictive-growth-telemetry — the non-community label share per
+      goatnet is a watched drift metric (the ratchet-up bias counter)
+    - >-
+      closed-enums — lane values are machine-validated closed sets (CI);
+      new values land by ADR only (G1 discipline applied to labels)
+
+# The grant loop (ADR 1075): every topic is DISCOVERABLE by every
+# authenticated viewer (catalog metadata: existence, labels, producer, org
+# — ADR 1028: visibility is advisory, never access); any viewer may
+# REQUEST access; the PRODUCER (its custodian humans / org — the
+# data-authority principle, design doc §8) APPROVES; approval mints a
+# grant ROW in the registry, F-207-audited, expiry-able (the
+# comrel-window pattern). Org-scope grants are the coalition default
+# (SP 800-162 unanticipated-user benefit); principal-scope for exceptions.
+# Grant rows are enumerable relations the data-roles resolver evaluates —
+# never a rule language, never a central PDP.
+grants:
+  row_shape: "{grantee: org:<id> | principal:<identity-uuid>, producer: <key>,
+    action: view | write, granted_by: <custodian>, justification: <string>,
+    effective: <from>/<to>, status: active | revoked}"
+  review: who-can-see-X and what-can-Y-see are answered by READING rows
+    (before-the-fact audit by enumeration — the stale-entitlement counter)
+  # ADR 1105 — co-publish onto a MULTI-PUBLISHER TOPIC (the
+  # PUBSUB-ORG-ADMIN capability). A grant row carries an `action`: `view` (the
+  # ADR 1075 default — every legacy row is a view grant) or `write`. A WRITE
+  # grant adds publisher X (a principal, its slot anchor) to a registered multi-publisher
+  # topic, whose key-base `multipub/<pool>/<topic>` is stored in `producer`.
+  #
+  # THE INVARIANT: single-owner <uuid>/** roots are INVIOLABLE — a write grant
+  # NEVER adds a writer to one. It can target ONLY a registered multi-publisher topic
+  # (multipub_topics table; a distinct, marked, discoverable class). The ACL
+  # renders one additive copub-w-* allow on the multipub-topic key (config.json5.j2;
+  # render input = group_var zenoh_copublish_grants, default {} / gated off,
+  # F-272). It is NOT a data.write.producer role — a multi-publisher topic is not a
+  # producer; it is surfaced as a distinct co-publish MEMBERSHIP.
+  #
+  # AUTHORITY: the WRITE FACET of data.govern.org:<O> (ADR 1102) — NOT a separate
+  # authority (ADR 1102 rejected a bespoke parallel governance role).
+  # `PUBSUB-ORG-ADMIN` is the operator-facing name. AT-MOST-OWN-ORG, fail-closed:
+  # both the multi-publisher topic's org and the publisher X must be an org the caller
+  # governs (data.govern.org:<O>); cross-org refused. Creating a multi-publisher topic +
+  # adding a publisher are gated in internal/api/data_access.go (governsOrg,
+  # GetMultipubTopic); every create/set/revoke is a pubsub.multipub-topic.create /
+  # pubsub.write-scope.* OperatorActionV1.
+
+# Extension bones (design doc §7–§8): reserved scope levels, each lands by
+# ADR. `echelon` is the reserved level between `all` and `org`
+# (upper rungs project into broad view without holding `all`).
+# Command relationships (comrel/OPCON, c2-authority) are deliberately NOT
+# scopes and NEVER imply view: they PROMPT the data-authority to issue an
+# explicit, comrel-window-bounded grant (release-set or org/producer,
+# expiry on the effective-dated assignment) — design doc §8; recognition
+# != authorization.
+reserved_scopes:
+  above_org: [site, echelon, releaseset, coalition]   # between all and org
+  below_producer: [topicclass, topic]                 # finer than producer

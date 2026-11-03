@@ -1,0 +1,142 @@
+{{define "content"}}
+{{if .SSHKeySelf}}
+
+<h1 class="page-title">Your SSH key</h1>
+
+<p>A host shell is a <strong>separate grant</strong> from your console login. Submitting a key here
+records it against <code>{{.SSHKeyHandle}}</code> and <strong>gives you no access</strong>. An admin
+reviews it, and only then is it installed. You will not be able to log in until that has happened.</p>
+
+<h2 class="section-title">Submit a public key</h2>
+<form method="post" action="/ssh-key" class="stacked">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <label for="pubkey">Your <strong>public</strong> key — the whole line from your <code>.pub</code> file
+    (usually <code>~/.ssh/id_ed25519.pub</code>). It starts with <code>ssh-ed25519</code> and is one line.</label>
+  <textarea id="pubkey" name="pubkey" rows="3" required
+            placeholder="ssh-ed25519 AAAAC3Nza... you@your-laptop"></textarea>
+  <p class="muted">Never paste a file that begins <code>-----BEGIN OPENSSH PRIVATE KEY-----</code>. That is
+  your private key; it is the secret itself. This form refuses it, but do not send it anywhere else either.
+  If you have no key yet, run <code>ssh-keygen -t ed25519</code> and submit the <code>.pub</code> file it writes.</p>
+  <label for="note">Note for the reviewer (optional) — e.g. which laptop this is</label>
+  <input type="text" id="note" name="note" placeholder="work laptop">
+  <button type="submit">Submit key for review</button>
+</form>
+
+<h2 class="section-title">Your submissions</h2>
+{{if .SSHKeys}}
+<table class="rows">
+  <thead><tr><th>Fingerprint</th><th>Type</th><th>Comment</th><th>State</th><th>Means</th></tr></thead>
+  <tbody>
+  {{range .SSHKeys}}
+    <tr>
+      <td><code>{{.Fingerprint}}</code></td>
+      <td>{{.KeyType}}</td>
+      <td>{{.Comment}}</td>
+      <td><strong>{{.Status}}</strong></td>
+      <td>
+        {{if eq .Status "submitted"}}Waiting on an admin. No access yet.
+        {{else if eq .Status "approved"}}Approved, not yet placed on the hosts. No access yet.
+        {{else if eq .Status "installed"}}Installed. You can log in with this key.
+        {{else if eq .Status "rejected"}}Rejected. Ask an admin why before resubmitting.
+        {{else if eq .Status "revoked"}}Revoked. This key no longer grants access.
+        {{else}}{{.Status}}{{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">You have not submitted a key yet.</p>
+{{end}}
+
+{{else}}
+
+<h1 class="page-title">SSH keys</h1>
+<p>Approving a key does <strong>not</strong> install it. The installer places approved keys on the hosts
+that person's role may reach, then marks them installed — so <code>approved</code> means decided,
+<code>installed</code> means they actually have a shell.</p>
+
+{{if .SSHKeyInstallPanel}}
+
+<h2 class="section-title">Install approved keys</h2>
+<p>Install acts on <strong>every approved key</strong> for this console's goatnet
+  <code>{{.SSHKeyInstallEnv}}</code>. Run the check command first to see what would be
+  installed, then the real install. The real run reads the queue again at
+  execution time — keys approved after a preview are included.</p>
+
+<pre class="command">
+# Recommended: preview-only (no writes)
+goat admin ssh-key install --env {{.SSHKeyInstallEnvQ}} --check
+
+# Install all approved keys (after preview)
+goat admin ssh-key install --env {{.SSHKeyInstallEnvQ}}
+</pre>
+
+{{if .SSHKeyInstallQueueError}}
+<p class="muted">Approved queue depth unavailable ({{.SSHKeyInstallQueueError}}).</p>
+{{else if eq .SSHKeyInstallQueueDepth 0}}
+<p>0 approved keys waiting — nothing to install.</p>
+{{else}}
+<p>
+  Approved queue depth: <strong>{{.SSHKeyInstallQueueDepth}}</strong>
+  key{{if ne .SSHKeyInstallQueueDepth 1}}s{{end}} awaiting install.
+</p>
+{{end}}
+<p class="muted">as of page load; refresh after a run to see the result.</p>
+
+{{else if .SSHKeyInstallHint}}
+
+<p class="muted">installation is run by a shell-holding admin via goat admin ssh-key install.</p>
+
+{{end}}
+
+<p class="muted">
+  Showing: <strong>{{if .SSHKeyStatus}}{{.SSHKeyStatus}}{{else}}all{{end}}</strong> &middot;
+  <a href="/onboarding/ssh-keys?status=submitted">submitted</a> &middot;
+  <a href="/onboarding/ssh-keys?status=approved">approved</a> &middot;
+  <a href="/onboarding/ssh-keys?status=installed">installed</a> &middot;
+  <a href="/onboarding/ssh-keys?status=all">all</a>
+</p>
+
+{{if .SSHKeys}}
+<table class="rows">
+  <thead><tr><th>Handle</th><th>Email</th><th>Fingerprint</th><th>Comment</th><th>State</th><th>Decided by</th><th></th></tr></thead>
+  <tbody>
+  {{range .SSHKeys}}
+    <tr>
+      <td><strong>{{.Handle}}</strong></td>
+      <td>{{.Email}}</td>
+      <td><code>{{.Fingerprint}}</code></td>
+      <td>{{.Comment}}{{if .Note}} <span class="muted">— {{.Note}}</span>{{end}}</td>
+      <td>
+        <strong>{{.Status}}</strong>
+        {{with skipAnnotation .}}<br><span class="muted">{{.}}</span>{{end}}
+      </td>
+      <td>{{.DecidedBy}}</td>
+      <td>
+        {{if eq .Status "submitted"}}
+          <form method="post" action="/ssh-keys/{{.ID}}/approve" class="inline">
+            <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+            <button type="submit">Approve</button>
+          </form>
+          <form method="post" action="/ssh-keys/{{.ID}}/reject" class="inline">
+            <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+            <button type="submit">Reject</button>
+          </form>
+        {{else if or (eq .Status "approved") (eq .Status "installed")}}
+          <form method="post" action="/ssh-keys/{{.ID}}/revoke" class="inline">
+            <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+            <button type="submit">Revoke</button>
+          </form>
+        {{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">Nothing in this state.</p>
+{{end}}
+
+{{end}}
+{{end}}

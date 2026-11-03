@@ -1,0 +1,175 @@
+{{define "layout"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{.Title}} — goat identity console</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    // Apply the saved theme BEFORE first paint (no flash). Dark is default;
+    // both themes are complete — never a mixed state.
+    (function(){ var t = localStorage.getItem("goat-theme"); if (t === "light") document.documentElement.dataset.theme = "light"; })();
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="mark"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4c0 6 3 9 8 9s8-3 8-9"/><path d="M12 13v7"/><path d="M8 20h8"/></svg></span>
+      goat <span class="sub">identity console</span>
+    </a>
+    <nav>
+      <a href="/identity">Your identity</a>
+      {{if .SponsorMode}}
+      {{/* Sponsor sessions (non-admin, portal-resolved sponsorship — ADR 1072)
+           see only the onboarding surface + the guide; the admin pages stay
+           ADMINS-gated. */}}
+      <a href="/onboarding">Onboarding</a>
+      <a href="/operator-key">Operator key</a>
+      {{if .GuideURL}}<a href="{{.GuideURL}}?topic=identity-admin{{if .GuideRole}}&amp;role={{.GuideRole}}{{end}}">Guide</a>{{end}}
+      {{else}}
+      <a href="/?idp={{.IdP.Key}}">Users</a>
+      <a href="/holds?idp={{.IdP.Key}}">Mesh holds</a>
+      <a href="/reactivation-requests?idp={{.IdP.Key}}">Reactivation</a>
+      {{if .OnboardEnabled}}<a href="/onboarding">Onboarding</a>{{else}}<a href="/invites?idp={{.IdP.Key}}">Invites</a>{{end}}
+      <a href="/operator-key">Operator key</a>
+      {{if .GuideURL}}<a href="{{.GuideURL}}?topic=identity-admin{{if .GuideRole}}&amp;role={{.GuideRole}}{{end}}">Guide</a>{{end}}
+      <a href="/permissions">Permissions</a>
+      <a href="/audit">Audit</a>
+      {{end}}
+    </nav>
+    {{/* The identity-plane selector only appears when this console manages
+         more than one Kratos instance (site users vs operators). With a
+         single plane there is nothing to switch — hide it. */}}
+    {{if gt (len .AllIdPs) 1}}
+    <form class="idp-selector inline" method="get" action="{{.RequestPath}}">
+      <label for="idp">Identity plane</label>
+      <select name="idp" id="idp" onchange="this.form.submit()">
+        {{range .AllIdPs}}
+          <option value="{{.Key}}" {{if eq .Key $.IdP.Key}}selected{{end}}>{{.Label}}</option>
+        {{end}}
+      </select>
+    </form>
+    {{end}}
+    <button type="button" class="theme-toggle" title="Toggle light/dark theme"
+      onclick="var r=document.documentElement, l=r.dataset.theme==='light'; if(l){delete r.dataset.theme; localStorage.setItem('goat-theme','dark');} else {r.dataset.theme='light'; localStorage.setItem('goat-theme','light');} this.textContent = l ? '☾' : '☀';">☾</button>
+    <script>if (document.documentElement.dataset.theme === "light") document.querySelector(".theme-toggle").textContent = "☀";</script>
+    {{if .Actor.Email}}
+      <span class="actor" title="{{.Actor.Email}}">{{.Actor.Email}}</span>
+    {{end}}
+  </header>
+  {{/* Step-up posture strip (#174). Always present when the goatnet enforces
+       step-up, so an admin knows BEFORE clicking whether a high-risk action
+       will interrupt them — the requirement is never a surprise 403. */}}
+  {{with .StepUp}}{{if .Enforced}}
+    <div class="stepup-strip {{if .Fresh}}fresh{{else}}idle{{end}}"
+         {{if .Fresh}}data-stepup-expires-in="{{.RemainingSec}}"{{end}}>
+      {{if .Fresh}}
+        <span class="stepup-shield" aria-hidden="true">{{template "icon_shield"}}</span>
+        <span>Step-up active — high-risk actions are unlocked for
+          <strong class="stepup-countdown">{{.RemainingSec}}s</strong></span>
+        {{/* Ending your own window can only tighten the gate, never loosen it,
+             so this is a plain form rather than anything privileged. It exists
+             because the window also opens when you ENROL a factor, not just
+             when you answer a challenge — so "why am I not being asked?" has a
+             visible answer and a one-click remedy. */}}
+        <form method="POST" action="/step-up/lock" class="stepup-lock-form">
+          <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+          {{/* RequestPath carries no query string, so re-attach the identity
+               plane — otherwise locking silently bounces an operator who was
+               administering the operator realm back to the default one. */}}
+          <input type="hidden" name="return_to" value="{{$.RequestPath}}?idp={{$.IdP.Key}}">
+          <button type="submit" class="stepup-lock"
+                  title="End the window now — the next high-risk action will ask for your second factor again">Lock now</button>
+        </form>
+      {{else}}
+        <span class="stepup-shield" aria-hidden="true">{{template "icon_shield"}}</span>
+        {{if .Locked}}
+          <span>Locked — you ended your step-up window. The next high-risk action
+            will ask for your second factor.</span>
+        {{else if .PostureUnknown}}
+          {{/* Lookup failed — "couldn't check" and "not enrolled" are
+               different facts, and the enrol nudge would lie to an enrolled
+               admin (goat#247). */}}
+          <span>Step-up status unavailable right now — high-risk actions will stay
+            locked until it can be checked.</span>
+        {{else}}
+          <span>High-risk actions require a second factor. You'll be asked to verify
+            when you use one{{if not .HasSecondFactor}} —
+            <a href="{{.EnrollURL}}" rel="noopener">enroll an authenticator first</a>{{end}}.</span>
+        {{end}}
+      {{end}}
+    </div>
+  {{end}}{{end}}
+  <main>
+    {{range .Flashes}}
+      <div class="flash {{.Level}}">{{.Message}}</div>
+    {{end}}
+    {{template "content" .}}
+  </main>
+  <footer class="disclaimer">
+    Accounts live in the identity provider; this console reads and edits them.
+  </footer>
+  {{/* Live countdown for the step-up strip. Purely cosmetic — the server
+       re-checks freshness on every gated mutation, so a drifted or disabled
+       clock can never admit an action. At zero it rewrites the strip to the
+       idle copy rather than silently showing "0s". */}}
+  <script>
+  (function () {
+    var strip = document.querySelector(".stepup-strip[data-stepup-expires-in]");
+    if (!strip) return;
+    var out = strip.querySelector(".stepup-countdown");
+    var left = parseInt(strip.dataset.stepupExpiresIn, 10);
+    function fmt(s) {
+      var m = Math.floor(s / 60);
+      return m > 0 ? m + "m " + (s % 60) + "s" : s + "s";
+    }
+    var lockForm = strip.querySelector(".stepup-lock-form");
+    function tick() {
+      if (left <= 0) {
+        strip.classList.remove("fresh");
+        strip.classList.add("idle");
+        out.parentNode.textContent =
+          "Step-up expired. The next high-risk action will ask you to verify again.";
+        // The window is already closed, so offering to close it is incoherent.
+        // Drop the control rather than leave "Lock now" beside "expired".
+        if (lockForm) lockForm.remove();
+        return;
+      }
+      out.textContent = fmt(left);
+      left -= 1;
+      setTimeout(tick, 1000);
+    }
+    tick();
+  })();
+  </script>
+<script src="/static/secret-copy.js" defer></script>
+<script src="/static/copy-row.js" defer></script>
+</body>
+</html>
+{{end}}
+
+{{/* aal2badge — the marker that sits on every step-up-gated control (#174).
+
+     Pass the pageVars' .StepUp. Renders nothing on a goatnet that does not
+     enforce step-up, so a sandbox console is not littered with badges for a
+     gate that never fires. When enforcement IS on it states the requirement up
+     front, and flips to "unlocked" while the freshness window is open — so an
+     admin can tell at a glance whether the next click will interrupt them. */}}
+{{/* icon_shield: the step-up shield, as inline SVG rather than an emoji (the
+     voice rules allow none, docs/design/design-system.md). Path from Lucide
+     "shield" (ISC licence), stroke 1.5 per the design system's icon note.
+     Decorative: every use sits beside text that says the same thing. */}}
+{{define "icon_shield"}}<svg class="icon" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>{{end}}
+
+{{define "aal2badge"}}
+  {{/* Nil-safe: pages rendered outside Server.render (tests, error paths) may
+       carry no StepUp payload. No payload = no claim, so render nothing. */}}
+  {{if .}}{{if .Enforced}}
+    {{if .Fresh}}
+      <span class="aal2-badge unlocked" title="You verified with a second factor recently — this action will proceed without interruption.">{{template "icon_shield"}} AAL2 ✓</span>
+    {{else}}
+      <span class="aal2-badge" title="High-risk action. You will be asked to confirm with your second factor (authenticator app or passkey) before this completes.">{{template "icon_shield"}} AAL2 required</span>
+    {{end}}
+  {{end}}{{end}}
+{{end}}

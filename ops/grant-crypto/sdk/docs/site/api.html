@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>grant-crypto SDK — API reference</title>
+  <meta name="description" content="The five nouns and six verbs language-neutral, then a per-language reference for the Rust core, Go, Python, and TypeScript — every public function with signature, semantics, and error behavior.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="index.html" class="wordmark">grant-crypto</a>
+      <span class="ver" aria-label="SDK version"></span>
+    </div>
+    <p class="brand-tag">Endpoint forward secrecy, by construction.</p>
+    <nav aria-label="Documentation">
+      <p class="nav-group">Start</p>
+      <a href="index.html">Overview</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="quickstart.html">Quickstart</a>
+      <p class="nav-group">Reference</p>
+      <a href="api.html" aria-current="page">API</a>
+      <a href="capi.html">C ABI</a>
+      <a href="wire.html">Wire format</a>
+      <p class="nav-group">Operate</p>
+      <a href="security.html">Security</a>
+      <a href="troubleshooting.html">Troubleshooting</a>
+    </nav>
+    <p class="theme-note">Every name here is cross-checked against the shipped source. Where a binding and the frozen doc conflict, the doc wins until amended.</p>
+  </aside>
+
+  <div class="content">
+    <main id="main">
+      <p class="eyebrow">API reference</p>
+      <h1>Five nouns, six verbs</h1>
+      <p class="lede">The frozen v1 public surface is small on purpose. Each binding renders these names idiomatically &mdash; <code>key_store.open()</code> in Python, <code>keystore.Open()</code> in Go &mdash; but adds, removes, or reinterprets nothing. This page gives the language-neutral vocabulary first, then a per-language reference.</p>
+
+      <h2>The nouns</h2>
+      <dl class="defs">
+        <dt>Identity</dt>
+        <dd>A member&rsquo;s id plus private key material (suite-typed). Unwrap-capable. Never serializable with key material in the clear; constructed from the member&rsquo;s enrollment credential (a raw 32-byte P-256 scalar in v1).</dd>
+        <dt>Recipient</dt>
+        <dd>A member&rsquo;s id plus public key material (suite-typed). Wrap-capable only. It exists service-side (the audience entry the key service wraps to) and is deliberately <em>not</em> on the consumer/producer binding surface &mdash; bindings never wrap.</dd>
+        <dt>Context</dt>
+        <dd>The required typed additional-authenticated-data binding: today the data topic (key expression). Mandatory on <code>seal</code> and <code>open</code> &mdash; there is no context-free overload.</dd>
+        <dt>KeyBundle</dt>
+        <dd>The wire structure the key service publishes on <code>keys/&lt;rs&gt;/&lt;gen&gt;</code> &mdash; the wrapped DEK for every member, signed. Parsed via the verbs; constructed only by the key service.</dd>
+        <dt>Envelope</dt>
+        <dd>The wire structure of a sealed data message &mdash; suite, release-set, generation, nonce, ciphertext. The in-band message body. See the <a href="wire.html">wire format</a>.</dd>
+      </dl>
+
+      <h2>The verbs</h2>
+      <div class="table-wrap">
+        <table>
+          <caption>The six verbs, language-neutral. The consumer order <code>verify &rarr; slot &rarr; unwrap &rarr; open</code> is enforced by construction, not by caller discipline.</caption>
+          <thead><tr><th>Verb</th><th>Shape</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>verify</code></td><td class="wrap"><code>(bundle, trust) &rarr; ()</code></td><td class="wrap">Authenticate a bundle against the key-service verifying key. Consumers MUST verify before admit.</td></tr>
+            <tr><td><code>admit</code></td><td class="wrap"><code>(keystore, bundle, identity) &rarr; had_slot</code></td><td class="wrap">Unwrap this member&rsquo;s slot (if any) and retain the DEK for <code>(rs, gen)</code>. <code>false</code> (no slot) is a normal outcome, not an error; fails closed on a malformed slot.</td></tr>
+            <tr><td><code>open</code></td><td class="wrap"><code>(keystore, context, envelope) &rarr; plaintext</code></td><td class="wrap">Open a data message with the held DEK for its <code>(rs, gen)</code>; no-slot if none held.</td></tr>
+            <tr><td><code>acquire</code></td><td class="wrap"><code>(bundles, rs, identity) &rarr; StreamKey</code></td><td class="wrap">The producer&rsquo;s path to a seal-capable key: pick the highest generation of <code>rs</code> with a slot for this identity, unwrap it. No-slot if the producer isn&rsquo;t in the audience.</td></tr>
+            <tr><td><code>seal</code></td><td class="wrap"><code>(stream_key, context, plaintext) &rarr; Envelope</code></td><td class="wrap">One-shot seal under the acquired key. No nonce, algorithm, or RNG parameter &mdash; the implementation supplies a fresh random nonce and stamps <code>(suite, rs, gen)</code>.</td></tr>
+            <tr><td><code>rotate</code></td><td class="wrap"><code>(identity, policy) &rarr; RotationReceipt</code></td><td class="wrap">Member-leaf rotation hygiene. <code>Destroy</code> (default) zeroizes the retired key, no re-wrap; <code>KeepAccess</code> re-wraps the member&rsquo;s own still-live DEKs first (reducing FS). The receipt is a structured, self-dating fact.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Error taxonomy</h2>
+      <p>Seven variants, frozen across all bindings. The capability-vs-reject distinction is load-bearing: <code>UnsupportedSuite</code> is a capability signal raised before any key operation; <code>NoSlot</code> (&ldquo;not in the audience&rdquo;) is a normal outcome; the read-side rejects are advisory, never a decrypt oracle. <code>RotationRequired</code> is the write-side local refusal at the seal cap &mdash; it changes nothing on the wire.</p>
+      <div class="table-wrap">
+        <table>
+          <caption>The frozen error taxonomy. C ABI codes are negative <code>int32</code>, stable forever; the full code table is on the <a href="capi.html#codes">C ABI page</a>.</caption>
+          <thead><tr><th>Variant</th><th>Code</th><th>Class</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>UnsupportedSuite</code></td><td>-1</td><td>capability</td><td>The named suite is not implemented (signalled pre-key).</td></tr>
+            <tr><td><code>Decrypt</code></td><td>-2</td><td>reject</td><td>AEAD authentication failed (wrong key/gen/rs/topic, tamper).</td></tr>
+            <tr><td><code>Unwrap</code></td><td>-3</td><td>reject</td><td>The wrapped DEK could not be recovered.</td></tr>
+            <tr><td><code>BadSignature</code></td><td>-4</td><td>reject</td><td>The bundle signature did not verify.</td></tr>
+            <tr><td><code>NoSlot</code></td><td>-5</td><td>outcome</td><td>The member has no slot / no held key (not in the audience).</td></tr>
+            <tr><td><code>Malformed</code></td><td>-6</td><td>reject</td><td>A field was malformed (bad base64/length/key encoding, bad JSON).</td></tr>
+            <tr><td><code>RotationRequired</code></td><td>-7</td><td>write-side</td><td>The seal cap was reached; seal refuses until rotation.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <hr>
+
+      <h2>Rust core</h2>
+      <p>The <code>grant-crypto</code> crate, consumed directly (no C ABI). Three surfaces: the <code>datapath</code> module (the producer/consumer ergonomic), the <code>rotate</code> module (member-leaf forward-secrecy hygiene), and the crate-root free functions (the low-level wire layer plus key reconstruction helpers).</p>
+
+      <h3>datapath</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Item</th><th>Signature</th><th>Semantics</th></tr></thead>
+          <tbody>
+            <tr><td><code>Context</code></td><td class="wrap"><code>Context&lt;'a&gt;(pub &amp;'a str)</code></td><td class="wrap">The required typed AAD binding (the topic). Mandatory on <code>seal</code>/<code>open</code>.</td></tr>
+            <tr><td><code>DEFAULT_SEAL_CAP</code></td><td class="wrap"><code>const u64 = 1 &lt;&lt; 24</code></td><td class="wrap">The cumulative per-key seal cap, below the AES-GCM random-nonce birthday bound.</td></tr>
+            <tr><td><code>acquire_stream_key</code></td><td class="wrap"><code>(rs: &amp;str, bundles: &amp;[KeyBundle], member_id: &amp;str, member_secret: &amp;SecretKey) -&gt; Result&lt;StreamKey, Error&gt;</code></td><td class="wrap">Highest generation of <code>rs</code> with a slot for the member, unwrapped. <code>NoSlot</code> if none. Seeds the seal count from the process-global cumulative counter.</td></tr>
+            <tr><td><code>StreamKey::seal</code></td><td class="wrap"><code>(&amp;mut self, ctx: Context, plaintext: &amp;[u8]) -&gt; Result&lt;Envelope, Error&gt;</code></td><td class="wrap">Seal under the acquired key; binds <code>ctx</code> as AAD. <code>RotationRequired</code> at the cap.</td></tr>
+            <tr><td><code>StreamKey::remaining</code></td><td class="wrap"><code>(&amp;self) -&gt; u64</code></td><td class="wrap">Messages that may still be sealed before rotation is required.</td></tr>
+            <tr><td><code>StreamKey::with_cap</code></td><td class="wrap"><code>(self, cap: u64) -&gt; Self</code></td><td class="wrap">Builder form. Monotone: <code>cap = min(current, requested)</code> &mdash; tighten-only.</td></tr>
+            <tr><td><code>StreamKey::set_cap</code></td><td class="wrap"><code>(&amp;mut self, cap: u64)</code></td><td class="wrap">In-place tighten. Same monotone rule.</td></tr>
+            <tr><td><code>StreamKey::release_set</code> / <code>generation</code></td><td class="wrap"><code>(&amp;self) -&gt; &amp;str</code> / <code>u64</code></td><td class="wrap">The <code>rs</code> / <code>gen</code> this key seals for (stamped into every message).</td></tr>
+            <tr><td><code>KeyStore::new</code></td><td class="wrap"><code>() -&gt; KeyStore</code></td><td class="wrap">An empty consumer key store.</td></tr>
+            <tr><td><code>KeyStore::admit</code></td><td class="wrap"><code>(&amp;mut self, bundle: &amp;KeyBundle, member_id: &amp;str, member_secret: &amp;SecretKey) -&gt; Result&lt;bool, Error&gt;</code></td><td class="wrap"><code>Ok(true)</code> if the member had a slot (DEK retained), <code>Ok(false)</code> for an outsider, <code>Err</code> only on a malformed slot. Verify the bundle first.</td></tr>
+            <tr><td><code>KeyStore::open</code></td><td class="wrap"><code>(&amp;self, ctx: Context, env: &amp;Envelope) -&gt; Result&lt;Vec&lt;u8&gt;, Error&gt;</code></td><td class="wrap"><code>NoSlot</code> if no key is held for the message&rsquo;s <code>(rs, gen)</code>; <code>ctx</code> must name the arriving topic.</td></tr>
+            <tr><td><code>KeyStore::holds</code></td><td class="wrap"><code>(&amp;self, rs: &amp;str, gen: u64) -&gt; bool</code></td><td class="wrap">Whether a key is held for <code>(rs, gen)</code> (diagnostics).</td></tr>
+            <tr><td><code>encode_message</code> / <code>decode_message</code></td><td class="wrap"><code>(&amp;Envelope) -&gt; Result&lt;Vec&lt;u8&gt;, Error&gt;</code> / <code>(&amp;[u8]) -&gt; Result&lt;Envelope, Error&gt;</code></td><td class="wrap">Serialize / parse the in-band carrier (the message body).</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>rotate</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Item</th><th>Signature</th><th>Semantics</th></tr></thead>
+          <tbody>
+            <tr><td><code>RotationPolicy</code></td><td class="wrap"><code>enum { Destroy, KeepAccess }</code> (default <code>Destroy</code>)</td><td class="wrap"><code>Destroy</code>: drop the retired key, re-wrap nothing. <code>KeepAccess</code>: re-wrap own still-live DEKs first (reduces FS). <code>as_str()</code> gives the receipt name.</td></tr>
+            <tr><td><code>Identity::from_scalar</code></td><td class="wrap"><code>(member_id, scalar: &amp;[u8; 32]) -&gt; Result&lt;Identity, Error&gt;</code></td><td class="wrap">Construct from a raw 32-byte P-256 scalar. <code>Malformed</code> if not a valid key.</td></tr>
+            <tr><td><code>Identity::new</code></td><td class="wrap"><code>(member_id, secret: SecretKey) -&gt; Identity</code></td><td class="wrap">Wrap an already-parsed secret key with its id.</td></tr>
+            <tr><td><code>Identity::secret</code></td><td class="wrap"><code>(&amp;self) -&gt; &amp;SecretKey</code></td><td class="wrap">Borrow the secret for an unwrap &mdash; never a by-value copy; zeroizes on drop.</td></tr>
+            <tr><td><code>rotate</code></td><td class="wrap"><code>(old: Identity, new_secret: SecretKey, policy: RotationPolicy, visible_bundles: &amp;[KeyBundle]) -&gt; (Identity, RotationReceipt, Vec&lt;ReWrappedDek&gt;)</code></td><td class="wrap">Consumes the old identity (its secret zeroizes on drop before returning). <code>Destroy</code> returns an empty re-wrap vector.</td></tr>
+            <tr><td><code>RotationReceipt</code></td><td class="wrap"><code>{ member_id, policy, now_unreadable_generations, rewrapped_generations, timestamp_rfc3339 }</code></td><td class="wrap">Serde-serializable, self-dating fact &mdash; counts plus an absolute RFC3339 UTC timestamp.</td></tr>
+            <tr><td><code>ReWrappedDek</code></td><td class="wrap"><code>{ rs, gen, wrapped: WrappedDek }</code></td><td class="wrap">One DEK re-wrapped to the new key under <code>KeepAccess</code>, for the caller to persist.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Crate-root free functions</h3>
+      <p>The low-level wire layer and helpers. <code>verify_bundle</code>, <code>secret_from_scalar</code>, and <code>verifying_key_from_spki</code> are the ones a typical consumer touches; the rest are the byte-level primitives the datapath and the key service compose.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Function</th><th>Signature</th><th>Semantics</th></tr></thead>
+          <tbody>
+            <tr><td><code>verify_bundle</code></td><td class="wrap"><code>(&amp;KeyBundle, &amp;VerifyingKey) -&gt; Result&lt;(), Error&gt;</code></td><td class="wrap">Verify the bundle signature against the trusted key-service verifying key.</td></tr>
+            <tr><td><code>secret_from_scalar</code></td><td class="wrap"><code>(&amp;[u8]) -&gt; Result&lt;SecretKey, Error&gt;</code></td><td class="wrap">A P-256 secret key from a raw 32-byte scalar.</td></tr>
+            <tr><td><code>verifying_key_from_spki</code></td><td class="wrap"><code>(&amp;[u8]) -&gt; Result&lt;VerifyingKey, Error&gt;</code></td><td class="wrap">A verifying key from SPKI DER.</td></tr>
+            <tr><td><code>consume</code></td><td class="wrap"><code>(&amp;KeyBundle, &amp;Envelope, member_id, &amp;SecretKey, Option&lt;&amp;VerifyingKey&gt;, keyexpr) -&gt; Result&lt;Vec&lt;u8&gt;, Error&gt;</code></td><td class="wrap">The full consumer path in one call: verify (if a key is given) &rarr; slot &rarr; unwrap &rarr; open.</td></tr>
+            <tr><td><code>unwrap_dek</code></td><td class="wrap"><code>(&amp;WrappedDek, &amp;SecretKey) -&gt; Result&lt;[u8; 32], Error&gt;</code></td><td class="wrap">Recover a DEK from a member&rsquo;s wrapped entry.</td></tr>
+            <tr><td><code>open_envelope</code></td><td class="wrap"><code>(&amp;[u8; 32], &amp;Envelope, additional: &amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;, Error&gt;</code></td><td class="wrap">Open a sealed payload with a DEK, binding <code>additional</code> (the topic).</td></tr>
+            <tr><td><code>seal_envelope</code></td><td class="wrap"><code>(&amp;[u8; 32], rs, gen, plaintext, additional) -&gt; Result&lt;Envelope, Error&gt;</code></td><td class="wrap">Seal under a DEK (fresh random nonce internally). The wire layer beneath <code>StreamKey::seal</code>.</td></tr>
+            <tr><td><code>new_dek</code></td><td class="wrap"><code>() -&gt; [u8; 32]</code></td><td class="wrap">A fresh random 256-bit DEK from the system CSPRNG (key-service side).</td></tr>
+            <tr><td><code>wrap_dek</code></td><td class="wrap"><code>(&amp;[u8; 32], &amp;PublicKey) -&gt; Result&lt;WrappedDek, Error&gt;</code></td><td class="wrap">Wrap a DEK to one recipient key (ephemeral-static ECDH &rarr; HKDF &rarr; AES-256-GCM).</td></tr>
+            <tr><td><code>new_bundle</code></td><td class="wrap"><code>(rs, gen, &amp;[u8; 32], &amp;BTreeMap&lt;String, PublicKey&gt;) -&gt; Result&lt;KeyBundle, Error&gt;</code></td><td class="wrap">Wrap a DEK to each recipient, in id order, fail-closed.</td></tr>
+            <tr><td><code>sign_bundle</code></td><td class="wrap"><code>(&amp;mut KeyBundle, signer: &amp;str, &amp;SigningKey) -&gt; Result&lt;(), Error&gt;</code></td><td class="wrap">Sign a bundle in place (ECDSA-P256/SHA-256).</td></tr>
+            <tr><td><code>set_signer_svid</code></td><td class="wrap"><code>(&amp;mut KeyBundle, svid_pem)</code></td><td class="wrap">Attach the signer&rsquo;s SVID (PEM); not part of the signed transcript.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">
+        <span class="callout-label">Suite constants</span>
+        <p><code>SUITE_V1 = "v1-ecdh-p256"</code> (the only implemented suite) and <code>SUITE_V2 = "v2-x25519-mlkem768"</code> (reserved, inert). The <code>service</code> and <code>pqc</code> modules are the key-distribution state machine and the reserved post-quantum hybrid wrap respectively &mdash; see <a href="wire.html">Wire format</a> and <a href="security.html#pqc">Security &rarr; FIPS + PQC</a>.</p>
+      </div>
+
+      <hr>
+
+      <h2>Go</h2>
+      <p>Module <code>github.com/usareur-af/goatcore/ops/grant-crypto/sdk/bindings/go</code>, cgo over the static library, zero Go dependencies. Every handle-holding type has an idempotent-harmless <code>Close()</code>; <code>defer Close()</code> is the sanctioned release. Errors are exported sentinels &mdash; compare with <code>errors.Is</code>, never on message text.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symbol</th><th>Signature</th><th>Semantics</th></tr></thead>
+          <tbody>
+            <tr><td><code>NewIdentity</code></td><td class="wrap"><code>(memberID string, scalar32 []byte) (*Identity, error)</code></td><td class="wrap">Validates the scalar; <code>ErrBadScalar</code> on wrong length, <code>ErrMalformed</code> on a bad key. Zeroize your copy of <code>scalar32</code> after it returns.</td></tr>
+            <tr><td><code>(*Identity).Rotate</code></td><td class="wrap"><code>(newScalar32 []byte, keepAccess bool, bundlesJSON []byte) ([]byte, error)</code></td><td class="wrap">In-place re-key; returns the receipt JSON. <code>keepAccess=false</code> is the Destroy default.</td></tr>
+            <tr><td><code>(*Identity).Close</code></td><td class="wrap"><code>() error</code></td><td class="wrap">Zeroizes the scalar. Second call returns <code>ErrDisposed</code>.</td></tr>
+            <tr><td><code>NewKeyStore</code></td><td class="wrap"><code>() (*KeyStore, error)</code></td><td class="wrap">An empty consumer key store.</td></tr>
+            <tr><td><code>(*KeyStore).Admit</code></td><td class="wrap"><code>(id *Identity, bundleJSON []byte) (hadSlot bool, err error)</code></td><td class="wrap"><code>false</code> for an outsider is normal, not an error. Verify first.</td></tr>
+            <tr><td><code>(*KeyStore).Open</code></td><td class="wrap"><code>(keyexpr string, envelopeJSON []byte) ([]byte, error)</code></td><td class="wrap"><code>ErrDecrypt</code> on the wrong key-expr (AEAD-bound); <code>ErrNoSlot</code> if no DEK held.</td></tr>
+            <tr><td><code>(*KeyStore).Close</code></td><td class="wrap"><code>() error</code></td><td class="wrap">Zeroizes all held DEKs.</td></tr>
+            <tr><td><code>AcquireStreamKey</code></td><td class="wrap"><code>(bundlesJSON []byte, rs string, id *Identity) (*StreamKey, error)</code></td><td class="wrap">Highest-gen slot for the id; <code>ErrNoSlot</code> if not in any visible audience.</td></tr>
+            <tr><td><code>(*StreamKey).Seal</code></td><td class="wrap"><code>(keyexpr string, plaintext []byte) ([]byte, error)</code></td><td class="wrap">Returns the serialized Envelope; <code>ErrRotationRequired</code> at the cap.</td></tr>
+            <tr><td><code>(*StreamKey).Remaining</code></td><td class="wrap"><code>() (uint64, error)</code></td><td class="wrap">Seals left before rotation is required.</td></tr>
+            <tr><td><code>(*StreamKey).SetCap</code></td><td class="wrap"><code>(cap uint64) error</code></td><td class="wrap">Tighten only; a cap above the default returns <code>ErrMalformed</code>.</td></tr>
+            <tr><td><code>(*StreamKey).Close</code></td><td class="wrap"><code>() error</code></td><td class="wrap">Zeroizes the DEK.</td></tr>
+            <tr><td><code>VerifyBundle</code></td><td class="wrap"><code>(bundleJSON, vkSPKIDER []byte) error</code></td><td class="wrap"><code>nil</code> on success; <code>ErrBadSignature</code> / <code>ErrMalformed</code> otherwise. Verify before Admit.</td></tr>
+            <tr><td><code>ABIVersion</code></td><td class="wrap"><code>() uint32</code></td><td class="wrap">The core&rsquo;s monotone C ABI version (lockstep; no cross-version promise).</td></tr>
+            <tr><td><code>Leaks</code> / <code>LeakLogger</code></td><td class="wrap"><code>() int64</code> / <code>var func(kind string)</code></td><td class="wrap">Report-only leak diagnostics. A finalizer <em>reports</em> a leaked (unclosed) handle; it never disposes.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Error sentinels: <code>ErrUnsupportedSuite</code>, <code>ErrDecrypt</code>, <code>ErrUnwrap</code>, <code>ErrBadSignature</code>, <code>ErrNoSlot</code>, <code>ErrMalformed</code>, <code>ErrRotationRequired</code>, <code>ErrDisposed</code>, plus the Go-side pre-checks <code>ErrBadScalar</code> and <code>ErrEmbeddedNUL</code> (both wrap <code>ErrMalformed</code>) and <code>ErrBufferTooLarge</code>.</p>
+
+      <hr>
+
+      <h2>Python</h2>
+      <p>Package import name <code>grant_crypto</code>; pure stdlib <code>ctypes</code>, zero pip dependencies. All wire arguments are <code>bytes</code>; <code>keyexpr</code>, <code>member_id</code>, and <code>rs</code> are <code>str</code>. Every handle object is a context manager (<code>with</code>) or takes an explicit <code>.close()</code>.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symbol</th><th>Signature</th><th>Semantics</th></tr></thead>
+          <tbody>
+            <tr><td><code>Identity</code></td><td class="wrap"><code>Identity(member_id: str, scalar32)</code></td><td class="wrap">Validates the scalar (32 bytes; <code>MalformedError</code> otherwise). The scalar is not retained in Python.</td></tr>
+            <tr><td><code>Identity.rotate</code></td><td class="wrap"><code>(new_scalar32, keep_access=False, bundles_json=b"[]") -&gt; dict</code></td><td class="wrap">In-place re-key; returns the parsed receipt dict. Under <code>keep_access</code> the re-wrapped entries ride under the receipt&rsquo;s <code>"rewrapped"</code> key.</td></tr>
+            <tr><td><code>KeyStore</code></td><td class="wrap"><code>KeyStore()</code></td><td class="wrap">An empty consumer key store.</td></tr>
+            <tr><td><code>KeyStore.admit</code></td><td class="wrap"><code>(identity, bundle_json) -&gt; bool</code></td><td class="wrap"><code>True</code> if a slot was found (DEK retained), <code>False</code> for an outsider. Verify first.</td></tr>
+            <tr><td><code>KeyStore.open</code></td><td class="wrap"><code>(keyexpr: str, envelope_json) -&gt; bytes</code></td><td class="wrap"><code>NoSlotError</code> if none held; the AEAD binds <code>keyexpr</code>.</td></tr>
+            <tr><td><code>StreamKey.acquire</code></td><td class="wrap"><code>classmethod (bundles_json, rs: str, identity) -&gt; StreamKey</code></td><td class="wrap"><code>NoSlotError</code> if the producer isn&rsquo;t in any visible audience.</td></tr>
+            <tr><td><code>StreamKey.seal</code></td><td class="wrap"><code>(keyexpr: str, plaintext) -&gt; bytes</code></td><td class="wrap">Returns the serialized Envelope; <code>RotationRequiredError</code> at the cap.</td></tr>
+            <tr><td><code>StreamKey.remaining</code></td><td class="wrap"><code>property -&gt; int</code></td><td class="wrap">Seals left before rotation is required.</td></tr>
+            <tr><td><code>StreamKey.set_cap</code></td><td class="wrap"><code>(n: int) -&gt; None</code></td><td class="wrap">Tighten only; above the default raises <code>MalformedError</code>.</td></tr>
+            <tr><td><code>verify_bundle</code></td><td class="wrap"><code>(bundle_json, vk_spki_der) -&gt; None</code></td><td class="wrap">Raises on bad signature / malformed. Verify before admit.</td></tr>
+            <tr><td><code>abi_version</code> / <code>error_message</code></td><td class="wrap"><code>() -&gt; int</code> / <code>(code) -&gt; str</code></td><td class="wrap">ABI version; static diagnostic string for a code (never branch on the text).</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Exceptions form one hierarchy under <code>GrantCryptoError</code>: <code>UnsupportedSuiteError</code>, <code>DecryptError</code>, <code>UnwrapError</code>, <code>BadSignatureError</code>, <code>NoSlotError</code>, <code>MalformedError</code>, <code>RotationRequiredError</code>, <code>DisposedHandleError</code>, <code>NullArgError</code>, <code>BadUtf8Error</code>, <code>InternalError</code>. A leaked (unclosed) handle emits a <code>ResourceWarning</code> from <code>__del__</code> &mdash; it never disposes.</p>
+
+      <hr>
+
+      <h2>TypeScript / Node</h2>
+      <p>Package <code>grant-crypto</code>; koffi loads the shared library at runtime. Handles are classes with a static factory; call <code>close()</code> or use <code>using</code> (each implements <code>Symbol.dispose</code>). Branch on errors with <code>instanceof</code>, never on message text. Wire arguments are <code>Uint8Array</code>.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symbol</th><th>Signature</th><th>Semantics</th></tr></thead>
+          <tbody>
+            <tr><td><code>Identity.create</code></td><td class="wrap"><code>static (memberId: string, scalar32: Uint8Array) =&gt; Identity</code></td><td class="wrap">Validates the scalar at construction (<code>MalformedError</code> if not 32 bytes / not a key).</td></tr>
+            <tr><td><code>Identity.rotate</code></td><td class="wrap"><code>(newScalar32, keepAccess = false, bundlesJson?) =&gt; RotationReceipt</code></td><td class="wrap">In-place re-key; the receipt carries <code>rewrapped</code> only under <code>keepAccess</code>.</td></tr>
+            <tr><td><code>Identity.close</code> / <code>[Symbol.dispose]</code></td><td class="wrap"><code>() =&gt; void</code></td><td class="wrap">Zeroizes the scalar; double-close throws <code>DisposedHandleError</code>.</td></tr>
+            <tr><td><code>KeyStore.create</code></td><td class="wrap"><code>static () =&gt; KeyStore</code></td><td class="wrap">An empty consumer key store.</td></tr>
+            <tr><td><code>KeyStore.admit</code></td><td class="wrap"><code>(id: Identity, bundleJson: Uint8Array) =&gt; boolean</code></td><td class="wrap"><code>false</code> for an outsider is normal. Verify first.</td></tr>
+            <tr><td><code>KeyStore.open</code></td><td class="wrap"><code>(keyexpr: string, envelopeJson: Uint8Array) =&gt; Uint8Array</code></td><td class="wrap"><code>NoSlotError</code> if none held; AEAD binds <code>keyexpr</code>.</td></tr>
+            <tr><td><code>StreamKey.acquire</code></td><td class="wrap"><code>static (bundlesJson, rs: string, id: Identity) =&gt; StreamKey</code></td><td class="wrap"><code>NoSlotError</code> if not in any visible audience.</td></tr>
+            <tr><td><code>StreamKey.seal</code></td><td class="wrap"><code>(keyexpr: string, plaintext: Uint8Array) =&gt; Uint8Array</code></td><td class="wrap">Returns the serialized Envelope; <code>RotationRequiredError</code> at the cap.</td></tr>
+            <tr><td><code>StreamKey.remaining</code></td><td class="wrap"><code>() =&gt; number | bigint</code></td><td class="wrap">Seals left; <code>number</code> when it fits a safe integer, else <code>bigint</code>.</td></tr>
+            <tr><td><code>StreamKey.setCap</code></td><td class="wrap"><code>(n: number | bigint) =&gt; void</code></td><td class="wrap">Tighten only; above the default throws <code>MalformedError</code>.</td></tr>
+            <tr><td><code>verifyBundle</code></td><td class="wrap"><code>(bundleJson, vkSpkiDer) =&gt; void</code></td><td class="wrap">Throws on bad signature / malformed. Verify before admit.</td></tr>
+            <tr><td><code>abiVersion</code></td><td class="wrap"><code>() =&gt; number</code></td><td class="wrap">The loaded core&rsquo;s ABI version.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Errors are typed subclasses of <code>GrantCryptoError</code> (each with a numeric <code>.code</code>): <code>UnsupportedSuiteError</code>, <code>DecryptError</code>, <code>UnwrapError</code>, <code>BadSignatureError</code>, <code>NoSlotError</code>, <code>MalformedError</code>, <code>RotationRequiredError</code>, <code>NullArgError</code>, <code>DisposedHandleError</code>, <code>BadUtf8Error</code>, <code>InternalError</code>. The exported types <code>RotationReceipt</code> and <code>ReWrappedDek</code> describe the receipt shape. A garbage-collected unclosed handle emits a warning via a <code>FinalizationRegistry</code> &mdash; it never disposes.</p>
+
+      <div class="pagenav">
+        <a href="quickstart.html"><span class="dir">Previous</span>&larr; Quickstart</a>
+        <a class="next" href="capi.html"><span class="dir">Next</span>C ABI &rarr;</a>
+      </div>
+
+      <footer class="page-footer">
+        <span class="version-badge"></span>
+        <span>grant-crypto SDK &middot; ADR 1106 &middot; ships in-SDK, served at get.&lt;site&gt;/sdk/docs/</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

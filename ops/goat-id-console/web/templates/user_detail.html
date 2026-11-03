@@ -1,0 +1,416 @@
+{{define "content"}}
+<p><a href="/?idp={{.IdP.Key}}">← Users</a></p>
+<h1 class="page-title">{{.User.Email}}</h1>
+<p class="muted">{{.User.ID}} · <a href="/offboard-verify?person={{.User.Email}}">Verify offboard</a></p>
+
+{{if .Reset2FAOK}}
+<div class="banner success">
+  Second factor reset — every TOTP / WebAuthn / backup-code credential was cleared.
+  Now <a href="#recovery-reauth">Mint a new recovery link</a> so the user can log in and
+  re-enrol a factor.
+</div>
+{{end}}
+
+<h2 class="section-title">Traits</h2>
+<table>
+  <tr><th>Email</th><td>{{.User.Email}}</td></tr>
+  <tr><th>Name</th><td>{{.User.Name}}</td></tr>
+  <tr>
+    <th>State</th>
+    <td>
+      {{if eq .User.State "inactive"}}
+        <span class="status-badge revoked">inactive</span>
+        <form method="post" action="/users/{{.User.ID}}/state?idp={{.IdP.Key}}" class="inline">
+          <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+          <input type="hidden" name="state" value="active">
+          <button type="submit" class="primary">Reactivate</button>
+        </form>
+        <span class="muted">
+          The identity provider sometimes deactivates a fresh password-only account when passkeys are required. Reactivate it here.
+        </span>
+      {{else}}
+        <span class="status-badge active">active</span>
+        <form method="post" action="/users/{{.User.ID}}/state?idp={{.IdP.Key}}" class="inline" 
+              onsubmit="return confirm('Disable {{.User.Email}}? They will not be able to log in until reactivated.');">
+          <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+          <input type="hidden" name="state" value="inactive">
+          <button type="submit" class="danger">Disable</button>{{template "aal2badge" $.StepUp}}
+        </form>
+      {{end}}
+    </td>
+  </tr>
+  <tr><th>Created</th><td>{{.User.CreatedAt}}</td></tr>
+  {{if or .User.OrgShortTag .User.OrgDisplayName}}
+  <tr>
+    <th>Org</th>
+    <td>
+      {{if .User.OrgDisplayName}}{{.User.OrgDisplayName}}{{else}}—{{end}}
+      {{if .User.OrgShortTag}}<code class="muted">({{.User.OrgShortTag}})</code>{{end}}
+      <span class="muted">
+        Set at mint via the operator-onboard manifest's <code>org.short_tag</code> + <code>org.display_name</code>. Operator-shape identities (no org block) hide this row.
+      </span>
+    </td>
+  </tr>
+  {{end}}
+</table>
+
+{{if .User.Aff.Known}}
+<h2 class="section-title">Affiliation &amp; coalition standing</h2>
+<table>
+  {{if .User.Aff.ID}}
+  <tr><th>Affiliation</th><td><code>{{.User.Aff.ID}}</code></td></tr>
+  {{end}}
+  {{if .User.Aff.Sector}}
+  <tr>
+    <th>Sector</th>
+    <td>
+      <code>{{.User.Aff.Sector}}</code>{{if .User.Aff.GovBranch}} · <code>{{.User.Aff.GovBranch}}</code>{{end}}
+      <span class="muted">
+        What sort of body the organization is{{if .User.Aff.GovBranch}}, and which part of
+        government{{end}}. Identity-only: never a NetBird group, never in the Zenoh write anchor.
+      </span>
+    </td>
+  </tr>
+  {{end}}
+  {{if .User.Aff.OrganicKnown}}
+  <tr>
+    <th>Ours or foreign</th>
+    <td>
+      {{if .User.Aff.Organic}}ours{{else}}foreign{{end}}
+      <span class="muted">{{.User.Aff.OrganicBasis}}. Derived, never stored — it is relative
+        to whoever operates this goatnet, so the same organization answers differently elsewhere.</span>
+    </td>
+  </tr>
+  {{else if .User.Aff.OrganicBasis}}
+  <tr>
+    <th>Ours or foreign</th>
+    <td>
+      <span class="status-badge warn">unknown</span>
+      <span class="muted">{{.User.Aff.OrganicBasis}}.</span>
+    </td>
+  </tr>
+  {{end}}
+  <tr>
+    <th>Nation</th>
+    <td>
+      {{if .User.Aff.Nation}}
+        <code>{{.User.Aff.Nation}}</code>{{if .User.Aff.NationName}} {{.User.Aff.NationName}}{{end}}
+        <span class="muted">(from the {{.User.Aff.NationSource}})</span>
+      {{else}}
+        <span class="status-badge warn">not recorded</span>
+        <span class="muted">
+          Coalition standing is derived from nation, so an unrecorded nation
+          silently means partner. Record it with
+          <code>goat admin org update &lt;id&gt; --nation &lt;ISO-3&gt;</code>.
+        </span>
+      {{end}}
+    </td>
+  </tr>
+  <tr>
+    <th>Coalition standing</th>
+    <td>
+      {{if .User.Aff.Unresolved}}
+        <span class="status-badge warn">unresolved</span>
+        <span class="muted">{{.User.Aff.Unresolved}}</span>
+      {{else}}
+        {{if eq .User.Aff.Standing "member"}}
+          <span class="status-badge active">member</span>
+        {{else}}
+          <span class="status-badge">{{.User.Aff.Standing}}</span>
+        {{end}}
+        of <strong>{{.User.Aff.FrameworkName}}</strong>
+        <code class="muted">({{.User.Aff.Framework}})</code>
+        <span class="muted">as-of {{.User.Aff.AsOf}}</span>
+        <div class="muted">{{.User.Aff.Basis}}</div>
+      {{end}}
+    </td>
+  </tr>
+</table>
+<div class="caveat">
+  <p>
+    <strong>What standing does.</strong> It bounds which release lanes an org is
+    <em>eligible</em> for: a partner org gets bilateral lanes and the broad lane,
+    never an ally's default reach. There is no member-only lane — alliance members
+    already read everything, so such a lane would grant nothing. Standing
+    is an eligibility check, not a grant: nobody reads anything because of it until a
+    release-lane or data grant is actually issued.
+  </p>
+  <p>
+    <strong>What standing does NOT do.</strong> It does not set this person's fabric
+    read or write scope. Writes are per-anchor (each identity writes only its own
+    <code>&lt;uuid&gt;/**</code> root); reads are flat across the goatnet unless the
+    partner read partition carves this anchor, which is a deliberate per-anchor
+    operator edit (<code>zenoh_partner_read_lanes</code>), not a consequence of
+    standing. Partner standing alone changes nothing on the wire.
+  </p>
+  <p>
+    <strong>Why it is derived, not stored.</strong> Membership changes (Finland
+    2023-04-04, Sweden 2024-03-07), so standing rides the registry as
+    currently-is and is deliberately absent from the frozen cert and from the Ory
+    claim. It is resolved here from nation against
+    the coalition framework registry, the one home for that fact — which is
+    also why an edit there changes standing fleet-wide with no re-mint.
+  </p>
+</div>
+{{end}}
+
+<h2 class="section-title">Groups</h2>
+<form method="post" action="/users/{{.User.ID}}/groups?idp={{.IdP.Key}}" class="stacked">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <label for="groups">Comma-separated login groups
+    {{if .GroupOptions}}<span class="muted">(valid: {{range $i, $g := .GroupOptions}}{{if $i}}, {{end}}<code>{{$g.Name}}</code>{{end}} — or <code>data.*</code> grants; see <a href="/permissions">permissions</a>. Mesh roles like <code>DEVELOPER</code>/<code>OBSERVER</code> are NetBird-plane, granted by onboarding — refused here.)</span>
+    {{else}}<span class="muted">(e.g. <code>ADMINS, GRAFANA-READONLY</code>)</span>{{end}}:</label>
+  <input type="text" id="groups" name="groups" value="{{.User.GroupsCSV}}">
+  <label><input type="checkbox" name="revoke_sessions" value="1" checked> Also revoke this user's sessions (forces fresh login to pick up new groups)</label>
+  <div>
+    <button type="submit" class="primary">Save groups</button>{{template "aal2badge" $.StepUp}}
+    <a href="/users/{{.User.ID}}?idp={{.IdP.Key}}" class="btn">Cancel</a>
+  </div>
+</form>
+
+<h2 class="section-title">Access <a href="/holds?idp={{.IdP.Key}}" class="section-link" id="see-all-holds">See all holds</a></h2>
+
+{{if eq .User.Authority.Mode "enforce"}}<div class="banner warn">Membership is warrant-governed. Direct hold release is disabled; <a href="{{.User.Authority.Procedure}}">use the reviewed warrant declaration-removal procedure</a>.</div>{{else if eq .User.Authority.Mode "unknown"}}<div class="banner error">Membership authority is unknown, so direct hold release is disabled. {{.User.Authority.Detail}}</div>{{end}}
+
+{{with .User.Access}}
+  {{if .HandleError}}
+    <p>
+      <span class="status-badge warn">handle cannot be derived</span>
+      <span class="muted">{{.HandleError}}</span>
+    </p>
+  {{else}}
+    <p>
+      Handle <code>{{.Handle}}</code>
+      {{if .Site}}<span class="muted">(on goatnet <code>{{.Site}}</code>).</span>{{end}}
+    </p>
+
+    {{if not .RecordsAvailable}}
+      <p>
+        <span class="status-badge warn">hold records unavailable</span>
+        <span class="muted">{{.RecordsError}}</span>
+      </p>
+    {{else if .RecordsSkipped}}
+      <p>
+        <span class="status-badge warn">{{.RecordsSkipped}} bad hold-record line(s) skipped</span>
+        <span class="muted">line(s) {{range $i, $n := .RecordsSkippedLines}}{{if $i}}, {{end}}{{$n}}{{end}} are not valid v1 hold records (malformed, a required field missing, or lane / hold group / phase outside the contract) and were skipped; a held peer whose line is bad has no record here and reads as a security hold until the file is repaired (validate-hold-records.py names the lines).</span>
+      </p>
+    {{end}}
+    {{if .KnownHandlesError}}
+      <p>
+        <span class="status-badge warn">handle roster partial</span>
+        <span class="muted">{{.KnownHandlesError}} — without the full roster a peer or key name could be credited to a handle that merely prefixes it, so nothing is attributed to this member until the roster reads again.</span>
+      </p>
+    {{end}}
+    {{if not .MeshAvailable}}
+      <p>
+        <span class="status-badge warn">mesh state unavailable</span>
+        <span class="muted">{{.MeshError}}</span>
+      </p>
+    {{end}}
+    {{if .Inconsistent}}
+      <p>
+        <span class="status-badge warn">inconsistent, investigate</span>
+        <span class="muted">{{.InconsistentDetail}}</span>
+      </p>
+    {{end}}
+
+    <h3>Peers</h3>
+    {{if not .Peers}}
+      {{if .MeshAvailable}}
+        <p class="muted">No mesh peers are currently attributed to this handle.</p>
+      {{else}}
+        <p class="muted">Peer list unavailable — see above.</p>
+      {{end}}
+    {{else}}
+      <table class="access-peers">
+        <thead>
+          <tr>
+            <th>Peer</th>
+            <th>Hold</th>
+            <th>Action</th>
+            <th>Entered</th>
+            <th>Days on hold</th>
+            <th>Days inactive</th>
+            <th>Groups</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Peers}}
+            <tr>
+              <td>{{.Name}} {{if .ID}}<code class="muted">({{.ID}})</code>{{end}}</td>
+              <td>
+                {{/* Kind + State from the shared define (hold_badges.html):
+                     the same words and colours the Holds page uses. */}}
+                {{if eq .Verdict "not_on_hold"}}
+                  <span class="status-badge active">not on hold</span>
+                {{else if .State}}
+                  {{template "hold_badges" (dict "Kind" .Kind "State" .State "Show" "")}}
+                {{else}}
+                  <span class="status-badge">unknown</span>
+                {{end}}
+              </td>
+              <td>{{if .ReleaseURL}}<a class="btn primary" href="{{.ReleaseURL}}">Release hold</a>{{end}}</td>
+              <td>{{if .EnteredAt}}{{.EnteredAt}}{{else}}<span class="muted">—</span>{{end}}</td>
+              <td>{{if .DaysOnHold}}{{.DaysOnHold}}{{else}}<span class="muted">—</span>{{end}}</td>
+              <td>{{if .LastSeenUnreadable}}<span class="muted">—<br>last seen unreadable</span>{{else if .DaysInactive}}{{.DaysInactive}}{{else}}<span class="muted">—</span>{{end}}</td>
+              <td>{{if .Groups}}{{range $i, $g := .Groups}}{{if $i}}, {{end}}<code>{{$g}}</code>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
+              <td>
+                {{if .Connected}}<span class="status-badge active">connected</span>{{else}}<span class="muted">offline</span>{{end}}
+                {{if .LastSeen}}<br><span class="muted">Seen: <span class="ts">{{.LastSeen}}</span></span>{{end}}
+                {{if .Reason}}<br><span class="muted">Reason: {{.Reason}}</span>{{end}}
+                {{if .Actor}}<br><span class="muted">Actor: {{.Actor}}</span>{{end}}
+                {{if .PriorGroups}}<br><span class="muted">Prior: </span>{{range $i, $g := .PriorGroups}}{{if $i}}, {{end}}<code>{{$g}}</code>{{end}}{{end}}
+                {{if .VerdictDetail}}<br><span class="muted">{{.VerdictDetail}}</span>{{end}}
+              </td>
+            </tr>
+          {{end}}
+        </tbody>
+      </table>
+    {{end}}
+
+    <h3>Setup keys</h3>
+    {{if not .KeysAvailable}}
+      <p>
+        <span class="status-badge warn">setup-key state unavailable</span>
+        <span class="muted">{{.KeysError}}</span>
+      </p>
+    {{else if .NoKeyForHandle}}
+      <p class="muted">No setup key found for this handle.</p>
+    {{else}}
+      <table>
+        <thead>
+          <tr><th>Name</th><th>Status</th><th>Uses</th><th>Expires</th></tr>
+        </thead>
+        <tbody>
+          {{range .Keys}}
+            <tr>
+              <td><code>{{.Name}}</code></td>
+              <td>
+                {{if eq .Status "valid"}}
+                  <span class="status-badge active">valid</span>
+                {{else if eq .Status "revoked"}}
+                  <span class="status-badge revoked">revoked</span>
+                {{else if eq .Status "expired"}}
+                  <span class="status-badge warn">expired</span>
+                {{else}}
+                  <span class="status-badge warn">{{.Status}}</span>
+                {{end}}
+              </td>
+              <td>{{.UsedTimes}}</td>
+              <td>{{.ExpiresAt}}</td>
+            </tr>
+          {{end}}
+        </tbody>
+      </table>
+    {{end}}
+  {{end}}
+{{end}}
+
+<h2 class="section-title">Active sessions{{if not .SessionsUnavailable}} ({{len .Sessions}}){{end}}</h2>
+{{if .SessionsUnavailable}}
+  <p role="alert">Could not load active sessions. Try again later; you can still revoke all sessions.</p>
+{{else if not .Sessions}}
+  <p class="muted">No active sessions — this user is either never-logged-in or all sessions have expired.</p>
+{{else}}
+  <table class="sessions">
+    <thead><tr><th>Issued</th><th>Expires</th><th>AAL</th><th>Device</th></tr></thead>
+    <tbody>
+      {{range .Sessions}}
+        <tr>
+          <td>{{.IssuedHuman}}</td>
+          <td>{{.ExpiresHuman}}</td>
+          <td>{{.AAL}}</td>
+          <td>{{.DeviceSummary}}</td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+{{end}}
+{{if or .Sessions .SessionsUnavailable}}
+  <form method="post" action="/users/{{.User.ID}}/revoke-sessions?idp={{.IdP.Key}}" class="inline">
+    <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+    <button type="submit" class="danger">Revoke all sessions</button>{{template "aal2badge" $.StepUp}}
+  </form>
+{{end}}
+
+<h2 class="section-title">Services accessed (Hydra consent grants)</h2>
+<div class="caveat">
+  Consent-grant time, not last-request time. A user who consented at T and is still using their JWT
+  five hours later shows up as T here. Future v1.5 expansion pipes oauth2-proxy access logs into a
+  per-identity index for real last-request times.
+</div>
+{{if .ConsentsUnavailable}}
+  <p role="alert">Could not load consent grants. Try again later.</p>
+{{else if not .ConsentSessions}}
+  <p class="muted">No consent grants — this user has not yet completed an OIDC flow against any client.</p>
+{{else}}
+  <table class="consent">
+    <thead><tr><th>Service (OIDC client)</th><th>Granted at</th><th>Scopes</th><th>Audience</th></tr></thead>
+    <tbody>
+      {{range .ConsentSessions}}
+        <tr>
+          <td>{{.ClientName}} <code>{{.ClientID}}</code></td>
+          <td>{{.HandledHuman}}</td>
+          <td>{{.ScopesCSV}}</td>
+          <td>{{.AudienceCSV}}</td>
+        </tr>
+      {{end}}
+    </tbody>
+  </table>
+{{end}}
+
+<h2 class="section-title" id="recovery-reauth">Recovery / re-auth</h2>
+<div class="action-row">
+  <form method="post" action="/users/{{.User.ID}}/recovery-link?idp={{.IdP.Key}}" class="inline">
+    <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+    <button type="submit" class="btn">Mint new recovery link</button>
+  </form>
+  <span class="muted">Generates a one-time URL the user opens to (re)set credentials.</span>
+</div>
+
+<div class="action-row">
+  <form method="post" action="/users/{{.User.ID}}/reset-2fa?idp={{.IdP.Key}}" class="inline"
+        onsubmit="return confirm('Reset second factor for {{.User.Email}}? This removes their TOTP / WebAuthn / backup codes. They will need a recovery link to log in and re-enrol.');">
+    <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+    <button type="submit" class="danger" {{if not .User.HasSecondFactor}}disabled{{end}}>Reset second factor</button>{{template "aal2badge" $.StepUp}}
+  </form>
+  <span class="muted">
+    Current: {{if .User.HasSecondFactor}}<span class="status-badge active">✓ 2FA enrolled</span>{{else}}<span class="status-badge warn">2FA not enrolled</span>{{end}}.
+    Clears TOTP authenticator, WebAuthn key, and backup codes so a locked-out user can log back in and re-enrol. Audited; requires step-up (AAL2).
+  </span>
+</div>
+
+<div class="action-row">
+  <form method="post" action="/users/{{.User.ID}}/rotate-credential?idp={{.IdP.Key}}" class="inline"
+        onsubmit="if (!confirm('Rotate the fabric credential for {{.User.Email}}? This invalidates the certificate and API key they hold right now — their running setup stops publishing until they install the new bundle. Rotate for a suspected compromise or a scheduled refresh, not to fetch a lost copy.')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+    <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+    <input type="hidden" name="rotate_nonce" value="{{.RotateNonce}}">
+    <button type="submit" class="danger">Rotate fabric credential</button>
+  </form>
+  <span class="muted">
+    Re-issues their fabric cert + portal API key in place — same anchor, same write namespace, fresh
+    credential shown once on the next page. The copy they currently hold stops working immediately. Audited.
+  </span>
+</div>
+
+<div class="action-row">
+  <form method="post" action="/users/{{.User.ID}}/email-reference?idp={{.IdP.Key}}" class="inline">
+    <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+    <button type="submit" class="btn">Email role reference</button>
+  </form>
+  <span class="muted">Emails this person the complete, current reference for their role (catch-up for access configured before role emails). No secrets ride in it.</span>
+</div>
+
+<div class="danger-zone">
+  <h2>Danger zone</h2>
+  <p>Delete this identity from Kratos. Downstream cleanup (NetBird peers, portal org rows, Zenoh certs) is operator-driven.</p>
+  <form method="post" action="/users/{{.User.ID}}/delete?idp={{.IdP.Key}}" class="stacked"
+        onsubmit="return confirm('Delete {{.User.Email}}? This cannot be undone.');">
+    <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+    <label for="confirm_email">Type the email to confirm: <code>{{.User.Email}}</code></label>
+    <input type="text" id="confirm_email" name="confirm_email" required>
+    <div><button type="submit" class="danger">Delete identity</button>{{template "aal2badge" $.StepUp}}</div>
+  </form>
+</div>
+{{end}}

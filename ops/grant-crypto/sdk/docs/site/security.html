@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>grant-crypto SDK — Security</title>
+  <meta name="description" content="The honest security page: invariants, capability-vs-reject error design, the zeroization ceiling enumerated, the seal-cap arithmetic, rotation tradeoffs, FIPS/PQC posture, WASM stance, and what conformance does and does not prove.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="index.html" class="wordmark">grant-crypto</a>
+      <span class="ver" aria-label="SDK version"></span>
+    </div>
+    <p class="brand-tag">Endpoint forward secrecy, by construction.</p>
+    <nav aria-label="Documentation">
+      <p class="nav-group">Start</p>
+      <a href="index.html">Overview</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="quickstart.html">Quickstart</a>
+      <p class="nav-group">Reference</p>
+      <a href="api.html">API</a>
+      <a href="capi.html">C ABI</a>
+      <a href="wire.html">Wire format</a>
+      <p class="nav-group">Operate</p>
+      <a href="security.html" aria-current="page">Security</a>
+      <a href="troubleshooting.html">Troubleshooting</a>
+    </nav>
+    <p class="theme-note">This page states limits plainly, including the zeroization ceiling and what conformance does not cover.</p>
+  </aside>
+
+  <div class="content">
+    <main id="main">
+      <p class="eyebrow">Security</p>
+      <h1>What holds, and where the edges are</h1>
+      <p class="lede">This page is deliberately honest. It restates the invariants, then walks the parts that are easy to overstate &mdash; the zeroization ceiling, the seal cap, rotation&rsquo;s tradeoff, FIPS and post-quantum posture, and the exact boundary of what conformance proves. If a claim is qualified below, the qualification is the point.</p>
+
+      <h2>Invariants</h2>
+      <ul class="invariants">
+        <li><span class="k">The platform holds no keys.</span> The key service mints, wraps, publishes, and drops the DEK. Its API exposes no function that returns plaintext or a DEK.</li>
+        <li><span class="k">Only members decrypt, in-process.</span> Plaintext is returned only to the holder of the member identity key; a non-member has no slot and <code>admit</code> fails closed.</li>
+        <li><span class="k">The producer is not a key authority.</span> <code>seal</code> takes no recipients; a producer seals under a key unwrapped from its own bundle slot.</li>
+        <li><span class="k">Forward secrecy is endpoint-enforced.</span> Default rotation destroys the retired private key with no re-wrap. The platform can never re-wrap &mdash; it holds nothing to re-wrap.</li>
+        <li><span class="k">Suite-agnostic by construction.</span> No algorithm, nonce, or RNG appears in any public signature; the suite id travels in the data and is AAD-bound, so a suite cannot be silently downgraded.</li>
+        <li><span class="k">Fail closed, quietly.</span> An unknown suite fails before any key operation; a missing slot is a normal outcome; every other failure is a reject, and error variants are advisory, never an oracle.</li>
+      </ul>
+
+      <h2>Capability vs reject &mdash; the error design</h2>
+      <p>The error taxonomy is designed so that error variants never leak key information. Three classes:</p>
+      <ul>
+        <li><strong>Capability signal</strong> &mdash; <code>UnsupportedSuite</code> means &ldquo;I do not implement this suite,&rdquo; raised <em>before</em> any key operation. It is safe to branch on: it says nothing about keys.</li>
+        <li><strong>Normal outcome</strong> &mdash; <code>NoSlot</code> means &ldquo;not in the audience / no key held for this generation.&rdquo; It is expected, not a failure.</li>
+        <li><strong>Reject</strong> &mdash; <code>Decrypt</code>, <code>Unwrap</code>, <code>BadSignature</code>, <code>Malformed</code> are authenticated-failure rejects. The distinction between them is <em>advisory</em>; a caller must not treat any of them as a decrypt oracle. Never build control flow that reveals which reject occurred to an untrusted party.</li>
+      </ul>
+      <p><code>RotationRequired</code> is a fourth, write-side case: a local refusal to seal past the cap. It changes nothing on the wire and is distinct from <code>Decrypt</code> &mdash; it is never a decrypt oracle.</p>
+
+      <h2 id="ceiling">The zeroization ceiling</h2>
+      <p>Key material is wiped on dispose and drop &mdash; but zeroization in a systems language has honest limits, and the SDK states them rather than implying a guarantee it cannot keep. <strong>Within</strong> the ceiling: identity scalars, held DEKs, stream-key DEKs, and buffer contents are wiped on dispose/drop, and local key copies are wiped after use. The ceiling itself:</p>
+      <div class="warn">
+        <span class="callout-label">What zeroization does not cover</span>
+        <ul>
+          <li><strong>Move copies.</strong> Rust move semantics can leave stack copies of a value that the zeroize path never sees.</li>
+          <li><strong>By-value returns at the conformance layer.</strong> A <code>[u8; 32]</code> returned by value (required by the conformance/roundtrip layer) leaves an uncovered caller copy at that boundary.</li>
+          <li><strong>The AES key schedule.</strong> Expanding a key into AES round keys produces a schedule the zeroize story never touches.</li>
+          <li><strong>Plaintext and receipts in a managed language.</strong> Plaintext returned by <code>open</code> and envelopes returned by <code>seal</code> are ordinary bytes in Go/Python/TS &mdash; the binding does not zeroize what it returns to you. Treat them as caller-managed sensitive data: minimize copies, drop references promptly.</li>
+          <li><strong>No mlock / guarded allocation.</strong> Key pages are not locked or guarded by default; this is a possible later opt-in, never a silent promise.</li>
+        </ul>
+      </div>
+
+      <h2 id="cap">The seal cap</h2>
+      <p>v1 seals every message with a fresh random 96-bit nonce under a shared per-generation DEK, so the risk to manage is a nonce <em>collision</em>. After <code>q</code> seals the collision probability is approximately <code>q&sup2; / 2&#8313;&#8311;</code>. NIST SP&nbsp;800-38D-style guidance keeps <code>q &le; 2&sup3;&sup2;</code> (collision &asymp; 2<sup>&minus;33</sup>). The SDK defaults an order of magnitude tighter:</p>
+      <div class="note">
+        <span class="callout-label">DEFAULT_SEAL_CAP = 2&sup2;&#8308; = 16,777,216 seals</span>
+        <p>A <strong>256&times; (2&#8312;) margin</strong> below <code>2&sup3;&sup2;</code>, giving a collision probability of about <code>(2&sup2;&#8308;)&sup2; / 2&#8313;&#8311; = 2<sup>&minus;49</sup></code> at the cap. At the cap, <code>seal</code> refuses with <code>RotationRequired</code> rather than risk nonce reuse; <code>remaining()</code> surfaces the approach well before the refusal.</p>
+      </div>
+      <p>Three properties keep the cap from being defeated by accident:</p>
+      <ul>
+        <li><strong>Cumulative within the process.</strong> The count lives in a process-global counter keyed by <code>(rs, gen)</code>, not in the stream key. So the natural &ldquo;hit the cap, re-acquire, continue&rdquo; path cannot silently reset the budget &mdash; re-acquiring the same generation <em>carries the count forward</em>.</li>
+        <li><strong>Fresh budget only on a new generation.</strong> A different generation is a different budget line: rotation legitimately re-keys the DEK, so its count starts fresh. Across a process restart the counter is empty again; the systemic guarantee there is the key service publishing new generations.</li>
+        <li><strong>Monotone, tighten-only.</strong> <code>set_cap</code> / <code>with_cap</code> take <code>min(current, requested)</code>. A later request can lower the cap, never raise it back &mdash; and since it starts at the default, never above the default.</li>
+      </ul>
+      <p class="note" style="font-size:0.9rem"><span class="callout-label">Honest concurrency note</span> Concurrent producers sealing the <em>exact same</em> <code>(rs, gen)</code> in one process may each read a slightly stale local count between the check and the write-through, so the effective cap is approximate under that unusual concurrency &mdash; never loose enough to matter against the 2&#8312; margin.</p>
+
+      <h2 id="rotation">Rotation: Destroy vs KeepAccess</h2>
+      <p>Rotation is entirely member-side; the platform is never involved (it holds no keys and can never re-wrap). Two policies, stated plainly:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Policy</th><th>What it does</th><th>Forward-secrecy effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>Destroy</code> (default)</td><td class="wrap">Drop the retired private key; re-wrap nothing. The member loses the ability to re-fetch pre-rotation history from retained bundles.</td><td class="wrap"><strong>Full forward secrecy.</strong> That loss <em>is</em> the forward secrecy: a future theft of the new key reveals nothing sealed to the old one.</td></tr>
+            <tr><td><code>KeepAccess</code> (opt-out)</td><td class="wrap">Before dropping the old key, locally unwrap the member&rsquo;s still-live DEKs and re-wrap each to the new public key, on this machine.</td><td class="wrap"><strong>Reduces forward secrecy</strong> for those generations &mdash; a theft of the new key now reaches them. Choose it only when you genuinely need continued access to that history.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Every rotation emits a <code>RotationReceipt</code>: a structured, self-dating fact (member id, count of now-unreadable pre-rotation generations, count re-wrapped, an absolute RFC3339 UTC timestamp) &mdash; never time-relative prose. Persist it to your ledger.</p>
+
+      <h2 id="pqc">FIPS + PQC posture</h2>
+      <p>The default backend is RustCrypto (pure Rust, non-FIPS). A <code>fips</code> build feature re-bases the primitive stack onto <code>aws-lc-rs</code> / <code>aws-lc-fips-sys</code> &mdash; a real re-base plus a full conformance re-run, not a flag &mdash; and the pair is pinned and verified by compiling.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Suite</th><th>Status</th><th>FIPS</th></tr></thead>
+          <tbody>
+            <tr><td><code>v1-ecdh-p256</code></td><td>implemented</td><td class="wrap"><strong>FIPS-capable</strong> (under the <code>fips</code> feature): AES-256-GCM payloads; DEK wrapped by ephemeral-static ECDH P-256 &rarr; HKDF-SHA256; bundle signed ECDSA-P256/SHA-256.</td></tr>
+            <tr><td><code>v2-x25519-mlkem768</code></td><td>provisional, inert</td><td class="wrap"><strong>Beyond-FIPS defense-in-depth &mdash; never a FIPS-mode tier.</strong> An X-Wing hybrid (X25519 + ML-KEM-768) for harvest-now-decrypt-later defence.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>v2 stays inert until three gates pass: the exact draft/RFC revision is pinned in the wire spec, spec KATs (not self-roundtrip) gate it, and any combiner-affecting change mints a <em>new</em> suite id. Shipping a new suite is a separate, audit-gated decision; the API merely <em>accommodates</em> it without a break. See the <a href="wire.html#suites">wire format</a> for the suite table.</p>
+
+      <h2>WASM stance</h2>
+      <p>WASM is deferred, and it is <strong>never key custody</strong>. WASM cannot honor the zeroize and forward-secrecy defaults the rest of the SDK provides, so if it is ever shipped it will be an explicitly-named, reduced-assurance interop tier &mdash; not a place keys live. It is not part of v1.</p>
+
+      <h2 id="conformance">What conformance proves &mdash; and what it does not</h2>
+      <p>&ldquo;One implementation&rdquo; is an honest claim only because it is scoped honestly. There are two separate gates, and neither borrows the other&rsquo;s coverage:</p>
+      <ul>
+        <li><strong>Read side (proven byte-for-byte).</strong> The shared decrypt-direction vectors are a required CI merge gate for the core and every binding &mdash; byte-exact accept/reject parity, including the negative cases (wrong key, wrong generation, wrong release-set, wrong topic, tamper, unknown suite, bad signature). This proves read-interop.</li>
+        <li><strong>Write side (cannot be vector-pinned).</strong> The write path is deliberately nondeterministic (fresh random nonces), so vectors cannot cover it. Instead, every binding seals through itself and re-opens the result (a roundtrip, including the wrong-topic fail-closed case) and asserts nonce freshness on sealed output. This proves write safety.</li>
+      </ul>
+      <div class="warn">
+        <span class="callout-label">Stated so the claim can&rsquo;t outrun the tests</span>
+        <p>Two write-side strengthenings are <strong>queued follow-ups, not yet built</strong>: a deterministic-RNG injection seam in the core for true uniqueness assertions, and a binding-sealed &rarr; Go-reference-opened cross-implementation leg. Today the Go-sealed &rarr; Rust-opened direction is covered by the vectors themselves. Vectors prove read-interop; the RNG-injection work will prove write uniqueness &mdash; neither claim borrows the other&rsquo;s coverage.</p>
+      </div>
+      <p>One structural divergence in the reject class is expected and allowed, stated so it can&rsquo;t creep: a wrong-generation envelope rejects as <code>Decrypt</code> through the reference&rsquo;s unwrap-then-open shape but as <code>NoSlot</code> through the SDK keystore&rsquo;s <code>(rs, gen)</code>-indexed shape (no DEK is held for that generation, so the reject happens before any key operation). Conformance runners accept <code>{Decrypt, NoSlot}</code> for that one case only; every other case asserts the exact class. A binding that fails either gate does not ship.</p>
+
+      <div class="pagenav">
+        <a href="wire.html"><span class="dir">Previous</span>&larr; Wire format</a>
+        <a class="next" href="troubleshooting.html"><span class="dir">Next</span>Troubleshooting &rarr;</a>
+      </div>
+
+      <footer class="page-footer">
+        <span class="version-badge"></span>
+        <span>grant-crypto SDK &middot; ADR 1106 &middot; ships in-SDK, served at get.&lt;site&gt;/sdk/docs/</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,34 @@
+# mtls-proxy-proof — prove the mtls_proxy path for one sovereign PKI profile:
+# a synthetic card -> nginx mTLS (validate vs that profile's test CA, apply the
+# registry's identifier rule) -> Dex authproxy -> OIDC token with
+# preferred_username "<pki>:<identifier>". Kratos consumes that token through
+# ops/identity/claim-maps/sovereign-pki.jsonnet.
+#
+# Run: ./run.sh [<pki id>]   (needs docker + openssl + python3 with PyYAML)
+services:
+  dex:
+    image: ghcr.io/dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/dex.yaml"]
+    volumes:
+      - ./dex.yaml:/dex.yaml:ro
+    networks: [mtls]
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on: [dex]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./gen:/etc/nginx/gen:ro
+      - ./gen/pki.js:/etc/nginx/pki.js:ro
+      - ./gen/pki-profiles.js:/etc/nginx/pki-profiles.js:ro
+      - ./proxy.crt:/certs/proxy.crt:ro
+      - ./proxy.key:/certs/proxy.key:ro
+      - ../cac-test-pki/out/${PKI:-us-dod}/ca.crt:/certs/ca.crt:ro
+    ports:
+      - "8543:8443"
+    networks:
+      mtls:
+        aliases: [card-proxy]   # Dex issuer + server cert SAN use this name
+
+networks:
+  mtls: {}

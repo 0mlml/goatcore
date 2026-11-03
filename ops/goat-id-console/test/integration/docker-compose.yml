@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: kratos
+      POSTGRES_PASSWORD: kratos
+      POSTGRES_DB: kratos
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kratos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kratos-migrate:
+    image: oryd/kratos:v1.3.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["migrate", "sql", "-e", "--yes"]
+    environment:
+      DSN: postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity.schema.json:/etc/config/identity.schema.json:ro
+
+  kratos:
+    image: oryd/kratos:v1.3.1
+    depends_on:
+      kratos-migrate:
+        condition: service_completed_successfully
+    command: ["serve", "all", "--config", "/etc/config/kratos.yaml"]
+    environment:
+      DSN: postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity.schema.json:/etc/config/identity.schema.json:ro
+    ports:
+      - "127.0.0.1:4433:4433" # public
+      - "127.0.0.1:4434:4434" # admin
+    healthcheck:
+      test: ["CMD", "kratos", "health", "ready", "--endpoint", "http://127.0.0.1:4434"]
+      interval: 5s
+      timeout: 5s
+      retries: 12

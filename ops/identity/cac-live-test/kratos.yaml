@@ -1,0 +1,70 @@
+# Kratos for the full-chain CAC live test: it federates to the CAC front-end (Dex/#2 or
+# Keycloak/#3) as an upstream OIDC provider and mints a native goat identity via the
+# real eams-a claim-map. issuer_url + client_secret are env-overridden per mode.
+#
+# Hostnames: base_url is kratos-idp:4433 and the upstream is cac-idp:PORT — BOTH names
+# resolve to the same place from the browser (/etc/hosts -> 127.0.0.1 -> published) and
+# from inside docker (network aliases), so one config serves the browser run AND the
+# headless verify. Kratos trusts the front-end's self-signed server cert via SSL_CERT_FILE.
+version: v1.3.1
+serve:
+  public:
+    base_url: http://kratos-idp:4433/
+    cors:
+      enabled: true
+      allowed_origins: ["http://kratos-idp:4433", "http://kratos-idp:4455"]
+  admin:
+    base_url: http://kratos:4434/
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/config/identity-schema.json
+selfservice:
+  default_browser_return_url: http://localhost:9090/done
+  allowed_return_urls:
+    - http://localhost:9090/
+    - http://kratos-idp:4433/
+  flows:
+    registration:
+      enabled: true
+      ui_url: http://kratos-idp:4455/registration
+      after:
+        oidc:
+          hooks: []
+    login:
+      ui_url: http://kratos-idp:4455/login
+    error:
+      ui_url: http://kratos-idp:4455/error
+    settings:
+      ui_url: http://kratos-idp:4455/settings
+  methods:
+    password:
+      enabled: true
+    oidc:
+      enabled: true
+      config:
+        providers:
+          - id: cac
+            provider: generic
+            label: "CAC"
+            client_id: kratos
+            client_secret: ""   # -> SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_CLIENT_SECRET
+            issuer_url: ""       # -> SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_ISSUER_URL
+            mapper_url: file:///etc/config/eams-a.jsonnet
+            scope: ["openid", "email", "profile"]
+session:
+  lifespan: 24h
+secrets:
+  cookie: ["live-test-cookie-secret-000000000"]
+  cipher: ["live-test-cipher-secret-00000000"]
+hashers:
+  algorithm: bcrypt
+  bcrypt:
+    cost: 4
+courier:
+  smtp:
+    connection_uri: "smtps://localhost:1025/?disable_starttls=true"
+log:
+  level: info
+  format: text

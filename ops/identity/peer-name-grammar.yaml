@@ -1,0 +1,297 @@
+# ops/identity/peer-name-grammar.yaml — the NetBird peer-name grammar SoT.
+#
+# ONE machine source for the deterministic peer-name convention
+# (docs/design/peer-identity-resolution.md, Option B). A generator
+# (ops/identity/generate-peer-name.py) derives the Go and Rust
+# implementations from this file, one-way (SoT -> code, never parsed back);
+# ops/ci/check-peer-name-grammar-sync.sh fails the build when a generated
+# file drifts from what this SoT produces.
+#
+# WHY THIS FILE EXISTS. Under setup-key enrollment `peer.user_id` is empty by
+# NetBird design, so the peer NAME is the only link from a mesh peer to the
+# person or org that owns it. That makes the name a load-bearing join, and
+# several independent implementations across languages would have no fence
+# between them. The failure mode is silent: a matcher that drops the trailing
+# separator attributes an org-mate's peer to the wrong principal, and a matcher
+# that never fires reports an honest-looking zero.
+#
+# WHAT IS AND IS NOT SINGLE-SOURCED. The grammar values below (prefix,
+# separator, field order, optionality) and the conformance vectors are the
+# single source: they exist once, here, and every consumer is generated from
+# them. The per-language function BODIES live once each in the generator's
+# emitters — Go and Rust cannot share code — so cross-language agreement is
+# proven behaviourally by the vectors, which are generated into a table-driven
+# test in BOTH languages. A divergence therefore fails a test, not only a byte
+# compare.
+#
+# NOT AUTHORITATIVE FOR OWNERSHIP. A peer name is evidence about ownership, not
+# a record of it. The recorded linkage is `slots.identity_id`, stamped at
+# onboard. Every consumer that presents ownership must say which one it used.
+#
+# Evolution: additive-only. Changing `prefix`, `separator`, or the field ORDER
+# renames every peer in the fleet and breaks every revoke selector — MAJOR bump
+# + a migration, never a quiet edit.
+
+version: 1.1.0
+
+# The literal that opens every operator-onboarded peer name.
+prefix: "peer-"
+
+# The single character between fields. Also the terminator that anchors a keyed
+# match: a key matches only when followed by this, so `ada` never matches
+# `peer-adam-...` (the org-mate mis-attribution class).
+separator: "-"
+
+# Field order, in the order they appear after the prefix. `optional: true`
+# fields are absent (with their separator) when their value is empty.
+fields:
+  - name: handle
+    optional: false
+    meaning: >-
+      The principal's onboarding handle (`identity.handle` in the operator
+      manifest). Always present, always first — this is what makes the name a
+      person join.
+  - name: org_short_tag
+    optional: true
+    meaning: >-
+      The principal's org short-tag (`org.short_tag`, legacy `vendor.short_tag`,
+      ADR 1052). Present only for org-affiliated principals. SHARED across
+      org-mates, so it is never sufficient on its own to identify a person.
+  - name: site
+    optional: false
+    meaning: >-
+      The goatnet the peer enrolled into (`zagros`, `nova`, …). Scopes a
+      revoke selector to one goatnet.
+  - name: date
+    optional: false
+    meaning: The enrollment date, `YYYY-MM-DD`, local to the minting host.
+  - name: hostname
+    optional: true
+    meaning: >-
+      Appended by NetBird itself at enrollment, not by the minter — so it is
+      part of the names consumers PARSE but never of the name they MINT.
+
+# The human-readable form string, reproduced verbatim into every generated
+# file and into the operator-facing error text.
+form: "peer-<handle>[-<org_short_tag>]-<site>-<date>[-<hostname>]"
+
+# The rules generated into each language. `name` is the SoT name; the emitters
+# map it to each language's idiomatic spelling.
+rules:
+  - name: is_peer_name
+    doc: >-
+      True when a name follows the operator-onboarded convention at all. A false
+      answer means "no principal key is encoded in this name", which is an
+      untracked peer, NOT a peer that failed to match a known principal.
+  - name: rest
+    doc: >-
+      The keyed remainder — everything after the prefix. Absent when the name is
+      not a peer name at all, so a caller can never accidentally key off a
+      non-conforming name's leading characters.
+  - name: match_longest_key
+    doc: >-
+      The LONGEST candidate key the name is keyed by, or none. A key matches
+      only when the remainder starts with the key followed by the separator, so
+      `foo` never claims `peer-foobar-…`, and longest-wins so a key that is a
+      prefix of another cannot shadow it. This is the one matcher behind both
+      the handle-keyed (person) and prefix-keyed (org) joins. Its limit is
+      stated rather than papered over: the separator also occurs INSIDE handles
+      and tags, so `maintainer` does match `peer-maintainer-smith-…` whenever `maintainer-smith`
+      is not itself among the candidates. Pass the FULL candidate set and let
+      longest-wins disambiguate; for anything that acts on a principal, use
+      `belongs_to`, which anchors on the site too.
+  - name: mint
+    doc: >-
+      Compose the name an onboard assigns. The hostname field is deliberately
+      absent: NetBird appends it at enrollment. An `org_short_tag` EQUAL to the
+      handle is omitted: it carries no information, and on per-uuid goatnets the
+      tag is FORCED to equal the handle (it doubles as the Zenoh prefix), which
+      minted names like `peer-pat-sample-pat-sample-galaxy-2000-01-01`.
+      It is the same degenerate handle-as-org value
+      that `org_trait_short_tag` already corrects for the Ory trait; this closes
+      the second consumer.
+  - name: belongs_to
+    doc: >-
+      Does this peer belong to exactly this principal on this goatnet? Anchored
+      on the FULL keyed prefix (handle, then the optional org tag, then the
+      site), which is strictly narrower than `match_longest_key`: an org-mate
+      carrying the same shared tag mid-name is never attributed here. This is
+      the selector a revoke cut may use; the loose matcher is not. It accepts
+      BOTH the tagged and the untagged form when the tag equals the handle —
+      a MIGRATION REQUIREMENT, not leniency: peers minted before v1.1.0 still
+      carry the doubled segment, and a selector that accepted only the new
+      shape would silently skip them. Because this is what a revoke cut keys
+      on, "silently skip" means a credential that was supposed to be cut stays
+      live. The dual accept retires when no peer carries the doubled form.
+
+# Cross-language conformance vectors. Generated into a table-driven test in
+# every target language, so Go and Rust are proven to agree on behaviour rather
+# than assumed to. Each case names the invariant it pins.
+vectors:
+  is_peer_name:
+    - { name: "peer-maintainer-zagros-2026-06-10-mac", want: true, why: "the canonical form" }
+    - { name: "peer-", want: true, why: "prefix alone conforms; the remainder is simply empty" }
+    - { name: "thor-a", want: false, why: "an unmanaged peer carries no principal key" }
+    - { name: "Peer-maintainer-zagros-2026-06-10", want: false, why: "the prefix is case-sensitive" }
+    - { name: "", want: false, why: "empty is not a peer name" }
+
+  rest:
+    - { name: "peer-maintainer-zagros-2026-06-10-mac", want: "maintainer-zagros-2026-06-10-mac", why: "the keyed remainder" }
+    - { name: "peer-", want: "", why: "an empty remainder is present-but-empty, not absent" }
+    - { name: "thor-a", want: null, why: "absent for a non-conforming name" }
+
+  match_longest_key:
+    - name: "peer-aardwolf-nova-2026-05-21-laptop"
+      keys: ["aardwolf", "user52x"]
+      want: "aardwolf"
+      why: "the ordinary org-prefix join"
+    - name: "peer-foobar-nova-2026-05-21-host"
+      keys: ["foo", "foobar"]
+      want: "foobar"
+      why: "longest wins — `foo` must not shadow `foobar`"
+    - name: "peer-foobar-nova-2026-05-21-host"
+      keys: ["foo"]
+      want: null
+      why: "the separator anchor: `foo` does not match `foobar` at all"
+    - name: "peer-maintainer-smith-zagros-2026-06-10-mac"
+      keys: ["maintainer", "maintainer-smith"]
+      want: "maintainer-smith"
+      why: >-
+        the org-mate mis-attribution class (hit live 2026-07-14) — the separator
+        also occurs INSIDE a handle, so `maintainer-` does prefix `maintainer-smith-…`;
+        longest-wins over the full candidate set is what keeps `maintainer` from
+        claiming their peer
+    - name: "peer-maintainer-smith-zagros-2026-06-10-mac"
+      keys: ["maintainer"]
+      want: "maintainer"
+      why: >-
+        the stated limit of this matcher, pinned so nobody mistakes it for a cut
+        selector: with the true owner ABSENT from the candidate set, a shorter
+        handle does match. Anything that acts on a principal (a revoke cut) must
+        use `belongs_to`, which anchors on handle AND site instead.
+    - name: "peer-maintainer-zagros-2026-06-10-mac"
+      keys: ["", "maintainer"]
+      want: "maintainer"
+      why: "an empty key never matches, and never wins by being 'longest'"
+    - name: "thor-a"
+      keys: ["thor"]
+      want: null
+      why: "a non-conforming name is keyed by nothing, whatever it contains"
+    - name: "peer-maintainer-zagros-2026-06-10-mac"
+      keys: []
+      want: null
+      why: "no candidates, no match — never a fabricated one"
+
+  mint:
+    - handle: "maintainer"
+      org_short_tag: ""
+      site: "nova"
+      date: "2026-05-17"
+      want: "peer-maintainer-nova-2026-05-17"
+      why: "unaffiliated principal — the org segment is absent, not empty"
+    - handle: "maintainer"
+      org_short_tag: "acme-corp"
+      site: "nova"
+      date: "2026-05-17"
+      want: "peer-maintainer-acme-corp-nova-2026-05-17"
+      why: "org-affiliated principal"
+    - handle: "maintainer"
+      org_short_tag: "  acme  "
+      site: "zagros"
+      date: "2026-06-10"
+      want: "peer-maintainer-acme-zagros-2026-06-10"
+      why: "a manifest's stray whitespace never reaches the wire name"
+    - handle: "user371x"
+      org_short_tag: "user371x"
+      site: "zagros"
+      date: "2026-06-16"
+      want: "peer-user371x-zagros-2026-06-16"
+      why: >-
+        v1.1.0 — a tag EQUAL to the handle is omitted. This exact input minted
+        peer-user371x-user371x-zagros-2026-06-16 on ZAGROS; the tag
+        is forced to equal the handle on per-uuid goatnets and carries nothing.
+    - handle: "maintainer"
+      org_short_tag: "  maintainer  "
+      site: "zagros"
+      date: "2026-06-10"
+      want: "peer-maintainer-zagros-2026-06-10"
+      why: "the equality is tested AFTER trimming, or whitespace defeats the rule"
+
+  belongs_to:
+    - name: "peer-maintainer-zagros-2026-06-10-mac"
+      handle: "maintainer"
+      org_short_tag: ""
+      site: "zagros"
+      want: true
+      why: "untagged form"
+    - name: "peer-maintainer-acme-zagros-2026-06-10-mac"
+      handle: "maintainer"
+      org_short_tag: "acme"
+      site: "zagros"
+      want: true
+      why: "tagged form"
+    - name: "peer-maintainer-acme-zagros-2026-06-10-mac"
+      handle: "maintainer"
+      org_short_tag: ""
+      site: "zagros"
+      want: false
+      why: "a manifest with no tag must not claim the tagged peer"
+    - name: "peer-user371x-user371x-zagros-2026-06-16-JL-2.local"
+      handle: "user371x"
+      org_short_tag: "user371x"
+      site: "zagros"
+      want: true
+      why: >-
+        MIGRATION — a peer minted BEFORE v1.1.0 carries the doubled segment and
+        must still be claimed. This is the revoke selector: a miss here leaves a
+        credential live that was supposed to be cut.
+    - name: "peer-user371x-zagros-2026-06-16-JL-2.local"
+      handle: "user371x"
+      org_short_tag: "user371x"
+      site: "zagros"
+      want: true
+      why: "the same principal minted AFTER v1.1.0 — both forms, one selector"
+    - name: "peer-maintainer-smith-zagros-2026-06-10-mac"
+      handle: "maintainer"
+      org_short_tag: "maintainer"
+      site: "zagros"
+      want: false
+      why: >-
+        the dual accept must not widen: `maintainer`+tag `maintainer` never claims the
+        DIFFERENT principal `maintainer-smith`, whose name merely starts the same way
+    - name: "peer-maintainer-smith-zagros-2026-06-10-mac"
+      handle: "maintainer"
+      org_short_tag: ""
+      site: "zagros"
+      want: false
+      why: "the org-mate mis-attribution class, on the revoke selector"
+    - name: "peer-maintainer-zagros-2026-06-10-mac"
+      handle: "maintainer"
+      org_short_tag: ""
+      site: "nova"
+      want: false
+      why: "site-scoped: a revoke on one goatnet never cuts a peer on another"
+    - name: "peer-maintainer-acme-zagros-2026-06-10-mac"
+      handle: "maintainer"
+      org_short_tag: "beta"
+      site: "zagros"
+      want: false
+      why: "the wrong tag is not a match"
+
+# The Ansible onboard playbook templates the same grammar in Jinja and cannot
+# be generated into (it is the live onboarding path, owned elsewhere). The
+# fence asserts every peer-name construction there matches this field order —
+# so the playbook cannot drift from the SoT even though it is hand-written.
+ansible_assertions:
+  file: ops/ansible/operator-onboard.yml
+  # Each assertion: every peer-name expression of that shape must place the
+  # handle immediately after the prefix and the org-tag segment immediately
+  # after the handle. `min_sites` keeps the fence from passing vacuously if the
+  # playbook stops constructing peer names in that shape at all.
+  assertions:
+    - what: "Jinja-interpolated construction (mint + the R1.2 revoke selector prefix)"
+      regex: 'peer-\{\{ *manifest\.identity\.handle *\}\}\{\{ *_vendor_short_tag_segment'
+      min_sites: 5
+    - what: "concatenated construction (the R1.2 revoke `is match(...)` test)"
+      regex: "'\\^peer-' *\\+ *manifest\\.identity\\.handle *\\+ *_vendor_short_tag_segment"
+      min_sites: 1

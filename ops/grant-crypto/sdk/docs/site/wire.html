@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>grant-crypto SDK — Wire format</title>
+  <meta name="description" content="The normative, language-neutral wire format: suites, the Envelope / WrappedDEK / KeyBundle structures, AAD layouts, the signing transcript, and the conformance contract.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="index.html" class="wordmark">grant-crypto</a>
+      <span class="ver" aria-label="SDK version"></span>
+    </div>
+    <p class="brand-tag">Endpoint forward secrecy, by construction.</p>
+    <nav aria-label="Documentation">
+      <p class="nav-group">Start</p>
+      <a href="index.html">Overview</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="quickstart.html">Quickstart</a>
+      <p class="nav-group">Reference</p>
+      <a href="api.html">API</a>
+      <a href="capi.html">C ABI</a>
+      <a href="wire.html" aria-current="page">Wire format</a>
+      <p class="nav-group">Operate</p>
+      <a href="security.html">Security</a>
+      <a href="troubleshooting.html">Troubleshooting</a>
+    </nav>
+    <p class="theme-note">The normative copy is <code>ops/grant-crypto/WIRE-FORMAT.md</code> in the source tarball. This page carries it faithfully.</p>
+  </aside>
+
+  <div class="content">
+    <main id="main">
+      <p class="eyebrow">Wire format</p>
+      <h1>What travels on the wire</h1>
+      <p class="lede">The normative, language-neutral description of the bytes that cross between implementations, so independent implementations interoperate and cannot silently drift. Every structure carries a <code>suite</code> identifier, bound into the AEAD additional-authenticated-data of the structure it labels &mdash; so a suite cannot be silently downgraded, and an implementation that does not recognise a suite fails closed rather than misparsing.</p>
+
+      <div class="note">
+        <span class="callout-label">Normative source</span>
+        <p><code>ops/grant-crypto/WIRE-FORMAT.md</code>, carried in the SDK source tarball, is the normative copy of this specification. This page reproduces it faithfully; where they differ, that file is canonical.</p>
+      </div>
+
+      <h2 id="suites">Suites (crypto-agility)</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Suite id</th><th>Status</th><th>Payload AEAD</th><th>DEK wrap</th></tr></thead>
+          <tbody>
+            <tr><td><code>v1-ecdh-p256</code></td><td><strong>implemented</strong></td><td>AES-256-GCM</td><td class="wrap">ephemeral-static ECDH P-256 &rarr; HKDF-SHA256 &rarr; AES-256-GCM</td></tr>
+            <tr><td><code>v2-x25519-mlkem768</code></td><td>provisional (Rust, inert)</td><td>AES-256-GCM</td><td class="wrap">hybrid X25519 + ML-KEM-768 &rarr; KDF &rarr; AES-256-GCM</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>An unknown or absent suite is a hard, fail-closed error (<code>UnsupportedSuite</code>) &mdash; distinct from a decryption failure, and returned before any key operation, so it leaks nothing about keys.</p>
+
+      <h3>v2 hybrid wrap (inert)</h3>
+      <p>The v2 DEK wrap runs <em>both</em> a classical X25519 ephemeral-static exchange and an ML-KEM-768 encapsulation, combining the two shared secrets so confidentiality holds if either KEM is unbroken (harvest-now-decrypt-later defence). The v2 wrapped entry carries <code>{ epk_x25519 (32B), mlkem_ct (1088B), nonce, wct }</code> and needs a hybrid recipient key (an X25519 point plus an ML-KEM encapsulation key) &mdash; a PKI extension over today&rsquo;s EC SVIDs. The combiner is <strong>X-Wing</strong> (<code>draft-connolly-cfrg-xwing-kem</code>, external review 2026-07-29):</p>
+      <figure class="codeblock">
+        <figcaption>v2 KEK derivation (X-Wing) — inert, round-trip-tested only</figcaption>
+        <pre><code>xwing_ss = SHA3-256(label ‖ ss_M ‖ ss_X ‖ ct_X ‖ pk_X)   <span class="cmt"># label = the 6 bytes \.//^\</span>
+KEK      = HKDF-SHA256(xwing_ss, info = "grant-crypto/dek-wrap/v2")</code></pre>
+      </figure>
+      <p>Implemented directly over <code>ml-kem</code> + <code>x25519-dalek</code> (the <code>x-wing</code> crate needs a rand_core version that conflicts with the AES-GCM/P-256 stack; the construction is byte-identical, with a later migration to the crate). It is inert and round-trip-tested only. See <a href="security.html#pqc">Security &rarr; FIPS + PQC</a> for the gates that would move it to live.</p>
+
+      <h2>Structures</h2>
+      <p>JSON; byte fields are base64-std. <code>len8</code> is an 8-byte big-endian length prefix; <code>be64</code> is 8-byte big-endian. Length-prefixing makes each concatenation unambiguous.</p>
+
+      <h3>Envelope &mdash; a sealed stream message</h3>
+      <figure class="codeblock">
+        <figcaption>Envelope</figcaption>
+        <pre><code>{ "suite": "v1-ecdh-p256", "rs": "&lt;release-set&gt;", "gen": &lt;uint64&gt;,
+  "nonce": &lt;12 bytes&gt;, "ct": &lt;AES-256-GCM ciphertext || 16-byte tag&gt; }</code></pre>
+      </figure>
+      <p>The additional-authenticated-data:</p>
+      <figure class="codeblock">
+        <figcaption>Envelope AAD</figcaption>
+        <pre><code>AAD = len8(suite)‖suite ‖ len8(rs)‖rs ‖ be64(gen) ‖ additional</code></pre>
+      </figure>
+      <p>where <code>additional</code> is the data topic (key expression) when the caller binds it, else empty. This is why a message sealed for one topic cannot be opened on another.</p>
+
+      <h3>WrappedDEK &mdash; the DEK sealed to one member</h3>
+      <figure class="codeblock">
+        <figcaption>WrappedDEK</figcaption>
+        <pre><code>{ "suite": "v1-ecdh-p256", "epk": &lt;ephemeral public point, uncompressed&gt;,
+  "nonce": &lt;12 bytes&gt;, "wct": &lt;AES-256-GCM(KEK) of the 32-byte DEK || tag&gt; }</code></pre>
+      </figure>
+      <figure class="codeblock">
+        <figcaption>WrappedDEK KEK + AAD</figcaption>
+        <pre><code>KEK = HKDF-SHA256(secret = ECDH(eph, recipient), salt = "",
+                  info = "grant-crypto/dek-wrap/v1", L = 32)
+AAD = len8(suite)‖suite ‖ epk ‖ recipientPublicPoint</code></pre>
+      </figure>
+      <p>The AAD binds the suite and <strong>both</strong> public keys, so a wrap cannot be re-presented for a different recipient or downgraded.</p>
+
+      <h3>KeyBundle &mdash; published on <code>keys/&lt;release-set&gt;/&lt;generation&gt;</code></h3>
+      <figure class="codeblock">
+        <figcaption>KeyBundle</figcaption>
+        <pre><code>{ "suite": "v1-ecdh-p256", "rs": "&lt;release-set&gt;", "gen": &lt;uint64&gt;,
+  "members": { "&lt;memberId&gt;": WrappedDEK, ... },
+  "signer": "&lt;key-service identity&gt;", "sig": &lt;signature&gt;,
+  "signer_svid": "&lt;key-service SVID, PEM&gt;"  <span class="cmt">// OPTIONAL; NOT in the transcript</span>
+}</code></pre>
+      </figure>
+      <p>Built fail-closed: any per-member wrap failure aborts the whole bundle (never a partial bundle).</p>
+
+      <h3>Bundle authentication</h3>
+      <p>The key service signs the bundle; a member MUST verify before trusting any wrapped key. For v1 the signature is <strong>ECDSA-P256 over SHA-256</strong> of the canonical transcript (a post-quantum suite moves this to ML-DSA):</p>
+      <figure class="codeblock">
+        <figcaption>Signing transcript (sig itself is excluded)</figcaption>
+        <pre><code>transcript =
+  len8("grant-crypto/bundle-sig/v1") ‖ "grant-crypto/bundle-sig/v1" ‖
+  len8(suite)‖suite ‖ len8(rs)‖rs ‖ be64(gen) ‖ len8(signer)‖signer ‖
+  be64(N) ‖  for each memberId in ascending order:
+             len8(id)‖id ‖ len8(wrap.suite)‖wrap.suite ‖
+             len8(wrap.epk)‖wrap.epk ‖ len8(wrap.nonce)‖wrap.nonce ‖ len8(wrap.wct)‖wrap.wct</code></pre>
+      </figure>
+      <p><code>signer</code> binds the claimed identity, so a signature cannot be moved to another signer; the verifier maps <code>signer</code> to a trusted public key. <code>signer_svid</code> is an OPTIONAL, self-describing carrier of that key: the key-service&rsquo;s own SVID (PEM), so a member can validate it against the SPIRE root and the expected key-service SPIFFE id and obtain the verifying key without a side channel &mdash; and an old cached bundle stays verifiable after the key-service rotates its identity. It is deliberately excluded from the transcript, so its presence or absence never changes <code>sig</code> or the conformance vectors; a member MAY instead be handed the verifying key out of band. Verification failure, an absent signature, or the wrong key is <code>BadSignature</code> &mdash; the member treats the bundle as untrusted and unwraps nothing.</p>
+
+      <h2 id="conformance">Conformance</h2>
+      <p>An implementation is conformant if, for a fixed suite and fixed key material, it (a) produces envelopes/wraps/bundles another implementation opens, and (b) opens those another implementation produced, with identical accept/reject decisions on the negative cases (wrong key, wrong generation, wrong release-set, wrong topic, tampered bytes, unknown suite, bad signature).</p>
+      <p>The canonical decrypt-direction test vectors live in the SDK at <code>envelope/testdata/vectors/</code> (committed fixed keys + produced artifacts + accept/reject cases). The <strong>consumer order</strong> every implementation must follow is <code>verify &rarr; slot &rarr; unwrap &rarr; open</code>:</p>
+      <ol>
+        <li>if a trust identity is supplied, verify the bundle signature &mdash; reject on failure;</li>
+        <li>find the member&rsquo;s slot &mdash; reject if absent (not in the audience);</li>
+        <li>unwrap the DEK with the member key &mdash; reject on failure;</li>
+        <li>open the envelope with the case key-expression &mdash; reject on failure.</li>
+      </ol>
+      <p>Both the Go reference and the Rust production reference validate against these vectors; the Rust read side is byte-compatible and passes all cases. No vector pins ECDSA <code>sig</code> bytes (signing is nondeterministic across backends); vectors verify signatures. The boundary of what conformance proves &mdash; read-interop versus the separately-gated write side &mdash; is on the <a href="security.html#conformance">Security page</a>.</p>
+
+      <div class="pagenav">
+        <a href="capi.html"><span class="dir">Previous</span>&larr; C ABI</a>
+        <a class="next" href="security.html"><span class="dir">Next</span>Security &rarr;</a>
+      </div>
+
+      <footer class="page-footer">
+        <span class="version-badge"></span>
+        <span>grant-crypto SDK &middot; ADR 1106 &middot; ships in-SDK, served at get.&lt;site&gt;/sdk/docs/</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

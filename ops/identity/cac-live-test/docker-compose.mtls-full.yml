@@ -1,0 +1,93 @@
+# Full-chain CAC live test — path #2: CAC -> nginx mTLS + EDIPI -> Dex -> Kratos ->
+# native goat identity (eams-a claim-map). Trusts the REAL DoD PKI (dod-ca.pem).
+# Names cac-idp (nginx) + kratos-idp (kratos) resolve on the docker net (aliases) and
+# from the host (/etc/hosts -> 127.0.0.1 -> published), so browser + headless both work.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: kratos, POSTGRES_PASSWORD: kratos, POSTGRES_DB: kratos }
+    networks: [cac]
+    healthcheck: { test: ["CMD-SHELL","pg_isready -U kratos"], interval: 3s, timeout: 3s, retries: 20 }
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/dex.yaml"]
+    volumes: [ "./dex-full.yaml:/dex.yaml:ro" ]
+    networks: [cac]
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on: [dex]
+    volumes:
+      - ./nginx-full.conf:/etc/nginx/nginx.conf:ro
+      - ./server.crt:/certs/proxy.crt:ro
+      - ./server.key:/certs/proxy.key:ro
+      - ./dod-ca.pem:/certs/ca.crt:ro
+    ports: [ "8543:8543" ]
+    networks:
+      cac:
+        aliases: [cac-idp]
+
+  kratos-migrate:
+    image: oryd/kratos:v1.3.1
+    depends_on: { postgres: { condition: service_healthy } }
+    environment: { DSN: "postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable" }
+    command: ["migrate","-c","/etc/config/kratos.yaml","sql","-e","--yes"]
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity-schema.json:/etc/config/identity-schema.json:ro
+      - ../claim-maps/eams-a.jsonnet:/etc/config/eams-a.jsonnet:ro
+    networks: [cac]
+
+  kratos:
+    image: oryd/kratos:v1.3.1
+    depends_on: { kratos-migrate: { condition: service_completed_successfully } }
+    environment:
+      DSN: "postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable"
+      SSL_CERT_FILE: /certs/cac-idp.crt   # trust the front-end self-signed server cert
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_ISSUER_URL: "https://cac-idp:8543"
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_CLIENT_SECRET: "kratos-secret"
+    command: ["serve","-c","/etc/config/kratos.yaml","--dev","--watch-courier"]
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity-schema.json:/etc/config/identity-schema.json:ro
+      - ../claim-maps/eams-a.jsonnet:/etc/config/eams-a.jsonnet:ro
+      - ./server.crt:/certs/cac-idp.crt:ro
+    ports: [ "4433:4433", "4434:4434" ]
+    networks:
+      cac:
+        aliases: [kratos-idp]
+
+  kratos-ui:
+    image: oryd/kratos-selfservice-ui-node:v1.3.1
+    depends_on: [kratos]
+    environment:
+      KRATOS_PUBLIC_URL: http://kratos-idp:4433/
+      KRATOS_BROWSER_URL: http://kratos-idp:4433/
+      PORT: "4455"
+      SECURITY_MODE: standalone
+      COOKIE_SECRET: livetestcookiesecret0123
+      CSRF_COOKIE_NAME: csrf_ui_live          # plain name (http localhost; __HOST- needs https)
+      CSRF_COOKIE_SECRET: livetestcsrfsecret0123
+    ports: [ "4455:4455" ]
+    networks:
+      cac:
+        aliases: [kratos-idp-ui]
+
+  # Landing/result page, containerized so the whole kit is ONE persistent `up -d`
+  # (no fragile host process, no teardown trap). Browser opens http://localhost:9090.
+  catcher:
+    image: python:3.12-alpine
+    depends_on: [kratos]
+    volumes: [ "./catcher.py:/catcher.py:ro" ]
+    environment:
+      CATCHER_MODE: kratos
+      KRATOS_PUBLIC: http://kratos-idp:4433   # browser-side link (resolves via /etc/hosts)
+      KRATOS_ADMIN: http://kratos:4434         # in-network admin read
+      CAC_ISSUER: http://kratos-idp:4433
+    command: ["python3", "/catcher.py"]
+    ports: [ "9090:9090" ]
+    networks: [cac]
+
+networks:
+  cac: {}

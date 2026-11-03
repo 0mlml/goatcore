@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__LEX_PRODUCT_NAME__ — __LEX_ORG_TITLE__ catalog</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script>
+    // Apply persisted theme before first paint to prevent theme-color flash.
+    // "system" mode resolves to light/dark via prefers-color-scheme so the
+    // data-theme attribute is ALWAYS set — this lets [data-theme="dark"]
+    // CSS selectors fire correctly in System mode too (without this, the
+    // attribute is absent in System and selectors miss).
+    (function () {
+      try {
+        var t = localStorage.getItem("portalTheme") || "system";
+        var resolved = t;
+        if (t === "system") {
+          resolved = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+        }
+        document.documentElement.setAttribute("data-theme", resolved);
+      } catch (e) {}
+    })();
+  </script>
+  <style>
+    /* Slots page — all page-scoped; shared tokens come from styles.css.
+       Layout: title line → sticky toolbar (search + chips + result line) →
+       left slot rail + cards. */
+    main { max-width: 1240px; }
+    .pagehead { display: flex; align-items: baseline; gap: 0.8rem; flex-wrap: wrap; margin: 0 0 0.6rem; }
+    .pagehead h2 { margin: 0; font-size: 1.25rem; }
+    .pagehead .sub { color: var(--muted); font-size: 0.9rem; }
+    .pagehead details { font-size: 0.85rem; color: var(--muted); }
+    .pagehead summary { cursor: pointer; color: var(--link); }
+    .pagehead details p { margin: 0.4rem 0 0; max-width: 62em; }
+    .mono { font-family: SF Mono, Menlo, Consolas, monospace; font-size: 0.86em; }
+    button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+
+    .sc-toolbar { position: sticky; top: 0; z-index: 15; background: var(--bg); padding: 0.4rem 0 0.6rem; border-bottom: 1px solid var(--border); margin-bottom: 0.8rem; }
+    .searchwrap { position: relative; max-width: 640px; }
+    .search { width: 100%; box-sizing: border-box; padding: 0.55rem 2.4rem 0.55rem 2.1rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-elev); color: var(--fg); font-size: 0.95rem; box-shadow: var(--shadow); }
+    .search:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    .searchwrap .ico { position: absolute; left: 0.7rem; top: 0.55rem; color: var(--muted); }
+    .searchwrap kbd { position: absolute; right: 0.6rem; top: 0.55rem; font: inherit; font-size: 0.72rem; color: var(--muted); border: 1px solid var(--border); border-radius: 3px; padding: 0 0.35rem; background: var(--bg); }
+    .suggest { position: absolute; left: 0; right: 0; top: 100%; margin-top: 4px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.12); max-height: 380px; overflow: auto; z-index: 30; display: none; }
+    .suggest.open { display: block; }
+    .suggest .grp { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 0.45rem 0.8rem 0.2rem; }
+    .suggest .it { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.35rem 0.8rem; cursor: pointer; font-size: 0.9rem; }
+    .suggest .it.sel { background: var(--accent-light); }
+    @media (hover: hover) { .suggest .it:hover { background: var(--accent-light); } }
+    .suggest .it .mono { color: var(--muted); }
+    .suggest .it .r { margin-left: auto; color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
+    .suggest .it.more { border-top: 1px solid var(--border); color: var(--muted); }
+    .suggest mark { background: none; color: var(--accent); font-weight: 600; }
+
+    .chips { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.55rem; align-items: center; }
+    .chip { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 999px; padding: 0.15rem 0.65rem; font-size: 0.82rem; color: var(--fg); display: inline-flex; gap: 0.35rem; align-items: center; }
+    .chip b { font-weight: 600; color: var(--muted); }
+    .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+    .chip[aria-pressed="true"] b { color: var(--on-accent); }
+    .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .chips .sep { width: 1px; height: 18px; background: var(--border); margin: 0 0.3rem; }
+    .result { margin-left: auto; font-size: 0.82rem; color: var(--muted); display: flex; gap: 0.7rem; align-items: center; }
+    .result button { color: var(--link); font-size: 0.82rem; }
+
+    .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 1.2rem; align-items: start; }
+    .rail { position: sticky; top: var(--toolbar-h, 7.5rem); max-height: calc(100vh - var(--toolbar-h, 7.5rem) - 1rem); overflow: auto; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; padding: 0.3rem; font-size: 0.86rem; }
+    .rail .ri { display: flex; flex-direction: column; padding: 0.35rem 0.6rem; border-radius: 4px; cursor: pointer; gap: 0.05rem; width: 100%; box-sizing: border-box; text-align: left; }
+    @media (hover: hover) { .rail .ri:hover { background: var(--accent-light); } }
+    .rail .ri.sel { background: var(--accent-light); box-shadow: inset 3px 0 0 var(--accent); }
+    .rail .ri .n { display: flex; justify-content: space-between; gap: 0.5rem; align-items: baseline; }
+    .rail .ri .n span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rail .ri .n span:last-child { color: var(--muted); font-size: 0.75rem; white-space: nowrap; }
+    .rail .ri .p { color: var(--muted); font-size: 0.75rem; display: flex; gap: 0.4rem; align-items: center; }
+    .rail .hd { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 0.5rem 0.6rem 0.2rem; }
+
+    .card-shell { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.8rem; box-shadow: var(--shadow); }
+    .card { background: var(--bg-elev); }
+    .card > summary { list-style: none; display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem 0.6rem; padding: 0.6rem 0.9rem; cursor: pointer; position: sticky; top: var(--toolbar-h, 7.5rem); background: var(--bg-elev); border-radius: 6px; z-index: 5; border-bottom: 1px solid transparent; }
+    .card[open] > summary { border-bottom-color: var(--border); border-radius: 6px 6px 0 0; }
+    .card > summary::-webkit-details-marker { display: none; }
+    .card .tw { color: var(--muted); font-size: 0.75rem; width: 0.8em; transition: transform 0.15s; }
+    .card[open] .tw { transform: rotate(90deg); }
+    .card .name { font-weight: 600; font-size: 1rem; }
+    .card .alias { color: var(--muted); font-size: 0.85rem; }
+    .badge { font-size: 0.66rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; padding: 0.08rem 0.45rem; border-radius: 999px; }
+    .badge.synthetic { background: var(--warn-bg); color: var(--warn-fg); }
+    .badge.pending { background: var(--code-bg); color: var(--muted); }
+    .prefix { display: inline-flex; align-items: center; gap: 0.3rem; background: var(--code-bg); border-radius: 4px; padding: 0.05rem 0.4rem; color: var(--muted); white-space: nowrap; }
+    .cp { color: var(--muted); font-size: 0.8rem; padding: 0 0.2rem; border-radius: 3px; opacity: 0.7; }
+    @media (hover: hover) { .cp:hover { opacity: 1; background: var(--accent-light); color: var(--accent); } }
+    .cp.done { color: var(--success-fg); opacity: 1; }
+    .card .meta { margin-left: auto; color: var(--muted); font-size: 0.82rem; display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .card .meta a { font-size: 0.82rem; }
+    .card .nothing { padding: 0.6rem 0.9rem; color: var(--muted); font-size: 0.88rem; }
+
+    .card table { width: 100%; border-collapse: collapse; }
+    .card th { text-align: left; color: var(--muted); font-weight: 600; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; padding: 0.4rem 0.9rem 0.3rem; border-bottom: 1px solid var(--border); }
+    .card td { padding: 0.42rem 0.9rem; border-bottom: 1px solid var(--border); vertical-align: middle; font-size: 0.9rem; }
+    .card tr:last-child td { border-bottom: 0; }
+    tr.t { cursor: pointer; }
+    tr.t:focus-within td { background: var(--accent-light); }
+    @media (hover: hover) { tr.t:hover td { background: var(--accent-light); } }
+    tr.t:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    td.k { max-width: 0; width: 48%; }
+    td.k .key { display: flex; align-items: center; gap: 0.3rem; white-space: nowrap; overflow: hidden; }
+    td.k .key .el { color: var(--muted); }
+    td.k .key .tail { overflow: hidden; text-overflow: ellipsis; }
+    td.k .key .cp { opacity: 0; }
+    tr:focus-within .cp { opacity: 0.8; }
+    @media (hover: hover) { tr:hover td.k .key .cp { opacity: 0.8; } }
+    td.k .d { color: var(--muted); font-size: 0.8rem; margin-top: 0.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .fmt { display: inline-block; background: var(--code-bg); border-radius: 6px; padding: 0.02rem 0.45rem; font-family: SF Mono, Menlo, Consolas, monospace; font-size: 0.76rem; }
+    .vp { display: inline-block; background: var(--accent-light); color: var(--accent); border-radius: 6px; padding: 0.02rem 0.45rem; font-family: SF Mono, Menlo, Consolas, monospace; font-size: 0.74rem; margin-right: 0.2rem; text-decoration: none; }
+    @media (hover: hover) { .vp:hover { text-decoration: underline; } }
+    .none { color: var(--muted); font-style: italic; font-size: 0.84rem; }
+    .seen { white-space: nowrap; font-size: 0.86rem; }
+    .dot { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.4rem; vertical-align: middle; border: 1.5px solid var(--muted); }
+    .dot.ok { background: var(--success-fg); border-color: var(--success-fg); }
+    .dot.am { background: #d98b00; border-color: #d98b00; }
+    .dot.old { background: var(--muted); }
+    td.f, td.s { white-space: nowrap; }
+    td.act { text-align: right; white-space: nowrap; }
+    .acts { display: inline-flex; gap: 0.15rem; opacity: 0.35; transition: opacity 0.1s; }
+    tr:focus-within .acts { opacity: 1; }
+    @media (hover: hover) { tr:hover .acts { opacity: 1; } }
+    .acts a, .acts .dis { color: var(--fg); text-decoration: none; font-size: 0.8rem; padding: 0.15rem 0.45rem; border-radius: 4px; border: 1px solid transparent; }
+    @media (hover: hover) { .acts a:hover { border-color: var(--border); background: var(--bg-elev); color: var(--accent); } }
+    .acts .dis { opacity: 0.4; }
+    .empty { padding: 2.2rem; text-align: center; color: var(--muted); background: var(--bg-elev); border: 1px dashed var(--border); border-radius: 6px; }
+    .empty button { color: var(--link); }
+    .toast { position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%); background: var(--tip-bg); color: var(--tip-fg); padding: 0.4rem 0.9rem; border-radius: 6px; font-size: 0.85rem; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 50; }
+    .toast.show { opacity: 1; }
+    @media (hover: none) { .acts, td.k .key .cp { opacity: 1; } }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } .rail { display: none; } .acts { opacity: 1; } }
+    @media (max-width: 700px) {
+      .search { font-size: 16px; }
+      .chips select { max-width: 100%; min-width: 0; }
+      .card > summary { position: static; }
+      .card table { min-width: 680px; }
+      .result { flex-wrap: wrap; }
+    }
+    .acts { opacity: 1; }
+    .acts .dis { opacity: 1; color: var(--muted); }
+    .card-tools { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.3rem 0.9rem; align-items: center; }
+    .card-tools a { display: inline-flex; min-height: 24px; align-items: center; }
+    .cp { min-width: 24px; min-height: 24px; opacity: 1; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>__LEX_ORG_TITLE__ catalog</h1>
+    <nav class="nav-grouped">
+      <a href="/" class="nav-link">Home</a>
+      <a href="/progress.html" class="nav-link">Progress</a>
+      <details class="nav-group">
+        <summary>Catalog</summary>
+        <div class="nav-menu">
+          <a href="/vendor.html" title="Every __LEX_ORG__ on this goatnet and every topic it publishes, with schema versions">Browse everything</a>
+          <a href="/topics.html" title="Declare a new topic under one __LEX_ORG__, or edit one you already declared">Register a topic</a>
+          <a href="/schema.html" title="Look up one schema by its topic key">Schema lookup</a>
+          <a href="/data-access.html">Data Access</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Inspect</summary>
+        <div class="nav-menu">
+          <a href="/inspector.html">Inspector</a>
+          <a href="__LEX_PANOSCOPE_URL__" target="_blank" rel="noopener">Panoscope &#x2197;</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Peering</summary>
+        <div class="nav-menu">
+          <a href="/peering/our-config.html">Our Config</a>
+          <a href="/peering/guide.html">Peering Guide</a>
+          <a href="/peering/best-practices.html">Best Practices</a>
+          <a href="/peering/zenohd-config.html">Router Config</a>
+          <a href="/peering/workbench.html">Workbench</a>
+          <a href="/peering/log-analyzer.html">Log Analyzer</a>
+          <a href="/peering/probe.html">Connectivity Probe</a>
+          <a href="/peering/echo.html">Echo Loopback</a>
+        </div>
+      </details>
+      <details class="nav-group operator-only hidden">
+        <summary>Admin</summary>
+        <div class="nav-menu">
+          <a href="/admin/onboard-invite.html">Sponsor a candidate</a>
+          <a href="/admin/onboard-sponsor-review.html">Sponsor review</a>
+          <a href="/admin/onboard-intake.html">Onboarding intake</a>
+          <a href="/admin/onboard-batch.html">Batch onboarding</a>
+          <a href="/admin/onboard-queue.html">Onboarding queue</a>
+          <a href="/admin/vendor-activity.html">__LEX_ORG_TITLE__ Activity</a>
+          <a href="/admin/trashgoat.html">trashgoat</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Reference</summary>
+        <div class="nav-menu">
+          <a href="/patterns.html">Patterns</a>
+          <a href="/docs.html">Docs</a>
+          <a href="/api-docs.html">API</a>
+        </div>
+      </details>
+    </nav>
+    <div id="theme-toggle" role="group" aria-label="Color theme">
+      <button type="button" data-mode="light" title="Use light theme" aria-pressed="false">Light</button>
+      <button type="button" data-mode="system" title="Use system theme" aria-pressed="false">System</button>
+      <button type="button" data-mode="dark" title="Use dark theme" aria-pressed="false">Dark</button>
+    </div>
+    <div id="who"></div>
+  </header>
+
+  <main>
+    <section id="auth-banner" class="warn hidden">
+      <p>Not authenticated — paste your portal API key on the home page.</p>
+    </section>
+
+    <div class="pagehead">
+      <h2>__LEX_ORGS_TITLE__</h2>
+      <span class="sub">Who publishes on this fabric, what topics they own, and where to inspect each one.</span>
+      <details>
+        <summary>How to read this page</summary>
+        <p>One card per <strong>__LEX_ORG__</strong> (a publisher identity; its 32-hex prefix is the write anchor).
+        Each row is a registered topic. Click a row to open live samples in the Inspector; use the row's quiet
+        buttons for the schema, a stethoscope diagnosis, or a flashlight tail. The dot in a card header shows the
+        most recent publish recorded under that __LEX_ORG__ by the fabric audit log (batched per minute, so up to
+        a minute behind): green under 5 min, amber under 24 h, grey older, hollow none recorded. The portal does
+        not track publish times per topic, so none is shown per row. Keyboard: while the topic list has focus, <kbd>/</kbd> search,
+        <kbd>↑</kbd><kbd>↓</kbd> pick, <kbd>Enter</kbd> open, <kbd>Esc</kbd> clear, <kbd>j</kbd>/<kbd>k</kbd> move between rows.</p>
+      </details>
+    </div>
+
+    <div class="sc-toolbar" id="toolbar">
+      <div class="searchwrap">
+        <span class="ico" aria-hidden="true">&#x2315;</span>
+        <input id="q" class="search" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Find a __LEX_ORG__ or topic — name, prefix, or key fragment"
+               aria-label="Find a __LEX_ORG__ or topic" role="combobox" aria-expanded="false"
+               aria-controls="suggest" aria-autocomplete="list">
+        <kbd aria-hidden="true">/</kbd>
+        <div id="suggest" class="suggest" role="listbox"></div>
+      </div>
+      <div class="chips" id="chips">
+        <button type="button" class="chip" data-f="kind" data-v="all" aria-pressed="false">All <b data-count="all"></b></button>
+        <button type="button" class="chip" data-f="kind" data-v="real" aria-pressed="false">Real <b data-count="real"></b></button>
+        <button type="button" class="chip" data-f="kind" data-v="synthetic" aria-pressed="false">Synthetic <b data-count="synthetic"></b></button>
+        <button type="button" class="chip" data-f="kind" data-v="pending" aria-pressed="false">Pending <b data-count="pending"></b></button>
+        <span class="sep" aria-hidden="true"></span>
+        <button type="button" class="chip" data-f="schema" aria-pressed="false" title="Only topics that have at least one registered schema version">Has schema</button>
+        <button type="button" class="chip" data-f="published" aria-pressed="false" title="__LEX_ORGS_TITLE__ whose most recent publish, as recorded by the fabric audit log, is under 24 hours old. Recorded in one-minute batches, so it can lag up to a minute.">Published &lt; 24 h</button>
+        <button type="button" class="chip" data-f="empty" aria-pressed="false" title="__LEX_ORGS_TITLE__ that are registered but have declared no topic">Nothing declared <b data-count="empty"></b></button>
+        <span class="sep" aria-hidden="true"></span>
+        <span id="fmtchips"></span>
+        <span class="result"><span id="result"></span><button type="button" id="share" title="Copy a link to this exact view">Share view</button></span>
+      </div>
+    </div>
+
+    <div class="layout">
+      <aside class="rail" id="rail" aria-label="__LEX_ORGS_TITLE__ in view"></aside>
+      <section id="cards" tabindex="0" aria-label="Catalog topics" style="background:none;border:0;padding:0;margin:0;box-shadow:none"></section>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </main>
+
+  <script src="/nav.js" defer></script>
+  <script src="/app.js" type="module"></script>
+  <script type="module" src="/vendor.js"></script>
+</body>
+</html>

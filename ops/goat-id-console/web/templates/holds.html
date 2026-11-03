@@ -1,0 +1,124 @@
+{{define "content"}}
+{{with .Holds}}
+{{if and .ReleaseOutcome (not .ReleaseQueued)}}<div class="banner {{.ReleaseClass}}" role="status" id="release-terminal">Hold release for {{.ReleasePeer}} finished at {{.ReleaseFinished}}: {{.ReleaseOutcome}}.</div>{{end}}
+<h1 class="page-title">Mesh holds — <code>{{if .Site}}{{.Site}}{{else}}goatnet unset{{end}}</code></h1>
+{{if .ReleaseQueued}}<div class="flash success" role="status">Release queued. The site runner will restore the exact recorded groups and record the verified outcome.</div>{{end}}
+
+<div class="caveat">
+  Dormancy holds are placed by the inactivity sweep. A clean dormancy row can be released here after preview and step-up authentication.
+  Security holds are containments placed by an admin and are released only through the sever/restore runbook, never one-click.
+</div>
+{{if eq .Authority.Mode "enforce"}}
+  <div class="banner warn" id="holds-authority">Membership is warrant-governed. Direct Release actions are disabled. <a href="{{.Authority.Procedure}}">Use the reviewed warrant declaration-removal procedure</a>.</div>
+{{else if eq .Authority.Mode "unknown"}}
+  <div class="banner error" id="holds-authority">Membership authority is unknown, so direct Release actions are disabled. {{.Authority.Detail}}</div>
+{{else if eq .Authority.Mode "report"}}
+  <div class="banner" id="holds-authority">Warrant membership is in report-only mode; live dormancy release remains available.</div>
+{{end}}
+{{if .GroupsError}}<div class="banner error">Group vocabulary unavailable, so Release actions are disabled — {{.GroupsError}}</div>{{end}}
+
+{{if not .RecordsAvailable}}
+  <div class="banner error" id="holds-banner-records">Hold records unavailable — {{.RecordsError}}. Rows below come from the mesh alone: a peer in a hold group with no readable record shows kind unknown.</div>
+{{end}}
+{{if not .MeshAvailable}}
+  <div class="banner error" id="holds-banner-mesh">Mesh unavailable — {{.MeshError}}. Rows below come from the hold records alone: kind, held since and prior groups, no live check, Inactive shown as “—”, and no row is attributed to a member (there is no live peer to own; the device name still carries the handle for the filter).</div>
+{{end}}
+{{if .KnownHandlesError}}
+  <div class="banner warn" id="holds-banner-roster">Handle roster unavailable — {{.KnownHandlesError}}; rows render unattributed until the roster reads in full, because a partial roster could credit a peer name to a handle that merely prefixes it.</div>
+{{end}}
+{{if $.Holds.DirectoryError}}
+  <div class="banner warn" id="holds-banner-directory">Identity directory unavailable — {{$.Holds.DirectoryError}}; handles render without a member link or organisation.</div>
+{{end}}
+{{if .RecordsSkipped}}
+  <p class="muted" id="holds-bad-lines">
+    <span class="status-badge warn">{{.RecordsSkipped}} bad hold-record line(s) skipped</span>
+    line(s) {{range $i, $n := .RecordsSkippedLines}}{{if $i}}, {{end}}{{$n}}{{end}} — validate-hold-records.py names them; a held peer whose line is bad reads as no record here.
+  </p>
+{{end}}
+
+<p class="holds-summary" id="holds-summary" role="group" aria-label="Quick filters">
+  <button type="button" class="holds-band active" data-band="all" aria-pressed="true">On hold <b>{{.Total}}</b></button>
+  <button type="button" class="holds-band" data-band="dormancy" aria-pressed="false">Dormancy <b>{{.Dormancy}}</b></button>
+  <button type="button" class="holds-band" data-band="security" aria-pressed="false">Security <b>{{.Security}}</b></button>
+  <button type="button" class="holds-band" data-band="attention" aria-pressed="false">Needs attention <b>{{.Attention}}</b></button>
+  {{if .Unknown}}<button type="button" class="holds-band" data-band="unknown" aria-pressed="false">Kind unknown <b>{{.Unknown}}</b></button>{{end}}
+</p>
+<p class="muted holds-legend" id="holds-legend">Dormancy and Security count the kind of hold; Needs attention counts the state. A peer can be both, so the counts overlap rather than add up.</p>
+
+<p>
+  <input type="text" id="holds-filter" placeholder="Filter by handle, org, or device name…"
+         autocomplete="off" style="width:22rem;max-width:100%">
+</p>
+
+<p class="muted holds-checked" id="holds-checked">
+  Checked at {{$.Holds.CheckedAtText}} ·
+  {{if .MeshAvailable}}{{.PeersChecked}} peer{{if ne .PeersChecked 1}}s{{end}} checked{{else}}mesh did not answer{{end}}
+  · snapshot, reload to re-read
+</p>
+
+{{if not .Rows}}
+  {{if and .RecordsAvailable .MeshAvailable}}
+    <p class="holds-empty" id="holds-empty">Nobody is on hold.</p>
+  {{else if or .RecordsAvailable .MeshAvailable}}
+    <p class="muted" id="holds-empty">No hold visible from the source that answered.</p>
+  {{else}}
+    <p class="muted" id="holds-empty">Neither source answered, so no hold can be listed.</p>
+  {{end}}
+{{else}}
+<table class="holds" id="holds-table">
+  <thead>
+    <tr>
+      <th>Member</th>
+      <th>Device</th>
+      <th>Kind</th>
+      <th>State</th>
+      <th class="sortable" data-sort="held" aria-sort="none"><button type="button">Held since</button></th>
+      <th class="sortable" data-sort="inactive" aria-sort="none"><button type="button">Inactive</button><small>days since last seen</small></th>
+      <th>Before the hold</th>
+      <th></th>
+    </tr>
+  </thead>
+  {{range .Rows}}
+  <tbody class="hold-row" data-band="{{.BandName}}" data-kind="{{.KindName}}" data-attention="{{if .Attention}}1{{else}}0{{end}}" data-filter="{{.FilterText}}" data-held="{{.EnteredAtUnix}}" data-inactive="{{.InactiveDays}}">
+    <tr>
+      <td>
+        {{if .MemberID}}
+          <a href="/users/{{.MemberID}}">{{.Handle}}</a>
+          {{if .OrgDisplayName}}<br><span class="muted">{{.OrgDisplayName}}</span>{{end}}
+          {{if .OrgShortTag}} <code class="muted">{{.OrgShortTag}}</code>{{end}}
+        {{else if .Handle}}
+          {{.Handle}}
+          <br><span class="muted">{{if $.Holds.DirectoryError}}directory unavailable, no link{{else}}{{.NoLoginReason}}{{end}}</span>
+        {{else}}
+          <span class="muted">not attributed to a member</span>
+        {{end}}
+      </td>
+      <td>{{.PeerName}}<br><code class="muted">{{.PeerID}}</code></td>
+      <td>{{template "hold_badges" (dict "Kind" .Kind "State" .State "Show" "kind")}}</td>
+      <td>{{template "hold_badges" (dict "Kind" .Kind "State" .State "Show" "state")}}</td>
+      <td>{{if .EnteredAtDate}}{{.EnteredAtDate}}<br><span class="muted">{{.DaysOnHold}} d</span>{{else}}<span class="muted">—</span>{{end}}</td>
+      {{/* "—" = the mesh did not answer, this record's peer is not on it,
+           or last_seen was unreadable (named beneath the dash). A live peer
+           with no last_seen at all says "never seen". */}}
+      <td>{{if .LastSeenUnreadable}}<span class="muted">—<br>last seen unreadable</span>{{else if .InactiveDays}}{{.InactiveDays}} d{{else if .Live}}<span class="muted">never seen</span>{{else}}<span class="muted">—</span>{{end}}</td>
+      <td class="groups-list">{{if .PriorGroups}}{{range .PriorGroups}}<span class="group {{.}}">{{.}}</span>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
+      <td class="hold-action">{{if .ReleaseURL}}<a class="btn primary" href="{{.ReleaseURL}}">Release hold</a>{{else if and (eq $.Holds.Authority.Mode "enforce") (eq .Kind "dormancy")}}<span class="muted">warrant-governed</span>{{end}}</td>
+    </tr>
+    {{if or .Reason .Actor .Detail}}
+    <tr class="hold-detail">
+      <td colspan="8" class="muted">
+        {{if .Reason}}Reason: {{.Reason}}{{end}}
+        {{if .Actor}}{{if .Reason}} · {{end}}Actor: {{.Actor}}{{end}}
+        {{if .Detail}}{{if or .Reason .Actor}} · {{end}}{{.Detail}}{{end}}
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+  {{end}}
+</table>
+<p id="holds-miss" class="muted" hidden>no held peer matches</p>
+{{end}}
+{{end}}
+
+<script src="/static/holds.js"></script>
+{{end}}

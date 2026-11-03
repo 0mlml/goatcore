@@ -1,0 +1,77 @@
+# Minimal standalone Kratos for the federation proof. Mirrors the real ory-role
+# oidc-broker block (kratos.yaml.j2) with ONE upstream_oidc provider pointing at the
+# local mock OIDC upstream + the _mock claim-map. NOT a production config (--dev).
+version: v1.3.1
+
+serve:
+  public:
+    # Use the in-network hostname so the OIDC redirect chain (driven by a curl
+    # container on the compose network) resolves consistently — kratos, mock-oidc,
+    # and the callback all speak container DNS. The host reaches the admin API via
+    # the mapped :4434 for assertions.
+    base_url: http://kratos:4433/
+    cors:
+      enabled: true
+      allowed_origins: ["http://kratos:4433"]
+  admin:
+    base_url: http://kratos:4434/
+
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/config/identity-schema.json
+
+selfservice:
+  default_browser_return_url: http://kratos:4433/
+  allowed_return_urls:
+    - http://kratos:4433/
+  flows:
+    login:
+      ui_url: http://kratos:4433/login
+    registration:
+      ui_url: http://kratos:4433/register
+      # oidc federation needs registration enabled to mint a first-seen federated user.
+      enabled: true
+    error:
+      ui_url: http://kratos:4433/error
+    settings:
+      ui_url: http://kratos:4433/settings
+
+  methods:
+    password:
+      enabled: true
+    # ---- the toggle-switch oidc broker (path #1, one provider) ----
+    oidc:
+      enabled: true
+      config:
+        providers:
+          - id: goatproof
+            provider: generic
+            label: "Mock CAC IdP"
+            client_id: goat-proof
+            client_secret: ""   # -> SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_CLIENT_SECRET
+            issuer_url: http://mock-oidc:8080/goatproof
+            mapper_url: file:///etc/config/claim-maps/_mock.jsonnet
+            scope: ["openid", "profile", "email"]
+
+session:
+  lifespan: 24h
+
+secrets:
+  cookie: ["proof-cookie-secret-0000000000000000"]
+  cipher: ["proof-cipher-secret-000000000000"]
+
+hashers:
+  algorithm: bcrypt
+  bcrypt:
+    cost: 4
+
+courier:
+  smtp:
+    connection_uri: "smtps://localhost:1025/?disable_starttls=true"
+
+log:
+  level: info
+  format: text
+  leak_sensitive_values: true

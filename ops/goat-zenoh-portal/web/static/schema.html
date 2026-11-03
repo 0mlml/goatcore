@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__LEX_PRODUCT_NAME__ — Schema viewer</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script>
+    // Apply persisted theme before first paint to prevent theme-color flash.
+    // "system" mode resolves to light/dark via prefers-color-scheme so the
+    // data-theme attribute is ALWAYS set — this lets [data-theme="dark"]
+    // CSS selectors fire correctly in System mode too (without this, the
+    // attribute is absent in System and selectors miss).
+    (function () {
+      try {
+        var t = localStorage.getItem("portalTheme") || "system";
+        var resolved = t;
+        if (t === "system") {
+          resolved = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+        }
+        document.documentElement.setAttribute("data-theme", resolved);
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="/highlight/github.min.css">
+  <style>
+    .schema-meta { background: var(--bg-elev); padding: 0.6rem 0.9rem; border: 1px solid var(--border); border-radius: 4px; margin: 0.8rem 0; }
+    .schema-meta dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.8rem; margin: 0; }
+    .schema-meta dt { color: var(--muted); font-size: 0.85rem; }
+    .schema-meta dd { margin: 0; font-family: SF Mono, Consolas, monospace; font-size: 0.85rem; word-break: break-all; }
+    .msg-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; margin: 0.9rem 0; padding: 0.6rem 0.9rem; }
+    .msg-card.primary { border-color: var(--accent); border-width: 2px; }
+    .msg-card h3 { margin: 0 0 0.4rem 0; font-family: SF Mono, Consolas, monospace; }
+    .msg-card .pkg { color: var(--muted); font-size: 0.85rem; margin-left: 0.5rem; }
+    .field-table { width: 100%; border-collapse: collapse; margin-top: 0.3rem; }
+    .field-table th, .field-table td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; vertical-align: top; }
+    .field-table th { color: var(--muted); font-weight: 600; }
+    .field-table td.num { font-family: SF Mono, Consolas, monospace; color: var(--muted); }
+    .field-table td.name { font-family: SF Mono, Consolas, monospace; font-weight: 600; }
+    .field-table td.type { font-family: SF Mono, Consolas, monospace; }
+    .type-ref { color: var(--accent); cursor: pointer; text-decoration: underline; }
+    .card-rule { color: var(--muted); font-size: 0.8rem; }
+    .pill { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 10px; background: var(--code-bg); font-size: 0.75rem; margin-left: 0.3rem; }
+    .pill.repeated { background: #ffeed8; color: #8a5a00; }
+    .pill.map { background: #d8efff; color: #1e3a8a; }
+    .pill.optional { background: #e6e6f0; color: #4b3a7b; }
+    .pill.oneof { background: #ffe2ec; color: #8a1d4a; }
+    [data-theme="dark"] .pill.repeated { background: #3a2c08; color: #f0d590; }
+    [data-theme="dark"] .pill.map { background: #11233d; color: #9ec5ff; }
+    [data-theme="dark"] .pill.optional { background: #2a213d; color: #c0b4e8; }
+    [data-theme="dark"] .pill.oneof { background: #3a1424; color: #ffaecb; }
+    .enum-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; margin: 0.9rem 0; padding: 0.6rem 0.9rem; }
+    .enum-card ul { margin: 0.3rem 0; padding-left: 1.2rem; font-family: SF Mono, Consolas, monospace; font-size: 0.9rem; }
+    .file-list { margin: 0; padding-left: 1.2rem; color: var(--muted); font-size: 0.85rem; }
+    .file-list code { background: transparent; }
+    .empty-hint { color: var(--muted); padding: 1rem; text-align: center; }
+    .controls { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+    .controls label { display: flex; gap: 0.3rem; align-items: center; font-size: 0.9rem; }
+    pre.code-block { background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.8rem 1rem; overflow-x: auto; margin: 0.6rem 0; font-size: 0.85rem; line-height: 1.45; }
+    pre.code-block code.hljs { padding: 0; background: transparent; }
+    textarea.ex-editor { width: 100%; min-height: 16rem; font-family: SF Mono, Consolas, monospace; font-size: 0.85rem; line-height: 1.45; padding: 0.6rem 0.8rem; background: var(--code-bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; resize: vertical; box-sizing: border-box; }
+    .ex-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.4rem; align-items: center; }
+    .ex-actions .spacer { flex: 1; }
+    .ex-actions .status { color: var(--muted); font-size: 0.85rem; }
+    .ex-actions button { padding: 0.3rem 0.8rem; border-radius: 3px; border: 1px solid var(--border); background: transparent; color: var(--fg); cursor: pointer; font-size: 0.85rem; font-family: inherit; }
+    .ex-actions button.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+    .ex-actions button.danger { color: #b91c1c; border-color: #f5c2c2; }
+    [data-theme="dark"] .ex-actions button.danger { color: #fca5a5; border-color: #5b1f1f; }
+    @media (hover: hover) { .ex-actions button:hover { opacity: 0.9; } }
+    .ex-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .src-section h2, .examples-section h2 { margin-top: 1.6rem; }
+    .src-file { font-family: SF Mono, Consolas, monospace; color: var(--muted); font-size: 0.8rem; margin: 0.3rem 0 0.1rem 0; }
+    .tab-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0 0.2rem 0; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+    .tab-btn { background: transparent; border: 1px solid var(--border); border-radius: 4px 4px 0 0; padding: 0.3rem 0.8rem; font-size: 0.85rem; cursor: pointer; }
+    .tab-btn.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .ex-meta { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.3rem 0; font-size: 0.85rem; }
+    .badge { display: inline-block; padding: 0.1rem 0.55rem; border-radius: 10px; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase; }
+    .badge.autogen { background: #fff3cd; color: #856404; }
+    .badge.vendor { background: #d4edda; color: #155724; }
+    [data-theme="dark"] .badge.autogen { background: #3a2c08; color: #f0d590; }
+    [data-theme="dark"] .badge.vendor { background: #0f2a1d; color: #6ee7b7; }
+    .disclaimer { background: #fff8e1; border: 1px solid #ffe082; border-left: 4px solid #ffb300; padding: 0.6rem 0.9rem; margin: 0.4rem 0 0.6rem 0; font-size: 0.85rem; border-radius: 2px; color: #5e4400; }
+    .disclaimer strong { color: #b76800; }
+    [data-theme="dark"] .disclaimer { background: #2b2008; border-color: #5a4612; border-left-color: #d4a72c; color: #f0d590; }
+    [data-theme="dark"] .disclaimer strong { color: #ffd884; }
+    .ex-copy-btn { background: transparent; color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 0.15rem 0.55rem; font-size: 0.75rem; cursor: pointer; }
+    @media (hover: hover) { .ex-copy-btn:hover { background: var(--accent-light); color: var(--accent); } }
+    @media (max-width: 700px) { .controls label { flex-wrap: wrap; min-width: 0; max-width: 100%; } .controls input { min-width: 0; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Schema viewer</h1>
+    <nav class="nav-grouped">
+      <a href="/" class="nav-link">Home</a>
+      <a href="/progress.html" class="nav-link">Progress</a>
+      <details class="nav-group">
+        <summary>Catalog</summary>
+        <div class="nav-menu">
+          <a href="/vendor.html" title="Every __LEX_ORG__ on this goatnet and every topic it publishes, with schema versions">Browse everything</a>
+          <a href="/topics.html" title="Declare a new topic under one __LEX_ORG__, or edit one you already declared">Register a topic</a>
+          <a href="/schema.html" title="Look up one schema by its topic key">Schema lookup</a>
+          <a href="/data-access.html">Data Access</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Inspect</summary>
+        <div class="nav-menu">
+          <a href="/inspector.html">Inspector</a>
+          <a href="__LEX_PANOSCOPE_URL__" target="_blank" rel="noopener">Panoscope &#x2197;</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Peering</summary>
+        <div class="nav-menu">
+          <a href="/peering/our-config.html">Our Config</a>
+          <a href="/peering/guide.html">Peering Guide</a>
+          <a href="/peering/best-practices.html">Best Practices</a>
+          <a href="/peering/zenohd-config.html">Router Config</a>
+          <a href="/peering/workbench.html">Workbench</a>
+          <a href="/peering/log-analyzer.html">Log Analyzer</a>
+          <a href="/peering/probe.html">Connectivity Probe</a>
+          <a href="/peering/echo.html">Echo Loopback</a>
+        </div>
+      </details>
+      <details class="nav-group operator-only hidden">
+        <summary>Admin</summary>
+        <div class="nav-menu">
+          <a href="/admin/onboard-invite.html">Sponsor a candidate</a>
+          <a href="/admin/onboard-sponsor-review.html">Sponsor review</a>
+          <a href="/admin/onboard-intake.html">Onboarding intake</a>
+          <a href="/admin/onboard-batch.html">Batch onboarding</a>
+          <a href="/admin/onboard-queue.html">Onboarding queue</a>
+          <a href="/admin/vendor-activity.html">__LEX_ORG_TITLE__ Activity</a>
+          <a href="/admin/trashgoat.html">trashgoat</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Reference</summary>
+        <div class="nav-menu">
+          <a href="/patterns.html">Patterns</a>
+          <a href="/docs.html">Docs</a>
+          <a href="/api-docs.html">API</a>
+        </div>
+      </details>
+    </nav>
+    <div id="theme-toggle" role="group" aria-label="Color theme">
+      <button type="button" data-mode="light" title="Use light theme" aria-pressed="false">Light</button>
+      <button type="button" data-mode="system" title="Use system theme" aria-pressed="false">System</button>
+      <button type="button" data-mode="dark" title="Use dark theme" aria-pressed="false">Dark</button>
+    </div>
+    <div id="who"></div>
+  </header>
+
+  <main>
+    <section id="auth-banner" class="warn hidden">
+      <p>Not authenticated — paste your portal API key on the home page.</p>
+    </section>
+
+    <section id="query">
+      <h2>Look up __LEX_ORG_TITLE__ data definitions</h2>
+      <p class="hint">
+        Renders the protobuf <code>FileDescriptorSet</code> __LEX_ORGS__ upload for their topics —
+        message fields, types, oneofs, enums, the works. Companion to the
+        <a href="/inspector.html">Inspector</a>, which decodes live payload bytes against the same schema.
+      </p>
+      <div class="controls">
+        <label>Topic key:
+          <input type="text" id="key-expr" placeholder="caracal/tracks-demo/entity/v1" style="width: 22rem; max-width: 100%;">
+        </label>
+        <label>Version:
+          <select id="version-select"><option value="">(latest)</option></select>
+        </label>
+        <button id="load-schema">Render</button>
+      </div>
+      <p id="error" class="hint warn hidden"></p>
+    </section>
+
+    <section id="meta" class="hidden">
+      <div class="schema-meta">
+        <dl>
+          <dt>Topic key</dt><dd id="m-key"></dd>
+          <dt>__LEX_ORG_TITLE__</dt><dd id="m-vendor"></dd>
+          <dt>Wire format</dt><dd id="m-format"></dd>
+          <dt>Schema version</dt><dd id="m-version"></dd>
+          <dt>Compatibility</dt><dd id="m-compat"></dd>
+          <dt>SHA-256</dt><dd id="m-sha"></dd>
+          <dt>Size</dt><dd id="m-size"></dd>
+          <dt>Uploaded</dt><dd id="m-uploaded"></dd>
+          <dt>Files</dt><dd><ul id="m-files" class="file-list"></ul></dd>
+        </dl>
+        <p style="margin-top: 0.5rem;">
+          <a id="m-download" href="#" download>Download schema</a>
+          &middot;
+          <a id="m-json" href="#">Open raw JSON</a>
+        </p>
+      </div>
+    </section>
+
+    <section id="messages-section" class="hidden">
+      <h2>Messages</h2>
+      <div id="messages"></div>
+    </section>
+
+    <section id="enums-section" class="hidden">
+      <h2>Enums</h2>
+      <div id="enums"></div>
+    </section>
+
+    <section id="source-section" class="src-section hidden">
+      <h2>.proto source</h2>
+      <p class="hint">Reconstructed from the uploaded <code>FileDescriptorSet</code>. Comments survive when the .fds was produced with <code>protoc --include_source_info</code>.</p>
+      <div id="source-blocks"></div>
+    </section>
+
+    <section id="examples-section" class="examples-section hidden">
+      <h2>Example code</h2>
+      <div class="disclaimer" id="autogen-disclaimer">
+        <strong>Notional, not validated.</strong> Examples flagged
+        <span class="badge autogen">Autogen</span>
+        are templated from the descriptor inside the portal — they
+        compile against the declared SDK versions but the portal does
+        not build or run them. Treat them as a copy-paste starting
+        point. When __LEX_ORGS__ upload their own example, it carries the
+        <span class="badge vendor">__LEX_ORG_TITLE__-provided</span>
+        badge instead.
+      </div>
+      <div class="tab-row" id="ex-tabs"></div>
+      <div id="ex-panels"></div>
+    </section>
+
+    <p id="empty-hint" class="empty-hint hidden">
+      No schema uploaded for this topic. Upload one from the
+      <a href="/topics.html">Register a topic</a> page.
+    </p>
+  </main>
+
+  <!-- defer: 125 KB of highlight.js plus six language packs blocked the parser
+       before the page could paint. Deferred classic scripts still execute in
+       document order ahead of the module scripts below, so window.hljs is in
+       place by the time schema.js highlights anything (and every use of it is
+       window.hljs-guarded regardless). -->
+  <script src="/highlight/highlight.min.js" defer></script>
+  <script src="/highlight/languages/javascript.min.js" defer></script>
+  <script src="/highlight/languages/typescript.min.js" defer></script>
+  <script src="/highlight/languages/rust.min.js" defer></script>
+  <script src="/highlight/languages/go.min.js" defer></script>
+  <script src="/highlight/languages/python.min.js" defer></script>
+  <script src="/highlight/languages/protobuf.min.js" defer></script>
+  <script src="/nav.js" defer></script>
+  <script src="/app.js" type="module"></script>
+  <script type="module" src="/schema.js"></script>
+</body>
+</html>

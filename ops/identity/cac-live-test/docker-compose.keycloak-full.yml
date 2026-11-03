@@ -1,0 +1,91 @@
+# Full-chain CAC live test — path #3: CAC -> Keycloak x509 -> Kratos -> native goat
+# identity (eams-a claim-map). Trusts the REAL DoD PKI (dod-ca.pem). Keycloak is cac-idp.
+# realm-full.rendered.json is written by run.sh with your EDIPI as the user.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: kratos, POSTGRES_PASSWORD: kratos, POSTGRES_DB: kratos }
+    networks: [cac]
+    healthcheck: { test: ["CMD-SHELL","pg_isready -U kratos"], interval: 3s, timeout: 3s, retries: 20 }
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev","--import-realm","--https-client-auth=request"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTPS_CERTIFICATE_FILE: /certs/server.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /certs/server.key
+      KC_HTTPS_PORT: "8843"
+      KC_TRUSTSTORE_PATHS: /certs/ca.pem
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: cac-idp
+    volumes:
+      - ./server.crt:/certs/server.crt:ro
+      - ./server.key:/certs/server.key:ro
+      - ./dod-ca.pem:/certs/ca.pem:ro
+      - ./realm-full.rendered.json:/opt/keycloak/data/import/realm.json:ro
+    ports: [ "8843:8843", "8480:8080" ]
+    networks:
+      cac:
+        aliases: [cac-idp]
+
+  kratos-migrate:
+    image: oryd/kratos:v1.3.1
+    depends_on: { postgres: { condition: service_healthy } }
+    environment: { DSN: "postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable" }
+    command: ["migrate","-c","/etc/config/kratos.yaml","sql","-e","--yes"]
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity-schema.json:/etc/config/identity-schema.json:ro
+      - ../claim-maps/eams-a.jsonnet:/etc/config/eams-a.jsonnet:ro
+    networks: [cac]
+
+  kratos:
+    image: oryd/kratos:v1.3.1
+    depends_on: { kratos-migrate: { condition: service_completed_successfully } }
+    environment:
+      DSN: "postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable"
+      SSL_CERT_FILE: /certs/cac-idp.crt
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_ISSUER_URL: "https://cac-idp:8843/realms/goat"
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_CLIENT_SECRET: "kratos-secret"
+    command: ["serve","-c","/etc/config/kratos.yaml","--dev","--watch-courier"]
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity-schema.json:/etc/config/identity-schema.json:ro
+      - ../claim-maps/eams-a.jsonnet:/etc/config/eams-a.jsonnet:ro
+      - ./server.crt:/certs/cac-idp.crt:ro
+    ports: [ "4433:4433", "4434:4434" ]
+    networks:
+      cac:
+        aliases: [kratos-idp]
+
+  kratos-ui:
+    image: oryd/kratos-selfservice-ui-node:v1.3.1
+    depends_on: [kratos]
+    environment:
+      KRATOS_PUBLIC_URL: http://kratos-idp:4433/
+      KRATOS_BROWSER_URL: http://kratos-idp:4433/
+      PORT: "4455"
+      SECURITY_MODE: standalone
+      COOKIE_SECRET: livetestcookiesecret0123
+      CSRF_COOKIE_NAME: csrf_ui_live
+      CSRF_COOKIE_SECRET: livetestcsrfsecret0123
+    ports: [ "4455:4455" ]
+    networks: [cac]
+
+  catcher:
+    image: python:3.12-alpine
+    depends_on: [kratos]
+    volumes: [ "./catcher.py:/catcher.py:ro" ]
+    environment:
+      CATCHER_MODE: kratos
+      KRATOS_PUBLIC: http://kratos-idp:4433
+      KRATOS_ADMIN: http://kratos:4434
+      CAC_ISSUER: http://kratos-idp:4433
+    command: ["python3", "/catcher.py"]
+    ports: [ "9090:9090" ]
+    networks: [cac]
+
+networks:
+  cac: {}

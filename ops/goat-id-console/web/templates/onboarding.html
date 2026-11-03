@@ -1,0 +1,769 @@
+{{define "content"}}
+
+<section class="card">
+<div class="row-split">
+  <h1 class="page-title">Onboarding Review</h1>
+  <div class="ob-find-bar">
+    {{/* Cross-stage find (#1306): filters the hidden index below in the
+         browser, the way the users list filters its table. The term lives in
+         the URL fragment (#q=), read and written by onboard-find.js only; the
+         server never sees it, so there is nothing to prefill here. */}}
+    <input id="candidate-filter" type="search" autocomplete="off" spellcheck="false"
+           placeholder="Find a candidate by email, name, handle or GitHub"
+           aria-label="Find a candidate across every stage" aria-controls="ob-find"
+           oninput="filterCandidates(this.value)">
+    <a class="btn primary" href="/onboarding/invite">+ Sponsor a Candidate</a>
+  </div>
+</div>
+<details class="how-to"><summary>How to Use</summary>
+<p>Each tab is a stage of bringing someone in. Pick a person on the left to see what they submitted and what needs deciding on the right. Buttons only appear when the decision is yours to make. Nothing is created until the final approval. {{if .InviteArchiveSweepEnabled}}Expired and revoked invites are kept as a record for {{.InviteArchiveWindow}}, then archived automatically. They are never deleted.{{else}}Expired and revoked invites are kept permanently as a record. They are never deleted.{{end}}</p>
+</details>
+{{if .SponsorMode}}
+<p class="ob-note">Your invitees only · candidate submits → you vouch → an admin approves &amp; provisions. You may sponsor up to <b>{{.SponsorMaxTier}}</b>.</p>
+{{else}}
+<p class="ob-note">Candidate submits → sponsor vouches → admin approves &amp; the runner provisions. Two human gates precede any mint.</p>
+{{end}}
+{{/* The runner band: rows the onboard-runner has left waiting past
+     the healthy pickup window, with what the runner has done since. Admin
+     sessions only (the handler sets it for nobody else). It names the
+     cause it can prove from the store and the fix for it, so an admin
+     never has to read the runner's log to learn that nothing is coming. */}}
+{{with .RunnerQueue}}
+<div class="banner warn ob-runner" role="alert">
+  <p><b>{{len .Rows}} {{if eq (len .Rows) 1}}row has{{else}}rows have{{end}} waited for the onboard-runner for up to {{.Oldest}}.</b> The runner last claimed any work <b>{{.LastClaim}}</b>.
+  {{if .Blind}}It was running and claimed other work after {{if .AllCuts}}{{if eq (len .Rows) 1}}this cut was{{else}}these cuts were{{end}}{{else}}{{if eq (len .Rows) 1}}this row was{{else}}these rows were{{end}}{{end}} queued, so it is not reading {{if .AllCuts}}the offboard queue{{else}}this queue{{end}}.
+  {{if .AllCuts}}A runner built before 2026-09-26 does not poll queued cuts: the cut never runs, and the person's email stays blocked for a fresh invite. <b>Fix:</b> deploy a current onboard-runner to this goatnet (the <code>onboard-runner</code> pin in <code>ops/pins/fleet-pins.yaml</code>, through the release ladder); the queued cuts then complete on their own. <b>To unblock one person before that:</b> cut their access from the CLI (<code>goat admin onboard &lt;handle&gt; --env &lt;goatnet&gt; --revoke</code>), then open the row below and use <b>Mark offboarded</b> with a note saying so.{{else}}On the management host, <code>docker logs onboard-runner</code> names each row it skips and why — usually a goatnet that does not match the runner's <code>--only-env</code>.{{end}}
+  {{else}}Nothing has been claimed since the oldest of these was queued, so the runner is either not running or not reading this queue. On the management host, <code>docker logs onboard-runner</code>: a stopped container, or a management-API preflight failure (logged as <i>NOT claiming</i>), keeps every row waiting; a runner that logs claims for other rows but none for these is a build that does not read this queue.{{end}}</p>
+  <ul>{{range .Rows}}<li><a href="/onboarding?status={{.Status}}&id={{.ID}}">{{.Handle}}</a> · {{.Env}} · {{.Stage}} · waiting {{.Waited}}</li>{{end}}</ul>
+</div>
+{{end}}
+
+<div class="ob-tabs">
+  {{range .OnboardStages}}
+    <a href="/onboarding?status={{.Key}}" data-stage="{{.Key}}"{{if eq .Key $.OnboardStatus}} aria-current="page"{{end}} class="{{if eq .Key $.OnboardStatus}}on{{end}}"{{if eq .Key "onboarding"}} title="Runner mint in progress · usually empty."{{end}}>{{.Label}}{{if .Count}}<span class="c">{{.Count}}</span>{{else}}<span class="c" hidden>0</span>{{end}}</a>
+  {{end}}
+  {{if .OperatorKeysTab}}
+    {{/* Cross-cutting queue, NOT a pipeline stage: the divider keeps the
+         candidate-journey story of the stage tabs true (#210). Admin
+         sessions only · the tab must not exist in sponsor markup. */}}
+    <span class="tabdiv" aria-hidden="true"></span>
+    <a href="/onboarding/operator-keys" aria-label="Operator keys · {{.OperatorKeysPending}} awaiting decision">Operator keys{{if .OperatorKeysPending}}<span class="c">{{.OperatorKeysPending}}</span>{{else}}<span class="c" hidden>0</span>{{end}}</a>
+  {{end}}
+</div>
+
+<div class="ob-wrap">
+  <div class="ob-list" id="ob-stage">
+    {{if eq .OnboardStatus "invited"}}
+      {{if not .OnboardInvites}}<div class="ob-empty">Nothing in this stage.</div>{{end}}
+      {{range .OnboardInvites}}
+        <a class="row {{if and $.OnboardInvite (eq .ID $.OnboardInvite.ID)}}sel{{end}}" href="/onboarding?status=invited&id={{.ID}}">
+          <div class="h">{{if .Note}}{{.Note}}{{else}}{{.ID}}{{end}}</div>
+          <div class="m">
+            <span>from {{.Sponsor}}</span>
+            <span>{{if .CandidateEmail}}to {{.CandidateEmail}}{{else}}not addressed{{end}}</span>
+            <span>{{.Env}}</span>
+            {{if eq .State "open"}}
+            <span class="ob-badge">expires {{.Expires}}</span>
+            {{else if eq .State "archived"}}
+            <span class="ob-badge pet">archived</span>
+            {{else if eq .State "expired"}}
+            <span class="ob-badge pet">expired {{.Expires}}{{if $.InviteArchiveSweepEnabled}}{{if .ArchivesDueNextSweep}} · archives within the hour{{else if .ArchivesIn}} · archives in {{.ArchivesIn}}{{end}}{{end}}</span>
+            {{else}}
+            <span class="ob-badge pet">revoked{{if .DeadAgo}} {{.DeadAgo}}{{end}}{{if $.InviteArchiveSweepEnabled}}{{if .ArchivesDueNextSweep}} · archives within the hour{{else if .ArchivesIn}} · archives in {{.ArchivesIn}}{{end}}{{end}}</span>
+            {{end}}
+            {{if .Escalated}}<span class="ob-badge esc">ESCALATED</span>{{end}}
+            {{if .MetadataError}}<span class="ob-badge pet">{{.MetadataError}}</span>{{end}}
+          </div>
+        </a>
+      {{end}}
+      {{/* Archived links are dead and stay dead — the token fails closed
+           exactly as it did before it was filed. Folded, because this is
+           the half of the list nobody is working on. Always rendered so the
+           destination is visible even before the first archive. */}}
+      {{/* Folded by default; unfolded when the selected invite lives in it,
+           so the highlighted row is never hidden behind its own summary. */}}
+      <details class="ob-archive"{{if and .OnboardInvite (eq .OnboardInvite.State "archived")}} open{{end}}>
+        {{if .InviteArchiveSweepEnabled}}
+        <summary>Archived ({{len .OnboardInvitesArchived}}) · revoked or expired invites move here automatically after {{.InviteArchiveWindow}}</summary>
+        {{else}}
+        <summary>Archived ({{len .OnboardInvitesArchived}}) · automatic archiving is disabled on this console</summary>
+        {{end}}
+        <p class="ob-note ob-archive-note">These are dead invite links, not people: a link here cannot be restored · to re-nominate, mint a fresh invite. A person whose key was never used is on the <a href="/onboarding?status=archived">Archived</a> stage tab instead, and can be restored from there.</p>
+        {{range .OnboardInvitesArchived}}
+          <a class="row {{if and $.OnboardInvite (eq .ID $.OnboardInvite.ID)}}sel{{end}}" href="/onboarding?status=invited&id={{.ID}}">
+            <div class="h">{{if .Note}}{{.Note}}{{else}}{{.ID}}{{end}}</div>
+            <div class="m">
+              <span>from {{.Sponsor}}</span>
+              <span>{{if .CandidateEmail}}to {{.CandidateEmail}}{{else}}not addressed{{end}}</span>
+              <span>{{.Env}}</span>
+              <span class="ob-badge pet">archived</span>
+              {{if .Escalated}}<span class="ob-badge esc">ESCALATED</span>{{end}}
+              {{if .MetadataError}}<span class="ob-badge pet">{{.MetadataError}}</span>{{end}}
+            </div>
+          </a>
+        {{end}}
+      </details>
+    {{else}}
+      {{if not .Proposals}}<div class="ob-empty">Nothing in this stage.</div>{{end}}
+      {{range .Proposals}}
+        <a class="row {{if and $.Proposal (eq .ID $.Proposal.ID)}}sel{{end}}" href="/onboarding?status={{$.OnboardStatus}}&id={{.ID}}">
+          <div class="h">{{.Handle}}</div>
+          <div class="m">
+            <span>{{.Email}}</span><span>{{.Env}}</span>
+            <span class="ob-age" data-created="{{.Created}}" data-decided="{{.DecidedAtUnix}}" data-queued="{{.OffboardRequestedAtUnix}}" data-status="{{.Status}}"></span>
+            {{if .Escalated}}<span class="ob-badge esc">ESCALATED</span>{{end}}
+            {{if and .Petitions (ne .Petitions "[]")}}<span class="ob-badge pet">change request</span>{{end}}
+            {{if .OrgUnregistered}}<span class="ob-badge pet">org not registered</span>{{end}}
+          </div>
+        </a>
+      {{end}}
+    {{end}}
+  </div>
+
+  {{/* The find index: every candidate this session may see, in every stage,
+       scoped server-side before a row exists. Rendered after the stage list so the
+       stage rows stay first in the document; hidden until the box holds a
+       term, when onboard-find.js swaps it in for the stage list. Rows carry only
+       what a hit needs to be recognised and opened. */}}
+  <div class="ob-list ob-find" id="ob-find" hidden>
+    {{range .OnboardFindRows}}
+      <a class="row" href="/onboarding?status={{.Stage}}&id={{.ID}}" data-filter="{{.Filter}}">
+        <div class="h">{{.Title}}</div>
+        <div class="m">
+          <span class="ob-badge stage">{{.StageLabel}}</span>
+          {{if .StateLabel}}<span class="ob-badge pet">{{.StateLabel}}</span>{{end}}
+          {{if .Email}}<span>{{.Email}}</span>{{end}}
+          {{if .Handle}}<span>{{.Handle}}</span>{{end}}
+          <span>from {{.Sponsor}}</span><span>{{.Env}}</span>{{if .ChangedOn}}<span>{{.ChangedOn}}</span>{{end}}
+        </div>
+      </a>
+    {{end}}
+    <div class="ob-empty ob-find-none" hidden>No candidate matches.</div>
+    <div class="ob-note ob-find-more" hidden>Showing the first 50 matches · narrow the search.</div>
+    {{if .OnboardFindTruncated}}<div class="ob-note">The index holds the {{len .OnboardFindRows}} most recently changed candidates · older rows are reachable from their stage tab.</div>{{end}}
+    {{if .OnboardFindPartial}}<div class="ob-note warn">Invites could not be read · this search covers proposals only.</div>{{end}}
+  </div>
+  <div class="ob-detail">
+    {{if .OnboardInvite}}
+      {{$i := .OnboardInvite}}
+      <h3>Invite {{$i.ID}}</h3>
+      <p class="ob-note">{{if eq $i.State "open"}}The candidate has this one-time link but has not submitted the nomination form yet{{else if eq $i.State "submitted"}}The candidate used this one-time link and submitted the nomination form · the link now fails closed{{else}}This link is {{$i.State}} and fails closed{{end}} · the link itself is never stored here.
+        {{if $i.Escalated}} <span class="ob-badge esc">ESCALATED</span>{{end}}</p>
+      {{if $i.MetadataError}}<p class="ob-note warn">{{$i.MetadataError}}. The pre-bound access fields cannot be read, so they are not shown and this link cannot be used to submit.</p>{{end}}
+
+      {{if or (eq $i.State "expired") (eq $i.State "revoked")}}
+        {{if $.InviteArchiveSweepEnabled}}
+        {{if and (eq $i.State "revoked") (eq $i.DeadAt "")}}
+        {{if $i.ArchivesDueNextSweep}}
+        <p class="ob-note">Nothing to do here. This link was revoked and can no longer be used. Its revocation time was not recorded, so it has stayed on this list for {{$.InviteArchiveWindow}} after the link's own expiry and moves to Archived automatically within the hour. Dead invites are kept, never deleted, so the audit trail stays complete. To re-nominate, mint a fresh invite.</p>
+        {{else}}
+        <p class="ob-note">Nothing to do here. This link was revoked and can no longer be used. Its revocation time was not recorded, so it stays on this list until {{$.InviteArchiveWindow}} after the link's own expiry{{if $i.ArchivesAtShort}}, then moves to Archived automatically on {{$i.ArchivesAtShort}}{{end}}. Dead invites are kept, never deleted, so the audit trail stays complete. To re-nominate, mint a fresh invite.</p>
+        {{end}}
+        {{else if $i.ArchivesDueNextSweep}}
+        <p class="ob-note">Nothing to do here. This link {{if eq $i.State "revoked"}}was revoked{{else}}expired{{end}}{{if $i.DeadAtShort}} on {{$i.DeadAtShort}}{{end}} and can no longer be used. It has stayed on this list for {{$.InviteArchiveWindow}} as a record and moves to Archived automatically within the hour. Dead invites are kept, never deleted, so the audit trail stays complete. To re-nominate, mint a fresh invite.</p>
+        {{else}}
+        <p class="ob-note">Nothing to do here. This link {{if eq $i.State "revoked"}}was revoked{{else}}expired{{end}}{{if $i.DeadAtShort}} on {{$i.DeadAtShort}}{{end}} and can no longer be used. It stays on this list for {{$.InviteArchiveWindow}} as a record{{if $i.ArchivesAtShort}}, then moves to Archived automatically on {{$i.ArchivesAtShort}}{{end}}. Dead invites are kept, never deleted, so the audit trail stays complete. To re-nominate, mint a fresh invite.</p>
+        {{end}}
+        {{else}}
+        <p class="ob-note">Nothing to do here. This link {{if eq $i.State "revoked"}}was revoked{{else}}expired{{end}}{{if $i.DeadAtShort}} on {{$i.DeadAtShort}}{{end}} and can no longer be used. It stays on this list permanently as a record. Dead invites are kept, never deleted, so the audit trail stays complete. To re-nominate, mint a fresh invite.</p>
+        {{end}}
+      {{end}}
+
+      <div class="ob-kv">
+        <div class="k">Sent to</div>
+        <div class="v">{{if $i.CandidateEmail}}<b>{{$i.CandidateEmail}}</b>{{else}}<span class="dim">no address recorded · the link was handed over out of band, or this invite predates recipient recording</span>{{end}}</div>
+
+        <div class="k">Delivery</div>
+        <div class="v">
+          {{if eq $i.SentVia "email"}}emailed by this console at <b>{{$i.Sent}}</b> ({{$i.SentAgo}}) · accepted for delivery, not proof it was read
+          {{else if eq $i.SentVia "eml"}}handed over as a downloaded .eml at <b>{{$i.Sent}}</b> ({{$i.SentAgo}}) · sent from the operator's own mail client, so this console never saw it leave
+          {{else}}<span class="dim">this console sent nothing · the sponsor copied the link</span>{{end}}
+        </div>
+
+        <div class="k">Minted by</div>
+        <div class="v">{{$i.Sponsor}} · goatnet <b>{{$i.Env}}</b></div>
+
+        <div class="k">Created</div>
+        <div class="v">{{$i.Created}} <span class="dim">({{$i.CreatedAgo}})</span></div>
+
+        <div class="k">Expires</div>
+        <div class="v">{{$i.ExpiresAt}} · <b>{{$i.Expires}}</b> <span class="dim">(lifetime {{$i.TTL}} from minting)</span></div>
+
+      {{if or (eq $i.State "expired") (eq $i.State "revoked") (eq $i.State "archived")}}
+        <div class="k">Archives</div>
+        <div class="v">
+          {{if eq $i.State "archived"}}
+            {{if $i.ArchivedAt}}archived {{$i.ArchivedAt}} · ({{$i.ArchivedAgo}}){{else}}archived{{end}}
+          {{else if or (eq $i.State "expired") (eq $i.State "revoked")}}
+              {{if $.InviteArchiveSweepEnabled}}
+              {{if $i.ArchivesAt}}
+                {{if $i.ArchivesDueNextSweep}}
+                  {{$i.ArchivesAt}} · overdue, moves to Archived within the hour <span class="dim">({{$.InviteArchiveWindow}} after {{if eq $i.State "revoked"}}{{if eq $i.DeadAt ""}}the link's own expiry — revocation time not recorded{{else}}revocation{{end}}{{else}}expiry{{end}}, automatic)</span>
+                {{else}}
+                  {{$i.ArchivesAt}} · in {{$i.ArchivesIn}} <span class="dim">({{$.InviteArchiveWindow}} after {{if eq $i.State "revoked"}}{{if eq $i.DeadAt ""}}the link's own expiry — revocation time not recorded{{else}}revocation{{end}}{{else}}expiry{{end}}, automatic)</span>
+                {{end}}
+              {{else}}
+                <span class="dim">automatic archiving is configured but this invite's archive time cannot be determined</span>
+              {{end}}
+            {{else}}
+              <span class="dim">never · automatic archiving is disabled on this console</span>
+            {{end}}
+          {{end}}
+        </div>
+      {{end}}
+
+        <div class="k">State</div>
+        <div class="v">{{if $i.Consumed}}submitted {{$i.Consumed}}{{if $i.ProposalID}} as <code>{{$i.ProposalID}}</code>{{end}}{{else}}{{$i.State}}{{end}}</div>
+
+        <div class="k">Note</div>
+        <div class="v">{{if $i.Note}}{{$i.Note}}{{else}}<span class="dim">none</span>{{end}}</div>
+      </div>
+
+      {{if not $i.MetadataError}}
+      <h4 class="ob-kv-head">Pre-bound fields</h4>
+      <p class="ob-note">What this link already fixes. The candidate fills only their own identity · they can never set these, and anything left to their choice below is a field they answer on the form.</p>
+      <div class="ob-kv">
+        <div class="k">Tier</div>
+        <div class="v">{{if $i.Tier}}<b>{{$i.Tier}}</b>{{else}}<span class="dim">enrollee's choice</span>{{end}}{{if $i.Escalated}} <span class="ob-badge esc">ESCALATED</span>{{end}}</div>
+
+        <div class="k">Affiliation</div>
+        <div class="v">{{if $i.Affiliation}}<b>{{$i.Affiliation}}</b>{{else}}<span class="dim">derived from sector and nation</span>{{end}}</div>
+
+        <div class="k">Sector</div>
+        <div class="v">{{if $i.Sector}}<b>{{$i.Sector}}</b>{{else}}<span class="dim">enrollee's choice</span>{{end}}</div>
+
+        <div class="k">Site</div>
+        <div class="v">{{if $i.Site}}<b>{{$i.Site}}</b>{{else}}<span class="dim">enrollee's choice</span>{{end}}</div>
+
+        <div class="k">Machine quota</div>
+        {{/* Every other blank row here reads "enrollee's choice"; this one too. Blank
+             does not apply a server default: it hands the number to the
+             candidate, and their number sets the device allowance on the key
+             they are issued. The default (netbird.usage_limit: 5) only survives
+             if the candidate ALSO leaves the field blank. A row that names a
+             default without naming its value invites the reader to supply one. */}}
+        <div class="v">{{if $i.MachineQuota}}<b>{{$i.MachineQuota}}</b> <span class="dim">· they may also enrol this many other machines as a custodian</span>{{else}}<span class="dim">enrollee's choice · they set their own device allowance on the form (5 if they leave it blank too). No custodian grant either way; grant one later with <code>goat machine grant</code>.</span>{{end}}</div>
+
+        <div class="k">Collab</div>
+        <div class="v"><b>{{if $i.Collab}}yes{{else}}no{{end}}</b> <span class="dim">· cloud collaboration account (Outline / filedrop / Zulip)</span></div>
+
+        <div class="k">Sponsor ceiling</div>
+        <div class="v">{{if $i.SponsorCap}}at most <b>{{$i.SponsorCap}}</b> <span class="dim">· server-set from the minter's sponsorship level</span>{{else}}<span class="dim">unrestricted · minted by an operator-equivalent sponsor</span>{{end}}</div>
+      </div>
+      {{end}}
+      {{if eq $i.State "open"}}
+        <div class="ob-actions">
+          <form method="post" action="/onboarding/invite/{{$i.ID}}/revoke" onsubmit="return confirm('Revoke this invite? The candidate link stops working immediately.')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><button class="bad" type="submit">Revoke invite</button></form>
+        </div>
+      {{else if eq $i.State "archived"}}
+        <p class="ob-note">No action available · an archived link already fails closed. Dead invites are kept, never deleted, so the audit trail stays complete. To re-nominate, mint a fresh invite.</p>
+      {{else if $i.Consumed}}
+        {{/* A submitted invite has no display state of its own (inviteToView
+             maps only open / expired / revoked / archived) and is not listed on
+             this tab, but the detail route loads any id, so a bookmarked or
+             pasted link still lands here. Say what happened instead of
+             rendering an empty actions area. */}}
+        <p class="ob-note">No action available · this link was used{{if $i.ProposalID}} and became proposal <code>{{$i.ProposalID}}</code>{{end}}. The candidate's submission is reviewed from the queue, not from here.</p>
+      {{else if and (ne $i.State "expired") (ne $i.State "revoked")}}
+        {{/* expired + revoked are explained by the lifecycle note above the
+             table and do not repeat it here; any other state still gets a
+             plain tail rather than an empty actions area. */}}
+        <p class="ob-note">No action available · this link already fails closed. To re-nominate, mint a fresh invite.</p>
+      {{end}}
+    {{else if .Proposal}}
+      <div id="idcard"></div>
+      {{$p := .Proposal}}
+      {{if $p.OrgResolved}}
+      <div class="ob-orgchain">
+        <span class="lbl">Organization</span>
+        {{range $i, $o := $p.OrgResolved}}{{if $i}}<span class="sep">→</span>{{end}}<span class="crumb{{if not $i}} self{{end}}"><code>{{$o.ID}}</code>{{if $o.DisplayName}} <span class="dn">{{$o.DisplayName}}</span>{{end}}</span>{{end}}
+        {{if eq (len $p.OrgResolved) 1}}<span class="dim">· root · no parent registered</span>{{end}}
+        <span class="ob-band exact">registered</span>
+      </div>
+      {{end}}
+      {{if $p.StandingConflict}}
+      <div class="ob-orgmatch">
+        <h3>Alliance standing: the manifest disagrees with the registry</h3>
+        <p class="ob-note">{{$p.StandingConflict}}</p>
+        <p class="ob-note">No action needed. Standing is worked out from the nation, so the registry value is the one in use.</p>
+      </div>
+      {{end}}
+      {{if $p.OrgTyped}}
+      <div class="ob-orgmatch">
+        <h3>Organization: {{if $p.OrgTypedName}}<b>{{$p.OrgTypedName}}</b> (<code>{{$p.OrgTyped}}</code>){{else}}<code>{{$p.OrgTyped}}</code>{{end}} {{if $p.OrgClaimed}}is claimed by the candidate{{else}}is not a registered org{{end}}</h3>
+        {{if $p.OrgClaimed}}
+        <p class="ob-note"><b>This organization is registered, and the candidate is the only one who says they belong to it.</b> Nobody bound them to it. Attach the proposal to confirm the membership; approval is refused until you do. If they do not belong there, correct the org on this card or reject the proposal.</p>
+        {{else if $p.OrgCandidates}}
+        <p class="ob-note"><b>A similar name is not the same organization.</b> Check the nation and parent before you attach.</p>
+        {{else}}
+        <p class="ob-note">Nothing matched. Fill in what you know, then select <b>Create as a new org</b>.</p>
+        {{end}}
+        {{if $p.OrgCandidates}}
+        <div class="ob-orggrid">
+          <div class="ob-orggrid-row head">
+            <span>Org id</span><span>Display name</span><span>Nation</span><span>Parent</span><span>Match</span><span></span>
+          </div>
+          {{range $c := $p.OrgCandidates}}
+          <form method="post" action="/onboarding/{{$p.ID}}/org-attach" class="ob-orggrid-row">
+            <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+            <input type="hidden" name="org" value="{{$c.ID}}">
+            <span class="cell"><code>{{$c.ID}}</code></span>
+            <span class="cell">{{if $c.DisplayName}}{{$c.DisplayName}}{{else}}<span class="dim">·</span>{{end}}</span>
+            <span class="cell">{{if $c.Nation}}{{$c.Nation}}{{else}}<span class="dim">·</span>{{end}}</span>
+            <span class="cell">{{if $c.Parent}}<code>{{$c.Parent}}</code>{{else}}<span class="dim">root</span>{{end}}</span>
+            <span class="cell"><span class="ob-band {{$c.Band}}">{{$c.Band}}</span>{{if $c.Demoted}} <span class="ob-band demoted">judged distinct</span>{{end}}</span>
+            <span class="cell act"><button type="submit" {{if $c.Demoted}}class="bad"{{end}}>Attach</button></span>
+          </form>
+          {{end}}
+        </div>
+        {{end}}
+        {{if not $p.OrgClaimed}}
+        <form method="post" action="/onboarding/{{$p.ID}}/org-new" class="ob-orgnew">
+          <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+          {{range $c := $p.OrgCandidates}}<input type="hidden" name="despite" value="{{$c.ID}}">{{end}}
+          <div class="ob-orgnew-fields">
+            {{/* ADR 1171. Asked FIRST because it decides what the Nation field
+                 below means: for a national org that is the owning sovereign,
+                 for a multinational one it is the body marker and the nations
+                 that staff it are contributors rather than owners. Nothing here
+                 is prefilled from the candidate's manifest — an org's facts are
+                 typed by the admin, which is the reversal ADR 1171 makes. */}}
+            <label>Composition
+              <span class="muted">One nation's, or a body of nations'.</span>
+              <select name="composition" id="org-composition">
+                <option value="" selected>— not declared —</option>
+                <option value="national">national — owned by one sovereign, whoever staffs it</option>
+                <option value="multinational">multinational — constituted by a body of nations (NATO, EU)</option>
+              </select>
+            </label>
+            <label>Sector
+              <span class="muted">Government, a company, or neither.</span>
+              <select name="sector" id="org-sector">
+                <option value="" selected>— not declared —</option>
+                <option value="state">state — government (armed forces, a ministry, police, a state lab)</option>
+                <option value="commercial">commercial — a company, including state-owned</option>
+                <option value="civil-society">civil-society — NGO, university, research, press</option>
+              </select>
+            </label>
+            <label id="org-gov-branch-label">Branch
+              <select name="gov_branch" id="org-gov-branch">
+                <option value="" selected>— none —</option>
+                <option value="military">military</option>
+                <option value="law-enforcement">law-enforcement — police, border, customs</option>
+                <option value="intelligence">intelligence</option>
+                <option value="civil">civil — another government agency</option>
+              </select>
+            </label>
+            <label>Nation — ISO 3166-1 alpha-3 or NATO / EU
+              <input type="text" name="nation" id="org-nation" value="{{$p.OrgNation}}" placeholder="e.g. XAA" spellcheck="false" autocomplete="off">
+              {{/* A reference, never a prefill: ADR 1171 Decision 6. The person's
+                   citizenship is not the organisation's nation. */}}
+              {{if $p.CandidateNationality}}
+              <span class="muted">Candidate nationality: <code>{{$p.CandidateNationality}}</code>. For reference only. Enter the nation of the organization.</span>
+              {{end}}
+            </label>
+            <div class="ob-derived" id="org-derived" hidden>
+              <div class="ob-derived-row">
+                <span class="ob-derived-k">Nation</span>
+                <span class="ob-derived-v" id="org-derived-nation">—</span>
+              </div>
+              <div class="ob-derived-row">
+                <span class="ob-derived-k">Alliance</span>
+                <span class="ob-derived-v" id="org-derived-standing">—</span>
+                <span class="muted" id="org-derived-standing-why"></span>
+              </div>
+              <div class="ob-derived-row">
+                <span class="ob-derived-k">Relationship</span>
+                <span class="ob-derived-v" id="org-derived-organic">—</span>
+                <span class="muted" id="org-derived-organic-why"></span>
+              </div>
+            </div>
+            <label>Display name (optional)
+              <input type="text" name="display_name" placeholder="e.g. Regional Data Office">
+            </label>
+            <label>Parent org id (optional, must already exist)
+              <span class="ob-parent-wrap">
+                <input type="text" name="parent" id="org-parent-input" placeholder="start typing to search the registry" autocomplete="off" spellcheck="false">
+                <div id="org-parent-menu" class="ob-suggest-menu" hidden></div>
+              </span>
+              <span id="org-parent-state" class="ob-parent-state"></span>
+            </label>
+          </div>
+          <button type="submit">Create as a new org{{if $p.OrgCandidates}} · it is genuinely distinct{{end}}</button>
+        </form>
+        {{end}}
+      </div>
+      {{if not $p.OrgClaimed}}
+      <script src="/static/affiliation-derive.js"></script>
+      <script>
+        // Branch applies ONLY to sector=state (ADR 1151), so it is HIDDEN
+        // otherwise rather than shown-and-user-451. The server drops a branch
+        // submitted under any other sector; a control you can set that is then
+        // silently discarded tells you that you declared something you did not.
+        (function () {
+          var sector = document.getElementById("org-sector");
+          var label = document.getElementById("org-gov-branch-label");
+          var branch = document.getElementById("org-gov-branch");
+          if (!sector || !label || !branch) return;
+          function sync() {
+            var isState = sector.value === "state";
+            label.hidden = !isState;
+            if (!isState) branch.value = "";
+          }
+          sector.addEventListener("change", sync);
+          sync();
+
+          // Live derivation. The operator types a nation; the two fields this
+          // console derives rather than stores are shown immediately, read-only.
+          // Advisory: the server recomputes them from the same functions at
+          // create time, so the panel cannot promise one answer and record
+          // another.
+          var nation = document.getElementById("org-nation");
+          var box = document.getElementById("org-derived");
+          if (!nation || !box) return;
+          var nationOut = document.getElementById("org-derived-nation");
+          var standing = document.getElementById("org-derived-standing");
+          var standingWhy = document.getElementById("org-derived-standing-why");
+          var organic = document.getElementById("org-derived-organic");
+          var organicWhy = document.getElementById("org-derived-organic-why");
+          initAffiliationDerive(nation, box, {
+            nation: nationOut, standing: standing, standingWhy: standingWhy,
+            organic: organic, organicWhy: organicWhy
+          }, sector);
+        })();
+      </script>
+      <script src="/static/org-suggest.js"></script>
+      <script>initOrgParentSuggest(
+        document.getElementById('org-parent-input'),
+        document.getElementById('org-parent-state'),
+        document.getElementById('org-parent-menu'));</script>
+      {{end}}
+      {{end}}
+      {{if $p.Editable}}
+      <div class="ob-fieldedit">
+        <h3>Correct a Field</h3>
+        <p class="ob-note">For what the candidate got <em>wrong</em>, not what you would prefer.
+          Nothing is minted yet. Leave a box untouched to leave it alone; every change is audited.</p>
+        <form method="post" action="/onboarding/{{$p.ID}}/fields" class="ob-fieldedit-form">
+          <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+          <div class="ob-fieldedit-fields">
+            <label>Organization · must already be registered
+              <span class="ob-parent-wrap">
+                <input type="text" name="affiliation.id" id="fe-org-{{$p.ID}}"
+                       value="{{$p.OrgID}}"
+                       placeholder="start typing to search the registry" autocomplete="off" spellcheck="false">
+                <div id="fe-org-menu-{{$p.ID}}" class="ob-suggest-menu" hidden></div>
+              </span>
+              <span id="fe-org-state-{{$p.ID}}" class="ob-parent-state"></span>
+              <span class="muted">Searches the registry. To add a new one, use the create action above.</span>
+            </label>
+            <label>Nation · ISO 3166-1 alpha-3, or NATO / EU
+              {{/* name and value stay ADJACENT: a test guards that exact pair,
+                   because an empty org/nation box 400s every later edit. */}}
+              <input type="text" name="affiliation.nation" value="{{$p.OrgNation}}"
+                     id="fe-nation-{{$p.ID}}" placeholder="e.g. XAA" spellcheck="false" autocomplete="off">
+              {{if $p.OrgNationFromOrg}}
+              {{/* The seed's origin rides along so Apply can tell an untouched
+                   seed from a typed nation, audit it as registry-sourced, and
+                   re-read it when the org above changes in the same Apply. */}}
+              <input type="hidden" name="affiliation.nation.seed" value="{{$p.OrgNationFromOrg}}">
+              <span class="muted">From the registered org <code>{{$p.OrgNationFromOrg}}</code>. Apply writes it to this proposal as a registry value; change the organization above and it follows the new org.</span>
+              {{end}}
+              {{if $p.OrgResolved}}{{with index $p.OrgResolved 0}}{{if .Nation}}{{if ne .Nation $p.OrgNation}}
+              <span class="muted">The registered org <code>{{.ID}}</code> says
+                <code>{{.Nation}}</code>. This box is the one that counts.</span>
+              {{end}}{{end}}{{end}}{{end}}
+            </label>
+            <div class="ob-derived" id="fe-derived-{{$p.ID}}" hidden>
+              <div class="ob-derived-row">
+                <span class="ob-derived-k">Nation</span>
+                <span class="ob-derived-v" id="fe-derived-nation-{{$p.ID}}">—</span>
+              </div>
+              <div class="ob-derived-row">
+                <span class="ob-derived-k">Alliance</span>
+                <span class="ob-derived-v" id="fe-derived-standing-{{$p.ID}}">—</span>
+                <span class="muted" id="fe-derived-standing-why-{{$p.ID}}"></span>
+              </div>
+              <div class="ob-derived-row">
+                <span class="ob-derived-k">Relationship</span>
+                <span class="ob-derived-v" id="fe-derived-organic-{{$p.ID}}">—</span>
+                <span class="muted" id="fe-derived-organic-why-{{$p.ID}}"></span>
+              </div>
+            </div>
+            <label>Organization display name
+              <input type="text" name="org.display_name" value="{{$p.OrgDisplayName}}" spellcheck="false">
+              <span class="muted">Display only. Shared by everyone at the same org.</span>
+            </label>
+            <label>GitHub username
+              <input type="text" name="identity.github" value="{{$p.GitHub}}"
+                     placeholder="e.g. github-login" spellcheck="false">
+              <span class="muted">Blank means repo grants skip this person entirely at provision.</span>
+            </label>
+          </div>
+          <button type="submit">Apply correction</button>
+        </form>
+      </div>
+      <script src="/static/affiliation-derive.js"></script>
+      <script>initAffiliationDerive(
+        document.getElementById('fe-nation-{{$p.ID}}'),
+        document.getElementById('fe-derived-{{$p.ID}}'),
+        {
+          nation:      document.getElementById('fe-derived-nation-{{$p.ID}}'),
+          standing:    document.getElementById('fe-derived-standing-{{$p.ID}}'),
+          standingWhy: document.getElementById('fe-derived-standing-why-{{$p.ID}}'),
+          organic:     document.getElementById('fe-derived-organic-{{$p.ID}}'),
+          organicWhy:  document.getElementById('fe-derived-organic-why-{{$p.ID}}')
+        });</script>
+      <script src="/static/org-suggest.js"></script>
+      <script>initOrgParentSuggest(
+        document.getElementById('fe-org-{{$p.ID}}'),
+        document.getElementById('fe-org-state-{{$p.ID}}'),
+        document.getElementById('fe-org-menu-{{$p.ID}}'));</script>
+      {{end}}
+
+      {{/* A person brought back from Archived (#1037) sits in these three
+           stages beside fresh approvals and looks identical without this. */}}
+      {{if and $p.RestoredAt (or (eq $p.Status "approved") (eq $p.Status "onboarding") (eq $p.Status "onboarded"))}}
+      <p class="ob-note ob-restored"><b>Restored</b> by {{$p.RestoredBy}} at {{$p.RestoredAt}} · this record came back from Archived; a fresh key is minted and the welcome package re-sent without repeating either approval.</p>
+      {{end}}
+
+      {{if eq $p.Status "proposed"}}
+        <h3>Sponsor Decision</h3>
+        <p class="ob-note">Vouch for this candidate to send them to the admin. Nothing is minted here.</p>
+        {{if and $p.OrgUnregistered $.SponsorMode}}<p class="ob-note">Organization not registered yet. An administrator will register it or match it to an existing one before approval.</p>{{end}}
+        <div class="ob-actions">
+          <form method="post" action="/onboarding/{{$p.ID}}/sponsor-approve"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><button class="ok" type="submit">Approve &amp; send to admin</button></form>
+          <form method="post" action="/onboarding/{{$p.ID}}/sponsor-reject" onsubmit="return confirm('Decline this candidate?')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><button class="bad" type="submit">Decline</button></form>
+        </div>
+      {{else if eq $p.Status "sponsor_approved"}}
+        {{if $.SponsorMode}}
+        <p class="ob-note">You vouched · this candidate is awaiting the admin decision.</p>
+        {{else}}
+        <h3>Admin Decision</h3>
+        <p class="ob-note">Approve to provision · the onboarding runner mints mesh + login + fabric access automatically (~30s).</p>
+        {{/* ADR 1171. Asked at the moment of decision, because this is the one
+             fact only the reviewer knows: how this person RELATES to the
+             organisation they are joining (not their nationality — two people of different
+             nations at the same organisation are both
+             `assigned`; what separates them is identity.nationality). Only a
+             governmental organisation has more than one answer: constituent
+             needs a multinational body, liaison is a coalition/interagency
+             shape. A commercial or civil-society organisation is in or out,
+             so the server records `assigned` and nothing is asked
+             (relationship_scope.go). */}}
+        <form method="post" action="/onboarding/{{$p.ID}}/approve" class="ob-relationship">
+          <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+          {{if $p.Relationship.Ask}}
+          <label>Membership relationship
+            <span class="muted">{{$p.Relationship.Why}}</span>
+            <select name="relationship">
+              <option value="" selected>— not declared —</option>
+              <option value="assigned">assigned — a full member working for the organisation; their nation is their own and does not transfer to it</option>
+              {{if $p.Relationship.ConstituentOK}}<option value="constituent">constituent — their nation is part of what the organisation IS (a member nation of a multinational body)</option>{{end}}
+              <option value="liaison">liaison — attached from outside, representing another organisation or nation; does NOT inherit this org's access</option>
+            </select>
+          </label>
+          {{else}}
+          <p class="ob-note">Membership relationship: <strong>{{$p.Relationship.Implied}}</strong> · {{$p.Relationship.Why}}</p>
+          {{end}}
+          {{if and $p.OrgUnregistered $.RequireRegisteredOrg}}
+          <p class="ob-note" id="ob-approve-why-{{$p.ID}}">Approve is unavailable until the organization above is registered or attached.</p>
+          <button class="ok" type="submit" disabled aria-disabled="true" aria-describedby="ob-approve-why-{{$p.ID}}">Approve &amp; provision</button>
+          {{else if $p.OrgClaimed}}
+          {{/* A claimed org (#1086) has no flag: requireAttachedOrg always
+               refuses it, so the button says so before the click. */}}
+          <p class="ob-note" id="ob-approve-why-{{$p.ID}}">Approve is unavailable until the organization above is attached.</p>
+          <button class="ok" type="submit" disabled aria-disabled="true" aria-describedby="ob-approve-why-{{$p.ID}}">Approve &amp; provision</button>
+          {{else}}
+          {{if $p.OrgUnregistered}}
+          <p class="ob-note warn" role="note">This organization is not registered. Approving now provisions the person under an unregistered organization; use the Organization panel above first.</p>
+          {{end}}
+          <button class="ok" type="submit">Approve &amp; provision</button>
+          {{end}}
+        </form>
+          <form method="post" action="/onboarding/{{$p.ID}}/reject" onsubmit="return confirm('Reject this candidate?')"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><button class="bad" type="submit">Reject</button></form>
+        </div>
+        {{end}}
+      {{else if eq $p.Status "failed"}}
+        <h3>Provisioning Failed · Retry the Mint</h3>
+        {{/* The runner's own error, rendered HERE. This block used to say "read
+             the failure note above" while $p.Note — which carries the entire
+             error string — was rendered nowhere on this panel. A failure panel that names
+             a note must show the note. */}}
+        {{if $p.Note}}<pre class="ob-failnote">{{$p.Note}}</pre>{{end}}
+        <p class="ob-note">Both gates already passed; the mint itself broke. Retry re-queues this candidate for the runner · it re-decides nothing. Read the failure above first: if the cause is still present (a missing token, an unreachable service, a goatnet the onboarder has no configuration for, a half-provisioned remnant) the retry will fail the same way.</p>
+        <div class="ob-actions">
+          <form method="post" action="/onboarding/{{$p.ID}}/retry"><input type="hidden" name="csrf" value="{{$.CSRFToken}}"><button class="ok" type="submit">Retry provisioning</button></form>
+        </div>
+      {{else if eq $p.Status "onboarded"}}
+        <h3>Onboarded · Hand Over the Welcome Package</h3>
+        {{template "devices_block" $p}}
+        <p class="ob-note">Provisioned{{if $p.DecidedBy}} · decided by {{$p.DecidedBy}}{{end}}. The welcome package is one complete, tier-correct hand-over: mesh join key, login link, CLI, surfaces, and publish path · use it when email delivery is unavailable.</p>
+        <div class="ob-actions">
+          <a class="btn primary" href="/onboarding/{{$p.ID}}/welcome">Download Welcome Package</a>
+          <form method="post" action="/onboarding/{{$p.ID}}/handset-key/reissue" onsubmit="if (!confirm('Reissue the handset key for {{$p.Handle}}? The runner revokes every current handset key (a phone or tablet still using one drops off the goatnet), mints a fresh OBSERVER-only key, and re-sends the welcome package with it. Laptops and their key are untouched.')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+            <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+            <button type="submit" aria-label="Reissue handset key for {{$p.Handle}}">Reissue handset key</button>
+          </form>
+        </div>
+        {{template "device_key_form" (dict "ID" $p.ID "Handle" $p.Handle "CSRFToken" $.CSRFToken)}}
+        {{if $p.GitHubPostMint}}{{template "github_form" (dict "ID" $p.ID "Handle" $p.Handle "GitHub" $p.GitHub "CSRFToken" $.CSRFToken)}}{{end}}
+        {{/* Its own block, NOT a member of .ob-actions: that row is a flex
+             container, and a multi-line form inside it stretches every
+             sibling to the form's height · which turned the welcome-package
+             link into a button the size of a card. */}}
+        {{template "offboard_form" (dict "ID" $p.ID "Handle" $p.Handle "Env" $p.Env "CSRFToken" $.CSRFToken "Required" false "ConfirmLead" "Mark this onboarding record offboarded? " "Button" "Mark offboarded")}}
+        {{template "offboard_cut_form" (dict "ID" $p.ID "Handle" $p.Handle "Env" $p.Env "CSRFToken" $.CSRFToken "ConfirmTail" "Reversible: a returning person is a re-onboard.")}}
+      {{else if eq $p.Status "enrolled"}}
+        <h3>Enrolled</h3>
+        {{template "devices_block" $p}}
+        <p class="ob-note">This person has enrolled at least once with the mesh credential minted for them. Offboard records their exit and frees the email for a future enrolment; it does not itself cut access.</p>
+        <p class="ob-note">Key expired or used up? Reissue a device key with the number of enrolments they need; devices already on the goatnet stay on. The welcome package is re-sent with the new key.</p>
+        <div class="ob-actions">
+          <form method="post" action="/onboarding/{{$p.ID}}/handset-key/reissue" onsubmit="if (!confirm('Reissue the handset key for {{$p.Handle}}? The runner revokes every current handset key (a phone or tablet still using one drops off the goatnet), mints a fresh OBSERVER-only key, and re-sends the welcome package with it. Laptops and their key are untouched.')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+            <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+            <button type="submit" aria-label="Reissue handset key for {{$p.Handle}}">Reissue handset key</button>
+          </form>
+        </div>
+        {{template "device_key_form" (dict "ID" $p.ID "Handle" $p.Handle "CSRFToken" $.CSRFToken)}}
+        {{if $p.GitHubPostMint}}{{template "github_form" (dict "ID" $p.ID "Handle" $p.Handle "GitHub" $p.GitHub "CSRFToken" $.CSRFToken)}}{{end}}
+        {{template "offboard_form" (dict "ID" $p.ID "Handle" $p.Handle "Env" $p.Env "CSRFToken" $.CSRFToken "Required" false "ConfirmLead" "Mark this onboarding record offboarded? " "Button" "Mark offboarded")}}
+        {{template "offboard_cut_form" (dict "ID" $p.ID "Handle" $p.Handle "Env" $p.Env "CSRFToken" $.CSRFToken "ConfirmTail" "Reversible: a returning person is a re-onboard.")}}
+      {{else if eq $p.Status "archived"}}
+        <h3>Archived · key never used</h3>
+        {{/* Two actions, reversible one first (#1037). Restore is the whole
+             point of archiving instead of deleting: the row kept both gate
+             approvals, so one click re-queues it for the runner, which mints
+             a FRESH key and re-sends the welcome package. The row leaves
+             this tab the moment it is restored; the redirect follows it to
+             Approved so the operator is not left watching a person vanish.
+             Sponsor sessions never see the button (the handler refuses them
+             too). The setup key value is never rendered here. */}}
+        {{if $p.RestoredAt}}
+        <p class="ob-note ob-restored"><b>Previously restored</b> by {{$p.RestoredBy}} at {{$p.RestoredAt}} · that key went unused too and the sweep archived this record again. Restoring now overwrites this mark.</p>
+        {{end}}
+        {{if not $.SponsorMode}}
+        <p class="ob-note">This person was sent credentials and never used them, so the dormancy sweep revoked the unused setup key. Sponsor, both approvals, tier and affiliation are all still on this record. Restore re-queues it without repeating either gate: a fresh key is minted and the welcome package is emailed again, automatically.</p>
+        <div class="ob-actions">
+          <form method="post" action="/onboarding/{{$p.ID}}/restore" onsubmit="if (!confirm('Restore {{$p.Handle}} and resend their key? The old setup key is dead. A fresh one will be minted on {{if $p.Env}}{{$p.Env}}{{else}}the recorded goatnet{{end}} and the welcome package emailed to {{$p.Email}}. No approval is repeated.')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+            <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+            <button class="primary" type="submit" aria-label="Restore {{$p.Handle}} and resend key">Restore and resend key</button>
+          </form>
+        </div>
+        {{else}}
+        <p class="ob-note">This person was sent credentials and never used them, so the dormancy sweep revoked the unused setup key. An administrator can restore this record without repeating either approval.</p>
+        {{end}}
+        <p class="ob-note">Offboarding an archived record is one-way and refuses until the person's access is actually cut. It closes the record for good and frees the email for a fresh invite.</p>
+        {{template "offboard_form" (dict "ID" $p.ID "Handle" $p.Handle "Env" $p.Env "CSRFToken" $.CSRFToken "Required" true "ConfirmLead" "Offboard this archived record for good? This is a one-way door: an offboarded record cannot be restored. To re-open this onboarding instead, cancel and restore it first. " "Button" "Mark offboarded")}}
+        {{template "offboard_cut_form" (dict "ID" $p.ID "Handle" $p.Handle "Env" $p.Env "CSRFToken" $.CSRFToken "ConfirmTail" "Access is reversible - a returning person is a re-onboard - but this record is not: it lands offboarded, and an offboarded record cannot be restored. To re-open this onboarding instead, cancel and restore it first.")}}
+      {{else if eq $p.Status "offboard-requested"}}
+        <h3>Cut Queued · Awaiting the Runner</h3>
+        <p class="ob-note">Queued{{if $p.OffboardRequestedBy}} by {{$p.OffboardRequestedBy}}{{end}}{{if $p.OffboardRequestedAt}} at {{$p.OffboardRequestedAt}}{{end}}. A healthy runner claims a queued cut within seconds: this row moves to Cutting while the reversible revoke runs, then Offboarded — or Cut failed with the reason. If it sits here, the runner for {{if $p.Env}}{{$p.Env}}{{else}}this goatnet{{end}} is not reading the offboard queue; the notice at the top of this page says whether that runner has claimed other work since, and what fixes it. The cut itself needs nothing from you.</p>
+        {{if not $.SponsorMode}}
+        <p class="ob-note">To unblock this person before the runner is fixed: cut the access by hand (<code>goat admin onboard {{$p.Handle}}{{if $p.Env}} --env {{$p.Env}}{{end}} --revoke</code>), then settle this record here. The note must say how the access was cut; the record is refused while the person's login is still active. The runner will not run this cut afterwards.</p>
+        {{template "offboard_form" (dict "ID" $p.ID "Handle" $p.Handle "Env" $p.Env "CSRFToken" $.CSRFToken "Required" true "ConfirmLead" "Settle this queued cut as done by hand? The runner will not run it afterwards. " "Button" "Mark offboarded")}}
+        {{end}}
+      {{else if eq $p.Status "offboarding"}}
+        <h3>Cutting Access · Revoke In Progress</h3>
+        <p class="ob-note">Claimed by the runner{{if $p.OffboardRequestedBy}} · queued by {{$p.OffboardRequestedBy}}{{end}}. The reversible revoke (mesh peer, login, slot, portal keys) is running; this row shows Offboarded when it lands, or Cut failed with the reason. A row stuck here means the runner died between claim and writeback: the revoke may or may not have landed, and no console action moves the row out. Check that goatnet's runner service, then settle it from the CLI with <code>goat admin onboard {{$p.Handle}}{{if $p.Env}} --env {{$p.Env}}{{end}} --revoke</code>, which is idempotent.</p>
+      {{else if eq $p.Status "offboard-failed"}}
+        <h3>Cut Failed · This Person Still Has Access</h3>
+        {{/* The runner's own error, rendered HERE — same contract as the
+             failed (mint) panel above: a failure panel that names a note
+             must show the note. */}}
+        {{if $p.Note}}<pre class="ob-failnote">{{$p.Note}}</pre>{{end}}
+        <p class="ob-note">The runner's revoke did not land{{if $p.OffboardRequestedBy}} · queued by {{$p.OffboardRequestedBy}}{{end}}{{if $p.OffboardRequestedAt}} at {{$p.OffboardRequestedAt}}{{end}}. Access is NOT cut. Read the failure above first: if the cause is still present (an unreachable management API, a half-provisioned remnant) the retry will fail the same way. Re-queue runs the same reversible revoke again.</p>
+        <form class="ob-offboard" method="post" action="/onboarding/{{$p.ID}}/offboard-cut" onsubmit="if (!confirm('Re-queue the cut for {{$p.Handle}}? The runner executes the reversible revoke (goat admin onboard {{$p.Handle}}{{if $p.Env}} --env {{$p.Env}}{{end}} --revoke) again.')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+          <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+          <button class="bad" type="submit" aria-label="Re-queue the cut for {{$p.Handle}}">Re-queue the cut</button>
+        </form>
+      {{else if eq $p.Status "offboarded"}}
+        <h3>Offboarded</h3>
+        {{if $p.OffboardRequestedBy}}
+        <p class="ob-note">Access cut by the runner · queued by {{$p.OffboardRequestedBy}}{{if $p.OffboardRequestedAt}} at {{$p.OffboardRequestedAt}}{{end}}. The reversible revoke removed the mesh peer, login, slot and portal keys. This record is kept for audit · sponsor, approver and tier are intact. A fresh invite for this email is now accepted; a returning person is a re-onboard.</p>
+        {{else}}
+        <p class="ob-note">Marked offboarded{{if $p.DecidedBy}} by {{$p.DecidedBy}}{{end}}{{if $p.DecidedAt}} at {{$p.DecidedAt}}{{end}}. This record is kept for audit · sponsor, approver and tier are intact. A fresh invite for this email is now accepted. Whether access is actually cut is a separate question, answered by the mesh, Ory and slot planes, not by this row.</p>
+        {{end}}
+      {{else}}
+        <p class="ob-note">Status: <b>{{$p.Status}}</b>{{if $p.DecidedBy}} · decided by {{$p.DecidedBy}}{{end}} · no action available.</p>
+      {{end}}
+      <script>window.GOAT_CONSOLE_ADMIN = "{{if $.SponsorMode}}false{{else}}true{{end}}" === "true";</script>
+      <script src="/static/identity-card.js"></script>
+      <script>renderIdentityCard(document.getElementById('idcard'), JSON.parse("{{if .ProposalJSON}}{{.ProposalJSON}}{{else}}null{{end}}"));</script>
+    {{else}}
+      <div class="ob-empty">Select a candidate to review their identity + requested authorities.</div>
+    {{end}}
+  </div>
+</div>
+</section>
+<script src="/static/onboard-queue.js"></script>
+<script src="/static/onboard-find.js"></script>
+{{end}}
+
+{{/* The Offboard form of the onboarded, enrolled and archived cards. One
+     block so the three cannot drift apart: the caller picks the confirm()
+     lead, the button text, and whether the note is required (archived only:
+     that transition is one-way, and the gate refuses a blank note). */}}
+{{define "github_form" -}}
+{{/* GitHub username after onboarding (github_retro.go). Saving re-runs the
+     repo-access grant, so a person who left it blank at intake is invited to
+     the repositories they missed. Own row, like device_key_form. */}}
+{{if not .GitHub}}<p class="ob-note warn"><b>No GitHub username on file.</b> This person has been added to none of the example or partner repositories their level includes. Add their username here, or they can add it themselves at <code>/github</code>; either re-runs the grant.</p>{{end}}
+<form class="ob-rekey" method="post" action="/onboarding/{{.ID}}/github">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <label for="github-{{.ID}}">GitHub</label>
+  <input id="github-{{.ID}}" type="text" name="github" value="{{.GitHub}}" placeholder="github-login" spellcheck="false">
+  <button type="submit" aria-label="Save GitHub username for {{.Handle}} and re-run repo grants">Save &amp; grant repos</button>
+</form>
+{{- end}}
+
+{{define "devices_block" -}}
+{{/* The person's mesh peers and each one's OS (#1586). A person whose only
+     peers are servers reads "enrolled" yet cannot open the mesh-only login
+     link from a workstation; say so here. Display only. */}}
+{{if .DevicesErr}}<p class="ob-note dim">Devices: {{.DevicesErr}}</p>
+{{else if .Devices}}
+<div class="ob-devices">
+  {{if .Devices.Peers}}
+  <p class="ob-note"><b>Devices on the mesh:</b></p>
+  <ul class="ob-device-list">
+    {{range .Devices.Peers}}<li><code>{{.Name}}</code> · {{if .OS}}{{.OS}}{{else}}<span class="dim">OS not reported</span>{{end}} · {{if .ControlOnly}}<b>control only — no tunnel</b>{{else if .Connected}}connected{{else}}offline{{end}}</li>{{end}}
+  </ul>
+  {{else}}<p class="ob-note dim">Devices on the mesh: none attributed to this handle.</p>{{end}}
+  {{if .Devices.ControlOnly}}<p class="ob-note warn" role="alert"><b>Connected to the control server only — the person's network blocks the mesh data ports.</b> The management host has never completed a tunnel with any of their devices, so nothing on the mesh, sign-in pages included, opens for them. Their network team must allow outbound TCP and UDP 33073 to the relays and UDP 3478; the network-team guide page lists the hosts.</p>{{end}}
+  {{if .Devices.ServerOnly}}<p class="ob-note warn" role="alert"><b>Only a server is enrolled — the person cannot open the login link yet.</b> The login link and /fabric-credential open only on a device connected to the mesh. Ask them to enroll the computer they browse from with the same setup key.</p>{{end}}
+</div>
+{{- end}}
+{{- end}}
+
+{{define "device_key_form" -}}
+{{/* A person whose device setup key expired or was used up gets a fresh one
+     here, with the reuse count the operator chooses. Own row for the same
+     reason as offboard_form: a label+input+button inside .ob-actions stretches
+     its siblings. */}}
+<form class="ob-rekey" method="post" action="/onboarding/{{.ID}}/device-key/reissue" onsubmit="if (!confirm('Reissue the device key for {{.Handle}}? The runner revokes any of their device keys still live, mints a fresh key with this many uses, and re-sends the welcome package with it. Devices already on the goatnet stay on.')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <label for="uses-{{.ID}}">Uses</label>
+  <input id="uses-{{.ID}}" type="number" name="uses" min="1" max="100" value="5" required>
+  <button type="submit" aria-label="Reissue device key for {{.Handle}}">Reissue device key</button>
+</form>
+{{- end}}
+
+{{define "offboard_form" -}}
+        <form class="ob-offboard" method="post" action="/onboarding/{{.ID}}/offboard" onsubmit="if (!confirm('{{.ConfirmLead}}This changes no access. It records that access was already cut elsewhere (goat admin onboard {{.Handle}}{{if .Env}} --env {{.Env}}{{end}} --revoke), and releases the email so a fresh invite is accepted.')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+          <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+          <label for="offboard-note-{{.ID}}">{{if .Required}}Note (required){{else}}Note (optional){{end}}</label>
+          <input id="offboard-note-{{.ID}}" type="text" name="note" placeholder="{{if .Required}}why this record is being closed for good{{else}}why access was cut{{end}}"{{if .Required}} required{{end}}>
+          <button class="bad" type="submit" aria-label="Mark {{.Handle}} offboarded">{{.Button}}</button>
+        </form>
+{{- end}}
+
+{{/* The "cut access now" form — the real, reversible revoke queued for the
+     runner. Rendered beside offboard_form on the same three cards, kept in
+     one block for the same anti-drift reason: they must not diverge. */}}
+{{define "offboard_cut_form" -}}
+        <form class="ob-offboard" method="post" action="/onboarding/{{.ID}}/offboard-cut" onsubmit="if (!confirm('Offboard {{.Handle}} and CUT their access? The runner executes the reversible revoke (goat admin onboard {{.Handle}}{{if .Env}} --env {{.Env}}{{end}} --revoke): mesh peer, login, slot and portal keys. {{.ConfirmTail}}')) return false; this.querySelector('button[type=submit]').disabled=true; return true;">
+          <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+          <button class="bad" type="submit" aria-label="Offboard {{.Handle}} and cut access">Offboard &mdash; cut access now</button>
+        </form>
+{{- end}}

@@ -1,0 +1,179 @@
+{{define "content"}}
+{{if .OperatorKeySelf}}
+
+<h1 class="page-title">Your operator key</h1>
+
+{{if .OperatorKeySecret}}
+
+<p>This is your operator key. <strong>It is shown once and cannot be shown again</strong> — copy it now.</p>
+<pre class="secret">{{.OperatorKeySecret}}</pre>
+<p>Keep it where you keep your other goat secrets (your gitignored
+<code>.envrc.local.d</code>, or a password manager). It is already live: the Portal accepts it within
+seconds of your approval, with no further step by you or anyone else.</p>
+<p class="muted">If you lose it, revoke it and request a new one. A key nobody holds is worse than no
+key — it still works, and nobody can tell you who is using it.</p>
+<p><a href="/operator-key">Back to your key</a></p>
+
+{{else}}
+
+<p>An operator key makes your Portal admin actions attributable to
+<code>{{.OperatorKeyHandle}}</code> instead of to a shared credential. It is not the <code>vp_</code>
+key ordinary members paste into the Portal, and it is not in your bundle or your welcome email.</p>
+
+<p>It is for admins. Approving one hands over the Portal's admin API and this console's machine
+API for every organisation, slot and person on the goatnet, so the console will not record a
+request from a login that holds no admin group.</p>
+<p>Requesting records the ask and <strong>grants nothing</strong>. An admin approves, and at that moment
+the key becomes live — there is no install step afterwards. You collect it here, once.</p>
+
+{{if .OperatorKeys}}
+<h2 class="section-title">Your request</h2>
+<table class="rows">
+  <thead><tr><th>State</th><th>Means</th><th>Fingerprint</th><th></th></tr></thead>
+  <tbody>
+  {{range .OperatorKeys}}
+  <tr>
+    <td><code>{{.Status}}</code></td>
+    <td>
+      {{if eq .Status "requested"}}Waiting on an admin. No access yet.
+      {{else if eq .Status "active"}}
+        {{if .Deliverable}}Approved and live. Collect it now — it is shown only once.
+        {{else}}Live, and already collected. This page cannot show it again.{{end}}
+      {{else if eq .Status "rejected"}}Declined. Ask an admin why before requesting again.
+      {{else if eq .Status "revoked"}}Revoked. The Portal no longer accepts it.
+      {{end}}
+    </td>
+    <td>{{if .Fingerprint}}<code>{{.Fingerprint}}</code>{{else}}—{{end}}</td>
+    <td>{{if .Deliverable}}<a href="/operator-key/collect/{{.ID}}">Show my key once</a>{{end}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{if not .OperatorKeys}}
+{{if not .OperatorKeyEligible}}
+<h2 class="section-title">This key is not for your access level</h2>
+<p class="warn">{{.OperatorKeyIneligMsg}}</p>
+{{else}}
+<h2 class="section-title">Request a key</h2>
+<form method="post" action="/operator-key" class="stacked">
+  <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+  <label for="reason">What do you need it for? The admin reading this decides on the person and the
+    work, not on the form being filled in.</label>
+  <input type="text" id="reason" name="reason" required placeholder="minting slots for the region C cohort">
+  <button type="submit">Request an operator key</button>
+</form>
+{{end}}
+{{end}}
+
+{{end}}
+
+{{else}}
+
+<p class="muted"><a href="/onboarding">&larr; Onboarding review</a></p>
+
+<h1 class="page-title">Operator keys</h1>
+
+<p>Each key attributes one person's Portal admin actions to their name. Approving <strong>is</strong> the
+grant: the key is written to the directory the Portal reads, and the Portal picks it up on its next
+reload. There is no installer step to follow — unlike an SSH key, approved here means live.</p>
+
+<p class="muted">You are deciding about the person and the work, not about the request being
+well-formed — and never about your own: a request is decided by a <strong>different</strong> admin.
+Revoking removes the file; the Portal stops accepting the key on its next reload.</p>
+
+<p class="muted">Looking for your <strong>own</strong> first operator key, not somebody else's request?
+This page is the decide queue — go to <a href="/operator-key">your operator key</a> instead.</p>
+
+{{if not .OperatorKeyDirPath}}
+<p class="warn"><strong>No key directory is configured on this goatnet.</strong> Requests are recorded
+here, but approving one would grant nothing — the Portal has nowhere to read it from. Set
+<code>OPERATOR_KEY_DIR</code> before working this queue.</p>
+{{end}}
+
+{{if .OperatorKeyStale}}
+<p class="warn"><strong>Revoked here, still granted by the Portal:</strong>
+{{range .OperatorKeyStale}}<code>{{.}}</code> {{end}}— the record says this access was taken away
+and it has not been. Reconcile with apply to remove the files.</p>
+{{end}}
+{{if .OperatorKeyUnmanaged}}
+<p class="muted"><strong>Not issued here:</strong> {{range .OperatorKeyUnmanaged}}<code>{{.}}</code>
+{{end}}— keys with no request behind them, typically written by a service's own deploy or issued
+before this queue existed. They are shown so nobody is surprised by them, and are never removed
+from here: this console does not own credentials it did not create.</p>
+{{end}}
+{{if .OperatorKeyUncollected}}
+<p class="warn"><strong>Live but never collected:</strong>
+{{range .OperatorKeyUncollected}}<code>{{.Handle}}</code> ({{.Age}}) {{end}}— these keys
+work. The Portal accepts them right now. The person they belong to has never been shown the
+secret, so from their side they have no credential and no reason to think one is waiting.
+Chase the recent ones; revoke the old ones, because a live key nobody holds still works and
+nobody can tell you who is using it.</p>
+{{end}}
+{{if .OperatorKeyMissing}}
+<p class="warn"><strong>Recorded as live but absent from the directory:</strong>
+{{range .OperatorKeyMissing}}<code>{{.}}</code> {{end}}— these people hold a key the Portal will
+refuse. Revoke and re-issue; the secret cannot be recovered.</p>
+{{end}}
+
+<p class="filters">
+  <a href="/onboarding/operator-keys?status=requested">requested</a> &middot;
+  <a href="/onboarding/operator-keys?status=active">active</a> &middot;
+  <a href="/onboarding/operator-keys?status=revoked">revoked</a> &middot;
+  <a href="/onboarding/operator-keys?status=all">all</a>
+</p>
+
+{{if .OperatorKeyRows}}
+<table class="rows">
+  <thead><tr><th>Handle</th><th>Admin groups</th><th>Goatnet</th><th>Reason</th><th>State</th><th>Fingerprint</th><th>Decided by</th><th>Actions</th></tr></thead>
+  <tbody>
+  {{range .OperatorKeyRows}}
+  <tr>
+    <td><code>{{.Handle}}</code></td>
+    <td>{{if .Tier}}<code>{{.Tier}}</code>{{else if eq .Status "requested"}}<span class="warn">none — not an admin</span>{{else}}—{{end}}</td>
+    <td>{{if .Env}}{{.Env}}{{else}}—{{end}}</td>
+    <td>{{if .Reason}}{{.Reason}}{{else}}<span class="muted">not stated</span>{{end}}</td>
+    <td><code>{{.Status}}</code></td>
+    <td>{{if .Fingerprint}}<code>{{.Fingerprint}}</code>{{else}}—{{end}}</td>
+    <td>{{if .DecidedBy}}{{.DecidedBy}}{{else}}—{{end}}</td>
+    <td>
+      {{if eq .Status "requested"}}
+      {{if .Own}}
+      {{/* Visible but not decidable. Both this and the branch below come from
+           Store.OperatorKeyDecisionCheck — the same call the decision handler
+           makes — so the page never offers a button the store refuses (#210). */}}
+      <span class="muted">Your request — another admin must decide.</span>
+      {{else if .Unverifiable}}
+      <span class="muted">Not decidable from this session — your login resolves to no handle and
+      this request records no email, so a two-person decision cannot be proven. Use
+      <code>goat admin operator-key</code>.</span>
+      {{else}}
+      <form method="post" action="/operator-keys/{{.ID}}/approve" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+        <button type="submit">Approve</button>
+      </form>
+      <form method="post" action="/operator-keys/{{.ID}}/reject" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+        <button type="submit">Reject</button>
+      </form>
+      {{end}}
+      {{else if eq .Status "active"}}
+      {{/* Revoke stays on own rows too: removing your own live key is
+           de-escalation, not a decision needing a second person. */}}
+      <form method="post" action="/operator-keys/{{.ID}}/revoke" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRFToken}}">
+        <button type="submit">Revoke</button>
+      </form>
+      {{end}}
+    </td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="muted">Nothing in this state.</p>
+{{end}}
+
+{{end}}
+{{end}}

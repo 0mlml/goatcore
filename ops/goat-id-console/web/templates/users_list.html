@@ -1,0 +1,93 @@
+{{define "content"}}
+<h1 class="page-title">Users — {{.IdP.Label}}</h1>
+
+<p>
+  <a href="/onboarding/invite" class="btn primary">Onboard someone (invite)</a>
+  <a href="/users/new?idp={{.IdP.Key}}" class="btn">+ New login only</a>
+  <a href="/invites?idp={{.IdP.Key}}" class="btn">Login invites</a>
+  <span class="muted">
+    {{len .Users}} {{if eq (len .Users) 1}}identity{{else}}identities{{end}}
+  </span>
+</p>
+<p class="muted">
+  Onboarding = mesh + credentials + login + welcome email, sent automatically on admin
+  approval. "New login only" and "Login invites" create a bare login for someone already
+  on the mesh — no mesh key, no credentials, no welcome email.
+</p>
+
+<p>
+  <input type="text" id="user-filter" placeholder="Filter by email, name, or ID…"
+         oninput="filterUsers(this.value)" autocomplete="off" style="width:22rem;max-width:100%">
+</p>
+{{/* A candidate has no login until the mint, so a miss here hands the term to
+     the onboarding page's cross-stage find (#1306). The term rides in the URL
+     fragment, never a query string, so it reaches no server log on the way.
+     Built with textContent and encodeURIComponent, never innerHTML: the term
+     is whatever was typed. */}}
+<p id="user-filter-miss" class="muted" hidden>
+  Not a login yet? <a id="user-filter-miss-link" href="/onboarding">Search onboarding for <span id="user-filter-miss-term"></span></a>
+</p>
+
+<table class="users">
+  <thead>
+    <tr>
+      <th>Email</th>
+      <th>Name</th>
+      <th>Org</th>
+      <th>Groups</th>
+      <th>MFA</th>
+      <th>Last session</th>
+      <th>State</th>
+      <th>Created</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .Users}}
+      <tr data-filter="{{.Email}} {{.Name}} {{.ID}}">
+        <td><a href="/users/{{.ID}}?idp={{$.IdP.Key}}">{{.Email}}</a></td>
+        <td>{{.Name}}</td>
+        <td>
+          {{if .OrgDisplayName}}{{.OrgDisplayName}}{{else}}<span class="muted">—</span>{{end}}
+          {{if .OrgShortTag}}<code class="muted">{{.OrgShortTag}}</code>{{end}}
+        </td>
+        <td class="groups-list">
+          {{range .Groups}}<span class="group {{.}}">{{.}}</span>{{end}}
+        </td>
+        <td>{{if .HasSecondFactor}}<span class="status-badge active">✓ 2FA</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>{{.LastSessionAt}}</td>
+        <td>{{.State}}</td>
+        <td>{{.CreatedAt}}</td>
+        <td><a href="/users/{{.ID}}?idp={{$.IdP.Key}}">→</a></td>
+      </tr>
+    {{end}}
+  </tbody>
+</table>
+
+<script>
+  // Pure client-side row filter — no network calls. Matches the space-joined
+  // email/name/id in each row's data-filter attribute, case-insensitively.
+  function filterUsers(q) {
+    var needle = q.trim().toLowerCase();
+    var rows = document.querySelectorAll('table.users tbody tr');
+    var shown = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var hay = (rows[i].getAttribute('data-filter') || '').toLowerCase();
+      var hit = (needle === '' || hay.indexOf(needle) !== -1);
+      rows[i].style.display = hit ? '' : 'none';
+      if (hit) shown++;
+    }
+    // Nothing matched a real term: point at onboarding, where a candidate who
+    // has not been minted yet lives (#1306). The find there needs two
+    // characters, so a one-character miss gets no link.
+    var miss = document.getElementById('user-filter-miss');
+    if (!miss) return;
+    var lost = needle.length >= 2 && shown === 0;
+    if (lost) {
+      document.getElementById('user-filter-miss-link').href = '/onboarding#q=' + encodeURIComponent(q.trim());
+      document.getElementById('user-filter-miss-term').textContent = q.trim();
+    }
+    miss.hidden = !lost;
+  }
+</script>
+{{end}}

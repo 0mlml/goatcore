@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>grant-crypto SDK — Troubleshooting</title>
+  <meta name="description" content="Library loading, checksum verification per platform, common errors mapped to causes, toolchain floors, the macOS dylib note, and where to get help.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="index.html" class="wordmark">grant-crypto</a>
+      <span class="ver" aria-label="SDK version"></span>
+    </div>
+    <p class="brand-tag">Endpoint forward secrecy, by construction.</p>
+    <nav aria-label="Documentation">
+      <p class="nav-group">Start</p>
+      <a href="index.html">Overview</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="quickstart.html">Quickstart</a>
+      <p class="nav-group">Reference</p>
+      <a href="api.html">API</a>
+      <a href="capi.html">C ABI</a>
+      <a href="wire.html">Wire format</a>
+      <p class="nav-group">Operate</p>
+      <a href="security.html">Security</a>
+      <a href="troubleshooting.html" aria-current="page">Troubleshooting</a>
+    </nav>
+    <p class="theme-note">Most first-run problems are the native library not being found, or an unverified checksum. Start there.</p>
+  </aside>
+
+  <div class="content">
+    <main id="main">
+      <p class="eyebrow">Troubleshooting</p>
+      <h1>When something doesn&rsquo;t work</h1>
+      <p class="lede">The two most common first-run problems are the native library not being found and a checksum that does not verify. After those, this page maps the error variants to their real causes and covers the toolchain floors and the macOS dylib note.</p>
+
+      <h2>Finding the native library</h2>
+      <p>The Go binding links the static library at build time; the Python and TypeScript bindings load the shared library at runtime, resolved from the <code>GRANT_CRYPTO_CAPI_LIB</code> environment variable. Its semantics differ slightly by binding:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Binding</th><th>How it locates the native</th></tr></thead>
+          <tbody>
+            <tr><td>Go</td><td class="wrap">cgo links <code>libgrant_crypto_capi.a</code> statically. The cgo directives default to <code>../../target/debug</code> relative to the package; a release build overrides the <code>LDFLAGS</code> search path to the shipped, checksum-pinned static library. On Linux the core also needs <code>-lm -ldl -lpthread</code> (wired in the directives); macOS needs nothing beyond libSystem.</td></tr>
+            <tr><td>Python</td><td class="wrap"><code>GRANT_CRYPTO_CAPI_LIB</code> may be the library <strong>file</strong> or the <strong>directory</strong> containing it. Resolution order: (1) that variable; (2) the Cargo dev build under <code>../../target/{debug,release}/</code>; (3) the platform library bundled next to the package. If none is found you get a clear <code>RuntimeError</code> naming every path tried and the build command.</td></tr>
+            <tr><td>TypeScript / Node</td><td class="wrap"><code>GRANT_CRYPTO_CAPI_LIB</code> is the full path to the shared library file; koffi loads it at runtime. Without it, a relative dev-path search finds a local <code>cargo build</code> output.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">
+        <span class="callout-label">Quick fix</span>
+        <p>Unpack a prebuilt <code>grant-crypto-capi-&lt;os&gt;-&lt;arch&gt;.tar.gz</code> and point at it: <code>export GRANT_CRYPTO_CAPI_LIB=/path/to/unpacked/dir</code> (Python) or <code>=/path/to/libgrant_crypto_capi.{so,dylib}</code> (TypeScript). For Go, set the cgo <code>LDFLAGS</code> search path to the unpacked directory that holds <code>libgrant_crypto_capi.a</code>.</p>
+      </div>
+
+      <h2>Verifying checksums</h2>
+      <p>Every artifact ships a sibling <code>.sha256</code>, and the release carries an aggregate <code>SHA256SUMS</code>. Verify before use &mdash; the download surface carries no app-layer auth beyond the mesh gate, so the checksum is your integrity check.</p>
+      <figure class="codeblock">
+        <figcaption>Per-platform checksum verification</figcaption>
+        <pre><code><span class="cmt"># Linux</span>
+sha256sum -c grant-crypto-capi-linux-amd64.tar.gz.sha256
+
+<span class="cmt"># macOS (no GNU coreutils by default)</span>
+shasum -a 256 -c grant-crypto-capi-darwin-arm64.tar.gz.sha256</code></pre>
+      </figure>
+      <p>A mismatch means a truncated or corrupted download (retry the fetch) or the wrong file for the checksum &mdash; the <code>.sha256</code> names its file, so confirm you fetched the matching pair. The source-tarball name carries the version (<code>grant-crypto-sdk-0.1.0-src.tar.gz</code>); a name that disagrees with the served <code>version.json</code> means the tag and the built artifact are out of step.</p>
+
+      <h2>Common errors and their causes</h2>
+      <p>Error variants are advisory (see <a href="security.html">Security</a>), but each maps to a real, actionable cause. The names below are the language-neutral variants; each binding renders them idiomatically (<code>ErrNoSlot</code>, <code>NoSlotError</code>, and so on).</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Error</th><th>Likely cause</th><th>What to do</th></tr></thead>
+          <tbody>
+            <tr><td><code>NoSlot</code></td><td class="wrap">You are not in the audience for this release-set, or you hold no key for the message&rsquo;s generation (you were not admitted to that <code>(rs, gen)</code>, or you were revoked at a later generation).</td><td class="wrap">Confirm the member id is in the bundle&rsquo;s audience and that you <code>admit</code>ted the bundle for the message&rsquo;s generation. For a producer, <code>NoSlot</code> from <code>acquire</code> means you are not in any visible audience &mdash; the key service must include your id.</td></tr>
+            <tr><td><code>RotationRequired</code></td><td class="wrap">The stream key hit its cumulative message-count cap; <code>seal</code> refuses rather than risk nonce reuse.</td><td class="wrap">Rotate to a new generation (the key service publishes it) and re-acquire &mdash; a new generation starts with a fresh budget. Re-acquiring the <em>same</em> generation will not help; the count carries forward. Watch <code>remaining()</code> to act before the refusal.</td></tr>
+            <tr><td><code>DisposedHandle</code></td><td class="wrap">Use after <code>close()</code>/<code>Close()</code>/<code>.close()</code>, a double-dispose, or a handle from a different (or already-collected) object. A lifecycle bug in the caller.</td><td class="wrap">Ensure exactly one dispose per handle and no use afterward (<code>defer Close()</code> in Go, <code>with</code>/<code>using</code> in Python/TS). A leak warning from a finalizer means you forgot to close &mdash; the finalizer never disposes for you.</td></tr>
+            <tr><td><code>Decrypt</code></td><td class="wrap">AEAD authentication failed: wrong topic (the key expression is AEAD-bound), wrong key/generation/release-set, or tampered bytes.</td><td class="wrap">Open with the exact key expression the message arrived on. Do not branch program logic on which reject occurred &mdash; it is not an oracle.</td></tr>
+            <tr><td><code>BadSignature</code></td><td class="wrap">The bundle signature did not verify, was absent, or you passed the wrong verifying key.</td><td class="wrap">Verify against the correct key-service verifying key (SPKI DER), or validate the carried <code>signer_svid</code> against the SPIRE root. Do not <code>admit</code> an unverified bundle.</td></tr>
+            <tr><td><code>UnsupportedSuite</code></td><td class="wrap">The data names a suite this build does not implement (e.g. the inert v2). A capability signal, raised before any key operation.</td><td class="wrap">Use a build/suite that supports the data. This is safe to branch on &mdash; it reveals nothing about keys.</td></tr>
+            <tr><td><code>Malformed</code></td><td class="wrap">Bad base64/length/key encoding or bad JSON &mdash; or a scalar of the wrong length, or a <code>set_cap</code> request above the default.</td><td class="wrap">Check the wire bytes and that scalars are exactly 32 bytes. <code>set_cap</code> can only tighten.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Toolchain floors</h2>
+      <p>CI builds the bindings on exactly these floors, so anything at or above them is supported:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Language</th><th>Minimum</th></tr></thead>
+          <tbody>
+            <tr><td>Rust</td><td>&ge; 1.88 (the patched RustCrypto dependencies require it)</td></tr>
+            <tr><td>Go</td><td>&ge; 1.22 (<code>CGO_ENABLED=1</code>, the default)</td></tr>
+            <tr><td>Python</td><td>&ge; 3.8 (stdlib <code>ctypes</code>, import name <code>grant_crypto</code>)</td></tr>
+            <tr><td>Node</td><td>&ge; 20 (koffi pinned to 2.16.3, MIT)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>The macOS dylib note</h2>
+      <p>The release signs the shared library on macOS &mdash; Developer ID plus notarization when the signing secrets are provisioned, otherwise a proper ad-hoc re-sign that clears the fragile linker-signed signature the Rust linker emits. A consumer&rsquo;s loader trust-evaluates that signature when it <code>dlopen()</code>s the library, so the re-sign matters even for local use. The static library (<code>.a</code>) is an <code>ar</code> archive, not a Mach-O, so it is not code-signed and ships as-is.</p>
+      <div class="warn">
+        <span class="callout-label">If macOS refuses to load the dylib</span>
+        <p>An un-notarized ad-hoc build may be blocked by Gatekeeper on first load. Prefer a release built with the Developer ID + notarize path, or clear the quarantine attribute on a library you fetched and verified yourself (<code>xattr -d com.apple.quarantine libgrant_crypto_capi.dylib</code>). Verify the checksum first &mdash; only clear quarantine on bytes you have checked.</p>
+      </div>
+
+      <h2>Where to get help</h2>
+      <ul>
+        <li><strong>The binding READMEs.</strong> Each binding&rsquo;s own <code>README.md</code>, shipped in the source tarball at <code>grant-crypto/sdk/bindings/&lt;lang&gt;/</code>, is the authoritative, CI-tested quickstart and error reference.</li>
+        <li><strong>The runnable examples.</strong> <code>bindings/go/example_test.go</code>, <code>bindings/python/examples/quickstart.py</code>, and <code>bindings/ts/examples/quickstart.ts</code> each walk the full flow and are CI-tested, so they can&rsquo;t drift from the API.</li>
+        <li><strong>The mesh surface.</strong> The SDK, its checksums, and this documentation are served at <code>get.&lt;site&gt;.&lt;zone&gt;/sdk/</code> (docs at <code>/sdk/docs/</code>); <code>/sdk/version.json</code> tells you exactly which release is being handed out.</li>
+        <li><strong>The normative wire spec.</strong> <code>ops/grant-crypto/WIRE-FORMAT.md</code> in the source tarball is the canonical wire contract if you are building or debugging an independent implementation.</li>
+      </ul>
+
+      <div class="pagenav">
+        <a href="security.html"><span class="dir">Previous</span>&larr; Security</a>
+        <a class="next" href="index.html"><span class="dir">Next</span>Overview &rarr;</a>
+      </div>
+
+      <footer class="page-footer">
+        <span class="version-badge"></span>
+        <span>grant-crypto SDK &middot; ADR 1106 &middot; ships in-SDK, served at get.&lt;site&gt;/sdk/docs/</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

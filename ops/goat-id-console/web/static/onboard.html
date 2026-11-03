@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Onboarding — goat identity</title>
+<!--
+  Candidate nomination form (ADR 1062 stage 1, Amendment 1). Self-contained on
+  purpose: candidate-facing and destined to sit behind the public front desk, so
+  it renders without the operator nav/CSS. Minimal-burden: the enrollee fills
+  their own identity plus any access field the sponsor left open. A field the
+  sponsor pre-set is shown prefilled + read-only; the enrollee may "request a
+  change" (an explicit extra action) which is recorded as a petition and flagged
+  for scrutiny at both review gates — the effective value stays the sponsor's.
+-->
+<style>
+  :root{
+    --bg:#0f1411; --card:#161c19; --fg:#e6e6df; --muted:#9aa39d;
+    --accent:#3fa06a; --accent-d:#246b46; --border:#2a332d; --warn:#d9a441;
+    --err-bg:#3a1d1d; --err-fg:#f5c2c2; --ok-bg:#12291d; --ok-fg:#9ff0c4;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:560px;margin:6vh auto;padding:0 20px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;
+    padding:28px 26px;box-shadow:0 6px 24px rgba(0,0,0,.35)}
+  h1{margin:0 0 4px;font-size:22px}
+  .org{color:var(--accent);font-weight:600}
+  p.lead{color:var(--muted);margin:0 0 22px}
+  label{display:block;margin:16px 0 6px;font-size:14px;color:var(--fg)}
+  .req{color:var(--accent)}
+  .opt{color:var(--muted);font-weight:400;font-size:12px}
+  input,textarea,select{width:100%;padding:10px 12px;background:#0c110e;color:var(--fg);
+    border:1px solid var(--border);border-radius:8px;font:inherit}
+  input:focus,textarea:focus,select:focus{outline:2px solid var(--accent);outline-offset:2px;border-color:var(--accent)}
+  textarea{min-height:74px;resize:vertical}
+  button{margin-top:22px;width:100%;padding:12px;border:0;border-radius:8px;
+    background:var(--accent-d);color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+  button:hover{background:var(--accent)}
+  button:disabled{opacity:.5;cursor:default}
+  .msg{padding:12px 14px;border-radius:8px;margin:0 0 8px;font-size:14px}
+  .msg.err{background:var(--err-bg);color:var(--err-fg)}
+  .msg.ok{background:var(--ok-bg);color:var(--ok-fg)}
+  .hide{display:none}
+  .foot{color:var(--muted);font-size:12px;margin-top:18px;text-align:center}
+  .steps{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:13px}
+  .step{color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:3px 10px}
+  .step.now{color:var(--fg);border-color:var(--accent);background:#0c110e}
+  .step.done{color:var(--accent);border-color:var(--accent-d)}
+  .sep{color:var(--muted)}
+  .section-h{margin:22px 0 4px;padding-top:14px;border-top:1px solid var(--border);
+    color:var(--muted);font-size:13px}
+  .locked{display:flex;align-items:center;gap:8px;background:#0c110e;border:1px solid var(--border);
+    border-radius:8px;padding:10px 12px}
+  .locked .val{font-weight:600}
+  .locked .by{color:var(--muted);font-size:12px;margin-left:auto}
+  .linkbtn{margin:6px 0 0;width:auto;min-width:24px;min-height:24px;padding:2px 0;background:none;color:var(--accent);
+    font-size:13px;font-weight:500;text-decoration:underline;cursor:pointer}
+  .linkbtn:hover{background:none;color:var(--accent)}
+  .petition{border-color:var(--warn)!important}
+  .petnote{color:var(--warn);font-size:12px;margin-top:5px}
+  .err-field{border-color:var(--err-fg)!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Join <span class="org">goat identity</span></h1>
+    <p class="lead" id="lead">Checking your invitation...</p>
+
+    <div id="gate" class="msg err hide" role="status"></div>
+
+    <section id="netreq" class="hide" aria-labelledby="netreq-h">
+      <h2 id="netreq-h">Before you start: your network</h2>
+      <p>The computer you will use must be allowed these <b>outbound</b> connections. Organisation networks often allow the first and block the second.</p>
+      <ul id="netreq-list"></ul>
+      <p>Ask your network team to check before you begin: <code id="netreq-test"></code></p>
+      <p>If it is blocked: <span id="netreq-symptom"></span> <a id="netreq-page" href="/network-requirements">Details for your network team</a>.</p>
+    </section>
+
+    <form id="form" class="hide" autocomplete="on">
+      <label for="name">Full name <span class="req">*</span></label>
+      <input id="name" name="name" required autocomplete="name">
+
+      <label for="email">Email <span class="req">*</span></label>
+      <input id="email" name="email" type="email" required autocomplete="email">
+
+      <label for="ptype">This identity is <span class="opt">— a person or a system?</span></label>
+      <select id="ptype" name="principal_type">
+        <option value="person">a person</option>
+        <option value="system">a system / service</option>
+      </select>
+
+      <label for="organization">Organization / unit <span class="req">*</span></label>
+      <input id="organization" name="organization" autocomplete="organization" placeholder="e.g. Demoforge" required>
+      <p class="opt" id="orgNote" style="margin:6px 0 0">For a person, this is the organization or unit your access is grouped under. For a system, this is the organization that operates this system. It becomes your organization of record: it groups you with your colleagues, it is what data-sharing decisions are made about, and your teammates should all type the <strong>same</strong> name here.</p>
+
+      <!-- ADR 1171. The question a PERSON is asked is only ever about the person.
+           The organisation's nation is an org fact, typed by an admin when the
+           organisation is registered, and is not asked here. -->
+      <label for="nationality">Nationality *<span class="opt"> — YOUR citizenship, as a three-letter country code (e.g. CAN, USA)</span></label>
+      <input id="nationality" name="nationality" required placeholder="e.g. CAN" pattern="[A-Z]{2,8}" title="Your own citizenship as a three-letter country code in UPPERCASE (e.g. CAN) — not a full country name" oninput="this.value=this.value.toUpperCase()">
+      <p class="opt" style="margin:6px 0 0">Your own citizenship — <strong>not</strong> your organization's nation.
+        The two are allowed to differ, and often do: a liaison officer, or anyone posted to a command of another
+        country. We do not infer one from the other, and your organization's own nation is recorded separately by
+        the administrator who registers it. <strong>Your citizenship can limit which shared data you may read</strong> — some shared data lanes
+        your organization can reach are narrowed by the nationality of the person reading, which is why it is
+        required: a request without it cannot be reviewed.</p>
+
+      <label for="unit_code">Unit code <span class="opt">— optional; your unit's codified identifier</span></label>
+      <input id="unit_code" name="unit_code" autocomplete="off">
+      <select aria-label="Unit code scheme" id="unit_code_scheme" name="unit_code_scheme" style="margin-top:6px">
+        <option value="">Which system? (auto — from my affiliation)</option>
+        <option value="sovereign">National code (e.g. US UIC)</option>
+        <option value="nato-logfas">NATO LOGFAS</option>
+        <option value="sap">SAP ERP</option>
+      </select>
+
+      <label for="title">Role / title <span class="opt">— optional</span></label>
+      <input id="title" name="title" autocomplete="organization-title">
+
+      <label for="github_username">GitHub username <span class="opt">— optional, but it is how you get repo access</span></label>
+      <input id="github_username" name="github_username" placeholder="e.g. octocat" autocomplete="off">
+      <p class="opt" style="margin:6px 0 0">Repository access is granted to this account when your onboarding is
+        approved. <strong>Leave it blank and you get no repositories</strong> until you add it, which you can do
+        yourself after onboarding on the GitHub page of the identity console (<code>/github</code>). Your GitHub
+        username, not your email.</p>
+
+      <div id="sysRow" class="hide">
+        <label style="display:flex;align-items:center;gap:9px;margin-top:16px;cursor:pointer">
+          <input type="checkbox" id="spire" name="spire_federated" style="width:auto;margin:0">
+          <span>This system needs to share its workload identity with this goatnet
+            <span class="opt">— ask your system administrator if this applies; they will arrange the connection after onboarding</span></span>
+        </label>
+      </div>
+
+      <label for="notes">Additional notes <span class="opt">— optional</span></label>
+      <textarea id="notes" name="notes"></textarea>
+
+      <div id="access" class="hide">
+        <div class="section-h">Access</div>
+        <div id="tierRow" data-field="tier"></div>
+        <p class="opt" style="margin:6px 0 0">Need Platform Admin or IAM Admin? Those escalated roles are granted
+          only when your sponsor includes one in your invite — ask your sponsor if you need it.</p>
+        <div id="mqRow" data-field="machine_quota" style="margin-top:16px"></div>
+        <label for="sector" style="margin-top:16px">Sector <span class="opt">— what your organization is</span></label>
+        <select id="sector" name="sector">
+          <option value="">(not declared)</option>
+          <option value="state">state — government (armed forces, a ministry, police, a state lab)</option>
+          <option value="commercial">commercial — a company, including state-owned</option>
+          <option value="civil-society">civil-society — NGO, university, research, press</option>
+        </select>
+        <p class="opt" style="margin:6px 0 0">If your organization sells what it does, pick <strong>commercial</strong>,
+          even if a government owns it. This describes your organization's work. Your citizenship is recorded separately above.</p>
+        <label for="gov_branch" id="gov_branch_label" style="margin-top:16px" hidden>Branch <span class="opt">— which part of government</span></label>
+        <select id="gov_branch" name="gov_branch" hidden>
+          <option value="">(not declared)</option>
+          <option value="military">military — armed forces</option>
+          <option value="law-enforcement">law-enforcement — police / gendarmerie / border / customs</option>
+          <option value="intelligence">intelligence — national intelligence / security service</option>
+          <option value="civil">civil — a civilian government agency</option>
+        </select>
+        <label for="alliance_standing" style="margin-top:16px">Alliance standing <span class="opt">— leave on auto; resolved from your nation</span></label>
+        <select id="alliance_standing" name="alliance_standing">
+          <option value="">(auto — resolve from nation + active framework)</option>
+          <option value="member">member — your nation is in the active framework</option>
+          <option value="partner">partner — your nation is not in it</option>
+        </select>
+      </div>
+
+      <div id="githubWarn" class="msg err hide" role="alert" style="margin-top:14px">
+        <b>You have not given a GitHub username.</b> Your access level includes GitHub repositories:
+        worked examples, partner code, and the repositories other participants build from. Without a
+        username you are added to none of them, and you will not see that work. You can still submit
+        and add it later on the GitHub page of the identity console (<code>/github</code>), but until
+        you do you are left out. To add it now, fill in the GitHub username box above.
+      </div>
+      <button id="submit" type="submit">Submit for review</button>
+      <div id="err" class="msg err hide" role="alert" style="margin-top:14px"></div>
+    </form>
+
+    <div id="done" class="msg ok hide"></div>
+    <div class="foot">Your details are sent over an encrypted connection and stored for review only.</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var params = new URLSearchParams(location.search);
+  var token = (params.get("t") || "").trim();
+  // Tiers the goatnet's repo-access policy grants repositories to (from the
+  // preview), the invite's locked tier, and whether the candidate has already
+  // seen the no-GitHub warning and chosen to go on.
+  var repoTiers = [], lockedTier = "", githubWarned = false;
+  var gate = document.getElementById("gate");
+  var form = document.getElementById("form");
+  var done = document.getElementById("done");
+  var err  = document.getElementById("err");
+  var btn  = document.getElementById("submit");
+
+  function clearValidationState(){
+    err.classList.add("hide");
+    err.innerHTML = "";
+    var bad = form.querySelectorAll(".err-field,[aria-invalid='true']");
+    for(var i=0;i<bad.length;i++){
+      bad[i].classList.remove("err-field");
+      bad[i].removeAttribute("aria-invalid");
+      bad[i].removeAttribute("aria-describedby");
+    }
+  }
+
+  // Drop one field's entry from a multi-field refusal, leaving the others
+  // standing. No-op when that field is not currently in error, so a
+  // single-message refusal in the same box is left alone.
+  function clearFieldError(name){
+    var li = document.getElementById("err-msg-" + name);
+    if(!li) return;
+    li.parentNode.removeChild(li);
+    var el = fieldElement(name);
+    if(el){
+      el.classList.remove("err-field");
+      el.removeAttribute("aria-invalid");
+      el.removeAttribute("aria-describedby");
+    }
+    if(!err.querySelector("li")){
+      err.classList.add("hide");
+      err.innerHTML = "";
+    }
+  }
+
+  function fieldElement(name){
+    switch(name){
+      case "name": return document.getElementById("name");
+      case "email": return document.getElementById("email");
+      case "organization": return document.getElementById("organization");
+      case "tier": return document.getElementById("tierRow-sel");
+      case "nationality": return document.getElementById("nationality");
+      // The server derives the account name from the email address; the form
+      // has no handle input, so the address is the field to fix.
+      case "handle": return document.getElementById("email");
+      default: return null;
+    }
+  }
+
+  function fieldLabel(name){
+    switch(name){
+      case "name": return "Full name";
+      case "email": return "Email";
+      case "organization": return "Organization";
+      case "tier": return "Access level";
+      case "nationality": return "Nationality";
+      case "nation": return "Organisation's nation";
+      case "handle": return "Email";
+      default: return cap(name.replace(/_/g, " "));
+    }
+  }
+
+  function renderFieldErrors(fields){
+    clearValidationState();
+    if(!fields) return;
+    var ul = document.createElement("ul");
+    var first = null;
+    var ordered = ["name", "email", "organization", "nationality", "handle", "tier", "nation"];
+
+    function addField(name){
+      if(!Object.prototype.hasOwnProperty.call(fields, name)) return;
+      var msg = fields[name];
+      var li = document.createElement("li");
+      li.id = "err-msg-" + name;
+      li.innerHTML = "<strong>"+esc(fieldLabel(name))+":</strong> " + esc(msg||"");
+      ul.appendChild(li);
+      var el = fieldElement(name);
+      if(el){
+        el.setAttribute("aria-invalid", "true");
+        el.setAttribute("aria-describedby", li.id);
+        el.classList.add("err-field");
+        if(!first && ordered.indexOf(name) !== -1){
+          first = el;
+        }
+      }
+    }
+
+    ordered.forEach(addField);
+    Object.keys(fields).forEach(function(name){
+      if(ordered.indexOf(name) === -1){
+        addField(name);
+      }
+    });
+    err.innerHTML = "";
+    err.appendChild(ul);
+    err.classList.remove("hide");
+    if(first){
+      first.focus();
+      if(first.scrollIntoView){ first.scrollIntoView({block:"center"}); }
+    }
+  }
+
+  function showGate(text){ document.getElementById("lead").classList.add("hide"); gate.textContent = text; gate.classList.remove("hide"); }
+
+  // A consumed link doubles as the candidate's status page: show how far
+  // their request has moved instead of telling them to ask for a new invite.
+  var PHASES = [
+    {key:"pending-sponsor", label:"Sponsor vouch"},
+    {key:"pending-admin",   label:"Admin review"},
+    {key:"provisioning",    label:"Provisioning"},
+    {key:"complete",        label:"Done"}
+  ];
+  function showStatus(sub){
+    document.getElementById("lead").classList.add("hide");
+    var idx = PHASES.findIndex(function(p){ return p.key === sub.phase; });
+    var terminal = (sub.phase === "rejected" || sub.phase === "issue" || sub.phase === "closed");
+    var html = "<b>Your request was submitted</b>";
+    if(sub.submitted_at){ html += " on " + esc(new Date(sub.submitted_at*1000).toLocaleDateString()); }
+    html += ".<br><br>";
+    if(!terminal){
+      html += "<div class=\"steps\">" + PHASES.map(function(p, i){
+        var cls = idx < 0 ? "" : (i < idx ? "step done" : (i === idx ? "step now" : "step"));
+        if(sub.phase === "complete"){ cls = "step done"; }
+        return "<span class=\"" + (cls || "step") + "\">" + esc(p.label) + "</span>";
+      }).join("<span class=\"sep\">&rsaquo;</span>") + "</div><br>";
+    }
+    html += esc(cap(sub.detail || "")) + ".";
+    if(!terminal){ html += "<br><br>Check back here any time — this link always shows your current status."; }
+    gate.innerHTML = html; gate.classList.remove("hide");
+  }
+  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function cap(s){ return s ? s.charAt(0).toUpperCase()+s.slice(1) : s; }
+
+  if(!token){ showGate("This onboarding link is missing its token. Please use the exact link your sponsor gave you."); return; }
+
+  // Reveal the system-only fields (SPIRE federation) when "a system" is chosen,
+  // and adjust the organization hint copy to match the principal type.
+  var ptypeEl = document.getElementById("ptype");
+  function syncSysRow(){
+    var isSystem = ptypeEl.value === "system";
+    document.getElementById("sysRow").classList.toggle("hide", !isSystem);
+    // Nationality is required of a PERSON (releasability is decided on it);
+    // a system has no citizenship, so the browser-side requirement lifts too.
+    document.getElementById("nationality").required = !isSystem;
+    var note = document.getElementById("orgNote");
+    if(note){
+      var suffix = " It becomes your organization of record: it groups you with your colleagues, it is what data-sharing decisions are made about, and your teammates should all type the <strong>same</strong> name here.";
+      note.innerHTML = (isSystem ?
+        "The organization that operates this system." :
+        "The organization or unit your access is grouped under.") + suffix;
+    }
+  }
+  ptypeEl.addEventListener("change", syncSysRow); syncSysRow();
+
+  fetch("/api/onboard/preview?t=" + encodeURIComponent(token))
+    .then(function(r){
+      if(!r.ok && r.status !== 400 && r.status !== 404 && r.status !== 410){
+        throw new Error("preview unavailable");
+      }
+      if(!r.ok){ return {valid:false}; }
+      return r.json();
+    })
+    .then(function(d){
+      if(d && d.valid){
+        // Name the sponsor when the invite carries a person (the portal
+        // suppresses the generic shared-operator label server-side).
+        document.getElementById("lead").textContent = "Fill in your details below. Your sponsor and an administrator will review your request.";
+        if(d.sponsor){
+          document.getElementById("lead").innerHTML =
+            "You've been invited by <b>" + esc(d.sponsor) + "</b> to onboard. Fill in your details below — " +
+            "your sponsor and an administrator will review and provision your access.";
+        }
+        repoTiers = (d.repo_tiers || []).map(function(t){ return String(t).toLowerCase(); });
+        lockedTier = String((d.prebound && d.prebound.tier) || "").toLowerCase();
+        form.classList.remove("hide"); buildAccess(d); showNetwork(d.network);
+      }
+      else if(d && d.submission){ showStatus(d.submission); }
+      else if(d && d.valid === false){ showGate("This invitation is unavailable or has expired. Please ask your sponsor for a new invite."); }
+      else { throw new Error("invalid preview response"); }
+    })
+    .catch(function(){ showGate("Couldn't reach the onboarding service. Please try again shortly."); });
+
+  // Renders each access field either as an open picker (sponsor left it blank)
+  // or as a prefilled, read-only value with a "Request a change" affordance.
+  function buildAccess(d){
+    var tierOpts = (d.selectable_tiers||[]).map(function(t){ return {v:t.id, label:(t.label||t.id)}; });
+    // Tier is frozen at review (ADR 1137), so when the sponsor left it open the
+    // candidate is the only one who can still set it: the row is required, and
+    // the server refuses a blank one rather than storing a draft nobody can
+    // complete.
+    fieldRow("tierRow", "Access level", d.tier_locked, (d.prebound&&d.prebound.tier)||"", tierOpts);
+    numberRow("mqRow", "Machines / devices you'll enroll", d.machine_quota_locked, (d.prebound&&d.prebound.machine_quota)||0);
+    // Say what the number DOES. It sets the device allowance on the one-time
+    // mesh enrollment key you are issued, so a low number is a key that stops
+    // working on your second laptop or after a reinstall — the exact confusion
+    // behind the "setup key is invalid" reports.
+    var mqNote = document.createElement("p");
+    mqNote.className = "opt";
+    mqNote.style.margin = "6px 0 0";
+    mqNote.innerHTML = "How many of <em>your own</em> devices you expect to put on the mesh (laptop, desktop, VM, phone). " +
+      "It sets the device allowance on your enrollment key, so count the reinstall you will do later — " +
+      "if the key runs out you have to ask an admin for a fresh one. Blank is fine: you get 5.";
+    document.getElementById("mqRow").appendChild(mqNote);
+    // ADR 1151: affiliation.kind is DERIVED from sector + nation, so the
+    // candidate is no longer asked for it. Nothing renders an affiliation row.
+    applyRecommendedOrg(d);
+    buildSectorOptions(d.selectable_sectors);
+    if(d.sector_locked) lockSector((d.prebound&&d.prebound.sector)||"");
+    syncBranchVisibility();
+    document.getElementById("access").classList.remove("hide");
+  }
+
+  // Recommended organization (ADR 1112). When the invite names a registered org,
+  // the field is filled in and locked rather than left for the candidate to type.
+  // Free typing produces duplicate orgs, and the person
+  // being onboarded is the worst-placed party to know which spelling their
+  // colleagues used. The lock is soft on purpose: someone genuinely invited under
+  // the wrong employer can open the field, and what they type reaches the
+  // reviewer as a change request rather than silently naming a new organization.
+  function applyRecommendedOrg(d){
+    if(!d || !d.org_locked) return;
+    var input = document.getElementById("organization");
+    var note  = document.getElementById("orgNote");
+    if(!input || !note) return;
+
+    var sponsorValue = d.org_name || "";
+    note.dataset.locked = "1";
+    input.dataset.sponsorValue = sponsorValue;
+
+    input.value = d.org_name || "";
+    input.readOnly = true;
+    input.setAttribute("aria-readonly", "true");
+
+    note.innerHTML = "Your sponsor registered you under this organization, so you don\u2019t need to type it. " +
+      "It groups you with your colleagues and is what data-sharing decisions are made about.";
+
+    var req = document.createElement("button");
+    req.type = "button";
+    req.className = "linkbtn";
+    req.textContent = "Request a different organization";
+
+    var keep = document.createElement("button");
+    keep.type = "button";
+    keep.className = "linkbtn hide";
+    keep.textContent = "Keep the organization my sponsor chose";
+
+    var pet = null;
+    req.onclick = function(){
+      input.readOnly = false;
+      input.removeAttribute("aria-readonly");
+      input.value = "";
+      input.classList.add("petition");
+      input.focus();
+      req.classList.add("hide");
+      keep.classList.remove("hide");
+      if(!pet){
+        pet = document.createElement("div");
+        pet.className = "petnote";
+        pet.textContent = "This is a change request \u2014 it will be flagged for your sponsor and an " +
+          "administrator to review; the organization your sponsor chose stands unless they approve it.";
+        note.parentNode.insertBefore(pet, note.nextSibling);
+      }
+      pet.classList.remove("hide");
+    };
+    keep.onclick = function(){
+      input.value = sponsorValue;
+      input.readOnly = true;
+      input.setAttribute("aria-readonly", "true");
+      input.classList.remove("petition");
+      keep.classList.add("hide");
+      req.classList.remove("hide");
+      if(pet) pet.classList.add("hide");
+      // The sponsor's value resolves the organization error only; any other
+      // field still named in the refusal stays marked until it is fixed.
+      clearFieldError("organization");
+    };
+    note.parentNode.insertBefore(keep, note.nextSibling);
+    note.parentNode.insertBefore(req, note.nextSibling);
+  }
+
+  // Sector menu is server-driven: the governmental cluster is always offered;
+  // the non-governmental cluster (ngo/media/academic/commercial) appears only
+  // when this goatnet has ONBOARD_SECTORS_NONGOV_ENABLED set (ADR 1077). The
+  // static <option>s are a graceful-degradation fallback; when the preview
+  // carries selectable_sectors we rebuild from it so a gated-off goatnet never
+  // shows the non-gov options.
+  // Branch applies ONLY to sector=state (ADR 1151). Hidden otherwise rather than
+  // shown-and-ignored: a control you can set that is then discarded tells you
+  // that you declared something you did not.
+  function syncBranchVisibility(){
+    var sector = document.getElementById("sector");
+    var label  = document.getElementById("gov_branch_label");
+    var branch = document.getElementById("gov_branch");
+    if(!sector || !label || !branch) return;
+    var isState = sector.value === "state";
+    label.hidden = !isState;
+    branch.hidden = !isState;
+    if(!isState) branch.value = "";
+  }
+
+  function buildSectorOptions(list){
+    var sectorEl = document.getElementById("sector");
+    if(sectorEl && !sectorEl.dataset.branchWired){
+      sectorEl.addEventListener("change", syncBranchVisibility);
+      sectorEl.dataset.branchWired = "1";
+    }
+    if(!list || !list.length) return;
+    var labels = {
+      // ADR 1151 target set.
+      "state": "state — government (armed forces, a ministry, police, a state lab)",
+      "commercial": "commercial — a company, including state-owned",
+      "civil-society": "civil-society — NGO, university, research, press",
+      // ADR 1077 legacy values, still accepted while the migration window is open.
+      "military": "military — armed forces",
+      "law-enforcement": "law-enforcement — police / gendarmerie / border / customs",
+      "civil-government": "civil-government — governmental, non-military, non-law-enforcement",
+      "intelligence": "intelligence — national intelligence / security service (IC)",
+      "ngo": "ngo — non-governmental organization / non-profit",
+      "media": "media — press / journalism",
+      "academic": "academic — university / research institution"
+    };
+    var sel = document.getElementById("sector");
+    var html = '<option value="">(not applicable / unknown)</option>';
+    for(var i=0;i<list.length;i++){
+      var v = list[i];
+      html += '<option value="'+esc(v)+'">'+esc(labels[v]||v)+'</option>';
+    }
+    sel.innerHTML = html;
+  }
+
+  // Sponsor-pinned sector (invite prebound). Shown, not asked: the sponsor
+  // knows what the organization is, and the server keeps their value whatever
+  // the form sends. The branch sub-question still follows the pinned value.
+  function lockSector(value){
+    var sel = document.getElementById("sector");
+    if(!sel || !value) return;
+    var present = false;
+    for(var i=0;i<sel.options.length;i++){ if(sel.options[i].value === value){ present = true; break; } }
+    if(!present){
+      var o = document.createElement("option");
+      o.value = value; o.textContent = value;
+      sel.appendChild(o);
+    }
+    sel.value = value;
+    sel.disabled = true;
+    sel.dataset.locked = "1";
+    var lbl = document.querySelector('label[for="sector"] .opt');
+    if(lbl) lbl.textContent = "— set by your sponsor";
+  }
+
+  // Machine-enrollment quota: like fieldRow but a number input. Locked → shown
+  // read-only + a "request a different number" petition; open → optional input.
+  function numberRow(rowId, label, locked, prefill){
+    var row = document.getElementById(rowId);
+    if(locked && prefill){
+      row.innerHTML =
+        '<label for="'+rowId+'-inp">'+esc(label)+'</label>'+
+        '<div class="locked"><span class="val">'+esc(prefill)+'</span><span class="by">set by your sponsor</span></div>'+
+        '<button type="button" class="linkbtn" id="'+rowId+'-req">Request a different number</button>'+
+        '<div id="'+rowId+'-pet" class="hide">'+
+          '<input type="number" min="1" max="100" id="'+rowId+'-inp" placeholder="how many?" onwheel="this.blur()">'+
+          '<div class="petnote">This is a change request — it will be flagged for your sponsor and an administrator to review; your sponsor’s number stands unless they approve it.</div>'+
+        '</div>';
+      row.dataset.locked = "1"; row.dataset.petition = "0";
+      document.getElementById(rowId+"-req").onclick = function(){
+        document.getElementById(rowId+"-pet").classList.remove("hide"); this.classList.add("hide");
+        document.getElementById(rowId+"-inp").classList.add("petition");
+        row.dataset.petition = "1";
+      };
+      return;
+    }
+    // onwheel blur: a focused number input eats the page scroll and silently
+    // writes its own value; on a blank field with min="1" that is a single-use
+    // key nobody chose. The placeholder is an example, not a default; the hint
+    // below says what blank actually does.
+    row.innerHTML =
+      '<label for="'+rowId+'-inp">'+esc(label)+' <span class="opt">— optional; how many machines/devices you\'ll bring online. Leave it blank for 5.</span></label>'+
+      '<input type="number" min="1" max="100" id="'+rowId+'-inp" placeholder="e.g. 3" onwheel="this.blur()">';
+    row.dataset.locked = "0";
+  }
+
+  function readNumber(rowId){
+    var row = document.getElementById(rowId);
+    if(row.dataset.locked === "1" && row.dataset.petition !== "1") return 0; // accepting sponsor's number
+    var inp = document.getElementById(rowId+"-inp");
+    var n = inp ? parseInt(inp.value, 10) : 0;
+    return (n > 0) ? n : 0;
+  }
+
+  // Returns true if it rendered anything. When locked, shows the value + a
+  // petition toggle; when open, shows a picker.
+  function fieldRow(rowId, label, locked, prefill, opts){
+    var row = document.getElementById(rowId);
+    if(locked){
+      row.innerHTML =
+        '<label for="'+rowId+'-sel">'+esc(label)+'</label>'+
+        '<div class="locked"><span class="val" id="'+rowId+'-val">'+esc(prefill)+'</span><span class="by">set by your sponsor</span></div>'+
+        '<button type="button" class="linkbtn" id="'+rowId+'-req">Request a different '+esc(label.toLowerCase())+'</button>'+
+        '<div id="'+rowId+'-pet" class="hide">'+
+          '<select id="'+rowId+'-sel">'+opts.map(function(o){ return '<option value="'+esc(o.v)+'">'+esc(o.label)+'</option>'; }).join("")+'</select>'+
+          '<div class="petnote">This is a change request — it will be flagged for your sponsor and an administrator to review; your sponsor’s choice stands unless they approve it.</div>'+
+        '</div>';
+      row.dataset.locked = "1"; row.dataset.prefill = prefill; row.dataset.petition = "0";
+      document.getElementById(rowId+"-req").onclick = function(){
+        var pet = document.getElementById(rowId+"-pet");
+        pet.classList.remove("hide"); this.classList.add("hide");
+        document.getElementById(rowId+"-sel").classList.add("petition");
+        row.dataset.petition = "1";
+      };
+      return true;
+    }
+    if(opts.length){
+      var hint = "— choose one; your sponsor left this to you";
+      var blank = "(choose your "+esc(label.toLowerCase())+")";
+      row.innerHTML =
+        '<label for="'+rowId+'-sel">'+esc(label)+' <span class="opt">'+hint+'</span></label>'+
+        '<select id="'+rowId+'-sel" required><option value="">'+blank+'</option>'+
+          opts.map(function(o){ return '<option value="'+esc(o.v)+'">'+esc(o.label)+'</option>'; }).join("")+'</select>';
+      row.dataset.locked = "0";
+      row.dataset.required = "1";
+      return true;
+    }
+    return false;
+  }
+
+  // Reads a field row: only sends a value when the enrollee actually chose one
+  // (open pick) or is petitioning a change (locked → different value).
+  function readField(rowId){
+    var row = document.getElementById(rowId);
+    if(!row.dataset.locked) return "";
+    if(row.dataset.locked === "1"){
+      if(row.dataset.petition !== "1") return "";            // accepting the sponsor's value → send nothing
+      return (document.getElementById(rowId+"-sel").value||"").trim();
+    }
+    var sel = document.getElementById(rowId+"-sel");
+    return sel ? (sel.value||"").trim() : "";
+  }
+
+  form.addEventListener("submit", function(e){
+    e.preventDefault();
+    clearValidationState();
+    var submission = {
+      name: document.getElementById("name").value.trim(),
+      email: document.getElementById("email").value.trim(),
+      principal_type: document.getElementById("ptype").value,
+      organization: document.getElementById("organization").value.trim(),
+      nationality: document.getElementById("nationality").value.trim(),
+      unit_code: document.getElementById("unit_code").value.trim(),
+      unit_code_scheme: document.getElementById("unit_code_scheme").value,
+      title: document.getElementById("title").value.trim(),
+      github_username: document.getElementById("github_username").value.trim(),
+      alliance_standing: document.getElementById("alliance_standing").value,
+      sector: document.getElementById("sector").value,
+      notes: document.getElementById("notes").value.trim(),
+      spire_federated: document.getElementById("ptype").value === "system" && document.getElementById("spire").checked
+    };
+    var tier = readField("tierRow"); if(tier) submission.tier = tier;
+    // ADR 1151: no affiliation row is rendered — kind is derived from sector +
+    // nation. gov_branch rides along with sector, and only under state.
+    var gb = document.getElementById("gov_branch");
+    if (gb && !gb.hidden && gb.value) submission.gov_branch = gb.value;
+    var mq = readNumber("mqRow"); if(mq) submission.machine_quota = mq;
+
+    var clientErrors = {};
+    if(!submission.name || !submission.email){
+      clientErrors.name = "Please provide at least your name and email.";
+      clientErrors.email = "Please provide at least your name and email.";
+    }
+    if(!submission.organization){
+      clientErrors.organization = "Please provide your organization.";
+    }
+    var tierRow = document.getElementById("tierRow");
+    if(tierRow.dataset.locked === "0" && tierRow.dataset.required === "1" && !tier){
+      clientErrors.tier = "Choose your access level — your sponsor left it to you, and it cannot be set later.";
+    }
+    // A person's nationality is what releasability is decided on, so a person
+    // cannot submit without one. A system has no citizenship and is exempt.
+    if(submission.principal_type !== "system" && !submission.nationality){
+      clientErrors.nationality = "Please provide your nationality as a three-letter country code (e.g. CAN, USA).";
+    }
+    if(Object.keys(clientErrors).length){
+      renderFieldErrors(clientErrors);
+      return;
+    }
+    // No GitHub username on a level that includes repositories: warn once,
+    // then let them go on. A warning, never a refusal — the username is
+    // optional and can be added later at /github on the identity console.
+    var effTier = String(tier || lockedTier || "").toLowerCase();
+    var gw = document.getElementById("githubWarn");
+    if(!submission.github_username && effTier && repoTiers.indexOf(effTier) >= 0 && !githubWarned){
+      githubWarned = true;
+      gw.classList.remove("hide");
+      btn.textContent = "Submit without a GitHub username";
+      gw.scrollIntoView({block:"center"});
+      return;
+    }
+    gw.classList.add("hide");
+    btn.disabled = true; btn.textContent = "Submitting…";
+    fetch("/api/onboard/submit", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ token: token, submission: submission })
+    }).then(function(r){
+      if(!(r.headers.get("Content-Type") || "").includes("json")){
+        return {ok:false, status:r.status, body:null};
+      }
+      return r.json().then(function(j){ return {ok:r.ok, status:r.status, body:j}; });
+    })
+      .then(function(res){
+        if(res.ok){
+          document.getElementById("lead").classList.add("hide");
+          form.classList.add("hide");
+          var petd = (document.getElementById("tierRow").dataset.petition==="1" || document.getElementById("mqRow").dataset.petition==="1");
+          done.innerHTML = "Thank you, " + esc(submission.name) + " — your details were submitted for review. Your sponsor and an administrator will finish setting up your access." +
+            (petd ? "<br><br>Your change request has been flagged for their review." : "") +
+            ((res.body && (res.body.warnings||[]).indexOf("github_username_missing") >= 0) ?
+              "<br><br><b>No GitHub username was given.</b> You will not be added to the example and partner repositories your level includes until you add one. Once you can sign in, open the GitHub page of the identity console (<code>/github</code>) and add it; the repositories are granted then." : "") +
+            "<br><br>Keep this link — reopening it any time shows your request's current status.";
+          done.classList.remove("hide");
+        } else {
+          btn.disabled = false; btn.textContent = "Submit for review";
+          var errObj = res.body && res.body.error;
+          if(errObj && errObj.code === "validation_failed" && errObj.fields){
+            renderFieldErrors(errObj.fields);
+          } else {
+            clearValidationState();
+            var message = "Your submission could not be confirmed. Your entries are still here; please try again shortly.";
+            if(res.status === 409) message = "This invitation may already have a submission. Reopen your invitation link to check its status, or contact your sponsor.";
+            if(res.status === 410 || res.status === 404) message = "This invitation is unavailable or has expired. Please ask your sponsor for a new invite.";
+            if(res.status === 400) message = "Please check the details you entered and submit again. Contact your sponsor if this continues.";
+            if(errObj && errObj.code === "duplicate_email") message = "This email already has a request in progress. Reopen your earlier invitation link to check it, or ask your sponsor for help.";
+            err.textContent = message;
+            err.classList.remove("hide");
+          }
+        }
+      })
+      .catch(function(){
+        btn.disabled = false; btn.textContent = "Submit for review";
+        clearValidationState();
+        err.textContent = "Network error — please try again."; err.classList.remove("hide");
+      });
+  });
+})();
+
+  // What the candidate's site network must allow, from the console's relay
+  // config (names and ports only). Absent when the console has no relay list.
+  function showNetwork(n){
+    if(!n || !n.control_host || !(n.data_hosts||[]).length) return;
+    var ul=document.getElementById("netreq-list");
+    var li1=document.createElement("li");
+    li1.textContent=(n.control_ports||[]).join(", ")+" to "+n.control_host;
+    var li2=document.createElement("li");
+    li2.textContent=(n.data_ports||[]).join(", ")+" to "+n.data_hosts.join(", ");
+    ul.appendChild(li1); ul.appendChild(li2);
+    document.getElementById("netreq-test").textContent=n.test||"";
+    document.getElementById("netreq-symptom").textContent=n.symptom||"";
+    if(n.page_url) document.getElementById("netreq-page").setAttribute("href", n.page_url);
+    document.getElementById("netreq").classList.remove("hide");
+  }
+</script>
+</body>
+</html>

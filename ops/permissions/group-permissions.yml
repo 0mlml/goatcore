@@ -1,0 +1,445 @@
+# Canonical group→service permission matrix for the goat identity plane.
+#
+# This file is the single source of truth for "what does it MEAN for a user
+# to be in group X." Two audiences read it:
+#
+#   1. goat-id-console (ops/goat-id-console/) renders the matrix verbatim on
+#      its /permissions page so an operator can answer "what does VENDOR
+#      group buy?" without grepping markdown.
+#
+#   2. Humans reading the L7 admin-fence design doc
+#      see a survey table; that table now cites this YAML rather than
+#      duplicating the rows. When the survey and this file disagree, this
+#      file wins.
+#
+# ENFORCED per ADR 1073 (docs/adr/1073-rbac-adherence-principle.md):
+#
+#   3. goat-built services gate humans by consulting this matrix
+#      (permissions.Matrix.AnyGroupGrants), never a hardcoded group
+#      literal — the id-admin-console adminGate is the first consumer.
+#
+#   4. oauth2-proxy fence allowed-groups lists must equal the set of
+#      groups this matrix grants the service; parity is CI-checked by
+#      ops/ci/check-group-permissions-parity.sh (fail-closed ratchet —
+#      coverage can only grow).
+#
+# Status: trial-scope. Production rows are added when a service lands on a
+# production site.
+
+schema_version: 1
+
+# Services known to the matrix, with their canonical door, fence and audit
+# point. A service appearing here does not imply it is deployed on every site
+# — the per-site deployment status lives in the site's group_vars, not here.
+#
+# `door:` is REQUIRED on every service and its value is a closed set. It says
+# what the FRONT DOOR decides, which is what tells a reader how to read a
+# blank cell in the group->service grid. Four values:
+#
+#   group-gated   An oauth2-proxy fence admitting only the groups this matrix
+#                 grants. The grid is the whole truth: a blank cell IS a
+#                 denial.
+#   authenticated An oauth2-proxy fence admitting ANY authenticated identity;
+#                 the app differentiates behind it. A blank cell is NOT a
+#                 denial — it records who reads WHAT, not who gets in.
+#   in-app        No proxy fence. The application authenticates and authorizes
+#                 itself. The grid describes the app's own tiers, not a door.
+#   mesh-only     No identity ANYWHERE. The only gate is a Traefik mesh
+#                 IPAllowList, so every caller that reaches the mesh is
+#                 admitted. A blank cell means nothing at all — not a denial.
+#
+# Why door is required rather than optional: a service with no door and a
+# `fence:` claiming an oauth2-proxy that does not exist renders in the console
+# as denied to every group but PLATFORM-ADMIN, when the truth is that nobody is
+# gated. An absent knob can put a service in production serving 200 to any
+# caller, invisibly, so ops/ci/check-group-permissions-parity.sh refuses a
+# service with no door.
+services:
+  - name: netbird-dashboard
+    door: group-gated
+    description: >-
+      NetBird dashboard, everyday address — for LOOKING. On a goatnet under
+      mesh change control (ADR 1189, docs/design/mesh-change-control.md) it is
+      read-only twice over: its API endpoint forwards only GET/HEAD/OPTIONS,
+      and the NetBird role the admitted groups map to is `auditor`. On a
+      goatnet not yet under change control it is still the admin SPA. Writes
+      go to netbird-dashboard-admin.
+    surface: https://dashboard.<site>.<zone>/
+    fence: oauth2-proxy sidecar (oauth2-proxy-dashboard) admitting the groups granted below.
+    audit_point: traefik access log + oauth2-proxy structured log.
+
+  - name: netbird-dashboard-admin
+    door: group-gated
+    description: >-
+      NetBird dashboard, admin address — the one write door, a break-glass
+      repair path for the NETBIRD-ADMIN holders (ADR 1189). A second dashboard
+      container pointed at the full management API; every change to the
+      network otherwise goes through warrant.
+    surface: https://admin-dashboard.<site>.<zone>/
+    fence: oauth2-proxy sidecar with allowed-group NETBIRD-ADMIN; the holder's NetBird role is `admin` via netbird_mgmt_role_map.
+    audit_point: traefik access log + oauth2-proxy structured log + NetBird activity log; an undeclared change shows as warrant drift until adopted into git or reverted.
+
+  - name: netbird-mgmt-api
+    door: in-app
+    description: NetBird management REST API (peer CRUD, group CRUD, setup keys).
+    surface: https://mgmt.nova.netbird.nova.example/api/
+    fence: in-process JWT role check per endpoint; non-admin tokens get 403 from the API itself.
+    audit_point: netbird-mgmt structured logs.
+
+  - name: grafana
+    door: in-app
+    description: Observability dashboards.
+    surface: https://grafana.nova.netbird.nova.example/
+    fence: OIDC role-attribute mapping (GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH) with STRICT=true; identities without a *-ADMIN or *-READONLY group claim are refused at OAuth handshake.
+    audit_point: grafana access log + OIDC handshake log.
+
+  - name: portal
+    door: in-app
+    description: Vendor-facing topic / schema / cert registration for the Zenoh trial fabric.
+    surface: https://portal.nova.netbird.nova.example/
+    fence: >-
+      In-app, not a proxy fence. There is no oauth2-proxy in front of the
+      portal (no allowed-groups var in the role); the binary authenticates
+      against Kratos itself via AuthMiddleware and enforces per-org scope in
+      scopedHandler. The index page is public and renders a Sign in control —
+      probed on ZAGROS, an unauthenticated GET of / returns 200. This row read
+      "oauth2-proxy any-authenticated" until 2026-09-05.
+    audit_point: portal structured log + Zenoh ops/audit/portal/v1.
+
+  - name: panoscope
+    door: authenticated
+    description: Read-only Zenoh fabric Data-COP visualizer.
+    surface: https://panoscope.nova.netbird.nova.example/
+    fence: >-
+      oauth2-proxy-panoscope sidecar, any-authenticated at the door
+      (panoscope_oauth2_proxy_allowed_groups empty by role default) +
+      in-app viewer scoping from the groups header, panoscope_rbac_mode.
+      Probed on ZAGROS 2026-09-05: an unauthenticated GET of / returns 302
+      to the Kratos login flow. This row described the pre-ADR-1073
+      mesh-only IPAllowList as "deployed today" until that date; the
+      sidecar had already landed.
+    audit_point: panoscope structured log.
+
+  - name: relay-health
+    door: authenticated
+    description: Relay-fleet health dashboard (blackbox prober + throughput panels).
+    # The door is not the authorization boundary here — see `fence:` below.
+    # The grants further down still say who reads WHAT: PLATFORM-ADMIN admin
+    # (full document), IAM-ADMIN read (the reduced one, like everyone else).
+    surface: https://relay-health.<site>.<zone>/
+    fence: >-
+      oauth2-proxy sidecar (oauth2-proxy-relay-health) admitting ANY
+      authenticated identity — the door is not the authorization boundary
+      here. Detail is: nginx maps X-Auth-Request-Groups to the full or the
+      reduced document (ADR 1066), fail-closed to reduced, with the full view
+      restricted to PLATFORM-ADMIN. IAM-ADMIN administers identities and has
+      no operational need for relay internals, so it reads reduced like
+      everyone else. Gating the DOOR on an admin group instead made the page
+      all-or-nothing and handed IAM-ADMIN detail it does not need.
+    audit_point: traefik access log + oauth2-proxy structured log.
+
+  - name: isitup
+    door: authenticated
+    description: Per-site service status page.
+    surface: https://isitup.nova.netbird.nova.example/
+    fence: oauth2-proxy any-authenticated.
+    audit_point: isitup structured log.
+
+  - name: brief
+    door: authenticated
+    description: GOAT-Net briefing surface (static deck).
+    surface: https://brief.nova.netbird.nova.example/
+    fence: >-
+      oauth2-proxy sidecar (oauth2-proxy-brief), any authenticated identity —
+      no group is refused. Attribution, not refusal: Hydra records the visit.
+      Mesh-only until 2026-09-05; the door was taken down 2026-09-06 (#726, deployed ahead of review) and put back the same day through review; the Traefik IP allowlist stays as defence in
+      depth. A static deck, so it declares no API routes.
+    audit_point: traefik access log.
+
+  - name: dataflows
+    door: authenticated
+    description: Data Flow Patterns static deck.
+    surface: https://dataflows.nova.netbird.nova.example/
+    fence: >-
+      oauth2-proxy sidecar (oauth2-proxy-dataflows), any authenticated identity
+      — no group is refused. Attribution, not refusal: Hydra records the visit.
+      Mesh-only until 2026-09-05; the door was taken down 2026-09-06 (#726, deployed ahead of review) and put back the same day through review; the Traefik IP allowlist stays as defence in
+      depth. A static deck, so it declares no API routes.
+    audit_point: traefik access log.
+
+  - name: demogame
+    door: authenticated
+    description: Demo Game Classic game + shared leaderboard; the fabric demo (/demo) inside it is platform-admin only.
+    surface: https://demogame.<site>.<zone>/
+    fence: >-
+      oauth2-proxy sidecar (oauth2-proxy-demogame), any authenticated
+      identity — no group is refused at the door. The door exists for
+      ATTRIBUTION: Hydra records one consent grant per visitor, which is what
+      makes this surface answerable in microscope. Mesh-only until 2026-09-05;
+      the door was taken down 2026-09-06 (#726, deployed ahead of review) and
+      put back the same day through review, when the Traefik IP allowlist was
+      the only gate and no identity was ever recorded; the allowlist stays as
+      defence in depth. The websocket, the score stream and the polled
+      leaderboard are declared API routes so a dropped connection 401s instead
+      of minting a CSRF cookie per retry, and /health and /metrics skip
+      auth because the Prometheus blackbox job reaches them through this front
+      door with no cookie jar. ONE in-app gate behind the door (2026-09-11):
+      GET /demo — the eight-bot fabric demo that fills the whole co-op room —
+      and the DEMO button that opens it render only for the groups in
+      demogame_demo_admin_groups (PLATFORM-ADMIN), read from the door's
+      unforgeable X-Forwarded-Groups (demo_auth.go). That is the `admin` grant
+      below; everyone else plays at / and /mp.
+    audit_point: demogame structured log.
+
+  - name: help
+    door: mesh-only
+    description: "Help desk (ADR 1176): FAQ, triage and tickets. Designed; no instance is deployed on any goatnet. The first upstream (HESK on the partner peer zagros-helpdesk) left ZAGROS on 2026-09-23 and its status row was withdrawn 2026-10-31."
+    surface: "https://help.<site>.<zone>/"
+    fence: >-
+      DESIGNED as an authenticated door (oauth2-proxy-help, no group refused;
+      identity reaches the desk as X-Forwarded-User / -Email / -Groups, every
+      visit a SurfaceVisitV1) — authored 2026-09-10 with
+      help_oauth2_proxy_enabled false on every goatnet, so this row says what
+      runs today: the Traefik mesh-only allowlist and nothing else. At go-live
+      this door becomes `authenticated` and `help` joins COVERED in
+      ops/ci/check-group-permissions-parity.sh, in the same change that flips
+      the flag; the go-live order is written beside the flag in
+      ops/ansible/group_vars/zagros_hosts/vars.yml.
+    audit_point: "none until the door is on; then the door's request log (SurfaceVisitV1)."
+
+  - name: id-admin-console
+    door: group-gated
+    description: This admin console itself (manages users + groups + invites).
+    surface: https://admin.auth.nova.netbird.nova.example/
+    fence: oauth2-proxy sidecar with --allowed-group=ADMINS + in-handler re-check + step-up AAL2 on sensitive mutations (ADR 0860).
+    audit_point: console structured log + Zenoh ops/audit/id-console/v1.
+
+  - name: compliance-dashboard
+    door: group-gated
+    description: AWS-native cloud-compliance dashboard, mesh-fronted per ADR 1029 (aws-sigv4-proxy behind the gate).
+    surface: https://compliance.<site>.<zone>/
+    fence: oauth2-proxy sidecar with --allowed-group=COMPLIANCE (oauth2-proxy-compliance).
+    audit_point: traefik access log + oauth2-proxy structured log.
+
+  - name: netvis
+    door: group-gated
+    description: "Mesh reachability at five levels (site, class, group, machines, one pair) plus curated reachability APIs. Read-only. Renders the ENTIRE ACL of a goatnet, which is why the door is a group gate rather than authenticated-only."
+    surface: "https://netvis.<site>.<zone>/"
+    fence: "oauth2-proxy sidecar (oauth2-proxy-netvis) gated to the matrix admin groups, plus the binary's own fail-closed check on X-Forwarded-Groups: a missing header admits nobody, so a misconfigured proxy cannot expose the ACL. This row said X-Auth-Request-Groups until F-320: the app really did read that header, the sidecar never sets it, and the fence therefore admitted NOBODY while being forgeable by any authenticated caller. The one file a reviewer reads to learn what a door is was documenting the broken wiring."
+    audit_point: "oauth2-proxy structured log."
+
+  - name: herd
+    door: group-gated
+    description: "Bearer-gear console (ADR 1131): an interactive browser session — SSH, the Cisco IOS-XE CLI hop, guestshell, RDP — to NETWORK-class transport gear ONLY. Never a goat host node: host shell is `authorized_keys` per the one-door rule, and herd is deliberately not a second door onto it. The SSH egress leaves from a separate NETWORK-JUMP peer, not from the console."
+    surface: "https://herd.<site>.<zone>/"
+    fence: "TWO gates, both required, and the second is the point. (1) oauth2-proxy sidecar; herd reads ONLY the unforgeable X-Forwarded-* family, never X-Auth-Request-*. (2) the site-scoped `network_admin` entitlement in the registry (ADR 1113 §3), read per-session from GET /api/machines/grant/{custodian}. A herd role alone opens nothing. The second gate exists so a person's console access and their entitlement are the SAME RECORD — one revoke cuts both, which is what the one-door rule demands of any second path to a device. Fail-closed throughout: an unreachable portal denies, an unclassified or stale-classified node denies, and a node that is not NETWORK-class denies."
+    audit_point: "oauth2-proxy structured log, plus a person-attributed OperatorActionV1-shaped row per session AND per denial (surface=herd). Attribution is the whole point here: every session leaves through one shared service key, so the host sees a single account and `actor` is the only field distinguishing two admins."
+
+  - name: microscope
+    door: group-gated
+    description: Per-entity behavior lens (ADR 1090) — capability + activity timeline + denials for one entity. Read-only identity-administration surface.
+    surface: https://microscope.<site>.<zone>/
+    fence: oauth2-proxy sidecar (oauth2-proxy-microscope, mirrors ADR 0860) + in-app X-Forwarded-Groups PEP.
+    audit_point: view-audit JSONL (every look, incl. refused) + oauth2-proxy structured log.
+
+  - name: consistency-console
+    door: group-gated
+    description: CF-6 consistency console (ADR 1110 D5) — read-only projection of the consistency rollup; renders grades + verbatim remediation pointers, executes nothing. The page names hosts and prints operator commands, so its audience is the group that runs them (consistency-foundation.md §7.2).
+    surface: https://consistency.<site>.<zone>/
+    fence: oauth2-proxy sidecar (oauth2-proxy-consistency-console, mirrors ADR 0860).
+    audit_point: traefik access log + oauth2-proxy structured log.
+
+  - name: consistency-aggregator
+    door: group-gated
+    description: >-
+      CF-7 hosted cross-goatnet aggregator (consistency-foundation.md §7.8
+      as-built) — the same console binary in --aggregate mode on the zagros-prod
+      cloud relay-health host; cross-env drift view + aggregate-v1 API.
+      Operator decision 2026-08-11: the audience is the TEAM, not the admin
+      group — the page is read-only drift state, and the team's identities
+      live on the ZAGROS roster + public Dex plane, not zagros-prod's Hydra (the
+      hydra-groups fence 403'd every teammate and needed the zagros-prod mesh to
+      even complete login).
+    surface: https://consistency.zagros-prod.goat.example/
+    fence: >-
+      oauth2-proxy sidecar (oauth2-proxy-consistency-aggregator) in
+      dex-allowlist mode — the relay-health public-door ceremony (ADR 1061
+      Phase 2): public Dex broker + the roster-synced authenticated-emails
+      file (ADR 1093 auto-sync from the ZAGROS Thor), so the door follows ZAGROS
+      active membership. The allowed-groups grant below applies to the
+      hydra-groups gate mode only (dormant on this deployment); the
+      parity-ratcheted var stays PLATFORM-ADMIN so a gate-mode flip-back
+      restores the admin fence, not an open door.
+    audit_point: relay-health traefik access log + oauth2-proxy structured log.
+
+# Groups known to the matrix. A group not listed here is treated by the
+# console as "unknown — grants nothing canonical, may grant ambient
+# any-authenticated access." That ambient default is itself a finding
+#; rows below describe the deliberate enforcement, not the
+# ambient surface.
+groups:
+  # Target name of the ADMINS rename (reads clearly beside IAM-ADMIN). Exact grant
+  # mirror of ADMINS for the dual-accept window; the ADMINS rows retire at
+  # contract once the id-console's hardcoded ADMINS checks are ported.
+  - name: PLATFORM-ADMIN
+    description: Runs the platform — every admin surface and every read surface.
+    details: >-
+      The full administrator group. It succeeds the older ADMINS name; both are
+      honoured while accounts move over, then ADMINS retires.
+    grants:
+      # netbird-dashboard / netbird-mgmt-api `admin`: the door admits this
+      # group on every goatnet. The NetBird ROLE behind it is per goatnet —
+      # admin where no role map is set, auditor (read-only) on a goatnet under
+      # mesh change control, where writing needs NETBIRD-ADMIN (ADR 1189).
+      - { service: netbird-dashboard,   access: admin }
+      - { service: netbird-mgmt-api,    access: admin }
+      - { service: id-admin-console,    access: admin }
+      - { service: portal,              access: admin }
+      - { service: relay-health,        access: admin }
+      - { service: microscope,          access: read }
+      - { service: netvis,              access: read }
+      - { service: consistency-console, access: read }
+      - { service: consistency-aggregator, access: read }
+      # herd: admin because holding the row is not what authorises a session —
+      # the network_admin entitlement is (ADR 1131). This grant opens the
+      # console; the entitlement opens a switch.
+      - { service: herd,                access: admin }
+      - { service: panoscope,           access: read }
+      - { service: isitup,              access: read }
+      # brief and dataflows carry NO grant rows: their door admits any login
+      # and refuses no group, so a grant here would describe nothing the fence
+      # enforces — the console once rendered one as "PLATFORM-ADMIN plays,
+      # nobody else does". demogame is the exception :
+      # `admin` here is the in-app fabric-demo gate (/demo + the DEMO button),
+      # enforced by the game from the door's X-Forwarded-Groups; playing is
+      # still any login.
+      - { service: demogame,        access: admin }
+
+  # ADR 1189 (docs/design/mesh-change-control.md). Held by the named people
+  # who may WRITE to NetBird from the admin dashboard address; granted and
+  # removed with `goat admin role`, which writes an operator-action record.
+  # Maps to the NetBird `admin` role through netbird_mgmt_role_map; on a
+  # governed goatnet PLATFORM-ADMIN and IAM-ADMIN map to `auditor`.
+  - name: NETBIRD-ADMIN
+    description: Writes to the NetBird dashboard from its admin address (break-glass repair).
+    details: >-
+      The one write door onto the mesh control plane. Everyone else who opens
+      the dashboard looks and cannot change anything; every routine change is
+      made through warrant. Holders reach the everyday dashboard through the
+      PLATFORM-ADMIN or IAM-ADMIN they also hold, not through this group.
+    grants:
+      - { service: netbird-dashboard-admin, access: admin }
+      - { service: netbird-mgmt-api,        access: admin }
+
+  - name: GRAFANA-ADMIN
+    description: Edits Grafana dashboards and folders.
+    grants:
+      - { service: grafana, access: admin }
+
+  - name: GRAFANA-READONLY
+    description: Views Grafana dashboards; cannot edit.
+    grants:
+      - { service: grafana, access: read }
+
+  # NOTE (ADR 1073/1074): the observability groups deliberately carry NO
+  # panoscope grant. Platform-obs privilege (Grafana/MinIO dashboards) and
+  # mission-DATA visibility are different axes. The data-access axis has
+  # its own SoT — ops/permissions/data-access-roles.yaml (ADR 1074):
+  # lowercase `data.*` grammar values in the same Ory claim, never rows in
+  # this file. This file keeps only the platform axis + the ONE declared
+  # cross-axis implication: the ADMINS panoscope `read` row IS its SoT
+  # implication to data.view.all, and CI (check-data-access-roles.sh)
+  # holds the two files in lock-step — never change one without the other.
+  - name: OBS-ADMIN
+    description: Edits every observability surface (today that is Grafana).
+    details: >-
+      Superset over the observability surfaces: Grafana now, OpenObserve and the
+      MinIO console when they arrive. Until then it is equivalent to GRAFANA-ADMIN.
+      Observability only — never platform admin.
+    grants:
+      - { service: grafana,   access: admin }
+
+  - name: OBS-READONLY
+    description: Views every observability surface; cannot edit.
+    grants:
+      - { service: grafana,   access: read }
+
+  # Composed tier per docs/design/onboard-tier-role-model.md §4 Option A — the
+  # mesh role stays MONITOR and the mutate capability rides operator-roster
+  # credentials; this Ory group gates the IAM consoles + diagnostics read. The
+  # L7 fences carry IAM-ADMIN alongside ADMINS (ADR 1073, CI parity-checked).
+  # Panoscope is `scoped`, NOT `read` — RATIFIED by the identity owner
+  # IAM-ADMIN controls others' access (the access COP, grant
+  # administration); it does not hold standing all-mission-data view.
+  - name: IAM-ADMIN
+    description: "Manages people and machines: mesh peers, groups and setup keys, Ory accounts, and fabric access grants."
+    details: >-
+      Identity and access administration only. Creates, rotates and revokes
+      credentials, edits who may reach what, and reads the security diagnostics
+      (anomalies, floods, usage). Not a platform administrator — no infrastructure
+      or service control beyond the identity consoles — and not a developer. On
+      panoscope this group sees a scoped view, not all mission data: it administers
+      other people's access rather than holding standing access itself.
+    grants:
+      - { service: netbird-dashboard, access: admin }
+      - { service: netbird-mgmt-api,  access: admin }
+      - { service: id-admin-console,  access: admin }
+      - { service: portal,            access: admin }
+      - { service: relay-health,      access: read }
+      - { service: microscope,        access: read }
+      - { service: netvis,            access: read }
+      - { service: grafana,           access: read }
+      - { service: panoscope,         access: scoped }
+      - { service: isitup,            access: read }
+      # Consistency surfaces widened by operator decision (bus
+      # msg p1522: PLATFORM-ADMIN + network admins + IAM admins all view).
+      # This supersedes the CF-6 exclusion ("IAM-ADMIN's charter excludes
+      # infra surfaces") for these two read-only drift pages. Note there is
+      # NO network-admin GROUP to grant — ADR 1113 rejected a NETWORK-ADMIN
+      # role (the capability is what PLATFORM-ADMIN names; site scoping is
+      # an entitlement, not an Ory group), so network admins view either as
+      # PLATFORM-ADMIN or through the aggregator's roster-allowlist door.
+      - { service: consistency-console,    access: read }
+      - { service: consistency-aggregator, access: read }
+
+  # ADR 1029. Granted/revoked via goat admin onboard. Was live-enforced but
+  # undeclared previously (plane-matchup finding) — this row codifies the
+  # existing oauth2-proxy-compliance gate.
+  - name: COMPLIANCE
+    description: Views the cloud-compliance dashboard.
+    details: >-
+      Granted and revoked as part of operator onboarding.
+    grants:
+      - { service: compliance-dashboard, access: read }
+
+# Access-level vocabulary.
+#   admin  — full mutation rights, including identity/permission management on the resource.
+#   write  — mutation rights on the user's own scope (e.g. vendor on their own topics) but not on others'.
+#   read   — read-only, unrestricted view.
+#   scoped — read-only, filtered to the viewer's own scope (ADR 1073 viewer
+#            tiers: e.g. a participant sees own-org nodes/topics + infra +
+#            ops environment-health on panoscope, not the whole fabric).
+#   play   — read + interactive but no admin (game leaderboard submission counts as play).
+#   none   — explicit "not granted" (used when overriding ambient default).
+access_levels:
+  - admin
+  - write
+  - read
+  - scoped
+  - play
+  - none
+
+# Step-up thresholds. The id-admin-console requires AAL2 step-up before
+# completing any mutation whose target is on this list — WHEN step-up is
+# enforced for the goatnet (STEP_UP_ENFORCED, default true; a sandbox goatnet
+# may set it false so these actions proceed-and-audit rather than 403 every
+# admin while no AAL2 signal is wired). See docs/design/id-admin-console.md
+# §"Step-up enforcement policy".
+step_up_required:
+  - grant_PLATFORM-ADMIN        # promoting any identity to PLATFORM-ADMIN group
+  - revoke_PLATFORM-ADMIN       # demoting a PLATFORM-ADMIN-bearing identity
+  - delete_identity             # any delete-identity action
+  - revoke_sessions_of_admin    # revoking sessions of an identity holding PLATFORM-ADMIN
+  - reset_2fa                   # clearing a user's second factor (admin 2FA reset, PR #168)
+  - offboard_identity           # queueing the real offboard cut from the console (goat#372)
+  - release_hold                # restoring a dormancy hold's recorded mesh membership

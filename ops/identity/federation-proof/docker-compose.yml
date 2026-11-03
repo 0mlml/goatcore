@@ -1,0 +1,83 @@
+# federation-proof — prove toggle-switch PATH #1 (upstream_oidc) end-to-end,
+# fully local, no external dependency. A mock OIDC upstream stands in for an
+# enterprise CAC-validating IdP (EAMS-A / Azure Gov); Kratos federates to it with
+# the same oidc-broker block + _mock claim-map the real deploy uses.
+#
+# Proves: login via an external OIDC IdP → Kratos mints a NATIVE identity whose
+# the minted identity carries metadata_public.external_subjects (issuer,client_id,subject)+last_assurance
+# snapshot, with external claims mapped through the declarative jsonnet. This is the
+# design's definition-of-done (docs/design/external-icam-federation.md).
+#
+# Run: ./run.sh   (see README.md)
+services:
+  # Mock OIDC provider — issues id_tokens with arbitrary claims. A single container,
+  # no config needed for the default issuer; we point Kratos at its discovery doc.
+  mock-oidc:
+    image: ghcr.io/navikt/mock-oauth2-server:2.1.10
+    environment:
+      # Bind the issuer to a name both the browser/curl AND Kratos resolve identically.
+      JSON_CONFIG: >-
+        {"interactiveLogin": false,
+         "httpServer": "NettyWrapper",
+         "tokenCallbacks": [
+           {"issuerId": "goatproof",
+            "requestMappings": [
+              {"requestParam": "grant_type", "match": "authorization_code",
+               "claims": {"sub": "mock-pairwise-001",
+                          "email": "person-29@example.org",
+                          "name": "CAC User",
+                          "acr": "aal2",
+                          "groups": ["goat-admins"]}}]}]}
+    ports:
+      - "8474:8080"   # host access for debugging; mock listens on 8080 internally
+    networks: [proof]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kratos
+      POSTGRES_PASSWORD: kratos
+      POSTGRES_DB: kratos
+    networks: [proof]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kratos"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  kratos-migrate:
+    image: oryd/kratos:v1.3.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DSN: "postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable"
+    command: ["migrate", "-c", "/etc/config/kratos.yaml", "sql", "-e", "--yes"]
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity-schema.json:/etc/config/identity-schema.json:ro
+      - ../claim-maps:/etc/config/claim-maps:ro
+    networks: [proof]
+
+  kratos:
+    image: oryd/kratos:v1.3.1
+    depends_on:
+      kratos-migrate:
+        condition: service_completed_successfully
+    environment:
+      DSN: "postgres://kratos:kratos@postgres:5432/kratos?sslmode=disable"
+      # The mock provider's client secret via the SAME env-override path the real
+      # ory role uses (providers[0]).
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_CLIENT_SECRET: "proof-secret"
+    command: ["serve", "-c", "/etc/config/kratos.yaml", "--dev", "--watch-courier"]
+    volumes:
+      - ./kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./identity-schema.json:/etc/config/identity-schema.json:ro
+      - ../claim-maps:/etc/config/claim-maps:ro
+    ports:
+      - "4433:4433"   # public
+      - "4434:4434"   # admin
+    networks: [proof]
+
+networks:
+  proof: {}

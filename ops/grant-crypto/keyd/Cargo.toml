@@ -1,0 +1,69 @@
+# grant-keyd — the E1 key-distribution service (data-access M2.1). Carries the
+# concrete integration seams the pure `grant-crypto::service` state machine leaves
+# as traits: the native-Zenoh bundle publisher (here) and, later, the HTTP audience
+# resolver + the daemon loop. The heavy transport dep tree (zenoh, ~380 crates)
+# lives HERE, never in the CI-fast crypto core.
+[package]
+name = "grant-keyd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "E1 key-distribution service: native-Zenoh publisher for grant-keyed encryption bundles"
+license = "Apache-2.0"
+publish = false
+
+# Standalone workspace: grant-keyd is the goat/Zenoh integration daemon and lives
+# deliberately OUTSIDE `../sdk/` so its heavy zenoh tree (~380 crates) never enters
+# the fast SDK build. An empty `[workspace]` table pins it as its own root with its
+# own lockfile — it is not absorbed by any parent workspace.
+[workspace]
+
+[features]
+# The native-Zenoh publisher + the daemon binary + the live examples need zenoh
+# (~380 crates). ON by default so grant-keyd's own build/CI/image are unchanged.
+# A pure consumer of the datapath + svid modules (e.g. goat-cli's sealed pub/sub)
+# depends with default-features = false to skip the whole transport tree.
+default = ["publisher"]
+publisher = ["dep:zenoh"]
+
+[[bin]]
+name = "grant-keyd"
+required-features = ["publisher"]
+
+[[example]]
+name = "producer"
+required-features = ["publisher"]
+
+[[example]]
+name = "consumer"
+required-features = ["publisher"]
+
+[dependencies]
+grant-crypto = { path = "../sdk/core", version = "0.1.0" }
+zenoh = { version = "1.9", optional = true }
+# Sync HTTP client for the portal resolver (GET /api/access/data-roles). Sync by
+# design — matches the daemon's poll-and-publish loop; no async runtime. The
+# `json` feature provides Response::into_json (serde-backed body decode).
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Recipient-key provider: parse a member's P-256 public key from a cert PEM (SVID
+# leaf) or a raw public-key PEM. `pem` = PEM decode; must match the core's p256.
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pkcs8", "pem"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+# SVID validation: rustls-webpki does the vetted chain + signature + validity + EKU
+# path validation (handles intermediates, so it survives a future SPIRE
+# UpstreamAuthority); the `ring` backend is already in the tree via zenoh (no new
+# crypto backend). x509-cert extracts the SPIFFE-ID URI-SAN + P-256 key.
+rustls-webpki = { version = "0.103", features = ["ring", "std"] }
+rustls-pki-types = "1"
+
+[dev-dependencies]
+# Building recipient key material for the transport proof + recipient tests.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Generating a real P-256 self-signed cert to exercise the cert-PEM parse path.
+rcgen = "0.13"
+# Unique temp-dir names in tests.
+hex = "0.4"
+# Explicit cert validity windows in the SVID-expiry test.
+time = "0.3"

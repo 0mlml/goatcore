@@ -1,0 +1,66 @@
+# repo-access.yaml — role/identity → GitHub repo collaborator grants at onboarding.
+#
+# CONFIG-DRIVEN BY DESIGN. Repos come and go and role→repo policy changes over
+# time; this file is the source of truth so that change is an EDIT here, never a
+# code change or redeploy. The console reads it FRESH at each provision, so an
+# operator edit takes effect on the next onboard without restarting the service.
+#
+# The GitHub token is NOT in this file (no plaintext secrets on disk, per
+# CLAUDE.md Credentials). The console resolves it at runtime from
+# $GITHUB_ONBOARD_TOKEN — a fine-grained PAT with `Administration: write` on the
+# repos below (the scope required to add a collaborator). If the token is unset,
+# repo grants are SKIPPED (logged), never fail the onboard.
+#
+# Path: pointed at by $REPO_ACCESS_CONFIG (default
+# /etc/goat-id-console/repo-access.yaml). Absent file = feature off (no grants).
+
+version: 1
+
+# Default GitHub org for any `repo:` written without an `owner/` prefix.
+default_owner: usareur-af
+
+# Rules are evaluated in order; a person gets the UNION of every matched rule's
+# grants (deduped by repo, strongest permission wins). A grant is attempted only
+# if the candidate supplied a github_username. `match` is AND across keys, OR
+# within a key's list; an empty/absent match matches everyone (who has a github
+# username). Match keys (all optional, extend additively): tier, affiliation_kind,
+# coalition, sector, nation.
+rules:
+  - name: developers-moon-pod
+    description: Developers + platform admins get the co-development repo.
+    match:
+      tier: [developer, platform-admin]
+    grant:
+      - repo: example-project          # owner defaults to default_owner
+        permission: pull
+
+  - name: developer-examples
+    description: Developers get the hello-galaxy example repos to build against.
+    match:
+      tier: [developer]
+    grant:
+      - repo: hello-galaxy-access-mgmt
+        permission: pull
+
+  - name: platform-admin-infra
+    description: Platform admins get push on the infra repo.
+    match:
+      tier: [platform-admin]
+    grant:
+      - repo: usareur-af-infra
+        permission: push
+
+  # Example of an affiliation/coalition-scoped rule (the coalition-standing hook,
+  # ADR 1077): a partner developer who is a MEMBER of the goatnet's active
+  # coalition framework could receive a coalition-shared repo a non-member
+  # partner would not. `sector` (military | law-enforcement | civil-government)
+  # is an additional additive match key for interagency scoping. Left commented —
+  # a template, not a live grant.
+  # - name: coalition-partner-shared
+  #   match:
+  #     tier: [developer]
+  #     affiliation_kind: [partner]
+  #     coalition: [member]
+  #   grant:
+  #     - repo: coalition-shared-examples
+  #       permission: pull

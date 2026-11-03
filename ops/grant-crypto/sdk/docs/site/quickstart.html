@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>grant-crypto SDK — Quickstart</title>
+  <meta name="description" content="Fetch, verify, and build the SDK, then walk the one obvious path — identity, acquire, seal, verify, admit, open, rotate — in Rust, Go, Python, and TypeScript.">
+  <link rel="stylesheet" href="styles.css">
+  <script>document.documentElement.classList.add('js');</script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="index.html" class="wordmark">grant-crypto</a>
+      <span class="ver" aria-label="SDK version"></span>
+    </div>
+    <p class="brand-tag">Endpoint forward secrecy, by construction.</p>
+    <nav aria-label="Documentation">
+      <p class="nav-group">Start</p>
+      <a href="index.html">Overview</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="quickstart.html" aria-current="page">Quickstart</a>
+      <p class="nav-group">Reference</p>
+      <a href="api.html">API</a>
+      <a href="capi.html">C ABI</a>
+      <a href="wire.html">Wire format</a>
+      <p class="nav-group">Operate</p>
+      <a href="security.html">Security</a>
+      <a href="troubleshooting.html">Troubleshooting</a>
+    </nav>
+    <p class="theme-note">The language tabs below need no JavaScript to be useful &mdash; without it, every language is shown in full.</p>
+  </aside>
+
+  <div class="content">
+    <main id="main">
+      <p class="eyebrow">Quickstart</p>
+      <h1>From download to first roundtrip</h1>
+      <p class="lede">Fetch a prebuilt library (or build from source), verify its checksum, then walk the one obvious path &mdash; a producer seals, a consumer verifies, admits its slot, and opens, and the member rotates its leaf &mdash; in the language of your choice.</p>
+
+      <h2>1. Fetch and verify</h2>
+      <p>On-mesh, the SDK is served at <code>get.&lt;site&gt;.&lt;zone&gt;/sdk/</code>. The fastest path, when you just want to link a binding, is the prebuilt C ABI library for your platform:</p>
+      <figure class="codeblock">
+        <figcaption>Prebuilt library — fetch, verify, unpack</figcaption>
+        <pre><code>base=https://get.zagros.netbird.zagros.example/sdk
+lib=grant-crypto-capi-linux-amd64.tar.gz     <span class="cmt"># pick your platform</span>
+curl -fsSL "$base/$lib"        -o "$lib"
+curl -fsSL "$base/$lib.sha256" -o "$lib.sha256"
+sha256sum -c "$lib.sha256"     <span class="cmt"># macOS: shasum -a 256 -c "$lib.sha256"</span>
+tar xzf "$lib"                 <span class="cmt"># -&gt; .so/.dylib, libgrant_crypto_capi.a, include/, INSTALL.txt</span></code></pre>
+      </figure>
+
+      <p>To build the library yourself (an unlisted platform) or to run the test suites, take the source tarball instead:</p>
+      <figure class="codeblock">
+        <figcaption>From source — fetch, verify, build</figcaption>
+        <pre><code>base=https://get.zagros.netbird.zagros.example/sdk
+src=grant-crypto-sdk-0.1.0-src.tar.gz        <span class="cmt"># name carries the version</span>
+curl -fsSL "$base/$src"        -o "$src"
+curl -fsSL "$base/$src.sha256" -o "$src.sha256"
+sha256sum -c "$src.sha256"
+tar xzf "$src"
+cd grant-crypto/sdk
+cargo build -p grant-crypto-capi   <span class="cmt"># shared + static library under target/</span>
+cargo test                          <span class="cmt"># optional: conformance + roundtrip suites</span></code></pre>
+      </figure>
+
+      <div class="note">
+        <span class="callout-label">Always verify</span>
+        <p>Every artifact ships a sibling <code>.sha256</code>, and the release also carries an aggregate <code>SHA256SUMS</code>. Verify before use. The core and the C ABI ship in lockstep from one tag &mdash; pull the library and the source from the same release.</p>
+      </div>
+
+      <h2>2. Point your binding at the library</h2>
+      <p>Each binding&rsquo;s own <code>README.md</code> (shipped in the source tarball at <code>grant-crypto/sdk/bindings/&lt;lang&gt;/</code>) is the authoritative, CI-tested setup. The essentials:</p>
+      <div class="table-wrap">
+        <table>
+          <caption>Toolchain floor and how each binding finds the native library.</caption>
+          <thead><tr><th>Language</th><th>Floor</th><th>Locate the native</th></tr></thead>
+          <tbody>
+            <tr><td>Rust (core crate)</td><td>Rust &ge; 1.88</td><td class="wrap"><code>cargo add --path core</code> &mdash; no C ABI, links the crate directly</td></tr>
+            <tr><td>Go</td><td>Go &ge; 1.22</td><td class="wrap">cgo over <code>libgrant_crypto_capi.a</code>; point the cgo <code>LDFLAGS</code> search path at the unpacked static library. <code>CGO_ENABLED=1</code> (default).</td></tr>
+            <tr><td>Python</td><td>Python &ge; 3.8</td><td class="wrap">stdlib <code>ctypes</code>; set <code>GRANT_CRYPTO_CAPI_LIB</code> to the directory or file of the shared library.</td></tr>
+            <tr><td>TypeScript / Node</td><td>Node &ge; 20</td><td class="wrap">koffi loads the shared library at runtime from <code>GRANT_CRYPTO_CAPI_LIB</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>3. The one obvious path</h2>
+      <p>Every language walks the same flow &mdash; <code>identity &rarr; acquire &rarr; seal &rarr; verify &rarr; admit &rarr; open &rarr; rotate</code> &mdash; and each ships a runnable, CI-tested example so the code below can&rsquo;t rot. The snippets are the shipped binding quickstarts; the expected output is from the runnable example that exercises the same flow.</p>
+
+      <div class="tabs">
+        <div class="tablist" role="tablist" aria-label="Quickstart language">
+          <button role="tab" id="tab-rust" aria-controls="panel-rust" aria-selected="true">Rust</button>
+          <button role="tab" id="tab-go" aria-controls="panel-go" aria-selected="false">Go</button>
+          <button role="tab" id="tab-py" aria-controls="panel-py" aria-selected="false">Python</button>
+          <button role="tab" id="tab-ts" aria-controls="panel-ts" aria-selected="false">TypeScript</button>
+        </div>
+
+        <section class="lang-panel" id="panel-rust" role="tabpanel" aria-labelledby="tab-rust">
+          <h3 class="panel-heading">Rust</h3>
+          <p>The core crate directly &mdash; no C ABI. Parse the signed bundle off the fabric, <code>acquire</code> your producer key and <code>seal</code> under a <code>Context</code> (the required typed topic binding), <code>admit</code>/<code>open</code> as the consumer, then <code>rotate</code> your leaf.</p>
+          <figure class="codeblock">
+            <figcaption>bindings — Rust core crate (sdk/README.md)</figcaption>
+            <pre><code>use grant_crypto::datapath::{acquire_stream_key, Context, KeyStore};
+use grant_crypto::rotate::{rotate, Identity, RotationPolicy};
+use grant_crypto::{secret_from_scalar, verify_bundle, verifying_key_from_spki, KeyBundle};
+
+let bundle: KeyBundle = serde_json::from_slice(bundle_json)?;
+let bundles = std::slice::from_ref(&bundle);
+let member = secret_from_scalar(member_scalar)?; <span class="cmt">// raw 32-byte P-256 scalar</span>
+
+<span class="cmt">// Producer: acquire a seal-capable key from your own slot, then seal.</span>
+let mut sk = acquire_stream_key("example-set", bundles, "member", &member)?;
+let env = sk.seal(Context("data/example-set/feed"), b"example snapshot")?;
+
+<span class="cmt">// Consumer: verify, admit, open.</span>
+verify_bundle(&bundle, &verifying_key_from_spki(vk_spki_der)?)?;
+let mut ks = KeyStore::new();
+ks.admit(&bundle, "member", &member)?;
+let plaintext = ks.open(Context("data/example-set/feed"), &env)?;
+
+<span class="cmt">// Rotate: destroy-by-default forward secrecy (re-wraps nothing).</span>
+let id = Identity::from_scalar("member", member_scalar)?;
+let (id, receipt, _rewrapped) = rotate(id, next_secret, RotationPolicy::Destroy, bundles);</code></pre>
+          </figure>
+          <p><code>plaintext</code> recovers the sealed bytes (<code>b"example snapshot"</code>); <code>seal</code> refuses with <code>Error::RotationRequired</code> at the cumulative message-count cap (<code>DEFAULT_SEAL_CAP = 2&sup2;&#8308;</code>), and held DEKs zeroize on drop. The runnable proof is the core crate&rsquo;s <code>cargo test</code> (roundtrip + conformance suites).</p>
+        </section>
+
+        <section class="lang-panel" id="panel-go" role="tabpanel" aria-labelledby="tab-go" hidden>
+          <h3 class="panel-heading">Go</h3>
+          <p>A thin cgo binding, zero Go dependencies. <code>defer Close()</code> every handle &mdash; <code>Close</code> is what zeroizes the secret material.</p>
+          <figure class="codeblock">
+            <figcaption>bindings/go/README.md</figcaption>
+            <pre><code>import gc "github.com/usareur-af/goatcore/ops/grant-crypto/sdk/bindings/go"
+
+id, _ := gc.NewIdentity("example-set/member", memberScalar) <span class="cmt">// raw 32-byte P-256 scalar</span>
+defer id.Close()
+
+<span class="cmt">// Producer: acquire a seal-capable key from your own bundle slot, then seal.</span>
+sk, _ := gc.AcquireStreamKey(bundlesJSON, "example-set", id) <span class="cmt">// highest-gen slot for this id</span>
+defer sk.Close()
+envelope, _ := sk.Seal("data/example-set/feed", []byte("example snapshot"))
+
+<span class="cmt">// Consumer: verify the bundle, admit your slot, open the message.</span>
+if err := gc.VerifyBundle(bundleJSON, keyServiceVKDER); err != nil {
+    return err <span class="cmt">// bad signature — do not admit</span>
+}
+ks, _ := gc.NewKeyStore()
+defer ks.Close()
+if _, err := ks.Admit(id, bundleJSON); err != nil {
+    return err
+}
+plaintext, _ := ks.Open("data/example-set/feed", envelope)
+
+<span class="cmt">// Rotate: destroy-by-default forward secrecy (re-wraps nothing).</span>
+receiptJSON, _ := id.Rotate(nextScalar, false, bundlesJSON)</code></pre>
+          </figure>
+          <p>The complete runnable version is <code>bindings/go/example_test.go</code> (<code>go test -run Example ./...</code> &mdash; the <code>// Output:</code> block is checked, so it can never drift):</p>
+          <figure class="codeblock">
+            <figcaption>Expected output — example_test.go</figcaption>
+            <pre><code>opened: example snapshot
+seals remaining: 1
+rotation: destroy, 1 generation now unreadable</code></pre>
+          </figure>
+        </section>
+
+        <section class="lang-panel" id="panel-py" role="tabpanel" aria-labelledby="tab-py" hidden>
+          <h3 class="panel-heading">Python</h3>
+          <p>Pure stdlib <code>ctypes</code>, zero pip dependencies. Use <code>with</code> (or <code>.close()</code>) on every handle &mdash; that is what zeroizes the native material.</p>
+          <figure class="codeblock">
+            <figcaption>bindings/python/README.md</figcaption>
+            <pre><code>import grant_crypto as gc
+
+<span class="cmt"># member_scalar: your member's raw 32-byte P-256 enrollment scalar (bytes).</span>
+<span class="cmt"># bundle_json / envelope_json: wire bytes you received off the fabric.</span>
+<span class="cmt"># key_service_spki_der: the key service's verifying key (SPKI DER bytes).</span>
+
+with gc.Identity("example-set/con", member_scalar) as ident, gc.KeyStore() as ks:
+    gc.verify_bundle(bundle_json, key_service_spki_der)   <span class="cmt"># authenticate first</span>
+    if ks.admit(ident, bundle_json):                      <span class="cmt"># unwrap our slot</span>
+        plaintext = ks.open("data/example-set/feed", envelope_json)
+        print(plaintext)</code></pre>
+          </figure>
+          <p>A producer (a member of the release-set) acquires a stream key and seals; rotating a leaf is one call:</p>
+          <figure class="codeblock">
+            <figcaption>bindings/python/README.md — produce + rotate</figcaption>
+            <pre><code>with gc.Identity("example-set/prod", producer_scalar) as ident:
+    with gc.StreamKey.acquire(bundles_json, "example-set", ident) as sk:
+        envelope_json = sk.seal("data/example-set/feed", b"example snapshot")
+        <span class="cmt"># publish envelope_json on the topic; sk.remaining tells you seals left</span>
+
+    receipt = ident.rotate(new_scalar)   <span class="cmt"># Destroy (default): full forward secrecy</span>
+    <span class="cmt"># receipt: {"policy": "destroy", "now_unreadable_generations": N,</span>
+    <span class="cmt">#          "rewrapped_generations": 0, "timestamp_rfc3339": "...Z"}</span></code></pre>
+          </figure>
+          <p>The runnable example is <code>bindings/python/examples/quickstart.py</code> (<code>python3 examples/quickstart.py</code>):</p>
+          <figure class="codeblock">
+            <figcaption>Expected output — quickstart.py</figcaption>
+            <pre><code>opened: example snapshot
+seals remaining after one seal (cap 2): 1
+rotation receipt: {"member_id": "member", "now_unreadable_generations": 1, "policy": "destroy", "rewrapped_generations": 0, "timestamp_rfc3339": "...Z"}
+OK</code></pre>
+          </figure>
+        </section>
+
+        <section class="lang-panel" id="panel-ts" role="tabpanel" aria-labelledby="tab-ts" hidden>
+          <h3 class="panel-heading">TypeScript</h3>
+          <p>A thin binding over koffi. Call <code>close()</code> (or use <code>using</code>) on every handle &mdash; <code>close()</code> zeroizes the underlying secret in the core.</p>
+          <figure class="codeblock">
+            <figcaption>bindings/ts/README.md</figcaption>
+            <pre><code>import { Identity, KeyStore, StreamKey, verifyBundle } from "grant-crypto";
+
+const enc = new TextEncoder();
+
+<span class="cmt">// --- Producer: acquire a stream key from your visible bundles and seal ---</span>
+const id = Identity.create("example-set/prod", myScalar32);   <span class="cmt">// raw 32-byte P-256 scalar</span>
+const sk = StreamKey.acquire(bundlesJson, "example-set", id); <span class="cmt">// highest-gen slot for this id</span>
+const envelope = sk.seal("data/example-set/feed", enc.encode("example snapshot"));
+<span class="cmt">// publish `envelope` (bytes) on the "data/example-set/feed" key-expression</span>
+
+<span class="cmt">// --- Consumer: verify, admit, open ---</span>
+verifyBundle(bundleJson, keyServiceSpkiDer);   <span class="cmt">// throws BadSignatureError on a bad bundle</span>
+const ks = KeyStore.create();
+const hadSlot = ks.admit(id, bundleJson);      <span class="cmt">// false for an outsider is normal, not an error</span>
+const plaintext = ks.open("data/example-set/feed", envelope);
+
+<span class="cmt">// --- Always dispose (keys are zeroized on close) ---</span>
+sk.close(); ks.close(); id.close();</code></pre>
+          </figure>
+          <p>The runnable example is <code>bindings/ts/examples/quickstart.ts</code> (<code>npm run example</code>):</p>
+          <figure class="codeblock">
+            <figcaption>Expected output — quickstart.ts</figcaption>
+            <pre><code>opened: example snapshot
+seals remaining after one seal (cap 2): 1
+rotation receipt: {"member_id":"member","policy":"destroy","now_unreadable_generations":1,"rewrapped_generations":0,"timestamp_rfc3339":"...Z"}
+OK</code></pre>
+          </figure>
+        </section>
+      </div>
+
+      <div class="note">
+        <span class="callout-label">Where the inputs come from</span>
+        <p>The examples read their signed <code>KeyBundle</code> and key material from the committed cross-language conformance vectors &mdash; the same material every binding validates against &mdash; so they do not re-implement the key service. In production, bundles arrive off the fabric and the member scalar comes from the member&rsquo;s enrollment credential. The vectors&rsquo; <code>member</code> identity has a slot in the <code>base</code> bundle, so it acts as both producer and consumer.</p>
+      </div>
+
+      <div class="pagenav">
+        <a href="concepts.html"><span class="dir">Previous</span>&larr; Concepts</a>
+        <a class="next" href="api.html"><span class="dir">Next</span>API reference &rarr;</a>
+      </div>
+
+      <footer class="page-footer">
+        <span class="version-badge"></span>
+        <span>grant-crypto SDK &middot; ADR 1106 &middot; ships in-SDK, served at get.&lt;site&gt;/sdk/docs/</span>
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      var lists = document.querySelectorAll('.tablist');
+      Array.prototype.forEach.call(lists, function (list) {
+        var tabs = Array.prototype.slice.call(list.querySelectorAll('[role=tab]'));
+        var panels = tabs.map(function (t) { return document.getElementById(t.getAttribute('aria-controls')); });
+        function select(i) {
+          tabs.forEach(function (t, j) {
+            var on = i === j;
+            t.setAttribute('aria-selected', on ? 'true' : 'false');
+            t.tabIndex = on ? 0 : -1;
+            if (panels[j]) panels[j].hidden = !on;
+          });
+        }
+        tabs.forEach(function (t, i) {
+          t.addEventListener('click', function () { select(i); });
+          t.addEventListener('keydown', function (e) {
+            var n = tabs.length, k;
+            if (e.key === 'ArrowRight') k = (i + 1) % n;
+            else if (e.key === 'ArrowLeft') k = (i - 1 + n) % n;
+            else if (e.key === 'Home') k = 0;
+            else if (e.key === 'End') k = n - 1;
+            else return;
+            e.preventDefault(); select(k); tabs[k].focus();
+          });
+        });
+        select(0);
+      });
+    })();
+  </script>
+</body>
+</html>

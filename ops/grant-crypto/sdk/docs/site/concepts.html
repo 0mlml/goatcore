@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>grant-crypto SDK — Concepts</title>
+  <meta name="description" content="The mental model: release-sets, generations, DEKs and wrapping, bundles, why the platform can never decrypt, revocation as rotation, and forward secrecy as an endpoint property.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <a href="index.html" class="wordmark">grant-crypto</a>
+      <span class="ver" aria-label="SDK version"></span>
+    </div>
+    <p class="brand-tag">Endpoint forward secrecy, by construction.</p>
+    <nav aria-label="Documentation">
+      <p class="nav-group">Start</p>
+      <a href="index.html">Overview</a>
+      <a href="concepts.html" aria-current="page">Concepts</a>
+      <a href="quickstart.html">Quickstart</a>
+      <p class="nav-group">Reference</p>
+      <a href="api.html">API</a>
+      <a href="capi.html">C ABI</a>
+      <a href="wire.html">Wire format</a>
+      <p class="nav-group">Operate</p>
+      <a href="security.html">Security</a>
+      <a href="troubleshooting.html">Troubleshooting</a>
+    </nav>
+    <p class="theme-note">Diagrams on this page are hand-authored SVG and follow your light/dark theme.</p>
+  </aside>
+
+  <div class="content">
+    <main id="main">
+      <p class="eyebrow">Concepts</p>
+      <h1>The mental model</h1>
+      <p class="lede">Six ideas carry the whole library: release-sets and generations, data keys and wrapping, bundles, the key-less platform, revocation as rotation, and forward secrecy as an endpoint property. Once these click, the <a href="api.html">API</a> reads as the obvious shape.</p>
+
+      <h2>Release-sets and generations</h2>
+      <p>Data is grouped into a <strong>release-set</strong> (<code>rs</code>) &mdash; a named stream that a defined audience is allowed to read, for example <code>example-set</code>. Within a release-set, keys advance by <strong>generation</strong> (<code>gen</code>), a monotone counter. Each <code>(rs, gen)</code> pair has exactly one symmetric data key. When the audience changes &mdash; someone joins, someone is revoked &mdash; the key service publishes a new generation. Old generations are never rewritten; a member simply stops being included in new ones.</p>
+
+      <h2>Data keys (DEKs) and wrapping</h2>
+      <p>A <strong>DEK</strong> (data encryption key) is a fresh 256-bit symmetric key for one <code>(rs, gen)</code>. Payloads are sealed under the DEK with AES-256-GCM. Members never receive the DEK in the clear: the key service <strong>wraps</strong> it to each member&rsquo;s public key &mdash; an ephemeral-static ECDH exchange to the member&rsquo;s enrollment key, deriving a key-encryption key that encrypts the DEK just for that member. A wrap is bound to both public keys, so it cannot be re-presented for a different recipient. The exact bytes are in the <a href="wire.html">wire format</a>.</p>
+
+      <h2>Bundles</h2>
+      <p>A <strong>KeyBundle</strong> is what the key service publishes for one <code>(rs, gen)</code>: the wrapped DEK for every member of the audience, keyed by member id, plus the service&rsquo;s signature. A member finds its own slot in the bundle, unwraps the DEK with its private key, and keeps it. An outsider has no slot &mdash; there is simply nothing in the bundle for them to unwrap. Bundle assembly is fail-closed: if any single member&rsquo;s wrap fails, the whole bundle is aborted rather than published partial.</p>
+
+      <h2>Why the platform can never decrypt</h2>
+      <p>The key service mints a DEK, wraps it to each currently-authorized member, publishes the bundle, and <strong>drops the DEK</strong>. It retains only a signing key and a generation counter. It holds no DEK and no member private key, so it is structurally incapable of reading any payload &mdash; and it cannot hand a latecomer access to data that was not encrypted to them at publish time, because it has nothing to hand over. The fabric carries wrapped bundles and ciphertext: locked boxes it never reads.</p>
+
+      <figure class="figure">
+        <svg viewBox="0 0 720 300" role="img" aria-labelledby="dgm1-title dgm1-desc">
+          <title id="dgm1-title">Producer, key service, and consumer flow</title>
+          <desc id="dgm1-desc">The key service mints a DEK, wraps it to each member, publishes a signed KeyBundle, and drops the DEK. The producer acquires its own slot and seals an envelope; the consumer verifies, admits its slot, and opens. The platform holds nothing that can decrypt.</desc>
+
+          <!-- Key service -->
+          <rect class="dgm-box-accent" x="270" y="16" width="180" height="56" rx="7"/>
+          <text class="dgm-text" x="360" y="40" text-anchor="middle" font-weight="600">Key service</text>
+          <text class="dgm-text-sm" x="360" y="58" text-anchor="middle">mint DEK &rarr; wrap to each &rarr; sign &rarr; drop DEK</text>
+
+          <!-- Fabric bundle -->
+          <rect class="dgm-box" x="285" y="120" width="150" height="46" rx="7"/>
+          <text class="dgm-text-mono" x="360" y="140" text-anchor="middle">KeyBundle</text>
+          <text class="dgm-text-sm" x="360" y="156" text-anchor="middle">keys/&lt;rs&gt;/&lt;gen&gt;</text>
+
+          <!-- Producer -->
+          <rect class="dgm-box" x="30" y="120" width="170" height="46" rx="7"/>
+          <text class="dgm-text" x="115" y="140" text-anchor="middle" font-weight="600">Producer (member)</text>
+          <text class="dgm-text-sm" x="115" y="156" text-anchor="middle">acquire own slot &rarr; seal</text>
+
+          <!-- Consumer -->
+          <rect class="dgm-box" x="520" y="120" width="170" height="46" rx="7"/>
+          <text class="dgm-text" x="605" y="140" text-anchor="middle" font-weight="600">Consumer (member)</text>
+          <text class="dgm-text-sm" x="605" y="156" text-anchor="middle">verify &rarr; admit &rarr; open</text>
+
+          <!-- Envelope on fabric -->
+          <rect class="dgm-box" x="285" y="222" width="150" height="46" rx="7"/>
+          <text class="dgm-text-mono" x="360" y="242" text-anchor="middle">Envelope</text>
+          <text class="dgm-text-sm" x="360" y="258" text-anchor="middle">data/&lt;topic&gt;</text>
+
+          <!-- Arrows: service -> bundle -->
+          <path class="dgm-line-accent" d="M360 72 L360 118" marker-end="url(#arrow-a)"/>
+          <!-- bundle -> producer -->
+          <path class="dgm-line" d="M283 143 L202 143" marker-end="url(#arrow)"/>
+          <!-- bundle -> consumer -->
+          <path class="dgm-line" d="M437 143 L518 143" marker-end="url(#arrow)"/>
+          <!-- producer -> envelope (seal) -->
+          <path class="dgm-line-accent" d="M115 168 L115 245 L283 245" marker-end="url(#arrow-a)"/>
+          <text class="dgm-accent-text" x="150" y="238">seal</text>
+          <!-- envelope -> consumer (open) -->
+          <path class="dgm-line-accent" d="M437 245 L605 245 L605 168" marker-end="url(#arrow-a)"/>
+          <text class="dgm-accent-text" x="560" y="238" text-anchor="end">open</text>
+
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--diagram-stroke)"/>
+            </marker>
+            <marker id="arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--diagram-accent)"/>
+            </marker>
+          </defs>
+        </svg>
+        <figcaption>The key service wraps and drops; producer and consumer are both members. The DEK and member private keys never reach the platform &mdash; it moves locked boxes it cannot open.</figcaption>
+      </figure>
+
+      <h2>Sealing and opening</h2>
+      <p>A <strong>producer</strong> is itself a member of the release-set. It <code>acquire</code>s a seal-capable key by unwrapping its <em>own</em> slot in the highest generation it can see, then <code>seal</code>s each message under that key. Sealing takes no recipients &mdash; the audience was already resolved by the key service when it built the bundle. Every message binds a <strong>context</strong> (the data topic / key expression) as additional-authenticated-data, so a message sealed for one topic cannot be opened on another, even by an authorized member.</p>
+      <p>A <strong>consumer</strong> follows a fixed order: <code>verify</code> the bundle signature, find its <code>slot</code>, <code>admit</code> (unwrap and retain the DEK for that <code>(rs, gen)</code>), then <code>open</code> messages. A message is openable only if the consumer holds the key for its generation. This order is enforced by the shape of the API, not by caller discipline.</p>
+
+      <h2>Revocation is rotation</h2>
+      <p>There is no &ldquo;revoke&rdquo; operation that reaches back and unmakes access. Instead, to revoke a member the key service publishes a <em>new generation</em> whose audience omits them. The revoked member keeps the older-generation keys it already holds (it can still open the traffic it was legitimately given), but it is not in the new bundle, so it can never admit or open the new generation.</p>
+
+      <figure class="figure">
+        <svg viewBox="0 0 720 250" role="img" aria-labelledby="dgm2-title dgm2-desc">
+          <title id="dgm2-title">Generation timeline on revocation and rotation</title>
+          <desc id="dgm2-desc">A member is in the audience for generations 1 and 2 and can open them. At generation 3 it is revoked and has no slot, so it cannot open generation 3. Separately, when the member rotates its own key with the destroy policy, the retired key is zeroized and pre-rotation generations can no longer be re-fetched.</desc>
+
+          <!-- timeline axis -->
+          <line class="dgm-line" x1="40" y1="70" x2="680" y2="70"/>
+          <!-- gen ticks -->
+          <circle class="dgm-box-accent" cx="150" cy="70" r="7"/>
+          <circle class="dgm-box-accent" cx="360" cy="70" r="7"/>
+          <circle class="dgm-box" cx="570" cy="70" r="7"/>
+          <text class="dgm-text" x="150" y="46" text-anchor="middle" font-weight="600">gen 1</text>
+          <text class="dgm-text" x="360" y="46" text-anchor="middle" font-weight="600">gen 2</text>
+          <text class="dgm-text" x="570" y="46" text-anchor="middle" font-weight="600">gen 3</text>
+          <text class="dgm-text-sm" x="150" y="92" text-anchor="middle">member in audience</text>
+          <text class="dgm-text-sm" x="360" y="92" text-anchor="middle">member in audience</text>
+          <text class="dgm-strike" x="570" y="92" text-anchor="middle">member revoked &mdash; no slot</text>
+
+          <!-- can open row -->
+          <text class="dgm-text-sm" x="40" y="140" font-weight="600">Member can open:</text>
+          <rect class="dgm-box" x="110" y="126" width="80" height="24" rx="5"/>
+          <text class="dgm-text-mono" x="150" y="142" text-anchor="middle">gen 1</text>
+          <rect class="dgm-box" x="320" y="126" width="80" height="24" rx="5"/>
+          <text class="dgm-text-mono" x="360" y="142" text-anchor="middle">gen 2</text>
+          <rect x="530" y="126" width="80" height="24" rx="5" fill="var(--danger-soft)" stroke="var(--danger-border)"/>
+          <text class="dgm-strike" x="570" y="142" text-anchor="middle">gen 3 ✕</text>
+
+          <!-- rotation destroy note -->
+          <line class="dgm-line" x1="40" y1="180" x2="680" y2="180"/>
+          <text class="dgm-accent-text" x="40" y="206">Rotate (Destroy):</text>
+          <text class="dgm-text-sm" x="160" y="206">retired key zeroized &mdash; pre-rotation generations can no longer be re-fetched. That loss is the forward secrecy.</text>
+        </svg>
+        <figcaption>Revocation works forward, not backward: a revoked member keeps the generations it already holds but is absent from every new one. Destructive rotation is the member&rsquo;s own lever for cutting off its own past.</figcaption>
+      </figure>
+
+      <h2>Forward secrecy as an endpoint property</h2>
+      <p>Because a DEK is wrapped to a member&rsquo;s <em>static, long-term</em> enrollment key and bundles are retained, a future theft of that member&rsquo;s own private key could decrypt that member&rsquo;s own past traffic. That residual is closed by <strong>destructive rotation</strong>: the member rotates its enrollment key and zeroizes the retired private key. Only new generations wrap to the new key; there is no re-wrap path. The loss of the ability to re-fetch pre-rotation history <em>is</em> the forward secrecy.</p>
+      <p>This property lives and dies in the receiver&rsquo;s software, not on the wire and not on the platform. That is why it is called <em>endpoint-enforced</em>: nothing central can grant it and nothing central can take it away.</p>
+
+      <div class="note">
+        <span class="callout-label">Rotate has two policies</span>
+        <p><strong>Destroy</strong> (the default) drops the retired key and re-wraps nothing &mdash; full forward secrecy. <strong>KeepAccess</strong> is an explicit member-side opt-out: before dropping the old key, it locally re-wraps the member&rsquo;s own still-live DEKs to the new key, so those generations stay readable &mdash; and it is labeled plainly as <em>reducing</em> forward secrecy for them. The platform is never involved either way; it holds nothing to re-wrap. See <a href="security.html#rotation">Security &rarr; Rotation</a>.</p>
+      </div>
+
+      <h2>Destroy-by-default</h2>
+      <p>Every default in the library leans toward the safe behavior: DEKs are fetched, used, and dropped rather than persisted; <code>rotate</code> defaults to <code>Destroy</code>; and the seal path enforces a message-count cap below the AES-GCM nonce-collision bound, refusing to seal past it rather than risking nonce reuse. The easy path is the secure path &mdash; the details are on the <a href="security.html">Security</a> page.</p>
+
+      <div class="pagenav">
+        <a href="index.html"><span class="dir">Previous</span>&larr; Overview</a>
+        <a class="next" href="quickstart.html"><span class="dir">Next</span>Quickstart &rarr;</a>
+      </div>
+
+      <footer class="page-footer">
+        <span class="version-badge"></span>
+        <span>grant-crypto SDK &middot; ADR 1106 &middot; ships in-SDK, served at get.&lt;site&gt;/sdk/docs/</span>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

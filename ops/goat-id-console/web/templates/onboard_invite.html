@@ -1,0 +1,133 @@
+{{define "content"}}
+<p><a href="/onboarding">← Onboarding</a></p>
+
+{{if .InviteResult}}
+  <h1 class="page-title">Invite Created</h1>
+  {{if .InviteEmailedTo}}<div class="banner success">✓ Emailed the link to <b>{{.InviteEmailedTo}}</b>.</div>{{end}}
+  {{if .InviteVerifySent}}<div class="banner info">Verification email sent to <b>{{.InviteCandidateEmail}}</b>. Once they click the link in it, use “Check verification &amp; send invite”.</div>{{end}}
+  {{if .InviteEmailErr}}<div class="banner error">{{.InviteEmailErr}}{{if not .InviteSandbox}} · copy the link below or download the email and send it yourself.{{end}}</div>{{end}}
+  <p class="ob-note">Send this one-time link to the candidate. They fill their own details; then you (or another sponsor) vouch, and an admin provisions.</p>
+  <div>
+    <label class="muted" for="invlink">Candidate link</label>
+    <div class="copyrow">
+      <input id="invlink" readonly value="{{if .InviteResult.IntakeURL}}{{.InviteResult.IntakeURL}}{{else}}{{.InviteResult.NominationURL}}{{end}}">
+      <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('invlink').value)">Copy</button>
+    </div>
+  </div>
+  {{/* The expiry is stated here, not just implied by "one-time link": the mint
+       is the last moment a wrong lifetime is cheap to fix. */}}
+  {{if .InviteResult.ShortTTL}}
+    <div class="banner warn">This link <b>expires {{.InviteResult.ExpiresLabel}}</b> · a short lifetime. If that was not deliberate, revoke it and mint another before sending.</div>
+  {{end}}
+  <p class="ob-note">Sponsor: <b>{{.InviteResult.Sponsor}}</b> · goatnet: {{.InviteResult.Env}}{{if .InviteResult.ExpiresLabel}} · expires <b>{{.InviteResult.ExpiresLabel}}</b>{{end}}{{if .InviteResult.Escalated}} · <b class="chip escalated">ESCALATED · flagged for scrutiny at both gates</b>{{end}}</p>
+
+  <div class="card">
+    <h2 class="section-title mt-0">Email Delivery</h2>
+    {{if and .InviteSandbox (not .InviteEmailedTo)}}
+      <p class="ob-note">The email service is in <b>sandbox mode</b>: a recipient must verify their address once before we can send to them. Trigger the verification email, have the candidate click its link, then send the invite. Keep this page open · the one-time link lives only here.</p>
+    {{else}}
+      <p class="ob-note">Send (or re-send) the invite email, or download it to deliver from your own mail client.</p>
+    {{end}}
+    <form method="post" class="inline" id="emailpanel">
+      <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+      <input type="hidden" name="invite_id" value="{{.InviteResult.ID}}">
+      <input type="hidden" name="sponsor" value="{{.InviteResult.Sponsor}}">
+      <input type="hidden" name="env" value="{{.InviteResult.Env}}">
+      <input type="hidden" name="intake_url" value="{{.InviteResult.IntakeURL}}">
+      <input type="hidden" name="nomination_url" value="{{.InviteResult.NominationURL}}">
+      <input type="hidden" name="escalated" value="{{if .InviteResult.Escalated}}true{{else}}false{{end}}">
+      <input type="hidden" name="expires_at" value="{{.InviteResult.ExpiresAt}}">
+      <label for="invite-email-recipient">Candidate email</label>
+      <div class="copyrow">
+        <input type="email" name="candidate_email" value="{{.InviteCandidateEmail}}" placeholder="person-60@example.org" id="invite-email-recipient">
+      </div>
+      <div class="ob-actions">
+        {{if .InviteSandbox}}
+          <button type="submit" formaction="/onboarding/invite/email/verify">Send verification email</button>
+          <button type="submit" formaction="/onboarding/invite/email/send" class="ok">Check verification &amp; send invite</button>
+        {{else if .MailerEnabled}}
+          <button type="submit" formaction="/onboarding/invite/email/send" class="ok">{{if .InviteEmailedTo}}Re-send invite email{{else}}Send invite email{{end}}</button>
+        {{end}}
+        <button type="submit" formaction="/onboarding/invite/email/eml">Download email (.eml)</button>
+      </div>
+    </form>
+  </div>
+
+  <p><a href="/onboarding/invite">Sponsor another</a></p>
+{{else}}
+  <h1 class="page-title">Sponsor a Candidate</h1>
+  {{if .SponsorMode}}
+  <p class="ob-note">Mint a one-time link. Everything below is optional · leave a field blank and the candidate fills it themselves. You may offer up to <b>{{.SponsorMaxTier}}</b>; higher tiers are refused.</p>
+  {{else}}
+  <p class="ob-note">Mint a one-time link. Everything below is optional · leave a field blank and the candidate fills it themselves. Escalated admin tiers are flagged at both review gates.</p>
+  {{end}}
+  <form method="post" action="/onboarding/invite" class="stacked">
+    <input type="hidden" name="csrf" value="{{.CSRFToken}}">
+    {{/* No env field. The console stamps the goatnet it serves. */}}
+    <label for="invite-candidate_email">Candidate email <span class="muted">· {{if .MailerEnabled}}we'll email them the link{{else}}email sending is off; you'll copy the link{{end}}</span></label>
+    <input type="email" name="candidate_email" placeholder="person-60@example.org" id="invite-candidate_email">
+    <label for="invite-tier">Access tier <span class="muted">· optional</span></label>
+    <select name="tier" id="invite-tier">
+      <option value="">(let the candidate choose)</option>
+      <option value="developer">Developer · dev access + fabric pub/sub</option>
+      <option value="browse">Browse · web surfaces only</option>
+      {{/* Escalated tiers are pointless noise for a capped sponsor · the
+           mint refuses anything above their cap server-side regardless. */}}
+      {{if not .SponsorMode}}
+      <option value="iam-admin">IAM Admin · ESCALATED</option>
+      <option value="platform-admin">Platform Admin · ESCALATED</option>
+      {{end}}
+    </select>
+    {{/* Recommended org (ADR 1112). Admin sessions only: the suggest endpoint is
+         an admin act (ADR 1072), and a sponsor pinning an arbitrary registered
+         org would widen what a sponsor may assert. A sponsor's invite carries no
+         org and behaves exactly as before — the candidate types a name and the
+         reviewer runs match-or-create. */}}
+    {{if not .SponsorMode}}
+    <label for="inv-org">Organization <span class="muted">— optional; a <em>registered</em> org id or alias. Pinned here, the candidate never types their employer, so one company cannot become three orgs.</span></label>
+    <span class="ob-parent-wrap">
+      <input type="text" id="inv-org" name="org" autocomplete="off" placeholder="start typing to search the registry" spellcheck="false">
+      <div id="inv-org-menu" class="ob-suggest-menu" hidden></div>
+    </span>
+    <span id="inv-org-state" class="ob-parent-state"></span>
+    {{end}}
+    <label for="invite-sector">Sector <span class="muted">— optional. Leave it to the candidate unless you already know.</span></label>
+    <select name="sector" id="invite-sector">
+      <option value="">(let the candidate declare it)</option>
+      <option value="state">state — government (armed forces, a ministry, police, a state lab)</option>
+      <option value="commercial">commercial — a company, including state-owned</option>
+      <option value="civil-society">civil-society — NGO, university, research, press</option>
+    </select>
+    <label style="display:flex;align-items:center;gap:9px;margin-top:4px;cursor:pointer">
+      <input type="checkbox" name="collab" value="1" checked style="width:auto;margin:0">
+      <span>Collaboration environment <span class="muted">· give them an Outline / files / Zulip account (cloud SSO, separate from the mesh)</span></span>
+    </label>
+    <label for="invite-machine_quota">Machine quota <span class="muted">· optional; grants custody of this many OTHER machines <em>and</em> sets their own device allowance. Blank = no custodian grant, and the candidate sets their own allowance (5 if they leave it blank too).</span></label>
+    {{/* onwheel blur: a focused number input eats the page scroll and silently
+         changes its own value. The placeholder is an EXAMPLE, not a
+         default · say what blank does in the label, because "e.g. 3" next to a
+         blank field is read as "blank means 3". */}}
+    <input type="number" name="machine_quota" min="1" max="100" placeholder="e.g. 3" onwheel="this.blur()" id="invite-machine_quota">
+    {{/* A <select>, not <input type=number>. A select has no spinner, no empty state, and every value here
+         is one somebody chose. */}}
+    <label for="invite-ttl_hours">Link lifetime <span class="muted">· how long the candidate has to open it</span></label>
+    <select name="ttl_hours" id="invite-ttl_hours">
+      <option value="4">4 hours · hand-over on this call</option>
+      <option value="24">24 hours</option>
+      <option value="72" selected>72 hours (default)</option>
+      <option value="168">7 days</option>
+      <option value="720">30 days · long-lead partner</option>
+    </select>
+    <label for="invite-note">Note <span class="muted">· for your reference</span></label>
+    <input type="text" name="note" placeholder="e.g. Jane, liaison at DEMO-ORG" id="invite-note">
+    <button type="submit" class="primary">Generate one-time link</button>
+  </form>
+  {{if not .SponsorMode}}
+  <script src="/static/org-suggest.js"></script>
+  <script>initOrgParentSuggest(
+    document.getElementById("inv-org"),
+    document.getElementById("inv-org-state"),
+    document.getElementById("inv-org-menu"));</script>
+  {{end}}
+{{end}}
+{{end}}

@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pub/Sub Best Practices &mdash; __LEX_PRODUCT_NAME__ Portal</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("portalTheme") || "system";
+        var resolved = t;
+        if (t === "system") {
+          resolved = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+        }
+        document.documentElement.setAttribute("data-theme", resolved);
+      } catch (e) {}
+    })();
+  </script>
+  <style>
+    main { max-width: 56rem; }
+    main h2 { margin-top: 2.5rem; }
+    main h3 { margin-top: 1.5rem; }
+    pre {
+      background: var(--code-bg, rgba(0,0,0,0.04));
+      padding: 0.9rem 1rem;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-size: 0.82rem;
+    }
+    code:not(pre code) {
+      background: var(--code-bg, rgba(0,0,0,0.06));
+      padding: 0.1rem 0.35rem;
+      border-radius: 3px;
+      font-size: 0.88em;
+    }
+    .lede {
+      background: var(--accent-light, rgba(0, 120, 200, 0.08));
+      border-left: 3px solid var(--accent, #0078c8);
+      padding: 0.9rem 1.1rem;
+      border-radius: 4px;
+      margin-top: 0.5rem;
+    }
+    .lede p:last-child { margin-bottom: 0; }
+    .footgun-callout {
+      background: rgba(220, 80, 60, 0.10);
+      border-left: 3px solid #c04040;
+      padding: 0.8rem 1rem;
+      border-radius: 4px;
+      margin: 1.2rem 0;
+    }
+    .footgun-callout h3 { margin-top: 0; }
+    .pattern-card {
+      background: var(--card-bg, var(--bg));
+      border: 1px solid var(--border, rgba(0,0,0,0.12));
+      border-radius: 6px;
+      padding: 1rem 1.2rem;
+      margin: 1.2rem 0;
+    }
+    .pattern-card h3 { margin-top: 0; }
+    .pattern-card .meta { opacity: 0.8; font-size: 0.9rem; font-style: italic; margin: 0.3rem 0 0.8rem; }
+    table.kxref { border-collapse: collapse; width: 100%; margin-top: 0.8rem; font-size: 0.9rem; }
+    table.kxref th, table.kxref td { border-bottom: 1px solid var(--border, rgba(0,0,0,0.10)); padding: 0.5rem 0.6rem; text-align: left; vertical-align: top; }
+    table.kxref code { background: var(--code-bg, rgba(0,0,0,0.06)); padding: 0.1rem 0.3rem; border-radius: 3px; }
+    table.s3-vs-pubsub { border-collapse: collapse; width: 100%; margin-top: 0.8rem; font-size: 0.9rem; }
+    table.s3-vs-pubsub th, table.s3-vs-pubsub td { border: 1px solid var(--border, rgba(0,0,0,0.12)); padding: 0.6rem 0.8rem; vertical-align: top; }
+    table.s3-vs-pubsub th { background: var(--card-bg, rgba(0,0,0,0.04)); font-weight: 600; }
+    nav.toc {
+      background: var(--card-bg, rgba(0,0,0,0.03));
+      border: 1px solid var(--border, rgba(0,0,0,0.10));
+      border-radius: 6px;
+      padding: 0.8rem 1.2rem;
+      margin: 1rem 0 1.6rem;
+      font-size: 0.92rem;
+    }
+    nav.toc ol { margin: 0.3rem 0 0 0; padding-left: 1.4rem; }
+    nav.toc li { margin: 0.15rem 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/" class="logo">__LEX_PRODUCT_NAME__ Portal</a>
+    <nav class="nav-grouped">
+      <a href="/" class="nav-link">Home</a>
+      <a href="/progress.html" class="nav-link">Progress</a>
+      <details class="nav-group">
+        <summary>Catalog</summary>
+        <div class="nav-menu">
+          <a href="/vendor.html" title="Every __LEX_ORG__ on this goatnet and every topic it publishes, with schema versions">Browse everything</a>
+          <a href="/topics.html" title="Declare a new topic under one __LEX_ORG__, or edit one you already declared">Register a topic</a>
+          <a href="/schema.html" title="Look up one schema by its topic key">Schema lookup</a>
+          <a href="/data-access.html">Data Access</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Inspect</summary>
+        <div class="nav-menu">
+          <a href="/inspector.html">Inspector</a>
+          <a href="__LEX_PANOSCOPE_URL__" target="_blank" rel="noopener">Panoscope &#x2197;</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Peering</summary>
+        <div class="nav-menu">
+          <a href="/peering/our-config.html">Our Config</a>
+          <a href="/peering/guide.html">Peering Guide</a>
+          <a href="/peering/best-practices.html">Best Practices</a>
+          <a href="/peering/zenohd-config.html">Router Config</a>
+          <a href="/peering/workbench.html">Workbench</a>
+          <a href="/peering/log-analyzer.html">Log Analyzer</a>
+          <a href="/peering/probe.html">Connectivity Probe</a>
+          <a href="/peering/echo.html">Echo Loopback</a>
+        </div>
+      </details>
+      <details class="nav-group operator-only hidden">
+        <summary>Admin</summary>
+        <div class="nav-menu">
+          <a href="/admin/onboard-invite.html">Sponsor a candidate</a>
+          <a href="/admin/onboard-sponsor-review.html">Sponsor review</a>
+          <a href="/admin/onboard-intake.html">Onboarding intake</a>
+          <a href="/admin/onboard-batch.html">Batch onboarding</a>
+          <a href="/admin/onboard-queue.html">Onboarding queue</a>
+          <a href="/admin/vendor-activity.html">__LEX_ORG_TITLE__ Activity</a>
+          <a href="/admin/trashgoat.html">trashgoat</a>
+        </div>
+      </details>
+      <details class="nav-group">
+        <summary>Reference</summary>
+        <div class="nav-menu">
+          <a href="/patterns.html">Patterns</a>
+          <a href="/docs.html">Docs</a>
+          <a href="/api-docs.html">API</a>
+        </div>
+      </details>
+    </nav>
+    <div id="theme-toggle" role="group" aria-label="Color theme">
+      <button type="button" data-mode="light" title="Use light theme" aria-pressed="false">Light</button>
+      <button type="button" data-mode="system" title="Use system theme" aria-pressed="false">System</button>
+      <button type="button" data-mode="dark" title="Use dark theme" aria-pressed="false">Dark</button>
+    </div>
+    <div id="who"></div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Pub/Sub Best Practices</h2>
+      <div class="lede">
+        <p>The single most common mistake new __LEX_ORGS__ hit on the fabric is treating pub/sub like an S3 bucket. <strong>It isn't.</strong> This page tells you the mental model that actually applies, gives you the topic-design patterns that cover ~95% of real use cases, and shows the three footguns that produce the symptom "I published but my subscriber didn't receive anything."</p>
+        <p>The fabric is Zenoh under the hood, but these principles apply to any pub/sub system (MQTT, NATS, Kafka, Solace, …). If you've worked with those, jump to <a href="#footguns">the footguns</a>.</p>
+      </div>
+
+      <nav class="toc">
+        <strong>Contents</strong>
+        <ol>
+          <li><a href="#mental-model">A topic is a <em>channel</em>, not a bucket</a></li>
+          <li><a href="#patterns">Four topic-design patterns</a></li>
+          <li><a href="#footguns">The three footguns</a></li>
+          <li><a href="#storage">Storage isn't a message bus</a></li>
+          <li><a href="#large-payloads">Payloads larger than ~2 MB</a></li>
+          <li><a href="#audit">The audit log isn't your retrieval surface</a></li>
+          <li><a href="#worked-example">Worked example: CoT done right</a></li>
+          <li><a href="#kxref">Key-expression reference</a></li>
+          <li><a href="#self-check">Self-check before asking for help</a></li>
+        </ol>
+      </nav>
+    </section>
+
+    <section id="mental-model">
+      <h2>1. The mental model: a topic is a <em>channel</em>, not a bucket</h2>
+      <p>If you come from object-storage backgrounds (S3, GCS, Azure Blob), it's natural to reach for the model "every object gets a unique key; you PUT the bytes; you GET the bytes back by key." That model is wrong for pub/sub. Here's what's actually happening:</p>
+      <table class="s3-vs-pubsub">
+        <thead>
+          <tr>
+            <th>You expect (S3 model)</th>
+            <th>What actually happens (pub/sub model)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Each PUT creates a uniquely-keyed object that lives until I delete it</td>
+            <td>Each <code>put</code> is a <strong>message</strong> broadcast onto a <strong>channel</strong> named by the key. Live subscribers on that channel receive it; if no one's listening, the message is gone.</td>
+          </tr>
+          <tr>
+            <td>GET retrieves the object stored at that key</td>
+            <td>Two different operations: <code>subscribe</code> watches a channel for <strong>future</strong> messages, <code>get</code> queries a <strong>storage</strong> that may or may not be configured for that channel.</td>
+          </tr>
+          <tr>
+            <td>The bucket is the namespace; individual object keys hold the data</td>
+            <td>The <strong>topic path is the channel name</strong>. Subscribers can pick one channel, or pattern-match many channels at once. Choosing what to put in the path is a design decision with real consequences.</td>
+          </tr>
+          <tr>
+            <td>Object names are arbitrary identifiers</td>
+            <td>Topic paths are <strong>patterns subscribers will match against</strong>. If your path embeds random UUIDs that subscribers can't predict, only wildcard subscribers will work.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p style="margin-top:1rem"><strong>The corollary that matters:</strong> the topic path is your contract with subscribers, not just a unique label for your data.</p>
+    </section>
+
+    <section id="patterns">
+      <h2>2. Four topic-design patterns (pick one consciously)</h2>
+      <p>The decision you have to make for each piece of data you publish: what <strong>shape</strong> does your topic path take, and what does that imply for subscribers and for storage?</p>
+
+      <div class="pattern-card">
+        <h3>Pattern A &mdash; Single channel, all events: <code>__LEX_ORG__/system/v1</code></h3>
+        <div class="meta">One topic; every message goes to the same key.</div>
+        <pre><code># Publisher:
+session.put("org164x/router/cot/v2", cot_xml_bytes)
+
+# Subscriber:
+session.declare_subscriber("org164x/router/cot/v2", handler)</code></pre>
+        <ul>
+          <li><strong>Best for:</strong> continuous event streams where consumers want "everything that happened on this channel."</li>
+          <li><strong>Storage behavior:</strong> rocksdb-style storages keep only the <strong>latest</strong> value per key &mdash; this pattern preserves only the most recent event in history. If you need replay of every event, use Pattern C.</li>
+          <li><strong>Subscriber gotcha:</strong> literal key, no wildcard needed. Simple.</li>
+        </ul>
+      </div>
+
+      <div class="pattern-card">
+        <h3>Pattern B &mdash; Per-entity state: <code>__LEX_ORG__/system/v1/&lt;entity-id&gt;</code></h3>
+        <div class="meta">One topic per logical entity, stable key per entity.</div>
+        <pre><code># Publisher (entity X's latest state):
+session.put(f"org164x/router/cot/v2/{entity_uid}", cot_xml_bytes)
+
+# Subscriber (all entities, live):
+session.declare_subscriber("org164x/router/cot/v2/*", handler)
+
+# OR get latest known state for a specific entity (queryable history):
+session.get(f"org164x/router/cot/v2/{specific_entity_uid}", queue)</code></pre>
+        <ul>
+          <li><strong>Best for:</strong> "latest known state per object" semantics &mdash; vehicle tracks, sensor positions, anything where consumers want "what's entity X doing right now?"</li>
+          <li><strong>Storage behavior:</strong> rocksdb keeps the latest message per entity. Storage size scales with <strong>number of entities</strong>, not number of events.</li>
+          <li><strong>Subscriber gotcha:</strong> wildcard required if you want all entities. Use <code>/*</code> to match exactly one segment (the entity UID); use <code>/**</code> to match any depth.</li>
+        </ul>
+      </div>
+
+      <div class="pattern-card">
+        <h3>Pattern C &mdash; Per-event archive: <code>__LEX_ORG__/system/v1/&lt;entity-id&gt;/&lt;event-id&gt;</code> or <code>__LEX_ORG__/system/v1/&lt;uuid&gt;</code></h3>
+        <div class="meta">Every message gets its own unique key.</div>
+        <pre><code># Publisher (fresh UUID per message):
+session.put(f"org164x/router/cot/v2/{uuid.uuid4()}", cot_xml_bytes)
+
+# Subscriber (live tap):
+session.declare_subscriber("org164x/router/cot/v2/**", handler)
+
+# OR query history (returns every event ever stored):
+session.get("org164x/router/cot/v2/**", queue)</code></pre>
+        <ul>
+          <li><strong>Best for:</strong> archival / audit / replay workloads where every individual event must be queryable in retrospect.</li>
+          <li><strong>Storage behavior:</strong> every message is a new key; rocksdb stores all of them up to the configured time-to-live (7 days on the trial fabric). Storage size scales with <strong>event volume</strong>, which can be large.</li>
+          <li><strong>Subscriber gotcha:</strong> <strong>wildcard is mandatory.</strong> Subscribers using a literal key never match. This is the most common failure mode on the trial fabric.</li>
+        </ul>
+      </div>
+
+      <div class="pattern-card">
+        <h3>Pattern D &mdash; Request/reply via queryables</h3>
+        <div class="meta">Not a pure pub/sub pattern &mdash; Zenoh queryables.</div>
+        <p>Out of scope for this page; covered in the <a href="/peering/guide.html">Peering Guide</a> walkthrough.</p>
+      </div>
+
+      <h3>Picking between B and C</h3>
+      <p>If a downstream consumer asks "what's the current state of entity X?", use Pattern B. If they ask "give me every event entity X has ever emitted," use Pattern C. If both, use Pattern C and have consumers do the latest-state dedup in their client, OR run two publishers (one B, one C) on different topic prefixes.</p>
+      <p><strong>CoT specifically:</strong> the Cursor on Target XML format already carries <code>uid="..."</code> as an attribute <em>inside the payload</em> &mdash; that's the canonical entity identity. If you're publishing CoT and your consumer wants "latest known position per track," Pattern B with the CoT uid in the topic path is correct: <code>org164x/router/cot/v2/&lt;cot-uid&gt;</code>. Don't mint a fresh UUID per message for the topic path &mdash; that's Pattern C, which has different consumer ergonomics and accumulates entries proportional to message rate, not entity count.</p>
+      <p><strong>Registering the format:</strong> register these topics with <code>format: xml</code> so the payload is declared as <code>application/xml</code> rather than opaque <code>raw</code> bytes. If you want the portal to hold a schema for the CoT event structure, register <code>format: xml:event</code> and upload your CoT <code>.xsd</code> via the per-row schema button (the <code>.xsd</code> must declare a top-level <code>&lt;xs:element name="event"&gt;</code>). The bytes on the wire are identical either way &mdash; the format string is registry metadata, not a wire transform. With the <code>.xsd</code> uploaded, the schema viewer renders the CoT data dictionary, per-language code tabs (Rust/Go/Python/TypeScript), and inspector sample-decode &mdash; the same surfaces protobuf topics get.</p>
+    </section>
+
+    <section id="footguns">
+      <h2>3. The three footguns</h2>
+      <p>If you're seeing "my subscriber didn't receive anything," it's almost always one of these:</p>
+
+      <div class="footgun-callout">
+        <h3>Footgun 1: Literal subscriber against a wildcarded publish</h3>
+        <pre><code># Publisher puts to a unique-per-event key:
+session.put(f"org164x/router/cot/v2/{uuid.uuid4()}", payload)
+
+# Subscriber waits on the literal parent:
+session.declare_subscriber("org164x/router/cot/v2", handler)   # WRONG &mdash; never matches</code></pre>
+        <p>The publisher's key is <code>org164x/router/cot/v2/&lt;some-uuid&gt;</code>. The subscriber's literal key is <code>org164x/router/cot/v2</code>. In Zenoh's key-expression matching, those are different keys. The subscriber sees nothing.</p>
+        <p><strong>Fix:</strong> add <code>/**</code> (any depth) or <code>/*</code> (exactly one more segment):</p>
+        <pre><code>session.declare_subscriber("org164x/router/cot/v2/**", handler)   # RIGHT</code></pre>
+      </div>
+
+      <div class="footgun-callout">
+        <h3>Footgun 2: Subscriber not alive at publish time</h3>
+        <p>Live pub/sub has <strong>no backlog</strong>. If your publisher fires before any subscriber declares interest, the message is forwarded to whatever subscribers exist (could be zero) and then it's gone. Storage helps late joiners <em>query history</em>, but it doesn't replay live samples retroactively.</p>
+        <pre><code># This shape works only if you keep the subscriber process alive:
+sub = session.declare_subscriber("org164x/**", handler)
+# ... your publisher in another window puts messages now ...
+# sub is alive &mdash; receives them.
+
+# This shape fails:
+session.put("org164x/router/cot/v2/abc", payload)   # router has no subscribers, drops
+sub = session.declare_subscriber("org164x/**", h)   # too late</code></pre>
+        <p>If pub + sub are in the same script, declare the subscriber <strong>before</strong> any put, and give the declaration time to round-trip to the router. If pub + sub are in separate processes, <strong>start the subscriber first</strong> and verify it's actually connected before you fire the publisher.</p>
+      </div>
+
+      <div class="footgun-callout">
+        <h3>Footgun 3: Subscriber session silently failed to connect</h3>
+        <p><code>zenoh.open()</code> doesn't always raise when the underlying TLS link fails to establish &mdash; depending on config, it can return a "session" that's not actually peered with any router. <code>declare_subscriber</code> on that session succeeds locally but never registers with the router, and no samples arrive.</p>
+        <p><strong>Verify the session is actually peered</strong> before relying on it:</p>
+        <pre><code>session = zenoh.open(config)
+# Do a session.get against a known-good admin key and confirm at least one reply.
+# If zero replies, your TLS handshake probably failed silently:
+replies = session.get("@/*/router", zenoh.Queue())
+got_any = False
+for r in replies:
+    got_any = True
+    break
+if not got_any:
+    print("ERROR: session not actually peered with the router")
+    sys.exit(1)</code></pre>
+        <p>The router endpoint, cert paths, and mTLS posture are all in your onboarding bundle's <code>first-publisher.py</code>. If you copy that scaffolding and your subscriber matches its session-config shape, the silent-fail mode goes away.</p>
+      </div>
+    </section>
+
+    <section id="storage">
+      <h2>4. Storage isn't a message bus</h2>
+      <p>The fabric has rocksdb storages configured per __LEX_ORG__. They're a <strong>queryable cache of latest known values per key</strong>, not a backlog of live messages. Two implications:</p>
+      <h3><code>session.get(key)</code> returns the LATEST value at that key, not the history of puts to it.</h3>
+      <p>If you publish 1,000 messages to the same key (Pattern A), <code>get</code> returns one message &mdash; the most recent one. To preserve event history, you need unique keys per event (Pattern C).</p>
+      <h3><code>session.get</code> is a query, not a subscription.</h3>
+      <p>It returns once with the current state. To receive future updates, use <code>declare_subscriber</code>. A common shape combines both: query for current state at startup, then subscribe for live updates.</p>
+      <pre><code># At startup: get current state of every track:
+replies = session.get("org164x/router/cot/v2/*", zenoh.Queue())
+for r in replies:
+    handle_track(r.ok.key_expr, r.ok.payload)
+
+# Then subscribe for live updates going forward:
+session.declare_subscriber("org164x/router/cot/v2/*", handle_track_update)</code></pre>
+    </section>
+
+    <section id="large-payloads">
+      <h2>5. Payloads larger than ~2 MB</h2>
+      <p>Pub/sub fabrics are tuned for <strong>many small messages</strong>, not for a few large ones. The default behaviors below kick in around 2 MB; expect silent failure modes above that size unless you actively design around them.</p>
+
+      <h3>What Zenoh does by default</h3>
+      <p>The transport layer fragments large samples across the underlying TCP/TLS link and the subscriber side reassembles. So a multi-megabyte <code>put</code> doesn't fail at the wire &mdash; your publisher returns "clean" and the bytes reach the router. The failure modes are downstream of that.</p>
+
+      <h3>What we've seen on the trial fabric</h3>
+      <p>A 12.5 MB <code>put</code> from a properly-configured __LEX_ORG__ under their prefix's storage stanza returned cleanly from the publisher but the bytes never persisted to the per-__LEX_ORG__ rocksdb dir on the router. The storage backend silently dropped the reassembled sample &mdash; no error to the publisher, no entry in the audit log indicating a storage commit failure. Live subscribers (if any had been online) might have received the sample over the wire, but <code>session.get</code> afterward returned nothing.</p>
+      <p>That's the behavior to expect from any pub/sub system under default configuration: the wire path is more permissive than the storage path, so an artifact too big for storage just evaporates after delivery to live subscribers (and even those have receive-side buffer caps).</p>
+
+      <h3>Sizing thresholds (rules of thumb on the trial fabric)</h3>
+      <table>
+        <thead><tr><th>Payload size</th><th>Expected behavior</th></tr></thead>
+        <tbody>
+          <tr><td><code>&lt; 64 KB</code></td><td>Comfortable across the wire, storage, and audit log. Audit captures the full payload bytes (base64 in NDJSON).</td></tr>
+          <tr><td><code>64 KB &ndash; 1 MiB</code></td><td>Live subscribers fine; storage persists; audit captures metadata + payload. Schema-body uploads via the portal use this range (1 MiB hard cap).</td></tr>
+          <tr><td><code>1 MiB &ndash; 2 MiB</code></td><td>Live subscribers fine; storage persists; audit captures metadata but drops the payload bytes (<code>payload_bytes_b64</code> absent above ~1 MiB).</td></tr>
+          <tr><td><code>2 MiB &ndash; 16 MiB</code></td><td><strong>Treat as not-persisted.</strong> Live subscribers MAY receive (depends on their reassembly buffer); storage drops silently. <code>session.get</code> will not return your bytes.</td></tr>
+          <tr><td><code>&gt; 16 MiB</code></td><td>Don't. Even live delivery becomes unreliable.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Pattern E &mdash; Chunk it</h3>
+      <p>Split the artifact into N keys under a sub-prefix and publish each chunk under the 2 MB threshold. Subscribers reassemble in order.</p>
+      <pre><code># Publisher:
+chunk_size = 1_500_000   # 1.5 MB &mdash; comfortably under storage cap
+for i in range(0, len(payload), chunk_size):
+    chunk = payload[i:i+chunk_size]
+    session.put(f"__LEX_ORG__/artifact/openapi/v1/chunk/{i:08d}", chunk)
+session.put("__LEX_ORG__/artifact/openapi/v1/manifest",
+            json.dumps({"chunks": ceil(len(payload)/chunk_size),
+                        "size": len(payload),
+                        "sha256": sha256(payload).hexdigest()}).encode())
+
+# Consumer:
+manifest = json.loads(session.get("__LEX_ORG__/artifact/openapi/v1/manifest").payload)
+chunks = []
+for i in range(manifest["chunks"]):
+    chunks.append(session.get(f"__LEX_ORG__/artifact/openapi/v1/chunk/{i*1_500_000:08d}").payload)
+payload = b"".join(chunks)</code></pre>
+      <p>Each chunk persists in storage independently; consumers <code>get</code> the manifest first, then walk the chunks. Treat the manifest as the canonical "is the artifact ready" signal.</p>
+
+      <h3>Pattern F &mdash; Treat the artifact as schema material</h3>
+      <p>If the artifact IS a schema (a <code>.proto</code>, a <code>.fds</code>, or &mdash; yes &mdash; an OpenAPI spec interpreted as schema-of-API), upload it to the portal's schema endpoint with <code>format=json</code> (or <code>format=protobuf-source</code> for protos). The portal's schema body cap is 1 MiB per upload, so still needs chunking for &gt;1 MiB artifacts. Schemas are queryable from the portal UI at <code>/schema.html?key=&lt;topic&gt;</code> without going through Zenoh storage at all.</p>
+
+      <h3>Pattern G &mdash; External storage pointer</h3>
+      <p>Publish a small "blob handle" message (URL + content-hash + size + content-type) under a normal topic. Store the artifact in one __LEX_ORG__-owned object store (MinIO, S3, etc). Consumers fetch the handle via Zenoh, then GET the artifact from the object store.</p>
+      <pre><code>session.put("__LEX_ORG__/artifact/openapi/v1/handle",
+            json.dumps({"url": "https://__LEX_ORG__-bucket.example/openapi/v1.json",
+                        "sha256": "...", "size": 12_500_000,
+                        "content_type": "application/json"}).encode())</code></pre>
+      <p>This is the right shape for artifacts that are large AND infrequently updated AND have existing object-store delivery infrastructure.</p>
+
+      <h3>Pattern H &mdash; Queryable</h3>
+      <p>__LEX_ORG_TITLE__ stands up a queryable that responds to <code>session.get</code> requests with the artifact materialized from their own process. No fabric storage involved; the artifact lives in __LEX_ORG__ memory or local disk. Good when the artifact is computed or project-specific.</p>
+
+      <h3>What NOT to do</h3>
+      <ul>
+        <li><strong>Don't</strong> treat <code>__LEX_ORG__/path/big-artifact</code> as your single retrieval URL with a multi-MB body in the <code>put</code>. That's the S3 model from §1 again; it doesn't work here for payloads above the storage cap.</li>
+        <li><strong>Don't</strong> rely on the publisher's "clean return" as confirmation that the artifact persisted. The wire and the storage paths have different size budgets; the publisher only sees the wire success.</li>
+        <li><strong>Don't</strong> assume the audit log will tell you a large put dropped. The audit subscriber records that the publish happened (with metadata) but may not flag a storage-side drop.</li>
+      </ul>
+
+      <h3>Confirming persistence</h3>
+      <p>For any single <code>put</code> you want to know whether storage actually captured, the canonical end-to-end test is:</p>
+      <ol>
+        <li><code>put</code> your bytes</li>
+        <li>Wait ~1 second</li>
+        <li><code>get</code> the same key from a fresh session</li>
+        <li>Compare the SHA256 of returned payload to what you put</li>
+      </ol>
+      <p>For chunked artifacts (Pattern E), additionally verify the manifest chunks-count matches the count you wrote, and each chunk's hash matches before assembly.</p>
+      <p>If <code>get</code> returns nothing or returns a truncated payload, the artifact exceeded a downstream cap. Drop to a smaller chunk size or move to Pattern G.</p>
+    </section>
+
+    <section id="audit">
+      <h2>6. The audit log isn't your retrieval surface</h2>
+      <p>The fabric's audit subscriber captures every put on <code>**</code> into object storage. That's for <strong>compliance and forensics</strong>, not for normal consumer retrieval. Don't build your consumer to scrape audit objects &mdash; use <code>session.get</code> or <code>declare_subscriber</code> against the router instead.</p>
+    </section>
+
+    <section id="worked-example">
+      <h2>7. Worked example: CoT publisher + subscriber done right</h2>
+      <p>This is the shape we'd ship in each __LEX_ORG__'s <code>first-subscriber.py</code> in the onboarding bundle. Pattern B (per-entity state) matches CoT's typical use case.</p>
+      <pre><code># publisher.py &mdash; publishes one CoT event per track per tick
+import zenoh, uuid, time, xml.etree.ElementTree as ET
+
+session = zenoh.open(config)  # config from onboarding bundle's first-publisher.py
+
+while True:
+    for track in get_tracks():
+        cot_xml = render_cot_xml(track)         # has uid=track.uid inside
+        # Use the track's stable uid as the key &mdash; NOT a fresh UUID:
+        session.put(f"org164x/router/cot/v2/{track.uid}", cot_xml.encode())
+    time.sleep(1)</code></pre>
+      <pre><code># subscriber.py &mdash; live tap on every track update
+import zenoh
+
+session = zenoh.open(config)  # SAME config shape as publisher
+
+# Verify we actually peered (footgun 3 guard):
+seen_router = False
+for r in session.get("@/*/router", zenoh.Queue()):
+    seen_router = True
+    break
+if not seen_router:
+    raise SystemExit("session.get('@/*/router') returned nothing &mdash; TLS handshake probably failed silently")
+
+def on_sample(sample):
+    print(sample.key_expr, "->", bytes(sample.payload).decode("utf-8"))
+
+# Wildcard match: any entity uid under v2:
+sub = session.declare_subscriber("org164x/router/cot/v2/*", on_sample)
+print("subscriber declared, waiting...")
+
+import time
+while True:
+    time.sleep(1)</code></pre>
+      <p>Run the subscriber first, leave it running, then run the publisher in another shell. The subscriber should print one line per CoT track per publisher tick.</p>
+    </section>
+
+    <section id="kxref">
+      <h2>8. Quick reference: key-expression syntax</h2>
+      <table class="kxref">
+        <thead>
+          <tr><th>Expression</th><th>Matches</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>org164x/router/cot/v2</code></td><td>The literal key <code>org164x/router/cot/v2</code>. Nothing else.</td></tr>
+          <tr><td><code>org164x/router/cot/v2/*</code></td><td>One more segment, exactly. E.g. <code>org164x/router/cot/v2/abc</code> (matches), <code>org164x/router/cot/v2/abc/def</code> (does NOT match).</td></tr>
+          <tr><td><code>org164x/router/cot/v2/**</code></td><td>Any depth, including zero segments. E.g. <code>org164x/router/cot/v2</code> (matches), <code>org164x/router/cot/v2/abc/def/ghi</code> (matches).</td></tr>
+          <tr><td><code>org164x/**</code></td><td>Anything under your __LEX_ORG__ prefix. The "fire hose" form.</td></tr>
+          <tr><td><code>**</code></td><td>Everything on the entire fabric. Subscribers don't usually want this; it's what the audit log uses.</td></tr>
+        </tbody>
+      </table>
+      <p style="margin-top:1rem">When in doubt, use <code>/**</code> for subscribers and a stable per-entity key for publishers (Pattern B). That covers almost all use cases without surprises.</p>
+    </section>
+
+    <section id="self-check">
+      <h2>9. Self-check before you ask for help</h2>
+      <p>When something doesn't seem to work, run these in order:</p>
+      <ol>
+        <li><strong>Did the router accept my publish?</strong> The portal's <a href="/inspector.html">Inspector</a> shows recent publishes. If your topic appears there, the router got your message.</li>
+        <li><strong>Is my subscriber actually peered?</strong> Run a <code>session.get("@/*/router", q)</code> and confirm at least one reply. If zero replies, your TLS handshake probably failed silently &mdash; check cert paths + endpoint hostname.</li>
+        <li><strong>Does my subscriber's key_expr actually match my publisher's key?</strong> Print both side by side. If publisher puts to <code>org164x/router/cot/v2/&lt;uuid&gt;</code> and subscriber declares on <code>org164x/router/cot/v2</code> (no wildcard) &mdash; that's footgun 1.</li>
+        <li><strong>Was my subscriber running BEFORE my publisher fired?</strong> If you can't answer this for sure, run them in two separate shells and start the subscriber first.</li>
+        <li><strong>Can I <code>session.get</code> what I just put?</strong> If yes, the publish + storage path works. If subscribers still don't receive, the issue is purely subscriber-side (footguns 1&ndash;3).</li>
+      </ol>
+      <p>If you've run those and you're still stuck, post in the feedback channel listed at the top of the <a href="/peering/guide.html">Peering Guide</a> with: your subscriber's <code>session.open</code> call and <code>declare_subscriber</code> line, one example key your publisher emits, and whether the symptom is "no messages received" or "wrong messages received." That's enough for someone with router access to tell you exactly which footgun you hit.</p>
+    </section>
+
+  </main>
+
+  <script src="/nav.js" defer></script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

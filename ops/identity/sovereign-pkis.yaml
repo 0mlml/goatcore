@@ -1,0 +1,203 @@
+# sovereign-pkis.yaml — the one place a sovereign PKI is described (ADR 1209).
+#
+# A PKI listed here may sign people in with its smart card at every door that
+# reads this file:
+#   goatnets    ops/ansible/roles/icam-mtls-proxy  (nginx mTLS -> Dex -> Kratos)
+#   elsewhere   a Terraform variable or a per-PKI CA directory, GENERATED from this
+#               file by ops/identity/sovereign-pkis-render.py
+# Every row is a profile of a CA someone else publishes, read from its publisher's
+# public documents. A row trusts nothing by itself: a goatnet opts in by naming it.
+# Gate: ops/ci/check-sovereign-pkis.py. Library: ops/identity/sovereign_pkis.py.
+#
+# Field reference
+#   id                 lower-case slug; prefixes every identity the PKI yields
+#                      ("<id>:<identifier>"), so two PKIs never collide
+#   display            human name
+#   nation             ISO 3166-1 alpha-3 of the sovereign that runs the PKI, or
+#                      NATO for the alliance's own PKI. Says who issued the card.
+#                      It is NEVER a person's nationality (identity.nationality,
+#                      ADR 1171) and nothing derives one from the other.
+#   status             live   = every field verified; a goatnet may select it
+#                      sketch = documented from public sources only; cannot be
+#                               selected; fields listed in `unverified` are
+#                               best reading, not fact
+#   source_scheme      grammar identity.source_scheme value the claim map records
+#   identifier_name    what the PKI calls the per-person number the card carries
+#   issuer_match       regex over the RFC 2253 issuer DN of the card's
+#                      authentication certificate; selects this profile
+#   identity           where the identifier is read from
+#     source           san_upn | san_email | san_othername | cn_regex | serial
+#                        san_upn        SAN otherName 1.3.6.1.4.1.311.20.2.3
+#                        san_email      SAN rfc822Name
+#                        san_othername  SAN otherName of `oid`
+#                        cn_regex       the subject CN value
+#                        serial         the certificate serial, upper-case hex
+#     oid              san_othername only
+#     identifier_regex regex over the raw value; its FIRST capture group is the
+#                      identifier. Optional except for cn_regex. Without it the
+#                      raw value is the identifier (san_upn: the part before @).
+#   subject_cn_format  how the subject CN is built. The store binds a card by
+#                      its exact subject CN, so this says what an admin types.
+#   trust_anchor       where the CA certificates come from, how the download is
+#                      verified, how often to refresh, and which CAs to load:
+#                      `load: issuing` = only the CAs that issue the card's
+#                      authentication certificate plus the roots they chain to
+#                      (a trust store with a cap, such as an ALB's 25, needs this)
+#   revocation         CRL URL(s) or none, OCSP URL or none, and the cadence
+#   example            a SYNTHETIC card in this PKI's shape. The test PKI
+#                      generator (ops/identity/cac-test-pki) builds it, the
+#                      unit tests and the CI gate apply the identity rule to it.
+#   sources            where each fact was read, with the date
+#   unverified         field paths whose values are not yet confirmed against a
+#                      live card or the publisher's own document
+version: 1
+
+pkis:
+  - id: us-dod
+    display: "U.S. DoD (CAC/PIV)"
+    nation: USA
+    status: live
+    source_scheme: dod-piv
+    card_name: "CAC (Common Access Card); the PIV authentication certificate on it"
+    identifier_name: EDIPI
+    identifier_description: >-
+      DoD ID number: 10 digits, printed on the back of the card. Reissued and not
+      unique over time, which is why it is a mapped attribute and never the key.
+    issuer_match: ',OU=PKI,OU=DoD,O=U\.S\. Government,C=US$'
+    identity:
+      source: san_upn
+      # A DoD ID certificate's UPN is <EDIPI><6-digit persona code>@mil (16 digits).
+      # Older cards carry <EDIPI>@mil. Both yield the 10-digit EDIPI.
+      identifier_regex: '^(\d{10})(?:\d{6})?@mil$'
+    subject_cn_format:
+      pattern: "<LAST>.<FIRST>.<MIDDLE>.<EDIPI>"
+      regex: '^[^.,]+\.[^.,]+(?:\.[^.,]+)*\.(\d{10})$'
+      note: "Middle name may be absent (LAST.FIRST.EDIPI). Contractor cards add OU=CONTRACTOR."
+    trust_anchor:
+      publisher: "DISA, DoD Cyber Exchange (public.cyber.mil/pki-pke)"
+      source_url: "https://dl.dod.cyber.mil/wp-content/uploads/pki-pke/zip/unclass-certificates_pkcs7_DoD.zip"
+      bundle_name: "PKI CA Certificate Bundles: PKCS#7 for DoD PKI Only"
+      version: "5.14"
+      verification: >-
+        The zip carries a CMS detached signature (Certificates_PKCS7_v5_14_DoD.sha256)
+        and the signer chain (DoD_PKE_CA_chain.pem); verify the signature with
+        openssl smime -verify before using any certificate from it.
+      refresh: "When DISA publishes a new bundle version (new DOD ID CAs appear); check quarterly."
+      load: issuing
+      issuing_ca_match: '^CN=DOD ID CA-\d+,'
+      loaded: "DoD Root CA 3, DoD Root CA 6 and the twelve unexpired DOD ID CAs (62-65, 70-73, 78-81): 14 of the 49 published certificates"
+      expires_first: "DOD ID CA-63, 2027-04-07"
+    revocation:
+      crl:
+        url_pattern: "http://crl.disa.mil/crl/DODIDCA_<NN>.crl"
+        note: "One CRL per issuing CA; http://crl.disa.mil/crl/DODIDCA_81.crl answered HTTP 200 on 2026-10-30. Large and reissued daily."
+        cadence: "daily, if loaded"
+      ocsp: "http://ocsp.disa.mil"
+      loaded: none
+    example:
+      identifier: "1234567890"
+      subject_dn: "CN=MAINTAINER.TEST.MI.1234567890,OU=USA,OU=PKI,OU=DoD,O=U.S. Government,C=US"
+      issuer_dn: "CN=DOD ID CA-81,OU=PKI,OU=DoD,O=U.S. Government,C=US"
+      san_upn: "1234567890121002@mil"
+      san_email: "person-30@example.org"
+    sources:
+      - what: "CA bundle, its signature and the ID-CA set"
+        url: "https://public.cyber.mil/pki-pke/"
+        date: 2026-10-30
+      - what: "CRL and OCSP hosts (crlDistributionPoints and authorityInfoAccess of the DOD ID CA certificates)"
+        url: "the bundle itself"
+        date: 2026-10-30
+    unverified: []
+
+  - id: est-id
+    display: "region E ID-card (ESTEID2018)"
+    nation: EST
+    status: sketch
+    source_scheme: sovereign-pki
+    card_name: "Estonian ID-card; the authentication certificate on it"
+    identifier_name: "personal identity code (isikukood)"
+    identifier_description: "11 digits; also carried in subject serialNumber as PNOEE-<code>"
+    issuer_match: '^CN=ESTEID2018,.*O=SK ID Solutions AS,C=EE$'
+    identity:
+      source: cn_regex
+      # CN = "<SURNAME>,<GIVEN NAMES>,<personal identity code>"; the code ends the CN.
+      identifier_regex: '(\d{11})$'
+    subject_cn_format:
+      pattern: "<SURNAME>,<GIVEN NAMES>,<personal identity code>"
+      regex: '^[^,]+,[^,]+,(\d{11})$'
+      note: "Example from the profile document: JÕEORG,JAAK-KRISTJAN,38001085718. Commas inside the CN appear escaped (\\,) in an RFC 2253 rendering."
+    trust_anchor:
+      publisher: "SK ID Solutions AS"
+      source_url: "https://c.sk.ee/esteid2018.pem.crt"
+      root_url: "https://c.sk.ee/EE-GovCA2018.pem.crt"
+      repository: "https://www.skidsolutions.eu/en/repository/certs/"
+      verification: >-
+        SHA-1 fingerprints published on the repository page: ESTEID2018
+        26 DF C3 22 84 C2 04 62 BB 63 2D 1F 03 AA 82 EE 00 B5 F1 70;
+        EE-GovCA2018 A7 9E 63 1B 21 C9 02 BD 4C 14 C0 1D 2C 7D 72 1A 63 5D 88 8E.
+      refresh: "Both CAs are valid to 2033-09-05; check yearly."
+      load: issuing
+      issuing_ca_match: '^CN=ESTEID2018,'
+      loaded: "ESTEID2018 (issuing) + EE-GovCA2018 (root): 2 certificates"
+    revocation:
+      crl:
+        url_pattern: "https://c.sk.ee/esteid2018.crl"
+        note: "Answered HTTP 200 on 2026-10-30."
+        cadence: unverified
+      ocsp: "http://aia.sk.ee/esteid2018"
+      loaded: none
+    example:
+      identifier: "38001085718"
+      subject_dn: "CN=JÕEORG\\,JAAK-KRISTJAN\\,38001085718,serialNumber=PNOEE-38001085718,GN=JAAK-KRISTJAN,SN=JÕEORG,C=EE"
+      # OpenSSL (nginx) renders 2.5.4.97 as organizationIdentifier; the issuer_match
+      # above does not depend on how that attribute is spelled.
+      issuer_dn: "CN=ESTEID2018,organizationIdentifier=NTREE-10747013,O=SK ID Solutions AS,C=EE"
+      san_email: "jaak-kristjan.joeorg@eesti.ee"  # oss-allow: the published test identity of the issuer
+    sources:
+      - what: "Certificate profile: issuer DN, subject CN composition and example, SAN rfc822Name, EKU clientAuth, AIA ocsp/caIssuers"
+        url: "https://www.skidsolutions.eu/upload/files/SK-CPR-ESTEID2018-EN-v1_3_20220217.pdf"
+        date: 2026-10-30
+      - what: "CA certificates, fingerprints, validity and CRL URL"
+        url: "https://www.skidsolutions.eu/en/repository/certs/"
+        date: 2026-10-30
+    unverified:
+      - "identity.identifier_regex (not applied to a live card)"
+      - "example.subject_dn (serialNumber PNOEE- form is ETSI EN 319 412-1 §5.1.3, which the profile cites; not read from a card)"
+      - "example.san_email (the profile says an e-mail rfc822Name is present; the address form is set by the Police and Border Guard Board)"
+      - "revocation.crl.cadence"
+      - "whether cards issued by the older ESTEID-SK 2015 CA (RSA, valid to 2030-12-17) are still in use; they are not in the loaded set"
+
+  - id: nato-npki
+    display: "NATO PKI (NPKI)"
+    nation: NATO
+    status: sketch
+    source_scheme: sovereign-pki
+    card_name: "NATO PKI user certificate on a token or smart card"
+    identifier_name: unverified
+    identifier_description: "Not read from any public document."
+    issuer_match: null
+    identity: null
+    subject_cn_format: null
+    trust_anchor:
+      publisher: "NCI Agency (NATO Communications and Information Agency)"
+      source_url: "https://www.ia.nato.int/IdentityManagement/Certificates"
+      verification: unverified
+      refresh: unverified
+      load: issuing
+      loaded: "NATO Root CA and the intermediate CA the page installs; names and count unverified"
+    revocation:
+      crl: null
+      ocsp: null
+      loaded: none
+    example: null
+    sources:
+      - what: "The page offers 'Installing NATO ROOT CA Certificate' and install steps for the NATO PKI Root CA and Intermediate CA; the identity-management page names the NPKI Handbook V2.0, the NATO PKI Certificate Policy V2.0 and a CPS for NU/NR V1.0."
+        url: "https://www.ia.nato.int/IdentityManagement"
+        date: 2026-10-30
+    unverified:
+      - "issuer_match"
+      - "identity"
+      - "subject_cn_format"
+      - "identifier_name"
+      - "trust_anchor.source_url (page not readable without a browser), trust_anchor.verification, trust_anchor.refresh, trust_anchor.loaded"
+      - "revocation"
