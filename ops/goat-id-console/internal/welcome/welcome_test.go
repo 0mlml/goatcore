@@ -300,7 +300,7 @@ func TestRender_githubSummaryAndRepoSection(t *testing.T) {
 			Groups: []string{"DEVELOPER", "OBSERVER"}, FabricAccess: true, Publisher: true,
 			GitHubUsername: "octocat",
 			RepoGrants: []RepoGrant{
-				{Owner: "usareur-af", Repo: "zagros-moon-pod", Permission: "pull", Outcome: "invited"},
+				{Owner: "example-org", Repo: "example-pod", Permission: "pull", Outcome: "invited"},
 				{Owner: "usareur-af", Repo: "hello-galaxy-access-mgmt", Permission: "pull", Outcome: "added"},
 			}},
 		Artifacts{SetupKey: "K"})
@@ -308,7 +308,7 @@ func TestRender_githubSummaryAndRepoSection(t *testing.T) {
 	must := []string{
 		"| github: octocat", // summary line append
 		"Repository access", // the section heading
-		"USAREUR-AF/zagros-moon-pod (pull) — https://github.com/USAREUR-AF/zagros-moon-pod",
+		"example-org/example-pod (pull) — https://github.com/example-org/example-pod",
 		"usareur-af/hello-galaxy-access-mgmt (pull) — https://github.com/usareur-af/hello-galaxy-access-mgmt",
 	}
 	for _, m := range must {
@@ -323,12 +323,12 @@ func TestRender_repoGrantSourceTag(t *testing.T) {
 		Recipient{Name: "Dev", Handle: "dev", Tier: "developer",
 			Groups: []string{"DEVELOPER"}, GitHubUsername: "octocat",
 			RepoGrants: []RepoGrant{
-				{Owner: "usareur-af", Repo: "zagros-moon-pod", Permission: "pull", Outcome: "added", Source: "policy"},
+				{Owner: "example-org", Repo: "example-pod", Permission: "pull", Outcome: "added", Source: "policy"},
 				{Owner: "usareur-af", Repo: "extra-repo", Permission: "push", Outcome: "invited", Source: "audible"},
 			}},
 		Artifacts{SetupKey: "K"})
 	must := []string{
-		"USAREUR-AF/zagros-moon-pod (pull) (policy) — https://github.com/USAREUR-AF/zagros-moon-pod",
+		"example-org/example-pod (pull) (policy) — https://github.com/example-org/example-pod",
 		"usareur-af/extra-repo (push) (audible) — https://github.com/usareur-af/extra-repo",
 	}
 	for _, m := range must {

@@ -102,8 +102,9 @@ const (
 	flashOffboardCutState  = "offboard_cut_state"
 	flashOffboardCutFailed = "offboard_cut_failed"
 	// GitHub username set or cleared after onboarding (github_retro.go).
-	flashGitHubSet     = "github_set"
-	flashGitHubCleared = "github_cleared"
+	flashGitHubSet       = "github_set"
+	flashGitHubCleared   = "github_cleared"
+	flashGitHubRequested = "github_requested"
 )
 
 var onboardFlashes = map[string]flash{
@@ -128,6 +129,7 @@ var onboardFlashes = map[string]flash{
 	flashOffboardCutFailed:    {Level: "error", Message: "Could not queue the cut. Nothing was changed; try again, and check the console logs if it keeps failing."},
 	flashGitHubSet:            {Level: "success", Message: "GitHub username saved and the repo-access grant re-run. The Repo access panel below shows what GitHub was asked to grant; the person accepts each invitation from GitHub."},
 	flashGitHubCleared:        {Level: "info", Message: "GitHub username removed. Repositories the person was already added to are not revoked by this; remove them on GitHub or through offboarding."},
+	flashGitHubRequested:      {Level: "success", Message: "Request emailed. It links the person to /github, where they add their username signed in as themselves; saving it re-runs the repo-access grant. The request is in the audit log as onboard_github_requested."},
 }
 
 // offboardNoteRequiredMsg is the one sentence both realms return when an

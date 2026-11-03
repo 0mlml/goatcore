@@ -318,11 +318,15 @@ has_obs_host: false
 prometheus_enabled: false
 alertmanager_enabled: false
 grafana_enabled: false
-# The essential tier the pins declare present; phase 12 deploys these four.
-minio_enabled: true
-id_admin_console_enabled: true
-goat_get_enabled: true
-goat_docs_enabled: true
+# Off on a goatlite today (see LITE_ABSENT): MinIO and the audit subscriber (the
+# pinned MinIO image no longer exists upstream), the identity console (mail and
+# external identity doors). The served goat and goatbuilder fetch release
+# assets with a GitHub token, an account a goatlite does not need; a learner
+# downloads both binaries from the release page.
+minio_enabled: false
+id_admin_console_enabled: false
+goat_get_enabled: false
+goat_docs_enabled: false
 # The LAN name server phase 10 brings up; no relay fleet to watch on a goatlite.
 lan_coredns_enabled: true
 relay_health_enabled: false
@@ -774,6 +778,12 @@ LITE_ABSENT = {
     "e2e-canary", "fabric-crawler", "fabric-health", "flashlight", "goat-topology", "herd",
     "herd-connector", "mesh-health", "microscope", "netvis", "node-net-health", "ntp-health-pub",
     "panoscope", "presence-health", "stethoscope", "time-health",
+    # Not on a goatlite today (measured on the second VM run, 2026-11-03): the
+    # pinned MinIO release is gone from Docker Hub and quay.io, so neither MinIO
+    # nor the audit subscriber that writes to it can start on a new box; the
+    # identity console needs a mail sender and two external identity doors a
+    # goatlite has no account for. Each returns when that is solved.
+    "audit-subscriber", "id-admin-console",
 }
 
 

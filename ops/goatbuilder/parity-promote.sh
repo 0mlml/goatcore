@@ -52,8 +52,8 @@ for side in py rs; do
   ( cd "$REPO" && tar cf - ops/pins ops/ansible/group_vars ops/ansible/roles ops/release ops/consistency 2>/dev/null ) | ( cd "$SCRATCH/$side" && tar xf - )
 done
 COMP=netvis
-REF='ghcr.io/{{ ghcr_org }}/netvis:sha-abcdef0@sha256:2222222222222222222222222222222222222222222222222222222222222222'
-HOT='ghcr.io/{{ ghcr_org }}/netvis:sha-1234567@sha256:3333333333333333333333333333333333333333333333333333333333333333'
+REF='ghcr.io/{{ ghcr_org }}/netvis@sha256:89528e88c0814c4629d4c9facfb7083c005e4e9b4e74f48d6334cd3daf0cf053'
+HOT='ghcr.io/{{ ghcr_org }}/netvis@sha256:89528e88c0814c4629d4c9facfb7083c005e4e9b4e74f48d6334cd3daf0cf053'
 compare "promote open" "$(py "$SCRATCH/py" open $COMP --ref "$REF" --reason "parity gate")" "$(rs "$SCRATCH/rs" open $COMP --ref "$REF" --reason "parity gate")"
 R=""; for f in "$SCRATCH/py/ops/release/records/$COMP"/*.yaml; do case "$f" in *hotfix*) ;; *) R="$(basename "$f")" ;; esac; done
 same_record "the opened record" "$SCRATCH/py/ops/release/records/$COMP/$R" "$SCRATCH/rs/ops/release/records/$COMP/$R"

@@ -18,6 +18,7 @@ SPEC=$(cat <<EOF
 ${S}_PG_PASS|hex32|postgres superuser
 ${S}_SPIRE_DB_PASS|hex32|SPIRE datastore role on postgres-a (phase 9)
 ${S}_PORTAL_DB_PASS|hex32|portal registry role on postgres-a (phase 12)
+${S}_ID_CONSOLE_DB_PASS|hex40|identity console Postgres role password (id_admin_console_store: postgres)
 ${S}_NB_ENCKEY|b64_32|netbird mgmt datastore key (Class-B: per-fabric)
 ${S}_BKP_KEY|b64_36|pgBackRest cipher pass
 ${S}_REPLICATOR_PASS|hex32|Spock/streaming replicator (Class-B: per-cluster)

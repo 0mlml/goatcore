@@ -429,12 +429,6 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     ev.push(p(12, "A", "onboarding intake front desk (public, ADR 1062 stage 1)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} onboard-intake-deploy.yml -e target={g} -e site_id={site}")));
     ev.push(p(12, "A", "onboard-runner (auto-mint on approval, ADR 1062 stage 3)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} onboard-runner-deploy.yml -e target={g} -e site_id={site}")));
     ev.push(p(12, "A", "grant-keyd (encryption key distribution)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} grant-keyd-deploy.yml -e target={g} -l 'mgmt-{site}-01*'")));
-    if s.lite {
-        // goatlite (goatlite.md §5): the essential tier the pins declare present
-        // and no phase above deploys. A full site takes these from the release
-        // ladder after standup; a one-box learner goatnet has no ladder.
-        ev.push(p(12, "A", "[lite] the essential services the pins declare: MinIO, the audit subscriber, the identity console, served goat and goatbuilder".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} minio-bootstrap.yml -e target={g} -e site_id={site} && {pre} {inv} audit-subscriber-deploy.yml -e target={g} -e site_id={site} && {pre} {inv} id-admin-console-deploy.yml -e target={g} -e site_id={site} && {pre} {inv} goat-get-deploy.yml -e target={g} -e site_id={site} && {pre} {inv} goat-docs-deploy.yml -e target={g} -e site_id={site}")));
-    }
     ev.push(p(12, "A", "notional pub/sub (synthetic vendors — opt-in via synth_vendors_enabled)".into(), format!("cd '{r}/ops/ansible' && ( grep -qE 'synth_vendors_enabled:[[:space:]]*true' group_vars/{g}/synth-vendors.yml 2>/dev/null && {pre} {inv} zagros-zenoh-synth-vendors-deploy.yml -e target={g} || echo 'synth_vendors_enabled not true for {g} — notional pub/sub not requested, skipping' )")));
     if s.obs {
         ev.push(Event::LegJoin { leg: "stack", at: 13 });

@@ -1009,14 +1009,6 @@ step 12 A "grant-keyd (encryption key distribution)" \
 #      that mints a slot anchor + cert per synth peer via the portal — the model
 #      every modern goatnet uses. (A flat-vendor goatnet uses
 #      zenoh-synth-vendors-deploy.yml instead.) Needs PORTAL_OPERATOR_API_KEY.
-# goatlite (goatlite.md §5): the essential tier the pins declare present and
-# no phase above deploys. A full site takes these from the release ladder after
-# standup; a one-box learner goatnet has no ladder. The binary's line is the
-# same (parity gate).
-if [ "$LITE" = 1 ]; then
-step 12 A "[lite] the essential services the pins declare: MinIO, the audit subscriber, the identity console, served goat and goatbuilder" \
-  "cd '$REPO/ops/ansible' && $ANSIBLE_PRE ${INV[*]} minio-bootstrap.yml -e target=$GROUP -e site_id=$SITE && $ANSIBLE_PRE ${INV[*]} audit-subscriber-deploy.yml -e target=$GROUP -e site_id=$SITE && $ANSIBLE_PRE ${INV[*]} id-admin-console-deploy.yml -e target=$GROUP -e site_id=$SITE && $ANSIBLE_PRE ${INV[*]} goat-get-deploy.yml -e target=$GROUP -e site_id=$SITE && $ANSIBLE_PRE ${INV[*]} goat-docs-deploy.yml -e target=$GROUP -e site_id=$SITE"
-fi
 
 step 12 A "notional pub/sub (synthetic vendors — opt-in via synth_vendors_enabled)" \
   "cd '$REPO/ops/ansible' && ( grep -qE 'synth_vendors_enabled:[[:space:]]*true' group_vars/${GROUP}/synth-vendors.yml 2>/dev/null && $ANSIBLE_PRE ${INV[*]} zagros-zenoh-synth-vendors-deploy.yml -e target=$GROUP || echo 'synth_vendors_enabled not true for ${GROUP} — notional pub/sub not requested, skipping' )"

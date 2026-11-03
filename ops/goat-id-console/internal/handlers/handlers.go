@@ -444,6 +444,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/onboard/proposals/{id}/repo-access", m(s.apiSetProposalRepoAccess))
 	// GitHub username at any stage; post-mint it re-runs the repo grant.
 	mux.HandleFunc("POST /api/onboard/proposals/{id}/github", m(s.apiSetProposalGitHub))
+	mux.HandleFunc("POST /api/onboard/proposals/{id}/github-request", m(s.apiRequestProposalGitHub))
+	mux.HandleFunc("POST /api/onboard/github-requests", m(s.apiRequestGitHubMissing))
 	// Review-gate field edits (ADR 1137). The machine-realm door is the
 	// substantive one: without it a correction can only be made from a browser,
 	// which invites hand-editing the store on the mgmt host.
@@ -574,6 +576,7 @@ func (s *Server) Routes() http.Handler {
 	// GitHub username on the Onboarded / Enrolled card (admin-only inside the
 	// handler), and the browser read of the repo-access set the card draws.
 	mux.HandleFunc("POST /onboarding/{id}/github", s.onboardGate(s.handleOnboardingGitHub))
+	mux.HandleFunc("POST /onboarding/{id}/github-request", s.onboardGate(s.handleOnboardingGitHubRequest))
 	mux.HandleFunc("GET /onboarding/{id}/repo-access", s.onboardGate(s.handleOnboardingRepoAccessView))
 	mux.HandleFunc("POST /onboarding/{id}/repo-access", s.onboardGate(s.handleOnboardingRepoAccessSet))
 	// The generated welcome package — a complete, tier-correct

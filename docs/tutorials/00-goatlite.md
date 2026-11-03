@@ -1,11 +1,11 @@
 # Your first goatnet
 
-You will stand up a working goatnet on one Ubuntu host or VM on your LAN and use it: enrol your laptop, sign in, read its health, publish a message and receive it. You write one file of four facts and run one command. What comes up is a real goatnet with its own mesh, identity service, certificate authority and data fabric, not a demo. You rehearse the run on a worked example first, on your laptop.
+You will stand up a working goatnet on one Ubuntu host or VM on your LAN and use it: enrol your laptop, sign in, check it layer by layer, and watch a message cross its fabric. You write one file of four facts and run one command. What comes up is a real goatnet with its own mesh, identity service, certificate authority and data fabric, not a demo. You rehearse the run on a worked example first, on your laptop.
 
 - **Audience:** Someone who has never run a goatnet and knows none of the software under it
 - **Time:** The rehearsal is short. The real run takes an hour or more; downloads, reading and fixing mistakes all add to it, so do not plan around a number
 - **You need:** One Ubuntu 24.04 host or VM with 4 cores and 16 GB that you can SSH into with a key, a laptop on the same LAN, the `goatbuilder` and `goat` binaries, and a checkout of the goat repository
-- **You finish with:** A goatnet whose acceptance gate is green and on which you have published a message and received it
+- **You finish with:** A goatnet whose acceptance gate is green and whose router has carried a message and returned it
 - **Status:** Updated 2026-11-02 during the first measured run; that run's fixes are in this text
 - **Next:** [Tutorial 1, a new goatnet, from nothing](01-new-goatnet.md)
 
@@ -284,64 +284,37 @@ It checks the goatnet layer by layer: the box, the management stack, TLS and DNS
 
 Every command in this section runs on your laptop.
 
-**Your welcome package.** Your fabric identity comes from the goatnet's own onboarding, the same way every later person's identity will: the identity console issues you a package holding the goatnet's root certificate, your fabric bundle and a notes file with the two commands to run, in order. Trust the root once per laptop, then establish your profile:
-
-```text
-goat ca add <the .pem in the package>
-goat profile init <the .cbor in the package> --context pasture
-```
-
-Install the same root certificate in your laptop's trust store, and the browser warnings from the sign-in step go away.
+**Trust the goatnet's root certificate.** The render wrote it into your checkout at `ops/enrollment/ca/pasture/root-cert.pem` (with your goatnet's name in place of `pasture`). Install it once, and the browser warnings from the sign-in step go away.
 
 On Ubuntu and Debian:
 
 ```text
-sudo cp <the .pem in the package> /usr/local/share/ca-certificates/pasture-root.crt
+sudo cp ops/enrollment/ca/pasture/root-cert.pem /usr/local/share/ca-certificates/pasture-root.crt
 sudo update-ca-certificates
 ```
 
 On Fedora and other RPM systems:
 
 ```text
-sudo cp <the .pem in the package> /etc/pki/ca-trust/source/anchors/pasture-root.pem
+sudo cp ops/enrollment/ca/pasture/root-cert.pem /etc/pki/ca-trust/source/anchors/pasture-root.pem
 sudo update-ca-trust
 ```
 
 On macOS:
 
 ```text
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain <the .pem in the package>
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ops/enrollment/ca/pasture/root-cert.pem
 ```
 
 Restart the browser afterwards. Firefox keeps its own trust store; in its settings, search for "certificates" and import the same file as an authority.
 
-**Read its health.**
+**Watch a message cross the fabric.** The assay's `fabric-put-subscribe-roundtrip` row publishes a value through the goatnet's router and reads it back; a `PASS` there is your goatnet carrying data. Run that row alone:
 
 ```text
-goat status
-goat health
-goat health --domain mesh
+goatbuilder assay pasture --only fabric-put-subscribe-roundtrip
 ```
 
-`goat status` opens one real session to the router and gives one verdict per layer. `goat health` reads the fabric's own health beat; `--domain mesh` reads the mesh's.
-
-**Send a message to yourself.** `goat hello` is the built-in test: it publishes through the fabric and receives its own message back.
-
-```text
-goat hello
-```
-
-**Publish and subscribe for real.** Your package names the prefix you may write under. Subscribe in one terminal, publish in another, and watch the message arrive.
-
-```text
-goat sub '<your-prefix>/**' --take 1 --for 60s
-```
-
-```text
-goat pub <your-prefix>/hello/v1 --payload 'first message on pasture' --confirm
-```
-
-`--confirm` reads the value back from the router's storage, so a denied write is reported instead of silently dropped. `goat topic ls` lists what the goatnet has declared.
+**Using the goatnet as yourself is not in goatlite yet.** On a larger goatnet, your identity console issues you a welcome package, and `goat profile init` with it gives you a `goat` context for `goat status`, `goat hello`, `goat pub` and `goat sub`. A goatlite does not run the identity console, and nothing else issues a person's package yet, so those commands have no context to use on a goatlite. A one-command founder identity, minted from the certificate authority you already hold, is the planned fix. Until it lands, the `goat` client is for the larger goatnets of Tutorial 1 onward.
 
 ## When something fails
 

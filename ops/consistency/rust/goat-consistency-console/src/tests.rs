@@ -2148,16 +2148,16 @@ fn production_fixture_intents() -> (Value, Value) {
 
     // The real pinned values (ADR-length refs, templated org, full digests).
     const NB: &str = "ghcr.io/{{ ghcr_org }}/netbird-mgmt:latest";
-    const PG: &str = "ghcr.io/{{ ghcr_org }}/postgres-spock@sha256:78ee7423a3ba51976aa814ddfa9fdeb6caf11db9bd84e24f23567f98d5e6ddfa";
-    const SIG: &str = "ghcr.io/{{ ghcr_org }}/signal-server:sha-be32c97@sha256:83de114fed4ae88569b1771e0ae23b6cb11db79e0c883a8c55931aae08e4eb60";
-    const ZR: &str = "ghcr.io/{{ ghcr_org }}/zenoh-pqc-fips@sha256:27c4e9b1cf4612deb7f1957321eca9cd017e4459b8f4bdc4e09796a178c2d6e1";
-    const PORTAL: &str = "ghcr.io/{{ ghcr_org }}/goat-zenoh-portal:sha-e68a6ae@sha256:85dc0e7300686f4f9b85d984c13dab60353249f2d6dbaac7250e2dbd90ae75b1";
+    const PG: &str = "ghcr.io/{{ ghcr_org }}/postgres-spock@sha256:038f12f0e5339b2722754c06273a2277fcc4e4e17056c8afd2f52f28ed16e56c";
+    const SIG: &str = "ghcr.io/{{ ghcr_org }}/signal-server@sha256:3a26d0e8884e90edcf8dfc0fba5261a16ce45c7e585d9ca325a0913d9029241d";
+    const ZR: &str = "ghcr.io/{{ ghcr_org }}/zenoh-pqc-fips@sha256:f3a16fdfda03cb6534c7ca27f2e120dd2f7e33c3cc8072f1c6a44643d9112f48";
+    const PORTAL: &str = "ghcr.io/{{ ghcr_org }}/goat-zenoh-portal@sha256:b8a3da7b3ddbd87794aab5bb26639bf182b754d0319bc6c1800e114e75459a1d";
     const CH: &str = "ghcr.io/{{ ghcr_org }}/goat-consistency-health:sha-7c9a662@sha256:09d330069d1d812b06fcf1bfebc3555ac43e80ef14bd49e12988aa0ac02ac718";
     const CC: &str = "ghcr.io/{{ ghcr_org }}/goat-consistency-console:sha-7c9a662@sha256:79d40ca11dcc108a5a516d40caf797690e96c8640221a1434c66cdaaa3f1da8f";
-    const IDC: &str = "ghcr.io/{{ ghcr_org }}/goat-id-console:sha-887f60b@sha256:df992bf1e2793284a69c93a395979571b20c7823f915335f25a5fe2eb9691062";
-    const RUNNER: &str = "ghcr.io/{{ ghcr_org }}/onboard-runner:sha-29758a5@sha256:8c9fd76511cee5afc83e351c927b455e42d62191dadbb84b574cebb8feb34b34";
-    const AUDIT: &str = "ghcr.io/{{ ghcr_org }}/goat-audit-subscriber:sha-81c7e54@sha256:46b91630a9440b10d6bb49855ef4ad01eadf56273c46efd357541cb48c3aee8d";
-    const MICRO: &str = "ghcr.io/{{ ghcr_org }}/microscope:sha-ad09348@sha256:f20b588eab4a22bf3a861a4f1ab27537243626ed89fc734ec3b697bae73b4a3c";
+    const IDC: &str = "ghcr.io/{{ ghcr_org }}/goat-id-console@sha256:60401f3cff3e84d1de92735294ed70a818094f8c267284a1f427cda59fc517c8";
+    const RUNNER: &str = "ghcr.io/{{ ghcr_org }}/onboard-runner@sha256:12cb6a42fed11397e7e31fb376be9b1fe7454d27895afe50d1634ac1bfe23929";
+    const AUDIT: &str = "ghcr.io/{{ ghcr_org }}/goat-audit-subscriber@sha256:6aacd50c4f6a8937e1750374a4e0b9a1150ddffe66a81d37fdb77c9e1ff49ae5";
+    const MICRO: &str = "ghcr.io/{{ ghcr_org }}/microscope@sha256:8a5462ffbc6c766373d6771dcd36e4ebec92453c2a9b187fbf1db9b19b815364";
 
     let both = |v: &str| {
         serde_json::json!({
