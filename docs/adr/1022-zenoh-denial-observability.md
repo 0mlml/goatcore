@@ -1,0 +1,75 @@
+# ADR 1022 — Zenoh write-denial observability
+
+**Status:** Proposed (Decision revised 2026-06-03 — expected-vs-actual primary, DLQ demoted to deferred-forensic, apply gated on detection)
+**Date:** 2026-06-02
+**Repo scope:** goat core (the trial-fabric zenoh router roles, `goat-cli`)
+**Related:** finding F-177 (the silent-denial gap) · [ADR 1020](1020-zenoh-federated-peering-trust-model.md) (peering-trust / ACL enforcement) · [ADR 0844](0844-zenoh-deployment-topology-and-acl-v1.md) (ACL v1) · design [`zenoh-dlq.md`](../design/zenoh-dlq.md) · [`zenoh-federated-peering-trust.md`](../design/zenoh-federated-peering-trust.md) · `goat-cli.md`
+
+## TL;DR (for a layperson)
+
+We just made the data fabric refuse writes from anyone who isn't onboarded for a topic. Good — except the refusal is *invisible*. The person whose write was refused gets no error (the protocol is "fire and forget"), and our own operators get no alert. So an honest partner who simply hasn't finished onboarding sees their data quietly vanish, and we can't tell it happened. This decision is about giving both sides a signal. We've already shipped the cheap publisher-side half (an opt-in "did it land?" check in the CLI). This ADR decides the operator-side half: instead of rebuilding the router to capture each refusal, we **watch the data each onboarded vendor is supposed to be producing, and alarm when it goes quiet** — which catches a silently-broken vendor no matter *why* it broke, using monitoring we already run. And we **don't turn enforcement on until that alarm exists**, so we never flip a switch we can't watch.
+
+## Context
+
+F-177 documents that a Zenoh ACL ingress-write denial is silent at three layers: the publisher (fire-and-forget `put`, no ack), the router (`RUST_LOG=info` emits no per-denial event), and audit/observability (the audit logger is a subscriber, so a denied sample it never sees). Two distinct problems hide inside "denials are invisible," and they are easy to conflate:
+
+1. **Denied writes** — an un-onboarded publisher's `put` is refused at ingress. Nothing is accepted, nothing is stored, nothing is delivered. The *honest-partner-mid-onboarding* case. There is no traffic to observe — the only evidence is the *attempt*, which lives only at the publisher and (at most) in elevated router logs.
+2. **Accepted-but-unexpected writes** — un-onboarded data that nonetheless *got in* (e.g. a vendor flood that entered via a relay's authorized session, not a denied direct write). This produces real traffic under a prefix with no onboarding record. The *squat / flood* case.
+
+These need different mechanisms. A subscriber-or-traffic-based detector sees (2) but is blind to (1), because (1) produces no traffic. A capture at the enforcement point sees (1) but is unnecessary for (2).
+
+**Publisher-side, already landed.** `goat pub --confirm` (this track) does an opt-in round-trip read-back: after publishing it queries the key back out of storage and reports landed / not-confirmed with a non-zero exit. That gives the honest partner in case (1) a self-serve signal — the ceiling of what's possible publisher-side, since Zenoh `put` can never *synchronously* return "denied."
+
+**The operator-side fork.** Two designed mechanisms exist:
+
+- **DLQ `policy_deny`** ([`zenoh-dlq.md`](../design/zenoh-dlq.md) §2) — a dead-letter-queue reason code that captures a denied sample with full provenance (who/what/why/when) to `@/dlq/policy_deny/<key>`, 30d, audit-relevant. Solves case (1) at the source. **But:** the DLQ design assumes a *custom* policy-enforcement interceptor that tags `drop_intent=policy_deny` and lets a downstream DLQ interceptor capture it. What we shipped in #716/#763 enforces via Zenoh's **built-in `access_control` module**, which drops internally and does **not** tag or feed any DLQ. So this path requires *moving enforcement out of the built-in module into a custom interceptor* — a rewrite of the security-critical path we had not yet live-verified on the trial fabric. The DLQ is also only Phase 3 in its own design (Phase 2 ships `ntp_degraded` + `no_subscribers`).
+- **Expected-vendor-manifest alert** ([`zenoh-federated-peering-trust.md`](../design/zenoh-federated-peering-trust.md) build-plan step 2) — a manifest of onboarded prefixes plus an alert keyed on the **per-vendor sample rate** the audit-subscriber already exports (`goat_audit_samples_total{vendor,key_pattern}`, scraped by the trial fabric's obs Prometheus). Cheap, additive, touches nothing in the enforcement path. **The same metric + manifest catches BOTH cases** — an *appearance-only* version (traffic under a prefix absent from the manifest) catches case (2); the *rate* version (an expected vendor whose rate drops to 0) catches case (1), because a silently-denied vendor produces no samples → flat line → alert. The earlier framing that this "does not solve case (1)" was wrong: it only fails to catch case (1) if you watch *appearance* instead of *rate*.
+
+## Decision
+
+**(Revised 2026-06-03.)** Frame silent-failure detection as the fabric's existing **general approach — declared-state reconciliation** ([`pubsub-state-as-code.md`](../design/pubsub-state-as-code.md): declare what should exist, reconcile actual to it). This is the *runtime* extension of that spine, with two vantages of one pattern: an **operator-side monitor** (the reconciler's runtime arm — central, covers everyone) and **producer-side reconciliation** (the producer's local intent-ledger-vs-actual — agency + the intent-heartbeat that lets the monitor catch partial failure; the tiered producer contract lives in [`pubsub-best-practices.md`](../design/pubsub-best-practices.md) §"Delivery reconciliation"). The DLQ/interceptor was the *other* paradigm (capture-at-point-of-failure) and never fit. The live apply is **gated on the operator monitor existing** (gate-to-C), not flipped behind an interim diff alone.
+
+1. **Primary — expected-vs-actual monitoring (no router change, no fork, no new component).** The fleet-wide `AuditSubscriberStalled` alert and per-vendor `goat-audit` Grafana dashboards already exist; the only gap is a per-vendor *alert* (a single vendor going silent is invisible to a fleet-wide rule and only dashboard-visible). Close it with: an expected-vendor manifest (which vendors *should* produce — from the portal registry) + two rules in the existing `audit-subscriber.yml`:
+   - expected vendor, `rate(goat_audit_samples_total) == 0` for N min → **silently-broken vendor** (case 1 — the F-177 concern; denied writes produce no samples).
+   - vendor not in manifest, `rate(...) > 0` → **accepted un-onboarded squat** (case 2 — the vendor-flood class).
+
+   *More general* than denial-capture (catches silent failure from any cause — ACL denial, cert expiry, client crash, network), reuses deployed substrate (the audit-subscriber's metric + the obs Prometheus), touches `zenohd` not at all. **Net new = 1 manifest + 2 rules.** **Coverage boundary:** the silence rule catches a vendor that *was producing and stopped*; it does **not** catch a vendor that *never produced* (broken from its first write — the likely shape of a permission failure), because a never-seen vendor isn't on the expected-active list and "misconfigured" looks identical to "not started yet." That start-time case is item 1b.
+
+1b. **Onboarding-time verification (the start-time complement).** At mint, the portal test-publishes with the freshly-minted cert and confirms it lands before declaring onboarding complete — catching a cert-CN/ACL/prefix misconfiguration at the source, immediately, instead of waiting for a silence window that never arrives. The "declare → immediately verify" arm of the spine. Roadmap; track `zenoh-onboarding-publish-verification`.
+
+2. **DLQ `policy_deny` → wrong *category*, not just costly. Deferred forensic.** A DLQ is the wrong *kind* of tool here, and that's the primary reason — the fork is secondary. In broker systems (Kafka / SQS / Google Pub/Sub) a DLQ is a **consumer-side, delivery-attempt** mechanism: a message the broker *already accepted* that a subscriber can't *process* after N tries, keyed on the subscription. Our failure is **admission rejection** — the ACL refuses the write at ingress — which in broker-land is a **synchronous produce error on the ack**, not a DLQ event. Zenoh is a **routing fabric, not a broker**: `put` is fire-and-forget with no produce ack, so it ships **no native dead-letter primitive** (nothing tracks delivery/processing failure; confirmed against upstream). The precedented answer for *"did my write get accepted?"* is therefore an **acknowledged write — Zenoh's first-class Query/Reply** (a queryable that accepts/rejects synchronously) for producers that need it, and the expected-vs-actual monitor (item 1) for operations. A router-internal DLQ would *additionally* need a **forked zenohd** (interceptors aren't drop-in plugins), reopening the fork [ADR 0858](0858-zenoh-image-upstream-pivot.md) closed — but even fork-free it would be answering the wrong question. Its one real edge is byte-level forensic capture of a refused sample; keep it only as a deferred-forensic option if that specific need ever arises. The earlier draft of this ADR treated DLQ as the eventual home for case (1); that is superseded.
+
+3. **Gate the apply on item 1 (gate-to-C).** Do not flip enforcement on the live partner-facing fabric until the expected-vs-actual detection exists, so we never enforce on a fabric we cannot watch. At apply time, *active* publishers are additionally covered by the pre/post-apply publisher diff; the *dormant* tail is covered by item 1 going forward. Rollout sequencing in `zenoh-write-enforcement-rollout.md`.
+
+4. **Document the protocol floor.** A Zenoh `put` cannot synchronously report denial; `goat pub --confirm` (opt-in, CLI-only) is the publisher-side ceiling and does not cover real vendor clients — which is *why* the operator-side item 1 is the real net.
+
+**What the platform builds vs. documents (no redundant platform layers).** The platform builds **one** detector — the operator monitor (item 1, the load-bearing floor that needs no producer cooperation). The producer-vantage mechanisms are **captured as a documented contract, not built/operated as platform components** — they are the producer half of the same reconciliation, tiered in [`pubsub-best-practices.md`](../design/pubsub-best-practices.md) §"Delivery reconciliation":
+- **Producer self-canary** (intent-ledger vs. own-output read-back) — producer's local health knowledge + agency. Documented (tier 1), not a platform component.
+- **Intent heartbeat** (intended-vs-landed) — the highest-leverage producer tier: it *upgrades the monitor* to catch **partial** denial. Documented (tier 2); nudged in onboarding.
+- **Query/Reply admission** (acked write) — the fabric-idiomatic must-land path (F-178). Documented (tier 3), reserved for control-grade writes.
+- **DLQ / interceptor** — the *other* paradigm (capture-at-point-of-failure), wrong category + needs a fork (item 2). Deferred-forensic only.
+
+The principle: **build one platform detector; document the producer contract.** No two platform components detect the same thing.
+
+**Status stays Proposed** pending ratification.
+
+## Alternatives considered
+
+The full deliberation (the reasoning is captured in F-178 and the rollout doc; condensed here):
+
+- **DLQ `policy_deny` as the primary detector.** Rejected — wrong *category*: a DLQ is a consumer-side delivery-failure mechanism; admission-rejection is an *acked-write* concern. Also narrower than the monitor (only ACL denials, not cert-expiry/crash/network) and would need a forked zenohd (against [ADR 0858](0858-zenoh-image-upstream-pivot.md)). Kept as deferred-forensic only.
+- **Custom in-router interceptor (capture/enforce inside zenohd).** Rejected as the mechanism: interceptors aren't drop-in plugins in 1.9.0 → a fork. Complete coverage + native, but the fork is the worse long-term liability than any alternative's cost.
+- **Gateway as the mandatory front door for *all* ingress** (enforcement + capture in our code, no fork). Viable end-state but a real re-architecture — a chokepoint that must scale to all vendor throughput, HA, +latency, vendor re-onboarding. Not warranted by the current problems; named, not chosen. (The gateway *is* the right tool for the narrower third-party-ingress / quarantine job — ADR 1020 Tier 2, `ops/zenoh-ingress-gateway/`.)
+- **Producer-side confirmation (`--confirm` read-back, or a self-canary that publishes normally + periodically reads its own output back).** Good *producer-side* design (self-canary keeps throughput + gives the producer agency), but redundant with the monitor *for detection* and — like all producer-side options — needs producer cooperation, which real vendor clients won't give. Documented as opt-in, not built.
+- **Query/Reply admission path** (the fabric-native acked write — a queryable that accepts/rejects synchronously). The *correct* answer for a producer that genuinely needs per-message delivery assurance, but niche. Offer on request; not built proactively.
+- **Intended-output heartbeat** (producer reports intended count; monitor compares intended-vs-landed). The one genuinely-distinct capability — catches *partial* denial the rate→0 rule misses — but lower priority and needs producer cooperation. Deferred enhancement, not a parallel layer.
+- **Elevate router log level + scrape denials into metrics.** `RUST_LOG=debug` on `access_control` is noisy, the denial log shape is unverified on 1.9.0, and log-parsing for a security signal is brittle. Acceptable only as a *temporary* diagnostic during the trial-fabric live test.
+- **Do nothing operator-side; rely on `goat pub --confirm` alone.** Leaves the dormant tail + accepted-squat with zero automated detection. Rejected.
+- **Build several of the above as parallel detectors.** Rejected on complexity-budget grounds — the monitor is the single load-bearing detector (covers everyone, no cooperation); the rest are redundant-for-detection, niche, or deferred.
+
+## Implementation status
+
+- ✅ **Publisher-side `goat pub --confirm`** — landed (#780, `crates/goat-cli/src/cmd/pubsub.rs`): opt-in storage read-back, landed / value-mismatch / not-found verdicts, non-zero exit, unit-tested classifier. Opt-in + CLI-only — does not cover real vendor clients.
+- ✅ **Expected-vs-actual monitoring (PRIMARY)** — built (track `zenoh-expected-vendor-monitor`, pending operator deploy): manifest → node-exporter textfile `goat_expected_vendor` + `ExpectedVendorSilent` (the gate) + `UnexpectedVendorProducing` rules in the obs Prometheus; promtool unit test passes. No new component. Remaining: operator deploys the obs host + verifies the metric's vendor label; follow-on completes the `allowed` set from the declared pub/sub state.
+- 🔲 **Pre/post-apply publisher diff + vendor-grant audit** — apply-time guards. Tracks `zenoh-acl-apply-publisher-diff`, `zenoh-vendor-grant-audit`.
+- 🔲 **DLQ `policy_deny` capture** — deferred forensic; only if denied-bytes capture is needed AND achievable without a zenohd fork.

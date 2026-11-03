@@ -1,0 +1,70 @@
+# ADR 1037 — Fabric time is internal-synchronization-first: peer mutual sync is the foundation, external reference (GNSS/NTS) is an opportunistic anchor
+
+**Status:** Proposed (2026-06-09)
+**Repo scope:** goat core (the fabric time model — `ntp-health-agent` + the planned internal-sync engine + the env-health time domain; reframes `universal-ntp-hygiene.md` + `ntp-strategy.md`)
+**Related:** [`universal-ntp-hygiene.md`](../design/universal-ntp-hygiene.md) (the cross-plane time policy this reframes) · [`ntp-strategy.md`](../design/ntp-strategy.md) (the three-tier external-acquisition model this subordinates) · [ADR 0834](0834-per-site-nts-server-tier.md) (the NTS tier, now an anchor not the foundation) · [ADR 1036](1036-environment-health-surface.md) (the env-health time domain that now carries two health axes) · the signed-attestation work in `ops/time-hygiene/internal/attest` (the Byzantine gate this depends on) · `zenoh-data-fabric.md` + [`zenoh-brokerless-consequences.md`](../design/zenoh-brokerless-consequences.md) (the brokerless philosophy this is consonant with) · Corsaro, "internal clock synchronization for large-scale dynamic systems" (the gossip-coupling basis)
+
+## Plain-language summary
+
+On a brokerless tactical fabric, every participant stamps its own data and consumers order and correlate events by those timestamps. What that actually requires is that all participants **agree with each other** about time — not that each is individually correct against UTC. Our current design has this backwards: it makes external references (GPS/GNSS, secured network time) the *foundation* of time correctness and treats running-without-them as a degraded fallback. But the fabric exists precisely for the contested, mobile, denied edge where GNSS is jammed or spoofed and the WAN is cut — so the "fallback" is the normal operating condition, and an external-first design fails exactly when it matters. This decision inverts the foundation: **fabric participants continuously synchronize their clocks to *each other*, peer-to-peer, with no external reference required** (the gossip-coupling approach Corsaro designed for this exact regime — and the same regime Zenoh itself was built for). External references (GNSS, NTS) are demoted to **opportunistic anchors**: when reachable they pull the whole synchronized ensemble toward true UTC; when not, the ensemble free-runs *together*, keeping the relative consistency the fabric needs while its UTC confidence honestly decays. Because the gossip model trusts neighbors and is not adversary-robust on its own, peer clock inputs are **gated by the signed attestation** we already build — sync over neighbors we can authenticate, not raw timestamps from a possibly-spoofed node.
+
+> **Runnable companion.** `hello-galaxy-time-hygiene` (Hello Galaxy series) walks this model in six scenarios — five of which need no infrastructure. It verifies a real `ntp-attest-v1` signature against a readable reference, exercises the five-state honesty grading, models the liar and the anchor-loss cases the engine would handle, and reproduces the RTC-less cold-boot failure with openssl. Its `docs/honesty-matrix.md` is the one place the live-versus-designed line is drawn for the whole time domain.
+
+## Context
+
+The fabric is **brokerless**: there is no central component, and every participating node — sensors, effectors, edge peers, services — publishes timestamped data that other nodes order, age-out, correlate, and fuse by producer timestamp ([`universal-ntp-hygiene.md`](../design/universal-ntp-hygiene.md) §1.1). The population that must agree about time is therefore **every fabric participant** — hundreds to ~1000 per site, thousands fleet-wide (ADR 0215) — not a small control set.
+
+Two facts make the current model wrong at its foundation:
+
+1. **The operating regime is the contested edge, not a machine room.** The fabric's purpose is the mobile, denied, adversarial tactical edge. GNSS is jammable and spoofable (in our threat model), and the WAN is routinely cut. So an external time reference is *exactly what you cannot rely on* in the conditions that matter most. A design that makes external reference the foundation is a fair-weather design that fails in its own intended environment.
+
+2. **Relative consistency, not absolute UTC, is what the fabric needs.** Event ordering, fusion, track correlation, causal age-out, and multi-master last-write-wins conflict resolution all need participants to *agree with each other* on the ordering and spacing of events. They do **not** need each participant to be individually correct against UTC. UTC matters only for a narrower set of operations — certificate / JWT / setup-key validity windows, and human-facing or cross-cluster absolute timestamps.
+
+The current design ([`ntp-strategy.md`](../design/ntp-strategy.md) Tiers 1–3, [`universal-ntp-hygiene.md`](../design/universal-ntp-hygiene.md)) acquires external time (GNSS + NTS) as the foundation (Tiers 1–2) and falls back to **per-node** holdover (Tier 3) when isolated. Per-node holdover is the specific failure: each isolated node extrapolates *its own* crystal independently, so participants **drift apart from one another** — destroying fabric-wide timestamp correlation at precisely the moment external reference is gone. There is no mechanism in the current design that keeps the fabric internally consistent without an external anchor.
+
+This is the same problem, regime, and scale Corsaro addresses with **gossip-based internal synchronization** — and notably he designed **Zenoh, our fabric**, after that research. The substrate's own author already concluded that internal peer synchronization is the time model for this environment; we have been layering an external-first model on top of it.
+
+## Decision
+
+1. **Internal synchronization is the foundation.** Every fabric participant continuously runs peer-to-peer mutual time synchronization — gossip-based adaptive coupling (random bounded peer view, four-timestamp delay compensation, age-adaptive coupling so young nodes absorb quickly and established nodes stay stable), per Corsaro's internal-synchronization work. The fabric thereby holds a common, **relatively-consistent** time across all participants **with no external reference required**. This is always-on and primary, not a fallback.
+
+2. **External references are opportunistic anchors, not the foundation.** GNSS, NTS, and peer-NTS are demoted to *anchors*: when reachable, an anchored node carries high weight in the coupling and pulls the ensemble's synchronization point toward true UTC; the whole ensemble follows. When no anchor is reachable, the ensemble **free-runs together** — relative consistency is preserved and UTC confidence decays honestly. Acquisition (the [`ntp-strategy.md`](../design/ntp-strategy.md) three tiers, [ADR 0834](0834-per-site-nts-server-tier.md)) is retained, but as the anchor-supply layer beneath internal sync, not as the source of fabric time.
+
+3. **Time health has two axes, replacing the single verdict.** The `healthy/warning/degraded/unknown` verdict is split into two independent measures:
+   - **Internal coherence** — is this node locked to the fabric ensemble within a bounded synchronization error? Governs fabric participation: event ordering, fusion/correlation, and multi-master LWW (whose correctness needs the *writers* to agree, which internal sync provides without UTC).
+   - **UTC confidence** — how well is the ensemble anchored to true UTC, and how fresh is the last anchor? Governs only UTC-bound operations (cert/JWT/setup-key validity, cross-cluster and human-facing absolute timestamps).
+
+   A node can be **internally-coherent but UTC-unknown** — the correct and common state for denied-edge operation — and that must read as *fully healthy for fabric ordering*, degraded only for UTC-bound operations. Conflating the two axes (the current single `ntp_class`) was the foundational error. This is the time domain of the environment-health surface ([ADR 1036](1036-environment-health-surface.md)); it now reports both axes.
+
+4. **Byzantine resistance via attestation-gated coupling.** Corsaro's coupling trusts neighbors and is explicitly not adversary-robust; a malicious node reporting false timestamps could drag the ensemble. Peer clock inputs to the coupling are therefore **gated by the signed attestation** (`ops/time-hygiene/internal/attest`, the `ntp-attest-v1` verdict signature): only attestation-verified peer clocks feed the sync, and the aggregation is **robust** (a trimmed mean / median-of-verified, not a plain mean) so a minority of compromised-but-attested peers cannot capture the ensemble. This is the principled reconciliation of Corsaro's *mean-for-accuracy* with our adversarial threat model, and it is why the signed attestation was the right primitive to build first.
+
+5. **Consonant with brokerless — no time authority.** Peer-to-peer sync has no central time master, no SPOF, no broker; it is the same philosophy as the rest of the fabric ([`zenoh-brokerless-consequences.md`](../design/zenoh-brokerless-consequences.md)). This does not reintroduce the broker we rejected — it removes the implicit one (the assumption of a reachable external reference) and replaces it with peer agreement.
+
+## Alternatives considered
+
+- **Keep external-reference-first (status quo).** Rejected — it makes fair-weather (reachable GNSS/NTS) the assumption and fails in the contested/denied/mobile regime the fabric exists for; per-node holdover lets participants drift apart exactly when external reference is gone.
+- **External + per-node holdover only (current Tier 3, no internal sync).** Rejected — independent holdover preserves *one node's* time, not *mutual* time; it does not keep the fabric correlated without an anchor, which is the actual requirement.
+- **PTP / hardware-assisted sync as the foundation.** Rejected as the foundation — PTP needs boundary clocks and symmetric, bounded-delay paths the mobile edge does not have. It is a fine *local anchor* where the infrastructure exists, slotting in under the anchor layer.
+- **A central time master / elected time authority.** Rejected — reintroduces a broker / SPOF and contradicts the brokerless commitment; a captured or lost master takes the fabric's time with it.
+- **Plain-mean coupling (Corsaro's accuracy-optimal choice).** Rejected for our threat model — a plain mean is not robust to a lying attested peer; we use robust aggregation over attested inputs, trading a little accuracy for adversary resistance.
+
+## Consequences
+
+**Positive.** The fabric holds a common, ordered time across all participants in exactly the conditions it is built for — GNSS denied, WAN cut, nodes churning — instead of fragmenting into independently-drifting clocks. Relative consistency (what ordering/fusion/LWW need) is decoupled from UTC confidence (what certs/cross-cluster need), so denied-edge operation is honestly "coherent, UTC-unknown" rather than falsely "unhealthy." The model is brokerless-native and matches the substrate's own design lineage. It repurposes the just-built signed attestation as the sync trust gate — validating that primitive and giving it a second load-bearing consumer.
+
+**Negative / cost.** This inverts the foundation of two mainline design docs and is a **significant build** — a continuous internal-sync engine on every participant is more than the current chrony-plus-holdover posture. It is adopted as a **model and health-semantics reframe first** (cheap, and the thing ZAGROS must be founded on), with the sync engine built incrementally; until the engine exists, the fabric still leans on external reference, but the health model and interfaces are correct so nothing has to be re-architected later. Robust attested-coupling needs careful design to resist a spoofed anchor capturing the ensemble (multi-anchor agreement + attestation, not single-source trust).
+
+**Neutral.** Acquisition (GNSS/NTS tiers) is retained, re-roled as the anchor layer. chrony remains the local clock discipliner; the internal-sync correction feeds it rather than replacing it (to be designed). Fail-closed admit ([`universal-ntp-hygiene.md`](../design/universal-ntp-hygiene.md) §7) is re-expressed against the two axes: gate fabric participation on internal coherence, gate UTC-bound operations on UTC confidence.
+
+## Open items
+
+- The coupling algorithm and our adaptations: peer-view size, the age-adaptive coupling-factor schedule, and how anchored nodes inject weight without a single (possibly spoofed) anchor dominating.
+- The Byzantine-robust aggregator that reconciles accuracy with adversary resistance (trimmed mean over attested peers vs median-of-verified) — and the formal bound on how many compromised-but-attested peers it tolerates.
+- The synchronization-error target(s): Corsaro targets SE < 10 µs; ours is workload-dependent (high-rate fusion vs LWW ordering have different needs) and must be stated per class.
+- chrony integration: does the sync correction feed chrony as a refclock-like input, or does it sit beside chrony and arbitrate selection?
+- Anti-spoof for anchors: a spoofed GNSS anchor must not capture the ensemble — requires multi-anchor cross-check + attestation weighting.
+- Migration from the current external-first deployment, and the manageable ZAGROS-sandbox subset that adopts the correct bones now (the next deliverable after this ADR).
+
+## Status
+
+**Proposed** pending ratification. Reframes the foundation of [`universal-ntp-hygiene.md`](../design/universal-ntp-hygiene.md) and [`ntp-strategy.md`](../design/ntp-strategy.md); depends on the signed attestation (`ops/time-hygiene/internal/attest`); surfaces through the env-health time domain ([ADR 1036](1036-environment-health-surface.md)). The ZAGROS sandbox time-health management is to be founded on this model.
