@@ -1,0 +1,200 @@
+name: wg-cp0-accessor
+
+# Block 22R.1 — per-module CI workflow for the wg-cp0 declarative
+# substrate accessor library (ops/enrollment/peerset) and the
+# read-only orchestrator surface (ops/enrollment/cmd/wg-cp0).
+#
+# What this gate covers:
+#   - unit tests + goleak across the peerset package
+#   - unit tests across the wg-cp0 read-only CLI
+#   - schema-validate the committed source-of-truth JSON
+#     (ops/enrollment/wg-cp0-bundle-allowlist.json) on every PR
+#   - six-target cross-compile build matrix for the wg-cp0 binary
+#     so platform-specific regressions surface at PR time
+#
+# Block 22R.2 will extend this workflow with the mutating
+# subcommand surface + a `release` job firing on the first
+# wg-cp0-v* tag (modeled on snitch.yml). 22R.1 deliberately does
+# NOT cut a release tag — the orchestrator binary is the operator
+# release surface and lands when the apply path is in.
+#
+# Triggers:
+#   - PR / push touching ops/enrollment/peerset/**,
+#     ops/enrollment/cmd/wg-cp0/**, the source-of-truth JSON, or
+#     this workflow itself.
+#   - PR / push touching ops/enrollment/cmd/bundle-create/** (which
+#     now routes --update-allowlist through the accessor library).
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. 98 of 119 workflows did that; measured at 4,787 runs in
+  # one day, roughly half of them this shape.
+  #
+  # An earlier draft of this comment also said "main is protected from
+  # force-push". IT IS NOT — this plan cannot have branch protection at all
+  # (the API answers "Upgrade to GitHub Pro"). A force-push to main therefore
+  # bypasses this guard entirely. That is a real gap and it is 's, not
+  # something a paths filter or a trigger change can close.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'ops/enrollment/peerset/**'
+      - 'ops/enrollment/cmd/wg-cp0/**'
+      - 'ops/enrollment/cmd/bundle-create/**'
+      - 'ops/enrollment/wg-cp0-bundle-allowlist.json'
+      - 'ops/enrollment/go.mod'
+      - 'ops/enrollment/go.sum'
+      - '.github/workflows/wg-cp0-accessor.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: unit tests + lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/enrollment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # 'stable' matches the sibling enrollment.yml workflow's
+          # rationale — pinned numeric versions resolve to patchlevels
+          # carrying stdlib CVEs that fail govulncheck.
+          go-version: 'stable'
+          cache-dependency-path: ops/enrollment/go.sum
+      - name: Install libpcsclite-dev (piv-go cgo dep, transitive)
+        timeout-minutes: 8
+        # The accessor library itself has zero cgo deps, but `go vet ./...`
+        # walks the whole module and the ca/yubikey signer pulls in
+        # piv-go which needs the libpcsclite headers. Mirrors the sibling
+        # enrollment.yml step.
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y -qq libpcsclite-dev
+      - name: go vet (accessor + CLI)
+        run: go vet ./peerset/... ./cmd/wg-cp0/... ./cmd/bundle-create/...
+      - name: go test (peerset accessor library — ≥90% line coverage gate)
+        run: |
+          go test -v -race -count=1 -coverprofile=/tmp/peerset.cov ./peerset/...
+          go tool cover -func=/tmp/peerset.cov | tee /tmp/peerset-cov.txt
+          # Final line is total; extract percent and assert ≥90%.
+          pct=$(awk '/^total:/ {gsub(/%/, "", $NF); print $NF}' /tmp/peerset-cov.txt)
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 90.0) ? 0 : 1 }' \
+            || { echo "peerset coverage $pct% < 90%"; exit 1; }
+          echo "peerset coverage: $pct%"
+      - name: go test (wg-cp0 read-only CLI)
+        run: go test -v -race -count=1 ./cmd/wg-cp0/...
+      - name: go test (bundle-create — routed through accessor)
+        run: go test -v -race -count=1 ./cmd/bundle-create/...
+
+  schema-validate:
+    name: schema-validate committed allowlist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: unit
+    defaults:
+      run:
+        working-directory: ops/enrollment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: ops/enrollment/go.sum
+      - name: Build wg-cp0
+        run: go build -trimpath -o /tmp/wg-cp0 ./cmd/wg-cp0
+      - name: wg-cp0 validate against the committed source-of-truth
+        # If the committed JSON ever drifts off-schema (operator
+        # hand-edit, partial migration, future regression), this step
+        # fails-loud rather than letting the divergence ship.
+        run: /tmp/wg-cp0 validate --path wg-cp0-bundle-allowlist.json
+
+  build-matrix:
+    name: build ${{ matrix.target.goos }}/${{ matrix.target.goarch }}
+    # Block 22R.1 — cross-compile the wg-cp0 binary for all six
+    # common Go targets. Operators run wg-cp0 from MacBooks (darwin/
+    # arm64), Windows laptops, and Linux Orins, so catching a
+    # platform-specific regression at PR time matters. NO release
+    # tag is cut from this matrix — 22R.2 owns the release surface
+    # once the orchestrator apply path lands.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    defaults:
+      run:
+        working-directory: ops/enrollment
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.target.goos }}
+      GOARCH: ${{ matrix.target.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: ops/enrollment/go.sum
+      - name: Compute output filename
+        id: outname
+        run: |
+          if [ "$GOOS" = "windows" ]; then
+            echo "binary=wg-cp0.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "binary=wg-cp0" >> "$GITHUB_OUTPUT"
+          fi
+      - name: go build (cross-compile to ${{ matrix.target.goos }}/${{ matrix.target.goarch }})
+        run: go build -trimpath -ldflags="-s -w" -o "${{ steps.outname.outputs.binary }}" ./cmd/wg-cp0
+      - name: Compute artifact sha256
+        id: sha
+        run: |
+          if command -v sha256sum >/dev/null; then
+            sum=$(sha256sum "${{ steps.outname.outputs.binary }}" | awk '{print $1}')
+          else
+            sum=$(shasum -a 256 "${{ steps.outname.outputs.binary }}" | awk '{print $1}')
+          fi
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "$sum  ${{ steps.outname.outputs.binary }}" > "${{ steps.outname.outputs.binary }}.sha256"
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wg-cp0-${{ matrix.target.goos }}-${{ matrix.target.goarch }}
+          path: |
+            ops/enrollment/${{ steps.outname.outputs.binary }}
+            ops/enrollment/${{ steps.outname.outputs.binary }}.sha256
+          if-no-files-found: error
+          retention-days: 90
+      - name: Annotate run summary
+        run: |
+          {
+            echo "### wg-cp0 ${GOOS}/${GOARCH}"
+            echo
+            echo "- Output: \`${{ steps.outname.outputs.binary }}\`"
+            echo "- SHA-256: \`${{ steps.sha.outputs.sha256 }}\`"
+            echo "- Trimpath + stripped (\`-s -w\`)"
+          } >> "$GITHUB_STEP_SUMMARY"

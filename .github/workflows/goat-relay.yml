@@ -1,0 +1,118 @@
+name: goat-relay
+
+# Block 33B Rust relay-server-rewrite CI. Runs build + test + clippy
+# against the goat-relay binary crate. Mirrors the goat-relay-protocol.yml
+# shape for parity per the Rust-CI parity audit.
+#
+# Scope: this workflow gates the goat-relay BINARY only. The
+# wire-format library (goat-relay-protocol) has its own workflow
+# (goat-relay-protocol.yml) so they ride independent fast paths and
+# clear failure attribution.
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. 98 of 119 workflows did that; measured at 4,787 runs in
+  # one day, roughly half of them this shape.
+  #
+  # An earlier draft of this comment also said "main is protected from
+  # force-push". IT IS NOT — this plan cannot have branch protection at all
+  # (the API answers "Upgrade to GitHub Pro"). A force-push to main therefore
+  # bypasses this guard entirely. That is a real gap and it is 's, not
+  # something a paths filter or a trigger change can close.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'goat-relay/**'
+      - 'goat-relay-protocol/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'ops/ci/check-no-permissive-validator.sh'
+      - '.github/workflows/goat-relay.yml'
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Relay-auth fail-closed guard — refuses any reintroduction of a
+      # permissive/accept-all validator into the relay source (the open-relay
+      # hole closed by the timed-HMAC validator). Fails fast before the build.
+      - name: guard — no permissive validator in relay source
+        run: bash ops/ci/check-no-permissive-validator.sh
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-goat-relay-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-goat-relay-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build (-p goat-relay)
+        run: cargo build -p goat-relay --tests
+
+      - name: cargo test (-p goat-relay)
+        # Linux-only kTLS path is exercised here (vs the macOS dev box
+        # which can't run the kTLS hand-off — see F-023). Tests that
+        # gate on `cfg(target_os = "linux")` only run in CI; macOS dev
+        # runs exercise the userspace fallback.
+        #
+        # `--skip end_to_end_steering_pins_same_src_to_same_socket` —
+        # the CBPF source-IP-affinity steering test needs kernel
+        # CAP_BPF privs the GHA runner doesn't grant. Test passes on
+        # dev workstations with the privilege; CI exercises the other
+        # 25 tests + the clippy gate. Tracked as a watchpoint in the
+        # workflow's comment trail (no F-NNN — environment limitation,
+        # not external-system behavior).
+        run: cargo test -p goat-relay --all-features -- --skip end_to_end_steering_pins_same_src_to_same_socket
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy -p goat-relay --all-targets -- -D warnings
+
+  bench:
+    # Real Linux/amd64 (the relay platform) measurement of the ADR 1055 §2b
+    # per-peer counting hot-path cost. The dev bench runs on macOS/arm64
+    # where std RwLock is pthread_rwlock (heavy) vs the relay's Linux futex, so
+    # the relay-platform number must be captured HERE. Informational — prints
+    # forward vs forward_data (counted / gated-off) to the log; does not gate
+    # (a hard criterion regression threshold would flake on shared runners).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-goat-relay-bench-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-goat-relay-bench-
+            ${{ runner.os }}-cargo-goat-relay-
+      - name: per-peer counting overhead bench (Linux/amd64)
+        run: |
+          cargo bench -p goat-relay --bench routing_dispatch -- \
+            per_peer_counting_overhead --warm-up-time 2 --measurement-time 8 | tee /tmp/bench.txt
+          echo "::group::per-peer counting overhead (median /frame)"
+          grep -A2 -E 'forward_baseline$|forward_data_counted$|forward_data_gated_off$' /tmp/bench.txt \
+            | grep -E 'time:' || true
+          echo "::endgroup::"

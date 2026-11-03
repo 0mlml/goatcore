@@ -1,0 +1,333 @@
+name: postgres-spock
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/postgres/spock/**'
+      - '.github/workflows/postgres-spock.yml'
+    tags: ['postgres-spock/v*']
+  pull_request:
+    paths:
+      - 'ops/postgres/spock/**'
+      - 'ops/ansible/roles/revocation-ledger-bootstrap/**'
+      - 'ops/ansible/roles/ory-narrow-repset/**'
+      - 'ops/ansible/roles/spock-mesh-peering/**'
+      - '.github/workflows/postgres-spock.yml'
+  workflow_dispatch:
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  revocation-rollout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Populated guard rollout and stale replica writes
+        run: python3 ops/postgres/spock/tests/revocation-rollout/test_rollout.py
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Ansible test runner
+        run: python3 -m pip install ansible-core==2.20.3
+      - name: Exercise actual two-site ledger reconciliation tasks
+        run: python3 ops/postgres/spock/tests/revocation-rollout/test_ansible_bootstrap.py
+
+  smoke-test:
+    # Build the image for the native arch only and run it briefly — verifies
+    # the baked postgresql.conf is picked up, wal_level is logical, Spock is
+    # preloaded, and init SQL creates the three Netbird databases without
+    # aborting. Catches config regressions that the multi-arch build alone
+    # wouldn't (a bad config_file path breaks only at runtime).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (native arch only)
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/postgres/spock
+          load: true
+          tags: postgres-spock:smoke
+          cache-from: type=gha,scope=postgres-spock
+          cache-to: type=gha,mode=max,scope=postgres-spock
+
+      - name: Verify running container (single-instance config check)
+        run: |
+          set -euo pipefail
+
+          # Wait for the REAL server, not the bootstrap one.
+          #
+          # The postgres entrypoint starts a temporary server to run initdb and
+          # /docker-entrypoint-initdb.d/, then SHUTS IT DOWN and starts the real
+          # one. That temporary server is deliberately socket-only
+          # (`listen_addresses=''`), so a unix-socket `pg_isready` answers "ready"
+          # during init and the very next psql can hit
+          # `FATAL: the database system is shutting down`.
+          #
+          # That is exactly how this job failed. It is a race, so it moved
+          # between steps run to run — it died in the two-instance
+          # replication step in this one — which is why it read as
+          # "Spock broke" rather than "the wait is wrong". A TCP probe is the
+          # discriminator: only the real server listens on 5432.
+          wait_ready() {
+            local c="$1"
+            for _ in $(seq 1 90); do
+              if ! docker inspect -f '{{ .State.Running }}' "$c" 2>/dev/null | grep -q true; then
+                echo "::error::$c exited during startup"
+                docker logs "$c" 2>&1 | tail -60
+                return 1
+              fi
+              if docker exec "$c" pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$c never accepted a TCP connection within 180s"
+            docker logs "$c" 2>&1 | tail -60
+            return 1
+          }
+
+          docker run -d --name pg-smoke \
+            -e POSTGRES_PASSWORD=smoke \
+            postgres-spock:smoke \
+            postgres -c config_file=/etc/postgresql/postgresql.conf
+          wait_ready pg-smoke
+          echo "--- init-SQL output (captured from container logs) ---"
+          docker logs pg-smoke 2>&1 | tail -40
+          echo "--- Spock-prerequisite settings ---"
+          docker exec pg-smoke psql -U postgres -tAXc "SHOW wal_level;" | tee /dev/stderr | grep -q '^logical$'
+          docker exec pg-smoke psql -U postgres -tAXc "SHOW shared_preload_libraries;" | tee /dev/stderr | grep -q spock
+          docker exec pg-smoke psql -U postgres -tAXc "SHOW track_commit_timestamp;" | tee /dev/stderr | grep -q '^on$'
+          docker exec pg-smoke psql -U postgres -tAXc "SHOW max_slot_wal_keep_size;" | tee /dev/stderr | grep -q '1GB'
+          # Recent PG16 minors refuse an output plugin that is not on this list,
+          # so an empty value means no Spock subscription can ever start. Assert
+          # it in the CHEAP single-instance step, not only via the two-instance
+          # replication test 90 seconds later.
+          docker exec pg-smoke psql -U postgres -tAXc "SHOW output_plugin_libraries;" | tee /dev/stderr | grep -q 'spock_output'
+          echo "--- Netbird databases + Spock extension ---"
+          for db in netbird netbird_idp netbird_events; do
+            docker exec pg-smoke psql -U postgres -d "$db" -tAXc "SELECT 1" >/dev/null
+            echo "  $db: exists"
+          done
+          for db in netbird netbird_idp; do
+            docker exec pg-smoke psql -U postgres -d "$db" -tAXc "SELECT extname FROM pg_extension WHERE extname='spock';" | grep -q '^spock$'
+            echo "  $db: spock extension loaded"
+          done
+          docker rm -f pg-smoke >/dev/null
+
+      - name: Two-instance Spock replication
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            docker rm -f pg-a pg-b 2>/dev/null || true
+            docker network rm spock-net 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          docker network create spock-net
+
+          for n in a b; do
+            docker run -d --name pg-$n --network spock-net \
+              -e POSTGRES_PASSWORD=smoke \
+              postgres-spock:smoke \
+              postgres -c config_file=/etc/postgresql/postgresql.conf
+          done
+
+          # Same rule as the single-instance step: TCP, not the unix socket, or
+          # the CREATE ROLE below can land on the bootstrap server as it shuts
+          # down. See the comment there.
+          wait_ready() {
+            local c="$1"
+            for _ in $(seq 1 90); do
+              if ! docker inspect -f '{{ .State.Running }}' "$c" 2>/dev/null | grep -q true; then
+                echo "::error::$c exited during startup"
+                docker logs "$c" 2>&1 | tail -60
+                return 1
+              fi
+              if docker exec "$c" pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$c never accepted a TCP connection within 180s"
+            docker logs "$c" 2>&1 | tail -60
+            return 1
+          }
+
+          for n in a b; do wait_ready pg-$n; done
+
+          # Replicator role — SUPERUSER for smoke-test simplicity. Production
+          # uses a scoped role per docs/design/ha-multi-site.md §5.5.
+          for n in a b; do
+            docker exec pg-$n psql -U postgres -c \
+              "CREATE ROLE replicator WITH LOGIN SUPERUSER PASSWORD 'smoke';"
+            docker exec --user root pg-$n bash -c \
+              "echo 'host netbird replicator 0.0.0.0/0 scram-sha-256' >> /etc/postgresql/pg_hba.conf"
+            docker exec pg-$n psql -U postgres -c "SELECT pg_reload_conf();"
+          done
+
+          # Identical schema on both — Spock replicates DML, not DDL.
+          for n in a b; do
+            docker exec pg-$n psql -U postgres -d netbird -c \
+              "CREATE TABLE repl_test (id int PRIMARY KEY, payload text);"
+          done
+
+          # A (provider): register node, add table to default repset.
+          docker exec pg-a psql -U postgres -d netbird -c \
+            "SELECT spock.node_create('node_a', 'host=pg-a dbname=netbird user=replicator password=smoke');"
+          docker exec pg-a psql -U postgres -d netbird -c \
+            "SELECT spock.repset_add_table('default', 'repl_test');"
+
+          # B (subscriber): register node, create subscription pulling from A.
+          docker exec pg-b psql -U postgres -d netbird -c \
+            "SELECT spock.node_create('node_b', 'host=pg-b dbname=netbird user=replicator password=smoke');"
+          docker exec pg-b psql -U postgres -d netbird -c \
+            "SELECT spock.sub_create('sub_from_a', 'host=pg-a dbname=netbird user=replicator password=smoke', '{default}');"
+
+          # Let the subscription initialize.
+          sleep 3
+
+          # INSERT on A — expect B to converge.
+          docker exec pg-a psql -U postgres -d netbird -c \
+            "INSERT INTO repl_test VALUES (1, 'hello from a');"
+
+          converged=0
+          for i in $(seq 1 30); do
+            rows=$(docker exec pg-b psql -U postgres -d netbird -tAXc \
+              "SELECT count(*) FROM repl_test;" 2>/dev/null || echo 0)
+            if [ "$rows" = "1" ]; then
+              echo "replication converged after $i seconds"
+              converged=1
+              break
+            fi
+            sleep 1
+          done
+
+          # Say WHY, not just that it failed. The previous version fell out of
+          # this loop silently and failed on the grep below, so every red run
+          # reported "exit 1" with no evidence and the cause had to be guessed.
+          if [ "$converged" != 1 ]; then
+            echo "::error::replication did not converge within 30s"
+            echo "--- subscription status (B) ---"
+            docker exec pg-b psql -U postgres -d netbird -xc \
+              "SELECT * FROM spock.sub_show_status();" || true
+            echo "--- replication slots (A) ---"
+            docker exec pg-a psql -U postgres -d netbird -xc \
+              "SELECT slot_name, plugin, active, restart_lsn FROM pg_replication_slots;" || true
+            echo "--- walsenders (A) ---"
+            docker exec pg-a psql -U postgres -d netbird -xc \
+              "SELECT application_name, state, sent_lsn, replay_lsn FROM pg_stat_replication;" || true
+            echo "--- spock version, both ---"
+            for n in a b; do
+              docker exec pg-$n psql -U postgres -d netbird -tAXc \
+                "SELECT 'pg-$n spock ' || extversion FROM pg_extension WHERE extname='spock';" || true
+            done
+            echo "--- pg-a log tail ---"; docker logs pg-a 2>&1 | tail -60
+            echo "--- pg-b log tail ---"; docker logs pg-b 2>&1 | tail -60
+            exit 1
+          fi
+
+          docker exec pg-b psql -U postgres -d netbird -tAXc \
+            "SELECT payload FROM repl_test WHERE id=1;" | grep -q '^hello from a$'
+
+          echo "OK: INSERT on A replicated to B via Spock."
+
+  partition-revoke:
+    # Issue #1505. Cuts replication between two Spock sites, revokes on one,
+    # writes the same rows on the other, heals. GUARD=0 pins the defect
+    # (last-writer-wins undoes the revocation); GUARD=1 proves the
+    # revocation guard keeps every revocation on both sites.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        guard: ['0', '1']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (native arch only)
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/postgres/spock
+          load: true
+          tags: postgres-spock:smoke
+          cache-from: type=gha,scope=postgres-spock
+      - name: Induced partition, GUARD=${{ matrix.guard }}
+        env:
+          IMAGE: postgres-spock:smoke
+          GUARD: ${{ matrix.guard }}
+        run: ops/postgres/spock/tests/partition-revoke/run.sh
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [smoke-test, revocation-rollout, partition-revoke]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # ghcr requires a lowercase namespace and the usareur-af org owner is
+      # mixed-case, so `${{ github.repository_owner }}` alone breaks the push.
+      # Resolve it self-referentially and lowercased — matching every other
+      # image workflow here — so goat-maintainer CI publishes to ghcr.io/goat-maintainer and
+      # usareur-af CI to ghcr.io/usareur-af (the ansible ghcr_org derivation
+      # pulls from whichever the deploy runs from). The prior hardcode to
+      # `usareur-af` 403'd under goat-maintainer CI, so main-branch pushes failed and
+      # the deploy pins starved — the same class as the signal-server fix.
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/postgres-spock" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      # No setup-qemu — our Dockerfile has only COPY statements over a
+      # multi-arch base. Buildx pulls pre-built per-arch layers and layers
+      # our files on top; nothing executes on the target platform.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=short,prefix=sha-
+            type=match,pattern=postgres-spock/v(.*),group=1
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/postgres/spock
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=postgres-spock
+          cache-to: type=gha,mode=max,scope=postgres-spock

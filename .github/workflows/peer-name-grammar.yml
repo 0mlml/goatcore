@@ -1,0 +1,84 @@
+name: peer-name-grammar
+
+# Peer-name grammar single-source gate (identity fragility audit
+# §1.2, fix-train item 8).
+#
+# The NetBird peer name is a load-bearing cross-store join — under setup-key
+# enrollment `peer.user_id` is empty, so the name is the only link from a mesh
+# peer to the principal that owns it. It had five independent implementations
+# across Go, Rust and an Ansible playbook with no fence between them. This job
+# proves they all still reproduce ops/identity/peer-name-grammar.yaml, and runs
+# the cross-language conformance vectors the SoT generates into BOTH languages
+# so a behavioural divergence fails a test, not only a byte compare.
+#
+# Rollback: rm this file (the SoT + generated code are inert config without it).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ops/identity/peer-name-grammar.yaml'
+      - 'ops/identity/generate-peer-name.py'
+      - 'ops/ci/check-peer-name-grammar-sync.sh'
+      - 'ops/goat-zenoh-portal/internal/peername/**'
+      - 'crates/panoscope-core/src/peername.rs'
+      - 'ops/ansible/operator-onboard.yml'
+      - '.github/workflows/peer-name-grammar.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peer-name-grammar-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  grammar-sync:
+    name: SoT parity + cross-language conformance vectors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Every implementation reproduces the SoT
+        run: ./ops/ci/check-peer-name-grammar-sync.sh
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: ops/goat-zenoh-portal/go.sum
+      - name: Go conformance vectors
+        working-directory: ops/goat-zenoh-portal
+        run: go test ./internal/peername/...
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-peer-name-grammar-${{ hashFiles('crates/Cargo.lock') }}
+          restore-keys: |
+            cargo-peer-name-grammar-
+
+      - name: Cache cargo build target
+        uses: actions/cache@v4
+        with:
+          path: crates/target
+          key: target-peer-name-grammar-${{ hashFiles('crates/Cargo.lock') }}
+          restore-keys: |
+            target-peer-name-grammar-
+
+      - name: Rust conformance vectors
+        working-directory: crates
+        run: cargo test -p panoscope-core peername

@@ -1,0 +1,87 @@
+name: Trivy advisory scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/go.mod'
+      - '**/go.sum'
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/requirements*.txt'
+      - '**/pyproject.toml'
+      - '**/poetry.lock'
+      - '**/Dockerfile*'
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '**/*.yaml'
+      - '**/*.yml'
+      - 'ops/scripts/trivy-scan.py'
+      - 'ops/scripts/trivy-images.txt'
+      - '.github/workflows/trivy-advisory.yml'
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trivy:
+    name: Trivy advisory scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Findings and scanner/setup/report errors are informational during this
+    # rollout. The job summary and artifacts retain the outcome for review.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.75.0
+          cache: true
+
+      - name: Scan repository and curated images
+        id: scan
+        run: python3 ops/scripts/trivy-scan.py --no-secrets
+
+      - name: Upload Trivy reports
+        id: reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports-${{ github.run_id }}
+          path: .envrc.local.d/trivy-reports/**
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
+
+      - name: Report workflow outcome
+        if: always()
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+          REPORT_OUTCOME: ${{ steps.reports.outcome }}
+        run: |
+          report_count=$(find .envrc.local.d/trivy-reports -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+          {
+            echo
+            echo '### Trivy workflow status'
+            if [ "$SCAN_OUTCOME" = success ]; then
+              echo 'The scan command completed. Review the severity table above for findings.'
+            else
+              echo "The scan command outcome was: $SCAN_OUTCOME. Review the logs; this advisory job does not block the PR."
+            fi
+            if [ "$REPORT_OUTCOME" = success ] && [ "$report_count" -gt 0 ]; then
+              echo 'The HTML summary and JSON reports were uploaded as a 14-day workflow artifact.'
+            else
+              echo "No JSON reports were uploaded (upload outcome: $REPORT_OUTCOME; report files: $report_count)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

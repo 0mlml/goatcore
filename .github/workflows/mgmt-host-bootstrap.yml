@@ -1,0 +1,288 @@
+name: mgmt-host-bootstrap
+
+# Block 21A Go CLI for sovereign netbird peer enrollment.
+# ADR 0410 + ADR 0413 (no ORM in our own Go code).
+#
+# Why this workflow exists: the CLI's correctness is load-bearing for every
+# netbird-mgmt version we run. A future netbird release that adds a new
+# NOT-NULL column or changes a JSON shape would silently break peer
+# enrollment if we don't catch it in CI. The integration test below is the
+# pin-regression gate — it brings up the exact pinned netbird-mgmt image,
+# runs the full create-account → real netbird peer enrollment chain, and
+# fails noisily if any of the 9 invariants documented in
+# ops/mgmt-host-bootstrap/README.md drift.
+#
+# Triggers:
+#   - Any PR / push touching ops/mgmt-host-bootstrap/**
+#   - Any PR / push touching the netbird-mgmt image pin (compose / Dockerfile)
+#   - Manual dispatch with optional override of the netbird-mgmt image
+#
+# Pins of interest (kept in sync; bump them together):
+#   ops/mgmt-host-bootstrap/testdata/docker-compose.yml management.image
+#   ops/compose/mgmt-host/docker-compose.yml management-a.image (when wired)
+
+on:
+  # Pin-regression hook: any change to a place that pins the netbird-mgmt
+  # image triggers this workflow. The integration test brings up that exact
+  # pinned image and runs the full account → setup-key → real-peer-enrollment
+  # chain. If a future netbird release adds a new NOT-NULL column or changes
+  # a JSON shape, this CI fails loudly *before* the change reaches a cluster.
+  push:
+    branches: [main]
+    paths:
+      - 'ops/mgmt-host-bootstrap/**'
+      - '.golangci.yml'
+      - 'ops/compose/mgmt-host/docker-compose.yml'
+      - 'ops/ansible/group_vars/**/vars.yml'
+      - 'ops/ansible/templates/management.json.j2'
+      - '.github/workflows/mgmt-host-bootstrap.yml'
+  pull_request:
+    paths:
+      - 'ops/mgmt-host-bootstrap/**'
+      - '.golangci.yml'
+      - 'ops/compose/mgmt-host/docker-compose.yml'
+      - 'ops/ansible/group_vars/**/vars.yml'
+      - 'ops/ansible/templates/management.json.j2'
+      - '.github/workflows/mgmt-host-bootstrap.yml'
+  # Weekly run guards against image-side drift (Hub re-tagging, etc.) even
+  # without a repo change. Saturday 03:17 UTC keeps it off the M-F path.
+  schedule:
+    - cron: '17 3 * * 6'
+  workflow_dispatch:
+    inputs:
+      netbird_mgmt_image:
+        description: 'netbird-mgmt image to test against (e.g. netbirdio/management:0.68.4@sha256:...). Empty = default in testdata/docker-compose.yml.'
+        required: false
+        default: ''
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/mgmt-host-bootstrap
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ops/mgmt-host-bootstrap/go.sum
+      - run: go vet ./...
+      - name: golangci-lint (Block 50A.3 — strict config)
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.1
+          working-directory: ops/mgmt-host-bootstrap
+          args: --config=${{ github.workspace }}/.golangci.yml
+      - run: go test -v -race ./...
+
+  integration:
+    name: integration test (netbird-mgmt + Postgres + real peer enrollment)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: unit
+    defaults:
+      run:
+        working-directory: ops/mgmt-host-bootstrap
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ops/mgmt-host-bootstrap/go.sum
+
+      - name: Override netbird-mgmt image (workflow_dispatch override)
+        if: ${{ inputs.netbird_mgmt_image != '' }}
+        run: |
+          # Replace the pinned netbirdio/management line with the override.
+          # sed -E pattern matches the existing image: ... line for the management service.
+          sed -i -E "s|image: netbirdio/management:.*|image: ${{ inputs.netbird_mgmt_image }}|" \
+            testdata/docker-compose.yml
+          echo "::notice::overrode netbird-mgmt image to ${{ inputs.netbird_mgmt_image }}"
+          grep "image:" testdata/docker-compose.yml
+
+      - name: Pull fixture images (warm cache)
+        run: docker compose -f testdata/docker-compose.yml pull
+
+      # --- geolocation fixture -------------------------------------------
+      # netbird-mgmt builds its geolocation layer during startup, before it
+      # answers HTTP, and with an empty Datadir that means ~82 MB from
+      # pkgs.netbird.io inside the readiness window. The files have not
+      # changed but the CDN's throughput varies enormously:
+      # a warm edge gets TestEndToEnd_OTLPEmit through in 19 s, a cold one
+      # spent 3 m 50 s on the first file alone and failed the job on a
+      # deadline. Seed the databases
+      # instead — netbird skips any that already exist, so a seeded run never
+      # touches the network for this. testdata/geolite/README.md.
+      - name: Resolve the published geolocation DB version
+        id: geo
+        run: |
+          # The cache key follows the filename netbird itself derives: a HEAD
+          # of the tarball URL and its Content-Disposition (getFilenameFromURL
+          # in management/server/geolocation/utils.go), e.g.
+          # "GeoLite2-City_20260602.tar.gz". The sha256 pointer beside it
+          # names the version the mirror MEANS to publish, which is not
+          # always the object it serves: the pointer moved to
+          # 20260908 while the tarball stayed at 20260602, netbird refused
+          # the download on the checksum, and a key taken from the pointer
+          # missed the cache that still matched what netbird wanted (#1069).
+          # testdata/geolite-version.sh reads both, the header in every
+          # spelling the Go parser accepts (tests/geolite-version.bats); the
+          # key is the tarball's version, else the pointer's, else a constant,
+          # since a stale entry is still a valid seed. Two states are worth
+          # a word on the run: the two disagree, because then the warm below
+          # cannot succeed; and the tarball's version could not be read at
+          # all, because then the key comes from the pointer and this step
+          # must not be the place that keeps quiet about it.
+          resolved="$(./testdata/geolite-version.sh)"
+          echo "$resolved" >> "$GITHUB_OUTPUT"
+          served=$(echo "$resolved" | sed -n 's/^served=//p')
+          pointer=$(echo "$resolved" | sed -n 's/^pointer=//p')
+          ver=$(echo "$resolved" | sed -n 's/^version=//p')
+          echo "::notice::geolocation DB version: $ver (tarball serves ${served:-?}, sha256 pointer names ${pointer:-?})"
+          if [ -z "$served" ]; then
+            msg="the tarball's Content-Disposition did not yield a version, so the cache key comes from the sha256 pointer (${pointer:-unreadable as well})."
+            msg="$msg That is the pointer #1069 found describing a different file than the one served; a warm on this key may be refused."
+            echo "::warning::$msg"
+          fi
+          if [ -n "$served" ] && [ -n "$pointer" ] && [ "$served" != "$pointer" ]; then
+            msg="pkgs.netbird.io is inconsistent: the tarball serves ${served} but its sha256 pointer names ${pointer}."
+            msg="$msg netbird-mgmt refuses that download on the checksum, so a cache miss cannot be warmed until the mirror agrees with itself (#1069)."
+            echo "::warning::$msg"
+          fi
+
+      - name: Restore the geolocation databases
+        id: geocache
+        uses: actions/cache/restore@v4
+        with:
+          path: ops/mgmt-host-bootstrap/testdata/geolite
+          key: geolite-${{ steps.geo.outputs.version }}-v1
+          # A version bump must not empty the seed. An older pair is restored
+          # and the warm step decides whether it is the version netbird will
+          # ask for; the save step below stores only a pair that is.
+          restore-keys: |
+            geolite-
+
+      - name: Warm the geolocation fixture (cache miss only)
+        id: warm
+        if: steps.geocache.outputs.cache-hit != 'true'
+        # A failure here is not the last word: the script names its reason
+        # (outputs.reason) and the two steps after the save decide whether it
+        # was the mirror's, which the run goes on under a disclosed fallback,
+        # or anything else, which fails the run.
+        continue-on-error: true
+        run: ./testdata/warm-geolite.sh
+        env:
+          WARM_TIMEOUT_S: '2400'
+          GEOLITE_VERSION: ${{ steps.geo.outputs.version }}
+
+      - name: Save the geolocation databases (after a successful warm only)
+        if: steps.geocache.outputs.cache-hit != 'true' && steps.warm.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ops/mgmt-host-bootstrap/testdata/geolite
+          key: geolite-${{ steps.geo.outputs.version }}-v1
+
+      - name: Run without geolocation (the mirror refused the download)
+        if: steps.warm.outcome == 'failure' && steps.warm.outputs.reason == 'mirror-checksum'
+        run: |
+          # Only the mirror's own inconsistency earns this: warm-geolite.sh
+          # saw netbird refuse the download on the checksum, so the seed is
+          # absent and the pinned image cannot start with geolocation on.
+          # netbird's own switch (NB_DISABLE_GEOLOCATION, management/internals/
+          # server/modules.go) skips the service; peer enrollment, which this
+          # gate exists to grade, does not read it. Disclosed here and in the
+          # test log, and never the default: an unseeded local run still
+          # downloads.
+          echo "MGMT_BOOTSTRAP_DISABLE_GEOLOCATION=true" >> "$GITHUB_ENV"
+          msg="pkgs.netbird.io refused the geolocation download on its own checksum (see the warm step); the integration test runs with NB_DISABLE_GEOLOCATION=true."
+          msg="$msg Enrollment is still graded against the pinned image; geolocation is not (#1069)."
+          echo "::warning::$msg"
+
+      - name: Fail the run (the warm failed for a reason that is not the mirror's)
+        if: steps.warm.outcome == 'failure' && steps.warm.outputs.reason != 'mirror-checksum'
+        run: |
+          # A timeout, a management that died on something other than the
+          # checksum, a stack that did not come up: each is a finding about
+          # the pinned image or the fixture, and it reads red rather than
+          # green with a warning, so a geolocation regression cannot hide
+          # behind the mirror's outage (PR #1070 review).
+          msg="the geolocation warm failed (reason: ${{ steps.warm.outputs.reason || 'none reported' }}); see the warm step's log."
+          msg="$msg Only a checksum refusal by the mirror runs the test without geolocation."
+          echo "::error::$msg"
+          exit 1
+
+      - name: Run integration test
+        run: go test -tags=integration -v -timeout 12m -count=1 ./...
+        env:
+          # Tests own their own up/down inside the test fn; this just gives
+          # docker compose context.
+          DOCKER_BUILDKIT: '1'
+
+      - name: Dump fixture logs on failure
+        if: failure()
+        run: |
+          echo "::group::compose ps"
+          docker compose -f testdata/docker-compose.yml ps || true
+          echo "::endgroup::"
+          echo "::group::management logs"
+          docker compose -f testdata/docker-compose.yml logs management 2>&1 | tail -200 || true
+          echo "::endgroup::"
+          echo "::group::postgres logs"
+          docker compose -f testdata/docker-compose.yml logs postgres 2>&1 | tail -100 || true
+          echo "::endgroup::"
+
+      - name: Tear down fixture
+        if: always()
+        run: docker compose -f testdata/docker-compose.yml down -v || true
+
+  build-image:
+    name: build container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [unit, integration]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # ghcr requires a lowercase namespace and the usareur-af org owner is
+      # mixed-case, so resolve it self-referentially in bash rather than
+      # hardcoding an org: a hardcode 403s on main under the other owner and
+      # the failure is silent to anyone reading the pin (signal-server class).
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mgmt-host-bootstrap" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/mgmt-host-bootstrap
+          # F-026: explicit multi-arch so Orin (arm64) hosts can pull from
+          # GHCR directly. Without this, build defaults to the runner's native
+          # arch (ubuntu-24.04 = amd64) and arm64 hosts fail with
+          # "no matching manifest for linux/arm64".
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY_IMAGE }}:latest
+            ${{ env.REGISTRY_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

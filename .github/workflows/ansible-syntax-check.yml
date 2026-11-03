@@ -1,0 +1,101 @@
+name: ansible-syntax-check
+
+# Closes the test-coverage gap on load-bearing Ansible roles. Two layers:
+#
+#   1. register-uniqueness lint — static check that catches F-075-class
+#      bugs (within-file `register:` name collision silently overwriting
+#      probe results). Runs against every role + orchestrator.
+#
+#   2. per-role syntax-check — runs every roles/*/tests/syntax-check.sh
+#      that exists. Each script parses YAML + Jinja2 against the role's
+#      own minimal test playbook + asserts the role plays cleanly under
+#      ansible-playbook --syntax-check.
+#
+# Together: every role that ships a tests/syntax-check.sh has CI gating
+# its YAML + Jinja2 + variable-shape integrity. The static register-lint
+# catches the F-075 class on every role regardless of fixture coverage.
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. 98 of 119 workflows did that; measured at 4,787 runs in
+  # one day, roughly half of them this shape.
+  #
+  # An earlier draft of this comment also said "main is protected from
+  # force-push". IT IS NOT — this plan cannot have branch protection at all
+  # (the API answers "Upgrade to GitHub Pro"). A force-push to main therefore
+  # bypasses this guard entirely. That is a real gap and it is 's, not
+  # something a paths filter or a trigger change can close.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'ops/ansible/**'
+      - 'ops/ci/check-ansible-inventory-groups.sh'
+      - '.github/workflows/ansible-syntax-check.yml'
+
+concurrency:
+  group: ansible-syntax-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  register-uniqueness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static lint — within-file register-name collisions
+        run: bash ops/ansible/tests/check-register-uniqueness.sh
+
+  inventory-group-vars-consistency:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static lint — group_vars dirs map to inventory groups
+        run: bash ops/ci/check-ansible-inventory-groups.sh
+
+  per-role-syntax-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ansible-core
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install 'ansible-core>=2.16,<2.21'
+          ansible-playbook --version
+
+      - name: Install ansible collections used by roles
+        # Roles import modules from ansible.posix (sysctl, authorized_key,
+        # etc.), community.general (timezone, htpasswd, etc.), and
+        # community.docker (docker_image, docker_compose_v2 — panoscope,
+        # goat-zenoh-portal, demogame, isitup, …). Without these,
+        # ansible-playbook --syntax-check warns "No module named
+        # 'ansible_collections.<ns>.<col>'" and the syntax-check.sh
+        # scripts exit non-zero. Pin major versions to keep the gate
+        # stable; bump explicitly when a role takes a new module.
+        run: |
+          ansible-galaxy collection install \
+            'ansible.posix:>=1.5,<3.0' \
+            'community.general:>=8.0,<11.0' \
+            'community.docker:>=3.4,<5.0'
+          ansible-galaxy collection list | grep -E 'ansible\.posix|community\.general|community\.docker'
+
+      - name: Run every roles/*/tests/syntax-check.sh
+        run: |
+          set -euo pipefail
+          fails=0
+          ran=0
+          while IFS= read -r -d '' s; do
+            ran=$((ran + 1))
+            echo "::group::$s"
+            if ! bash "$s"; then
+              fails=$((fails + 1))
+              echo "::error file=$s::syntax-check FAILED"
+            fi
+            echo "::endgroup::"
+          done < <(find ops/ansible/roles -path '*/tests/syntax-check.sh' -print0 | sort -z)
+          echo "ansible-syntax-check: ran=$ran fails=$fails"
+          [[ "$fails" -eq 0 ]] || exit 1

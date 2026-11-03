@@ -1,0 +1,290 @@
+name: snitch
+
+# Block 66A.1 — per-module CI workflow for ops/snitch.
+#
+# Snitch is the load-bearing relay-side health visibility surface
+# (Block 61). After Block 50E.1-3 hardened its HTTP + auth surfaces and
+# Block 50F.1 backfilled testcontainers integration tests, this
+# workflow is the per-PR gate that runs them. Without it, Block 50F.1's
+# regression tests for Block 50E.2 (URL-query auth removal) only run
+# when an operator types `go test` locally.
+#
+# Block 61H multi-platform follow-on: the build-matrix
+# job cross-compiles snitch for all six common Go targets
+# (linux/{amd64,arm64}, darwin/{amd64,arm64}, windows/{amd64,arm64}) and
+# uploads each binary as a workflow artifact + a SHA256SUMS manifest. On
+# tag push (refs/tags/snitch-v*) the release job also uploads the same
+# binaries to a GitHub Release. The container image
+# (ops/snitch/Dockerfile) remains the canonical fleet-pull source — CI
+# artifacts are the pre-image regression catch + per-commit binary trail.
+#
+# Triggers:
+#   - PR / push touching ops/snitch/**
+#   - PR / push touching the workflow itself
+#   - Tag push (snitch-v*) for the release job
+#   - Weekly cron guards against image-side drift on
+#     postgres:16-alpine (testcontainers fixture)
+#
+# Pin: testcontainers-go v0.42.0 (matches ops/mgmt-host-bootstrap pin)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Scope: only Go-source changes that affect the cross-compiled
+      # snitch binary. Installer scripts (install-probe*.sh /
+      # install-probe-windows.ps1) are linted by .github/workflows/ci.yml
+      # ShellCheck. docker-compose.yml + Dockerfile changes don't affect
+      # the matrix-built binary — they target the container image, which
+      # has no CI build job today (operator-built). When a snitch-image
+      # workflow lands, give it its own filter rather than re-broadening
+      # this one.
+      - 'ops/snitch/cmd/**'
+      - 'ops/snitch/internal/**'
+      - 'ops/snitch/go.mod'
+      - 'ops/snitch/go.sum'
+      - '.golangci.yml'
+      - '.github/workflows/snitch.yml'
+    tags:
+      - 'snitch-v*'
+  pull_request:
+    paths:
+      - 'ops/snitch/cmd/**'
+      - 'ops/snitch/internal/**'
+      - 'ops/snitch/go.mod'
+      - 'ops/snitch/go.sum'
+      - '.golangci.yml'
+      - '.github/workflows/snitch.yml'
+  schedule:
+    - cron: '23 3 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: unit tests + lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/snitch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ops/snitch/go.sum
+      - run: go vet ./...
+      - name: golangci-lint (Block 50A.3 — strict config)
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.1
+          working-directory: ops/snitch
+          args: --config=${{ github.workspace }}/.golangci.yml
+      - name: go test (default tag — Block 50E.5 measure goleak)
+        run: go test -v -race -count=1 ./...
+
+  integration:
+    name: integration tests (testcontainers-go + Postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: unit
+    defaults:
+      run:
+        working-directory: ops/snitch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ops/snitch/go.sum
+      - name: Pull fixture image (warm cache)
+        run: docker pull postgres:16-alpine
+      - name: Run integration tests (Block 50F.1 — auth tests)
+        # Block 50F.1 — backfills tests for Block 50E.2 (URL-query auth
+        # removal) and 50E.3 (KeyCount race fix). Requires docker
+        # daemon; testcontainers spins up postgres:16-alpine per test.
+        run: go test -tags=integration -v -timeout 8m -count=1 ./internal/auth/...
+        env:
+          GOFLAGS: -tags=integration
+
+  build-matrix:
+    name: build ${{ matrix.target.goos }}/${{ matrix.target.goarch }}
+    # Block 61H — cross-compile every commit for all six common Go targets.
+    # Catches platform-specific regressions (e.g. a Linux-only API call
+    # leaking into shared code) before the snitch container image bakes
+    # the broken binary in. Runs in parallel with unit + integration —
+    # any matrix cell red turns the whole workflow red.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    defaults:
+      run:
+        working-directory: ops/snitch
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.target.goos }}
+      GOARCH: ${{ matrix.target.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ops/snitch/go.sum
+      - name: Compute output filename
+        id: outname
+        run: |
+          if [ "$GOOS" = "windows" ]; then
+            echo "binary=snitch.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "binary=snitch" >> "$GITHUB_OUTPUT"
+          fi
+      - name: go vet (per-target view of build tags)
+        run: go vet ./...
+      - name: go build (cross-compile to ${{ matrix.target.goos }}/${{ matrix.target.goarch }})
+        run: go build -trimpath -ldflags="-s -w" -o "${{ steps.outname.outputs.binary }}" ./cmd/snitch
+      - name: go test -c (verify per-target test compile)
+        # Build-tag-split per-OS files have per-target test files (e.g.
+        # dialer_log_other_test.go is !linux); compiling the test binary
+        # for each target catches tag mismatches that runtime-only builds
+        # would miss.
+        run: go test -c -o /tmp/measure.test ./internal/measure
+      - name: Compute artifact sha256
+        id: sha
+        run: |
+          if command -v sha256sum >/dev/null; then
+            sum=$(sha256sum "${{ steps.outname.outputs.binary }}" | awk '{print $1}')
+          else
+            sum=$(shasum -a 256 "${{ steps.outname.outputs.binary }}" | awk '{print $1}')
+          fi
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "$sum  ${{ steps.outname.outputs.binary }}" > "${{ steps.outname.outputs.binary }}.sha256"
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snitch-${{ matrix.target.goos }}-${{ matrix.target.goarch }}
+          path: |
+            ops/snitch/${{ steps.outname.outputs.binary }}
+            ops/snitch/${{ steps.outname.outputs.binary }}.sha256
+          if-no-files-found: error
+          retention-days: 90
+      - name: Annotate run summary
+        run: |
+          {
+            echo "### snitch ${GOOS}/${GOARCH}"
+            echo
+            echo "- Output: \`${{ steps.outname.outputs.binary }}\`"
+            echo "- SHA-256: \`${{ steps.sha.outputs.sha256 }}\`"
+            echo "- Trimpath + stripped (\`-s -w\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  checksums:
+    name: aggregate SHA256SUMS
+    needs: build-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download all matrix artifacts
+        uses: actions/download-artifact@v4.3.0
+        with:
+          path: artifacts
+      - name: Build SHA256SUMS manifest
+        # Each per-target artifact already carries a `<binary>.sha256`
+        # line; concatenating them gives the canonical fleet-wide
+        # manifest. Sort for deterministic output.
+        run: |
+          set -euo pipefail
+          (
+            cd artifacts
+            find . -name '*.sha256' -print0 \
+              | xargs -0 cat \
+              | sort -k 2 \
+              > ../SHA256SUMS
+          )
+          echo "### snitch SHA256SUMS"
+          echo
+          echo '```'
+          cat SHA256SUMS
+          echo '```'
+          {
+            echo "### snitch SHA256SUMS"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: snitch-checksums
+          path: SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: attach binaries to GitHub Release
+    # Block 61H — tag-gated upload. Inert for normal pushes + PRs; fires
+    # only on `git push origin snitch-v<semver>`. The release is created
+    # if it doesn't exist; existing releases are replaced for that tag.
+    needs:
+      - build-matrix
+      - checksums
+    if: startsWith(github.ref, 'refs/tags/snitch-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4.3.0
+        with:
+          path: artifacts
+      - name: Stage release assets
+        # Flatten artifact dirs into a single release-assets/ tree.
+        # Naming pattern: snitch-<goos>-<goarch>[.exe] + .sha256 sidecar.
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          for d in artifacts/snitch-*; do
+            name=$(basename "$d")
+            for f in "$d"/*; do
+              base=$(basename "$f")
+              if [ "$base" = "snitch" ] || [ "$base" = "snitch.exe" ]; then
+                ext=""
+                [ "$base" = "snitch.exe" ] && ext=".exe"
+                cp "$f" "release-assets/${name}${ext}"
+              elif [ "$base" = "snitch.sha256" ] || [ "$base" = "snitch.exe.sha256" ]; then
+                ext=""
+                [ "$base" = "snitch.exe.sha256" ] && ext=".exe"
+                cp "$f" "release-assets/${name}${ext}.sha256"
+              fi
+            done
+          done
+          cp artifacts/snitch-checksums/SHA256SUMS release-assets/SHA256SUMS
+          ls -la release-assets/
+      - name: Create or update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          tag_name: ${{ github.ref_name }}

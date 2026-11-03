@@ -1,0 +1,164 @@
+name: wg-cp0-mesh-reach
+
+# Substrate-invariant test for wg-cp0 (ADR 1017 first instance, applied per
+# ADR 0321 §"Implementation" 22R.0.2). Runs the combinatorial mesh-reach
+# matrix in a Docker bench env on the GitHub Actions runner.
+#
+# Two jobs:
+#   - unit:       harness's own Go unit tests + go vet + go test (fast,
+#                 every PR touching the harness or enrollment).
+#   - bench:      full bench-env run (build container image, mint bundles,
+#                 stand up N peers × M relays, cross-product ping).
+#                 Runs floor (N=4, M=3) on PR; nightly cron runs N=10.
+#   - regression: same bench, regression mode. Asymmetric bundles MUST
+#                 produce a matrix FAIL — that is the harness teeth check.
+#
+# Triggers:
+#   - PR / push touching ops/enrollment/** or ops/wg-cp0-mesh-reach/**
+#     or this workflow itself
+#   - nightly cron (broader N for steady-state coverage)
+#   - manual workflow_dispatch
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. 98 of 119 workflows did that; measured at 4,787 runs in
+  # one day, roughly half of them this shape.
+  #
+  # An earlier draft of this comment also said "main is protected from
+  # force-push". IT IS NOT — this plan cannot have branch protection at all
+  # (the API answers "Upgrade to GitHub Pro"). A force-push to main therefore
+  # bypasses this guard entirely. That is a real gap and it is 's, not
+  # something a paths filter or a trigger change can close.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'ops/enrollment/**'
+      - 'ops/wg-cp0-mesh-reach/**'
+      - '.github/workflows/wg-cp0-mesh-reach.yml'
+  schedule:
+    # 04:17 UTC daily — offset from other nightly jobs to avoid bursts.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      peers:
+        description: 'N (peer containers)'
+        required: false
+        default: '4'
+      relays:
+        description: 'M (relay containers)'
+        required: false
+        default: '3'
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: harness unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/wg-cp0-mesh-reach
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: ops/wg-cp0-mesh-reach/go.sum
+      - name: Install libpcsclite-dev (transitive piv-go cgo dep)
+        timeout-minutes: 8
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y -qq libpcsclite-dev
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  bench:
+    name: combinatorial mesh-reach (symmetric)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: unit
+    defaults:
+      run:
+        working-directory: ops/wg-cp0-mesh-reach
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: ops/wg-cp0-mesh-reach/go.sum
+      - name: Verify wireguard kernel module present
+        run: |
+          if ! lsmod | grep -q wireguard; then
+            echo "Loading wireguard kernel module..."
+            sudo modprobe wireguard
+          fi
+          lsmod | grep wireguard
+      - name: Decide matrix shape
+        id: shape
+        run: |
+          # Floor on PRs/pushes; broader on scheduled cron + manual.
+          case "${{ github.event_name }}" in
+            schedule)         N=10; M=3 ;;
+            workflow_dispatch) N="${{ github.event.inputs.peers }}"; M="${{ github.event.inputs.relays }}" ;;
+            *)                N=4; M=3 ;;
+          esac
+          echo "N=${N}" >> "$GITHUB_OUTPUT"
+          echo "M=${M}" >> "$GITHUB_OUTPUT"
+      - name: Run mesh-reach matrix
+        env:
+          N: ${{ steps.shape.outputs.N }}
+          M: ${{ steps.shape.outputs.M }}
+          VERBOSE: "1"
+        run: ./run.sh | tee verdict.json
+      - name: Upload verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-reach-verdict-symmetric
+          path: ops/wg-cp0-mesh-reach/verdict.json
+
+  regression:
+    name: combinatorial mesh-reach (regression — FAIL expected)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: unit
+    defaults:
+      run:
+        working-directory: ops/wg-cp0-mesh-reach
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: ops/wg-cp0-mesh-reach/go.sum
+      - name: Verify wireguard kernel module present
+        run: |
+          if ! lsmod | grep -q wireguard; then
+            sudo modprobe wireguard
+          fi
+      - name: Run regression matrix (asymmetric — expects FAIL → exits 0)
+        env:
+          N: "4"
+          M: "3"
+          VERBOSE: "1"
+        run: ./run-regression.sh | tee verdict-regression.json
+      - name: Upload regression verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-reach-verdict-regression
+          path: ops/wg-cp0-mesh-reach/verdict-regression.json

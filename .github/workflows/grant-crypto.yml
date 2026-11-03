@@ -1,0 +1,260 @@
+name: grant-crypto
+
+# Per-module CI gate for ops/grant-crypto — the data-access M2 (grant-keyed
+# encryption) crypto core (phase E0/M2.0): the payload envelope + DEK wrapping
+# primitives. Standard-library-only, security-critical, so it gets vet + strict
+# lint + race-enabled tests on every touch. See
+# docs/design/grant-keyed-encryption.md and docs/design/portal-architecture-review.md.
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. This guard does not run on a direct push to main.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'ops/grant-crypto/**'
+      - '.golangci.yml'
+      - '.github/workflows/grant-crypto.yml'
+      - 'tests/rustcrypto_wire_interop.sh'
+      - 'ops/goat-zenoh-portal/internal/certmint/**'
+      - 'ops/enrollment/cmd/cert-sign/**'
+      - 'ops/enrollment/cmd/ca-init/**'
+      - 'ops/enrollment/x509ca/**'
+      - 'ops/enrollment/ca/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: unit tests + lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/grant-crypto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ops/grant-crypto/go.sum
+      - run: go vet ./...
+      - name: golangci-lint (strict config)
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.1
+          working-directory: ops/grant-crypto
+          args: --config=${{ github.workspace }}/.golangci.yml
+      - name: go test (envelope crypto — round-trip + tamper/wrong-key/wrong-generation + wrap/unwrap + bundle + E0 end-to-end)
+        run: go test -v -race -count=1 ./...
+
+  portal-mint-conformance:
+    name: portal mint → recipient conformance
+    # A REAL certmint.Mint through the REAL cert-sign against a throwaway
+    # offline CA must produce an ECDSA-P256 leaf that gce can wrap a DEK to
+    # and open with the minted key (outsider denied). This is the gate that
+    # caught nothing before F-270: every other test uses synthetic P-256
+    # certs, masking the Ed25519 leaves the portal actually mints.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: |
+            ops/grant-crypto/go.sum
+            ops/enrollment/go.sum
+            ops/goat-zenoh-portal/go.sum
+      - name: Install libpcsclite-dev (transitive piv-go cgo dep)
+        timeout-minutes: 8
+        # Building ca-init from ops/enrollment compiles the prod-mode YubiKey
+        # path (go-piv), which cgo-links libpcsclite. Mirrors the sibling
+        # wg-cp0-accessor / wg-cp0-mesh-reach workflows.
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y -qq libpcsclite-dev
+      - name: run the mint→wrap→unwrap→deny chain
+        run: ./ops/grant-crypto/conformance/portal-mint/run.sh
+
+  transport-proof:
+    name: on-fabric transport proof (live Zenoh)
+    # E0/M2.0: carry the envelope over a REAL Zenoh router link (two peers) and
+    # confirm member-decrypts / outsider-denied end to end. Go crypto + native
+    # Python Zenoh — the same split E1 runs (no Go Zenoh client; ADR 1023).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: ops/grant-crypto/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: run transport proof
+        working-directory: ops/grant-crypto/transport-proof
+        run: ./run.sh
+
+  rust-core:
+    name: rust production reference (conformance vectors)
+    # Decision §7.9: the production core is Rust. This job proves the Rust read
+    # side reaches the SAME accept/reject decisions as the Go reference on the
+    # shared conformance vectors — the cross-language drift guard. Bare cargo here
+    # builds the SDK workspace (core + the grant-crypto-capi C ABI, ADR 1106); the
+    # heavy `keyd` service crate is a SEPARATE workspace outside sdk/ and is
+    # exercised by rust-transport-proof below.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/grant-crypto/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo test (conformance against the Go-produced vectors)
+        run: cargo test --locked
+      - name: C ABI header drift gate (the committed header must match cbindgen output)
+        run: |
+          cargo install cbindgen --locked
+          cbindgen --config capi/cbindgen.toml --crate grant-crypto-capi --output /tmp/grant_crypto.h capi
+          diff -u capi/include/grant_crypto.h /tmp/grant_crypto.h
+      - name: SDK docs drift gate (every gc_* fn + GC_* code documented; version badge matches the crate)
+        # Scaladoc-style: ties the docs site (docs/site/capi.html) mechanically to
+        # the C ABI header and the core crate version. Runs from the repo root, so
+        # override the job's working-directory. Dependency-free (bash/grep/awk).
+        working-directory: ${{ github.workspace }}
+        run: ./ops/ci/check-sdk-docs-drift.sh
+
+  rust-msrv:
+    name: Rust 1.88 minimum (SDK + C ABI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/grant-crypto/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+      - name: Locked conformance tests at the declared minimum
+        env:
+          CARGO_BUILD_JOBS: '2'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+        run: cargo test --locked
+
+  rust-transport-proof:
+    name: rust on-fabric transport proof (live Zenoh, native path)
+    # M2.1: the E1 key-service's native-Rust write path. A Rust KeyService mints +
+    # signs a bundle and its ZenohBundlePublisher PUTs it over a REAL loopback
+    # router link (two peer sessions, multicast off); a second session reads it
+    # back and the machine-plane read cut holds (member opens, outsider denied) —
+    # enforced by the crypto, not the router. The production analogue of the Go+
+    # Python E0 proof, now on the transport E1 actually ships.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/grant-crypto/keyd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt + clippy (keyd service crate)
+        run: |
+          cargo fmt --check -p grant-keyd
+          cargo clippy --locked -p grant-keyd --all-targets -- -D warnings
+      - name: cargo test (keyd — resolver/recipient/daemon units + live-router transport + e2e)
+        run: cargo test --locked -p grant-keyd -- --nocapture
+
+  # ---- SDK bindings (ADR 1106 Phase 2) ----------------------------------------
+  # Each binding's merge gate: the shared decrypt-direction conformance vectors run
+  # THROUGH the binding (read-interop) + its write-side/lifecycle suite. A binding
+  # that fails does not ship (grant-crypto-sdk.md §Conformance gate).
+
+  binding-go:
+    name: SDK go binding (conformance gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+      - name: build the C ABI staticlib
+        working-directory: ops/grant-crypto/sdk
+        run: cargo build --locked -p grant-crypto-capi
+      - name: gofmt + vet + test
+        working-directory: ops/grant-crypto/sdk/bindings/go
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+      - name: Rust writer to independent Go reader
+        run: bash tests/rustcrypto_wire_interop.sh
+
+  binding-python:
+    name: SDK python binding (conformance gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the C ABI cdylib
+        working-directory: ops/grant-crypto/sdk
+        run: cargo build --locked -p grant-crypto-capi
+      - name: conformance + binding tests (handle leaks fatal)
+        working-directory: ops/grant-crypto/sdk/bindings/python
+        env:
+          GRANT_CRYPTO_CAPI_LIB: ${{ github.workspace }}/ops/grant-crypto/sdk/target/debug
+        run: |
+          python -m compileall grant_crypto
+          python -W error::ResourceWarning -m unittest discover -s tests -v
+          python examples/quickstart.py
+
+  binding-ts:
+    name: SDK ts binding (conformance gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: build the C ABI cdylib
+        working-directory: ops/grant-crypto/sdk
+        run: cargo build --locked -p grant-crypto-capi
+      - name: build + conformance + binding tests
+        working-directory: ops/grant-crypto/sdk/bindings/ts
+        env:
+          GRANT_CRYPTO_CAPI_LIB: ${{ github.workspace }}/ops/grant-crypto/sdk/target/debug
+        run: |
+          npm ci
+          npm run build
+          npm test
+          npm run example

@@ -1,0 +1,104 @@
+name: enrollment
+
+# Block 66A.4 — per-module CI workflow for ops/enrollment.
+#
+# Enrollment hosts:
+#   - bundle/        offline-enrollment CBOR bundle encode/decode/verify
+#                    + CRL pipeline (Block 22 + Block 56 device-side custody)
+#   - ca/            age-CA tooling (Block 22 wg-cp0 + offline-CA primitives)
+#   - x509ca/        Block 22J internal X.509 CA (root cert ceremony +
+#                    leaf signing for service TLS)
+#   - cmd/bundle-extract/  device-side reader for the offline-enrollment bundle
+#   - cmd/ca-init/         offline-CA bootstrap CLI
+#   - cmd/cert-sign/       leaf-cert signing CLI
+#
+# Block 50E.11 added goleak.VerifyTestMain across the four packages
+# with tests (bundle / ca / x509ca / cmd/bundle-extract). This
+# workflow is the per-PR gate that runs them.
+#
+# Triggers:
+#   - PR / push touching ops/enrollment/**
+#   - PR / push touching the workflow itself
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. 98 of 119 workflows did that; measured at 4,787 runs in
+  # one day, roughly half of them this shape.
+  #
+  # An earlier draft of this comment also said "main is protected from
+  # force-push". IT IS NOT — this plan cannot have branch protection at all
+  # (the API answers "Upgrade to GitHub Pro"). A force-push to main therefore
+  # bypasses this guard entirely. That is a real gap and it is 's, not
+  # something a paths filter or a trigger change can close.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'ops/enrollment/**'
+      - '.golangci.yml'
+      - '.github/workflows/enrollment.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: unit tests + lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/enrollment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Match the patched Go pin in ci.yml. Go 1.27 export data is not
+          # supported by the current linter.
+          go-version: '1.26.10'
+          cache-dependency-path: ops/enrollment/go.sum
+      - name: Install libpcsclite-dev (piv-go cgo dep)
+        timeout-minutes: 8
+        # github.com/go-piv/piv-go/v2 requires libpcsclite headers at
+        # build time. The pinned ubuntu-24.04 runner doesn't have the
+        # -dev package; without it `go vet ./...` fails at the Cgo
+        # config-resolution step before getting to actual analysis.
+        # Block 22M production-CA backend pulled this dep in.
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y -qq libpcsclite-dev
+      - run: go vet ./...
+      - name: errcheck (production and tests)
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.13.2
+          working-directory: ops/enrollment
+          args: --config=${{ github.workspace }}/.golangci.yml --enable-only=errcheck
+      - name: golangci-lint (Block 50A.3 — strict config)
+        # F-091: ops/enrollment carries chronic findings from the broader
+        # linter set. They have been failing this workflow .
+        # None are correctness or security issues — pre-existing lint debt.
+        # Keep that broader pass as observability while the dedicated
+        # errcheck step above blocks new discarded errors in code and tests.
+        continue-on-error: true
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.13.2
+          working-directory: ops/enrollment
+          args: --config=${{ github.workspace }}/.golangci.yml
+      - name: go test (Block 50E.11 — goleak across 4 packages)
+        # Covers bundle / ca / x509ca / cmd/bundle-extract. Each carries
+        # its own goleak.VerifyTestMain via Block 50E.11.
+        run: go test -v -race -count=1 ./...

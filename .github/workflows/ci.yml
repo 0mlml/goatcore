@@ -1,0 +1,136 @@
+# The public build: everything here runs on a fresh clone with GITHUB_TOKEN alone.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # A pinned toolchain: rustfmt's output is toolchain-dependent, so a floating
+      # `stable` can turn the format check red on an unchanged tree.
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates
+      - name: relay workspace
+        run: |
+          # formatting is checked per component by its own workflow
+          cargo build --workspace --locked
+          # the source-IP steering test needs kernel features GitHub-hosted runners lack; goat-relay.yml skips it the same way
+          cargo test --workspace --locked -- --skip end_to_end_steering_pins_same_src_to_same_socket
+      - name: tools workspace (goat, goatbuilder, goat-errors, panoscope-core)
+        working-directory: crates
+        run: |
+          cargo build --workspace --locked
+          cargo test --workspace --locked
+
+  go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # signal-server's gen/ packages are protoc output, generated at build time
+      # exactly as its Dockerfile does.
+      - name: protoc and plugins
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler libpcsclite-dev
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: signal-server protobuf bindings
+        working-directory: signal-server
+        run: |
+          protoc -I proto \
+            --go_out=. --go_opt=module=github.com/usareur-af/goatcore/signal-server \
+            --go-grpc_out=. --go-grpc_opt=module=github.com/usareur-af/goatcore/signal-server \
+            proto/signalexchange.proto proto/federation.proto
+      - name: build, vet and test every module
+        run: |
+          rc=0
+          for gm in $(git ls-files '*go.mod' | sed 's|/go.mod||'); do
+            echo "== $gm"
+            ( cd "$gm" && go build ./... && go vet ./... ) || rc=1
+            # These tests link the Rust library; its own crate is tested in the rust job.
+            [ "$gm" = ops/grant-crypto/sdk/bindings/go ] && continue
+            ( cd "$gm" && go test ./... ) || rc=1
+          done
+          exit $rc
+
+  python-and-ansible:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: deps
+        timeout-minutes: 5
+        run: |
+          python3 -m pip install -q pyyaml jsonschema pytest ansible-core yamllint
+          sudo apt-get update -q && sudo apt-get install -y -q shellcheck ripgrep
+          ansible-galaxy collection install -r ops/ansible/requirements.yml
+      - name: every Python file compiles
+        run: python3 -m compileall -q .
+      # Plain scripts: pytest finds no tests in them, and one exits at import.
+      - name: script-style Python checks
+        run: |
+          set -o pipefail
+          export PYTHONPATH="$PWD/ops/consistency/python"
+          for s in ops/ci/test_membership_reconcile.py ops/consistency/python/tests/test_corpus.py ops/consistency/python/tests/test_lite_sidecar.py; do
+            python3 "$s" | tail -3
+          done
+      - name: Python tests
+        run: |
+          set -o pipefail
+          export PYTHONPATH="$PWD/ops/consistency/python"
+          python3 -m pytest -q --ignore=ops/ci/test_membership_reconcile.py --ignore=ops/consistency/python/tests/test_corpus.py --ignore=ops/consistency/python/tests/test_lite_sidecar.py ops/ci ops/consistency/python ops/goatbuilder tests 2>&1 | tail -40
+      - name: Ansible roles and templates resolve
+        run: bash ops/ci/check-role-template-refs-resolve.sh
+      - name: playbooks parse
+        run: |
+          cd ops/ansible
+          rc=0
+          for p in *.yml; do
+            # Not playbooks: data files and a tasks file imported by relay-server.yml.
+            # site-bootstrap and site-resume index a group named from site_id, which needs an inventory.
+            case "$p" in netbird_acl_matrix.yml|netbird_acl_taxonomy.yml|requirements.yml|relay-server-rathole.yml|site-bootstrap.yml|site-resume.yml) continue;; esac
+            ansible-playbook --syntax-check -i localhost, -e target=all -e mgmt_host_target=all -e migrator_host=all -e site_id=zagros "$p" >/dev/null 2>&1 || { echo "syntax: $p"; rc=1; }
+          done
+          exit $rc
+      - name: shell and YAML lint
+        run: |
+          bash ops/ci/check-bash-portability.sh
+          yamllint -d relaxed .github/workflows
+
+  no-identifiers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: no keys, equipment addresses or live values in the tree
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ripgrep
+          bash ops/ci/check-no-identity-spillage.sh

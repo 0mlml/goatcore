@@ -1,0 +1,202 @@
+name: netbird-mgmt
+
+# Builds ops/netbird/Dockerfile — upstream Netbird management binary with the
+# skip-migrations.patch applied — and publishes to
+# ghcr.io/usareur-af/netbird-mgmt. Tag format matches the image IDs
+# ops/ansible/coordinated-upgrade.yml expects (patched-<ref>).
+#
+# Per-arch native build + manifest combine.
+#   - linux/amd64 on ubuntu-24.04
+#   - linux/arm64 on ubuntu-24.04-arm  (GitHub-hosted arm64 runner)
+#
+# Why native per-arch (not buildx cross-compile)?
+# CGO=1 is mandatory (netbirdio/dex fork's SQLite bindings). Cross-compiling
+# CGO from amd64 to arm64 requires installing cross-gcc and fiddling with
+# sysroots; running native on each arch is simpler and matches upstream's
+# own build pattern. Final step `docker buildx imagetools create` merges
+# the two single-arch images into one multi-arch tag.
+#
+# Pattern: https://docs.docker.com/build/ci/github-actions/multi-platform/
+#
+# NETBIRD_REF: defaults to the commit SHA the skip-migrations patch is
+# rebased against (see ops/netbird/Dockerfile). When upstream Netbird ships
+# a tag containing that commit, bump the Dockerfile default and the input
+# default below.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/netbird/**'
+      - '.github/workflows/netbird-mgmt.yml'
+    tags: ['netbird-mgmt/v*']
+  pull_request:
+    paths:
+      - 'ops/netbird/**'
+      - '.github/workflows/netbird-mgmt.yml'
+  workflow_dispatch:
+    inputs:
+      netbird_ref:
+        description: 'Netbird git ref to build: tag, branch, or commit SHA'
+        required: true
+        # Keep in sync with ops/netbird/Dockerfile ARG NETBIRD_REF default.
+        default: '0358be23136da50e829ba99a83e54ef555071a7f'  # upstream v0.71.4
+
+# REGISTRY_IMAGE is NOT a workflow-level `env:` literal: ghcr requires a
+# lowercase namespace and the usareur-af org owner is mixed-case, and workflow
+# expressions have no lowercasing function. Each publishing job resolves it
+# self-referentially in bash instead (see the "Resolve self-referential
+# registry namespace" steps), so goat-maintainer CI publishes to ghcr.io/goat-maintainer and
+# usareur-af CI to ghcr.io/usareur-af. A hardcoded org 403s silently on main
+# under the other owner — the class that stalled signal-server image builds.
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      ref: ${{ steps.ver.outputs.ref }}
+      patch_tag: ${{ steps.ver.outputs.patch_tag }}
+    steps:
+      - name: Resolve Netbird ref
+        id: ver
+        run: |
+          R="${{ github.event.inputs.netbird_ref }}"
+          # Keep fallback in sync with ops/netbird/Dockerfile ARG NETBIRD_REF
+          # default. `push` events don't supply github.event.inputs.netbird_ref,
+          # so this fallback is what the workflow actually builds against on
+          # most fires.
+          if [ -z "$R" ]; then R=0358be23136da50e829ba99a83e54ef555071a7f; fi  # upstream v0.71.4
+          if [ "${#R}" = 40 ]; then
+            SHORT="${R:0:7}"
+          else
+            SHORT="$R"
+          fi
+          echo "ref=$R"                     >> "$GITHUB_OUTPUT"
+          echo "patch_tag=patched-$SHORT"   >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/netbird-mgmt" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest (${{ matrix.arch }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/netbird
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: |
+            NETBIRD_REF=${{ needs.resolve.outputs.ref }}
+          cache-from: type=gha,scope=netbird-mgmt-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=netbird-mgmt-${{ matrix.arch }}
+          outputs: |
+            type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [resolve, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/netbird-mgmt" >> "$GITHUB_ENV"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.patch_tag }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short,prefix=sha-
+            type=match,pattern=netbird-mgmt/v(.*),group=1,prefix=patched-v
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          # Pass JSON via env var — direct ${{ }} interpolation of multi-line
+          # JSON into the bash script body corrupts it (embedded quotes break
+          # the heredoc), and jq parses `Invalid literal at line 1, column 6`.
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$META_JSON") \
+            $(printf "${{ env.REGISTRY_IMAGE }}@sha256:%s " *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ needs.resolve.outputs.patch_tag }}

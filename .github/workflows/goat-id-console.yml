@@ -1,0 +1,126 @@
+name: goat-id-console
+
+# Block 66A.2 — per-module CI workflow for ops/goat-id-console.
+#
+# goat-id-console is the admin console for the Ory Kratos + Hydra
+# identity plane (ADR 0860). This workflow is the per-PR gate for the
+# Go control-plane module under ops/goat-id-console/.
+#
+# Triggers:
+#   - PR / push touching ops/goat-id-console/**
+#   - PR / push touching the workflow itself
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/goat-id-console/**'
+      - 'ops/identity/backfill-verified-addresses.py'
+      - 'ops/identity/test_backfill_verified_addresses.py'
+      - '.golangci.yml'
+      - '.github/workflows/goat-id-console.yml'
+  pull_request:
+    paths:
+      - 'ops/goat-id-console/**'
+      - 'ops/identity/backfill-verified-addresses.py'
+      - 'ops/identity/test_backfill_verified_addresses.py'
+      - '.golangci.yml'
+      - '.github/workflows/goat-id-console.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit:
+    name: unit tests + lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ops/goat-id-console
+    services:
+      # ADR 1165 step A: the onboarding and org stores live in Postgres. Store
+      # tests (and every handler test that opens a store) take a fresh schema
+      # on this server per test via TEST_PG_DSN; without it they skip.
+      postgres:
+        image: postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ops/goat-id-console/go.mod
+          cache-dependency-path: ops/goat-id-console/go.sum
+      - name: Verified-address backfill selection tests
+        working-directory: ${{ github.workspace }}
+        run: python3 ops/identity/test_backfill_verified_addresses.py
+      - run: go vet ./...
+      - name: golangci-lint (Block 50A.3 — strict config)
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.13.2
+          working-directory: ops/goat-id-console
+          args: --config=${{ github.workspace }}/.golangci.yml
+      - name: Install golangci-lint for the errcheck fixtures
+        # v7 has no install-only input. A help invocation installs the pinned
+        # binary and adds it to PATH without analyzing a package.
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.13.2
+          working-directory: ops/goat-id-console
+          verify: false
+          args: --help
+      - name: errcheck rejects discarded production errors
+        # Must fail with exactly the four findings the fixture plants. Any
+        # other failure (config, typecheck, build tags) is a broken gate.
+        run: |
+          set +e
+          out=$(golangci-lint run --config="$GITHUB_WORKSPACE/.golangci.yml" \
+            --tests=false --enable-only=errcheck --build-tags=errcheck_reject \
+            ./internal/errcheckfixture/reject 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          test "$rc" -eq 1 || { echo "expected exit 1 (issues found), got $rc"; exit 1; }
+          for want in 'unchecked.go:13:.*f.Write' 'unchecked.go:17:.*w.Write' \
+                      'unchecked.go:21:.*Encode' 'unchecked.go:25:.*buf.WriteTo'; do
+            printf '%s\n' "$out" | grep -Eq "$want.*\(errcheck\)" || { echo "missing finding: $want"; exit 1; }
+          done
+          n=$(printf '%s\n' "$out" | grep -c '(errcheck)$')
+          test "$n" -eq 4 || { echo "expected 4 errcheck findings, got $n"; exit 1; }
+      - name: errcheck accepts handled errors and HTTP suppressions
+        run: |
+          golangci-lint run --config="$GITHUB_WORKSPACE/.golangci.yml" \
+            --tests=false --enable-only=errcheck --build-tags=errcheck_pass \
+            ./internal/errcheckfixture/pass
+      - name: Raise the test Postgres connection limit
+        # The race tests open a fresh schema per test and run concurrent
+        # claim/offboard callers; the image default of 100 connections runs
+        # out. A service container cannot take server flags, so set it and
+        # restart.
+        working-directory: ${{ github.workspace }}
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U postgres -c "ALTER SYSTEM SET max_connections = 500"
+          docker restart "${{ job.services.postgres.id }}"
+          for i in $(seq 1 30); do
+            docker exec "${{ job.services.postgres.id }}" pg_isready -U postgres && break
+            sleep 2
+          done
+          docker exec "${{ job.services.postgres.id }}" psql -U postgres -tAc "SHOW max_connections" | grep -qx 500
+      - name: go test (id-console unit + race)
+        env:
+          TEST_PG_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+        run: go test -v -race -count=1 ./...

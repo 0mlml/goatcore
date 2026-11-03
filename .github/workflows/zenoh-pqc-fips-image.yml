@@ -1,0 +1,231 @@
+name: zenoh-pqc-fips-image
+
+# Builds ops/zenoh/pqc-image/Dockerfile.fips — the FIPS variant of the
+# PQ-hybrid-TLS zenoh router (docs/design/zenoh-pqc-tls.md §5): zenohd on the
+# aws-lc-rs FIPS backend with aws-lc-fips-sys pinned =0.13.11 (the exact
+# CMVP #5298/#5314-validated AWS-LC FIPS 3.1.0 source), X25519MLKEM768
+# preferred. Publishes to ghcr.io/usareur-af/zenoh-pqc-fips.
+#
+# Verification is layered fail-closed:
+#   - build-time: fips-probe runs inside the builder (module enters FIPS
+#     mode; X25519MLKEM768 offered fips=true + preferred; negotiates on
+#     loopback; classical ring client down-negotiates to P-256).
+#   - smoke (here, per-arch): boot the image with the full baked plugin set
+#     over a real TLS listener; assert the "goat FIPS" boot marker, the
+#     F-122/F-136 plugin-ABI class, the rest plugin answering, AND a live
+#     fips-probe --connect handshake negotiating X25519MLKEM768 against the
+#     running zenohd.
+#
+# IMPORTANT (fleet pinning discipline): deploys pin the multi-arch LIST
+# digest from the merge job, never a per-arch leaf.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/zenoh/pqc-image/**'
+      - '.github/workflows/zenoh-pqc-fips-image.yml'
+    tags: ['zenoh-pqc-fips/v*']
+  pull_request:
+    paths:
+      - 'ops/zenoh/pqc-image/**'
+      - '.github/workflows/zenoh-pqc-fips-image.yml'
+  workflow_dispatch:
+
+# Self-referential namespace (docs/design/usareur-af-repo-migration.md, Phase 2):
+# REGISTRY_IMAGE is resolved per-job from the repo owner, lowercased (ghcr rejects
+# uppercase, so `${{ github.repository_owner }}` alone breaks for usareur-af — the
+# reason #154 hardcoded usareur-af; lowercasing is the fix that keeps it self-
+# referential). Each repo publishes to its OWN namespace.
+env:
+  IMAGE_NAME: zenoh-pqc-fips
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build runtime (${{ matrix.arch }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/zenoh/pqc-image
+          file: ops/zenoh/pqc-image/Dockerfile.fips
+          target: runtime
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: zenoh-pqc-fips:smoke-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=zenoh-pqc-fips-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=zenoh-pqc-fips-${{ matrix.arch }}
+      - name: Build probe stage (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/zenoh/pqc-image
+          file: ops/zenoh/pqc-image/Dockerfile.fips
+          target: probe
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: zenoh-pqc-fips-probe:smoke-${{ matrix.arch }}
+          cache-from: type=gha,scope=zenoh-pqc-fips-${{ matrix.arch }}
+      - name: Smoke — FIPS boot marker + plugin ABI + live X25519MLKEM768
+        run: |
+          set -euo pipefail
+          # Throwaway P-256 server cert (same curve as the goat CA chain).
+          mkdir -p /tmp/certs
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/certs/key.pem
+          # basicConstraints CA:FALSE — `req -x509` defaults to CA:TRUE and
+          # webpki refuses a CA cert as end-entity (CaUsedAsEndEntity).
+          openssl req -new -x509 -key /tmp/certs/key.pem -out /tmp/certs/cert.pem \
+            -days 2 -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=digitalSignature" \
+            -addext "extendedKeyUsage=serverAuth"
+          chmod 644 /tmp/certs/*
+          cat > /tmp/smoke.json5 <<'EOF'
+          {
+            mode: "router",
+            listen: { endpoints: ["tls/0.0.0.0:7447"] },
+            transport: { link: { tls: {
+              listen_certificate: "/certs/cert.pem",
+              listen_private_key: "/certs/key.pem",
+            } } },
+            plugins_loading: { enabled: true, search_dirs: ["/"] },
+            plugins: {
+              rest: { http_port: 8000 },
+              storage_manager: {
+                backend_search_dirs: ["/opt/zenoh/plugins-baked"],
+                volumes: { rocksdb: {} },
+                storages: { smoke: { key_expr: "smoke/**", volume: { id: "rocksdb", dir: "smoke", create_db: true } } },
+              },
+            },
+          }
+          EOF
+          docker run -d --name smoke --network host \
+            -v /tmp/smoke.json5:/smoke.json5:ro \
+            -v /tmp/certs:/certs:ro \
+            zenoh-pqc-fips:smoke-${{ matrix.arch }} -c /smoke.json5
+          sleep 8
+          docker logs smoke 2>&1 | tee /tmp/smoke.log
+          if grep -qi 'compatibility mismatch\|Cannot spawn\|panic' /tmp/smoke.log; then
+            echo "::error::plugin ABI or boot failure"; exit 1
+          fi
+          grep -q 'goat FIPS: AWS-LC FIPS module active' /tmp/smoke.log \
+            || { echo "::error::FIPS boot marker missing"; exit 1; }
+          # rest plugin answering == zenohd + plugins all live
+          curl -sSf http://127.0.0.1:8000/@/local/router | head -c 300; echo
+          # THE assertion: a live handshake against the booted zenohd
+          # negotiates the hybrid PQ group under the FIPS provider.
+          docker run --rm --network host -v /tmp/certs:/certs:ro \
+            zenoh-pqc-fips-probe:smoke-${{ matrix.arch }} \
+            --connect 127.0.0.1:7447 localhost /certs/cert.pem
+          docker rm -f smoke
+      - name: Push by digest (${{ matrix.arch }})
+        if: github.event_name != 'pull_request'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/zenoh/pqc-image
+          file: ops/zenoh/pqc-image/Dockerfile.fips
+          target: runtime
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=zenoh-pqc-fips-${{ matrix.arch }}
+          outputs: |
+            type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+      - name: Download digests
+        uses: actions/download-artifact@v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short,prefix=sha-
+            type=match,pattern=zenoh-pqc-fips/v(.*),group=1,prefix=v
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          # Pass JSON via env var — direct ${{ }} interpolation of multi-line
+          # JSON into the bash body corrupts it (embedded quotes break the
+          # heredoc), and jq parses `Invalid literal at line 1, column 6`.
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$META_JSON") \
+            $(printf "${{ env.REGISTRY_IMAGE }}@sha256:%s " *)
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:latest

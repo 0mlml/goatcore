@@ -1,0 +1,271 @@
+name: ory-consent-image
+
+# Builds ops/ory-consent/Dockerfile — overlays oryd/kratos-selfservice-ui-node
+# with a small patch that forwards the Kratos login groups (admin-managed
+# metadata_public.groups since F-572 / ADR 1188) into the OIDC JWT id_token.
+# See ops/ory-consent/README.md for the why.
+#
+# Per-arch native build + manifest combine, mirroring panoscope-image.yml:
+#   - linux/amd64 on ubuntu-24.04
+#   - linux/arm64 on ubuntu-24.04-arm (GitHub-hosted arm64 runner)
+#
+# Tag scheme:
+#   - On main push:                       `:latest` + `:sha-<short>`
+#   - On `ory-consent/v*` tag:            `:<tag-name>` (e.g. `:v1.3.1-groups`)
+#   - On main push / tag / dispatch:      `:sha-<short>`
+#
+# PR BUILDS DO NOT PUSH. The build and the verify-patched.sh gate both run on a
+# pull request, but every push step is guarded by
+# `github.event_name != 'pull_request'`, so no `:sha-<short>` tag exists until
+# the PR merges. An earlier version of this comment said a sha tag was produced
+# on "any build (PR or main)", which sent someone looking for an image that was
+# never published. A PR gives you confidence the
+# patch applies; it does not give you something to deploy.
+#
+# Post-build smoke gate: ops/ory-consent/tests/verify-patched.sh runs the
+# built per-arch image and greps for the patch marker; failing the gate
+# blocks the manifest combine.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/ory-consent/**'
+      - '.github/workflows/ory-consent-image.yml'
+    tags: ['ory-consent/v*']
+  pull_request:
+    paths:
+      - 'ops/ory-consent/**'
+      - '.github/workflows/ory-consent-image.yml'
+  workflow_dispatch:
+
+# Self-referential namespace (docs/design/usareur-af-repo-migration.md, Phase 2):
+# REGISTRY_IMAGE is resolved per-job from the repo owner, lowercased (ghcr rejects
+# uppercase, so `${{ github.repository_owner }}` alone breaks for usareur-af — the
+# reason #154 hardcoded usareur-af; lowercasing is the fix that keeps it self-
+# referential). Each repo publishes to its OWN namespace.
+env:
+  IMAGE_NAME: kratos-selfservice-ui-node-patched
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  guard-behaviour:
+    # Cheap, browser-free check of the double-submit guard's BEHAVIOUR.
+    # verify-patched.sh proves the guard is present in the built image; presence
+    # is not correctness. The broken version and the correct version differ only
+    # in WHEN the submit control is disabled, and a synchronous disable drops
+    # method=password from the POST body and breaks every login. That cannot be
+    # grepped for, so it is asserted here instead.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Double-submit guard behaves correctly
+        run: node ops/ory-consent/tests/double-submit-guard.test.js
+      # F-572: a migrated identity's self-editable traits never reach the JWT,
+      # and each marker stays where verify-patched.sh looks for it (that check
+      # runs only on a main push, after merge).
+      - name: Groups and aff forwarding read admin metadata
+        run: node ops/ory-consent/tests/claim-forwarding.test.js
+
+  detect-relevant-changes:
+    # Guard against redundant re-fires on PR syncs (merge commits, rebases
+    # that touched zero relevant files). GitHub's native path-filter
+    # evaluates against the PR's full diff every sync; this job evaluates
+    # against the latest push's delta (parent..HEAD) — so a merge of main
+    # into a PR that brings in workflow-irrelevant files no longer re-fires
+    # the build. See docs/design/ci-redundant-rebuild-guard.md for why we
+    # use raw `git diff` instead of dorny/paths-filter (dorny v3 ignores
+    # `base` overrides on pull_request events).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && format('{0}^', github.event.pull_request.head.sha) || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # Push events (branch main + release tags) are already gated by this
+          # workflow's native on.push.paths filter — the run only STARTS when a
+          # relevant path changed, so on push we ALWAYS build. The manual
+          # parent..HEAD delta below silently false-skipped a real main-push
+          # image build (panoscope #1807) despite its changed-file list clearly
+          # containing relevant paths; on push that is pure downside (a lost
+          # deployable image), since native on.push.paths already did the
+          # filtering. The delta dedup is only useful — and only harmless, since
+          # PR builds never publish images — on pull_request syncs. See
+          # docs/design/ci-redundant-rebuild-guard.md.
+          if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+            echo "push event — native on.push.paths already gated this run to a relevant-path change; building"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base ref (new branch / initial push) — failing open"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            git fetch --depth=1 origin "$BASE_SHA" 2>/dev/null || {
+              echo "Could not fetch base $BASE_SHA — failing open"
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+          fi
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "Files changed in latest push ($BASE_SHA..$HEAD_SHA):"
+          echo "$CHANGED" | sed 's/^/  /'
+          if echo "$CHANGED" | grep -qE '^ops/ory-consent/|^\.github/workflows/ory-consent-image\.yml$'; then
+            echo "→ relevant changes present; running downstream jobs"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "→ no relevant changes; skipping downstream jobs"
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: detect-relevant-changes
+    if: needs.detect-relevant-changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest (${{ matrix.arch }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ops/ory-consent
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=kratos-selfservice-ui-node-patched
+            org.opencontainers.image.description=oryd/kratos-selfservice-ui-node + identity groups forwarding into JWT id_token (Block 82B-rbac)
+          cache-from: type=gha,scope=ory-consent-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ory-consent-${{ matrix.arch }}
+          outputs: |
+            type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+
+      - name: Smoke-test built image (verify patch marker present)
+        if: github.event_name != 'pull_request'
+        run: |
+          # Pull by digest so we test exactly what just got pushed.
+          DIGEST="${{ steps.build.outputs.digest }}"
+          IMAGE="${{ env.REGISTRY_IMAGE }}@${DIGEST}"
+          chmod +x ops/ory-consent/tests/verify-patched.sh
+          ops/ory-consent/tests/verify-patched.sh "$IMAGE"
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [detect-relevant-changes, build]
+    if: (needs.detect-relevant-changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch') && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        # Needed so the final `Inspect image` step can resolve
+        # `git rev-parse --short HEAD` for tag construction.
+        # Without this checkout `git rev-parse` errors and the job
+        # fails (image is already pushed by then; the failure is
+        # cosmetic but turns the workflow red).
+
+      - name: Download digests
+        uses: actions/download-artifact@v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short,prefix=sha-
+            type=match,pattern=ory-consent/v(.*),group=1,prefix=v
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$META_JSON") \
+            $(printf "${{ env.REGISTRY_IMAGE }}@sha256:%s " *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:sha-$(git rev-parse --short HEAD)

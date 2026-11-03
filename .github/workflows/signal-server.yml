@@ -1,0 +1,144 @@
+name: signal-server
+
+on:
+  # MANUAL TRIGGER, and it is not a convenience.
+  #
+  # A push-only trigger has NO RECOVERY PATH whenever workflow runs are lost,
+  # for any reason: a merged change can show green and build nothing. The only
+  # alternative is an empty commit, which is a worse artifact than a button.
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'signal-server/**'
+      - '.golangci.yml'
+      - '.github/workflows/signal-server.yml'
+    tags: ['signal-server/v*']
+  pull_request:
+    paths:
+      - 'signal-server/**'
+      - '.golangci.yml'
+      - '.github/workflows/signal-server.yml'
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Match the patched Go pin in ci.yml. Go 1.27 export data is not
+          # supported by the current linter.
+          go-version: '1.26.10'
+          cache-dependency-path: signal-server/go.sum
+
+      - name: Install protoc
+        timeout-minutes: 8
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends protobuf-compiler
+
+      - name: Install protoc plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+
+      - name: Generate proto bindings
+        working-directory: signal-server
+        run: |
+          protoc -I proto \
+            --go_out=. --go_opt=module=github.com/usareur-af/goatcore/signal-server \
+            --go-grpc_out=. --go-grpc_opt=module=github.com/usareur-af/goatcore/signal-server \
+            proto/signalexchange.proto proto/federation.proto
+
+      - name: go vet
+        working-directory: signal-server
+        run: go vet ./...
+
+      - name: golangci-lint (Block 50A.3 — strict config)
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.13.2
+          working-directory: signal-server
+          args: --config=${{ github.workspace }}/.golangci.yml
+
+      - name: govulncheck (S2 — federation-security.md §3 Tier 1)
+        working-directory: signal-server
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: go test
+        working-directory: signal-server
+        run: go test -race -count=1 ./...
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # ghcr requires a lowercase namespace and the usareur-af org owner is
+      # mixed-case, so `${{ github.repository_owner }}` alone breaks the push.
+      # Resolve it self-referentially and lowercased — matching every other
+      # image workflow here — so goat-maintainer CI publishes to ghcr.io/goat-maintainer and
+      # usareur-af CI to ghcr.io/usareur-af (the ansible ghcr_org derivation
+      # pulls from whichever the deploy runs from). A prior hardcode to
+      # `usareur-af` 403'd under goat-maintainer CI and stalled every signal-server
+      # image build on main.
+      - name: Resolve self-referential registry namespace (lowercased)
+        run: echo "REGISTRY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/signal-server" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      # No setup-qemu — the Dockerfile pins the builder stage to
+      # --platform=$BUILDPLATFORM (native amd64) and cross-compiles Go for
+      # each target via GOARCH. The final stage is a static distroless image
+      # (no runtime code executed during build), so buildx only needs to
+      # pick the right pre-built manifest per arch.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=short,prefix=sha-
+            type=match,pattern=signal-server/v(.*),group=1
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: signal-server
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=signal-server
+          cache-to: type=gha,mode=max,scope=signal-server

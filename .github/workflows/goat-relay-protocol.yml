@@ -1,0 +1,65 @@
+name: goat-relay-protocol
+
+# Runs unit + proptest + fuzz (parse-never-panics) tests for the wire-format
+# library crate. The fuzz_parse.rs integration test exercises every public
+# parse function with 1024 random byte vectors apiece (~9k inputs) and is
+# the Block 50A.4 production-readiness gate against parser panics.
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. 98 of 119 workflows did that; measured at 4,787 runs in
+  # one day, roughly half of them this shape.
+  #
+  # An earlier draft of this comment also said "main is protected from
+  # force-push". IT IS NOT — this plan cannot have branch protection at all
+  # (the API answers "Upgrade to GitHub Pro"). A force-push to main therefore
+  # bypasses this guard entirely. That is a real gap and it is 's, not
+  # something a paths filter or a trigger change can close.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'goat-relay-protocol/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/goat-relay-protocol.yml'
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build (--workspace -p goat-relay-protocol)
+        run: cargo build -p goat-relay-protocol --tests --benches
+
+      - name: cargo test (unit + proptest + fuzz_parse)
+        run: cargo test -p goat-relay-protocol --all-features
+        env:
+          # Keep the proptest case count stable across CI vs developer runs.
+          PROPTEST_CASES: '1024'
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy -p goat-relay-protocol --all-targets -- -D warnings

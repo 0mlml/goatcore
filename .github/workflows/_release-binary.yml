@@ -1,0 +1,261 @@
+# Builds one of this repository's command-line binaries for three platforms,
+# signs its checksums, and attaches everything to the GitHub Release of the tag.
+# Called by goat-release.yml and goatbuilder-release.yml; runs with GITHUB_TOKEN
+# alone.
+#
+# Assets, per release:
+#   <bin>-linux-amd64    ubuntu-24.04,     linked against glibc 2.31 (Ubuntu 20.04, Debian 11 and later)
+#   <bin>-linux-arm64    ubuntu-24.04-arm, linked against glibc 2.31
+#   <bin>-darwin-arm64   macos-14, ad-hoc signed, not notarized
+#   <asset>.sha256       one per binary
+#   SHA256SUMS           every binary's digest
+#   SHA256SUMS.cosign-bundle  a keyless cosign signature over SHA256SUMS, made
+#                        under this workflow's GitHub OIDC identity
+#
+# The names are the ones `goat update` and `goatbuilder update` fetch
+# (crates/goat-selfupdate: <bin>-<os>-<arch>). goatbuilder checks the signature
+# against the certificate identity ^https://github.com/<this repository>/, so
+# the signature must be made here, in this repository, and nowhere else.
+
+name: release-binary
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: cargo package under crates/
+        type: string
+        required: true
+      bin:
+        description: binary name, and the prefix of every asset
+        type: string
+        required: true
+      tag_prefix:
+        description: the release tag minus its semver, e.g. goatbuilder/v
+        type: string
+        required: true
+      notes:
+        description: release notes file under .github/release-notes/
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  nominator:
+    name: the tag is on main and pushed by a repository admin
+    if: startsWith(github.ref_name, inputs.tag_prefix) && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The pusher holds the admin role
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          role=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${GITHUB_ACTOR}/permission" --jq .role_name 2>/dev/null || echo unknown)
+          echo "${GITHUB_ACTOR} holds role: ${role}"
+          if [ "$role" != admin ]; then
+            echo "::error::${GITHUB_ACTOR} holds the '${role}' role; only a repository admin cuts a release. Nothing is built for ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+      - name: The tagged commit is on main
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main. Nothing is built."
+            exit 1
+          fi
+
+  build:
+    name: build ${{ matrix.os_label }}-${{ matrix.arch }}
+    needs: [nominator]
+    # workflow_dispatch has no tag: nominator is skipped and the build runs.
+    if: ${{ !cancelled() && (needs.nominator.result == 'success' || needs.nominator.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04,     os_label: linux,  arch: amd64, rust_target: x86_64-unknown-linux-gnu,  glibc: '2.31' }
+          - { runner: ubuntu-24.04-arm, os_label: linux,  arch: arm64, rust_target: aarch64-unknown-linux-gnu, glibc: '2.31' }
+          - { runner: macos-14,         os_label: darwin, arch: arm64, rust_target: aarch64-apple-darwin,      glibc: ''     }
+    defaults:
+      run:
+        shell: bash
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          key: release-${{ inputs.package }}-${{ matrix.rust_target }}
+
+      - name: Python for zig (Linux)
+        if: matrix.glibc != ''
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: zig and cargo-zigbuild (Linux), to link against the glibc floor and not the runner's
+        if: matrix.glibc != ''
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+          ZIGLANG_VERSION: '0.16.0'
+          CARGO_ZIGBUILD_VERSION: '0.23.4'
+        run: |
+          set -euo pipefail
+          "$PYTHON" -m pip install --quiet "ziglang==${ZIGLANG_VERSION}"
+          cargo install --locked cargo-zigbuild --version "=${CARGO_ZIGBUILD_VERSION}"
+
+      - name: cargo build --release --locked -p ${{ inputs.package }}
+        env:
+          PKG: ${{ inputs.package }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          GLIBC_FLOOR: ${{ matrix.glibc }}
+          CARGO_ZIGBUILD_PYTHON_PATH: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$GLIBC_FLOOR" ]; then
+            cargo zigbuild --release --locked -p "$PKG" --target "$RUST_TARGET.$GLIBC_FLOOR"
+          else
+            cargo build --release --locked -p "$PKG" --target "$RUST_TARGET"
+          fi
+
+      - name: Refuse a Linux binary that needs a newer glibc than the floor
+        if: matrix.glibc != ''
+        env:
+          BIN: target/${{ matrix.rust_target }}/release/${{ inputs.bin }}
+          GLIBC_FLOOR: ${{ matrix.glibc }}
+        run: |
+          set -euo pipefail
+          need="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1 || true)"
+          if [ -z "$need" ]; then
+            echo "::error::no versioned glibc symbols in $BIN; the floor cannot be checked"
+            exit 1
+          fi
+          echo "binary needs glibc $need; floor is $GLIBC_FLOOR"
+          if [ "$(printf '%s\n%s\n' "$need" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::$BIN needs glibc $need, above the floor $GLIBC_FLOOR"
+            exit 1
+          fi
+
+      - name: Ad-hoc sign the macOS binary
+        # The linker's own ad-hoc signature can stall or kill a launch on macOS 14
+        # and later; a codesign ad-hoc signature does not. No Apple account is
+        # involved, so the binary is not notarized (see the release notes).
+        if: runner.os == 'macOS'
+        env:
+          BIN: target/${{ matrix.rust_target }}/release/${{ inputs.bin }}
+        run: |
+          set -euo pipefail
+          codesign --force --sign - "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+      - name: --version agrees with the tag
+        env:
+          BIN: target/${{ matrix.rust_target }}/release/${{ inputs.bin }}
+          PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          got="$("$BIN" --version | awk '{print $2}')"
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            want="${GITHUB_REF_NAME#"$PREFIX"}"
+            echo "binary says $got, tag says $want"
+            if [ "$got" != "$want" ]; then
+              echo "::error::the binary reports $got and the tag is $want: bump the version in crates/${{ inputs.package }}/Cargo.toml before tagging"
+              exit 1
+            fi
+          else
+            echo "binary says $got (no tag on this run)"
+          fi
+
+      - name: Stage the asset and its .sha256
+        id: stage
+        env:
+          SRC: target/${{ matrix.rust_target }}/release/${{ inputs.bin }}
+          OUT: ${{ inputs.bin }}-${{ matrix.os_label }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$SRC" "$GITHUB_WORKSPACE/dist/$OUT"
+          cd "$GITHUB_WORKSPACE/dist"
+          if command -v sha256sum >/dev/null; then sum=$(sha256sum "$OUT" | awk '{print $1}'); else sum=$(shasum -a 256 "$OUT" | awk '{print $1}'); fi
+          echo "$sum  $OUT" > "$OUT.sha256"
+          echo "- \`$OUT\` sha256 \`$sum\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.bin }}-${{ matrix.os_label }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  checksums:
+    name: SHA256SUMS, signed with cosign (keyless)
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          set -euo pipefail
+          cat artifacts/*.sha256 | sort -k 2 > SHA256SUMS
+          (cd artifacts && sha256sum -c ../SHA256SUMS)
+          { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign SHA256SUMS, then verify it the way goatbuilder update does
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle SHA256SUMS.cosign-bundle SHA256SUMS
+          cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.bin }}-checksums
+          path: |
+            SHA256SUMS
+            SHA256SUMS.cosign-bundle
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: attach the assets to the release
+    needs: [build, checksums]
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, inputs.tag_prefix)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - run: ls -la release-assets/
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
+          body_path: .github/release-notes/${{ inputs.notes }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

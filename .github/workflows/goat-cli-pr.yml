@@ -1,0 +1,154 @@
+name: goat-cli-pr
+
+# Check host behavior and Windows compilation before a CLI release. Windows uses
+# the GNU cross target here; the release workflow links the native MSVC build.
+# Declaration-only changes are checked by acl-assertions.yml.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/goat-cli/**'
+      - 'crates/panoscope-core/**'
+      - 'crates/Cargo.toml'
+      - 'crates/Cargo.lock'
+      - 'clippy.toml'
+      - 'crates/clippy.toml'
+      - 'ops/operators/gen-roster.py'
+      - 'ops/operators/generate-affiliation-kind.py'
+      - '.github/workflows/goat-cli-pr.yml'
+      - 'crates/goat-errors/**'
+      - 'crates/goat-fun/**'
+      - 'crates/goat-selfupdate/**'
+      - 'ops/scripts/translate-ftl.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: goat-cli-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: crates
+
+jobs:
+  host:
+    name: host check + clippy + test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-goat-cli-pr-host-${{ hashFiles('crates/Cargo.lock') }}
+          restore-keys: |
+            cargo-goat-cli-pr-host-
+
+      - name: Cache cargo build target
+        uses: actions/cache@v4
+        with:
+          path: crates/target
+          key: target-goat-cli-pr-host-${{ hashFiles('crates/Cargo.lock') }}
+          restore-keys: |
+            target-goat-cli-pr-host-
+
+      - name: Install affiliation generator dependency
+        run: python3 -m pip install 'PyYAML==6.0.2'
+
+      - name: Check affiliation derivation parity
+        run: python3 ../ops/operators/generate-affiliation-kind.py --check
+
+      - name: cargo check (host)
+        run: cargo check -p goat-cli --all-targets
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy -p goat-cli -p goat-fun -p goat-selfupdate -p panoscope-core --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test -p goat-cli -p goat-fun -p goat-selfupdate
+
+      - name: Every message has a translation in every shipped language
+        working-directory: .
+        run: |
+          python3 ops/scripts/translate-ftl.py --self-test
+          python3 ops/scripts/translate-ftl.py --check --catalog goat-cli --catalog goat-errors || {
+            echo "::error::A message in English has no translation in some shipped language (docs/design/goat-cli-i18n.md §CLI catalog currency)."
+            echo "::error::Fill it: ops/scripts/translate-ftl.py --apply --catalog goat-cli --catalog goat-errors   (needs ANTHROPIC_API_KEY; or dispatch docs-translation-gate.yml with apply=true)"
+            exit 1
+          }
+
+  windows-portability:
+    name: windows/amd64 portability check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # `cargo check` runs build scripts (ring compiles C/asm) but never
+      # links, so a mingw cross-toolchain is enough — no Windows runner.
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+      AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, target x86_64-pc-windows-gnu)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install mingw-w64 cross-toolchain
+        timeout-minutes: 8
+        run: |
+          # Azure's runner mirror timed out twice before compilation. Use the
+          # official HTTPS archives for this install, with the same Ubuntu
+          # archive keyring and package/target; keep the bounded step above.
+          set -euo pipefail
+          ubuntu_sources="$(mktemp)"
+          trap 'rm -f "$ubuntu_sources"' EXIT
+          cat > "$ubuntu_sources" <<'SOURCES'
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-backports main restricted universe multiverse
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+          SOURCES
+          apt_args=(-o "Dir::Etc::sourcelist=$ubuntu_sources" -o Dir::Etc::sourceparts=-
+                    -o Acquire::Retries=3 -o Acquire::http::Timeout=20
+                    -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120)
+          sudo apt-get "${apt_args[@]}" update
+          sudo apt-get "${apt_args[@]}" install -y gcc-mingw-w64-x86-64
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-goat-cli-pr-win-${{ hashFiles('crates/Cargo.lock') }}
+          restore-keys: |
+            cargo-goat-cli-pr-win-
+
+      - name: Cache cargo build target
+        uses: actions/cache@v4
+        with:
+          path: crates/target
+          key: target-goat-cli-pr-win-${{ hashFiles('crates/Cargo.lock') }}
+          restore-keys: |
+            target-goat-cli-pr-win-
+
+      - name: cargo check (x86_64-pc-windows-gnu)
+        # A reference to a Unix-only API that isn't cfg-gated is a hard
+        # compile error for this target, so a non-portable change fails
+        # the PR here rather than at release time.
+        run: cargo check -p goat-cli --all-targets --target x86_64-pc-windows-gnu

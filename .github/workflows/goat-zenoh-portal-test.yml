@@ -1,0 +1,107 @@
+name: goat-zenoh-portal-test
+
+# go vet + race-enabled unit tests (govulncheck runs in ci.yml's go-vuln matrix) for the goat-zenoh-portal
+# Go backend. These ~46 test packages (decoder, protocompile, certmint,
+# pubsubstate, acl, api, registry, schemastore, audittail, netbirdpoll) were
+# previously run by no CI job — the portal's only gates were the docker image
+# build (goat-zenoh-portal-image.yml) and the frontend Playwright suite
+# (portal-web-e2e.yml), so backend regressions in ACL decoding, schema
+# rendering, cert minting, and pubsub-state reconciliation shipped uncaught.
+# This gate closes that hole. Mirrors work-cli-test.yml / the per-component
+# go-test workflows (time-hygiene, gatewatch, signal-server). Path-filtered so
+# it only fires on portal-backend changes.
+
+on:
+  # push: on main REMOVED — this workflow is a guard, not a publisher. It
+  # already gates the pull request, and a squash merge puts the reviewed diff
+  # on main unchanged, so re-running it there re-verifies a commit whose answer
+  # is known. 98 of 119 workflows did that; measured at 4,787 runs in
+  # one day, roughly half of them this shape.
+  #
+  # An earlier draft of this comment also said "main is protected from
+  # force-push". IT IS NOT — this plan cannot have branch protection at all
+  # (the API answers "Upgrade to GitHub Pro"). A force-push to main therefore
+  # bypasses this guard entirely. That is a real gap and it is 's, not
+  # something a paths filter or a trigger change can close.
+  # Publishers keep push: on purpose — the merge commit is the artifact.
+  pull_request:
+    paths:
+      - 'ops/goat-zenoh-portal/**'
+      - '.github/workflows/goat-zenoh-portal-test.yml'
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      # ADR 1165 step A: the registry lives in Postgres. Registry tests, and
+      # every handler test that opens a registry, take a fresh schema on this
+      # server per test via TEST_PG_DSN; without it they skip. Same image digest
+      # as ops/postgres/docker-compose.yml and the id-console workflows.
+      postgres:
+        image: postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # 'stable' (latest patched Go) for the current stdlib +
+          # govulncheck scan. Pattern parity with ci.yml / work-cli-test.
+          go-version: 'stable'
+          cache-dependency-path: ops/goat-zenoh-portal/go.sum
+
+      - name: go vet
+        working-directory: ops/goat-zenoh-portal
+        run: go vet ./...
+
+      - name: Raise the test Postgres connection limit
+        # Every test opens its own registry pool on a fresh schema, and the
+        # slot-allocation race tests run concurrent callers; the image default
+        # of 100 connections runs out. A service container cannot take server
+        # flags, so set it and restart.
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U postgres -c "ALTER SYSTEM SET max_connections = 500"
+          docker restart "${{ job.services.postgres.id }}"
+          for _ in $(seq 1 30); do
+            docker exec "${{ job.services.postgres.id }}" pg_isready -U postgres && break
+            sleep 2
+          done
+          docker exec "${{ job.services.postgres.id }}" psql -U postgres -tAc "SHOW max_connections" | grep -qx 500
+
+      # Explicit timeout: internal/api takes ~11 minutes under -race on
+      # ubuntu-24.04 (5.5 min on an M-series laptop), which is Go's default
+      # per-package limit. Runs passed or failed on runner speed alone
+      # (three runs at 10:53 / 11:09 / 10:55; the last two failed
+      # with "test timed out after 10m0s" while a 2-4 s test was running).
+      # 18 minutes keeps a hung test from holding the runner while leaving room
+      # for a slow day. The job limit is 25 minutes because setup, the Postgres
+      # restart, vet and the race build take ~3 minutes before this step starts:
+      # under a 20-minute job a real hang was killed by Actions at 20:00, before
+      # Go's timeout could print the stack that names the stuck test. Making the
+      # package cheaper is #1361.
+      - name: go test (race)
+        working-directory: ops/goat-zenoh-portal
+        env:
+          TEST_PG_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+        run: go test -race -count=1 -timeout 18m ./...

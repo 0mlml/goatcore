@@ -1,0 +1,63 @@
+name: goat-relay-image
+# Builds ops/goat-relay/Dockerfile — the Block 33 Rust relay-server (ADR 0709)
+# — and publishes the container image to ghcr.io/usareur-af/goat-relay.
+#
+# Distinct from goat-relay.yml (which gates the Rust BINARY: build + test +
+# clippy). This workflow is the IMAGE-publish tier: pre-staging the base image
+# in the registry for engineering convenience + speed. The relay runs in the
+# cloud anyway and the image carries no mission data, so registry-staging is
+# sovereignty-consistent (mission DATA stays sovereign; base IMAGES are
+# pre-staged) — see docs/design/oci-goat-substrate.md (Block 75). Replaces the
+# build-locally → S3 → `docker load` workaround that goat-relay-deploy.yml
+# Phase 0 used while no registry published the image; the goat-relay role
+# pulls goat_relay_image (default ghcr.io/usareur-af/goat-relay:latest) directly.
+#
+# Per-arch native build + manifest combine (same pattern as netbird-mgmt.yml):
+#   - linux/amd64 on ubuntu-24.04
+#   - linux/arm64 on ubuntu-24.04-arm  (GitHub-hosted arm64 runner)
+# Native per-arch avoids cross-compiling the Rust build (ktls-sys's build
+# script generates C bindings against the kernel TLS ULP); `docker buildx
+# imagetools create` merges the two single-arch images into one multi-arch tag.
+# Build context = repository root (the Dockerfile copies the whole Cargo
+# workspace); target = the Chainguard glibc-dynamic `runtime` stage.
+#
+# Build body: .github/workflows/_image-build.yml (shared).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'goat-relay/**'
+      - 'goat-relay-protocol/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'ops/goat-relay/Dockerfile'
+      - '.github/workflows/goat-relay-image.yml'
+    tags: ['goat-relay/v*']
+  pull_request:
+    paths:
+      - 'ops/goat-relay/Dockerfile'
+      - '.github/workflows/goat-relay-image.yml'
+  workflow_dispatch:
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  image:
+    uses: ./.github/workflows/_image-build.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      image_name: goat-relay
+      tag_prefix: goat-relay
+      file: ops/goat-relay/Dockerfile
+      target: runtime

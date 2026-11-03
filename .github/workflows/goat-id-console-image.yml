@@ -1,0 +1,105 @@
+name: goat-id-console-image
+# Builds ops/goat-id-console/Dockerfile — Go admin console for the Ory
+# Kratos + Hydra identity plane (ADR 0860). Single static binary with
+# embedded HTML templates + CSS; deploys behind oauth2-proxy on nova-a.
+#
+# Per-arch native build + manifest combine, mirroring
+# audit-subscriber-image.yml. The image runs on nova-a (Tegra arm64) for
+# the trial fabric and on any x86 mgmt-host for production.
+#
+# Tag scheme:
+#   - On main push:                       :latest + :sha-<short>
+#   - On goat-id-console/v* tag:          :<tag-name>
+#   - On any build:                       :sha-<short>
+#
+# Build body: .github/workflows/_image-build.yml (shared).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/goat-id-console/**'
+      # Onboarding schema-sync guard (ADR 1061): the console's embedded
+      # onboardlint schema must stay byte-identical to the canonical SoT. Fire
+      # when EITHER the canonical schema or the check itself changes.
+      - 'ops/operators/schema/**'
+      - 'ops/ci/check-onboard-schema-sync.sh'
+      # The console's permissions tests read ops/permissions/group-permissions.yml
+      # (TestMeshOnlyDoorsAreNamed pins the ungated surfaces by name). Without this
+      # path a matrix-only change merged with those tests red and CI never ran
+      # them (#680).
+      - 'ops/permissions/group-permissions.yml'
+      - '.github/workflows/goat-id-console-image.yml'
+    tags: ['goat-id-console/v*']
+  pull_request:
+    paths:
+      - 'ops/goat-id-console/**'
+      - 'ops/operators/schema/**'
+      - 'ops/ci/check-onboard-schema-sync.sh'
+      # The console's permissions tests read ops/permissions/group-permissions.yml
+      # (TestMeshOnlyDoorsAreNamed pins the ungated surfaces by name). Without this
+      # path a matrix-only change merged with those tests red and CI never ran
+      # them (#680).
+      - 'ops/permissions/group-permissions.yml'
+      - '.github/workflows/goat-id-console-image.yml'
+  workflow_dispatch:
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Fail-closed guard that the console's embedded onboardlint schema
+  # (go:embed) is byte-identical to the canonical operator-manifest SoT — the
+  # onboarding engine lives here now (docs/design/onboarding-extraction-plan.md).
+  schema-sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: onboarding schema-sync check
+        run: bash ops/ci/check-onboard-schema-sync.sh
+
+  # The console's Go tests ran in NO workflow previously . This job builds
+  # and publishes the image that mints identities, and it never executed the
+  # suite guarding it. Measured cost of the gap: a nil-deref added in #503
+  # panicked TestApplyFieldEdits_unregisteredOrgRefused and still merged with 39
+  # green checks, because nothing anywhere ran `go test` for this module.
+  # -race is deliberate — the console serves concurrent onboarding requests over
+  # one store, which is precisely where an untested race would live.
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ops/goat-id-console/go.mod
+          cache-dependency-path: ops/goat-id-console/go.sum
+      - name: go vet
+        working-directory: ops/goat-id-console
+        run: go vet ./...
+      - name: go test -race
+        working-directory: ops/goat-id-console
+        run: go test -race -count=1 ./...
+
+  image:
+    # Gate the image on its tests. Previously the build job had no
+    # `needs`, so a main push published the image whether or not the Go tests
+    # and the schema-sync check passed (guard-cull review, item 12).
+    needs: [schema-sync, test]
+    uses: ./.github/workflows/_image-build.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      image_name: goat-id-console
+      tag_prefix: goat-id-console
+      context: ops/goat-id-console
+      description: "Admin console for the Ory Kratos + Hydra identity plane (ADR 0860)"

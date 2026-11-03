@@ -1,0 +1,45 @@
+# Base-image refresh for digest-pinned Dockerfiles (ADR 0703).
+#
+# Pinning a FROM by digest stops a rebuild changing under us, and also stops it
+# picking up the upstream's CVE rebuilds (Chainguard republishes :latest for
+# that). This file is the other half: dependabot opens a PR when a pinned
+# digest has a newer build behind the same tag, so a pin is reviewed and moved
+# rather than silently stale.
+#
+# ONLY directories whose FROM carries @sha256 belong here. A floating FROM gets
+# nothing from dependabot but tag-version bumps. ops/ci/check-image-refs-pinned.py
+# fails when a Dockerfile pins a digest and its directory is missing below —
+# pin a base and add its directory in the same change.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directories:
+      - /ops/admit-audit
+      - /ops/e2e/canary
+      - /ops/e2e/host
+      - /ops/goat-id-console
+      - /ops/gatewatch
+      - /ops/goat-zenoh-portal
+      - /ops/netbird
+      - /ops/onboard-runner
+      - /ops/postgres/spock
+      - /ops/secwatch
+      - /signal-server
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      base-images:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+    open-pull-requests-limit: 5
+    ignore:
+      # Postgres major version bumps are an on-disk upgrade for a replicated
+      # Spock fleet (see docs/adr for the Spock HA topology) and need their
+      # own reviewed upgrade plan, not a dependabot auto-bump. The pgedge
+      # minimal images also drop pg_trgm on major bumps, which breaks
+      # 02-spock-extension.sql (see PR #2080 CI failures).
+      - dependency-name: "ghcr.io/pgedge/pgedge-postgres"
+        update-types: ["version-update:semver-major"]
+      - "/ops/federation-e2e/host"

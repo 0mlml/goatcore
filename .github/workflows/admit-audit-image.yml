@@ -1,0 +1,130 @@
+name: admit-audit-image
+# Builds ops/admit-audit/Dockerfile (the read-only sidecar that watches the
+# NetBird mgmt Postgres for new peer rows) and publishes to
+# ghcr.io/usareur-af/goat-admit-audit.
+#
+# WHY THE goat- PREFIX. ghcr.io/usareur-af/admit-audit already exists: a
+# hand-pushed mirror of an older build, linked to no repository,
+# which this workflow's GITHUB_TOKEN cannot write to. Nothing runs it. A new
+# name is created and linked to this repo by the first publish, the same way
+# goat-fabric-crawler and goat-consistency-health were.
+#
+# WHY THIS EXISTS. Previously nothing published admit-audit. The role
+# built it on each mgmt host and tagged the result `:latest`, so every rebuild
+# overwrote the previous image under the same name and the deploy ledger had
+# no digest to roll back to (ADR 0703, ADR 1060). A published, digest-pinned
+# image is what makes the pin and the rollback mean something.
+#
+# Per-arch native build + manifest combine, same shape as
+# goat-zenoh-portal-image.yml:
+#   - linux/amd64 on ubuntu-24.04
+#   - linux/arm64 on ubuntu-24.04-arm
+#
+# Tag scheme:
+#   - On main push:           `:latest` + `:sha-<short>`
+#   - On `admit-audit/v*` tag: `:<tag-name>`
+#   - On any build:           `:sha-<short>` (always)
+#
+# Build body: .github/workflows/_image-build.yml. The per-PR unit tests stay in
+# admit-audit.yml; this workflow only builds and publishes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/admit-audit/**'
+      - '.github/workflows/admit-audit-image.yml'
+    tags: ['admit-audit/v*']
+  pull_request:
+    paths:
+      - 'ops/admit-audit/**'
+      - '.github/workflows/admit-audit-image.yml'
+  workflow_dispatch:
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  detect-relevant-changes:
+    # Guard against redundant re-fires on PR syncs (merge commits, rebases
+    # that touched zero relevant files). GitHub's native path-filter
+    # evaluates against the PR's full diff every sync; this job evaluates
+    # against the latest push's delta (parent..HEAD) — so a merge of main
+    # into a PR that brings in workflow-irrelevant files no longer re-fires
+    # the build. See docs/design/ci-redundant-rebuild-guard.md for why we
+    # use raw `git diff` instead of dorny/paths-filter (dorny v3 ignores
+    # `base` overrides on pull_request events).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && format('{0}^', github.event.pull_request.head.sha) || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # Push events (branch main + release tags) are already gated by this
+          # workflow's native on.push.paths filter — the run only STARTS when a
+          # relevant path changed, so on push we ALWAYS build. The manual
+          # parent..HEAD delta below silently false-skipped a real main-push
+          # image build (panoscope #1807) despite its changed-file list clearly
+          # containing relevant paths; on push that is pure downside (a lost
+          # deployable image), since native on.push.paths already did the
+          # filtering. The delta dedup is only useful — and only harmless, since
+          # PR builds never publish images — on pull_request syncs. See
+          # docs/design/ci-redundant-rebuild-guard.md.
+          if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+            echo "push event — native on.push.paths already gated this run to a relevant-path change; building"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base ref (new branch / initial push) — failing open"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            git fetch --depth=1 origin "$BASE_SHA" 2>/dev/null || {
+              echo "Could not fetch base $BASE_SHA — failing open"
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+          fi
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "Files changed in latest push ($BASE_SHA..$HEAD_SHA):"
+          echo "$CHANGED" | sed 's/^/  /'
+          if echo "$CHANGED" | grep -qE '^ops/admit-audit/|^\.github/workflows/admit-audit-image\.yml$'; then
+            echo "→ relevant changes present; running downstream jobs"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "→ no relevant changes; skipping downstream jobs"
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  image:
+    needs: detect-relevant-changes
+    if: needs.detect-relevant-changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/_image-build.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      image_name: goat-admit-audit
+      tag_prefix: admit-audit
+      context: ops/admit-audit
+      description: "Read-only sidecar that reports NetBird peer admit events from the mgmt Postgres"

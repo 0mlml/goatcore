@@ -1,0 +1,50 @@
+name: onboard-runner-image
+# Builds ops/onboard-runner/Dockerfile — the pull-model onboarding auto-executor
+# (docs/design/operator-onboard-intake.md §"Fast-follow") as a container with its
+# own scoped identity — and publishes to ghcr.io/usareur-af/onboard-runner.
+#
+# Same shape as flashlight-image / onboard-intake: per-arch native build +
+# multi-arch manifest combine. Build context is ops/onboard-runner/ (the Go
+# module is self-contained — no cross-crate path deps).
+#
+# Tag scheme:
+#   - On main push:  `:latest` + `:sha-<short>`
+#   - On any build:  `:sha-<short>` (always)
+#
+# Build body: .github/workflows/_image-build.yml (shared).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/onboard-runner/**'
+      - '.github/workflows/onboard-runner-image.yml'
+    tags: ['onboard-runner/v*']
+  pull_request:
+    paths:
+      - 'ops/onboard-runner/**'
+      - '.github/workflows/onboard-runner-image.yml'
+  workflow_dispatch:
+
+# Supersede in-flight runs for the same ref. A push during review used to
+# leave the previous run going to completion, so a branch pushed three
+# times paid three times for an answer only the last one needed. Keyed on
+# the workflow plus the ref, and NEVER cancels on main — a merge-commit run
+# is the one whose result is recorded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  image:
+    uses: ./.github/workflows/_image-build.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      image_name: onboard-runner
+      tag_prefix: onboard-runner
+      context: ops/onboard-runner
+      file: ops/onboard-runner/Dockerfile
+      description: "Pull-model onboarding auto-executor (three-stage candidate onboarding)"
