@@ -1,0 +1,143 @@
+# TEMPLATE leaf-cert manifest — copy to <site-id>-certs.yaml and re-thread.
+#
+# phase 4 of the canonical standup is `mint-site-certs.sh <site>`, and phase 5
+# needs a manifest. Start here. Do not copy another goatnet's manifest: its URI
+# SANs name that goatnet, and a copied SAN mints a cert that claims the wrong
+# goatnet. Do not hand-mint leaf by leaf either; the script exists to stop that.
+#
+# HOW TO USE:
+#   cp ops/enrollment/manifests/TEMPLATE-certs.yaml \
+#      ops/enrollment/manifests/<site-id>-certs.yaml
+#   # replace every <SITE> and TBD_ below, then:
+#   ops/scripts/mint-site-certs.sh <site-id> --dry-run
+#
+# The dry run prints one cert-sign invocation per leaf and mints nothing —
+# read it before the real run. Every TBD_ left in place is a value nobody has
+# decided yet; the script fails on a site_id mismatch, but the URI prefixes are
+# on the author (Class A, docs/design/instance-variability-model.md §1 — URI
+# SANs are freeze-critical identity, not a label you can fix later).
+#
+# WHAT IS NOT HERE, deliberately:
+#   - Org-anchored app peers (CN = a 32-hex slot anchor). Those are PORTAL-
+#     minted per goatnet via `goat admin rotate <anchor>`; a template cannot
+#     carry an anchor that does not exist yet. Add a row per anchor AFTER the
+#     portal issues it, as the offline-replay fallback.
+#   - The mgmt-identity cert (ACME supersedes it on most paths; hand-minted per
+#     ops/enrollment/ca/<site>/README.md §Leaf mints).
+#
+# NO SECRETS HERE — subjects, SANs, EKUs and paths only.
+
+site_id: TBD_SITE_ID          # lowercase instance id, e.g. hobby — must match
+                              # the argument to mint-site-certs.sh
+
+ca:
+  root_cert: ops/enrollment/ca/TBD_SITE_ID/root-cert.pem
+  root_key: ~/.goat/state/TBD_SITE_ID-ca/ca.key.age
+  age_identity: ~/.config/age/keys.txt
+  ca_id: TBD_CA_ID            # e.g. dev-<site>-ca-ecdsa-<YYYY-MM-DD>; read it
+                              # back from the root cert, do not invent one
+
+out_dir: ~/.goat/state/TBD_SITE_ID-leaves
+
+# CN convention: <service>-trial-peer, matching the other tiers. A dev tier
+# exists to be the same shape as the tiers above it, and the zenoh ACL matches
+# readers BY CN — so a goatnet minting `panoscope` while its siblings enumerate
+# `panoscope-trial-peer` has every reader named-but-absent and every present
+# reader unnamed. The template was internally inconsistent about this: `operator`
+# already carried the suffix, these three did not.
+leaves:
+  # --- router server cert — POST-ENROLL ---------------------------------
+  # This row cannot be completed before phase 10. The mesh IP does not exist
+  # until the host enrolls onto its own goatnet, and a RE-enrollment reassigns
+# it. So: run the loop
+  # pre-enroll to mint everything else, then fill the IP and
+  # `mint-site-certs.sh <site> --only router`.
+  - name: router
+    cn: goat-zenoh-router
+    eku: serverAuth,clientAuth
+    sans:
+      - goat-zenoh-router
+      - zenoh.<SITE>.netbird.<SITE-APEX>
+      - TBD_ROUTER_MESH_IP                   # from `wt0` after phase 10
+      - 127.0.0.1
+
+  # --- infra peers ------------------------------------------------------
+  # CN matches the router ACL subject; URI is urn:goat:<site>:infra:<svc>.
+  # Delete any row whose service this goatnet does not deploy — a minted-and-
+  # unused leaf is key material with no owner. Check against this goatnet's
+  # group_vars file inventory (standup-config-preflight.py <group> --scaffold-plan).
+  - name: audit-subscriber
+    cn: audit-subscriber
+    sans: [audit-subscriber]
+    uri_sans: ["urn:goat:<SITE>:infra:audit-subscriber"]
+  - name: fabric-crawler
+    cn: goat-fabric-crawler-trial-peer
+    sans: [goat-fabric-crawler-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:fabric-crawler"]
+  - name: goat-topology
+    cn: goat-topology-trial-peer
+    sans: [goat-topology-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:topology"]
+  - name: fabric-health
+    cn: fabric-health-trial-peer
+    sans: [fabric-health-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:fabric-health"]
+  - name: grant-keyd
+    cn: grant-keyd-trial-peer
+    sans: [grant-keyd-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:grant-keyd"]
+  - name: mesh-health
+    cn: goat-mesh-health-trial-peer
+    sans: [goat-mesh-health-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:mesh-health"]
+  - name: node-net-health
+    cn: goat-node-net-health-trial-peer
+    sans: [goat-node-net-health-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:node-net-health"]
+  - name: ntp-health-pub
+    cn: ntp-health-pub-trial-peer
+    sans: [ntp-health-pub-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:ntp-health-pub"]
+  - name: presence-health
+    cn: goat-presence-health-trial-peer
+    sans: [goat-presence-health-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:presence-health"]
+  - name: time-health
+    cn: goat-time-health-trial-peer
+    sans: [goat-time-health-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:time-health"]
+  - name: consistency-health
+    cn: goat-consistency-health-trial-peer
+    sans: [goat-consistency-health-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:consistency-health"]
+  - name: consistency-console
+    cn: goat-consistency-console-trial-peer
+    sans: [goat-consistency-console-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:consistency-console"]
+  # The acceptance assay's probe identity (goatnet-acceptance-suite.md
+  # §"The probe identity"); keep it when the goatnet sets assay_probe_enabled.
+  - name: assay-probe
+    cn: goat-assay-probe-trial-peer
+    sans: [goat-assay-probe-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:infra:assay-probe"]
+
+  # --- operator surfaces ------------------------------------------------
+  # All four share one URI (urn:goat:<site>:operator) — that is the operator
+  # class, not a per-surface identity. Keep it that way; the router ACL grants
+  # on the class.
+  - name: flashlight
+    cn: flashlight-trial-peer
+    sans: [flashlight]
+    uri_sans: ["urn:goat:<SITE>:operator"]
+  - name: operator
+    cn: operator-trial-peer
+    sans: [operator-trial-peer]
+    uri_sans: ["urn:goat:<SITE>:operator"]
+  - name: panoscope
+    cn: panoscope-trial-peer
+    sans: [panoscope]
+    uri_sans: ["urn:goat:<SITE>:operator"]
+  - name: stethoscope
+    cn: stethoscope-trial-peer
+    sans: [stethoscope]
+    uri_sans: ["urn:goat:<SITE>:operator"]
