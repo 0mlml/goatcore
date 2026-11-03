@@ -14,7 +14,7 @@
 </p>
 
 > [!NOTE]
-> goat is pre-1.0. Until the first tag, `goatcore/v0.1.0`, this repository is regenerated from its source tree and `main` may be replaced; clone again rather than pull. After that tag, history only moves forward and pull requests are welcome.
+> goat is pre-1.0: interfaces can still change between releases. This repository is generated from goat's source tree; each update arrives as a new commit on `main`.
 
 ## What goat is
 
@@ -86,7 +86,7 @@ To run goat for real on a single machine with no cloud account, start with [goat
 
 ## Contributing
 
-Contributions open with the first tagged release. Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start; every CI check is a script under `ops/ci/` that you can run locally. Report security issues privately as described in [SECURITY.md](SECURITY.md).
+Pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start; every CI check is a script under `ops/ci/` that you can run locally. Report security issues privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

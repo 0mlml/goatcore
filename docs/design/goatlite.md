@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Unproven on hardware. A goatlite is never for production: production is the full preset (§7).** Designed 2026-10-31; phases A and B built 2026-11-02 (the lite preset, the derivation script, the account-leak fixes, the fixture rehearsal and the quickstart); unmeasured on hardware. It is proven for its purpose, learning and first goatnets, when the cold-read drill of §9 passes on a fresh VM and the grow-out of §6 is measured (phases C and D). |
+| Status | **Run once on hardware, not yet proven for its purpose. A goatlite is never for production: production is the full preset (§7).** Designed 2026-10-31; built 2026-11-02; first real run 2026-11-02 on a fresh cloud VM through `goatbuilder`: every automated phase completes in about 24 minutes of phase time, and the defects that run found are fixed. Proven for its purpose when the cold-read drill of §9 passes and the grow-out of §6 is measured (phases C and D). |
 | ADR | [ADR 1213](../adr/1213-goatlite-preset-one-box-one-file.md) |
 | Prepared for by | [ADR 1198 D6](../adr/1198-goatbuilder-config-driven-deploy-release-cli.md) ("goatlite is a preset, not a fork"); [goatbuilder.md §"A goatlite profile"](goatbuilder.md#a-goatlite-profile-future) |
 | Bar it is measured against | [complexity-budget-and-encapsulation.md §"The bar"](https://github.com/usareur-af/goatdocs/blob/main/docs/design/complexity-budget-and-encapsulation.md#the-bar-definition-of-success): the 5-minute and 30-minute onboarding paths (ADR 1016 D2) |
@@ -131,7 +131,7 @@ goatlite is rung 4 of a ten-rung ladder from "I have a welcome package" to "I sh
 | 1 | uses an existing goatnet: enrols a laptop, reads what is published, uses the CLI | gym newcomer modules | Built |
 | 2 | builds a moon-pod and joins with it | the `moon-pod` reference implementation | Reference implementation; design Proposed |
 | 3 | rehearses a new goatnet on the fixture | `goatbuilder tutor`, tutorial 01 | Built, CI-checked |
-| 4 | stands up a goatlite and uses it | this design, [the quickstart](../tutorials/00-goatlite.md) | Built; unmeasured on hardware |
+| 4 | stands up a goatlite and uses it | this design, [the quickstart](../tutorials/00-goatlite.md) | Run once on a fresh VM, every automated phase complete, the put/subscribe round trip passing; cold-read drill under way |
 | 5 | grows it to an internet-enrollable goatnet | §6; goatnet-standup.md internet profile | Driver built; not turnkey-certified; §6 unmeasured |
 | 6 | breaks it, reads `goat explain`, fixes it, tears it down and rebuilds | `goat explain`, `goatbuilder assay`, `goatbuilder teardown` | Verbs built; module not written |
 | 7 | federates a first node inside it | tutorial 02, `goatbuilder federate` | Rehearsed on the fixture; no hardware run |
@@ -144,6 +144,8 @@ Rung 6 is on the ladder because the one-week troubleshooting path is the bar's h
 ## 9. Acceptance
 
 goatlite is done when a person who did not write it, with no AI and only `docs/tutorials/00-goatlite.md`, takes a fresh Ubuntu VM to a green `goatbuilder assay` and a round-trip publish, and every other document they had to open is recorded. That is a cold-read drill applied to the lite preset, and the 5-minute and 30-minute paths of ADR 1016 walked for real.
+
+**The drill, as assigned 2026-11-03:** two people who did not write goatlite each run it, separately, on a fresh Ubuntu 24.04 VM on their own network, from this tutorial alone, and record where they stopped by phase number and every other page they opened. goatlite is proven for its purpose when both reach a green assay and a round-trip publish.
 
 Two numbers are recorded as a measurement: wall-clock from `standup` to green `assay`, and the count of documents opened beyond the quickstart.
 
