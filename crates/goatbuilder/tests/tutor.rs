@@ -140,9 +140,9 @@ fn a_command_run_outside_the_tutors_copy_does_not_count() {
     let ws = std::env::temp_dir().join(format!("goatbuilder-tutor-wrong-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
     let _ = tutor(&ws);
-    // Lesson 1 done through its two commands on the checkout.
+    // Lesson 1 done through its two commands: validate on the skeleton, doctor on the checkout.
     let path = format!("{}:{}", bin().parent().unwrap().display(), std::env::var("PATH").unwrap_or_default());
-    run("goatbuilder validate", &ws, &path);
+    run(&format!("goatbuilder validate -C {}/repo", ws.display()), &ws, &path);
     run("goatbuilder doctor --env zagros_dev", &ws, &path);
     assert!(rows(&tutor(&ws)).iter().any(|(n, _, d)| n == "lesson 1" && d == "done"));
     // Lesson 2 on the basic fixture in the checkout, not the tutor's copy.
@@ -171,7 +171,7 @@ fn a_finished_lesson_opens_to_read_and_changes_nothing() {
     let _ = std::fs::remove_dir_all(&ws);
     let _ = tutor(&ws);
     let path = format!("{}:{}", bin().parent().unwrap().display(), std::env::var("PATH").unwrap_or_default());
-    run("goatbuilder validate", &ws, &path);
+    run(&format!("goatbuilder validate -C {}/repo", ws.display()), &ws, &path);
     run("goatbuilder doctor --env zagros_dev", &ws, &path);
     let _ = tutor(&ws); // marks lesson 1 done
     let page = |args: &[&str]| {

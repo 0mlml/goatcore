@@ -460,6 +460,11 @@ mgmt_container_host_port: "8081"
 # ops/scripts/create-assay-probe-identity.sh mint and install it. The mint
 # itself stays an operator command, never a playbook side effect.
 assay_probe_enabled: true
+# The founder's own fabric identity: a goatlite runs no identity console,
+# so ops/scripts/create-founder-identity.sh mints a person leaf with this CN from
+# the goatnet's CA and installs it as a goat context on the laptop. The router
+# admits it (founder-w in roles/goat-zenoh) only where this is set.
+zenoh_founder_cn: goat-founder-trial-peer
 
 # -- Portal registry store -----------------------------------------------------
 # The box runs its own Postgres, and every portal image pinned today stores
@@ -716,6 +721,11 @@ def manifest_yaml(f: dict) -> str:
     append_root: true
     sans:
       - dashboard.{n}.{zone}
+  # --- the founder: the one person on a goatlite
+  - name: founder
+    cn: goat-founder-trial-peer
+    sans: [goat-founder-trial-peer]
+    uri_sans: ["urn:goat:{n}:operator:founder"]
 """
     head = f"""{HEADER}
 # Leaf-cert manifest for {n}, a goatlite goatnet (ADR 1213), rendered from

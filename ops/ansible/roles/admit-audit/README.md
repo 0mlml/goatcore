@@ -43,7 +43,7 @@ Defaults (overridable):
 
 | Var | Default | Meaning |
 |---|---|---|
-| `admit_audit_image` | `ghcr.io/usareur-af/admit-audit:latest` | pinned per-release in production |
+| `admit_audit_image` | `ghcr.io/<ghcr_org>/goat-admit-audit:sha-<rev>@sha256:<digest>` | the CI build, pinned by digest |
 | `pg_admit_audit_role` | `admit_audit` | PG role name |
 | `pg_admit_audit_db` | `netbird` | DB holding the `peers` table |
 

@@ -1,11 +1,11 @@
 # Your first goatnet
 
-You will stand up a working goatnet on one Ubuntu host or VM on your LAN and use it: enrol your laptop, sign in, check it layer by layer, and watch a message cross its fabric. You write one file of four facts and run one command. What comes up is a real goatnet with its own mesh, identity service, certificate authority and data fabric, not a demo. You rehearse the run on a worked example first, on your laptop.
+You will stand up a working goatnet on one Ubuntu host or VM on your LAN and use it: enrol your laptop, sign in, read its health, and publish a message and receive it. You write one file of four facts and run one command. What comes up is a real goatnet with its own mesh, identity service, certificate authority and data fabric, not a demo. You rehearse the run on a worked example first, on your laptop.
 
 - **Audience:** Someone who has never run a goatnet and knows none of the software under it
 - **Time:** The rehearsal is short. The real run takes an hour or more; downloads, reading and fixing mistakes all add to it, so do not plan around a number
 - **You need:** One Ubuntu 24.04 host or VM with 4 cores and 16 GB that you can SSH into with a key, a laptop on the same LAN, the `goatbuilder` and `goat` binaries, and a checkout of the goat repository
-- **You finish with:** A goatnet whose acceptance gate is green and whose router has carried a message and returned it
+- **You finish with:** A goatnet whose acceptance gate is green and on which you have published a message and received it
 - **Status:** Updated 2026-11-02 during the first measured run; that run's fixes are in this text
 - **Next:** [Tutorial 1, a new goatnet, from nothing](01-new-goatnet.md)
 
@@ -314,7 +314,40 @@ Restart the browser afterwards. Firefox keeps its own trust store; in its settin
 goatbuilder assay pasture --only fabric-put-subscribe-roundtrip
 ```
 
-**Using the goatnet as yourself is not in goatlite yet.** On a larger goatnet, your identity console issues you a welcome package, and `goat profile init` with it gives you a `goat` context for `goat status`, `goat hello`, `goat pub` and `goat sub`. A goatlite does not run the identity console, and nothing else issues a person's package yet, so those commands have no context to use on a goatlite. A one-command founder identity, minted from the certificate authority you already hold, is the planned fix. Until it lands, the `goat` client is for the larger goatnets of Tutorial 1 onward.
+**Your own identity on the goatnet.** On a larger goatnet, the identity console issues each person a welcome package. A goatlite runs no console, and you already hold its certificate authority, so you mint your own identity from it and install it as a `goat` context named after your goatnet. **On your laptop, once:**
+
+```text
+ops/scripts/create-founder-identity.sh pasture
+```
+
+It ends with `verified: goat --context pasture status opens an mTLS session to the router`. Your identity may write under `founder/`, and `goat hello` writes under your goatnet's name.
+
+**Read its health.**
+
+```text
+goat --context pasture status
+goat --context pasture health
+```
+
+`goat status` opens one real session to the router and gives one verdict per layer. `goat health` reads the fabric's own health beat.
+
+**Send a message to yourself.** `goat hello` publishes through the fabric and receives its own message back.
+
+```text
+goat --context pasture hello
+```
+
+**Publish and subscribe for real.** Subscribe in one terminal, publish in another, and watch the message arrive.
+
+```text
+goat --context pasture sub 'founder/**' --take 1 --for 60s
+```
+
+```text
+goat --context pasture pub founder/hello/v1 --payload 'first message on pasture' --confirm
+```
+
+`--confirm` reads the value back from the router's storage, so a denied write is reported instead of silently dropped.
 
 ## When something fails
 

@@ -82,7 +82,7 @@ pub const LESSONS: &[Lesson] = &[
         text: "The goatbuilder CLI builds, deploys and releases GOAT software. Before you use it, check your setup with two commands:\n- The goatbuilder `validate` command checks the config file, `ops/goatbuilder/goatbuilder.yaml`. It reads only this checkout and needs no network.\n- The goatbuilder `doctor` command checks what a real deploy needs: your tools, your sign-ins, whether this checkout matches main, and how goatbuilder reaches each goatnet. A goatnet is one GOAT environment.\n\nThe goatbuilder `doctor` command prints how many checks passed, then each problem with its fix. In this lesson a problem is information, not a mistake. Read the fixes, but you do not have to apply them now.\n\nMost lessons need no sign-in. Lessons 2 to 5, 10, 11 and 16 use a practice copy. Lessons 8, 9, 12, 13, 15, 17 and 18 only read this checkout. Lesson 6 needs `gh` and the mesh, lesson 7 needs `gh`, and lesson 14 needs the mesh. No lesson needs 1Password.",
         setup: &[],
         expects: &[
-            Expect { label: "Check the config file", command: "goatbuilder validate", words: &["validate"], on: On::Repo, exits: &[0], contains: ANY, hint: "validate refuses only a config that breaks the schema; regenerate it with `python3 ops/goatbuilder/gen-config.py`." },
+            Expect { label: "Check the config file", command: "goatbuilder validate -C {ws}/repo", words: &["validate"], on: On::Skeleton, exits: &[0], contains: ANY, hint: "validate refuses only a config that breaks the schema; regenerate it with `python3 ops/goatbuilder/gen-config.py`." },
             Expect { label: "Ask the doctor about one goatnet", command: "goatbuilder doctor --env {goatnet}", words: &["doctor", "--env"], on: On::Repo, exits: &[0, 1], contains: ANY, hint: "pass --env with a goatnet key from the pins; `goatbuilder doctor --all` lists them." },
         ],
         needs_verb: None,
@@ -668,10 +668,19 @@ fn setup(repo: &Path, ws: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(ws.join("federate"))?;
     let sk = ws.join("repo");
-    for d in ["ops/pins", "ops/ansible/group_vars", "ops/consistency/schema", "ops/consistency/intent", "ops/enrollment/public-keys"] {
+    for d in ["ops/pins", "ops/ansible/group_vars", "ops/consistency/schema", "ops/consistency/intent", "ops/enrollment/public-keys", "ops/goatbuilder/schema"] {
         if repo.join(d).is_dir() {
             copy_dir(&repo.join(d), &sk.join(d))?;
         }
+    }
+    // Lesson 1 validates the skeleton's config. A deployment checkout has its
+    // own; a public clone carries none (it is a deployment's file), so the
+    // skeleton takes the worked example's, and lesson 1 works from any clone.
+    let own = repo.join("ops/goatbuilder/goatbuilder.yaml");
+    let example = repo.join("ops/goatbuilder/fixtures/goatnet-from-scratch/01-founder/goatbuilder.yaml");
+    if let Some(src) = [own, example].into_iter().find(|p| p.is_file()) {
+        std::fs::create_dir_all(sk.join("ops/goatbuilder"))?;
+        std::fs::copy(src, sk.join("ops/goatbuilder/goatbuilder.yaml"))?;
     }
     if let Ok(rd) = std::fs::read_dir(repo.join("ops/ansible/roles")) {
         for role in rd.flatten() {
