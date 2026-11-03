@@ -1,0 +1,2301 @@
+{
+  "uid": "service-response-pressure",
+  "title": "Service Response Under Pressure",
+  "description": "Response performance for a representative service set, read against usage pressure and path class. Paired with mesh-bandwidth-attribution (ADR 1128).",
+  "tags": [
+    "goat-obs",
+    "net",
+    "capacity",
+    "slo"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "links": [
+    {
+      "title": "\u25c0 Mesh Bandwidth Attribution",
+      "type": "link",
+      "url": "/d/mesh-bandwidth-attribution",
+      "icon": "external link",
+      "tooltip": "What is consuming the pipe, same host and window",
+      "keepTime": true,
+      "includeVars": true,
+      "targetBlank": false,
+      "asDropdown": false,
+      "tags": []
+    },
+    {
+      "title": "Dashboards",
+      "type": "dashboards",
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "goat-obs"
+      ],
+      "targetBlank": false
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(goat_net_attribution_up, host)",
+          "refId": "host"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1,
+        "description": "Same variable name as the bandwidth dashboard, so the cross-link carries your selection."
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "query_result(sum by (service) (rate(traefik_service_requests_total[1h])) > 0)",
+          "refId": "service"
+        },
+        "regex": "/service=\"([^\"]+)\"/",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1,
+        "description": "Defaults to the representative set \u2014 services with traffic in the last hour. Widen to All to see the silent ones report No data."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 24,
+        "h": 8,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### Response performance, read against usage pressure\n\nTwo questions that are only useful together: **is this service answering\nquickly**, and **is the pipe under it busy**. The pair is cross-linked \u2014 every\npanel here can hand you to\n[Mesh Bandwidth Attribution](/d/mesh-bandwidth-attribution) on the same host over the same window,\nand it links back.\n\n**Read it as a quadrant.** That is the whole point of pairing them:\n\n| | pipe quiet | pipe busy |\n|---|---|---|\n| **fast** | healthy | coping \u2014 headroom is real |\n| **slow** | **the SERVICE is the problem** \u2014 the network is not your answer | **contention** \u2014 go to the bandwidth dashboard and find the category |\n\nCorrelation is not causation, and this dashboard does not claim it. It puts the\ntwo facts on one screen with a shared time axis so the quadrant is readable;\ndeciding which way the arrow points is still yours.\n\n**Latency here is Traefik's** \u2014 it is measured at the ingress and knows nothing\nabout how the client reached the mesh. The p2p-vs-relayed split below is a\n*separate* measurement of the path, from `netbird status`. Do not read one as\nthe cause of the other without checking the third block."
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "Response \u2014 the representative set",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 8
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 24,
+        "h": 4,
+        "x": 0,
+        "y": 9
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Not every service, deliberately. Of the routers Traefik knows, only a handful\ncarry any traffic; the rest return `NaN` from `histogram_quantile` because\ntheir buckets are empty. A dashboard that renders those as `0 s` would claim\nevery idle service is infinitely fast.\n\n`$service` defaults to the set that actually moves requests. Widen it with the\npicker \u2014 an idle service will show **No data**, which is the honest answer."
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "p99 response \u2014 worst service",
+      "description": "Highest p99 across the selected services. Blank means none of them served a request in the window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "noValue": "no traffic to measure",
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(histogram_quantile(0.99, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval]))) and on (service) (sum by (service) (rate(traefik_service_requests_total[1h])) > 0))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "p90 response \u2014 worst service",
+      "description": "Highest p90 across the selected services. Blank means none of them served a request in the window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "noValue": "no traffic to measure",
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(histogram_quantile(0.90, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval]))) and on (service) (sum by (service) (rate(traefik_service_requests_total[1h])) > 0))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 4,
+        "y": 13
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "p50 response \u2014 worst service",
+      "description": "Highest p50 across the selected services. Blank means none of them served a request in the window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "noValue": "no traffic to measure",
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(histogram_quantile(0.50, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval]))) and on (service) (sum by (service) (rate(traefik_service_requests_total[1h])) > 0))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 8,
+        "y": 13
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Error ratio (5xx)",
+      "description": "Failures, the other half of 'performance'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "noValue": "no traffic",
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(traefik_service_requests_total{service=~\"$service\",service!~\"signal@file|portal@file\",code=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(traefik_service_requests_total{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 12,
+        "y": 13
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Requests/s",
+      "description": "Demand. A latency number with no requests behind it is noise.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(traefik_service_requests_total{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 16,
+        "y": 13
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Services answering",
+      "description": "How many of the selected services actually served a request. The rest are not fast \u2014 they are silent.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(sum by (service) (rate(traefik_service_requests_total{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval])) > 0)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 20,
+        "y": 13
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Response time by service \u2014 p99",
+      "description": "Gaps are real: a service with no requests in a bucket has no p99, and the line breaks rather than interpolating a value nobody measured.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval]))) and on (service) (sum by (service) (rate(traefik_service_requests_total[1h])) > 0), \"service\", \"$1\", \"service\", \"(.*)@file\")",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "gridPos": {
+        "w": 24,
+        "h": 8,
+        "x": 0,
+        "y": 17
+      }
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Per-service now \u2014 latency, load, failures",
+      "description": "p99 / req-per-sec / 5xx ratio side by side. Sort by req/s first \u2014 a slow service nobody is calling is a different problem from a slow one under load.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true,
+              "__name__": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval]))) and on (service) (sum by (service) (rate(traefik_service_requests_total[1h])) > 0), \"service\", \"$1\", \"service\", \"(.*)@file\")",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(sum by (service) (rate(traefik_service_requests_total{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval])) > 0, \"service\", \"$1\", \"service\", \"(.*)@file\")",
+          "refId": "B",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(sum by (service) (rate(traefik_service_requests_total{service=~\"$service\",service!~\"signal@file|portal@file\",code=~\"5..\"}[$__rate_interval])) / clamp_min(sum by (service) (rate(traefik_service_requests_total{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval])), 1) and on (service) (sum by (service) (rate(traefik_service_requests_total[1h])) > 0), \"service\", \"$1\", \"service\", \"(.*)@file\")",
+          "refId": "C",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "w": 24,
+        "h": 8,
+        "x": 0,
+        "y": 25
+      }
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Long-lived streams \u2014 measured as streams, not as requests",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 33
+      },
+      "panels": []
+    },
+    {
+      "id": 13,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 0,
+        "y": 34
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**A stream's lifetime is not a response time.** `signal@file|portal@file` is the NetBird\nsignal server: it holds a gRPC stream open per peer, and Traefik times a stream\nfrom open to close. A peer connected for twenty minutes is recorded as one\n1200-second \"request\".\n\nMeasured here on 2026-08-14: **95.8% of signal requests finished under 100 ms**,\nand 42 of 21,093 exceeded 5 s. That bimodal shape is quick RPCs plus a handful\nof streams \u2014 not a slow service. Averaged together it dragged p99 to the\nhistogram ceiling and this dashboard reported the signal server as slow when it\nis fast. Streaming services are now excluded from every percentile above.\n\nWhat actually matters for a stream is **how many are open and how long they\nlast**, which is what these panels show. Note the bucket resolution is coarse\n(Traefik's defaults are 0.1 / 0.3 / 1.2 / 5 s), so anything past 5 s is\n\"longer than 5 s\" and nothing finer \u2014 appropriate for a stream, useless as a\nlatency figure."
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Stream completions by duration bucket",
+      "description": "Cumulative histogram buckets. The gap between the 5s line and +Inf is the genuinely long-lived streams \u2014 peers that stayed connected. Rising +Inf means more peers holding sessions, which is health, not latency.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (le) (increase(traefik_service_request_duration_seconds_bucket{service=~\"signal@file|portal@file\"}[$__interval]))",
+          "refId": "A",
+          "legendFormat": "\u2264{{le}}s"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 12,
+        "y": 34
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Streams opened/s",
+      "description": "Includes the quick RPCs on the same service \u2014 Traefik cannot separate them by route, so read this as signal-plane activity, not as sessions.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(traefik_service_requests_total{service=~\"signal@file|portal@file\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 0,
+        "y": 42
+      }
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Sessions lasting >5s (10m)",
+      "description": "The long tail, counted rather than averaged. THIS is the stream population; it was previously being reported as a 5-second p99.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(increase(traefik_service_request_duration_seconds_count{service=~\"signal@file|portal@file\"}[10m])) - sum(increase(traefik_service_request_duration_seconds_bucket{service=~\"signal@file|portal@file\",le=\"5\"}[10m]))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 6,
+        "y": 42
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Signal errors (5xx)",
+      "description": "Failures ARE meaningful for a stream \u2014 this is the honest health signal for the signal plane, where latency is not.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(traefik_service_requests_total{service=~\"signal@file|portal@file\",code=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(traefik_service_requests_total{service=~\"signal@file|portal@file\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 12,
+        "y": 42
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Open connections (all entrypoints)",
+      "description": "Concurrency across the edge. Streams are a concurrency cost, not a throughput cost \u2014 this is the number that grows with viewers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(traefik_open_connections)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 18,
+        "y": 42
+      }
+    },
+    {
+      "id": 19,
+      "type": "table",
+      "title": "Fast-vs-stream split for stream-carrying services",
+      "description": "Share of this service's requests that completed under 1.2s \u2014 i.e. were ordinary requests rather than held-open streams. THIS is the page latency signal for a service whose percentile is unusable. A high share with a bad percentile means the pages are fine and the streams are just long, which is what a stream is supposed to be.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true,
+              "__name__": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(sum by (service) (increase(traefik_service_request_duration_seconds_bucket{service=~\"signal@file|portal@file\",le=\"1.2\"}[30m])) / clamp_min(sum by (service) (increase(traefik_service_request_duration_seconds_count{service=~\"signal@file|portal@file\"}[30m])), 1), \"service\", \"$1\", \"service\", \"(.*)@file\")",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 6,
+        "x": 0,
+        "y": 46
+      }
+    },
+    {
+      "id": 20,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 12,
+        "h": 6,
+        "x": 12,
+        "y": 46
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Why these services are excluded from the percentiles above**\n\nMeasured on 2026-08-14 over 30 minutes:\n\n| service | evidence | reading |\n|---|---|---|\n| `nova-signal` | 95.8% under 100 ms; 42 of 21,093 over 5 s | quick RPCs plus a few long gRPC streams |\n| `nova-portal` | **361 of 513 over 5 s (70%)** | the SSE route is the majority of what Traefik counts |\n\nTraefik measures a stream open-to-close, so a peer connected for twenty minutes\nis one 1200-second \"request\". Leaving these in reported the signal server as\nslow when 95.8% of its work finishes in under a tenth of a second.\n\n**This is a measurement limit, not a service verdict.** Router-label metrics\nwould let the SSE route be excluded on its own instead of the whole service \u2014\n`--metrics.prometheus.addRoutersLabels=true`, at the cost of a label per router."
+      }
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "Path context \u2014 peer-to-peer vs relayed",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 52
+      },
+      "panels": []
+    },
+    {
+      "id": 22,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 24,
+        "h": 5,
+        "x": 0,
+        "y": 53
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Where a client sits changes what \"slow\" means.** A relayed peer's traffic\ngoes node \u2192 relay \u2192 peer, so it carries the relay's round trip and the relay's\nqueue; a direct peer does not. Judging a service's response time without\nknowing the path mix is judging two different populations as one.\n\nThis is measured by `netbird`, not by Traefik \u2014 it is the *path*, not the\nservice. **Only peers netbird has actually timed are counted.** It reports\n`0` for peers it has not measured, and a 0 here would render as an\ninstantaneous link, so `goat_net_peer_latency_measured` gates every panel\nbelow and the coverage tile says how much of the fleet is behind the number."
+      }
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Direct (p2p) RTT \u2014 mean",
+      "description": "Mean RTT over peers netbird has timed on a direct path.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 150
+              }
+            ]
+          },
+          "noValue": "none measured"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "avg(goat_net_peer_latency_ms{class=\"mesh-p2p\"} and on (peer, class) (goat_net_peer_latency_measured == 1))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 0,
+        "y": 58
+      }
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "Relayed RTT \u2014 mean",
+      "description": "Same, for peers reached through a relay. Compare with the tile beside it \u2014 but check the coverage tile before believing the difference.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 150
+              }
+            ]
+          },
+          "noValue": "none measured",
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "avg(goat_net_peer_latency_ms{class=\"mesh-relayed\"} and on (peer, class) (goat_net_peer_latency_measured == 1))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 4,
+        "y": 58
+      }
+    },
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "Relay penalty",
+      "description": "Relayed mean minus direct mean. Blank unless BOTH classes have measured peers \u2014 a difference against an unmeasured population is not a difference.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "not comparable"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "avg(goat_net_peer_latency_ms{class=\"mesh-relayed\"} and on (peer, class) (goat_net_peer_latency_measured == 1)) - avg(goat_net_peer_latency_ms{class=\"mesh-p2p\"} and on (peer, class) (goat_net_peer_latency_measured == 1))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 8,
+        "y": 58
+      }
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "RTT coverage",
+      "description": "Share of connected peers netbird has actually timed. Read the two RTT tiles through this: a mean over a third of the fleet is a hint, not a measurement.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.34
+              },
+              {
+                "color": "green",
+                "value": 0.67
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(goat_net_peer_latency_measured) / clamp_min(count(goat_net_peer_latency_measured), 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 12,
+        "y": 58
+      }
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "Peers relayed",
+      "description": "The path mix itself. A high relayed share means most clients are paying the relay hop before they ever reach a service.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(goat_net_peer_latency_measured{class=\"mesh-relayed\"}) / clamp_min(count(goat_net_peer_latency_measured), 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 16,
+        "y": 58
+      }
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "Peers connected",
+      "description": "Population behind every tile in this row.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(goat_net_peer_latency_measured)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 20,
+        "y": 58
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "RTT by path class",
+      "description": "Measured peers only. A class with nothing measured is ABSENT here, not zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "avg by (class) (goat_net_peer_latency_ms and on (peer, class) (goat_net_peer_latency_measured == 1))",
+          "refId": "A",
+          "legendFormat": "{{class}}"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 0,
+        "y": 62
+      }
+    },
+    {
+      "id": 30,
+      "type": "table",
+      "title": "Slowest measured peers",
+      "description": "Per peer, with its path class. A relayed peer at the top is a candidate for why one person says the surface is slow while everyone else is fine.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true,
+              "__name__": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(15, goat_net_peer_latency_ms and on (peer, class) (goat_net_peer_latency_measured == 1))",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 12,
+        "y": 62
+      }
+    },
+    {
+      "id": 31,
+      "type": "row",
+      "title": "Response against pressure \u2014 the same window, one above the other",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 70
+      },
+      "panels": []
+    },
+    {
+      "id": 32,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 24,
+        "h": 5,
+        "x": 0,
+        "y": 71
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Two panels, one time axis, never one chart.** Latency and throughput have\ndifferent units and different scales; putting them on a shared y-axis (or worse,\ntwo y-axes) invents a relationship by choosing where the lines cross. Stacked\npanels let you read the same instant on both without the chart asserting\nanything.\n\nIf the top line rises where the bottom line rises, that is worth investigating \u2014\nclick through to\n[Mesh Bandwidth Attribution](/d/mesh-bandwidth-attribution) with this window preserved and find\nwhich category was consuming the pipe."
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "\u25b2 Response \u2014 worst p99 across the selected services",
+      "description": "The response half of the pair.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(histogram_quantile(0.99, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"$service\",service!~\"signal@file|portal@file\"}[$__rate_interval]))) and on (service) (sum by (service) (rate(traefik_service_requests_total[1h])) > 0))",
+          "refId": "A",
+          "legendFormat": "worst p99"
+        }
+      ],
+      "gridPos": {
+        "w": 24,
+        "h": 7,
+        "x": 0,
+        "y": 76
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "\u25bc Pressure \u2014 physical link throughput over the same window",
+      "description": "The pressure half. The capacity line is absent until a host declares one \u2014 on this fleet none has, so there is no ceiling drawn and no percentage anywhere. Utilisation, when declared, is on the bandwidth dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "links": [
+            {
+              "title": "Open Mesh Bandwidth Attribution (same host, same window)",
+              "url": "/d/mesh-bandwidth-attribution?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "goat:link_bits_per_second:rx{host=~\"$host\"}",
+          "refId": "A",
+          "legendFormat": "{{host}} down"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "goat:link_bits_per_second:tx{host=~\"$host\"}",
+          "refId": "B",
+          "legendFormat": "{{host}} up"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(goat_link_capacity_bytes_per_second{host=~\"$host\"}) * 8",
+          "refId": "C",
+          "legendFormat": "declared capacity"
+        }
+      ],
+      "gridPos": {
+        "w": 24,
+        "h": 7,
+        "x": 0,
+        "y": 83
+      }
+    },
+    {
+      "id": 35,
+      "type": "table",
+      "title": "Response by pressure band",
+      "description": "A crude banding: p99 restricted to windows where the link was moving bytes. It is deliberately crude \u2014 a real pressure/latency regression wants a load test (ADR 1012), not an observational join. This says 'look closer', never 'proven'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true,
+              "__name__": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(histogram_quantile(0.99, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{service=~\"$service\"}[$__rate_interval])))) and on () (sum(goat:link_bits_per_second:rx{host=~\"$host\"}) > bool 0) == 1",
+          "refId": "A",
+          "legendFormat": "p99 while the link is carrying traffic",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 6,
+        "x": 0,
+        "y": 90
+      }
+    },
+    {
+      "id": 36,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 12,
+        "h": 6,
+        "x": 12,
+        "y": 90
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**What this pair cannot tell you.**\n\n- Traefik's latency is measured *at the ingress*. It does not include the\n  client's mesh path, so a relayed client's felt latency is this number **plus**\n  the relay hop in the block above.\n- Jitter and packet loss are **not measured on this goatnet** \u2014\n  `goat_mesh_rtt_jitter_ms` and `goat_mesh_packet_loss_ratio` exist in the\n  rules but the path-quality prober is not deployed here, so there are zero\n  series. They are absent rather than shown as zero.\n- Correlation on observed traffic is suggestive only. To establish that\n  pressure *causes* latency, drive it: `zenoh-loadtest.md` / ADR 1012."
+      }
+    },
+    {
+      "id": 37,
+      "type": "row",
+      "title": "Response compression (ADR 1139)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "panels": []
+    },
+    {
+      "id": 38,
+      "title": "Wire savings by client class",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 97
+      },
+      "description": "Fraction of bytes compression removed, split by who the client is. READ THE `mesh` LINE \u2014 that is real users, and it ran 71-81% when goat-compress shipped. `gateway` is our own blackbox canary, which never sends Accept-Encoding and sits near zero (slightly negative, the honest cost of negotiation overhead on responses it cannot compress). A combined ratio would average these two into a number that means nothing.",
+      "datasource": null,
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{client_class}}",
+          "expr": "(sum by (client_class) (rate(goat_traefik_origin_bytes_total[30m])) - sum by (client_class) (rate(goat_traefik_wire_bytes_total[30m]))) / clamp_min(sum by (client_class) (rate(goat_traefik_origin_bytes_total[30m])), 1)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "percentunit",
+          "min": -0.1,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 39,
+      "title": "Origin vs wire bytes \u2014 real clients only",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "description": "The gap between these two lines IS the compression. Note this cannot be built from traefik_service_responses_bytes_total: that counter reports the origin figure only and is blind to compression, which is why this dashboard reads goat_traefik_* from the access log instead.",
+      "datasource": null,
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "origin (what the app produced)",
+          "expr": "sum(rate(goat_traefik_origin_bytes_total{client_class=\"mesh\"}[30m]))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "wire (what Traefik sent)",
+          "expr": "sum(rate(goat_traefik_wire_bytes_total{client_class=\"mesh\"}[30m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 40,
+      "title": "Savings by service \u2014 real clients",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 105
+      },
+      "description": "Per-surface compression. A surface dropping to zero here while others hold means its own route stopped matching the entrypoint middleware, not that compression fell over fleet-wide.",
+      "datasource": null,
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{service}}",
+          "expr": "(sum by (service) (rate(goat_traefik_origin_bytes_total{client_class=\"mesh\"}[30m])) - sum by (service) (rate(goat_traefik_wire_bytes_total{client_class=\"mesh\"}[30m]))) / clamp_min(sum by (service) (rate(goat_traefik_origin_bytes_total{client_class=\"mesh\"}[30m])), 1)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "percentunit",
+          "min": -0.1,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 41,
+      "title": "Bytes left on the table",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 105
+      },
+      "description": "Compressible content sent uncompressed because the client did not negotiate. On `gateway` this is expected and inert \u2014 the blackbox canary will never ask for gzip. On `mesh` it is actionable: a real client is paying for bytes it could have avoided. Reads 0 until the access log carries the response Content-Type (--accesslog.fields.headers.names.Content-Type=keep).",
+      "datasource": null,
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{client_class}}",
+          "expr": "sum by (client_class) (rate(goat_traefik_compressible_missed_bytes_total[30m]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 42,
+      "type": "stat",
+      "title": "Exporter health",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 114
+      },
+      "datasource": null,
+      "description": "If this reads 0 the compression panels above are FROZEN at their last good values, not showing a real decline. The exporter carries counters forward on failure precisely so a broken reader cannot masquerade as broken compression.",
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "exporter up",
+          "expr": "min(goat_traefik_compression_exporter_up)"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "records / run",
+          "expr": "sum(goat_traefik_compression_exporter_records)"
+        },
+        {
+          "refId": "C",
+          "legendFormat": "skipped records",
+          "expr": "sum(goat_traefik_compression_exporter_skipped_records)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value_and_name"
+      }
+    }
+  ]
+}

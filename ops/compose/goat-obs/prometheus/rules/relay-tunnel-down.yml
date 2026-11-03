@@ -1,0 +1,65 @@
+# Relay tunnel down — the enrollment path or control channel is failing on a
+# relay that is still being probed.
+#
+# WHY THIS FILE EXISTS. relay-health already publishes the right values:
+# goat_relay_enroll_up is 1 when a relay's public :443 forwards to the
+# management host and 0 when it does not, and goat_relay_rathole_ctl_up is the
+# :2333 control-channel reachability. RelayHealthReportStale (relay-health.yml)
+# fires when the PROBER stops — not when a probed relay reports a dead tunnel. So
+# a relay can serve nothing on :443 for hours after a mgmt-host power-cycle while
+# its report clock stays fresh. These rules page on that.
+#
+# FRESH-PROBE GATE. Each expression is AND-ed with a fresh report clock
+# (time() - goat_relay_probe_timestamp_seconds < 900). That does two things:
+# it stops this rule from firing off a frozen band (which RelayHealthReportStale
+# already owns, so the two never double-page), and it means a 0 here is a value
+# the prober actually just observed, not a stale leftover. The report clock is a
+# single fleet-wide series, so the join is `and on()` — no shared labels.
+#
+# ABSENCE IS NOT AN ALARM. If a relay is decommissioned its series disappear and
+# these rules go quiet, which is correct; a removed relay is not an outage.
+groups:
+  - name: relay-tunnel-down
+    rules:
+      - alert: RelayEnrollmentTunnelDown
+        # The user-facing failure: enrollment and management reach the Thor
+        # through this relay's :443, and it is forwarding nothing. 10m against a
+        # 15s probe rides out a single relay restart or tunnel re-handshake
+        # without paging, and pages on a genuine dead tunnel.
+        expr: |
+          (goat_relay_enroll_up == 0)
+          and on() (time() - goat_relay_probe_timestamp_seconds < 900)
+        for: 10m
+        labels:
+          severity: critical
+          component: relay-health
+        annotations:
+          summary: "relay {{ $labels.relay }}: enrollment tunnel (:443) is down"
+          description: |
+            goat_relay_enroll_up{relay="{{ $labels.relay }}"} has read 0 for over
+            ten minutes while the relay is still being probed: the relay is up but
+            its public :443 forwards nothing to the management host, so enrollment
+            and management traffic routed to it fail.
+
+            This is the rathole management tunnel, not the data relay (:33073) and
+            not STUN (:3478); those can be healthy while this is down. Check the
+            rathole-client@{{ $labels.relay }} unit on the management host and the
+            rathole-server on the relay (docs/design/relay-ingress-dispatch.md).
+            The fleet routes around one dead relay; enrolment DNS still answers
+            with the others.
+      - alert: RelayRatholeControlDown
+        expr: |
+          (goat_relay_rathole_ctl_up == 0)
+          and on() (time() - goat_relay_probe_timestamp_seconds < 900)
+        for: 10m
+        labels:
+          severity: warning
+          component: relay-health
+        annotations:
+          summary: "relay {{ $labels.relay }}: rathole control channel (:2333) unreachable"
+          description: |
+            goat_relay_rathole_ctl_up{relay="{{ $labels.relay }}"} has read 0 for
+            over ten minutes while the relay is still being probed. The management
+            tunnel's control channel is not answering, so new data channels cannot
+            be established even if :443 still serves cached state. Investigate the
+            relay's rathole-server; this often precedes RelayEnrollmentTunnelDown.

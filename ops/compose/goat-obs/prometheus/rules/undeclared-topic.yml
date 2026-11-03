@@ -1,0 +1,42 @@
+# Topic-granular declared-vs-actual reconciliation.
+#
+# The expected-vendor rules (expected-vendor.yml) reconcile at the ANCHOR
+# layer — they sum the topic dimension away. So an onboarded anchor publishing
+# an UNREGISTERED topic under its own prefix is invisible to them: the anchor
+# is expected (ExpectedVendorSilent stays quiet, it's producing) and it's in
+# the manifest (UnexpectedVendorProducing stays quiet). The wire ACL grants the
+# slot anchor its whole <anchor>/** subtree, so the write lands without
+# the topic ever being declared in the portal — the actual-without-declared
+# quadrant. This rule closes that gap one level down.
+#
+# Join: actuals (goat_audit_samples_total{vendor,key_pattern}, key_pattern in
+# the <anchor>/<class>/* form) against the declared-topic snapshot
+# (goat_declared_topic, rendered from expected-topics/declared-topics.yml).
+groups:
+  - name: zenoh-undeclared-topic
+    rules:
+      # A (vendor, key_pattern) is producing but is NOT in the declared-topic
+      # set, AND its anchor HAS at least one declared topic (so it's a known
+      # onboarded anchor publishing an undeclared class — the F-216 gap — not a
+      # fully-unknown squat, which UnexpectedVendorProducing already owns).
+      #
+      # severity=info DELIBERATELY: declared-topics.yml is INCOMPLETE in v1
+      # (it lists the streaming producers' known classes, not every declared
+      # topic), so an unlisted-but-legitimate class trips it. Treat as "is this
+      # topic registered?" until the declared set is auto-derived from the
+      # portal registry (GET /api/vendors/{v}/topics), then raise to warning.
+      # The promtool test proves the rule logic independent of completeness.
+      - alert: TopicProducingUndeclared
+        expr: |
+          (
+            sum by (vendor, key_pattern) (rate(goat_audit_samples_total[10m])) > 0
+            unless on(vendor, key_pattern) goat_declared_topic
+          )
+          and on(vendor) goat_declared_topic
+        for: 10m
+        labels:
+          severity: info
+          component: zenoh-fabric
+        annotations:
+          summary: "anchor {{ $labels.vendor }} is producing undeclared topic-class {{ $labels.key_pattern }}"
+          description: "{{ $labels.vendor }} is publishing {{ $labels.key_pattern }} but that topic-class is not registered in the portal under it (the anchor has other declared topics, so it's onboarded — this is an unregistered topic, not a squat). The write lands because the ACL grants the whole <anchor>/** subtree, but the topic has no schema/format and is invisible to the Data-Access COP. Triage: stethoscope-diagnose the key, then either register it in the portal or re-key the publisher. If the class IS legitimately declared, add it to expected-topics/declared-topics.yml."

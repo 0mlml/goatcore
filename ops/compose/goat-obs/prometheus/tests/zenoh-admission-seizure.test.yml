@@ -1,0 +1,548 @@
+# Admission-seizure replay and negative controls. TCP/TLS is an admission proxy.
+# Run: promtool test rules ops/compose/goat-obs/prometheus/tests/zenoh-admission-seizure.test.yml
+rule_files:
+- ../rules/zenoh-wedge.yml
+evaluation_interval: 15s
+tests:
+- name: coarse seizure legacy producer still pages and recovers
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: 1 1 1 0 1 1 1 1
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 10 10 10 12019 10 10 8 13
+  - series: goat_zenoh_close_wait{router="a"}
+    values: 0 0 0 146 1 0 0 0
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: &id001
+        summary: 'CRITICAL: zenoh router a TCP/TLS admission proxy failed or stalled with CLOSE-WAIT'
+        description: |
+          A fresh TCP/TLS attempt failed, excluding a classified TLS rejection,
+          or took >3s with >20 CLOSE-WAIT sockets while the container was healthy.
+          This proxy does not exchange Zenoh OPEN messages or prove F-253's
+          cause. TLS 1.3 may return before a client-auth rejection arrives.
+          Capture sockets and logs now, before a transient drains:
+            pid=$(docker inspect -f '{{.State.Pid}}' <router>)
+            sudo nsenter -t "$pid" -n ss -tan state close-wait
+            docker logs --since 5m <router>
+          CLOSE-WAIT is netns-wide; inspect ports before attributing it to TLS.
+          Correlate open latency, client sessions and delivery. zenoh-symcap
+          waits for container unhealthy, so it is not a capture-now command here.
+          Evidence and the unresolved mechanism: docs/findings/F-568-f253-admission-seizure-recurred-on-patched-image-and-detection-missed-the-transient.md
+  - eval_time: 3m
+    alertname: ZenohRouterOpenLatencyHigh
+    exp_alerts: []
+  - eval_time: 3m
+    alertname: ZenohRouterCloseWaitClimbing
+    exp_alerts: []
+  - eval_time: 5m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+# Raw values relative to a fixed instant, including report age.
+- name: raw 15s recurrence peaks at 495 and recovers without restart
+  interval: 15s
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: '-37.183 -6.183 -6.183 24.817 56.817 56.817 56.817 88.817'
+  - series: goat_zenoh_open_ok{router="a"}
+    values: 1 0 0 0 1 1 1 1
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 10 12019 12019 12018 10 10 10 10
+  - series: goat_zenoh_close_wait{router="a"}
+    values: 0 146 146 495 1 1 1 0
+  alert_rule_test:
+  - eval_time: 45s
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+  - eval_time: 60s
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 45s
+    alertname: ZenohRouterOpenLatencyHigh
+    exp_alerts: []
+- name: ramp pages before failure from latency plus CLOSE-WAIT
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: 1 1 1 1 1 1 1 0
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 9 9 10 40 300 900 3200 12000
+  - series: goat_zenoh_close_wait{router="a"}
+    values: 0 60 130 210 320 430 560 680
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: ZenohRouterCloseWaitClimbing
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+      exp_annotations:
+        summary: zenoh router a netns CLOSE-WAIT at 320
+        description: |
+          CLOSE-WAIT sockets have exceeded 100 in the router netns for 2m.
+          The gauge counts all ports, not just inbound TLS. Inspect addresses
+          and ports before attributing a cause; correlate admission and delivery:
+            sudo nsenter -t <router-pid> -n ss -tan state close-wait
+          docs/findings/F-253-zenoh-router-admission-seizure-close-wait.md
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+  - eval_time: 7m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+- name: healthy
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: 1x8
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 10x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_probe_status{router="a",reason="ok"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+- name: typed TLS rejection alone
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 40x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_probe_status{router="a",reason="tls_error"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+      exp_annotations: &id002
+        summary: zenoh router a admission proxy is unmeasured or TLS-rejected
+        description: |
+          A healthy reporting router has no complete TCP/TLS proxy measurement,
+          or its probe has been TLS-rejected for 5m. Admission detection is
+          incomplete. Check client certificate/key, probe status and service
+          logs; do not interpret missing samples as healthy admission.
+- name: slow TLS rejection with rising CLOSE-WAIT
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 12019x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: 146x8
+  - series: goat_zenoh_open_probe_status{router="a",reason="tls_error"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+- name: timeout without CLOSE-WAIT
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 12019x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_probe_status{router="a",reason="timeout"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+- name: connection refusal while container healthy
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 5x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_probe_status{router="a",reason="connection_refused"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+- name: TLS EOF or protocol failure without CLOSE-WAIT while container healthy
+  interval: 15s
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+15x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '1 0 1x6'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 10 5 10x6
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_probe_status{router="a",reason="connection_error"}
+    values: 0 1 0x6
+  alert_rule_test:
+  - eval_time: 15s
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+  - eval_time: 30s
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+- name: unclassified failed legacy proxy
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 40x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: a
+      exp_annotations: *id001
+- name: slow successful TLS proxy without CLOSE-WAIT does not page
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: 1x8
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 3200x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_probe_status{router="a",reason="ok"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+- name: startup and known unhealthy container do not page
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 5x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_probe_status{router="a",reason="connection_refused"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 0m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts: []
+- name: health not yet measured does not page
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 12019x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: 146x8
+  - series: goat_zenoh_open_probe_status{router="a",reason="timeout"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+- name: frozen report cannot page despite fresh scrape
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ok{router="a"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a"}
+    values: 12019x8
+  - series: goat_zenoh_close_wait{router="a"}
+    values: 146x8
+  - series: goat_zenoh_open_probe_status{router="a",reason="timeout"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 2m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts: []
+- name: never configured
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_probe_status{router="a",reason="not_configured"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+      exp_annotations: *id002
+- name: broken local cert
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_probe_status{router="a",reason="client_config_error"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+      exp_annotations: *id002
+- name: probe execution failed
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_probe_status{router="a",reason="probe_error"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+      exp_annotations: *id002
+- name: partial measurement is not complete
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+      exp_annotations: *id002
+- name: healthy sibling cannot mask missing router
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a"}
+    values: 0+60x8
+  - series: goat_zenoh_healthy{router="b"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="b"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="b"}
+    values: 1x8
+  - series: goat_zenoh_open_ms{router="b"}
+    values: 10x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+      exp_annotations: *id002
+- name: same router separate scrape source cannot mask missing source
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a",job="node",instance="fixture-a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a",job="node",instance="fixture-a"}
+    values: 0+60x8
+  - series: goat_zenoh_healthy{router="a",job="node",instance="fixture-b"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a",job="node",instance="fixture-b"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a",job="node",instance="fixture-b"}
+    values: 1x8
+  - series: goat_zenoh_open_ms{router="a",job="node",instance="fixture-b"}
+    values: 10x8
+  - series: goat_zenoh_close_wait{router="a",job="node",instance="fixture-b"}
+    values: '0x8'
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionProbeUnmeasured
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: a
+        job: node
+        instance: fixture-a
+      exp_annotations: *id002
+- name: source identity cannot cross-match healthy or fresh labels
+  interval: 1m
+  input_series:
+  - series: goat_zenoh_healthy{router="a",job="node",instance="fixture-a"}
+    values: 1x8
+  - series: goat_zenoh_report_timestamp_seconds{router="a",job="node",instance="fixture-a"}
+    values: 0+60x8
+  - series: goat_zenoh_open_ok{router="a",job="node",instance="fixture-b"}
+    values: '0x8'
+  - series: goat_zenoh_open_ms{router="a",job="node",instance="fixture-b"}
+    values: 12019x8
+  - series: goat_zenoh_close_wait{router="a",job="node",instance="fixture-b"}
+    values: 146x8
+  - series: goat_zenoh_open_probe_status{router="a",job="node",instance="fixture-b",reason="timeout"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: ZenohRouterAdmissionSeizure
+    exp_alerts: []

@@ -1,0 +1,130 @@
+# Portal registry WAL alerts — gauge the file, not the averaged burn.
+#
+# A long-lived reader pins the checkpoint — a checkpoint can never fold frames
+# past the oldest reader's snapshot — so /opt/goat-zenoh-portal/registry.db-wal
+# grows to many GiB over a database of a few MiB, until the connection drops.
+# journal_size_limit(64 MiB) on the registry DSN
+# (ops/goat-zenoh-portal/internal/registry/registry.go) bounds the file only at
+# checkpoints that actually RUN, so a pinned reader still grows it.
+#
+# ThorDiskRunwayShort (thor-host.yml) cannot see this, and the reason is
+# structural, not a tuning miss: it derives runway from the 24 h AVERAGE burn, and
+# this leak writes in bursts. A burst while a reader is pinned averages out to a
+# runway that never crosses the 14-day threshold. Rate-over-average is
+# the right instrument for a disk filling steadily; for one bursty file it is
+# provably blind, so these rules watch the file itself.
+#
+# Metrics: goat_registry_* from ops/relay/health/registry-wal-signals.py
+# (relay-health role timer → node-exporter textfile). Null, not zero: an
+# absent file omits its gauge, so every expr below is a positive comparison
+# over a series that simply does not exist on a goatnet that does not run the
+# collector — nothing false-fires when this file loads fleet-wide, and no
+# absent() form is used (the fitness test in obs-host's obs_rule_files notes).
+# A dead collector timer freezes the gauges rather than clearing them; the
+# textfile file-age clock (node_textfile_mtime_seconds) is the existing
+# staleness instrument for that.
+#
+# Runbook for all three: docs/operations/disk-runway-and-retention.md
+# §"goat-zenoh-portal WAL" — consistent backup via the online backup API
+# (NEVER cp), restart the portal to drop the pinned reader, then
+# wal_checkpoint(TRUNCATE) to shrink the file. Committed data is not at risk
+# at any step.
+
+groups:
+  - name: registry-wal
+    interval: 30s
+    rules:
+
+      # 4x the configured 64 MiB journal_size_limit. Steady state after a
+      # checkpoint is at or under the limit, so a WAL holding at 4x it for 15m
+      # means checkpoints are not truncating — the pinned-reader growth has
+      # started. This is the "fix it today" tier: at burst rate
+      # the file adds a gigabyte in minutes, so waiting for a runway alert
+      # that structurally cannot fire (see header) is not a plan.
+      - alert: RegistryWalOversized
+        expr: goat_registry_wal_bytes > 268435456
+        for: 15m
+        labels:
+          severity: warning
+          component: goat-zenoh-portal
+        annotations:
+          summary: "portal registry WAL is {{ $value | humanize1024 }}B — 4x its 64 MiB journal_size_limit for 15m"
+          description: |
+            registry.db-wal is over 256 MiB and holding, which means
+            checkpoints are not folding frames back — the 2026-08-15
+            pinned-reader growth (recurred at 91.4 GB) is most likely underway.
+            Confirm and recover with the runbook, in order:
+              docs/operations/disk-runway-and-retention.md §"goat-zenoh-portal WAL"
+              1. Hold the out-of-band readers (budget-notify, sync-slot-anchors
+                 --check, reap-orphans, ad-hoc python) for the window.
+              2. sudo docker stop -t 60 goat-zenoh-portal   # STOP, not restart — see runbook
+              3. sudo lsof /opt/goat-zenoh-portal/registry.db*   # must be empty
+              4. cp -a registry.db registry.db-wal registry.db-shm <backup dir, same volume>
+                 # quiescent copy of all three
+              5. PRAGMA wal_checkpoint(TRUNCATE) offline via python3; record the
+                 (busy, log, checkpointed) triple; expect minutes on a large WAL.
+              6. NEVER delete -wal or -shm. Verify registry.db mtime moved and the
+                 WAL is ~0 bytes, then docker start.
+            Cross-check goat_registry_db_mtime_seconds: frozen while this grows
+            is the starvation signature (RegistryCheckpointStalled).
+
+      # The same mechanism, past arguing about. 2 GiB is ~32x the limit and
+      # minutes of burst away from real disk pressure on a small-root host.
+      # Pages — a goatnet may route only severity=critical to a person
+      # (thor-host.yml header).
+      - alert: RegistryWalRunaway
+        expr: goat_registry_wal_bytes > 2147483648
+        for: 5m
+        labels:
+          severity: critical
+          component: goat-zenoh-portal
+        annotations:
+          summary: "CRITICAL: portal registry WAL is {{ $value | humanize1024 }}B and growing unchecked"
+          description: |
+            registry.db-wal is over 2 GiB — the unbounded pinned-reader growth,
+            not a burst a checkpoint will clean up. At the 2026-09 recurrence
+            rate (~200 GB/day) this fills a Thor in days (and would fill an
+            zagros-prod Orin’s
+            57 GB root in hours — that host does not run the collector yet, a
+            stated non-goal). Act now, in runbook order (quiesce and STOP first:
+            a backup is only valid quiescent):
+              docs/operations/disk-runway-and-retention.md §"goat-zenoh-portal WAL"
+              1. Hold the out-of-band readers (budget-notify, sync-slot-anchors
+                 --check, reap-orphans, ad-hoc python) for the window.
+              2. sudo docker stop -t 60 goat-zenoh-portal   # STOP, not restart — see runbook
+              3. sudo lsof /opt/goat-zenoh-portal/registry.db*   # must be empty
+              4. cp -a registry.db registry.db-wal registry.db-shm <backup dir, same volume>
+                 # quiescent copy of all three
+              5. PRAGMA wal_checkpoint(TRUNCATE) offline via python3; record the
+                 (busy, log, checkpointed) triple; expect minutes on a large WAL.
+              6. NEVER delete -wal or -shm. Verify registry.db mtime moved and the
+                 WAL is ~0 bytes, then docker start.
+            Then verify goat_registry_wal_bytes actually fell — journal_size_limit
+            truncates to 64 MiB only at a checkpoint that RUNS.
+
+      # The starvation signature, caught before the file is huge: writes are
+      # landing (WAL over the 64 MiB limit) while nothing folds back into the
+      # main db (its mtime — the last successful checkpoint — is 6h+ old). A
+      # quiet registry goes stale WITHOUT WAL growth, which is why the size
+      # guard is ANDed in: mtime alone would page on every idle weekend.
+      - alert: RegistryCheckpointStalled
+        expr: |
+          (time() - goat_registry_db_mtime_seconds) > 21600
+            and goat_registry_wal_bytes > 67108864
+        for: 15m
+        labels:
+          severity: warning
+          component: goat-zenoh-portal
+        annotations:
+          summary: "portal registry checkpoint has not completed in 6h+ while the WAL grows past its limit"
+          description: |
+            registry.db has not been written for over 6 hours while
+            registry.db-wal sits above the 64 MiB journal_size_limit: frames
+            are accumulating and no checkpoint is folding them back. This is
+            the pinned-reader mechanism itself — wal_checkpoint(PASSIVE) on
+            2026-08-15 moved 954 of 5,376,726 pages for exactly this reason —
+            and no ops-side checkpoint timer can drain it while the reader
+            holds its snapshot. Recover with the runbook (quiesce readers, STOP
+            the portal, prove zero holders, cold-copy all three files, then
+            TRUNCATE offline):
+              docs/operations/disk-runway-and-retention.md §"goat-zenoh-portal WAL"

@@ -1,0 +1,245 @@
+# promtool unit tests for the zenoh-delivery group (rules/zenoh-wedge.yml).
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/zenoh-delivery.test.yml
+#
+# The shapes are a delivery stall: the audit tap's
+# receive rate going to zero while the router stays up, and the router closing
+# one slow `**` subscriber every ~5 s (12 closes a minute). Each alert gets a
+# positive case, a negative case, and the guard that keeps a quiet goatnet
+# silent.
+
+rule_files:
+  - ../rules/zenoh-wedge.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- FabricDeliveryStopped ------------------------------------------------
+  # 60 min at ~50 msg/s (3000/min), then nothing for 10 min, then recovery.
+  - interval: 1m
+    input_series:
+      - series: 'goat_audit_samples_total{instance="audit-subscriber:9303"}'
+        values: '0+3000x70 210000x10 210000+3000x10'
+    alert_rule_test:
+      - eval_time: 69m
+        alertname: FabricDeliveryStopped
+        exp_alerts: []
+      # Flat from 71m; the 2m rate reads zero from 73m; for:1m -> firing at 74m.
+      - eval_time: 75m
+        alertname: FabricDeliveryStopped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: zenoh-fabric
+            exp_annotations:
+              summary: "CRITICAL: fabric delivery STOPPED — the audit tap has received nothing for 3m"
+              description: |
+                The audit subscriber (a `**` tap) received zero samples for 3 minutes
+                on a goatnet that carried more than 1 msg/s over the prior hour.
+                The router is probably ALIVE — check it is not blocked on a slow
+                consumer before restarting anything:
+                  goat_zenoh_slow_consumer_closes_total / ZenohSlowConsumerStalling
+                  docker logs --since 5m <router> | grep "Unable to push non droppable"
+                Restarting the router does NOT fix a slow consumer (it reconnects).
+                Capture first: sudo /usr/local/sbin/zenoh-symcap.sh
+                F-287 amendment; docs/design/zenoh-router-health.md.
+      - eval_time: 90m
+        alertname: FabricDeliveryStopped
+        exp_alerts: []
+
+  # A quiet goatnet (well under 1 msg/s) that goes silent must NOT page.
+  - interval: 1m
+    input_series:
+      - series: 'goat_audit_samples_total{instance="audit-subscriber:9303"}'
+        values: '0+20x70 1400x20'
+    alert_rule_test:
+      - eval_time: 85m
+        alertname: FabricDeliveryStopped
+        exp_alerts: []
+      - eval_time: 85m
+        alertname: FabricDeliveryCollapsed
+        exp_alerts: []
+
+  # --- FabricDeliveryCollapsed ----------------------------------------------
+  # 3000/min, then ~12/min (the short-window shape: two anchors getting through).
+  - interval: 1m
+    input_series:
+      - series: 'goat_audit_samples_total{instance="audit-subscriber:9303"}'
+        values: '0+3000x70 210000+12x20'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: FabricDeliveryCollapsed
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: FabricDeliveryCollapsed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-fabric
+            exp_annotations:
+              summary: "fabric delivery below 5% of the previous hour"
+              description: |
+                The audit tap's receive rate fell below 5% of its prior-hour average
+                for 2m. Either a large publisher stopped (benign — check which) or
+                the router is stalling on a slow consumer (see
+                ZenohSlowConsumerStalling). F-287 amendment.
+      # Not zero, so the critical must stay silent.
+      - eval_time: 80m
+        alertname: FabricDeliveryStopped
+        exp_alerts: []
+
+  # --- ZenohSlowConsumerStalling / ZenohSlowConsumerOutage ----------------------
+  # Quiet, then one stuck subscriber closed 12x a minute for 25 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_slow_consumer_closes_total{router="zagros"}'
+        values: '0x10 0+12x25 300x30'
+      # A 1-3 close blip on another router must not warn.
+      - series: 'goat_zenoh_slow_consumer_closes_total{router="zagros-dev"}'
+        values: '0x10 2x2 3x50'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ZenohSlowConsumerStalling
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: ZenohSlowConsumerStalling
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-router
+              router: zagros
+            exp_annotations:
+              summary: "zenoh router zagros is blocking on slow consumers (60 transport closes in 5m)"
+              description: |
+                The router cannot push non-droppable messages to at least one
+                subscriber and is closing it every ~5 s. While it does, delivery from
+                the sources routed to that subscriber stalls for everyone.
+                Which subscriber:
+                  goat_zenoh_slow_consumer_last_close_timestamp_seconds{router="zagros"}
+                Usual causes: an inspection surface or CLI holding a `**` subscription
+                that stopped draining (panoscope did on 2026-09-17), or a remote peer
+                on a stalled link. F-287 amendment.
+      # 15-minute increase reaches 90 at ~18m; for:5m -> firing by 24m.
+      - eval_time: 16m
+        alertname: ZenohSlowConsumerOutage
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: ZenohSlowConsumerOutage
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: zenoh-router
+              router: zagros
+            exp_annotations:
+              summary: "CRITICAL: zenoh router zagros blocked on slow consumers for 15m+"
+              description: |
+                180 slow-consumer transport closes in 15 minutes —
+                the 2026-09-17 zagros outage shape. Identify the subscriber from
+                goat_zenoh_slow_consumer_last_close_timestamp_seconds and stop it
+                (stop the container or revoke the peer) rather than restarting the
+                router, which it will simply reconnect to. F-287 amendment.
+      # Closes stopped at 35m; both clear once the window moves past them.
+      - eval_time: 60m
+        alertname: ZenohSlowConsumerStalling
+        exp_alerts: []
+
+  # --- whole-keyspace subscribers -------------------------------------------
+  # `**` alone is the enforced spelling and must not alert on its own; a second
+  # spelling appearing is the ACL workaround.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_fabric_wide_shape_present{router="zagros",shape="**"}'
+        values: '1x40'
+      - series: 'goat_zenoh_fabric_wide_shape_present{router="zagros",shape="*/**"}'
+        values: '_x10 1x30'
+      - series: 'goat_zenoh_fabric_wide_subscribers{router="zagros"}'
+        values: '19x20 25x20'
+      - series: 'goat_zenoh_fabric_wide_expected{router="zagros"}'
+        values: '24x40'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ZenohFabricWideWorkaroundShape
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ZenohFabricWideWorkaroundShape
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-fabric
+              router: zagros
+              shape: "*/**"
+            exp_annotations:
+              summary: "a peer is subscribing to the whole keyspace as `*/**` on zagros"
+              description: |
+                `*/**` selects every key with at least one chunk —
+                the whole fabric — and the ACL cannot refuse it while still allowing
+                ordinary keys. Nobody used a spelling other than `**` when this was
+                written, so this is either a new integration that needs the named
+                grant or someone working around the refusal. Identify the session,
+                then decide: scope the subscription, add the peer to
+                zenoh_fabric_wide_read, or stop it. F-287 amendment.
+      # 19 granted-and-expected sessions must stay quiet; 25 over a 24 ceiling fires.
+      - eval_time: 18m
+        alertname: ZenohFabricWideSubscriberUnexpected
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: ZenohFabricWideSubscriberUnexpected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-fabric
+              router: zagros
+            exp_annotations:
+              summary: "25 whole-keyspace subscribers on zagros, more than the named list grants"
+              description: |
+                The named list (zenoh_fabric_wide_read) is a grandfather list: it
+                names the peers that already held a whole-fabric subscription, so
+                enforcement broke nobody, and its purpose is to stop the NEXT one.
+                This counts SESSIONS, not identities: one named peer held three at
+                once on zagros, so the ceiling is a measured number plus headroom
+                (zenoh_health_fabric_wide_max_sessions), never the length of the
+                grant list. Over it means a new whole-fabric subscriber appeared, or
+                an existing one multiplied its sessions. Reconcile against the list
+                before granting anything.
+
+  # --- ZenohUndeclaredRouterPeer + ZenohRouterSignalsUnmeasured --------------
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_remote_router_sessions{router="zagros"}'
+        values: '0x10 3x40'
+      - series: 'goat_zenoh_log_tail_ok{router="zagros"}'
+        values: '1x10 0x30'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: ZenohUndeclaredRouterPeer
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: ZenohUndeclaredRouterPeer
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-router
+              router: zagros
+            exp_annotations:
+              summary: "3 remote peer(s) joined zenoh router zagros in router/peer mode, undeclared"
+              description: |
+                Remote sessions in router or peer mode are routing participants, and
+                one on a stalled link can stall the fabric. Move them to
+                `mode: client` (docs/design/pubsub-best-practices.md §3), or declare
+                them in zenoh_health_router_peer_allow. List them:
+                  curl -s http://127.0.0.1:8000/@/local/router   # sessions[].whatami (in the router netns)
+      - eval_time: 30m
+        alertname: ZenohRouterSignalsUnmeasured
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-router
+              router: zagros
+            exp_annotations:
+              summary: "zenoh router zagros delivery-stall counters are UNMEASURED"
+              description: |
+                zenoh-health-probe could not read the router's container log, so
+                ZenohSlowConsumerStalling / ZenohSlowConsumerOutage cannot fire. Check
+                the probe runs as root and the container still uses the json-file
+                log driver (docker inspect <router> --format '{{.LogPath}}').

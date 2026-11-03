@@ -1,0 +1,77 @@
+# Mgmt-stack service-health alerts — on-mgmt-host obs (goat-obs).
+#
+# Tracks the per-service `up` metric for the four mgmt-host services
+# that expose Prometheus targets. Single-host topology means these
+# alert when a container is dead but Thor itself is alive — useful
+# for the bulk of the "service broken but host fine" outage class.
+
+groups:
+  - name: services
+    interval: 30s
+    rules:
+
+      - alert: SignalServerDown
+        expr: up{job="signal-server"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "signal-server unreachable"
+          description: "Prometheus has not scraped signal-server /metrics for 5+ minutes. Netbird peers will lose new-tunnel rendezvous."
+
+      - alert: TraefikDown
+        expr: up{job="traefik"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Traefik unreachable"
+          description: "Public DNS hostnames (signal/dashboard/auth/oauth2/grafana) lose their TLS terminator."
+
+      - alert: PostgresExporterDown
+        expr: up{job="postgres-exporter"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "postgres-exporter unreachable"
+          description: "Either the exporter container is down or it lost its postgres-a connection. Check 'monitoring' role + password."
+
+      # goat-zenoh-portal liveness — the ONLY signal that catches a STOPPED
+      # portal. A stopped container emits no goat_container_health_status at
+      # all, so every container-health rule is silent for it; the blackbox
+      # probe (prometheus.yml, blackbox-https) sees Traefik's 502 instead.
+      # Critical tier alongside kratos/hydra/postgres: cert mint, the
+      # data-access COP and the budget projection all sit behind it.
+      # The instance series only exists where the portal target is rendered
+      # (the target is gated on portal_traefik_host), so this cannot fire on a
+      # goatnet that runs no portal. 3m rather than 5m: a portal redeploy is a
+      # few seconds of downtime, well inside the window, and the audit's
+      # observable is "something pages within minutes, not half an hour."
+      - alert: PortalProbeDown
+        expr: probe_success{job="blackbox-https", instance=~"https://portal\\..*"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          component: identity
+        annotations:
+          summary: "CRITICAL: goat-zenoh-portal not answering /api/health ({{ $labels.instance }})"
+          description: |
+            The blackbox probe of the portal's unauthenticated /api/health has
+            failed for 3m+. Either the container is stopped/crash-looping (the
+            case no container-health rule can see), Traefik lost the route, or
+            the portal is wedged serving. Cert mint, the data-access COP, the
+            budget projection and the onboarding cert leg are down while this
+            holds. Triage on the Thor:
+              docker ps -a | grep goat-zenoh-portal
+              docker logs --tail 80 goat-zenoh-portal
+              curl -sS -o /dev/null -w '%{http_code}\n' {{ $labels.instance }}
+
+      - alert: PostgresStorageHigh
+        expr: pg_database_size_bytes / (1024 * 1024 * 1024) > 50
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Postgres database exceeds 50 GiB"
+          description: "{{ $labels.datname }} crossed 50 GiB. Audit retention + vacuum cadence."

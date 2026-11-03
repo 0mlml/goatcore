@@ -1,0 +1,319 @@
+diff --git a/client/internal/peer/guard/guard.go b/client/internal/peer/guard/guard.go
+index 2e5efbcc5..ace6b2b30 100644
+--- a/client/internal/peer/guard/guard.go
++++ b/client/internal/peer/guard/guard.go
+@@ -6,6 +6,19 @@ import (
+ 
+ 	"github.com/cenkalti/backoff/v4"
+ 	log "github.com/sirupsen/logrus"
++
++	nbbackoff "github.com/netbirdio/netbird/shared/backoff"
++)
++
++// goat ADR 1081 (control-plane storm resilience) Layer 1: full-jitter backoff
++// on signal offer retries. The 2026-07-15 ZAGROS collapse was ~90 peers retrying
++// offers at a fixed cadence into a degraded uplink; full jitter across a
++// growing interval keeps a fleet that lost its streams together from
++// re-storming together. Base is snappy for the common single-peer flap; the
++// cap bounds the worst case.
++const (
++	offerRetryBackoffBase = 1 * time.Second
++	offerRetryBackoffCap  = 60 * time.Second
+ )
+ 
+ // ConnStatus represents the connection state as seen by the guard.
+@@ -51,7 +64,7 @@ func NewGuard(log *log.Entry, isConnectedFn connStatusFunc, timeout time.Duratio
+ }
+ 
+ func (g *Guard) Start(ctx context.Context, eventCallback func()) {
+-	g.log.Infof("starting guard for reconnection with MaxInterval: %s", g.timeout)
++	g.log.Infof("starting guard for reconnection with full-jitter offer retry (base %s, cap %s)", offerRetryBackoffBase, offerRetryBackoffCap)
+ 	g.reconnectLoopWithRetry(ctx, eventCallback)
+ }
+ 
+@@ -140,26 +153,18 @@ func (g *Guard) reconnectLoopWithRetry(ctx context.Context, callback func()) {
+ 
+ // initialTicker give chance to the peer to establish the initial connection.
+ func (g *Guard) initialTicker(ctx context.Context) *backoff.Ticker {
+-	bo := backoff.WithContext(&backoff.ExponentialBackOff{
+-		InitialInterval:     3 * time.Second,
+-		RandomizationFactor: 0.1,
+-		Multiplier:          2,
+-		MaxInterval:         g.timeout,
+-		Stop:                backoff.Stop,
+-		Clock:               backoff.SystemClock,
++	bo := backoff.WithContext(&nbbackoff.FullJitter{
++		Base: offerRetryBackoffBase,
++		Cap:  offerRetryBackoffCap,
+ 	}, ctx)
+ 
+ 	return backoff.NewTicker(bo)
+ }
+ 
+ func (g *Guard) newReconnectTicker(ctx context.Context) *backoff.Ticker {
+-	bo := backoff.WithContext(&backoff.ExponentialBackOff{
+-		InitialInterval:     800 * time.Millisecond,
+-		RandomizationFactor: 0.1,
+-		Multiplier:          2,
+-		MaxInterval:         g.timeout,
+-		Stop:                backoff.Stop,
+-		Clock:               backoff.SystemClock,
++	bo := backoff.WithContext(&nbbackoff.FullJitter{
++		Base: offerRetryBackoffBase,
++		Cap:  offerRetryBackoffCap,
+ 	}, ctx)
+ 
+ 	ticker := backoff.NewTicker(bo)
+diff --git a/shared/backoff/fulljitter.go b/shared/backoff/fulljitter.go
+new file mode 100644
+index 000000000..ddcae744d
+--- /dev/null
++++ b/shared/backoff/fulljitter.go
+@@ -0,0 +1,101 @@
++// Package backoff provides a full-jitter exponential backoff calculator used
++// by the NetBird client to keep control-plane retry load decaying when
++// delivery fails.
++//
++// Introduced for goat ADR 1081 (control-plane storm resilience), Layer 1:
++// the 2026-07-15 ZAGROS collapse was caused by ~90 clients retrying signal
++// offers and stream re-registration at a fixed cadence regardless of outcome,
++// saturating a degraded uplink. Full jitter spreads retries across the whole
++// interval so a fleet that loses its signal streams together does not
++// re-storm together.
++package backoff
++
++import (
++	"math/bits"
++	"math/rand"
++	"time"
++
++	"github.com/cenkalti/backoff/v4"
++)
++
++// FullJitter is an exponential backoff with AWS-style full jitter: each delay
++// is drawn uniformly from [0, min(Cap, Base*2^attempt)]. It implements
++// github.com/cenkalti/backoff/v4.BackOff so it drops into backoff.NewTicker
++// and backoff.Retry in place of an ExponentialBackOff.
++//
++// Zero value is not usable; set Base and Cap. Not safe for concurrent use —
++// each retry loop owns its own instance, matching the ExponentialBackOff it
++// replaces.
++type FullJitter struct {
++	// Base is the first interval's ceiling (attempt 0 draws from [0, Base]).
++	Base time.Duration
++	// Cap bounds the growing interval; the draw ceiling never exceeds Cap.
++	Cap time.Duration
++	// MaxElapsed, if > 0, gives up (returns backoff.Stop) once this much time
++	// has passed since the last Reset. 0 means never give up.
++	MaxElapsed time.Duration
++
++	// randFloat returns a value in [0.0, 1.0); nil uses the default source.
++	// Injectable for deterministic tests.
++	randFloat func() float64
++	// now returns the current time; nil uses time.Now. Injectable for tests.
++	now func() time.Time
++
++	attempt int
++	start   time.Time
++}
++
++// Reset returns the backoff to its initial state and restarts the MaxElapsed
++// clock. Call it after a successful delivery so the next failure retries
++// promptly rather than at the grown interval.
++func (f *FullJitter) Reset() {
++	f.attempt = 0
++	f.start = f.clock()
++}
++
++// NextBackOff returns the next delay, or backoff.Stop if MaxElapsed is
++// exceeded.
++func (f *FullJitter) NextBackOff() time.Duration {
++	if f.start.IsZero() {
++		f.start = f.clock()
++	}
++	if f.MaxElapsed > 0 && f.clock().Sub(f.start) >= f.MaxElapsed {
++		return backoff.Stop
++	}
++
++	ceiling := f.ceilingFor(f.attempt)
++	f.attempt++
++	return time.Duration(f.random() * float64(ceiling))
++}
++
++// ceilingFor returns min(Cap, Base*2^attempt), guarding against the shift
++// overflowing int64 for large attempt counts (a long-lived open retry loop).
++func (f *FullJitter) ceilingFor(attempt int) time.Duration {
++	if f.Base <= 0 {
++		return f.Cap
++	}
++	// If Base*2^attempt would overflow, clamp to Cap. bits.LeadingZeros64
++	// tells us how many left-shifts Base tolerates before overflow.
++	if attempt >= bits.LeadingZeros64(uint64(f.Base)) {
++		return f.Cap
++	}
++	scaled := f.Base << uint(attempt)
++	if scaled <= 0 || scaled > f.Cap {
++		return f.Cap
++	}
++	return scaled
++}
++
++func (f *FullJitter) random() float64 {
++	if f.randFloat != nil {
++		return f.randFloat()
++	}
++	return rand.Float64()
++}
++
++func (f *FullJitter) clock() time.Time {
++	if f.now != nil {
++		return f.now()
++	}
++	return time.Now()
++}
+diff --git a/shared/backoff/fulljitter_test.go b/shared/backoff/fulljitter_test.go
+new file mode 100644
+index 000000000..0c8882b69
+--- /dev/null
++++ b/shared/backoff/fulljitter_test.go
+@@ -0,0 +1,86 @@
++package backoff
++
++import (
++	"testing"
++	"time"
++
++	"github.com/cenkalti/backoff/v4"
++)
++
++func TestFullJitterWithinCeiling(t *testing.T) {
++	// randFloat just below 1.0 draws the maximum of the interval.
++	f := &FullJitter{Base: time.Second, Cap: 60 * time.Second, randFloat: func() float64 { return 0.999999 }}
++
++	// attempt 0 ceiling = 1s, attempt 1 = 2s, ... doubling until the 60s cap.
++	wantCeilings := []time.Duration{
++		1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
++		16 * time.Second, 32 * time.Second, 60 * time.Second, 60 * time.Second,
++	}
++	for i, ceil := range wantCeilings {
++		got := f.NextBackOff()
++		if got < 0 || got > ceil {
++			t.Fatalf("attempt %d: delay %s outside [0, %s]", i, got, ceil)
++		}
++		// with randFloat≈1 the draw should be very close to the ceiling
++		if got < ceil-time.Millisecond {
++			t.Fatalf("attempt %d: delay %s not near ceiling %s", i, got, ceil)
++		}
++	}
++}
++
++func TestFullJitterFullRange(t *testing.T) {
++	// randFloat = 0 draws the floor (0); the calculator must allow a full
++	// spread down to zero — that spread is what de-synchronizes the fleet.
++	f := &FullJitter{Base: time.Second, Cap: 60 * time.Second, randFloat: func() float64 { return 0 }}
++	if got := f.NextBackOff(); got != 0 {
++		t.Fatalf("randFloat=0 should draw 0, got %s", got)
++	}
++}
++
++func TestFullJitterResetRestartsGrowth(t *testing.T) {
++	f := &FullJitter{Base: time.Second, Cap: 60 * time.Second, randFloat: func() float64 { return 0.999999 }}
++	for i := 0; i < 4; i++ {
++		f.NextBackOff()
++	}
++	f.Reset()
++	// after reset the ceiling is Base again
++	got := f.NextBackOff()
++	if got > time.Second {
++		t.Fatalf("after reset delay %s should be within Base ceiling 1s", got)
++	}
++}
++
++func TestFullJitterMaxElapsedStops(t *testing.T) {
++	now := time.Unix(0, 0)
++	f := &FullJitter{
++		Base:       time.Second,
++		Cap:        60 * time.Second,
++		MaxElapsed: 10 * time.Second,
++		randFloat:  func() float64 { return 0.5 },
++		now:        func() time.Time { return now },
++	}
++	f.Reset() // stamp start at now
++	if got := f.NextBackOff(); got == backoff.Stop {
++		t.Fatal("should not stop before MaxElapsed")
++	}
++	now = now.Add(11 * time.Second)
++	if got := f.NextBackOff(); got != backoff.Stop {
++		t.Fatalf("should stop after MaxElapsed, got %s", got)
++	}
++}
++
++func TestFullJitterNoOverflowAtHighAttempt(t *testing.T) {
++	// A long-lived open retry loop advances attempt far past the point where
++	// Base<<attempt would overflow int64; the ceiling must stay clamped to Cap.
++	f := &FullJitter{Base: time.Second, Cap: 60 * time.Second, randFloat: func() float64 { return 0.999999 }}
++	for i := 0; i < 200; i++ {
++		got := f.NextBackOff()
++		if got < 0 || got > 60*time.Second {
++			t.Fatalf("attempt %d: delay %s outside [0, 60s]", i, got)
++		}
++	}
++}
++
++// FullJitter must satisfy the cenkalti BackOff interface so it drops into
++// backoff.NewTicker / backoff.Retry.
++var _ backoff.BackOff = (*FullJitter)(nil)
+diff --git a/shared/signal/client/grpc.go b/shared/signal/client/grpc.go
+index b245b2296..581ddd55e 100644
+--- a/shared/signal/client/grpc.go
++++ b/shared/signal/client/grpc.go
+@@ -18,6 +18,7 @@ import (
+ 
+ 	nbgrpc "github.com/netbirdio/netbird/client/grpc"
+ 	"github.com/netbirdio/netbird/encryption"
++	nbbackoff "github.com/netbirdio/netbird/shared/backoff"
+ 	"github.com/netbirdio/netbird/shared/management/client"
+ 	"github.com/netbirdio/netbird/shared/signal/proto"
+ 	"github.com/netbirdio/netbird/util/wsproxy"
+@@ -25,6 +26,18 @@ import (
+ 
+ const healthCheckTimeout = 5 * time.Second
+ 
++// goat ADR 1081 (control-plane storm resilience) Layer 1: full-jitter backoff
++// on signal stream re-registration. Re-registration is heavier than an offer
++// (TLS + gRPC stream setup) and was a major byte source in the 2026-07-15 ZAGROS
++// storm — ~90 peers re-registering on a ≤10 s cadence kept the uplink
++// saturated. A 2 s→120 s full-jitter interval spreads the herd; MaxElapsed
++// preserves upstream's multi-month "retry then give up" bound.
++const (
++	reRegisterBackoffBase       = 2 * time.Second
++	reRegisterBackoffCap        = 120 * time.Second
++	reRegisterBackoffMaxElapsed = 3 * 30 * 24 * time.Hour // 3 months, matches upstream
++)
++
+ // ConnStateNotifier is a wrapper interface of the status recorder
+ type ConnStateNotifier interface {
+ 	MarkSignalDisconnected(error)
+@@ -112,16 +125,13 @@ func (c *GrpcClient) SetConnStateListener(notifier ConnStateNotifier) {
+ 	c.connStateCallback = notifier
+ }
+ 
+-// defaultBackoff is a basic backoff mechanism for general issues
++// defaultBackoff is a basic backoff mechanism for general issues.
++// goat ADR 1081 L1: full-jitter re-registration backoff (see const block).
+ func defaultBackoff(ctx context.Context) backoff.BackOff {
+-	return backoff.WithContext(&backoff.ExponentialBackOff{
+-		InitialInterval:     800 * time.Millisecond,
+-		RandomizationFactor: 1,
+-		Multiplier:          1.7,
+-		MaxInterval:         10 * time.Second,
+-		MaxElapsedTime:      3 * 30 * 24 * time.Hour, // 3 months
+-		Stop:                backoff.Stop,
+-		Clock:               backoff.SystemClock,
++	return backoff.WithContext(&nbbackoff.FullJitter{
++		Base:       reRegisterBackoffBase,
++		Cap:        reRegisterBackoffCap,
++		MaxElapsed: reRegisterBackoffMaxElapsed,
+ 	}, ctx)
+ }
+ 

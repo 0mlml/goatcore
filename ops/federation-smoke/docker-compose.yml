@@ -1,0 +1,35 @@
+# Cross-sovereign federation smoke test.
+#   core-a  — sovereign A's core fabric. Trusts A's CA only.
+#   edge-a  — sovereign A's edge for partner B. Trusts B's CA only. Dials inward.
+#   (the partner is driven from the host by test-fabric.sh using B-issued certs)
+#
+# NOT a deployment artifact. It exists to prove four denials and one acceptance.
+#
+# ZENOH_IMAGE is REQUIRED and must be digest-pinned. There is deliberately no
+# default: a floating tag is mutable, so a harness that 'passed' against one
+# would prove nothing about what you actually run (ADR 0703, and
+# ops/ci/check-zenoh-pinning.sh enforces it repo-wide).
+services:
+  core-a:
+    image: ${ZENOH_IMAGE:?set ZENOH_IMAGE to a DIGEST-PINNED zenoh image - see README}
+    command: ["-c", "/conf/core-a.json5"]
+    volumes: [ "./conf:/conf:ro", "./pki:/pki:ro" ]
+    networks: [ fed ]
+    # The ACL interceptor at trace. Not a nicety: a denial is SILENT to the
+    # sender, so the router's own log is the only honest witness that a
+    # write was refused rather than merely lost. Without this every negative case
+    # would "pass" on silence, which is the defect F-448 records. Scoped to the
+    # ACL module so the rest of the router stays at info.
+    environment:
+      RUST_LOG: "zenoh=info,zenoh::net::routing::interceptor::access_control=trace"
+  edge-a:
+    image: ${ZENOH_IMAGE:?set ZENOH_IMAGE to a DIGEST-PINNED zenoh image - see README}
+    command: ["-c", "/conf/edge-a.json5"]
+    volumes: [ "./conf:/conf:ro", "./pki:/pki:ro" ]
+    ports: [ "7448:7448" ]        # the ONLY port facing the partner
+    networks: [ fed ]
+    depends_on: [ core-a ]
+    environment:
+      RUST_LOG: "zenoh=info,zenoh::net::routing::interceptor::access_control=trace"
+networks:
+  fed: {}

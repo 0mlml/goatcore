@@ -1,0 +1,60 @@
+# oauth2-proxy-id-console overlay — L7 admin-fence in front of
+# goat-id-console (ADR 0860). Sibling-of oauth2-proxy-dashboard with
+# admin.auth.* FQDN + a separate Hydra OIDC client.
+#
+# Used as a compose OVERLAY on top of mgmt-host docker-compose.yml +
+# docker-compose.id-admin-console.yml:
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.id-admin-console.yml \
+#                  -f docker-compose.oauth2-proxy-id-console.yml \
+#                  up -d
+#
+# Driven by the Ansible role ops/ansible/roles/oauth2-proxy-id-console/,
+# which renders /opt/mgmt-host/oauth2-proxy-id-console.env (mode 0600 —
+# client_secret + cookie secret + ADMINS gate), provisions the Hydra
+# OIDC client `oauth2-proxy-id-console` via the sibling
+# oauth2-proxy-id-console-oidc-client role, and brings up the sidecar
+# on the `mgmt` network.
+#
+# Routing (rendered into the Traefik dynamic file by traefik-acme.yml's
+# mgmt-dynamic.yml.j2 template when id_admin_console_enabled is true):
+#   https://admin.auth.<site>.<zone>/*  → oauth2-proxy-id-console:4180
+#                                         (which then forwards to
+#                                          goat-id-console:8080 once
+#                                          ADMINS group claim passes).
+
+services:
+  oauth2-proxy-id-console:
+    # SHA-pinned per ADR 0859. Per-service env var
+    # (OAUTH2_PROXY_ID_CONSOLE_IMAGE) so this container's rollback is
+    # independent of oauth2-proxy-dashboard.
+    image: ${OAUTH2_PROXY_ID_CONSOLE_IMAGE:-quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d}
+    container_name: oauth2-proxy-id-console
+    restart: unless-stopped
+    # On-host OIDC-discovery resolution (F-126 pattern — same shape as
+    # oauth2-proxy-dashboard).
+    extra_hosts:
+      - "${OAUTH2_PROXY_ID_CONSOLE_OIDC_HOST_ENTRY:-localhost.invalid:127.0.0.1}"
+    env_file:
+      - oauth2-proxy-id-console.env
+    # Loopback-only diagnostic port. Production traffic comes via Traefik
+    # service-name resolution on the mgmt docker network.
+    ports:
+      - "127.0.0.1:${ID_ADMIN_CONSOLE_OAUTH2_PROXY_HOST_PORT:-4182}:4180"
+    networks:
+      - mgmt
+    # No exec healthcheck: the oauth2-proxy image is distroless (no wget / sh /
+    # curl), so this wget probe is unrunnable and leaves the container
+    # perpetually "unhealthy" despite the proxy serving fine. oauth2-
+    # proxy ships no self-health subcommand; liveness is observable via Traefik
+    # forwardAuth (auth fails loudly if it is down) + its access logs.
+    healthcheck:
+      test: ["NONE"]
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "adr=0860"
+
+networks:
+  mgmt:
+    external: true
+    name: mgmt

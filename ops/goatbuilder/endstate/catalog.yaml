@@ -1,0 +1,456 @@
+# ops/goatbuilder/endstate/catalog.yaml — what each goat service IS (ADR 1206).
+#
+# One row per service: the containers that make it up, the machine class it
+# runs on, which existing declaration says whether a goatnet runs it, and the
+# zero-trust edges it needs wired to other services. Nothing in this file is
+# per-goatnet. WHETHER a goatnet runs a service is read from that goatnet's own
+# declarations (its group_vars, the fleet pin table); WHERE it runs is read from
+# the site's declared shape (has_obs_host, the inventory). `endstate.py model`
+# joins the two into the goatnet's end state, and `goatbuilder endstate` grades
+# the running goatnet against it. Canon: docs/design/goatnet-end-state.md.
+#
+# SCHEMA (goatnet-endstate-catalog/v1)
+#   services:
+#     <name>:
+#       class: mgmt | obs                # where it runs; obs collapses onto the
+#                                        # mgmt host when the site declares
+#                                        # has_obs_host: false (a single machine)
+#       present:                         # the declarations to consult; each one
+#         founder: true                  #   the founder site only (goatnet_founder,
+#                                        #   default true); a joiner reads absent
+#         pin: <fleet-pins component>    #   rendered for the member, not `absent: true`
+#         var: <group_vars key>          #   truthy in the site's group_vars, else
+#         default: true|false            #   the role default, else this default;
+#                                        #   with no default the presence is
+#                                        #   UNDECLARED (a coverage gap, never a guess)
+#                                        # Every consulted declaration must agree; two
+#                                        # that disagree are reported as a contradiction.
+#       containers: [<name or glob>]     # every one must be running; {site} and
+#                                        # {zenoh_stack} expand from group_vars
+#       oneshot: [<glob>]                # run-to-completion containers; exited 0 is right
+#       ledger: <component> | null       # /var/lib/goat/<ledger>/deploy-history.jsonl
+#       surfaces: [<isitup_services id>] # the served names it owns: each must resolve
+#                                        # in the mesh zone and present a valid cert
+#       oidc_clients: [<hydra client id>]# registered in Hydra, redirect on its surface
+#       spiffe: [<path>]                 # a SPIRE registration entry for spiffe://<td><path>
+#       assay: [<token>]                 # acceptance rows whose `requires` names a
+#                                        # token here are this service's functional checks
+#       assay_exclude: [<row id>]        # rows that require the token but test something
+#                                        # else (a whole-site row), so they do not grade it
+#       zenoh:                           # a fabric client: the router's ACL must grant it
+#         put: [<key>]                   #   publish on each key ({site} expands), and its
+#         sub: [<key expr>]              #   subscriptions; its certificate must chain to the
+#                                        #   goatnet CA and its CN name a subject. Paired
+#                                        #   negatives: an operator-audit key and a key no
+#                                        #   service declares must be refused
+#       mesh:                            # NetBird L4 paths to the host the service runs on
+#         reach: [<proto>/<port>]        #   ports peers reach it on (a front-door surface
+#                                        #   adds tcp/443); `from` the groups that must reach
+#         from: [<GROUP>]                #   it (default PLATFORM-ADMIN)
+#         internal: [<proto>/<port>]     #   ports no participant group may reach
+#       play: <ops/ansible play>         # the play that deploys it, when not <name>-deploy.yml
+#       role: <role>                     # the role that deploys it, when not named for it
+#       guard: [<file>]                  # files that must each read the presence flag
+#                                        # (ops/ci/check-role-honours-presence-flag.py)
+schema: goatnet-endstate-catalog/v1
+
+services:
+  # --- the goatnet's own control plane: every founder runs these ------------
+  traefik:
+    class: mgmt
+    play: traefik-acme.yml
+    present: {founder: true}
+    containers: [traefik]
+    ledger: traefik
+    assay: [traefik]
+  netbird-mgmt:
+    class: mgmt
+    present: {founder: true, pin: netbird-mgmt}
+    containers: ["management-*"]
+    ledger: null
+    surfaces: [mgmt, mgmt-read, mgmt-admin]
+    assay: [netbird-mgmt]
+  signal-server:
+    class: mgmt
+    present: {founder: true, pin: signal-server}
+    containers: ["signal-*"]
+    ledger: null
+    assay: [signal-server]
+  netbird-dashboard:
+    class: mgmt
+    present: {founder: true}
+    containers: [dashboard, dashboard-admin, oauth2-proxy-dashboard, oauth2-proxy-dashboard-admin]
+    ledger: netbird-dashboard
+    surfaces: [dashboard, admin-dashboard]
+    oidc_clients: [netbird-dashboard, oauth2-proxy-dashboard, oauth2-proxy-dashboard-admin]
+  ory:
+    class: mgmt
+    present: {founder: true}
+    containers: ["*-kratos-1", "*-hydra-1"]
+    oneshot: ["*-kratos-migrate-1", "*-hydra-migrate-1"]
+    ledger: ory
+    surfaces: [oauth2]
+    assay: [kratos, hydra]
+  kratos-selfservice-ui:
+    class: mgmt
+    present: {founder: true, pin: kratos-selfservice-ui}
+    containers: [selfservice-ui]
+    ledger: ory
+    surfaces: [auth]
+  postgres-spock:
+    class: mgmt
+    present: {pin: postgres-spock}
+    containers: ["postgres-*"]
+    ledger: null
+    mesh: {internal: [tcp/5432]}
+    assay: [postgres-spock]
+  zenoh-router:
+    class: mgmt
+    present: {pin: zenoh-router}
+    containers: ["{zenoh_stack}-router"]
+    ledger: null
+    mesh: {reach: [tcp/7447, udp/7448], from: [PLATFORM-ADMIN, OBSERVER]}
+    surfaces: [zenoh-router]
+    assay: [zenoh-router, goat-zenoh]
+  mesh-coredns:
+    class: mgmt
+    play: goat-coredns.yml
+    present: {founder: true}
+    containers: [mesh-dns]
+    ledger: mesh-coredns
+    mesh: {reach: [udp/53, tcp/53, udp/5353], from: [PLATFORM-ADMIN, OBSERVER]}
+    assay: [mesh-coredns]
+    # every isitup container running: the end state's own `active` grade, site-wide
+    assay_exclude: [declared-service-actually-deployed]
+  lan-coredns:
+    class: mgmt
+    play: site-services.yml
+    present: {var: lan_coredns_enabled}
+    containers: [lan-dns]
+    ledger: lan-coredns
+  spire:
+    class: mgmt
+    present: {pin: spire}
+    containers: [spire-server]
+    ledger: spire
+  spire-agent:
+    class: mgmt
+    present: {pin: spire-agent}
+    containers: [spire-agent]
+    ledger: null
+  portal:
+    class: mgmt
+    present: {pin: portal}
+    containers: [goat-zenoh-portal]
+    ledger: goat-zenoh-portal
+    surfaces: [zenoh-portal]
+    assay: [goat-zenoh-portal]
+  isitup:
+    class: mgmt
+    present: {var: isitup_enabled}
+    containers: [isitup, oauth2-proxy-isitup]
+    ledger: isitup
+    surfaces: [netview, netview-response, peerview-peers, peerview-demand]
+    oidc_clients: [isitup]
+
+  # --- identity and onboarding ---------------------------------------------
+  id-admin-console:
+    class: mgmt
+    present: {pin: id-admin-console, var: id_admin_console_enabled}
+    containers: [goat-id-console, goat-id-console-spiffe-helper, oauth2-proxy-id-console]
+    ledger: id-admin-console
+    surfaces: [id-admin-console, onboarding-guide, onboard-api]
+    oidc_clients: [oauth2-proxy-id-console]
+    spiffe: [/goat-id-console]
+    assay: [id-admin-console, goat-id-console]
+  onboard-intake-collector:
+    class: mgmt
+    play: onboard-intake-deploy.yml
+    present: {var: onboard_intake_enabled}
+    containers: [onboard-intake-collector]
+    ledger: onboard-intake-collector
+    assay: [onboard-intake-collector]
+  intake-mesh-advisory:
+    class: mgmt
+    present: {var: intake_mesh_advisory_enabled}
+    containers: [intake-mesh-advisory]
+    ledger: intake-mesh-advisory
+  onboard-runner:
+    class: mgmt
+    present: {pin: onboard-runner, var: onboard_runner_enabled}
+    containers: [onboard-runner, onboard-runner-spiffe-helper]
+    ledger: onboard-runner
+    spiffe: [/onboard-runner]
+    assay: [onboard-runner]
+  grant-keyd:
+    class: mgmt
+    present: {var: grant_keyd_enabled}
+    containers: [grant-keyd, grant-keyd-spiffe-helper]
+    ledger: grant-keyd
+    zenoh: {put: [keys/endstate-probe]}
+    spiffe: [/grant-keyd]
+
+  # --- the fabric's own health publishers -----------------------------------
+  fabric-health:
+    class: mgmt
+    present: {pin: fabric-health}
+    containers: [fabric-health, fabric-health-spiffe-helper]
+    ledger: fabric-health
+    zenoh: {put: ["ops/fabric/health/{site}"]}
+    spiffe: [/fabric-health]
+    assay: [fabric-health]
+  fabric-crawler:
+    class: mgmt
+    present: {pin: fabric-crawler}
+    containers: [fabric-crawler]
+    ledger: fabric-crawler
+    zenoh: {put: ["ops/fabric/cardinality/{site}", "ops/fabric/census/{site}"]}
+  mesh-health:
+    class: mgmt
+    present: {pin: mesh-health}
+    containers: [mesh-health]
+    ledger: mesh-health
+    zenoh: {put: ["ops/mesh/health/{site}"]}
+    assay: [mesh-health, mesh-health-publisher]
+  node-net-health:
+    class: mgmt
+    present: {pin: node-net-health, var: node_net_health_enabled}
+    containers: [node-net-health]
+    ledger: node-net-health
+    zenoh: {put: ["ops/net/health/{site}"]}
+    assay: [node-net-health]
+  node-net-health-rollup:
+    class: mgmt
+    present: {var: node_net_health_rollup_enabled}
+    containers: [node-net-health-rollup]
+    ledger: node-net-health
+  ntp-health-pub:
+    class: mgmt
+    present: {pin: ntp-health-pub}
+    containers: [ntp-health-pub]
+    ledger: ntp-health-pub
+    zenoh: {put: ["ops/time/attest/{site}"]}
+  presence-health:
+    class: mgmt
+    present: {pin: presence-health}
+    containers: [presence-health]
+    ledger: presence-health
+    zenoh: {put: ["ops/presence/health/{site}"]}
+    assay: [presence-health]
+  time-health:
+    class: mgmt
+    present: {pin: time-health}
+    containers: [time-health]
+    ledger: time-health
+    zenoh: {put: ["ops/time/health/{site}"]}
+    assay: [time-health]
+  consistency-health:
+    class: mgmt
+    present: {pin: consistency-health, var: consistency_health_enabled}
+    containers: [consistency-health]
+    ledger: consistency-health
+    zenoh: {put: ["ops/consistency/health/{site}", "ops/consistency/report/{site}"]}
+    assay: [consistency-health]
+  consistency-health-rollup:
+    class: mgmt
+    present: {var: consistency_health_rollup_enabled}
+    containers: [consistency-health-rollup]
+    ledger: consistency-health
+
+  # --- inspection and admin surfaces ---------------------------------------
+  consistency-console:
+    class: mgmt
+    present: {pin: consistency-console, var: consistency_console_enabled}
+    containers: [consistency-console, oauth2-proxy-consistency-console]
+    ledger: consistency-console
+    surfaces: [consistency]
+    oidc_clients: [consistency-console]
+  consistency-aggregator:
+    class: mgmt
+    present: {pin: consistency-aggregator, var: consistency_aggregator_enabled}
+    containers: [consistency-aggregator]
+    ledger: consistency-console
+  panoscope:
+    class: mgmt
+    present: {pin: panoscope}
+    containers: [panoscope, oauth2-proxy-panoscope]
+    ledger: panoscope
+    surfaces: [panoscope]
+    oidc_clients: [panoscope]
+    assay: [panoscope]
+  stethoscope:
+    class: mgmt
+    play: stethoscope.yml
+    present: {pin: stethoscope}
+    containers: [stethoscope]
+    ledger: stethoscope
+    surfaces: [stethoscope]
+  microscope:
+    class: mgmt
+    present: {pin: microscope}
+    containers: [microscope, oauth2-proxy-microscope]
+    ledger: microscope
+    surfaces: [microscope]
+    oidc_clients: [microscope]
+    assay: [microscope]
+  netvis:
+    class: mgmt
+    present: {pin: netvis}
+    containers: [netvis, oauth2-proxy-netvis]
+    ledger: netvis
+    surfaces: [netvis]
+    oidc_clients: [netvis]
+  flashlight:
+    class: mgmt
+    play: flashlight.yml
+    present: {pin: flashlight}
+    containers: [flashlight]
+    ledger: flashlight
+    surfaces: [flashlight]
+  goat-logship:
+    class: mgmt
+    present: {var: goat_logship_enabled}
+    containers: [goat-logship]
+    ledger: null
+  audit-subscriber:
+    class: mgmt
+    present: {pin: audit-subscriber}
+    containers: [audit-subscriber]
+    ledger: audit-subscriber
+    zenoh: {sub: ["ops/**"]}
+    assay: [audit-subscriber]
+  admit-audit:
+    class: mgmt
+    present: {var: admit_audit_enabled}
+    containers: [admit-audit]
+    ledger: admit-audit
+  minio:
+    class: mgmt
+    play: minio-bootstrap.yml
+    present: {var: minio_enabled}
+    containers: [minio]
+    ledger: minio
+    mesh: {internal: [tcp/9000]}
+    surfaces: [minio-console]
+    oidc_clients: [minio]
+  compliance-proxy:
+    class: mgmt
+    present: {var: compliance_proxy_enabled}
+    containers: [aws-sigv4-proxy-compliance, oauth2-proxy-compliance]
+    ledger: compliance-proxy
+    surfaces: [compliance]
+  herd:
+    class: mgmt
+    present: {pin: herd, var: herd_enabled}
+    containers: [herd, herd-guacd, herd-postgres, oauth2-proxy-herd]
+    ledger: herd
+    surfaces: [herd]
+    oidc_clients: [herd]
+  herd-connector:
+    class: mgmt
+    present: {pin: herd-connector, var: herd_connector_enabled}
+    containers: [herd-connector]
+    ledger: herd-connector
+    spiffe: [/herd-connector]
+  relay-health:
+    class: mgmt
+    present: {var: relay_health_enabled}
+    containers: ["relay-health*", oauth2-proxy-relay-health]
+    ledger: relay-health
+    oidc_clients: [oauth2-proxy-relay-health]
+
+  # --- downloads, docs, training and demo surfaces --------------------------
+  goat-get:
+    class: mgmt
+    present: {var: goat_get_enabled}
+    containers: [goat-get]
+    ledger: goat-get
+    surfaces: [goat-get]
+    assay: [goat-get]
+  goat-docs:
+    class: mgmt
+    present: {var: goat_docs_enabled}
+    containers: [goat-docs]
+    ledger: goat-docs
+    surfaces: [goat-docs]
+  gym:
+    class: mgmt
+    present: {var: gym_enabled}
+    containers: [gym]
+    ledger: gym
+    surfaces: [gym]
+  brief:
+    class: mgmt
+    present: {var: brief_enabled}
+    containers: [brief, oauth2-proxy-brief]
+    ledger: brief
+    surfaces: [brief]
+    oidc_clients: [brief]
+  dataflows:
+    class: mgmt
+    present: {var: dataflows_enabled}
+    containers: [dataflows, oauth2-proxy-dataflows]
+    ledger: dataflows
+    surfaces: [dataflows]
+    oidc_clients: [dataflows]
+  demogame:
+    class: mgmt
+    present: {var: demogame_enabled}
+    containers: [demogame, demogame-zenoh-sidecar, oauth2-proxy-demogame]
+    ledger: demogame
+    surfaces: [demogame]
+    oidc_clients: [demogame]
+  zenoh-sandbox:
+    class: mgmt
+    present: {var: zenoh_sandbox_enabled}
+    containers: [zenoh-sandbox-router, zenoh-sandbox-web]
+    ledger: zenoh-sandbox
+    surfaces: [zenoh-sandbox]
+  synth-vendors:
+    class: mgmt
+    play: zenoh-synth-vendors-deploy.yml
+    present: {var: synth_vendors_enabled}
+    guard: [ops/ansible/zenoh-synth-vendors-deploy.yml, ops/ansible/zagros-zenoh-synth-vendors-deploy.yml]
+    containers: ["synth-*"]
+    ledger: null
+  goat-trashgoat:
+    class: mgmt
+    present: {var: goat_trashgoat_enabled}
+    containers: [goat-trashgoat]
+    ledger: goat-trashgoat
+
+  # --- observability: on the obs host, or on the mgmt host of a single-machine site
+  prometheus:
+    class: obs
+    play: obs.yml
+    present: {var: prometheus_enabled, default: true}
+    guard: [ops/ansible/obs.yml, ops/ansible/roles/observability/tasks/main.yml]
+    containers: ["{site}-obs-prometheus"]
+    ledger: null
+    assay:
+    - prometheus
+  alertmanager:
+    class: obs
+    play: obs.yml
+    present: {var: alertmanager_enabled, default: true}
+    guard: [ops/ansible/obs.yml, ops/ansible/roles/observability/tasks/main.yml]
+    containers: ["{site}-obs-alertmanager"]
+    ledger: null
+    assay:
+    - alertmanager
+  grafana:
+    class: obs
+    play: obs.yml
+    present: {var: grafana_enabled, default: true}
+    guard: [ops/ansible/obs.yml]
+    containers: ["{site}-obs-grafana"]
+    ledger: null
+    surfaces: [grafana]
+    oidc_clients: [grafana]
+  obs-exporters:
+    class: obs
+    play: obs.yml
+    present: {var: obs_exporters_enabled, default: true}
+    guard: [ops/ansible/obs.yml, ops/ansible/roles/observability/tasks/main.yml]
+    containers: ["{site}-obs-node-exporter", "{site}-obs-cadvisor", "{site}-obs-blackbox", "{site}-obs-process-exporter", "{site}-obs-postgres-exporter"]
+    ledger: null

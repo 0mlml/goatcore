@@ -1,0 +1,77 @@
+# promtool unit tests for the zenoh router session-table alerts (#1922,
+# rules/zenoh-wedge.yml).
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/zenoh-session-table.test.yml
+#
+# The shape: the table climbing toward the
+# 1000-session limit while linkless entries pile up. Each alert gets a firing
+# case and a below-threshold case.
+
+rule_files:
+  - ../rules/zenoh-wedge.yml
+
+evaluation_interval: 1m
+
+# 500 sessions for 30m (quiet), then 650 (filling), then 950 (near full);
+# linkless 20, then 150 from 30m. Expected annotations mirror the rule text.
+tests:
+- interval: 1m
+  input_series:
+  - series: goat_zenoh_sessions_total{router="zagros"}
+    values: 500x30 650x30 950x30
+  - series: goat_zenoh_sessions_linkless{router="zagros"}
+    values: 20x30 150x60
+  alert_rule_test:
+  - eval_time: 29m
+    alertname: ZenohRouterSessionTableFilling
+    exp_alerts: []
+  - eval_time: 29m
+    alertname: ZenohRouterLinklessSessionsAccumulating
+    exp_alerts: []
+  - eval_time: 29m
+    alertname: ZenohRouterSessionTableNearFull
+    exp_alerts: []
+  - eval_time: 46m
+    alertname: ZenohRouterSessionTableFilling
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: zagros
+      exp_annotations:
+        summary: zenoh router zagros holds 650 sessions (limit 1000)
+        description: "The transport table is over 60% of max_sessions. When it reaches the\nlimit, new clients are refused silently while existing ones keep\nworking. Check how many entries are linkless (leaked, not live):\n  curl -s 'http://127.0.0.1:8000/@/*/router' | python3 -c 'import sys,json; s=json.load(sys.stdin)[0][\"value\"][\"sessions\"]; d=[x for x in s if not x.get(\"links\")]; print(\"linkless\", len(d), \"live\", len(s)-len(d))'\nA router restart clears the leaked entries (about 75s for clients\nto reconnect). Before restarting, capture the evidence #1922 asks\nfor: the session list above and the router's start time.\nIssue: #1922.\n"
+  - eval_time: 46m
+    alertname: ZenohRouterSessionTableNearFull
+    exp_alerts: []
+  - eval_time: 68m
+    alertname: ZenohRouterSessionTableNearFull
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        component: zenoh-router
+        router: zagros
+      exp_annotations:
+        summary: 'CRITICAL: zenoh router zagros session table at 950 of 1000 — new clients will be refused'
+        description: "The transport table is within 10% of max_sessions. At the limit the\nrouter refuses every new transport (close reason INVALID, logged only\nat trace level): bridges that restart cannot re-attach and new\nclients never connect. Save the session list for #1922, then restart\nthe router in a quiet window before the table fills:\n  curl -s 'http://127.0.0.1:8000/@/*/router' > /tmp/zenoh-sessions-$(date -u +%Y%m%dT%H%M%SZ).json\n"
+  - eval_time: 61m
+    alertname: ZenohRouterLinklessSessionsAccumulating
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: zenoh-router
+        router: zagros
+      exp_annotations:
+        summary: zenoh router zagros holds 150 linkless sessions
+        description: 'Sessions that reference no network link are entries whose teardown
+
+          never finished (#1922). They are not live, and they still use
+
+          max_sessions slots. On 2026-10-22 they accumulated at about 113 a
+
+          day until the table filled. A restart clears them; the fix is the
+
+          teardown defect tracked in #1922.
+
+          '

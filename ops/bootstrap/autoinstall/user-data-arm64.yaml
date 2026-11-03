@@ -1,0 +1,80 @@
+#cloud-config
+# SUPERSEDED — do NOT use this as the Pi golden path.
+# The proven Pi 5 build method is the usareur-af-rpi-base-image builder
+# (docs/operations/bare-metal-install.md §"Raspberry Pi 5"). This UEFI+subiquity
+# answer file was an unproven parallel invention — no Pi was ever installed through
+# it — and needs EDK2 firmware the builder does not. Kept for reference only.
+#
+# Ubuntu 24.04 Server autoinstall answer file — arm64 / Raspberry Pi 5, COA C.
+# Before phase 1 of a host-site standup (docs/operations/bare-metal-install.md §Pi).
+#
+# This is the arm64 sibling of ops/bootstrap/autoinstall/user-data.yaml: the SAME
+# subiquity autoinstall the x86 Karbons use, so both platforms share one install
+# method. It drives subiquity's `lvm` layout with a password — full-disk
+# LUKS-on-LVM — which yields the SAME shape the LUKS node class expects on the
+# Karbon: nvme0n1p3 crypto_LUKS -> dm_crypt -> ubuntu-vg. The `tang_initramfs`
+# unlock class (ops/ansible/roles/luks-unlock/tasks/installer-luks.yml) then
+# enrolls Clevis+Tang onto that partition — it does not create it.
+#
+# PREREQUISITE — read the runbook first. A stock Raspberry Pi 5 has NO UEFI and
+# will not boot the arm64 Live Server ISO on its own. EDK2 UEFI firmware
+# (pftf/RPi5, aka raspberrypi/edk2-rpi5) must be on the Pi's boot medium FIRST.
+# That firmware is NOT part of this answer file. See
+# docs/operations/bare-metal-install.md §"Raspberry Pi (arm64, no TPM)".
+#
+# STATUS: this arm64 path is DESIGNED, TO VALIDATE ON-SITE. No Pi has been
+# installed end-to-end through Pi5-UEFI + subiquity in this repo. Do NOT treat
+# it as proven until a real Pi 5 has run it and cold-booted to a mounted root.
+#
+# Deltas from the x86 answer file (user-data.yaml):
+#   - no tpm2-tools (the Pi 5 has no TPM; unlock is Clevis+Tang, not TPM2);
+#   - NIC match still `en*` — the Pi 5's onboard Cadence GEM comes up as `end0`
+#     (or enx<mac>) under Ubuntu predictable naming, both matched by `en*`;
+#   - the boot chain is UEFI (EDK2) rather than the Karbon's native UEFI, but
+#     subiquity behaves identically: in UEFI mode its `lvm` layout creates an
+#     ESP + /boot + the crypto_LUKS partition, same as the Karbon.
+#   - device naming is /dev/nvme0n1 (NVMe HAT), same base name as the Karbon.
+#
+# Fill the three <PLACEHOLDERS> before use. The LUKS passphrase comes from
+# .envrc.local.d/20-host-access.envrc (<SITE>_<ROLE>_LUKS_PASS) — NEVER commit it.
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard: {layout: us}
+  # Wired DHCP so the box is reachable the moment it boots.
+  network:
+    version: 2
+    ethernets:
+      any-nic:
+        match: {name: "en*"}
+        dhcp4: true
+  identity:
+    hostname: <HOSTNAME>
+    # Day-1 admin account. Password auth is disabled below; this is for console.
+    username: goat
+    # a hashed throwaway console password (mkpasswd -m sha-512); rotated by baseline.
+    password: "<MKPASSWD_SHA512_HASH>"
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - "<OPERATOR_SSH_PUBKEY>"
+  # Full-disk LUKS-on-LVM. subiquity's `lvm` layout with a password IS full-disk
+  # encryption: booted under EDK2 UEFI it produces an ESP + /boot + nvme0n1p3
+  # crypto_LUKS -> dm_crypt -> ubuntu-vg, the shape the LUKS node class
+  # (unlock_class: tang_initramfs) enrolls Clevis+Tang onto and carves
+  # docker-data from — identical to the Karbon.
+  storage:
+    layout:
+      name: lvm
+      password: "<LUKS_PASSPHRASE>"
+    swap: {size: 0}
+  # No third-party drivers and NO tpm2-tools — the Pi 5 has no TPM. Keep the base
+  # minimal; the fleet baseline installs the rest so the image stays reproducible.
+  # The Clevis/Tang initramfs packages are installed later by the luks-unlock role.
+  packages: [openssh-server, cryptsetup, lvm2]
+  late-commands:
+    # NOPASSWD sudo for the day-1 account so ansible become works before FIDO2.
+    - echo 'goat ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/goat
+    - chmod 0440 /target/etc/sudoers.d/goat
+  shutdown: reboot

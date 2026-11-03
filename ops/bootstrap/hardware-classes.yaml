@@ -1,0 +1,135 @@
+# ops/bootstrap/hardware-classes.yaml — what the rapid-bringup mirror publishes.
+#
+# TWO AXES, DELIBERATELY SEPARATE.
+#
+#   platforms  what an IMAGE is built for. Firmware, drivers and CPU
+#              architecture differ, so each platform is a distinct artifact.
+#   roles      what a HOST BECOMES at first boot. Selected from the USB
+#              userdata.yml / serial-console prompt, exactly as
+#              build-image-orin.sh already describes: "single image; role
+#              selected at first boot".
+#
+# They were previously conflated: classes were named orin-mgmt, orin-obs,
+# karbon-mgmt. That is wrong twice over. It bakes a runtime choice into a build
+# artifact, and it multiplies — six roles across five platforms is thirty class
+# names to maintain and thirty images to bake, for five distinct binaries.
+# Keeping them separate is five images and a boot-time question.
+#
+# It also could not express the site we actually build: there was no obs class
+# on x86 at all, and nothing for backup, breakglass or the jumphost.
+
+platforms:
+  orin:
+    model: NVIDIA Jetson AGX Orin 64GB
+    arch: arm64
+    image: Tegra-flashable (L4T / JetPack; vendor BSP required)
+    builder: build-image-orin.sh
+    status: supported
+    note: Being shifted away from, but in service across the current fleet.
+  thor:
+    model: NVIDIA Jetson AGX Thor
+    arch: arm64
+    image: Tegra-flashable (L4T / JetPack; vendor BSP required)
+    builder: build-image-orin.sh
+    status: supported
+    note: Same builder as Orin; BSP and JetPack level differ.
+
+  karbon-801:
+    model: OnLogic Karbon 801
+    arch: amd64
+    image: Ubuntu 24.04 raw IMG + cloud-init seed
+    builder: build-image-karbon.sh
+    status: supported
+    # Disk-encryption node-class metadata (advisory; the source of truth for the
+    # mechanism is docs/design/host-site-node-disk-encryption.md and the
+    # luks-unlock role, this is a machine-readable index). Boot unlock is a
+    # PLATFORM property — it depends on TPM presence — not a first-boot role.
+    disk_encryption:
+      shape: installer-luks-lvm       # installer builds crypto_LUKS -> dm-crypt -> LVM
+      luks_partition: /dev/nvme0n1p3  # ~1.8 TB free in ubuntu-vg after install
+      vg: ubuntu-vg
+      unlock_class: tpm2              # TPM 2.0 present; Clevis TPM2 bind (PCR 7), unlocked in initramfs
+      docker_data_lv: docker-data     # carved in the encrypted VG for F-093 Tier-3
+      certified: true                 # cold-boot proven on delta-core-a + delta-obs-a 2026-09-11 (clevis-tpm2 + LV carve)
+      design: docs/design/host-site-node-disk-encryption.md
+  karbon-802:
+    model: OnLogic Karbon 802
+    arch: amd64
+    image: Ubuntu 24.04 raw IMG + cloud-init seed
+    builder: build-image-karbon.sh
+    status: preferred
+    note: The direction of travel for new sites.
+    disk_encryption:
+      shape: installer-luks-lvm
+      luks_partition: /dev/nvme0n1p3
+      vg: ubuntu-vg
+      unlock_class: tpm2
+      docker_data_lv: docker-data
+      certified: false
+      design: docs/design/host-site-node-disk-encryption.md
+
+  ec2:
+    model: AWS EC2 (cloud-resident host site)
+    arch: amd64
+    image: AMI
+    builder: build-image-ec2.sh
+    status: supported
+
+  rpi5:
+    model: Raspberry Pi 5 (16 GB)
+    arch: arm64
+    image: Ubuntu 24.04 arm64 (installer full-disk encryption)
+    builder: none-yet
+    status: proposed
+    note: >-
+      Headless same-site edge node. NO TPM, so TPM2 auto-unseal is impossible.
+      Boot unlock is Clevis+Tang IN THE INITRAMFS, bound to a same-site Tang
+      server (the paired Karbon). arm64 gaps (FIPS kernel, USG STIG on stock
+      arm64, wg-kmod artifacts, pin arm64-resolution, no image builder) are
+      catalogued in the design doc — this platform is proposed, not built.
+    disk_encryption:
+      shape: installer-luks           # verify LVM use on the arm64 image
+      luks_partition: /dev/nvme0n1p2  # verify on the real image
+      vg: ""                          # arm64 installer LVM layout unverified
+      unlock_class: tang_initramfs    # clevis-initramfs + _netdev + initramfs IP
+      certified: false                # never run in initramfs anywhere in this repo
+      design: docs/design/host-site-node-disk-encryption.md
+
+# The six machines of a host site. A role is a first-boot selection against one
+# of the platform images above — it is NOT a separate artifact to bake.
+roles:
+  core:
+    purpose: Active management plane — mesh control, identity, fabric router.
+  obs:
+    purpose: Observability and storage.
+  core-backup:
+    purpose: >-
+      Passive partner to core. Cutover-gated per ADR 1111 — it is a standby, and
+      a standby that nothing enforces is just a second active node.
+  obs-backup:
+    purpose: >-
+      Passive partner to obs. ADR 1141 added the observability partner the
+      original three-node shape deferred, after an obs outage hindered an
+      incident response on 2026-08-19.
+  breakglass:
+    purpose: >-
+      Independent way in when the mesh and the control plane are both down.
+      See docs/design/zagros-prod-breakglass-node.md — the 2026-08-21 outage took
+      two goatnets' control planes with one LAN, and every remote door
+      terminated behind that switch.
+  jumphost:
+    purpose: >-
+      Network-gear reach: switch, router and out-of-band management that live on
+      the site LAN rather than on the mesh.
+
+# Legacy names kept resolvable so artifacts already published under them, and
+# any operator muscle memory, still work. Each maps to its platform; the role
+# half was never a property of the image.
+aliases:
+  orin-mgmt: orin
+  orin-obs: orin
+  karbon-mgmt: karbon-801
+  karbon-obs: karbon-801
+  karbon-802-mgmt: karbon-802
+  karbon-802-obs: karbon-802
+  ec2-mgmt: ec2

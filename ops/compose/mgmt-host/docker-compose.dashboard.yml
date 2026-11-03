@@ -1,0 +1,71 @@
+# netbird-dashboard overlay — Block 21D.1 (first 21D OIDC consumer, 2026-05-07).
+#
+# Per-site netbird management UI fronted by Ory Hydra. Restores the dashboard
+# the NETHOST-era stack ran (snapshot at ops/snapshots/goat-backup-
+# goat-20260324-122515/containers.txt confirms `netbirdio/dashboard:
+# latest` was running as of 2026-03-24); the Block 22-era mgmt-host rewrite
+# dropped it on the way to multi-master Spock + silent control plane.
+#
+# Used as a compose OVERLAY:
+#   docker compose -f docker-compose.yml -f docker-compose.dashboard.yml up -d
+#
+# Deployment is driven by the Ansible role ops/ansible/roles/netbird-dashboard/,
+# which:
+#   1. Renders dashboard.env (mode 0600 — contains OIDC client_secret) at
+#      /opt/mgmt-host/dashboard.env.
+#   2. Provisions the OIDC client in Hydra via the loopback admin API
+#      (idempotent upsert by client_id).
+#   3. Pulls the image + brings up the service.
+#   4. Loopback HTTP smoke-test confirms the React bundle answers.
+#
+# Routing: Traefik (the existing mgmt-host TLS terminator from
+# docker-compose.yml) routes `https://dashboard.<site>.<site_dns_zone>/`
+# to `http://dashboard:80` per the per-site `traefik_services` entry in
+# group_vars. Cert is offline-CA-signed per ADR 0407 (issued via
+# ops/enrollment/cmd/cert-sign).
+#
+# Auth flow (v1 — Kratos self-signup ENABLED):
+#   1. Operator browses to https://dashboard.<site>.<site_dns_zone>/.
+#   2. Dashboard React bundle redirects to Hydra at oauth2.<site>.../oauth2/auth
+#      with PKCE.
+#   3. Hydra delegates the login UI to Kratos at auth.<site>.../login.
+#   4. First visit: operator clicks "Sign up" → Kratos /register flow →
+#      identity created → session established → redirect back to Hydra.
+#   5. Hydra issues authorization code → dashboard exchanges for access
+#      token → operator lands on the dashboard, can see peers + ACL groups
+#      + setup-keys.
+
+services:
+  dashboard:
+    # Default digest captured 2026-05-08 from docker.io/netbirdio/dashboard:latest;
+    # bump along with the tag when intentionally upgrading. Tag+digest pinning
+    # required by ADR 0703 + ops/ci/check-pin-compat.sh CI gate.
+    image: ${NETBIRD_DASHBOARD_IMAGE:-netbirdio/dashboard:latest@sha256:e3ee15351a46345d338a5f9d20cf49bcc3d3594d6d61bc4e5d6f640dda2cbdb0}
+    container_name: dashboard
+    restart: unless-stopped
+    env_file:
+      - dashboard.env
+    networks:
+      - mgmt
+    # Loopback-only host port for diagnostic curls. Production traffic
+    # comes in through Traefik (via the docker-compose.yml service ports).
+    ports:
+      - "127.0.0.1:${DASHBOARD_HOST_PORT:-3000}:80"
+    # Traefik routes by Host header to dashboard:80 from inside the mgmt
+    # network (no docker labels — Traefik file-provider config is rendered
+    # by ops/ansible/roles/traefik/ from the per-site traefik_services list).
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "router_role=${ROUTER_ROLE:-a}"
+      - "block=21D.1"
+
+networks:
+  mgmt:
+    external: true
+    name: mgmt

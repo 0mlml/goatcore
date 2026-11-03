@@ -1,0 +1,78 @@
+# promtool unit tests for the identity-plane alert label matchers.
+#
+# Run by .github/workflows/prometheus-rules.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/alert-matchers.test.yml
+#
+# `promtool check rules` proves an expression PARSES. It cannot tell you the
+# regex selects the containers you meant — and a matcher that quietly selects
+# nothing is the same silent-blindness failure these alerts exist to catch.
+# So the series names below are the real ones from the compose templates, and
+# the counts are asserted exactly, including the exclusions (grafana must not
+# be caught by the portal matcher; the zenoh router must stay out of
+# CriticalServiceUnhealthy, which FabricRouterUnhealthy already owns).
+rule_files:
+  - ../rules/services.yml
+  - ../rules/container-health.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # Real instance label shape from the blackbox relabel (=__param_target).
+      - series: 'probe_success{job="blackbox-https",instance="https://portal.zagros.netbird.zagros.example/api/health"}'
+        values: '0x10'
+      # Must NOT be caught by the portal matcher.
+      - series: 'probe_success{job="blackbox-https",instance="https://grafana.zagros.netbird.zagros.example"}'
+        values: '0x10'
+      # Real container names from the compose templates.
+      - series: 'goat_container_health_status{status="unhealthy",name="goat-zenoh-portal",cid="aaa"}'
+        values: '1x10'
+      - series: 'goat_container_health_status{status="unhealthy",name="grant-keyd-spiffe-helper",cid="bbb"}'
+        values: '1x10'
+      - series: 'goat_container_health_status{status="unhealthy",name="goat-id-console",cid="ccc"}'
+        values: '1x10'
+      - series: 'goat_container_health_status{status="unhealthy",name="fabric-crawler",cid="ddd"}'
+        values: '1x10'
+      - series: 'goat_container_health_status{status="unhealthy",name="onboard-runner",cid="eee"}'
+        values: '1x10'
+      # The router must stay OUT of CriticalServiceUnhealthy (FabricRouterUnhealthy owns it).
+      - series: 'goat_container_health_status{status="unhealthy",name="zagros-zenoh-router",cid="fff"}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: 'count(probe_success{job="blackbox-https", instance=~"https://portal\\..*"} == 0)'
+        eval_time: 9m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(goat_container_health_status{status="unhealthy", name=~"(signal|management|.*kratos.*|.*hydra.*|.*postgres.*|relay-metrics-ingest|goat-zenoh-portal|goat-id-console|grant-keyd).*"} == 1)'
+        eval_time: 9m
+        exp_samples:
+          - labels: '{}'
+            value: 3
+      - expr: 'count(goat_container_health_status{status="unhealthy", name=~"(fabric-crawler|onboard-runner).*"} == 1)'
+        eval_time: 9m
+        exp_samples:
+          - labels: '{}'
+            value: 2
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: PortalProbeDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: identity
+              job: blackbox-https
+              instance: "https://portal.zagros.netbird.zagros.example/api/health"
+            exp_annotations:
+              summary: "CRITICAL: goat-zenoh-portal not answering /api/health (https://portal.zagros.netbird.zagros.example/api/health)"
+              description: |
+                The blackbox probe of the portal's unauthenticated /api/health has
+                failed for 3m+. Either the container is stopped/crash-looping (the
+                case no container-health rule can see), Traefik lost the route, or
+                the portal is wedged serving. Cert mint, the data-access COP, the
+                budget projection and the onboarding cert leg are down while this
+                holds. Triage on the Thor:
+                  docker ps -a | grep goat-zenoh-portal
+                  docker logs --tail 80 goat-zenoh-portal
+                  curl -sS -o /dev/null -w '%{http_code}\n' https://portal.zagros.netbird.zagros.example/api/health

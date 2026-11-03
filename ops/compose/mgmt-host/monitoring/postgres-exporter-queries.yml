@@ -1,0 +1,303 @@
+# Custom queries for postgres-exporter — Spock-specific metrics.
+#
+# Format: https://github.com/prometheus-community/postgres_exporter#custom-queries
+#
+# The 'monitoring' PG role (created by ops/ansible/roles/observability/)
+# has pg_monitor + SELECT on spock.* views and pg_replication_slots.
+# Queries run against the `postgres` database (default DATA_SOURCE_NAME
+# in docker-compose.obs.yml). Spock views live in the `spock` schema
+# of whatever DB is the replicated one; we query the `netbird` DB for
+# those via a schema-qualified, cross-database-tolerant pattern where
+# needed. For Phase 2 MVP we scope queries to views visible from any
+# database, which keeps this config simple and avoids per-database
+# connection duplication.
+
+pg_replication_slot:
+  query: |
+    SELECT
+      slot_name,
+      COALESCE(database, '') AS database,
+      CASE WHEN active THEN 1 ELSE 0 END AS active,
+      COALESCE(
+        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn),
+        0
+      ) AS retained_wal_bytes,
+      CASE WHEN wal_status = 'lost' THEN 1 ELSE 0 END AS wal_status_lost
+    FROM pg_replication_slots
+  master: true
+  metrics:
+    - slot_name:
+        usage: "LABEL"
+        description: "Replication slot name"
+    - database:
+        usage: "LABEL"
+        description: "Database the slot is attached to (empty for physical slots)"
+    - active:
+        usage: "GAUGE"
+        description: "1 if a consumer is connected, 0 if detached"
+    - retained_wal_bytes:
+        usage: "GAUGE"
+        description: "Bytes of WAL retained for this slot (distance from current LSN to slot restart_lsn)"
+    - wal_status_lost:
+        usage: "GAUGE"
+        description: "1 if wal_status = 'lost' (slot invalidated, rebuild required)"
+
+spock_subscription_lag:
+  # spock.sub_show_status() returns per-subscription state incl.
+  # replication_lag (interval). We emit it as seconds for threshold
+  # math. The `subscription_name` label is the spock subscription
+  # name, e.g. 'sub_hadev_arm64_to_amd64'.
+  #
+  # NOTE: this query succeeds only when the spock extension is
+  # installed in the current database. postgres-exporter runs queries
+  # per-database via DATA_SOURCE_NAME; by default we connect to
+  # `postgres` which does NOT have spock. For the MVP we connect to
+  # `netbird` (the replicated DB). See DATA_SOURCE_NAME in
+  # docker-compose.obs.yml.
+  query: |
+    SELECT
+      subscription_name,
+      COALESCE(EXTRACT(EPOCH FROM replication_lag), 0)::float AS lag_seconds,
+      CASE WHEN status = 'replicating' THEN 1 ELSE 0 END AS replicating
+    FROM spock.sub_show_status()
+  master: true
+  metrics:
+    - subscription_name:
+        usage: "LABEL"
+        description: "Spock subscription name"
+    - lag_seconds:
+        usage: "GAUGE"
+        description: "Replication replay lag in seconds"
+    - replicating:
+        usage: "GAUGE"
+        description: "1 if subscription status = 'replicating', else 0"
+
+spock_resolutions:
+  # Conflicts Spock resolved (update_update, insert_exists, ...), one row each
+  # in spock.resolutions. Needs spock.save_resolutions = on (image conf). There
+  # is no spock.conflict_log table in Spock 5: the query this replaces failed
+  # every scrape, so the conflict alert could never fire.
+  query: |
+    SELECT COALESCE(COUNT(*), 0)::bigint AS total
+    FROM spock.resolutions
+  master: true
+  metrics:
+    - total:
+        usage: "COUNTER"
+        description: "Rows in spock.resolutions (conflicts resolved by last-writer-wins)"
+
+spock_exceptions:
+  # Remote changes the apply worker could not apply and skipped
+  # (spock.exception_behaviour = discard), e.g. an update to a row the other
+  # site deleted. Each one is a change that did not land here.
+  query: |
+    SELECT COALESCE(COUNT(*), 0)::bigint AS total
+    FROM spock.exception_log
+  master: true
+  metrics:
+    - total:
+        usage: "COUNTER"
+        description: "Rows in spock.exception_log (remote changes skipped on apply)"
+
+pg_stat_replication:
+  # Provider-side WAL sender state — one row per active replication
+  # connection (logical or physical). Block 52A.2 surface for
+  # SpockSlotWALSenderLag. Subscriber-side metrics (spock_subscription_lag)
+  # tell us replay lag *after* WAL has reached the subscriber; this
+  # query tells us whether WAL is queueing on the *provider* side
+  # before it gets to the wire.
+  #
+  # `pending_bytes` = `pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)` —
+  # the bytes the WAL sender hasn't yet handed off to the subscriber
+  # over the network. Sustained growth here means the network or
+  # subscriber is the bottleneck, not the provider's apply path.
+  query: |
+    SELECT
+      COALESCE(application_name, '') AS subscriber,
+      COALESCE(client_addr::text, '') AS client_addr,
+      COALESCE(state, '') AS state,
+      COALESCE(
+        pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn),
+        0
+      )::bigint AS pending_bytes,
+      COALESCE(EXTRACT(EPOCH FROM write_lag), 0)::float AS write_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM flush_lag), 0)::float AS flush_lag_seconds,
+      COALESCE(EXTRACT(EPOCH FROM replay_lag), 0)::float AS replay_lag_seconds
+    FROM pg_stat_replication
+  master: true
+  metrics:
+    - subscriber:
+        usage: "LABEL"
+        description: "application_name from pg_stat_replication — typically the subscription name on the receiving side"
+    - client_addr:
+        usage: "LABEL"
+        description: "Subscriber connection IP"
+    - state:
+        usage: "LABEL"
+        description: "WAL sender state: streaming | catchup | startup | backup | stopping"
+    - pending_bytes:
+        usage: "GAUGE"
+        description: "Bytes of WAL on the provider not yet sent over the wire (pg_current_wal_lsn − sent_lsn). Sustained growth ⇒ network or subscriber bottleneck."
+    - write_lag_seconds:
+        usage: "GAUGE"
+        description: "Time elapsed since WAL was generated locally vs. confirmed written by the standby"
+    - flush_lag_seconds:
+        usage: "GAUGE"
+        description: "Time elapsed since WAL was generated locally vs. confirmed flushed by the standby"
+    - replay_lag_seconds:
+        usage: "GAUGE"
+        description: "Time elapsed since WAL was generated locally vs. confirmed replayed by the standby"
+
+spock_config:
+  # Reads the LIVE configured value from pg_settings (NOT a hardcoded
+  # constant). The postgres-streaming-replication role sets
+  # max_slot_wal_keep_size = 6GB via ALTER SYSTEM; a hardcoded constant
+  # makes the SpockSlotWALNearLimit alert fire at the wrong threshold.
+  #
+  # `setting` is the postgres-internal stored value; `unit` tells us
+  # the unit it's measured in. For max_slot_wal_keep_size, postgres
+  # stores the value with unit '8kB' (PostgreSQL's standard WAL block
+  # accounting unit). Multiply by 8192 to get bytes. `setting='-1'`
+  # means unlimited; we emit a sentinel 2^63-1 so the rule's >0.8
+  # ratio comparison never fires (no false positive even if the cap is dropped
+  # to unlimited).
+  query: |
+    SELECT
+      CASE
+        WHEN setting = '-1' THEN 9223372036854775807::bigint
+        ELSE (setting::bigint *
+              CASE unit
+                WHEN '8kB' THEN 8192
+                WHEN 'kB'  THEN 1024
+                WHEN 'MB'  THEN 1048576
+                WHEN 'GB'  THEN 1073741824
+                ELSE 1
+              END)::bigint
+      END AS max_slot_wal_keep_size_bytes
+    FROM pg_settings
+    WHERE name = 'max_slot_wal_keep_size'
+  master: true
+  metrics:
+    - max_slot_wal_keep_size_bytes:
+        usage: "GAUGE"
+        description: "LIVE configured max_slot_wal_keep_size in bytes — derived from pg_settings, not hardcoded. Sentinel 2^63-1 means unlimited."
+
+# ----------------------------------------------------------------------
+# WAL observability: empirical answers to "where's the WAL coming from /
+# what's eating disk", so a post-incident analysis is evidence-backed.
+# ----------------------------------------------------------------------
+
+# pg_stat_wal — cumulative WAL emission stats (PG 14+). Lets a panel
+# show "WAL bytes written per minute" and "WAL records / FPI per
+# minute" so operators can see whether the WAL ceiling is being
+# approached due to legitimate write rate or due to runaway FPI from
+# a checkpoint storm.
+pg_stat_wal_extended:
+  query: |
+    SELECT
+      wal_records,
+      wal_fpi,
+      wal_bytes::bigint AS wal_bytes,
+      wal_buffers_full,
+      wal_write,
+      wal_sync,
+      wal_write_time,
+      wal_sync_time
+    FROM pg_stat_wal
+  master: true
+  metrics:
+    - wal_records:
+        usage: "COUNTER"
+        description: "Total WAL records generated"
+    - wal_fpi:
+        usage: "COUNTER"
+        description: "Total full-page-image WAL records (FPI). Spike → checkpoint storm or massive UPDATE."
+    - wal_bytes:
+        usage: "COUNTER"
+        description: "Total WAL bytes generated. Rate-of-change × 6GB / max_slot_wal_keep_size = how long an offline subscriber's slot can hold before invalidation."
+    - wal_buffers_full:
+        usage: "COUNTER"
+        description: "Number of times WAL buffers were full and forced to disk (wal_buffers tuning indicator)"
+    - wal_write:
+        usage: "COUNTER"
+        description: "Number of WAL buffer write operations"
+    - wal_sync:
+        usage: "COUNTER"
+        description: "Number of WAL fsync operations"
+    - wal_write_time:
+        usage: "COUNTER"
+        description: "Total time spent writing WAL to disk (ms)"
+    - wal_sync_time:
+        usage: "COUNTER"
+        description: "Total time spent syncing WAL to disk (ms)"
+
+# Per-database size. A slot pinning WAL can leave pg_wal hundreds of times larger
+# than the DB content, and the disparity isn't obvious from observability alone.
+# query exposes per-DB size so the next time a slot pins WAL, it's
+# immediately visible whether the DB is huge (re-snapshot expensive,
+# tune up max_slot_wal_keep_size) or tiny (re-snapshot cheap, the
+# default cap is fine).
+pg_database_extended:
+  query: |
+    SELECT
+      datname,
+      pg_database_size(datname) AS size_bytes
+    FROM pg_database
+    WHERE datname NOT IN ('template0', 'template1')
+  master: true
+  cache_seconds: 60
+  metrics:
+    - datname:
+        usage: "LABEL"
+        description: "Database name"
+    - size_bytes:
+        usage: "GAUGE"
+        description: "Database size in bytes"
+
+# Top-N table sizes per database. Surfaces table bloat / runaway
+# inserts. Capped at 25 rows to bound exporter memory + prometheus
+# series cardinality. cache_seconds: 300 (5 min) because table sizes
+# don't change at scrape rates and pg_total_relation_size is not
+# free.
+pg_table_top_sizes:
+  query: |
+    SELECT
+      schemaname AS schema,
+      relname AS table,
+      pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(relname)) AS size_bytes
+    FROM pg_stat_user_tables
+    ORDER BY pg_total_relation_size(quote_ident(schemaname) || '.' || quote_ident(relname)) DESC
+    LIMIT 25
+  master: true
+  cache_seconds: 300
+  metrics:
+    - schema:
+        usage: "LABEL"
+        description: "Schema name"
+    - table:
+        usage: "LABEL"
+        description: "Table name"
+    - size_bytes:
+        usage: "GAUGE"
+        description: "Total relation size in bytes (heap + indexes + TOAST)"
+
+# pg_wal directory absolute size. node-exporter's filesystem metrics
+# get the volume-level view; this query gets the directory-level view
+# so panels can show "/opt/docker-data/docker/volumes/<vol>/_data/pg_wal
+# is N bytes" without operator-shelling. PG 16 emits pg_wal_size()
+# but earlier versions required pg_ls_waldir() summed; we use
+# pg_ls_waldir() for portability.
+pg_wal_dir:
+  query: |
+    SELECT
+      COALESCE(SUM(size), 0)::bigint AS bytes,
+      COUNT(*)::bigint AS segments
+    FROM pg_ls_waldir()
+  master: true
+  metrics:
+    - bytes:
+        usage: "GAUGE"
+        description: "Total bytes in pg_wal directory (segments × 16 MiB at PG default)"
+    - segments:
+        usage: "GAUGE"
+        description: "Number of WAL segment files in pg_wal/. Each segment is 16 MiB by default."

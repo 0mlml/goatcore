@@ -1,0 +1,335 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "goatbuilder config — schema version goatbuilder/v1",
+  "description": "The repo-specific topology goatbuilder reads: components; environments (goatnets), the host sites within them (founder or joiner) and the machine classes within those; how each is converged; the promotion path a change travels; and any sovereign peerings. Everything repo-specific is data here; the model and the deploy contract (docs/design/goatbuilder.md) are the binary. Fail-closed: an unknown or malformed field is an error (ADR 1198).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema"],
+  "if": { "properties": { "preset": { "const": "lite" } }, "required": ["preset"] },
+  "then": {
+    "description": "preset lite: environments and promotion may be absent — the lite: block supplies them (one environment named after the goatnet, one founder site, one class core, one rung); repo and components may be absent — the checkout's own ops/goatbuilder/goatbuilder.yaml supplies them (the loader refuses a lite config that lacks them with no checkout config to take them from)."
+  },
+  "else": { "required": ["repo", "components", "environments", "promotion"] },
+  "properties": {
+    "schema": {
+      "description": "The config's schema version. The binary ships the schema it validates against; a config written for a later version is refused, not guessed at.",
+      "const": "goatbuilder/v1"
+    },
+    "preset": {
+      "description": "A named set of defaults an explicit field overrides. 'full' is this repository's shape: environments and promotion are required. 'lite' is the goatlite preset (ADR 1213, docs/design/goatlite.md): a first goatnet on one box, declared by the four facts of the lite: block (name, host, ssh_user, admin); environments and promotion become optional and derive from it (environment <name with - as _>, converger push-ansible, transport direct, one founder site <name> with class core, one rung), repo and components become optional, taken from the checkout's own ops/goatbuilder/goatbuilder.yaml when it has one and absent when it does not, secrets default to the env-file store, and a standup runs the LAN profile over the same fourteen phases. An explicit field always wins over a derived one.",
+      "enum": ["full", "lite"],
+      "default": "full"
+    },
+    "lite": {
+      "description": "The goatlite preset's input: the four facts a learner writes (goatlite.md §2). Everything else the full shape asks for is derived from them (§3). Only meaningful under preset lite.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "host", "ssh_user", "admin"],
+      "properties": {
+        "name": {
+          "description": "The goatnet's name: its site id is <name>, its ansible group <name with - as _>_hosts, its default zone <name>.lan.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,23}$"
+        },
+        "host": {
+          "description": "The one box: its LAN address or hostname.",
+          "type": "string",
+          "minLength": 1
+        },
+        "ssh_user": {
+          "description": "The SSH user the push converger reaches the box as.",
+          "type": "string",
+          "minLength": 1
+        },
+        "admin": {
+          "description": "The first (and only) administrator's email: site_admins, the bootstrap identity.",
+          "type": "string",
+          "pattern": "^[^@\\s]+@[^@\\s]+$"
+        },
+        "zone": {
+          "description": "The goatnet's DNS zone, served by the box's LAN CoreDNS. Default <name>.lan.",
+          "type": "string",
+          "minLength": 1
+        },
+        "disk_encryption": {
+          "description": "Encrypt the data disk (LUKS). Default true; false is a declared exclusion for a VM (doctrine P2).",
+          "type": "boolean",
+          "default": true
+        },
+        "data_disk": {
+          "description": "The LUKS data volume's device on the box. Default /dev/nvme0n1. Read by the renderer; the binary only validates its shape.",
+          "type": "string",
+          "minLength": 1
+        },
+        "ssh_pubkey": {
+          "description": "Path to the administrator's SSH public key, seeded onto the box. Default the first ~/.ssh/id_*.pub found. Read by the renderer; the binary only validates its shape.",
+          "type": "string",
+          "minLength": 1
+        },
+        "internet": {
+          "description": "Growing out of lite (goatlite.md §6): the public zone and the cloud accounts an internet-enrollable goatnet needs. Shape only in v1 — nothing acts on it yet.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zone"],
+          "properties": {
+            "zone": { "type": "string", "minLength": 1, "description": "The public DNS zone (ACME, relays, enrolment apex)." },
+            "aws_profile": { "type": "string", "minLength": 1, "description": "The AWS profile the relay tier's Terraform tree and SSM door run under." },
+            "cloudflare_token_ref": { "type": "string", "minLength": 1, "description": "A reference to the Cloudflare API token under the declared secrets posture (an op:// reference or an env-file key), never a value." }
+          }
+        }
+      }
+    },
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "image_namespace"],
+      "properties": {
+        "source": {
+          "description": "The release source of record as owner/name, e.g. the GitHub repository that tags and builds releases.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "image_namespace": {
+          "description": "The registry namespace images are published under, e.g. ghcr.io/<org>. Refs are always pinned by digest beneath it (contract C1).",
+          "type": "string",
+          "pattern": "^[a-z0-9.-]+(/[a-z0-9._-]+)+$"
+        },
+        "signing": {
+          "description": "How a published declaration is signed at the source (contract C2): intent-sign for the git-published intents, cosign for a registry-published index.",
+          "enum": ["intent-sign", "cosign"],
+          "default": "intent-sign"
+        }
+      }
+    },
+    "components": {
+      "description": "What can be built and shipped. Keys are component names.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "additionalProperties": { "$ref": "#/definitions/component" }
+    },
+    "environments": {
+      "description": "The goatnets a component is converged in, in no particular order; the promotion path gives the order.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/environment" }
+    },
+    "promotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "description": "The ordered stages a change travels. A stage's gates are the gates of the hop into it; the first stage is the entry and carries none.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/stage" }
+        }
+      }
+    },
+    "peerings": {
+      "description": "Sovereign peerings: a declared relationship between one of our environments and another sovereign goatnet, run as the identical four-step process on each side (ADR 1157) — reachability over a dedicated tunnel, SPIRE-federated trust material, an agreed identity, and one dedicated edge router per partner. Recognition, never authorization.",
+      "type": "array",
+      "items": { "$ref": "#/definitions/peering" }
+    },
+    "deploy": {
+      "description": "How this project's machines and cloud account are reached. Optional: a value not declared here falls back to a name that belongs to no project, and a command that needs an undeclared value says so (docs/design/goatbuilder-portability.md).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "aws_profile": { "type": "string", "minLength": 1, "description": "The AWS profile a run uses. GOAT_AWS_PROFILE overrides it per command; undeclared, the profile is `default`." },
+        "ssh_user": { "type": "string", "minLength": 1, "description": "The account a new machine is first reached as (`join-node`). Undeclared, a plan prints a placeholder and a real run refuses." },
+        "state_dir": { "type": "string", "minLength": 1, "description": "Where this machine keeps the project's local state: goatnet CA keys under <state_dir>/<ca-name>/, standup logs and timings. `~` is the home directory. Undeclared: ~/.goat/state." }
+      }
+    },
+    "secrets": {
+      "description": "The team's declared secrets posture (ADR 1204): where the values a deploy templates are held. goat's own is 1password, references only (ADR 1186); a team adopting goat may choose a simpler store and owns that trade. GOAT_SECRET_STORE overrides it per command. Both avenues read it through ops/secrets/posture.py.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store"],
+      "properties": {
+        "store": {
+          "enum": ["1password", "openbao", "custom", "sops", "git-crypt", "env-file", "env"],
+          "description": "1password, openbao, custom: references in the environment, resolved per command. sops, git-crypt: values encrypted in git. env-file: plaintext values in a gitignored 0600 file. env: values already exported."
+        },
+        "env_file": { "type": "string", "description": "env-file store: the file (default .envrc.local.d/secrets.env)" },
+        "sops_file": { "type": "string", "description": "sops store: the encrypted dotenv file (default secrets.sops.env)" },
+        "git_crypt_file": { "type": "string", "description": "git-crypt store: the dotenv file under a git-crypt filter (default secrets/goat.env)" },
+        "ref_prefix": { "type": "string", "description": "reference stores: what a reference starts with (default op:// or bao://)" },
+        "op_account": { "type": "string", "description": "1password store: the account op:// references resolve against (e.g. example.1password.com), pinned before any op call so it cannot prompt across every configured account. OP_ACCOUNT overrides it per command." }
+      }
+    }
+  },
+  "definitions": {
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["declared_in"],
+      "properties": {
+        "image_workflow": {
+          "description": "The CI workflow file that builds this component's image, by basename; null for an image built elsewhere and only pinned here.",
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._-]+\\.ya?ml$"
+        },
+        "var": {
+          "description": "The variable name a push converger sets to this component's pinned ref (the Ansible group_var today).",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "declared_in": {
+          "description": "Where this component's declaration lives in git — the source of record contract C1 and C3 read (the pins file today).",
+          "type": "string",
+          "minLength": 1
+        },
+        "ledger": {
+          "description": "The name of this component's per-machine record (the deploy ledger directory under /var/lib/goat today) — contract C7's verification surface. Defaults to the component name.",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        }
+      }
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "converger": {
+      "description": "What makes actual match declared: an operator-driven Ansible push, or the on-host pull agent.",
+      "enum": ["push-ansible", "pull-agent"]
+    },
+    "transport": {
+      "description": "How a push converger reaches an environment's hosts. direct = SSH over the mesh with an inventory: the routine path, minutes, open to every deployer on the environment's mesh. ssm = an SSM port-forward door through the environment's cloud mesh peer, open to every deployer with the provider credentials: bootstrap and break-glass grade — sessions idle out at about 20 minutes and long plays over it have died mid-run — used only when the operator's machine is not on the environment's mesh. The resolver always prefers the mesh when the operator is on the environment's profile; a pull converger needs no transport at all — the agent reaches out. An address on one operator's own network (Tailscale is the bad-day path of ADR 1114, never a transport) is not a value here: it is reachable from one machine, and doctor refuses an environment that has nothing else.",
+      "enum": ["direct", "ssm"]
+    },
+    "class": {
+      "description": "A machine class within a site (core, obs, breakglass, network-jump, pod, …). It may override the converger — the pull chain's unit of adoption is one class at one site.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "converger": { "$ref": "#/definitions/converger" }
+      }
+    },
+    "site": {
+      "description": "A host site within an environment (ADR 1141's four-node baseline is one site). The first site of a goatnet is its founder — it originates the account, the CA and the declared ACL; any other is a joiner that attaches to the founder's (ADR 1084).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/definitions/name" },
+        "role": { "enum": ["founder", "joiner"], "default": "founder" },
+        "joins": {
+          "description": "For a joiner: the founder site it attaches to, by name, in the same environment.",
+          "$ref": "#/definitions/name"
+        },
+        "converger": { "$ref": "#/definitions/converger" },
+        "transport": { "$ref": "#/definitions/transport" },
+        "inventory": { "type": "string", "minLength": 1 },
+        "classes": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_-]*$" },
+          "additionalProperties": { "$ref": "#/definitions/class" }
+        }
+      },
+      "if": { "properties": { "role": { "const": "joiner" } }, "required": ["role"] },
+      "then": { "required": ["name", "role", "joins"] }
+    },
+    "environment": {
+      "description": "A goatnet. Its converger, transport and inventory are defaults every site and class inherits unless they override them. With no sites block it is one founder site.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "converger"],
+      "properties": {
+        "name": { "$ref": "#/definitions/name" },
+        "converger": { "$ref": "#/definitions/converger" },
+        "transport": { "$ref": "#/definitions/transport" },
+        "groups": {
+          "description": "The inventory groups a push converger targets for this environment (the goatnet's members in the pins today). doctor reads their group_vars to derive which environment variables each component's deploy templates, so a missing secret is named before any host is touched.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/name" }
+        },
+        "inventory": {
+          "description": "The inventory file under ops/ansible/ a push converger loads for this environment.",
+          "type": "string",
+          "minLength": 1
+        },
+        "sites": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/site" }
+        }
+      }
+    },
+    "gate": {
+      "description": "A condition that must hold before a change enters a stage. The vocabulary is the release ladder's (ops/release/ladder.yaml hops), not a new one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "enum": ["candidate-record", "validation-evidence", "soak", "convergence-evidence", "operator-ack", "health"]
+        },
+        "min_days": {
+          "description": "For a soak gate: the minimum days the change must have held on the previous stage.",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "if": { "properties": { "id": { "const": "soak" } } },
+      "then": { "required": ["id", "min_days"] }
+    },
+    "stage": {
+      "description": "One step on the promotion path. A rung is an environment; a ring is a machine population within an environment (canary before stable); a tier is a geographic seam a change spreads along. The gate logic is the same for every kind.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": { "$ref": "#/definitions/name" },
+        "kind": { "enum": ["rung", "ring", "tier"] },
+        "environment": {
+          "description": "The environment this stage converges in. Required for a rung; a ring or tier names the environment it subdivides.",
+          "$ref": "#/definitions/name"
+        },
+        "gates": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/gate" }
+        }
+      },
+      "if": { "properties": { "kind": { "const": "rung" } } },
+      "then": { "required": ["name", "kind", "environment"] }
+    },
+    "peering": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["with", "environment", "site", "edge_class"],
+      "properties": {
+        "with": {
+          "description": "The partner's sovereign identifier — the short code its trust domain and ingress prefix are named by.",
+          "$ref": "#/definitions/name"
+        },
+        "environment": { "$ref": "#/definitions/name" },
+        "site": {
+          "description": "Which of our sites in that environment hosts the edge.",
+          "$ref": "#/definitions/name"
+        },
+        "edge_class": {
+          "description": "The class at that site that runs the dedicated edge router for this partner (ADR 1157 step 4: one zenohd per partner, trusting only that partner's bundle).",
+          "$ref": "#/definitions/name"
+        },
+        "tunnel": {
+          "description": "Step 1: the dedicated tunnel between the two edge hosts, on neither management plane.",
+          "enum": ["wireguard", "ipsec"],
+          "default": "wireguard"
+        },
+        "trust": {
+          "description": "Step 2: how trust material is exchanged and refreshed. v1 knows one mechanism.",
+          "const": "spire-federation"
+        },
+        "ingress_prefix": {
+          "description": "The key prefix the partner's data arrives under on our side, so provenance is in the name (cross-sovereign-federation.md §5.6).",
+          "type": "string",
+          "pattern": "^from/[a-z0-9][a-z0-9-]*/$"
+        }
+      }
+    }
+  }
+}

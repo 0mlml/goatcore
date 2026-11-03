@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# image-digest — print the manifest digest (sha256:…) of an image reference.
+#
+#   ops/scripts/image-digest ghcr.io/usareur-af/<image>:<tag>
+#
+# Tries crane, then skopeo, then docker buildx imagetools — whichever is
+# installed (ADR 1204: no single tool is required). Each tool's own error is
+# kept and printed when none answers, so a missing tool or a refused login never
+# reads as "image not found" (the panoscope rc.1 run, 2026-10-28).
+set -uo pipefail
+[ $# -eq 1 ] || { echo "usage: image-digest <image-ref>" >&2; exit 2; }
+ref="$1"; errs=""; tried=""
+if command -v crane >/dev/null 2>&1; then
+  tried="$tried crane"
+  if out="$(crane digest "$ref" 2>&1)" && [[ "$out" == sha256:* ]]; then echo "$out"; exit 0; fi
+  errs="$errs\n  crane: ${out}"
+fi
+if command -v skopeo >/dev/null 2>&1; then
+  tried="$tried skopeo"
+  if out="$(skopeo inspect --format '{{.Digest}}' "docker://$ref" 2>&1)" && [[ "$out" == sha256:* ]]; then echo "$out"; exit 0; fi
+  errs="$errs\n  skopeo: ${out}"
+fi
+if command -v docker >/dev/null 2>&1; then
+  tried="$tried docker"
+  if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+    d="$(printf '%s\n' "$out" | awk '/^Digest:/{print $2; exit}')"
+    [[ "$d" == sha256:* ]] && { echo "$d"; exit 0; }
+  fi
+  errs="$errs\n  docker buildx imagetools: ${out}"
+fi
+if [ -z "$tried" ]; then
+  echo "image-digest: none of crane, skopeo or docker is installed — install one (brew install crane)" >&2
+  exit 127
+fi
+printf 'image-digest: no digest for %s from%s:%b\n' "$ref" "$tried" "$errs" >&2
+exit 1

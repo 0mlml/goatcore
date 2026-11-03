@@ -1,0 +1,307 @@
+diff --git a/client/internal/engine.go b/client/internal/engine.go
+index 3bd0d4621..b880c4566 100644
+--- a/client/internal/engine.go
++++ b/client/internal/engine.go
+@@ -1362,6 +1362,17 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
+ 
+ 		e.statusRecorder.FinishPeerListModifications()
+ 
++		// ADR 1081 L1: peers listed in the network map are reported online by
++		// management (offline peers arrive on a separate list). That is the
++		// positive signal to half-open any offer circuit breaker that had
++		// opened while the peer was unreachable, so re-dial is event-driven
++		// rather than a poll into the void.
++		for _, p := range remotePeers {
++			if c, ok := e.peerStore.PeerConn(p.GetWgPubKey()); ok {
++				c.OnPeerReportedOnline()
++			}
++		}
++
+ 		e.updatePeerSSHHostKeys(remotePeers)
+ 
+ 		if err := e.updateSSHClientConfig(remotePeers); err != nil {
+diff --git a/client/internal/peer/breaker.go b/client/internal/peer/breaker.go
+new file mode 100644
+index 000000000..9e3e9753b
+--- /dev/null
++++ b/client/internal/peer/breaker.go
+@@ -0,0 +1,118 @@
++package peer
++
++import (
++	"sync"
++	"time"
++)
++
++// goat ADR 1081 (control-plane storm resilience) Layer 1: per-peer-pair offer
++// circuit breaker.
++//
++// During the 2026-07-15 ZAGROS collapse, clients kept sending offers to peers
++// whose signal streams were absent — the sends failed (notfound / deadline)
++// but the retry cadence never relented, so ~90 peers poured undeliverable
++// offers into a saturated uplink. The breaker makes that load decay: after a
++// run of failed sends to one peer it stops blind-retrying, and re-dials only
++// on a positive signal — either management reporting that peer online again
++// (an event the client already receives on every network-map update) or a
++// slow fallback probe if that event is lost.
++const (
++	// breakerFailureThreshold is the number of consecutive failed offer sends
++	// to one peer before the breaker opens.
++	breakerFailureThreshold = 5
++	// breakerProbeInterval is the fallback half-open window: if no online
++	// report arrives, the breaker still permits one probe this often. It is
++	// the safety net for a lost network-map event, not the primary re-dial
++	// path (that is OnPeerReportedOnline).
++	breakerProbeInterval = 5 * time.Minute
++)
++
++type breakerState int
++
++const (
++	breakerClosed   breakerState = iota // sends allowed; counting failures
++	breakerOpen                         // sends suppressed until a probe is permitted
++	breakerHalfOpen                     // exactly one probe permitted
++)
++
++// pairBreaker is the offer circuit breaker for a single peer-pair. Safe for
++// concurrent use: the guard loop calls Allow/OnResult while the engine calls
++// OnPeerReportedOnline from the management update path.
++type pairBreaker struct {
++	mu       sync.Mutex
++	state    breakerState
++	failures int
++	openedAt time.Time
++
++	// now is injectable for tests; nil uses time.Now.
++	now func() time.Time
++}
++
++func newPairBreaker() *pairBreaker {
++	return &pairBreaker{state: breakerClosed}
++}
++
++func (b *pairBreaker) clock() time.Time {
++	if b.now != nil {
++		return b.now()
++	}
++	return time.Now()
++}
++
++// Allow reports whether an offer send should proceed now. When the breaker is
++// open it stays suppressed until breakerProbeInterval has elapsed, at which
++// point it transitions to half-open and permits a single probe.
++func (b *pairBreaker) Allow() bool {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	switch b.state {
++	case breakerOpen:
++		if b.clock().Sub(b.openedAt) >= breakerProbeInterval {
++			b.state = breakerHalfOpen
++			return true
++		}
++		return false
++	default: // breakerClosed, breakerHalfOpen
++		return true
++	}
++}
++
++// OnResult records the outcome of an attempted offer send. Success closes the
++// breaker; a failure counts toward the threshold when closed, or re-opens the
++// breaker (restarting the probe timer) when it was a half-open probe.
++func (b *pairBreaker) OnResult(success bool) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	if success {
++		b.state = breakerClosed
++		b.failures = 0
++		return
++	}
++
++	switch b.state {
++	case breakerHalfOpen:
++		b.state = breakerOpen
++		b.openedAt = b.clock()
++	case breakerClosed:
++		b.failures++
++		if b.failures >= breakerFailureThreshold {
++			b.state = breakerOpen
++			b.openedAt = b.clock()
++		}
++	}
++}
++
++// OnPeerReportedOnline is the positive management signal that a peer is
++// reachable again. It half-opens an open breaker so the next guard tick probes
++// immediately instead of waiting out breakerProbeInterval. It never suppresses
++// a closed breaker.
++func (b *pairBreaker) OnPeerReportedOnline() {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	if b.state == breakerOpen {
++		b.state = breakerHalfOpen
++	}
++}
+diff --git a/client/internal/peer/breaker_test.go b/client/internal/peer/breaker_test.go
+new file mode 100644
+index 000000000..00927d2ff
+--- /dev/null
++++ b/client/internal/peer/breaker_test.go
+@@ -0,0 +1,102 @@
++package peer
++
++import (
++	"testing"
++	"time"
++)
++
++func TestBreakerOpensAfterThreshold(t *testing.T) {
++	b := newPairBreaker()
++
++	// below threshold the breaker stays closed and keeps allowing sends
++	for i := 0; i < breakerFailureThreshold-1; i++ {
++		if !b.Allow() {
++			t.Fatalf("send %d should be allowed while closed", i)
++		}
++		b.OnResult(false)
++	}
++	if !b.Allow() {
++		t.Fatal("still closed before the threshold-crossing failure")
++	}
++	b.OnResult(false) // threshold-th consecutive failure -> open
++
++	if b.Allow() {
++		t.Fatal("breaker should be open and suppress sends after threshold failures")
++	}
++}
++
++func TestBreakerSuccessResetsFailureRun(t *testing.T) {
++	b := newPairBreaker()
++	for i := 0; i < breakerFailureThreshold-1; i++ {
++		b.OnResult(false)
++	}
++	b.OnResult(true) // success resets the run
++
++	// a fresh run of failures below threshold must not open the breaker
++	for i := 0; i < breakerFailureThreshold-1; i++ {
++		b.OnResult(false)
++	}
++	if !b.Allow() {
++		t.Fatal("breaker should still be closed; success reset the failure count")
++	}
++}
++
++func TestBreakerTimerFallbackHalfOpen(t *testing.T) {
++	now := time.Unix(1000, 0)
++	b := newPairBreaker()
++	b.now = func() time.Time { return now }
++
++	for i := 0; i < breakerFailureThreshold; i++ {
++		b.OnResult(false)
++	}
++	if b.Allow() {
++		t.Fatal("breaker open, should suppress before probe window")
++	}
++
++	now = now.Add(breakerProbeInterval - time.Second)
++	if b.Allow() {
++		t.Fatal("still inside probe window, should suppress")
++	}
++
++	now = now.Add(2 * time.Second) // now past breakerProbeInterval
++	if !b.Allow() {
++		t.Fatal("probe window elapsed, should permit one half-open probe")
++	}
++	// a failed probe re-opens and restarts the window
++	b.OnResult(false)
++	if b.Allow() {
++		t.Fatal("failed probe should re-open the breaker")
++	}
++}
++
++func TestBreakerPeerOnlineHalfOpensImmediately(t *testing.T) {
++	now := time.Unix(1000, 0)
++	b := newPairBreaker()
++	b.now = func() time.Time { return now }
++
++	for i := 0; i < breakerFailureThreshold; i++ {
++		b.OnResult(false)
++	}
++	if b.Allow() {
++		t.Fatal("breaker should be open")
++	}
++
++	// mgmt reports the peer online well before the fallback window
++	b.OnPeerReportedOnline()
++	if !b.Allow() {
++		t.Fatal("online report should half-open the breaker for an immediate probe")
++	}
++	// a successful probe closes the breaker
++	b.OnResult(true)
++	if !b.Allow() {
++		t.Fatal("successful probe should close the breaker")
++	}
++}
++
++func TestBreakerOnlineReportNoopWhenClosed(t *testing.T) {
++	b := newPairBreaker()
++	b.OnPeerReportedOnline() // must not disturb a healthy closed breaker
++	if !b.Allow() {
++		t.Fatal("closed breaker must keep allowing sends")
++	}
++}
+diff --git a/client/internal/peer/conn.go b/client/internal/peer/conn.go
+index 1e416bfe7..6b823db3e 100644
+--- a/client/internal/peer/conn.go
++++ b/client/internal/peer/conn.go
+@@ -127,6 +127,9 @@ type Conn struct {
+ 	guard *guard.Guard
+ 	wg    sync.WaitGroup
+ 
++	// breaker suppresses blind offer retries to an unreachable peer. ADR 1081 L1.
++	breaker *pairBreaker
++
+ 	// debug purpose
+ 	dumpState *stateDump
+ 
+@@ -162,6 +165,7 @@ func NewConn(config ConnConfig, services ServiceDependencies) (*Conn, error) {
+ 		endpointUpdater:    NewEndpointUpdater(connLog, config.WgConfig, isController(config)),
+ 		wgWatcher:          NewWGWatcher(connLog, config.WgConfig.WgInterface, config.Key, dumpState),
+ 		metricsRecorder:    services.MetricsRecorder,
++		breaker:            newPairBreaker(),
+ 	}
+ 
+ 	return conn, nil
+@@ -605,12 +609,29 @@ func (conn *Conn) handleRelayDisconnectedLocked() {
+ }
+ 
+ func (conn *Conn) onGuardEvent() {
++	// ADR 1081 L1: skip blind retries to an unreachable peer. The breaker
++	// re-opens the door on a mgmt online report (OnPeerReportedOnline) or the
++	// fallback probe window, so this suppresses signal load without stranding
++	// a peer that comes back.
++	if !conn.breaker.Allow() {
++		conn.Log.Debugf("offer send suppressed by circuit breaker; awaiting peer-online report or probe window")
++		return
++	}
+ 	conn.dumpState.SendOffer()
+-	if err := conn.handshaker.SendOffer(); err != nil {
++	err := conn.handshaker.SendOffer()
++	conn.breaker.OnResult(err == nil)
++	if err != nil {
+ 		conn.Log.Errorf("failed to send offer: %v", err)
+ 	}
+ }
+ 
++// OnPeerReportedOnline half-opens the offer circuit breaker when management
++// reports this peer online, letting the next guard tick probe immediately.
++// ADR 1081 L1.
++func (conn *Conn) OnPeerReportedOnline() {
++	conn.breaker.OnPeerReportedOnline()
++}
++
+ func (conn *Conn) onWGDisconnected() {
+ 	conn.mu.Lock()
+ 	defer conn.mu.Unlock()

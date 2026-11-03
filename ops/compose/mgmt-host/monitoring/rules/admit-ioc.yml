@@ -1,0 +1,143 @@
+# Admit-IOC alert rules.
+#
+# C3 of docs/design/mgmt-plane-threat-mitigations.md §2.1.
+# Consumes metrics emitted by the admit-audit sidecar (ops/admit-audit/),
+# scraped by this Prometheus via the compose network.
+#
+# Threat model recap — coincident-infiltration + partition:
+#   Adversary compromises admin creds at one site AND severs its
+#   uplink, then admits themselves silently via the local mgmt API.
+#   On reconnect, the admit replicates cluster-wide. Signature: a
+#   cluster of enrollments during a partition window from one
+#   source-user with fresh WG keys.
+#
+# Metrics consumed:
+#   admit_audit_admits_total{site, account_id, source_user}    (counter)
+#   admit_audit_peers_total_bywindow{site, window}              (gauge)
+#   admit_audit_peers_per_source_user_max{site, window}         (gauge)
+#   admit_audit_distinct_wg_keys_bywindow{site, window}         (gauge)
+#   up{job="admit-audit"}                                       (built-in)
+#
+# Metric for partition detection:
+#   spock_subscription_lag_replicating{site, subscription_name}  (postgres-exporter
+#      custom query — see monitoring/postgres-exporter-queries.yml. The
+#      metric is 1 when the subscription is actively replicating, 0 when
+#      detached / partitioned. Naming is queryname_columnname per
+#      postgres-exporter convention: query `spock_subscription_lag` +
+#      column `replicating` -> `spock_subscription_lag_replicating`.)
+#
+# Thresholds assume a baseline of single-digit admits/week
+# in normal ops); tune per-site as real traffic settles. See
+# docs/design/mgmt-plane-threat-mitigations.md §2.1 for the design
+# intent; numeric thresholds live here so they can be A/B'd without
+# changing design-doc prose.
+
+groups:
+
+  - name: admit-audit.availability
+    interval: 30s
+    rules:
+
+      # Scraper visibility loss is itself a signal — if the sidecar
+      # stops scraping, an adversary could admit with no audit
+      # record. Lights up before the other IOCs can fire.
+      - alert: AdmitAuditDown
+        expr: up{job="admit-audit"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: admit-audit
+        annotations:
+          summary: "admit-audit sidecar at {{ $labels.site }}:{{ $labels.instance }} unreachable for 2m"
+          description: "Prometheus cannot scrape admit-audit /metrics. Audit log visibility into new peer admits is lost — an adversary could enroll peers with no alert coverage until the sidecar returns. Check `docker compose ps admit-audit` on the mgmt-host and inspect `docker logs admit-audit` for DB/auth failures."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/ops/admit-audit/README.md"
+
+  - name: admit-audit.ioc
+    interval: 30s
+    rules:
+
+      # IOC #1 — Rate spike against 24h baseline.
+      # Fires when current 5m admit rate exceeds 3x the 24h average
+      # rate (sampled every 5m via :5m subquery). A sudden burst
+      # relative to the site's own history, independent of absolute
+      # threshold — so it adapts to per-site normal.
+      - alert: AdmitRateSpike
+        expr: |
+          (
+            sum by (site) (rate(admit_audit_admits_total[5m]))
+              >
+            3 * sum by (site) (avg_over_time(rate(admit_audit_admits_total[5m])[24h:5m]))
+          )
+          and
+          sum by (site) (rate(admit_audit_admits_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: admit-audit
+          ioc: rate_spike
+        annotations:
+          summary: "Admit rate at {{ $labels.site }} is >3x its 24h baseline for 5m"
+          description: "Sustained burst of peer admits relative to this site's own 24h average. Possible indicators: bulk-enroll event (benign if announced), automated churn from a test harness, or coincident-infiltration. Cross-check operator activity + review admit-audit JSON log for source_user clustering."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/ops/admit-audit/README.md"
+
+      # IOC #2 — Burst during an active partition.
+      # This is the direct coincident-infiltration signature: admits
+      # happening while the Spock subscription is not replicating
+      # (i.e. this site is partitioned from its cluster peer). Fires
+      # instantly on five admits during a partition — lower bar than
+      # rate-spike because the conditional context is already
+      # suspicious.
+      #
+      # `spock_subscription_lag_replicating == 0` means at least one
+      # subscription is detached. We take min() over subscriptions so
+      # any detached subscription (not requiring all) triggers the
+      # partition condition.
+      - alert: AdmitBurstDuringPartition
+        expr: |
+          sum by (site) (increase(admit_audit_admits_total[5m])) > 5
+          and on (site)
+          min by (site) (spock_subscription_lag_replicating) == 0
+        for: 0m
+        labels:
+          severity: critical
+          component: admit-audit
+          ioc: partition_burst
+        annotations:
+          summary: "Admit burst during partition at {{ $labels.site }} — coincident-infiltration signature"
+          description: "More than 5 peer admits in 5m while this site's Spock subscription is NOT replicating (partition active). This is the direct signature described in docs/design/mgmt-plane-threat-mitigations.md §2.1. Investigate immediately: who is the source_user of the most recent admit-audit JSON events, and was the admission authorized during the partition window? Consider Primary Ops revoke-and-review per C4 (deferred in MVP)."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/ops/admit-audit/README.md"
+
+      # IOC #3 — One source_user burst-enrolling.
+      # Fires when the max per-source-user admit count in the 5m
+      # rolling window reaches 5. A single operator admitting five
+      # peers in 5 minutes is anomalous at that baseline; if
+      # it's a legitimate bulk-enroll, the operator should
+      # acknowledge this alert rather than have it suppressed.
+      - alert: AdmitSameSourceUserManyKeys
+        expr: admit_audit_peers_per_source_user_max{window="5m0s"} >= 5
+        for: 0m
+        labels:
+          severity: warning
+          component: admit-audit
+          ioc: same_source_user
+        annotations:
+          summary: "Source user has admitted >=5 peers in 5m at {{ $labels.site }}"
+          description: "One source_user account has issued 5+ admits within the sidecar's 5m rolling window. Cross-check identity vs known operators + whether a bulk-enroll was scheduled. If unknown source_user, treat as potential credential compromise — disable account + review admit-audit JSON log for peer_ids."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/ops/admit-audit/README.md"
+
+      # IOC #4 — Distinct fresh WG keys spike.
+      # Netbird generates a new WG pubkey per peer enrollment. An
+      # unusual number of distinct keys in 5m catches mass-enroll
+      # regardless of which source_user did each admit (defeats
+      # source_user rotation evasion).
+      - alert: AdmitDistinctKeysSpike
+        expr: admit_audit_distinct_wg_keys_bywindow{window="5m0s"} >= 10
+        for: 0m
+        labels:
+          severity: warning
+          component: admit-audit
+          ioc: distinct_keys_spike
+        annotations:
+          summary: ">=10 distinct WireGuard keys enrolled at {{ $labels.site }} in 5m"
+          description: "Ten or more distinct WG pubkeys in the 5m rolling window. Catches multi-source-user mass-enroll that would evade the per-source-user IOC. Legitimate only during a planned batch deployment — cross-check the change calendar."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/ops/admit-audit/README.md"

@@ -1,0 +1,48 @@
+# oauth2-proxy-dashboard-admin overlay — the fence in front of the admin
+# dashboard (docs/design/mesh-change-control.md §2, ADR 1189).
+#
+# The same oauth2-proxy-dashboard role renders this instance with different
+# values (dashboard-fence-deploy.yml, second play):
+#   host       admin-dashboard.<site>.<zone>
+#   client     oauth2-proxy-dashboard-admin (its own Hydra client)
+#   groups     NETBIRD-ADMIN (dashboard_admin_oauth2_proxy_allowed_groups)
+#   upstream   http://dashboard-admin:80
+#
+# Deployed only when netbird_dashboard_split_enabled is true.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.oauth2-proxy-dashboard-admin.yml up -d oauth2-proxy-dashboard-admin
+
+services:
+  oauth2-proxy-dashboard-admin:
+    # Same upstream image and digest as oauth2-proxy-dashboard; its own env
+    # var so the two roll back independently (ADR 0859).
+    image: ${OAUTH2_PROXY_DASHBOARD_ADMIN_IMAGE:-quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d}
+    container_name: oauth2-proxy-dashboard-admin
+    restart: unless-stopped
+    # On-host OIDC-discovery resolution, same as oauth2-proxy-dashboard.
+    extra_hosts:
+      - "${OAUTH2_PROXY_DASHBOARD_ADMIN_OIDC_HOST_ENTRY:-localhost.invalid:127.0.0.1}"
+    env_file:
+      - oauth2-proxy-dashboard-admin.env
+    # Loopback-only diagnostic port (4181 dashboard fence, 4182 id-console
+    # fence, 4183 relay-health fence).
+    ports:
+      - "127.0.0.1:${DASHBOARD_ADMIN_OAUTH2_PROXY_HOST_PORT:-4184}:4180"
+    networks:
+      - mgmt
+    # Distroless image, no shell to run a probe in.
+    healthcheck:
+      test: ["NONE"]
+    # The everyday dashboard fence sits at ~11 MiB.
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "block=mesh-change-control"
+
+networks:
+  mgmt:
+    external: true
+    name: mgmt

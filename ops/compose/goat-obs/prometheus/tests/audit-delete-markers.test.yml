@@ -1,0 +1,189 @@
+# promtool unit test for the two F-171/F-372 delete-marker alerts in
+# audit-subscriber.yml.
+#
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/audit-delete-markers.test.yml
+#
+# The point of this test is that a bare `> 0.5 for: 6h` does not fire on the
+# condition these rules exist to catch. So the cases below are anchored on
+# realistic numbers rather than round ones, and the healthy case
+# reproduces the SAWTOOTH that makes a bare threshold wrong:
+#
+#   broken bucket
+#     minio_bucket_usage_deletemarker_total{audit-integrity}   370043
+#     minio_bucket_usage_version_total{audit-integrity}        959976
+#     ratio                                                     0.385
+#
+# A healthy bucket cycles: markers appear as current versions expire and are
+# reclaimed on the next ExpiredObjectDeleteMarker pass, so the ratio rises and
+# falls. What distinguishes broken from healthy is not the PEAK — a healthy
+# peak can exceed a broken floor — it is whether the floor ever comes down.
+# Hence min_over_time, and hence a healthy series here that PEAKS ABOVE the
+# 0.2 threshold and must still stay quiet.
+rule_files:
+  - ../rules/audit-subscriber.yml
+
+evaluation_interval: 10m
+
+tests:
+
+  # ---------------------------------------------------------------- broken --
+  - name: markers accumulate and are never reclaimed (the F-171 tail)
+    interval: 10m
+    input_series:
+      # 300 samples x 10m = 50h, enough to fill the 48h lookback window.
+      # Held at the broken ratio: 370043 / 959976 = 0.3854.
+      - series: 'minio_bucket_usage_deletemarker_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '370043x300'
+      - series: 'minio_bucket_usage_version_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '959976x300'
+      - series: 'minio_bucket_usage_object_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '925142x300'
+    alert_rule_test:
+      # 48h of lookback + the 1h hold-down. Fires.
+      - eval_time: 49h
+        alertname: AuditBucketDeleteMarkersNeverReclaimed
+        exp_alerts:
+          - exp_labels:
+              bucket: audit-integrity
+              job: minio-bucket
+              severity: warning
+              component: minio
+            exp_annotations:
+              summary: "audit-integrity delete markers are never reclaimed (48h floor 38.55% of versions)"
+              description: |
+                Across two full scanner passes, delete markers never fell below a
+                fifth of audit-integrity's object versions. They are accumulating,
+                not cycling.
+
+                This will NOT show up in bucket size, quota utilisation, or any
+                other byte-oriented metric — a delete marker with nothing beneath
+                it stores nothing. It shows up as CPU: the scanner walks every one
+                of them on every pass.
+
+                FIRST THING TO CHECK — is the clause even there:
+                  mc ilm rule list <alias>/audit-integrity
+                The EXPIRE DELETEMARKER column must read `true` on a rule. If no
+                rule has it, this is F-171's tail returning: re-run the
+                audit-subscriber role with `--tags lifecycle`. If a rule DOES have
+                it, the clause is present and the scanner is behind — check
+                `mc admin config get <alias> scanner`.
+
+                F-171, F-372, docs/design/audit-cold-storage-offload.md.
+      # A bucket that is expiring things is NOT the lifecycle-missing case.
+
+  # --------------------------------------------------------------- healthy --
+  - name: markers cycle — peaks above the threshold, floor comes down, stays quiet
+    interval: 10m
+    input_series:
+      # A sawtooth against a fixed 1,000,000 versions: climbs to 300,000
+      # (ratio 0.30 — ABOVE the 0.2 threshold, which is the whole point) and
+      # is reclaimed to 10,000 (0.01) on each scanner pass. Two full cycles
+      # inside the 48h window.
+      #
+      # A bare `> 0.2` threshold would fire on every peak here. min_over_time
+      # sees the floor at 0.01 and correctly says nothing.
+      - series: 'minio_bucket_usage_deletemarker_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '10000+2000x145 10000+2000x145 10000x10'
+      - series: 'minio_bucket_usage_version_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '1000000x300'
+      - series: 'minio_bucket_usage_object_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '900000x300'
+    alert_rule_test:
+      - eval_time: 49h
+        alertname: AuditBucketDeleteMarkersNeverReclaimed
+        exp_alerts: []
+
+  # ------------------------------------------------- no lifecycle rule at all --
+  - name: the post-reclaim state stays quiet
+    interval: 10m
+    input_series:
+      # A realistic "healthy" case: the numbers one scanner pass after the
+      # ExpiredObjectDeleteMarker clause takes effect:
+      #
+      #   markers   531,232 -> 34,834   (-93.4%)
+      #   versions 1,121,453 -> 626,216
+      #   ratio        0.385 -> 0.0556
+      #
+      # This case is what makes 0.2 a validated threshold rather than a guess:
+      # the broken case above proves it fires at 0.385, this one proves it is
+      # quiet at 0.056. A threshold checked on only one side will not fire.
+      - series: 'minio_bucket_usage_deletemarker_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '34834x300'
+      - series: 'minio_bucket_usage_version_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '626216x300'
+      - series: 'minio_bucket_usage_object_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '591382x300'
+    alert_rule_test:
+      - eval_time: 49h
+        alertname: AuditBucketDeleteMarkersNeverReclaimed
+        exp_alerts: []
+      # Markers are present and nonzero, so the lifecycle IS configured.
+
+  # ------------- a goatnet that scrapes NONE of these metrics stays silent ----
+  - name: no audit-subscriber and no minio-bucket job — every alert in this file is quiet
+    interval: 10m
+    # DELIBERATELY NO input_series. This is the fitness test for listing
+    # audit-subscriber.yml in obs-host's `obs_rule_files`: an obs stack that
+    # scrapes neither the audit-subscriber nor the minio-bucket job must get
+    # silence, not a permanent false alarm.
+    #
+    # The rule that made this necessary is tls-cert-renewal.yml, which is
+    # excluded from that list precisely because its guard is
+    # `absent(probe_ssl_earliest_cert_expiry{...})` — TRUE wherever blackbox is
+    # not scraped, so it fires forever on arrival. None of the six alerts in
+    # audit-subscriber.yml use absent(); every one is a positive condition over
+    # a series that simply will not exist, which yields an empty vector.
+    #
+    # The neighbouring entries in obs_rule_files (bandwidth-attribution,
+    # mesh-liveness) each carry a case exactly like this one, and say the
+    # silence is asserted rather than assumed. This is that assertion.
+    input_series: []
+    alert_rule_test:
+      - eval_time: 8d
+        alertname: AuditSubscriberPutsFailing
+        exp_alerts: []
+      - eval_time: 8d
+        alertname: AuditSubscriberStalled
+        exp_alerts: []
+      - eval_time: 8d
+        alertname: AuditBucketQuotaHigh
+        exp_alerts: []
+      - eval_time: 8d
+        alertname: AuditBucketQuotaCritical
+        exp_alerts: []
+      - eval_time: 8d
+        alertname: AuditBucketDeleteMarkersNeverReclaimed
+        exp_alerts: []
+
+  # ------------------------------------------- small bucket, no false alarm --
+  - name: zero markers on a loaded bucket is the HEALTHY shape, not a missing lifecycle
+    interval: 10m
+    input_series:
+      # A goatnet's first minio-bucket scrape: 251,864 objects, 251,864 versions,
+      # ZERO delete
+      # markers — and `mc ilm rule list` shows the lifecycle present and
+      # enabled, including audit-integrity-zombie-delete-markers
+      # (ExpiredObjectDeleteMarker, 0 days), whose job is to keep that count
+      # at zero.
+      #
+      # AuditBucketLifecycleMissing used to assert on exactly this input and
+      # is retired: it read a working lifecycle as a missing one. The
+      # case is kept, inverted, so nobody re-derives the same inference — this
+      # input must produce NO alerts from this file.
+      - series: 'minio_bucket_usage_deletemarker_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '0x1200'
+      - series: 'minio_bucket_usage_version_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '251864x1200'
+      - series: 'minio_bucket_usage_object_total{bucket="audit-integrity",job="minio-bucket"}'
+        values: '251864x1200'
+    alert_rule_test:
+      - eval_time: 8d
+        alertname: AuditBucketDeleteMarkersNeverReclaimed
+        exp_alerts: []
+      - eval_time: 8d
+        alertname: AuditBucketQuotaHigh
+        exp_alerts: []
+      - eval_time: 8d
+        alertname: AuditBucketQuotaCritical
+        exp_alerts: []
+

@@ -1,0 +1,92 @@
+# promtool unit tests for the absent()-guarded alerts (rules/zenoh-wedge.yml).
+#
+# Run by .github/workflows/prometheus-rules.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/absent-guards.test.yml
+#
+# What is being pinned: a value-comparison alert matches NOTHING when its
+# series is deleted rather than frozen, so silence reads as health. The
+# absent() companions close that. Each case asserts both directions — the
+# companion fires on deletion AND stays quiet where it should — because an
+# absent() rule with a bad guard is a pager that never stops.
+rule_files:
+  - ../rules/zenoh-wedge.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Metric published for 30m then DELETED (series stops). Absent-guard must fire.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_fabric_sampled_at_seconds{router="zagros-router"}'
+        values: '1000+0x30'
+      - series: 'goat_zenoh_budget_source_live{router="zagros-router"}'
+        values: '1+0x30'
+    alert_rule_test:
+      # t=20m: metric still being published -> silent.
+      - eval_time: 20m
+        alertname: ZenohFabricSamplerAbsent
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ZenohTopicBudgetSourceAbsent
+        exp_alerts: []
+      # t=40m: last sample 30m, +5m lookback -> absent from 35m; for:15m not met.
+      - eval_time: 40m
+        alertname: ZenohFabricSamplerAbsent
+        exp_alerts: []
+      # t=55m: absent since 35m -> 20m > for:15m -> FIRING.
+      - eval_time: 55m
+        alertname: ZenohFabricSamplerAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-router
+            exp_annotations:
+              summary: "fabric-sample metric DISAPPEARED (not stale — gone)"
+              description: |
+                goat_zenoh_fabric_sampled_at_seconds was being published within the
+                last 6h and is now absent entirely, so ZenohFabricSamplerStale has
+                nothing to compare and stays silent. The band JSON was deleted or
+                lost its `fabric` block while zenoh-health-to-prom keeps running.
+                Cardinality precursors (goat_zenoh_stored_keys_*, owner cardinality,
+                admin walk latency) are not frozen — they are GONE, and every
+                precursor alert riding on them is disarmed. Check the band JSON on
+                the Thor + the zenoh-fabric-sampler timer.
+      - eval_time: 55m
+        alertname: ZenohTopicBudgetSourceAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-fabric
+            exp_annotations:
+              summary: "topic budget: the allowance-source metric DISAPPEARED (not stale — gone)"
+              description: |
+                goat_zenoh_budget_source_live was being published within the last 6h
+                and is now absent entirely. ZenohTopicBudgetSourceDown cannot see
+                this — a value comparison matches nothing when the series is gone.
+                Either the band JSON lost its budget_source_state field (the crawler
+                fell back to legacy mode), or the band file was deleted/replaced.
+                Every owner is classifying as `unmeasured` and
+                ZenohTopicBudgetException is silently disarmed. Check the band JSON
+                + the fabric-crawler's budget source on the Thor.
+      # The value-comparison originals must NOT fire on a deleted metric —
+      # this is exactly the gap the companions close.
+      - eval_time: 55m
+        alertname: ZenohTopicBudgetSourceDown
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: ZenohFabricSamplerStale
+        exp_alerts: []
+
+  # Legacy goatnet: budget source NEVER published (fabric sampler runs fine).
+  # The 6h guard must keep the absent-alert silent forever here.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_fabric_sampled_at_seconds{router="legacy-router"}'
+        values: '1000+60x120'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: ZenohTopicBudgetSourceAbsent
+        exp_alerts: []
+      - eval_time: 100m
+        alertname: ZenohFabricSamplerAbsent
+        exp_alerts: []

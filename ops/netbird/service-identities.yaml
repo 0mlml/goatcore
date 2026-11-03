@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# NetBird service identities — the one list of the NetBird service users a
+# goatnet needs, what turns each one on, where its token lives, and which roles
+# read it.
+#
+# Canon: docs/design/netbird-service-identities.md.
+#
+# Every NetBird PAT a deployed service reads belongs to exactly one identity
+# below. Three things read this file, so a new consumer is added here once:
+#
+#   ops/scripts/netbird-service-identities.py   check a goatnet, mint what is
+#                                               missing (operator-run)
+#   ops/ansible/tasks/require-netbird-service-identity.yml
+#                                               every consumer role includes it,
+#                                               passing its own token value and
+#                                               enabled condition; refuses to
+#                                               deploy an enabled consumer whose
+#                                               token is empty or read from a
+#                                               name other than token_env
+#   ops/ci/check-netbird-service-identities.py  refuses a token consumer that
+#                                               is not registered, a role that
+#                                               skips the require task, and a
+#                                               group_vars env name that
+#                                               disagrees with token_env
+#
+# Placeholders: {goatnet} is the group's site_id (zagros-dev); {SITE} is the same
+# uppercased with '-' -> '_' (ZAGROS_DEV).
+#
+# Minting is a decision with an audit trail (live-state-guard-scheduling.md §4):
+# identities are created by an operator running the script, never as a side
+# effect of a playbook. Every one is `role: admin`, because NetBird has no
+# read-only role that can list what these consumers read. A dedicated identity
+# buys revocation without collateral and attribution in the activity log. It
+# does not reduce privilege.
+
+schema: netbird-service-identities/v1
+
+onepassword:
+  account: example.1password.com
+  vault: goat-site-services
+
+identities:
+  netbird-infra:
+    purpose: >-
+      The goatnet's infrastructure token: surfaces that read peers, groups and
+      policies, the onboard runner, and operator playbooks. Minted by hand in
+      standup phase 11 (first login), because it is the credential that mints every other
+      identity here.
+    bootstrap: true
+    service_user: "svc-{goatnet}-netbird-infra"
+    # Live names that predate the convention. Recorded, not renamed: renaming a
+    # service user revokes nothing and gains nothing, and the check reports the
+    # owner it finds against this list.
+    declared_names:
+      zagros-dev: onboard-runner
+      zagros-prod: svc-standup-automation
+    token_env: "{SITE}_NB_API_TOKEN"
+    token_name: netbird-infra
+    required_when: always
+    onepassword: {item: "{goatnet}-netbird", field: api_token}
+    consumers:
+      - netvis
+      - microscope
+      - peerview
+      - onboard-runner
+      - mesh-health
+
+  portal-mint:
+    purpose: >-
+      The portal's own identity. It mints the single-use setup key a machine
+      enrolls with (ADR 1116 §9) and polls peers for the vendor-progress view.
+    without_it: >-
+      The portal deploys, logs the poller as disabled, and refuses every machine
+      enrollment with 412 mesh_mint_unconfigured.
+    service_user: goat-portal-mint
+    token_env: "{SITE}_PORTAL_NB_SVC_TOKEN"
+    token_name: portal-mesh-mint
+    required_when: {var: portal_mesh_key_mint_enabled, role: goat-zenoh-portal}
+    onepassword: {item: "{goatnet}-portal-nb-svc", field: token}
+    consumers:
+      - goat-zenoh-portal
+
+  console-enrollwatch:
+    purpose: >-
+      The id-admin-console's enrollment watcher: reads setup-key use counts and
+      moves a proposal from `onboarded` to `enrolled` once the person has used
+      the mesh credential minted for them. Read-only against NetBird.
+    without_it: >-
+      The console runs, logs the watcher as disabled, and every proposal stays
+      at `onboarded`, so nobody can see whether a person ever joined the mesh.
+    service_user: svc-console-enrollwatch
+    token_env: "{SITE}_ENROLLWATCH_NB_TOKEN"
+    token_name: console-enrollwatch
+    required_when: {var: id_admin_console_enabled, role: id-admin-console}
+    onepassword: {item: "{goatnet}-enrollwatch", field: nb_token}
+    consumers:
+      - id-admin-console
+
+  provenance-guard:
+    purpose: >-
+      machine-provenance-guard (ADR 1130): compares mesh peers against the
+      portal's custody registry every hour.
+    without_it: The guard role refuses to install, so nothing audits machine provenance.
+    service_user: "svc-{goatnet}-provenance-guard"
+    token_env: "{SITE}_PROVENANCE_GUARD_NB_TOKEN"
+    token_name: machine-provenance-guard
+    required_when: {var: machine_provenance_guard_enabled, role: machine-provenance-guard}
+    onepassword: {item: "{goatnet}-provenance-guard", field: nb_token}
+    consumers:
+      - machine-provenance-guard
+
+  membership-reconcile:
+    purpose: >-
+      mesh-membership-reconcile: audits every peer's groups against the
+      setup key it enrolled with.
+    without_it: The reconcile role refuses to install, so group drift goes unaudited.
+    service_user: "svc-{goatnet}-membership-reconcile"
+    token_env: "{SITE}_NB_RECONCILE_TOKEN"
+    token_name: membership-reconcile
+    required_when: {var: mesh_membership_reconcile_enabled, role: mesh-membership-reconcile}
+    onepassword: {item: "{goatnet}-nb-reconcile", field: token}
+    consumers:
+      - mesh-membership-reconcile
+
+  warrant-membership:
+    purpose: >-
+      The warrant membership converger (ADR 1189,
+      docs/design/mesh-change-control.md §4.4): `goat warrant apply
+      --membership` on the mgmt host, every five minutes, makes live peer
+      membership match ops/warrant/membership/<scope>/. It reads peers,
+      groups, setup keys and events and, on a scope declared
+      `converge: enforce`, writes group membership — at most --max-changes
+      peer-group changes per run.
+    without_it: >-
+      The warrant-membership role refuses to install, so a governed scope's
+      declaration is never applied or read back.
+    service_user: "svc-{goatnet}-warrant"
+    token_env: "{SITE}_WARRANT_NB_API_TOKEN"
+    token_name: warrant-membership
+    required_when: {var: warrant_membership_enabled, role: warrant-membership}
+    onepassword: {item: "{goatnet}-warrant", field: token}
+    consumers:
+      - warrant-membership

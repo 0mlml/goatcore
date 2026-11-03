@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# standup-phase-run: run one standup phase command, the same way from both drivers
+# (ops/scripts/goat-standup.sh and `goatbuilder standup`; the parity gate compares
+# their plans, and this keeps how a planned line RUNS identical too).
+#
+#   standup-phase-run '<command>'          load, check, then run it with bash -euo pipefail
+#   standup-phase-run --check '<command>'  check only: exit 0, or 3 naming the empty names
+#
+# 1. Under a value store (env-file, sops, git-crypt; ADR 1204) the command runs
+#    through `posture.py exec`, which reads the store afresh. Phase 3 writes the
+#    goatnet's values into that store during the run, so this is how they reach
+#    phases 5 and on without being exported by hand. No value is printed, logged
+#    or placed on this script's command line. Reference stores (1password, openbao,
+#    vaultwarden) are not loaded here: those values reach the drivers as they
+#    always have (with-secrets, direnv), and the play injector resolves the rest.
+# 2. Every `$(printenv NAME)` the command expands must be non-empty here, or the
+#    phase refuses before it runs and names each NAME, on every profile. An empty
+#    expansion handed Ansible an empty Postgres password, which is worse than a stop.
+#
+# Exit: the command's own status; 3 when a name is empty; 2 on usage.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+POSTURE="$HERE/../secrets/posture.py"
+
+check_only=0
+if [ "${1:-}" = "--check" ]; then check_only=1; shift; fi
+[ $# -eq 1 ] || { echo "usage: standup-phase-run [--check] '<command>'" >&2; exit 2; }
+cmd="$1"
+
+if [ "$check_only" = 0 ] && [ -z "${GOAT_STANDUP_PHASE_LOADED:-}" ]; then
+  store="${GOAT_SECRET_STORE:-$(python3 "$POSTURE" store 2>/dev/null || echo 1password)}"
+  case "$store" in
+    env-file|sops|git-crypt)
+      export GOAT_STANDUP_PHASE_LOADED=1
+      exec python3 "$POSTURE" exec -- "$0" "$cmd" ;;
+  esac
+fi
+
+empty=()
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  [ -n "${!name:-}" ] || empty+=("$name")
+done < <(grep -oE '\$\(printenv [A-Za-z_][A-Za-z0-9_]*\)' <<<"$cmd" | sed -E 's/^\$\(printenv ([A-Za-z0-9_]+)\)$/\1/' | sort -u)
+
+if [ "${#empty[@]}" -gt 0 ]; then
+  {
+    echo "standup-phase-run: refusing to run this phase: it reads ${empty[*]}, which $( [ "${#empty[@]}" = 1 ] && echo is || echo are ) empty in this environment."
+    echo "  An empty value would reach the play as an empty password or key."
+    echo "  Phase 3 generates the goatnet's own; supply the rest under your secrets posture:"
+    hint="$(python3 "$POSTURE" hint "${empty[@]}" 2>/dev/null || true)"
+    if [ -n "$hint" ]; then printf '%s\n' "$hint" | sed 's/^/    /'; else echo "    ops/scripts/with-secrets <command>"; fi
+  } >&2
+  exit 3
+fi
+[ "$check_only" = 1 ] && exit 0
+exec bash -euo pipefail -c "$cmd"

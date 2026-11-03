@@ -1,0 +1,196 @@
+# Audit-subscriber + audit-integrity bucket observability alert rules.
+#
+# audit-subscriber S3 puts can silently fail with no
+# operator-visible signal, which loses audit data until something else
+# surfaces it.
+#
+# Metric sources:
+#   - audit-subscriber emits Prometheus metrics on :9303
+#     (job=audit-subscriber in monitoring/prometheus.yml). Notable
+#     series: goat_audit_write_errors_total (counter),
+#     goat_audit_batches_uploaded_total (counter),
+#     goat_audit_samples_total (counter).
+#   - MinIO emits per-bucket usage on its node-exporter-style endpoint
+#     (job=minio in monitoring/prometheus.yml). The configured *quota*
+#     is not in upstream MinIO metrics — it's scraped via
+#     prometheus.yml's static_configs and exposed as
+#     minio_bucket_quota_bytes per-bucket.
+#
+# Severity discipline matches postgres-storage.yml:
+#   - critical: drives an immediate page (data being lost right now).
+#   - warning: needs human eyes within a working day.
+#   - info: trend / capacity-planning signal — never paging.
+#
+# See also:
+#   - docs/findings/F-169-audit-subscriber-s3-puts-silently-fail-no-alert.md
+#   - docs/findings/F-171-minio-lifecycle-vs-object-lock-retention-retains-longer-than-policy.md
+#   - docs/design/zenoh-audit-external-subscriber.md
+#   - ADR 0811 (audit-log integrity)
+
+groups:
+  - name: audit-subscriber.writes
+    rules:
+
+      # Any sustained put failures = data being dropped right now. The
+      # audit-subscriber buffers in-memory and drops batches when S3
+      # writes fail (no on-disk spool), so every failed put is lost
+      # events. The 10m hold-down prevents single-batch transient
+      # flakes from paging while still surfacing the genuine "stuck"
+      # case within the same hour.
+      - alert: AuditSubscriberPutsFailing
+        expr: rate(goat_audit_write_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+          component: audit-subscriber
+        annotations:
+          summary: "audit-subscriber S3 puts failing for {{ $labels.instance }}"
+          description: |
+            audit-subscriber is dropping audit batches on S3 PUT failure
+            for at least 10 minutes. Every failed batch = lost audit
+            events (no on-disk spool).
+
+            Common causes (in observed order):
+              - audit-integrity bucket quota exceeded — see
+                AuditBucketQuotaHigh below; the underlying error is
+                often masked as a misleading 403 AccessDenied for
+                non-root MinIO users.
+              - MinIO container down or unhealthy.
+              - audit-subscriber's S3 credentials rotated without the
+                role re-applying.
+              - Bucket policy drift removed write permission.
+
+            Triage:
+              - `docker logs --tail 30 audit-subscriber` for the
+                underlying SDK error.
+              - `mc cp /tmp/probe.ndjson root/audit-integrity/probe.ndjson`
+                as the MinIO root user to see the unmasked error
+                
+
+      # Subscriber receives events from Zenoh but emits nothing — the
+      # service is wedged upstream of S3 (zenoh session dropped,
+      # subscriber task exited, container is alive but not doing work).
+      # A clock-sync race at boot can leave audit-subscriber in this state.
+      - alert: AuditSubscriberStalled
+        expr: |
+          sum by (instance) (rate(goat_audit_samples_total[5m])) == 0
+          AND ON(instance)
+          sum by (instance) (rate(goat_audit_samples_total[1h] offset 1h)) > 0
+        for: 15m
+        labels:
+          severity: critical
+          component: audit-subscriber
+        annotations:
+          summary: "audit-subscriber stopped receiving events for {{ $labels.instance }}"
+          description: |
+            audit-subscriber received 0 events in the last 5m but was
+            receiving them an hour ago. Subscriber task likely exited
+            (zenoh session drop, clock skew on container start, ACL
+            change). Container may show "Up" while the loop is dead.
+
+            Triage:
+              - `docker logs audit-subscriber | grep "subscriber task exited"`
+              - `docker inspect audit-subscriber --format "{{ .State.StartedAt }}"`
+                — if epoch 1970, hit F-165 chrony-presync race; restart.
+              - Cross-check with flashlight — if flashlight shows live
+                events on the fabric, the wire is OK and the gap is
+                audit-subscriber-side.
+
+  - name: audit-integrity.bucket
+    rules:
+
+      # Approaching the configured quota gives multi-day forecasting
+      # horizon before writes start failing. Even at correct
+      # lifecycle the bucket can hold >7d of data. Warn at 85%, page
+      # at 95%.
+      - alert: AuditBucketQuotaHigh
+        expr: |
+          minio_bucket_usage_bytes{bucket="audit-integrity"}
+            / on(bucket) minio_bucket_quota_bytes{bucket="audit-integrity"}
+            > 0.85
+        for: 30m
+        labels:
+          severity: warning
+          component: minio
+        annotations:
+          summary: "audit-integrity bucket >85% of configured quota"
+          description: |
+            audit-integrity bucket is approaching its configured quota.
+            Once the quota is exceeded, every PUT fails silently from
+            the audit-subscriber's point of view and audit
+            events start dropping.
+
+            Triage:
+              - `mc quota info local/audit-integrity` for the current
+                hard quota.
+              - `mc du local/audit-integrity` for actual size.
+              - If F-171 hasn't been resolved yet, the bucket may hold
+                more than its documented retention; check
+                `mc admin info local` for last scanner pass.
+
+            Forecasting:
+              - At current growth rate, page-level (>95%) reaches in
+                approximately `(0.95 - current_ratio) / daily_growth`
+                days.
+
+      - alert: AuditBucketQuotaCritical
+        expr: |
+          minio_bucket_usage_bytes{bucket="audit-integrity"}
+            / on(bucket) minio_bucket_quota_bytes{bucket="audit-integrity"}
+            > 0.95
+        for: 15m
+        labels:
+          severity: critical
+          component: minio
+        annotations:
+          summary: "audit-integrity bucket >95% of configured quota"
+          description: |
+            audit-integrity bucket will start rejecting writes within
+            hours at current growth rate. Once that happens, every
+            audit batch is dropped. This is a compliance
+            gap — ADR 0811 puts audit-integrity on the substrate's
+            critical-write path.
+
+            Immediate action:
+              - Raise the quota: `mc quota set local/audit-integrity --size <new>GiB`.
+                Underlying disk usually has plenty of room (nova-a had
+                841 GB free behind a 12 GiB cap during the F-169
+                incident).
+              - Verify writes resume: `docker logs --tail 5 audit-subscriber`
+                should show `batch uploaded` within 10s.
+
+      # Oldest object age in the bucket helps detect F-171-class
+      # issues — lifecycle not running on schedule. Documented
+      # retention is 7d in trial, 1y in production; if the oldest
+      # object is more than (retention + 1 day slack) old, the
+      # lifecycle scanner is not keeping up.
+      #
+      # Trial: 7d + 1d slack = 8d = 691200s
+      # Prod:  365d + 1d slack = 366d = 31622400s
+      #
+      # We alert against the trial threshold by default; production
+      # deployments override this rule's `for` and `expr` thresholds
+      # via prometheus's rule-overrides mechanism.
+      - alert: AuditBucketRetainingPastPolicy
+        expr: minio_bucket_oldest_object_seconds{bucket="audit-integrity"} > 691200
+        for: 1h
+        labels:
+          severity: warning
+          component: minio
+        annotations:
+          summary: "audit-integrity holding objects older than the documented retention"
+          description: |
+            Oldest object in audit-integrity is older than the
+            documented 7-day retention + 1d scanner slack. Lifecycle
+            scanner is not pruning on schedule.
+
+            See F-171 for the substrate-substrate interaction this
+            alert protects against. Long-running gap compounds F-169
+            (quota fills faster than the operator's mental model).
+
+            Triage:
+              - `mc admin info local` for last scanner pass timestamp.
+              - `mc admin config get local scanner` for the configured
+                scan interval / speed.
+              - `mc retention info` on the offending oldest object —
+                confirm whether retention has actually cleared.

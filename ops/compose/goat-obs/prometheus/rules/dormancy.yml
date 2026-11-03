@@ -1,0 +1,78 @@
+# Dormancy-report health — the watchdog's own watchdog.
+#
+# dormancy-report (ops/compose/goat-obs/dormancy-report/dormancy_report.py,
+# hourly cron installed by obs.yml) is the REPORT-ONLY dormancy census behind
+# ADR 1089 Stage 3.2: NetBird peer last-seen on one axis, Kratos session
+# recency on the other. It has emitted its own `_up` gauges since it shipped
+# and nothing alerted on them — the 2026-08-01 identity fragility audit
+# (item 5) called this out as a monitor that can go blind silently.
+#
+# The two axes fail INDEPENDENTLY and the script degrades rather than crashes,
+# so "the cron ran" is not the same as "the census is complete":
+#   goat_dormancy_report_up          — the NetBird peer fetch (peer axis)
+#   goat_dormancy_sessions_check_up  — the Kratos sessions sweep (identity axis)
+# Each gets its own rule; a zero on either means the corresponding dormancy
+# counts are UNKNOWN, not zero.
+#
+# Cadence honesty: the cron is hourly and these are textfile metrics (they
+# never expire), so a dead cron freezes the last good values. The staleness
+# rule below is the only thing that distinguishes "nobody is dormant" from
+# "nobody has looked in a day."
+#
+# Deployment gate: obs.yml installs the cron only `when:
+# dormancy_report_netbird_mgmt_url is defined`, so on a goatnet that does not
+# run it these series never exist and every rule here stays silent. That is
+# why they are value comparisons and NOT absent() forms — an absent() rule
+# would fire forever on every goatnet without a dormancy report.
+
+groups:
+  - name: dormancy
+    interval: 30s
+    rules:
+
+      - alert: DormancyReportPeerAxisDown
+        expr: goat_dormancy_report_up == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "dormancy-report cannot reach NetBird management on {{ $labels.env }}"
+          description: |
+            goat_dormancy_report_up=0 — the report ran but the NetBird peer
+            fetch failed (management down, API token expired, or mesh DNS), so
+            goat_dormant_peers is stale and the peer axis of the dormancy
+            census is UNKNOWN rather than zero. Check the mgmt API token in the
+            dormancy-report env file and `journalctl -t dormancy-report`.
+
+      - alert: DormancySessionsAxisDown
+        expr: goat_dormancy_sessions_check_up == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "dormancy-report's Kratos sessions sweep is failing on {{ $labels.env }}"
+          description: |
+            goat_dormancy_sessions_check_up=0 — the Kratos sessions sweep did
+            not complete (the peer axis is unaffected). goat_dormant_person_identities
+            and goat_identities_no_session_ever are stale, so identity-side
+            dormancy is UNKNOWN. Check KRATOS_ADMIN_URL for the cron and
+            `journalctl -t dormancy-report`.
+
+      - alert: DormancyReportStale
+        expr: time() - goat_dormancy_report_last_run_timestamp_seconds > 10800
+        for: 15m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "dormancy-report has not completed a run in 3h+"
+          description: |
+            The hourly dormancy-report cron has missed three or more runs.
+            Its metrics are textfile metrics and never expire, so every
+            goat_dormant_* series is frozen at its last value and silence
+            reads as "nobody is dormant" when it means "nobody has looked."
+            Check the cron on the mgmt host:
+              sudo crontab -l | grep dormancy-report
+              journalctl -t dormancy-report | tail

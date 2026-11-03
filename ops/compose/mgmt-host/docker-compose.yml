@@ -1,0 +1,540 @@
+# Mgmt-host compose stack — postgres-spock + signal + management + traefik.
+#
+# What's here today:
+#   - postgres-a  (Spock-enabled PG16 built by ops/postgres/spock/)
+#   - signal-a    (our custom federated signal server)
+#   - management-a (netbird-mgmt; image override via NETBIRD_MGMT_IMAGE
+#                   in .env — production sites use ghcr.io/usareur-af/netbird-mgmt:patched-<ref>
+#                   per Block 21A regression hook + ADR 0413; pilot/dev
+#                   sites use upstream netbirdio/management:0.68.3)
+#                   — configured via /etc/netbird/management.json rendered
+#                     by ops/ansible/mgmt-host.yml from
+#                     ops/ansible/templates/management.json.j2
+#                   — DB DSN passed via NETBIRD_STORE_ENGINE_POSTGRES_DSN
+#   - traefik     (TLS termination at :443 for the mgmt-API, route by Host
+#                  header; cert + key from offline-CA-signed PEM files
+#                  delivered by the traefik ansible role per ADR 0407 +
+#                  docs/design/internal-tls-ca.md §6. No ACME / no Let's
+#                  Encrypt — internal-only endpoints behind wg-cp0 don't
+#                  have public DNS per ADR 0314.)
+#   - mgmt-host-bootstrap (Block 21A account-seed CLI, profile-gated)
+#
+# Layering:
+#   - The base file (this) covers the mgmt-plane minimum.
+#   - Optional overlays (compose with -f base -f <overlay>):
+#       docker-compose.obs.yml         — Phase 4 observability (Prom + Alertmanager)
+#       docker-compose.pgbackrest.yml  — Phase 5 paired-stanza backups
+#       docker-compose.admit-audit.yml — Phase 6 admit-audit sidecar
+#       docker-compose.ory.yml         — Block 21C Kratos + Hydra
+#       docker-compose.phase2.yml      — Phase 2 multi-master one-host validation
+#
+# Three-Orin topology (ADR 0826): observability (Prom / Alertmanager / OpenObserve
+# / OTel Collector / Grafana / MinIO) lives on Orin-C, not Orin-A or Orin-B. Our
+# mgmt-plane Phase 4 obs overlay is provided for single-host envs; the production
+# three-Orin shape uses a separate obs-bootstrap playbook against the site's obs
+# hosts group.
+#
+# This file runs on any mgmt-host. Site-specific values live in .env (rendered by Ansible from env vars
+# and 1Password, not checked in).
+
+services:
+  postgres-a:
+    # Pinned to the build with full pg_hba + pgBackRest baked in (see
+    # ops/postgres/spock/Dockerfile). Any future pin bump is validated by
+    # ops/ci/check-pin-compat.sh (wired into .github/workflows/compose-lint.yml).
+    image: ${POSTGRES_SPOCK_IMAGE:-ghcr.io/usareur-af/postgres-spock@sha256:cccb075b140ec40815e3f3e40bf969459f6363bad1441a7bcecc51451973f9a1}
+    container_name: postgres-a
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    # Sized for t3.small (~4 vCPU / 4 GB). Tighten if thermal/OOM
+    # pressure shows up in chaos drills.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+    # Baked config lives at /etc/postgresql/postgresql.conf; the default
+    # postgres entrypoint would otherwise use PGDATA/postgresql.conf which
+    # initdb generates with wal_level=replica. 00-verify-config.sql fails
+    # fast if this override is forgotten.
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+      # Cluster encoding = UTF8, NOT the pgedge base image's SQL_ASCII initdb
+      # default. Every database created here inherits template1, so a
+      # UTF8 cluster makes netbird/kratos/hydra UTF8 with no per-DB change —
+      # identity and org names validate and store as Unicode. --locale=C keeps
+      # the current byte-order collation; only the encoding moves.
+      #
+      # NON-DISRUPTIVE BY CONSTRUCTION: the upstream entrypoint applies
+      # POSTGRES_INITDB_ARGS ONLY when it runs initdb on an EMPTY PGDATA. A
+      # container with an already-initialized data dir skips initdb entirely
+      # so this is a no-op on every already-running goatnet and takes
+      # effect only on a FRESH standup. Existing SQL_ASCII clusters migrate
+      # separately — destructive and coordinated.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      # Bound to 0.0.0.0 so peer sites reach us via the Netbird mesh
+      # interface for Spock logical replication. EC2/Orin SG rules
+      # restrict the port to mesh peers only. A 127.0.0.1 binding
+      # silently breaks cross-site Spock the moment any postgres-a container is
+      # recreated: subscriptions stay in 'down' state.
+      - "5432:5432"
+    volumes:
+      # IMPORTANT: pgedge's ghcr.io/pgedge/pgedge-postgres uses the Red Hat
+      # layout (PGDATA=/var/lib/pgsql/16/data), NOT the Debian layout
+      # (/var/lib/postgresql/data) used by the Docker Official postgres image.
+      # Mounting at the wrong path means the container silently runs on
+      # ephemeral intra-container storage — data is lost on every restart.
+      - pgdata-a:/var/lib/pgsql/16/data
+      # pgBackRest local repo + log + spool. pgbackrest runs inside
+      # postgres-a via docker exec (simplest architecture: local socket,
+      # local PGDATA, local repo). The sidecar-container approach was
+      # tried in the agent-built Phase 5 and dropped — different container
+      # namespaces don't share postgres's Unix socket. These bind mounts
+      # persist backups across postgres-a container recreates.
+      - /opt/docker-data/pgbackrest:/var/lib/pgbackrest
+      - /var/log/pgbackrest:/var/log/pgbackrest
+      - /var/spool/pgbackrest:/var/spool/pgbackrest
+      # pgBackRest config, read-only. archive_command (stored in PGDATA by
+      # ALTER SYSTEM) and the cron backups read it from here, so it has to
+      # survive a recreate the same way. When it was copied in with
+      # `docker cp`, a recreate dropped it and archiving failed on every
+      # segment while Postgres kept them all. A host without pgBackRest gets
+      # an empty directory that nothing reads.
+      - /etc/pgbackrest:/etc/pgbackrest:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mgmt
+
+  signal-a:
+    # Pinned to the build that accepts -federation-peers. sha-9df2a27 removed
+    # that flag, breaking the compose command below. If the CLI surface
+    # changes again, update the `command:` block in lockstep BEFORE bumping
+    # the pin, and run a throwaway `docker compose up --wait` to verify.
+    image: ${SIGNAL_SERVER_IMAGE:-ghcr.io/usareur-af/signal-server:sha-dced051@sha256:1122f0fb3f08b19443717c8215020c27e0a6059891a6aef90528fc433a635c67}
+    container_name: signal-a
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    # Set per goatnet through .env (SIGNAL_A_CPUS / SIGNAL_A_MEMORY, rendered
+    # by mgmt-host.yml from mgmt_signal_cpus / mgmt_signal_memory); the
+    # defaults are the fleet values. This file reaches every mgmt host, and
+    # Docker refuses a cpus value above the host's core count.
+    deploy:
+      resources:
+        limits:
+          cpus: "${SIGNAL_A_CPUS:-1.0}"
+          memory: "${SIGNAL_A_MEMORY:-512M}"
+        reservations:
+          memory: 128M
+    command:
+      - --node=${SITE_NAME:-pilot}-a
+      - --grpc-addr=:10000
+      - --metrics-addr=:9090
+      # FEDERATION_PEERS is a comma-separated list of peer signal-server
+      # mesh addresses (host:port). Empty = standalone/no federation;
+      # peers enrolled here cannot reach peers enrolled at other sites.
+      # Set via .env from Ansible: FEDERATION_PEERS=100.127.1.14:10000
+      - --federation-peers=${FEDERATION_PEERS:-}
+    environment:
+      # CVE-2026-98432 mitigation (IPv4 TCP request-socket use-after-free, CVSS
+      # 9.8): the published exploit needs an MPTCP listener and Go 1.24+ listeners
+      # request one by default. GODEBUG keeps this Go listener plain TCP on any
+      # kernel; a container sysctl would refuse to start on Tegra, which has no
+      # MPTCP. Remove with the host sysctl once the fixed Ubuntu kernel is live.
+      - GODEBUG=multipathtcp=0
+      # ADR 1081 Layer 2 — control-plane storm shedding. Both mechanisms are
+      # DEFAULT OFF (0 = disabled) and stay off until an operator sets the var
+      # in .env. Do NOT enable here; enablement is a per-goatnet decision made
+      # during a storm or a load-shed drill, not a standing default.
+      #   - Per-sender token bucket on the unary Send path. Recommended when
+      #     enabling: 30 offers/min, burst 60 (per-sender, so a healthy
+      #     mass-reconnect after a Thor reboot is not throttled). A breach
+      #     returns ResourceExhausted + a RetryInfo backoff hint.
+      - SIGNAL_SENDER_RATE_LIMIT=${SIGNAL_SENDER_RATE_LIMIT:-0}   # offers/min per sender; 0 = off
+      - SIGNAL_SENDER_RATE_BURST=${SIGNAL_SENDER_RATE_BURST:-0}   # burst; 0 = 2x rate when enabled
+      #   - Recipient-offline negative cache. Sheds repeated misses to an
+      #     absent peer before the federation fan-out. Recommended when
+      #     enabling: 20 (seconds). Purged the moment the recipient registers.
+      - SIGNAL_NEGATIVE_CACHE_TTL=${SIGNAL_NEGATIVE_CACHE_TTL:-0} # seconds; 0 = off
+      # mesh-control-path Phase 3 (ADR 1085 Amendment 1) — shared bearer
+      # token on the federation surface. When set, this server rejects
+      # unauthenticated federation RPCs and attaches the token to its own
+      # outbound Forwards. Same value on every federating server of the
+      # goatnet. Empty = auth off (mesh-only posture; the server logs a
+      # warning if federation peers are configured without it). May be a
+      # comma-separated accept-list during rotation (server accepts all,
+      # client sends the first).
+      - SIGNAL_FEDERATION_TOKEN=${SIGNAL_FEDERATION_TOKEN:-}
+      # Dual-path tunables (empty/0 = off): authority = the PEER's
+      # federation hostname so its Traefik router Host-matches the public
+      # leg; forward-timeout raised (~1000 ms) on dual-path goatnets so a
+      # mesh-flap failover onto the relay leg doesn't feed the breaker
+      # spurious 200 ms deadline failures.
+      - SIGNAL_FEDERATION_AUTHORITY=${SIGNAL_FEDERATION_AUTHORITY:-}
+      - SIGNAL_FEDERATION_FORWARD_TIMEOUT_MS=${SIGNAL_FEDERATION_FORWARD_TIMEOUT_MS:-0}
+    ports:
+      # Bound to 0.0.0.0 so peers reach it via the Netbird mesh interface.
+      # EC2/Orin SG rules already restrict external exposure. 127.0.0.1
+      # binding (the previous default) prevented cross-site federation
+      # and made signal_uri in management.json unreachable.
+      - "10000:10000"                # gRPC — peer signal + federation
+      # /metrics: bind 0.0.0.0 so the peer mgmt-host scrapes us over the
+      # VPC private-IP path (see docs/design/ha-multi-site.md §7.3).
+      # External exposure blocked by the EC2 SG (9090 allowed only from
+      # 172.31.0.0/16 — our intra-VPC range). 127.0.0.1 (the old bind)
+      # fires SignalServerDown on the peer-scrape target.
+      - "9090:9090"
+    networks:
+      - mgmt
+
+  federation-proxy:
+    # mesh-control-path Phase 3 (ADR 1085 Amendment 1) — Thor-local dual-path
+    # alias for the signal federation peer. signal-a dials
+    # federation-proxy:10001; haproxy holds the peer's mesh IP:10000 primary
+    # and the relay-tunneled public :443 route (TLS, SNI-pinned to the peer's
+    # federation hostname) as checked backup — so signal forwarding survives
+    # any state where SOME bearer exists between the mgmt hosts.
+    # Config rendered by Ansible from
+    # ops/ansible/templates/federation-proxy-haproxy.cfg.j2.
+    # Profile-gated: inert unless COMPOSE_PROFILES includes federation-proxy
+    # (.env, written by Ansible on goatnets that enable the dual path;
+    # single-site goatnets never run it).
+    # Multi-arch INDEX digest (amd64+arm64) — resolve per-host at pull.
+    image: ${FEDERATION_PROXY_IMAGE:-haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f}
+    container_name: federation-proxy
+    profiles: ["federation-proxy"]
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          memory: 32M
+    volumes:
+      - ./federation-proxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - mgmt
+
+  management-a:
+    # Default: upstream netbirdio/management (AutoMigrate runs on every start —
+    # fine for single-instance pilot). For Phase 2 multi-master on the EC2
+    # pair or any Phase 3+ site, override via .env:
+    #   NETBIRD_MGMT_IMAGE=ghcr.io/usareur-af/netbird-mgmt:patched-<ref>
+    # The patched image honors NETBIRD_SKIP_MIGRATIONS / NETBIRD_MIGRATION_MARKER;
+    # the stock image ignores them (harmless on either).
+    image: ${NETBIRD_MGMT_IMAGE:-netbirdio/management:0.68.3@sha256:8d3ac9d38c9589520d9d1563c8ae3646b9a038596aae16b9ed089602060a8001}
+    container_name: management-a
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    # Set per goatnet through .env (MANAGEMENT_A_CPUS / MANAGEMENT_A_MEMORY,
+    # rendered by mgmt-host.yml from mgmt_management_cpus /
+    # mgmt_management_memory); the defaults are the fleet values. This file
+    # reaches every mgmt host, and Docker refuses a cpus value above the
+    # host's core count.
+    deploy:
+      resources:
+        limits:
+          cpus: "${MANAGEMENT_A_CPUS:-1.0}"
+          memory: "${MANAGEMENT_A_MEMORY:-512M}"
+        reservations:
+          memory: 128M
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+      signal-a:
+        condition: service_started
+    environment:
+      # Postgres superuser DSN — fine for Phase 1-2 pilot validation; production
+      # would use a scoped `netbird` role (docs/design/ha-multi-site.md §5.5).
+      # client_encoding=UTF8 is required: the pgedge image's initdb defaults to
+      # SQL_ASCII encoding, but netbird's Go GORM stack runs simple-protocol
+      # queries that require UTF8 client encoding (without this the management
+      # container crash-loops in migratePreAuto).
+      NETBIRD_STORE_ENGINE_POSTGRES_DSN: "host=postgres-a user=postgres password=${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD} dbname=netbird sslmode=disable client_encoding=UTF8"
+      # Patched-image marker path (stock image ignores this env var). Host
+      # side: /opt/mgmt-host/management-a/marker/migrations.allow, written
+      # and removed by ops/ansible/coordinated-upgrade.yml.
+      NETBIRD_MIGRATION_MARKER: /opt/netbird-ha/migrations.allow
+      # Network-map push buffer (ADR 1122 P2), read by the fork controller
+      # (network_map/controller/controller.go: StartWarmup sets it,
+      # BufferUpdateAccountPeers uses it). It does NOT batch a steady stream:
+      # a change that arrives while no push is running cancels any pending
+      # timer and pushes at once. Only changes that arrive DURING a push are
+      # folded into one follow-up push, sent this many ms after that push
+      # ends. For the first NB_PEER_UPDATE_STARTUP_PERIOD_S seconds the delay
+      # is ten times the value; unset, it parses as 1 ms. Harmless: it only
+      # delays the final push after a burst.
+      NB_PEER_UPDATE_INTERVAL_MS: "${NB_PEER_UPDATE_INTERVAL_MS:-500}"
+      NB_PEER_UPDATE_STARTUP_PERIOD_S: "${NB_PEER_UPDATE_STARTUP_PERIOD_S:-90}"
+    volumes:
+      # management.json rendered by ops/ansible/mgmt-host.yml from
+      # ops/ansible/templates/management.json.j2 — see that file for var contract.
+      - ./management-a/management.json:/etc/netbird/management.json:ro
+      - management-a-data:/var/lib/netbird
+      # Marker dir for coordinated-upgrade. Ansible creates this directory
+      # at deploy time; touching / removing migrations.allow inside it gates
+      # AutoMigrate on the patched image. No-op for stock image.
+      - ./management-a/marker:/opt/netbird-ha:rw
+    ports:
+      # REST + gRPC on port 80 inside the container, loopback-only exposure
+      # to the host (kept for direct local debugging via curl from the host).
+      # Production traffic enters via the traefik service below at :443 with
+      # offline-CA-signed cert per ADR 0407 + docs/design/internal-tls-ca.md.
+      - "127.0.0.1:${MGMT_CONTAINER_HOST_PORT:-8080}:80"
+    command:
+      - management
+      - --log-file=console
+    networks:
+      - mgmt
+    # Mgmt-API + dashboard-tier hostnames
+    # served by the local Traefik MUST resolve to the host's wg-cp0 IP
+    # (from the management-a container's perspective). Without these,
+    # management-a's JWKS-fetch from the public oauth2.<site>...
+    # URL — which Hydra advertises in its discovery doc, regardless of
+    # the internal config-time AuthKeysLocation — fails with `dial tcp:
+    # lookup ... no such host`, every JWT validates as unverifiable, and
+    # all dashboard API calls return 401. The host-gateway alias points
+    # the container at its own host's network stack so the request loops
+    # back through Traefik.
+    #
+    # SITE_FQDN is rendered into .env by ops/ansible/mgmt-host.yml from
+    # `{{ site_id }}.{{ site_dns_zone }}`. For sites without a dashboard
+    # tier the fallback `${site_id}.local`
+    # is harmless — the entries map nonexistent hostnames that nothing
+    # in those profiles references.
+    extra_hosts:
+      - "oauth2.${SITE_FQDN}:host-gateway"
+      - "auth.${SITE_FQDN}:host-gateway"
+      - "mgmt.${SITE_FQDN}:host-gateway"
+      - "dashboard.${SITE_FQDN}:host-gateway"
+
+  # traefik — TLS terminator at :443 for the mgmt-API (and future
+  # dashboard / Ory / db-policy-engine / snitch collector at the same Orin).
+  # File-provider only: no docker labels, no ACME, no Cloudflare. Cert and
+  # key are PEM files mounted read-only from the host filesystem at
+  # /etc/goat/tls/<service>/{cert.pem,key.pem}, delivered by the
+  # `traefik` ansible role from operator-laptop output of
+  # `cert-sign` per ADR 0407 + docs/design/internal-tls-ca.md.
+  #
+  # Routing: dynamic config rendered into /etc/traefik/dynamic/ by the
+  # ansible role; --providers.file.watch=true picks up cert + config
+  # updates without a Traefik restart on rotation. Routes by Host
+  # header — peer software typically dials `https://198.18.0.1:443` (the
+  # wg-cp0 internal address) so the routing rule covers that host plus
+  # the canonical mgmt FQDN and 127.0.0.1.
+  #
+  # Pin discipline (ADR 0703): production sets TRAEFIK_IMAGE in .env to
+  # a digest-pinned ref. Tag-only fallback is for ad-hoc dev only and
+  # is flagged by ops/ci/check-pin-compat.sh. Chainguard image is the
+  # preferred long-term path (CLAUDE.md "Supply chain"); upstream
+  # `traefik:v3.7.16` (3.7 is the supported line; 3.2 took no fixes after 2025) is acceptable as the bridge until Chainguard
+  # procurement question lands.
+  traefik:
+    # Multi-arch index digest from
+    # docker.io/library/traefik:v3.7.16; bump alongside the tag when
+    # intentionally upgrading. ADR 0703 + ops/ci/check-pin-compat.sh
+    # require tag+digest pinning.
+    image: ${TRAEFIK_IMAGE:-traefik:v3.7.16@sha256:1336e85aaed293bd63d005086e0dd013b04078b26aaeb1c18b26a2f928af7e65}
+    container_name: traefik
+    restart: unless-stopped
+    environment:
+      # CVE-2026-98432 mitigation (IPv4 TCP request-socket use-after-free, CVSS
+      # 9.8): the published exploit needs an MPTCP listener and Go 1.24+ listeners
+      # request one by default. GODEBUG keeps this Go listener plain TCP on any
+      # kernel; a container sysctl would refuse to start on Tegra, which has no
+      # MPTCP. Remove with the host sysctl once the fixed Ubuntu kernel is live.
+      - GODEBUG=multipathtcp=0
+    deploy:
+      resources:
+        # 1G is the fleet default. A 256M limit OOM-kills Traefik in a tight
+        # restart loop on a host fronting many services: RSS stays ~90 MB (the
+        # binary mmap) but cgroup accounting picks up Go
+        # runtime virtual reservation, page cache, kernel slab, and
+        # the periodic ACME renewal-check working set. 1G gives Traefik
+        # comfortable headroom on a 122-GiB-RAM Orin without becoming
+        # the next noisy neighbor.
+        #
+        # Set per goatnet through .env (TRAEFIK_CPUS / TRAEFIK_MEMORY, rendered
+        # by mgmt-host.yml from mgmt_traefik_cpus / mgmt_traefik_memory); the
+        # defaults are the fleet values.
+        limits:
+          cpus: "${TRAEFIK_CPUS:-0.5}"
+          memory: "${TRAEFIK_MEMORY:-1G}"
+        reservations:
+          memory: 64M
+    command:
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.websecure.address=:443
+      # A `web` entrypoint on :80 that ONLY redirects to :443. Without it a
+      # browser given a bare hostname (people type `isitup.<site>.<zone>`, not
+      # the scheme) tries http first and gets ERR_CONNECTION_REFUSED — a
+      # confusing dead end for a service that is actually healthy. It serves no
+      # content in the clear; every request is answered with a 308 to https.
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --entrypoints.web.http.redirections.entryPoint.permanent=true
+      # F-106: explicit zero respondingTimeouts on websecure so
+      # netbird-mgmt's `ManagementService/Job` server-streaming RPC
+      # (long-poll for peer-config updates; idle minutes between
+      # pushes) is not killed at Traefik v3's 60s readTimeout default.
+      # Safe because websecure is wg-cp0-fronted only (ADR 0313); no
+      # public-internet exposure to need defensive timeouts at this
+      # layer. Public entrypoints, if ever added, need their own review.
+      - --entrypoints.websecure.transport.respondingTimeouts.readTimeout=0
+      - --entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0
+      - --entrypoints.websecure.transport.respondingTimeouts.idleTimeout=0
+      # Enrollment-only entrypoint. The host-side docker-compose binds this
+      # entrypoint to 127.0.0.1:8443 (see ports block) so it is reachable ONLY via
+      # the rathole tunnel from the public relays. The Traefik dynamic config
+      # restricts signal + mgmt-public to this entrypoint exclusively; no
+      # mesh-only router attaches, so a public-via-rathole request whose
+      # Host header is anything other than `netbird.<zone>`
+      # gets a 404 at routing time (no Host match), structurally
+      # eliminating the mesh-only-allowlist bypass (docker-SNAT'd rathole traffic
+      # at the websecure entrypoint has a 172.x bridge-gateway source IP, matching
+      # the on-host-container allowlist entry). Same zero
+      # respondingTimeouts shape as websecure for the ManagementService/Job
+      # long-poll. Sites that don't deploy rathole
+      # don't bind this port; the entrypoint is
+      # defined unconditionally but has no listener if the host port is
+      # not mapped — Traefik treats it as inert.
+      - --entrypoints.enrollment.address=:8443
+      - --entrypoints.enrollment.transport.respondingTimeouts.readTimeout=0
+      - --entrypoints.enrollment.transport.respondingTimeouts.writeTimeout=0
+      - --entrypoints.enrollment.transport.respondingTimeouts.idleTimeout=0
+      - --entrypoints.metrics.address=:8082
+      - --metrics.prometheus=true
+      - --metrics.prometheus.entryPoint=metrics
+      # Per-ROUTER duration series, not just per-service (ADR 1133).
+      #
+      # Traefik times a request open-to-close, so an SSE stream held open for
+      # twenty minutes is one 1200-second "request", and the portal's event
+      # stream (/api/topics/stream) makes most of its long requests. Excluding the
+      # WHOLE service from every percentile would throw away its real page
+      # latency too.
+      #
+      # Router labels let the stream be excluded on its own. They are necessary
+      # but NOT sufficient: a Host()-only router covers every path on the host,
+      # so this flag alone would just relabel the same aggregate. The service
+      # also needs a dedicated router for the stream path — see
+      # traefik-portal.yml.j2, which now defines one.
+      #
+      # Cost: one extra label value per router (~20 on a goatnet), which is
+      # cardinality this Prometheus carries comfortably.
+      - --metrics.prometheus.addRoutersLabels=true
+      - --log.level=INFO
+      - --accesslog=true
+      - --accesslog.format=json
+      - --api.dashboard=false
+      - --api.insecure=false
+      # No ACME / no Let's Encrypt — internal-only endpoints behind
+      # wg-cp0; cert is offline-CA-signed per ADR 0407.
+    ports:
+      # Bind :443 on all interfaces. Defense-in-depth comes from:
+      #   1. wg-cp0 silent control plane — peers reach 198.18.0.1:443 only
+      #      after a successful WireGuard handshake (ADR 0313).
+      #   2. The cert is signed by the offline CA, distributed via bundle
+      #      tls_trust_anchor; clients without the trust anchor fail
+      #      verification.
+      #   3. Traefik routes by Host header — only valid Host values get
+      #      served (mgmt FQDN, 198.18.0.1 wg-cp0 internal, 127.0.0.1).
+      # Site-private LAN exposure to operator laptops is intended (mgmt
+      # of the mgmt-host happens over LAN-SSH + LAN-HTTPS).
+      - "443:443"
+      # Enrollment-only entrypoint. Bound to 127.0.0.1 ONLY — not reachable from
+      # any external interface. The rathole-client systemd unit forwards
+      # relay-tunneled TCP to 127.0.0.1:8443 (see
+      # ops/ansible/templates/client.toml.j2).
+      # Only signal + mgmt-public attach to the `enrollment`
+      # entrypoint in mgmt-dynamic.yml.j2; mesh-only routers stay on
+      # websecure only, so a public client whose request reaches :8443
+      # via the rathole tunnel can only ever match the enrollment
+      # hostname — every other Host header gets 404 at routing time.
+      # On sites without rathole-client nothing connects to :8443;
+      # the Traefik enrollment entrypoint sits idle.
+      - "127.0.0.1:8443:8443"
+      # Prometheus metrics entrypoint (:8082, configured above). ADR 1161.
+      #
+      # DEFAULT IS LOOPBACK, and the default is the whole safety story: on a
+      # co-located stack the obs Prometheus reaches this as `traefik:8082` over
+      # the shared docker network and never needs the published port at all, so
+      # binding it to 127.0.0.1 changes nothing for those sites.
+      #
+      # A site whose obs host is a SEPARATE MACHINE (the ADR 0826 three-Orin
+      # topology) has no shared network to reach it over, and every traefik_*
+      # alert and the whole response-time reading surface stay dark there —
+      # F-449. Those sites set TRAEFIK_METRICS_BIND to this host's MESH address
+      # in group_vars, never to 0.0.0.0: the mesh IP is reachable only after a
+      # WireGuard handshake, an all-interfaces bind would also expose the
+      # endpoint on the site LAN, and Traefik's metrics endpoint carries no
+      # authentication of its own.
+      - "${TRAEFIK_METRICS_BIND:-127.0.0.1}:8082:8082"
+    volumes:
+      # Cert + key mounted read-only. Traefik file-watcher picks up
+      # rotations without restart. Mode 0400 root:root for the key
+      # is enforced on the host by the ansible role.
+      - /etc/goat/tls/:/etc/goat/tls/:ro
+      # Dynamic routing config rendered by the traefik ansible role
+      # from ops/ansible/templates/traefik-mgmt-host-dynamic.yml.j2
+      # per ADR 0407 + docs/design/internal-tls-ca.md §6.2.
+      - /etc/traefik/dynamic/:/etc/traefik/dynamic/:ro
+    depends_on:
+      management-a:
+        condition: service_started
+    networks:
+      - mgmt
+
+  # mgmt-host-bootstrap — Block 21A Go CLI for sovereign netbird account +
+  # setup-key creation. Per ADR 0410. A DB-direct seed is not an alternative.
+  #
+  # Profile-gated so it does NOT start with the normal mgmt-plane lifecycle
+  # (postgres + signal + management). Operators invoke it via:
+  #   docker compose --profile bootstrap run --rm mgmt-host-bootstrap \
+  #     create-account --owner ops@... --site-name <site>
+  #
+  # Or, if the host has the wrapper script installed by the Ansible role
+  # (ops/ansible/roles/mgmt-host-bootstrap-wrapper/, follow-up):
+  #   mgmt-host-bootstrap create-account --owner ops@... --site-name <site>
+  #
+  # Source: ops/mgmt-host-bootstrap/. Tests at .github/workflows/mgmt-host-bootstrap.yml.
+  #
+  # Pin discipline (ADR 0703): production deployments MUST set
+  # MGMT_HOST_BOOTSTRAP_IMAGE in .env to a digest-pinned reference
+  # (e.g. ghcr.io/usareur-af/mgmt-host-bootstrap:<sha>@sha256:<digest>),
+  # rendered by Ansible group_vars. The :latest fallback below is for
+  # ad-hoc operator invocation (`compose run --rm`) only — never long-lived.
+  # The compose-lint pin-compat job (ops/ci/check-pin-compat.sh) flags any
+  # service whose effective image is a tag-only ref.
+  mgmt-host-bootstrap:
+    image: ${MGMT_HOST_BOOTSTRAP_IMAGE:-ghcr.io/usareur-af/mgmt-host-bootstrap:latest}
+    profiles: ["bootstrap"]
+    environment:
+      # Same DSN the management container uses; netbird's encryption applies
+      # uniformly. The CLI never touches anything but accounts/setup_keys/
+      # groups/peers/users, all in the netbird database.
+      PGDSN: "host=postgres-a user=postgres password=${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD} dbname=netbird sslmode=disable client_encoding=UTF8"
+    networks:
+      - mgmt
+    # No restart policy — this is invoked one-shot via `compose run --rm`.
+
+volumes:
+  pgdata-a:
+  management-a-data:
+
+networks:
+  mgmt:
+    name: mgmt

@@ -1,0 +1,117 @@
+# Postgres storage / WAL observability alert rules.
+#
+# Companion to spock.yml — covers the F-093 follow-on observability
+# need ("where's the WAL coming from / what's eating disk") that the
+# Spock-side rules in spock.yml don't surface.
+#
+# Metric sources: pg_stat_wal_extended, pg_database_extended,
+# pg_table_top_sizes, pg_wal_dir custom queries in
+# monitoring/postgres-exporter-queries.yml. Surfaced via the local
+# postgres-exporter sidecar (job=postgres in monitoring/prometheus.yml).
+#
+# Severity discipline:
+#   - critical: drives an immediate page (postgres about to fall over,
+#     or a disk fill within hours under normal write rate).
+#   - warning: needs human eyes within a working day.
+#   - info: trend / capacity-planning signal — never paging.
+
+groups:
+  - name: postgres.disk
+    rules:
+
+      # pg_wal directory is a meaningful fraction of the data volume.
+      # Tied to node-exporter filesystem size since pg_wal lives on
+      # the data volume. A pinned slot can fill the volume with WAL within days.
+      # We alert at 70% to give a multi-hour heads-up
+      # (70% means there's still
+      # a day or more of headroom, plenty of time to investigate).
+      - alert: PostgresWalDirNearVolumeCapacity
+        expr: |
+          pg_wal_dir_bytes
+            / (
+              node_filesystem_size_bytes{mountpoint="/opt/docker-data"}
+              - node_filesystem_avail_bytes{mountpoint="/opt/docker-data"}
+              + pg_wal_dir_bytes
+            ) > 0.5
+        for: 30m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "pg_wal at {{ $labels.site }} is > 50% of total used data-volume"
+          description: "pg_wal directory is consuming more than half of the used capacity on /opt/docker-data. This means an offline subscriber slot is pinning WAL — investigate via the SpockSlotInactive / SpockSlotWALSenderLag siblings. If unaddressed, an offline-too-long subscriber will eventually trip the 6 GB max_slot_wal_keep_size cap and self-invalidate (which is the safety net — but the disk-headroom signal is a chance to do something graceful first)."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/post-partition-convergence-runbook.md"
+
+      # Critical disk-fill class. node-exporter's filesystem free is
+      # the absolute truth. At /-volume = 100% the dashboards cascade;
+      # alerting at 90% gives operators time to
+      # respond before postgres restart-loops. Runs against the
+      # data volume specifically (where the postgres + container
+      # state lives).
+      - alert: DataVolumeNearFull
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/opt/docker-data"}
+            / node_filesystem_size_bytes{mountpoint="/opt/docker-data"} < 0.10
+        for: 5m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "Data volume at {{ $labels.site }} is < 10% free"
+          description: "/opt/docker-data has dropped below 10% free. Postgres will start restart-looping on `pg_wal: No space left on device` if this continues. Check pg_wal usage (`pg_wal_dir_bytes`), per-database sizes (`pg_database_extended_size_bytes`), and per-table top sizes (`pg_table_top_sizes_size_bytes`) for the root cause. F-093 was the inaugural incident in this class."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/docker-data-root-migration.md"
+
+      # eMMC disk-fill class. The eMMC should hold OS +
+      # boot only (~10 GB used / 57 GB total). A spike past 60% used
+      # indicates either Docker's data-root drifted off /opt/docker-data
+      # somehow, or some non-Docker artifact (apt cache, journal logs,
+      # /tmp) is bloating. Either way, operator-investigable BEFORE
+      # the eMMC fills.
+      - alert: SystemDiskUnexpectedlyFull
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/"}
+            / node_filesystem_size_bytes{mountpoint="/"} < 0.40
+        for: 30m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "/ at {{ $labels.site }} is > 60% used (post-F-093 eMMC should be ~20%)"
+          description: "Post-F-093 closure (2026-05-09), eMMC should hold OS + boot only — 10-20% used in steady state. > 60% used indicates docker data-root or containerd root drifted back to /var/lib/{docker,containerd}, or apt/journal/tmp is bloating. Run `df -h /var/lib/docker /var/lib/containerd /opt/docker-data` to see where the bytes are landing."
+
+  - name: postgres.wal-rate
+    rules:
+
+      # WAL bytes-per-second rate of change. Useful as a telemetry
+      # signal (info severity); not paging. Helps operator answer
+      # "is the load spiking" by graphing rate(pg_stat_wal_extended_wal_bytes[5m]).
+      # No alert here — purely a dashboard signal. The threshold
+      # below is a safety net for "100x the steady-state rate" which
+      # almost always means a runaway DELETE or schema migration.
+      - alert: PostgresWalGenerationRateExtreme
+        expr: rate(pg_stat_wal_extended_wal_bytes[5m]) > (100 * 1024 * 1024)
+        for: 10m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "Postgres WAL generation rate at {{ $labels.site }} > 100 MB/s for 10m"
+          description: "Sustained high WAL generation rate. F-093 incident-time write rate was ~330 MB/hr (~92 KB/s) — 100 MB/s is 1000x that. Likely culprits: bulk INSERT/UPDATE/DELETE without batching, schema migration on a large table, or a runaway feedback loop. Check `pg_stat_activity` for long-running statements."
+
+  - name: postgres.cluster-config
+    rules:
+
+      # max_slot_wal_keep_size is unset / unbounded: the upstream default is
+      # `-1` (unlimited). The query emits
+      # 2^63-1 as a sentinel for unlimited; alert when we observe it
+      # so a role drifting back to default is caught.
+      - alert: PostgresMaxSlotWalKeepSizeUnbounded
+        expr: spock_config_max_slot_wal_keep_size_bytes >= 9223372036854775807
+        for: 30m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "max_slot_wal_keep_size is unbounded at {{ $labels.site }}"
+          description: "The Postgres setting `max_slot_wal_keep_size` is back to the upstream `-1` (unlimited) default. This is the F-093 root cause — any offline subscriber's slot can pin WAL on disk indefinitely. The role default is 6GB; check `postgres-streaming-replication` was applied recently on this primary and that no out-of-band ALTER SYSTEM cleared the value."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/findings/F-093-docker-data-root-default-plus-spock-unbounded-wal.md"

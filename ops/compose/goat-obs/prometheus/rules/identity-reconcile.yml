@@ -1,0 +1,88 @@
+# Identity reconciliation — live-vs-declared strays (the user209x backstop).
+#
+# The access COP classifies a live person with no declared manifest as
+# `out_of_band` (data-access-cop.md); identity-reconcile/reconcile.py surfaces
+# that verdict as goat_identity_strays. Before this, the verdict existed but
+# nothing watched it — a stray sat invisible for a month. These rules make it
+# loud. NO PII in the metric (aggregate counts only); the WHO is in the cron's
+# journald output (`journalctl -t identity-reconcile`).
+groups:
+  - name: identity-reconcile
+    rules:
+      # GATE: one or more live person-identities have no declared record and
+      # aren't allowlisted (test/service accounts). Each is either a real
+      # participant needing a manifest backfill (like user209x) or an
+      # identity that should be revoked.
+      - alert: IdentityStrayUntracked
+        expr: goat_identity_strays{scope="unallowlisted"} > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "{{ $value }} live identity(ies) on {{ $labels.env }} have no declared record"
+          description: "{{ $value }} unallowlisted person-stray(s) reconcile to out_of_band — live (login/mesh) but absent from the declared registry (roster.json). Each is a real participant needing a manifest backfill (see the user209x backfill) or an identity to revoke; if it's a legitimate test/service account, add it to identity-reconcile-allowlist.txt. Names: `journalctl -t identity-reconcile` on the mgmt host."
+
+      # STALENESS: the reconciler stopped running (cron dead / portal unreachable
+      # for >90m), so a silence here is "we've gone blind," not "all clear."
+      - alert: IdentityReconcileStale
+        expr: time() - goat_identity_reconcile_last_run_timestamp_seconds > 5400
+        for: 10m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "identity-reconcile has not run for >90m on {{ $labels.env }}"
+          description: "goat_identity_reconcile_last_run_timestamp_seconds is stale — the reconciler cron isn't running or can't reach the portal. Stray detection is BLIND until it recovers. Check the cron + `journalctl -t identity-reconcile`."
+
+      # FETCH FAIL: the reconciler ran but the portal roster fetch failed (up=0),
+      # so the stray count is unknown (not zero).
+      - alert: IdentityReconcileDown
+        expr: goat_identity_reconcile_up == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "identity-reconcile cannot reach the portal on {{ $labels.env }}"
+          description: "goat_identity_reconcile_up=0 for 30m — the reconciler is running but the portal /api/access/roster fetch is failing (portal down, token invalid, or mesh DNS). Stray counts are stale. Check the portal + the reconciler's PORTAL_URL/PORTAL_OPERATOR_API_KEY."
+
+      # The F-213 guard's own health. IdentityOffVocabGroup below fires on
+      # `> 0`, so a check that never RAN looks identical to a clean goatnet:
+      # reconcile.py renders offvocab_up=0 alongside offvocab=0 whenever the
+      # Kratos identity fetch throws (reconcile.py fetch_offvocab). obs.yml
+      # renders ORY_SOT_GROUPS from group-permissions.yml unconditionally and
+      # KRATOS_ADMIN_URL has a default, so wherever identity-reconcile is
+      # deployed a healthy run is 1 — a sustained 0 is a real failure, not a
+      # goatnet that opted out. 2026-08-01 fragility audit, item 5.
+      - alert: IdentityOffVocabCheckDown
+        expr: goat_identity_offvocab_check_up == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "the off-vocabulary Ory-group check is not running on {{ $labels.env }}"
+          description: |
+            goat_identity_offvocab_check_up=0 for 30m — reconcile.py could not
+            enumerate Kratos identities (admin API unreachable) or the SoT
+            vocabulary was empty, so goat_identity_offvocab_groups is 0 because
+            NOTHING WAS CHECKED, not because the fleet is clean. The F-213
+            conflation guard is blind until this clears. Check KRATOS_ADMIN_URL
+            + ORY_SOT_GROUPS in /etc/goat-identity-reconcile.env and
+            `journalctl -t identity-reconcile`.
+
+      # F-213 conflation guard: an Ory identity carrying a group outside the
+      # group-permissions.yml vocabulary (e.g. a mesh-role name in traits).
+      - alert: IdentityOffVocabGroup
+        expr: goat_identity_offvocab_groups > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} identity(ies) carry off-vocabulary Ory groups ({{ $labels.env }})"
+          description: >-
+            An Ory identity's traits.groups contains a value not present in
+            ops/permissions/group-permissions.yml (and not a data.* grammar
+            value). Mesh-role names in Ory traits are the F-213 conflation.
+            Names: journalctl -t identity-reconcile on the mgmt host.

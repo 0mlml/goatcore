@@ -1,0 +1,234 @@
+# Ory IdP overlay (ADR 0411).
+#
+# Per-site Ory Kratos (identity management) + Ory Hydra (OAuth2 / OIDC server)
+# for human + service-account authentication. Backed by the SAME postgres-spock
+# cluster (postgres-a) used by netbird-mgmt — separate logical databases
+# (kratos, hydra). Required Postgres contribs (pg_trgm, btree_gin for
+# Kratos's identity-search index) baked into the postgres-spock image at
+# ops/postgres/spock/Dockerfile. Identity state inherits
+# Spock multi-master replication + pgBackRest paired-stanza backup; per-site
+# sovereign (no cross-site identity replication) controlled at the Spock
+# subscription level.
+#
+# Operational pattern: ADR 1010 — active-passive behind keepalived VIP,
+# flow + auth_code lifespans budgeted > worst-case Spock replication lag,
+# all identity writes through the Kratos/Hydra admin API only (no direct
+# SQL). Read ADR 1010 before touching the kratos/hydra config templates,
+# adding a load-balanced active-active deployment, or scripting any
+# direct SQL writes against the kratos/hydra schemas.
+#
+# Used as a compose OVERLAY:
+#   docker compose -f docker-compose.yml -f docker-compose.ory.yml up -d
+# So the production mgmt-host stack stays unchanged when Ory is not desired
+# (validation envs may skip; sovereign Orin sites enable).
+#
+# Deployment is driven by the Ansible role ops/ansible/roles/ory/, which:
+#   1. Creates the kratos + hydra logical DBs in postgres-a (psql command).
+#   2. Renders kratos.yaml + hydra.yaml + identity-schema.json from templates
+#      into /opt/mgmt-host/ory/.
+#   3. Runs the *-migrate one-shots to bring the schemas up.
+#   4. Brings up the kratos + hydra long-running services.
+#   5. Imports the initial admin identity from admins.<site>.yaml.
+#   6. Smoke-checks both /health/ready endpoints.
+#
+# Image versions pinned per ADR 0411. Bumps go through the same pin-regression
+# discipline as the netbird image. Index digests are the multi-arch manifest list
+# digest and resolve to per-arch digests at pull time. Bump tag + digest together.
+
+services:
+  # Kratos + Hydra share the existing postgres-spock cluster (postgres-a)
+  # as separate logical databases (kratos, hydra). pg_trgm + btree_gin
+  # contribs are baked into the postgres-spock image
+  # (ops/postgres/spock/Dockerfile) so Kratos's identity-search-index
+  # migrations succeed. Ory state benefits from the same Spock multi-master
+  # replication + pgBackRest paired-stanza backup pattern netbird-mgmt
+  # uses. Per-site sovereign per ADR 0401 (no cross-site identity
+  # replication) — controlled at the Spock-subscription level (intra-site
+  # only).
+
+  # One-shot migration container — applies Kratos schema, then exits.
+  # Re-runs are idempotent (Kratos's migrate is safe to re-apply).
+  kratos-migrate:
+    image: ${ORY_KRATOS_IMAGE:-oryd/kratos:v1.3.1@sha256:c47903ba278bbcb330b5af4ce43d33dc17adacc1d40456b8e2a235add8ababa5}
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+    environment:
+      DSN: "postgres://postgres:${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD}@postgres-a:5432/kratos?sslmode=disable"
+    command: ["migrate", "-c", "/etc/config/kratos.yaml", "sql", "-e", "--yes"]
+    volumes:
+      - ./ory/kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./ory/identity-schema.json:/etc/config/identity-schema.json:ro
+    restart: "no"
+    networks:
+      - mgmt
+
+  # Kratos — identity management. Public API for browser flows; admin API
+  # for `kratos identity import` and similar.
+  kratos:
+    image: ${ORY_KRATOS_IMAGE:-oryd/kratos:v1.3.1@sha256:c47903ba278bbcb330b5af4ce43d33dc17adacc1d40456b8e2a235add8ababa5}
+    depends_on:
+      kratos-migrate:
+        condition: service_completed_successfully
+      postgres-a:
+        condition: service_healthy
+    environment:
+      DSN: "postgres://postgres:${POSTGRES_SUPERUSER_PASSWORD:?}@postgres-a:5432/kratos?sslmode=disable"
+      # Secrets injected via env (NOT inlined in kratos.yaml at mode
+      # 0644). Kratos's env-override pattern parses these as
+      # comma-separated arrays before config validation runs. Per F-005:
+      # KRATOS_SECRETS_CIPHER MUST be identical across the HA pair
+      # (operator provisions same value on both Orins via 1Password).
+      SECRETS_COOKIE: "${KRATOS_SECRETS_COOKIE:?set KRATOS_SECRETS_COOKIE (32+ char random)}"
+      SECRETS_CIPHER: "${KRATOS_SECRETS_CIPHER:?set KRATOS_SECRETS_CIPHER (32 chars exactly, IDENTICAL across HA pair per F-005)}"
+      # Courier SMTP — the transport for self-service account-recovery mail.
+      # Same reason as the secrets above: the URI embeds the SMTP user:pass and
+      # kratos.yaml is 0644, so it rides the env instead. The `ory` role writes
+      # KRATOS_COURIER_SMTP_URI into /opt/mgmt-host/.env (0600) only when
+      # ory_courier_smtp_enabled; the fallback below is byte-identical to the
+      # no-op sink in kratos.yaml, so a site without a courier is unaffected
+      # and mail is swallowed exactly as before rather than erroring.
+      COURIER_SMTP_CONNECTION_URI: "${KRATOS_COURIER_SMTP_URI:-smtps://localhost:1025/?disable_starttls=true}"
+    # External ICAM federation client secrets, one env var per provider
+    # (SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_<n>_CLIENT_SECRET), written by the
+    # `ory` role at 0600. Empty when icam_federation is off, absent on a host the role
+    # has not visited since this line landed — default-off stays zero-behaviour.
+    env_file:
+      - path: ./ory/kratos-icam.env
+        required: false
+    # A local card front-end (icam_federation mode mtls_proxy / keycloak_frontend) has
+    # a mesh name that resolves to this host's mesh address, and Kratos's outgoing-HTTP
+    # client refuses 100.64.0.0/10 in every configuration (not a private range to it,
+    # and exceptions only cover the RFC 1918 ranges). The `ory` role points that name
+    # at the Docker host gateway instead, where Traefik answers with the same
+    # certificate. Unset: a placeholder entry no code resolves.
+    extra_hosts:
+      - "${KRATOS_ICAM_LOCAL_HOST_ENTRY:-icam-local-front-end-unset.invalid:127.0.0.1}"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 64M
+    ports:
+      # Public flows (browser) — Traefik fronts these as auth.<site>.netbird.legacy.example
+      - "127.0.0.1:${KRATOS_PUBLIC_HOST_PORT:-4433}:4433"
+      # Admin API — kept loopback-only; ops use docker exec or compose run.
+      - "127.0.0.1:${KRATOS_ADMIN_HOST_PORT:-4434}:4434"
+    command: ["serve", "-c", "/etc/config/kratos.yaml", "--watch-courier"]
+    volumes:
+      - ./ory/kratos.yaml:/etc/config/kratos.yaml:ro
+      - ./ory/identity-schema.json:/etc/config/identity-schema.json:ro
+      # External ICAM federation claim-maps (docs/design/external-icam-federation.md).
+      # The `ory` role always creates this dir; it is EMPTY + unreferenced unless
+      # icam_federation.enabled, so default-off is a zero-behavior mount.
+      - ./ory/claim-maps:/etc/config/claim-maps:ro
+    networks:
+      - mgmt
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:4434/admin/health/ready || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  hydra-migrate:
+    image: ${ORY_HYDRA_IMAGE:-oryd/hydra:v2.3.0@sha256:38bbfe332099e9214b8041dffe5e3eaa271140993f148d3c8a5f7af825013097}
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+    environment:
+      DSN: "postgres://postgres:${POSTGRES_SUPERUSER_PASSWORD:?}@postgres-a:5432/hydra?sslmode=disable"
+    command: ["migrate", "-c", "/etc/config/hydra.yaml", "sql", "-e", "--yes"]
+    volumes:
+      - ./ory/hydra.yaml:/etc/config/hydra.yaml:ro
+    restart: "no"
+    networks:
+      - mgmt
+
+  hydra:
+    image: ${ORY_HYDRA_IMAGE:-oryd/hydra:v2.3.0@sha256:38bbfe332099e9214b8041dffe5e3eaa271140993f148d3c8a5f7af825013097}
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+      postgres-a:
+        condition: service_healthy
+    environment:
+      DSN: "postgres://postgres:${POSTGRES_SUPERUSER_PASSWORD:?}@postgres-a:5432/hydra?sslmode=disable"
+      SECRETS_SYSTEM: "${HYDRA_SECRETS_SYSTEM:?set HYDRA_SECRETS_SYSTEM (32+ char random)}"
+      SECRETS_COOKIE: "${HYDRA_SECRETS_COOKIE:?set HYDRA_SECRETS_COOKIE (32+ char random)}"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 64M
+    ports:
+      # Public OAuth2/OIDC endpoints — Traefik fronts as oauth2.<site>.netbird.legacy.example
+      - "127.0.0.1:${HYDRA_PUBLIC_HOST_PORT:-4444}:4444"
+      # Admin API — kept loopback-only.
+      - "127.0.0.1:${HYDRA_ADMIN_HOST_PORT:-4445}:4445"
+    command: ["serve", "-c", "/etc/config/hydra.yaml", "all"]
+    volumes:
+      - ./ory/hydra.yaml:/etc/config/hydra.yaml:ro
+    networks:
+      - mgmt
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:4445/health/ready || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  # Block 21D.1.b — Ory Kratos selfservice-ui-node.
+  #
+  # Renders the login / registration / recovery / verification / settings /
+  # error / consent HTML pages that Kratos's API server (kratos:4433) does
+  # NOT serve itself — Kratos is API-only. Hydra's `/oauth2/auth` redirects
+  # the browser to `auth.<site>.<zone>/login?login_challenge=...`; Traefik
+  # routes that to this container (selfservice-ui:3000) per each site's
+  # group_vars `traefik_services` or per `mgmt-dynamic.yml.j2` (the ACME overlay).
+  #
+  # Without selfservice-ui any OIDC login flow returns 502 Bad Gateway from
+  # Traefik on `auth.<site>`.
+  #
+  # KRATOS_BROWSER_URL is per-site — built from SITE_FQDN_FOR_AUTH which the
+  # ory role renders into /opt/mgmt-host/.env. SITE_FQDN_FOR_AUTH includes
+  # the scheme + auth-subdomain prefix; e.g.
+  # `https://auth.<site>.<zone>`.
+  selfservice-ui:
+    image: ${KRATOS_SELFSERVICE_UI_IMAGE:-oryd/kratos-selfservice-ui-node:v1.3.1@sha256:2d6f9a84456c0e6797664e65f2a743f695794788f1e276f915d247f9e35684a3}
+    container_name: selfservice-ui
+    depends_on:
+      kratos:
+        condition: service_healthy
+    environment:
+      KRATOS_PUBLIC_URL: "http://kratos:4433"
+      KRATOS_BROWSER_URL: "${SITE_FQDN_FOR_AUTH:?set SITE_FQDN_FOR_AUTH (https://auth.<site>.<zone>)}"
+      KRATOS_ADMIN_URL: "http://kratos:4434"
+      HYDRA_ADMIN_URL: "http://hydra:4445"
+      BASE_URL: "/"
+      COOKIE_SECRET: "${UI_COOKIE_SECRET:?set UI_COOKIE_SECRET (32+ char random)}"
+      CSRF_COOKIE_NAME: "ui_csrf"
+      CSRF_COOKIE_SECRET: "${UI_CSRF_SECRET:?set UI_CSRF_SECRET (32+ char random)}"
+      DANGEROUSLY_DISABLE_SECURE_CSRF_COOKIES: "false"
+      PORT: "3000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 64M
+    ports:
+      # Loopback-only — only Traefik routes traffic to this container.
+      - "127.0.0.1:${SELFSERVICE_UI_HOST_PORT:-3001}:3000"
+    networks:
+      - mgmt
+    restart: unless-stopped
+    labels:
+      - "block=21D.1.b"

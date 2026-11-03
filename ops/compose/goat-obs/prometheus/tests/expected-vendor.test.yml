@@ -1,0 +1,57 @@
+# promtool unit test for expected-vendor.yml.
+# Run:  promtool test rules ops/compose/goat-obs/prometheus/tests/expected-vendor.test.yml
+#
+# Scenario: org59x keeps producing (healthy); notional goes flat (silently
+# stopped landing — the F-177 case); org11x produces but isn't onboarded
+# (squat). Proves both alerts fire for the right vendor and stay quiet for the
+# healthy/expected ones — independent of the deployed manifest's completeness.
+rule_files:
+  - ../rules/expected-vendor.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # Expectation (the manifest, as node-exporter would expose it).
+      - series: 'goat_expected_vendor{vendor="org59x",active="true"}'
+        values: '1x30'
+      - series: 'goat_expected_vendor{vendor="notional",active="true"}'
+        values: '1x30'
+      - series: 'goat_expected_vendor{vendor="system",active="false"}'
+        values: '1x30'
+      # Actuals (audit-subscriber counter).
+      - series: 'goat_audit_samples_total{vendor="org59x",key_pattern="org59x/c2/v1"}'
+        values: '0+10x30'        # steadily increasing -> producing
+      - series: 'goat_audit_samples_total{vendor="notional",key_pattern="notional/mantis/v1"}'
+        values: '500x30'         # flat -> zero increase -> silently stopped
+      - series: 'goat_audit_samples_total{vendor="org11x",key_pattern="org11x/lattice/v1"}'
+        values: '0+7x30'         # increasing, but org11x is NOT in the manifest
+
+    alert_rule_test:
+      # The gate: notional (expected-active) is silent -> fires. org59x healthy
+      # (no alert); system is active="false" so it's never checked.
+      - eval_time: 25m
+        alertname: ExpectedVendorSilent
+        exp_alerts:
+          - exp_labels:
+              vendor: notional
+              active: "true"
+              severity: warning
+              component: zenoh-fabric
+            exp_annotations:
+              summary: "expected vendor notional has produced no samples in 15m"
+              description: "notional is expected-active but the audit-subscriber saw zero samples for 15m — likely a silently-denied write, a dead publisher, or a retired vendor (then remove it from expected-vendors.yml). Triage: goat sub 'notional/**' --count 1; check the portal registry + live ACL."
+
+      # The squat: org11x produces but isn't expected -> fires. org59x/notional
+      # are in the manifest, excluded.
+      - eval_time: 25m
+        alertname: UnexpectedVendorProducing
+        exp_alerts:
+          - exp_labels:
+              vendor: org11x
+              severity: info
+              component: zenoh-fabric
+            exp_annotations:
+              summary: "un-onboarded vendor org11x is producing on the fabric"
+              description: "org11x is producing but is absent from the expected-vendor manifest — an un-onboarded squat (verify it has no ACL subject / storage / schema), or an onboarded vendor missing from expected-vendors.yml allowed. Confirm against the portal registry before treating as a squat."

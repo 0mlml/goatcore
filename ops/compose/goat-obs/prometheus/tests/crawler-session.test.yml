@@ -1,0 +1,101 @@
+# promtool unit tests for ZenohCrawlerSessionDegraded (rules/zenoh-wedge.yml).
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/crawler-session.test.yml
+#
+# Context: the crawler now stays UP without a zenoh session when it has a
+# usable rocksdb source. That is correct — census and topic-budget
+# classification are router-independent — but it retired the signal that used
+# to mean "the router is gone" (the process exiting). This alert is the
+# replacement, and it deliberately does NOT couple to crawler liveness: the
+# crawler's own container healthcheck stays green in the degraded state on
+# purpose, so this is the only thing that says the fabric view is partial.
+#
+# The 0/1 mapping itself lives in ops/relay/health/zenoh-health-to-prom.py and
+# is not exercised here (promtool tests PromQL, not the exporter). It was
+# verified directly against the exporter with fixtures:
+#   zenoh_session_state="live"        -> 1
+#   zenoh_session_state="unavailable" -> 0
+#   zenoh_session_state="degraded"    -> 1   (unknown states are NOT paged)
+#   field absent (older crawler)      -> no series emitted at all
+
+rule_files:
+  - ../rules/zenoh-wedge.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Session drops and stays down: the alert fires after for:15m.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_crawler_session_live{router="zagros"}'
+        values: '1x10 0x60'
+      # The crawl itself keeps going — sampled_at advances the whole time, so
+      # the staleness rules must stay silent. Degraded is not stale.
+      - series: 'goat_zenoh_fabric_sampled_at_seconds{router="zagros"}'
+        values: '0+60x70'
+      - series: 'goat_zenoh_prom_last_run_timestamp_seconds'
+        values: '0+60x70'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ZenohCrawlerSessionDegraded
+        exp_alerts: []
+      # Degraded from 11m; for:15m -> firing by 26m.
+      - eval_time: 30m
+        alertname: ZenohCrawlerSessionDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: zenoh-fabric
+              router: zagros
+            exp_annotations:
+              summary: "fabric crawler on zagros is measuring from rocksdb with NO zenoh session"
+              description: |
+                The crawler has had no zenoh session for 15m+ and is running
+                rocksdb-only. Still trustworthy: stored-key census, per-owner
+                cardinality, topic-budget classification. NOT being measured at
+                all: publishers, liveliness, admin declarations — those facets are
+                null, not zero, so any panel or query reading them is looking at an
+                absence and must not report it as "no publishers". The crawler
+                itself is healthy and will re-attach on its own; the question is
+                why the router is unreachable from it. Check the router first
+                (FabricRouterUnhealthy / ZenohRouterWedging may also be firing),
+                then the crawler's cert/ACL if the router is fine.
+      # Load-bearing: a degraded session must NOT masquerade as a dead sampler.
+      # The crawl is still publishing, so the staleness/absence rules stay quiet
+      # and the operator gets exactly one signal describing exactly one problem.
+      - eval_time: 30m
+        alertname: ZenohFabricSamplerStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ZenohFabricSamplerAbsent
+        exp_alerts: []
+
+  # A healthy session must never fire, and a brief blip inside for:15m must not
+  # either — the crawler re-attaches on its own and a 5-minute reconnect is not
+  # worth waking anyone.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_crawler_session_live{router="zagros"}'
+        values: '1x20 0x5 1x40'
+      - series: 'goat_zenoh_fabric_sampled_at_seconds{router="zagros"}'
+        values: '0+60x65'
+    alert_rule_test:
+      - eval_time: 24m
+        alertname: ZenohCrawlerSessionDegraded
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: ZenohCrawlerSessionDegraded
+        exp_alerts: []
+
+  # An older crawler emits no such field, so the exporter emits no series and
+  # this alert must be structurally silent — no presence guard needed for a
+  # value comparison, same reasoning as the budget-notify rules.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_fabric_sampled_at_seconds{router="nova"}'
+        values: '0+60x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: ZenohCrawlerSessionDegraded
+        exp_alerts: []

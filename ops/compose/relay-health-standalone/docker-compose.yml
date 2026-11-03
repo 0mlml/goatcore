@@ -1,0 +1,96 @@
+# relay-health standalone compose (ADR 1061 — cloud-resident host).
+#
+# SELF-CONTAINED, unlike the Thor overlay (docker-compose.relay-health.yml,
+# which layers on the mgmt-host base + its external `mgmt` network + the
+# oauth2-proxy/Ory gate). This runs on a bare cloud host
+# that has only Docker + netbird from cloud-init: its own network, nginx
+# publishes a host port, NO gate.
+#
+# PHASE 1 (here): just the static dashboard, mesh-only. The host's SG is
+# egress-only, so the published port is reachable ONLY from mesh WireGuard peers
+# (and localhost) — never the public internet. The dashboard JSON is refreshed
+# by relay-health-probe.timer (external-vantage, credential-free) into the
+# bind-mounted www dir.
+#
+# PHASE 2 (the gated flip): add oauth2-proxy + Traefik + LE here and open :443
+# (see ADR 1061). The relay-metrics ingest (ADR 1058) is also added then — it
+# needs the Traefik enrollment route to receive relay POSTs.
+#
+# Driven by ops/ansible/roles/relay-health/ with relay_health_standalone=true.
+#   docker compose -f docker-compose.standalone.yml up -d relay-health
+
+services:
+  # Static dashboard server — read-only bind of the prober output dir. Publishes
+  # on the host port so mesh peers can reach http://<mesh-ip>:<port>/. The SG
+  # (egress-only in PHASE 1) is the access control, not auth — mesh-only.
+  relay-health:
+    # nginx:1.27-alpine, digest-pinned to the multi-arch INDEX (ADR 0703) so it
+    # resolves on both amd64 + arm64 hosts.
+    image: ${RELAY_HEALTH_NGINX_IMAGE:-nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
+    container_name: relay-health
+    restart: unless-stopped
+    ports:
+      - "${RELAY_HEALTH_LISTEN_PORT:-8888}:80"
+    volumes:
+      - /opt/relay-health/www:/usr/share/nginx/html:ro
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "adr=1061"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # Ingest, lifted from docker-compose.public.yml so the two standalone variants
+  # agree: the role brings up `relay-health relay-metrics-ingest` whenever the
+  # ingest is enabled, so a NON-public standalone deploy without it dies on "no
+  # such service". A gateless standalone box still
+  # variant was the only one ever exercised. A gateless standalone box still
+  # needs the ingest: it is how its own host publishes host-net health to it,
+  # and how sibling goatnets post their cross-goatnet rollups.
+  relay-metrics-ingest:
+    image: ${RELAY_METRICS_INGEST_IMAGE:-python:3.12-alpine@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df}
+    container_name: relay-metrics-ingest
+    restart: unless-stopped
+    command: ["python3", "/app/relay-metrics-ingest.py"]
+    environment:
+      RELAY_METRICS_BEARER_TOKEN: "${RELAY_METRICS_BEARER_TOKEN:?relay-metrics ingest requires a bearer token}"
+      RELAY_METRICS_ALLOWED_NAMES: "${RELAY_METRICS_ALLOWED_NAMES:?relay-metrics ingest requires the relay-name allowlist}"
+      # Site network hosts allowed to publish host-net health
+      # (host-net-publish.sh). Empty = route 404s.
+      HOST_NET_ALLOWED_NAMES: "${HOST_NET_ALLOWED_NAMES:-}"
+      # Zenoh routers allowed to publish their SERVICE health (zenoh-health-probe.sh,
+      # F-248/F-253). Empty = /zenoh-health-ingest 404s.
+      ZENOH_HEALTH_ALLOWED_NAMES: "${ZENOH_HEALTH_ALLOWED_NAMES:-}"
+      # Cross-goatnet rollup ingest (goatnets.html). Its OWN token so a sibling
+      # goatnet never holds this box's full ingest credential; both empty ⇒ the
+      # route 404s and the feature is simply off.
+      CROSS_FLEET_TOKEN: "${CROSS_FLEET_TOKEN:-}"
+      CROSS_FLEET_ALLOWED_NAMES: "${CROSS_FLEET_ALLOWED_NAMES:-}"
+      RELAY_METRICS_INGEST_DIR: "/ingest"
+      RELAY_METRICS_LISTEN_PORT: "8090"
+      # Allowlist auto-sync (ADR 1093 Phase 1) — publishers allowed to POST the
+      # active roster; empty = feature off (route 404s). Fail-closed floor below.
+      ALLOWLIST_PUBLISHERS: "${ALLOWLIST_PUBLISHERS:-}"
+      ALLOWLIST_FILE: "/allowlist/authenticated-emails.txt"
+      ALLOWLIST_MIN: "${ALLOWLIST_MIN:-20}"
+    expose:
+      - "8090"
+    volumes:
+      - /opt/relay-health/relay-metrics-ingest.py:/app/relay-metrics-ingest.py:ro
+      - /opt/relay-health/www/ingest:/ingest
+      # rw so the allowlist route can write the gate file IN-PLACE (same inode
+      # oauth2-proxy bind-mounts read-only above; a rename would strand it).
+      - /opt/relay-health/authenticated-emails.txt:/allowlist/authenticated-emails.txt:rw
+    labels:
+      - "adr=1058"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+networks:
+  default:
+    name: relay-health

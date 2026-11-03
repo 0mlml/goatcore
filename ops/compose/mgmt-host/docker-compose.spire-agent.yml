@@ -1,0 +1,52 @@
+# docker-compose.spire-agent.yml — SPIRE AGENT ONLY (ADR 0412 Phase B).
+#
+# For a node that runs a workload needing an SVID but is NOT the goatnet's CA
+# holder. The Workload API socket is local by construction, so a workload can
+# only be served by an agent on its own host — this overlay is what puts one
+# there without also putting a second CA there.
+#
+# DIFFERENCES FROM docker-compose.spire.yml, all deliberate:
+#   - no spire-server service. A second server mints a second CA inside one
+#     trust domain, which is the split-brain roles/spire's entry guard refuses.
+#   - no depends_on. The server is on another host; a health condition on a
+#     service that does not exist here would never be satisfiable.
+#   - the trust bundle is BIND-MOUNTED and pinned. The co-located overlay relies
+#     on insecure_bootstrap, which is sound only when server and agent share a
+#     host and a private network. Across hosts it would let anything answering
+#     on server_address become the trust root.
+#
+#   docker compose --env-file .env.spire-agent \
+#     -f docker-compose.spire-agent.yml up -d spire-agent
+#
+# Rendered and driven by roles/spire/tasks/agent-only.yml.
+
+services:
+  spire-agent:
+    # Tag-only dev default; the deploy overrides SPIRE_AGENT_IMAGE with the
+    # digest from the generated pins, same as the co-located overlay.
+    image: ${SPIRE_AGENT_IMAGE:-ghcr.io/spiffe/spire-agent:1.11.2}
+    container_name: spire-agent
+    restart: unless-stopped
+    command: ["-config", "/run/spire/config/agent.conf", "-expandEnv"]
+    environment:
+      # One-time node-attestation token minted ON THE CA HOLDER and delivered
+      # here over the Ansible control path — which is what avoids a standing
+      # host-to-host credential existing purely for attestation. Only consulted
+      # on first attestation; empty on steady-state reruns, when the agent
+      # reuses its persisted SVID.
+      SPIRE_JOIN_TOKEN: "${SPIRE_JOIN_TOKEN:-}"
+    pid: "host"
+    volumes:
+      - "/opt/spire/config/agent.conf:/run/spire/config/agent.conf:ro"
+      - "/opt/spire/data/agent:/opt/spire/data/agent"
+      # Docker workload attestor needs the daemon socket (read-only).
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      # Workload API socket on a host dir, so a sidecar in another compose
+      # project (the herd connector's spiffe-helper) can mount it.
+      - "/run/spire/sockets:/run/spire/sockets"
+    networks:
+      - mgmt
+
+networks:
+  mgmt:
+    name: mgmt

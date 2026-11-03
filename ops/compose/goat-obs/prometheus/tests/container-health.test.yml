@@ -1,0 +1,97 @@
+# promtool unit test for container-health.yml.
+# Run:  promtool test rules ops/compose/goat-obs/prometheus/tests/container-health.test.yml
+#
+# Scenario: the fabric router goes unhealthy and stays there (the F-248/
+# F-253 class) — both the broad warning and the router-specific critical
+# fire. A second container flaps unhealthy for one publisher cycle
+# (deploy transient) and recovers — stays quiet. The textfile canary
+# goes stale — ObsTextfileStale fires.
+rule_files:
+  - ../rules/container-health.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # Router unhealthy from t=0, stays unhealthy (a long seizure).
+      - series: 'goat_container_health_status{cid="3fe962cd655e",name="zagros-sandbox-zenoh-router",status="unhealthy"}'
+        values: '1x30'
+      # Healthy long-runner — never alerts.
+      - series: 'goat_container_health_status{cid="abcdef123456",name="goat-id-console",status="healthy"}'
+        values: '1x30'
+      # Deploy transient: unhealthy for 5 samples (~one cron cycle), then
+      # the series disappears (publisher rewrites the file with
+      # status=healthy — a NEW series; the unhealthy one vanishes).
+      - series: 'goat_container_health_status{cid="00112233aabb",name="selfservice-ui",status="unhealthy"}'
+        values: '1x5 stale'
+      # Canary: fresh at t=0 then never updated again (cron died at t=0).
+      # time() advances 60s/sample; 900s threshold crosses at t=15m.
+      - series: 'goat_obs_textfile_last_run_timestamp_seconds'
+        values: '0x30'
+
+    alert_rule_test:
+      # At 12m the router has been unhealthy >10m — warning + critical both fire.
+      - eval_time: 12m
+        alertname: ContainerUnhealthy
+        exp_alerts:
+          - exp_labels:
+              cid: 3fe962cd655e
+              name: zagros-sandbox-zenoh-router
+              status: unhealthy
+              severity: warning
+              component: container-health
+            exp_annotations:
+              summary: "container zagros-sandbox-zenoh-router reports docker health=unhealthy for 10m+"
+              description: |
+                The container's own HEALTHCHECK has been failing for 10+
+                minutes while the process stays up — `docker ps` will show
+                `Up (unhealthy)`. This is the hang class, not the crash
+                class: nothing restarts it and nothing else alerts on it.
+                Triage on the host:
+                  docker inspect zagros-sandbox-zenoh-router | jq '.[0].State.Health'
+                  docker logs --tail 50 zagros-sandbox-zenoh-router
+                A restart clears the July 2026 router variants (F-248 fd
+                exhaustion, F-253 admission seizure) but file/annotate a
+                finding before restarting — the wedged state is the evidence.
+      - eval_time: 12m
+        alertname: FabricRouterUnhealthy
+        exp_alerts:
+          - exp_labels:
+              cid: 3fe962cd655e
+              name: zagros-sandbox-zenoh-router
+              status: unhealthy
+              severity: critical
+              component: container-health
+            exp_annotations:
+              summary: "CRITICAL: fabric router zagros-sandbox-zenoh-router unhealthy for 10m+"
+              description: |
+                The zenoh router's HEALTHCHECK (REST admin query) has been
+                failing 10+ minutes. New session opens are likely stalling
+                or failing fleet-wide on this goatnet while established
+                sessions keep flowing — goat health fails, goat status
+                stays green. Prior art: F-248 (fd exhaustion, 2-day hang),
+                F-253 (admission seizure, CLOSE-WAIT accumulation).
+                Capture evidence, then restart:
+                  ss -tan state close-wait | wc -l   # inside the container netns
+                  docker restart zagros-sandbox-zenoh-router
+      # At 8m nothing has met `for: 10m` yet — transient flap never fires.
+      - eval_time: 8m
+        alertname: ContainerUnhealthy
+        exp_alerts: []
+      # Canary stale: crosses 900s at 15m, `for: 5m` → fires by 21m.
+      - eval_time: 21m
+        alertname: ObsTextfileStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: container-health
+            exp_annotations:
+              summary: "goat-obs-textfile cron stale for 15m+ — health metrics frozen"
+              description: |
+                goat-obs-textfile.sh (*/5 root cron) has not completed a run
+                in 15+ minutes. Every textfile metric — container id→name
+                map, container health status — is frozen at its last value
+                and can silently mask a real failure. Check on the host:
+                  sudo grep goat-obs /var/log/syslog | tail
+                  sudo crontab -l | grep goat-obs

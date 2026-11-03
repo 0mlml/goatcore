@@ -1,0 +1,2278 @@
+{
+  "uid": "mesh-bandwidth-attribution",
+  "title": "Mesh Bandwidth Attribution",
+  "description": "Per-host link utilisation and what is consuming it. Two planes, never summed (ADR 1128).",
+  "tags": [
+    "goat-obs",
+    "net",
+    "capacity"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "links": [
+    {
+      "title": "Service Response Under Pressure \u25b6",
+      "type": "link",
+      "url": "/d/service-response-pressure",
+      "icon": "external link",
+      "tooltip": "Is anything actually answering slowly while the pipe is busy?",
+      "keepTime": true,
+      "includeVars": true,
+      "targetBlank": false,
+      "asDropdown": false,
+      "tags": []
+    },
+    {
+      "title": "Dashboards",
+      "type": "dashboards",
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "goat-obs"
+      ],
+      "targetBlank": false
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(goat_net_attribution_up, host)",
+          "refId": "host"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1
+      },
+      {
+        "name": "direction",
+        "label": "Direction",
+        "type": "custom",
+        "query": "tx,rx",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [
+          {
+            "text": "tx",
+            "value": "tx",
+            "selected": false
+          },
+          {
+            "text": "rx",
+            "value": "rx",
+            "selected": false
+          }
+        ],
+        "description": "tx = this host sending (its uplink). rx = receiving."
+      },
+      {
+        "name": "category",
+        "label": "Category",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(goat_net_workload_bytes_total, category)",
+          "refId": "category"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1,
+        "description": "Drives the drill-down block only."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 24,
+        "h": 6,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### Two planes. Never add them together.\n\nA Zenoh message crossing the mesh is counted **twice on this host at this\ninstant** \u2014 once as WireGuard UDP on the physical NIC, once as TCP :7447\ninside the tunnel. Same bytes, two layers.\n\n| Plane | Answers | Denominator |\n|---|---|---|\n| **Transport** (below, first block) | *How much of my physical pipe is in use?* | declared link capacity |\n| **Workload** (second block) | *Who and what is consuming the mesh?* | mesh transport total |\n\n**Percentages are against a DECLARED capacity, not a measured one**, unless the\ncapacity source reads `measured`. A host nobody has characterised shows\n`capacity not declared` and no percentage \u2014 that is deliberate, not a broken panel.\n\nThe **Unattributed** and **Off-mesh** rows are always drawn. A growing\nUnattributed share means the category map has fallen behind reality, not that\nthe traffic went away. Full design: `docs/design/mesh-bandwidth-attribution.md`\n(ADR 1128)."
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "Transport plane \u2014 how full is the physical pipe",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 6
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Uplink used",
+      "description": "Physical NIC tx against DECLARED uplink capacity. Blank when no capacity is declared \u2014 never a guessed percentage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "noValue": "capacity not declared",
+          "links": [
+            {
+              "title": "What did this do to response times?",
+              "url": "/d/service-response-pressure?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "goat:link_utilisation_ratio:tx{host=~\"$host\"}",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 0,
+        "y": 7
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Downlink used",
+      "description": "Physical NIC rx against DECLARED downlink capacity.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "noValue": "capacity not declared"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "goat:link_utilisation_ratio:rx{host=~\"$host\"}",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 4,
+        "y": 7
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Relayed share of mesh",
+      "description": "Relay bandwidth is metered and billed, and the same payload is paid for twice (node->relay, relay->peer). A rise here is usually peers silently losing their P2P path.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_net_transport_bytes_total{host=~\"$host\",class=\"mesh-relayed\"}[$__rate_interval])) / clamp_min(sum(rate(goat_net_transport_bytes_total{host=~\"$host\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 8,
+        "y": 7
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Attribution coverage",
+      "description": "Share of mesh transport landing in a NAMED workload category. Never 100%: socket byte counters are TCP-only and short-lived connections close between samples. Falling over time = the map is going stale.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.75
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "goat:workload_attribution_coverage:ratio{host=~\"$host\"}",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 12,
+        "y": 7
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Hosts with no declared capacity",
+      "description": "Each of these renders no utilisation percentage anywhere. Set node_exporter_link_capacity in group_vars.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(goat_link_capacity_declared == 0) or vector(0)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 16,
+        "y": 7
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Oldest capacity claim",
+      "description": "A capacity nobody has re-checked is a claim, not a fact \u2014 and every utilisation percentage rests on it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 31536000
+              }
+            ]
+          },
+          "noValue": "never asserted"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(time() - goat_link_capacity_asserted_timestamp_seconds)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 20,
+        "y": 7
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Uplink \u2014 transport plane vs declared capacity",
+      "description": "Stacked classes sum to the physical NIC total by construction \u2014 off-mesh is the exact remainder. The dashed line is the DECLARED ceiling and is not part of the stack.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 35,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "declared capacity"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_net_transport_bytes_total{host=~\"$host\",class=\"mesh-p2p\",direction=\"tx\"}[$__rate_interval])) * 8",
+          "refId": "A",
+          "legendFormat": "mesh direct (p2p)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_net_transport_bytes_total{host=~\"$host\",class=\"mesh-relayed\",direction=\"tx\"}[$__rate_interval])) * 8",
+          "refId": "B",
+          "legendFormat": "mesh relayed"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "clamp_min(sum(goat:link_bits_per_second:tx{host=~\"$host\"}) - sum(goat:mesh_bits_per_second:tx{host=~\"$host\"}), 0)",
+          "refId": "C",
+          "legendFormat": "off-mesh (derived)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(goat_link_capacity_bytes_per_second{host=~\"$host\",direction=\"tx\"}) * 8",
+          "refId": "D",
+          "legendFormat": "declared capacity"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 9,
+        "x": 0,
+        "y": 11
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Downlink \u2014 transport plane vs declared capacity",
+      "description": "Stacked classes sum to the physical NIC total by construction \u2014 off-mesh is the exact remainder. The dashed line is the DECLARED ceiling and is not part of the stack.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 35,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "declared capacity"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_net_transport_bytes_total{host=~\"$host\",class=\"mesh-p2p\",direction=\"rx\"}[$__rate_interval])) * 8",
+          "refId": "A",
+          "legendFormat": "mesh direct (p2p)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_net_transport_bytes_total{host=~\"$host\",class=\"mesh-relayed\",direction=\"rx\"}[$__rate_interval])) * 8",
+          "refId": "B",
+          "legendFormat": "mesh relayed"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "clamp_min(sum(goat:link_bits_per_second:rx{host=~\"$host\"}) - sum(goat:mesh_bits_per_second:rx{host=~\"$host\"}), 0)",
+          "refId": "C",
+          "legendFormat": "off-mesh (derived)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(goat_link_capacity_bytes_per_second{host=~\"$host\",direction=\"rx\"}) * 8",
+          "refId": "D",
+          "legendFormat": "declared capacity"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 9,
+        "x": 12,
+        "y": 11
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Link utilisation over time",
+      "description": "Alert thresholds: warning at 75% for 15m, critical at 90% for 5m. Hosts with no declared capacity are absent here, not at zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisSoftMin": 0,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.75
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "goat:link_utilisation_ratio:tx{host=~\"$host\"}",
+          "refId": "A",
+          "legendFormat": "{{host}} uplink"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "goat:link_utilisation_ratio:rx{host=~\"$host\"}",
+          "refId": "B",
+          "legendFormat": "{{host}} downlink"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 0,
+        "y": 20
+      }
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Top peers by physical-pipe bytes",
+      "description": "Transport plane, per mesh peer. The `class` column separates direct from relayed \u2014 a peer that is high AND relayed is costing the most.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true,
+              "__name__": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(15, sum by (peer, class) (rate(goat_net_peer_bytes_total{host=~\"$host\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 12,
+        "y": 20
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Workload plane \u2014 what the mesh is carrying",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 28
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Bytes by workload category",
+      "description": "Socket categories EXCLUDING http-delegated, plus the HTTP plane \u2014 a clean partition, because Traefik's browser-facing sockets appear in both taps and adding them would double web traffic. Do NOT compare this total to the transport plane above; they measure the same bytes at different layers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 35,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unattributed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (category) (rate(goat_net_workload_bytes_total{host=~\"$host\",category!~\"http-delegated|transport-underlay\",direction=~\"$direction\"}[$__rate_interval])) * 8",
+          "refId": "A",
+          "legendFormat": "{{category}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (category) (rate(goat_http_bytes_total{host=~\"$host\",direction=~\"$direction\"}[$__rate_interval])) * 8",
+          "refId": "B",
+          "legendFormat": "{{category}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "clamp_min(sum(rate(goat_net_transport_bytes_total{host=~\"$host\",direction=~\"$direction\"}[$__rate_interval])) * 8 - sum(rate(goat_net_workload_bytes_total{host=~\"$host\",category!~\"http-delegated|transport-underlay\",direction=~\"$direction\"}[$__rate_interval])) * 8 - sum(rate(goat_http_bytes_total{host=~\"$host\",direction=~\"$direction\"}[$__rate_interval])) * 8, 0)",
+          "refId": "C",
+          "legendFormat": "unattributed"
+        }
+      ],
+      "gridPos": {
+        "w": 24,
+        "h": 10,
+        "x": 0,
+        "y": 29
+      }
+    },
+    {
+      "id": 15,
+      "type": "bargauge",
+      "title": "Top workload categories now",
+      "description": "Bulk categories (image-pull, backup, audit-offload, replication) are schedulable around scarcity. surface-stream scales with concurrent viewers, not requests.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(10, sum by (category) (rate(goat_net_workload_bytes_total{host=~\"$host\",category!~\"http-delegated|transport-underlay\",direction=~\"$direction\"}[$__rate_interval])) * 8 or sum by (category) (rate(goat_http_bytes_total{host=~\"$host\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "{{category}}"
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 0,
+        "y": 39
+      }
+    },
+    {
+      "id": 16,
+      "type": "bargauge",
+      "title": "Web bytes by surface category",
+      "description": "From the Traefik access log. Static assets here are the cheapest thing to pin or edge-cache.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(10, sum by (category) (rate(goat_http_bytes_total{host=~\"$host\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "{{category}}"
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 8,
+        "y": 39
+      }
+    },
+    {
+      "id": 17,
+      "type": "bargauge",
+      "title": "Web bytes by service",
+      "description": "Which backend behind Traefik is producing the bytes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(10, sum by (service) (rate(goat_http_bytes_total{host=~\"$host\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 16,
+        "y": 39
+      }
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Headroom \u2014 what can I turn down, and what must I never touch",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 47
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "w": 12,
+        "h": 10,
+        "x": 0,
+        "y": 48
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "\nWhen the pipe fills, the question is not *what is using it* \u2014 the block above\nanswers that. It is **what may give way so the critical thing keeps working.**\n\nShed order is declared in `ops/observability/bandwidth-categories.yaml`, one\nhome, and read from there by this dashboard. Highest first:\n\n1. **`image-pull`** (deferrable) \u2014 Bursty hundreds of MB. THE canonical thing to batch off-peak: it is the usual cause of a link going unusable for minutes.\n2. **`audit-offload`** (deferrable) \u2014 Scheduled bulk to cold storage. Retention is 30d; a few hours late costs nothing.\n3. **`backup`** (deferrable) \u2014 pgBackRest. Schedulable; skipping a window is a judgement, delaying one is not.\n4. **`filedrop`** (deferrable) \u2014 Operator-initiated bulk. Pause and resume; nothing is lost.\n5. **`observability`** (sheddable) \u2014 Monitoring's own cost. Shed LAST among sheddables \u2014 shedding it blinds the decision.\n6. **`messaging`** (sheddable) \u2014 Chat and push. Defer without data loss.\n7. **`surface-static`** (sheddable) \u2014 Cacheable assets. Cheapest real win: pin or edge-cache instead of re-serving.\n8. **`surface-stream`** (sheddable) \u2014 Live views. Cost scales with CONCURRENT VIEWERS, so capping viewers reclaims a lot for little loss.\n\n**Never shed:** `identity`, `fabric`, `mesh-control`, `time`.\nMesh control and time are what you need in order to fix anything else, and\nshedding observability blinds the decision \u2014 so it is last among the sheddables,\nnot first.\n\nThis is *declared policy paired with measured cost*. The panels beside it say\nwhat each row is actually worth right now, so the trade is real rather than\ntheoretical."
+      }
+    },
+    {
+      "id": 20,
+      "type": "bargauge",
+      "title": "Reclaimable now \u2014 sheddable categories, worst first",
+      "description": "What you would actually get back by turning each one down. A category at the top of the shed list that is costing nothing is not worth shedding \u2014 order says what is ACCEPTABLE to lose, this says what it is WORTH.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sort_desc(sum by (category) (rate(goat_net_workload_bytes_total{host=~\"$host\",category=~\"image-pull|audit-offload|backup|filedrop|observability|messaging|surface-static|surface-stream\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "{{category}}"
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 10,
+        "x": 12,
+        "y": 48
+      }
+    },
+    {
+      "id": 21,
+      "type": "bargauge",
+      "title": "Protected \u2014 never shed these",
+      "description": "The floor. If these alone approach the declared capacity, shedding will not save you and the answer is more pipe or fewer peers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "continuous-BlPu"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sort_desc(sum by (category) (rate(goat_net_workload_bytes_total{host=~\"$host\",category=~\"identity|fabric|mesh-control|time\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "{{category}}"
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 10,
+        "x": 18,
+        "y": 48
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Reclaimable share of mesh",
+      "description": "How much of the workload is sheddable at all. LOW is the bad colour here: little to give up means no room to manoeuvre before the essential traffic is the thing competing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.15
+              },
+              {
+                "color": "green",
+                "value": 0.35
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_net_workload_bytes_total{host=~\"$host\",category=~\"image-pull|audit-offload|backup|filedrop|observability|messaging|surface-static|surface-stream\"}[$__rate_interval])) / clamp_min(sum(rate(goat_net_workload_bytes_total{host=~\"$host\",category!~\"http-delegated|transport-underlay\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 0,
+        "y": 58
+      }
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Protected floor",
+      "description": "Essential traffic. Any capacity plan has to clear this with margin.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_net_workload_bytes_total{host=~\"$host\",category=~\"identity|fabric|mesh-control|time\"}[$__rate_interval])) * 8",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 6,
+        "y": 58
+      }
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "Headroom to declared capacity",
+      "description": "Spare downlink. Blank until a capacity is declared \u2014 the whole point of declaring one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1000000.0
+              },
+              {
+                "color": "green",
+                "value": 10000000.0
+              }
+            ]
+          },
+          "noValue": "capacity not declared"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(goat_link_capacity_bytes_per_second{host=~\"$host\",direction=\"rx\"}) * 8 - sum(goat:link_bits_per_second:rx{host=~\"$host\"})",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 12,
+        "y": 58
+      }
+    },
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "Days to saturation at current trend",
+      "description": "Extends the capacity-forecast pattern to the network. Meaningless without a declared capacity, and honest about it \u2014 same predict-style projection the disk panels use, so read it as a direction, not a date.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 14
+              },
+              {
+                "color": "green",
+                "value": 60
+              }
+            ]
+          },
+          "noValue": "capacity not declared"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(max(goat_link_capacity_bytes_per_second{host=~\"$host\",direction=\"rx\"}) * 8 - sum(goat:link_bits_per_second:rx{host=~\"$host\"})) / clamp_min(deriv(sum(goat:link_bits_per_second:rx{host=~\"$host\"})[6h:5m]) * 86400, 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 4,
+        "x": 18,
+        "y": 58
+      }
+    },
+    {
+      "id": 26,
+      "type": "row",
+      "title": "Drill down \u2014 inside one category ($category)",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 62
+      },
+      "panels": []
+    },
+    {
+      "id": 27,
+      "type": "table",
+      "title": "Peers driving $category (mesh sockets)",
+      "description": "In-tunnel socket bytes for the selected category, per peer mesh IP. Empty for the web categories \u2014 those peers are HTTP clients, in the panel beside this one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true,
+              "__name__": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(20, sum by (peer) (rate(goat_net_workload_peer_bytes_total{host=~\"$host\",category=~\"$category\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 9,
+        "x": 0,
+        "y": 63
+      }
+    },
+    {
+      "id": 28,
+      "type": "table",
+      "title": "Clients driving $category (web)",
+      "description": "Per-client HTTP bytes for the selected category. Deliberately carries no `service` label \u2014 both would make the series count the product of clients AND services. Off by default above the goatnet scale envelope.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true,
+              "__name__": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "topk(20, sum by (client) (rate(goat_http_peer_bytes_total{host=~\"$host\",category=~\"$category\",direction=~\"$direction\"}[$__rate_interval])) * 8)",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 9,
+        "x": 12,
+        "y": 63
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "$category over time",
+      "description": "Trend for the selected category only. Use it to tell a steady consumer (replication) from a bursty one (image-pull).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (category) (rate(goat_net_workload_bytes_total{host=~\"$host\",category=~\"$category\",direction=~\"$direction\"}[$__rate_interval])) * 8",
+          "refId": "A",
+          "legendFormat": "{{category}} (sockets)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (category) (rate(goat_http_bytes_total{host=~\"$host\",category=~\"$category\",direction=~\"$direction\"}[$__rate_interval])) * 8",
+          "refId": "B",
+          "legendFormat": "{{category}} (web)"
+        }
+      ],
+      "gridPos": {
+        "w": 24,
+        "h": 7,
+        "x": 0,
+        "y": 72
+      }
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Is this measurement trustworthy right now",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 79
+      },
+      "panels": []
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Attribution sample age",
+      "description": "Older than ~2 minutes means the panels are showing last-known values that age silently. Treat as unknown, not as quiet.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 300
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          },
+          "noValue": "never reported"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(time() - timestamp(goat_net_attribution_up{host=~\"$host\"}))",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 0,
+        "y": 80
+      }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Sample gap",
+      "description": "The REAL interval the last delta covered \u2014 the denominator of every rate here. 0 means a first sample with no delta taken yet.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(goat_net_attribution_sample_gap_seconds{host=~\"$host\"})",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 4,
+        "y": 80
+      }
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Transport plane blind",
+      "description": "Hosts where `netbird status` was unreadable. Their mesh traffic reads as ZERO, which on a chart is indistinguishable from an idle mesh and is not the same thing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(goat_net_attribution_mesh_plane_up{host=~\"$host\"} == 0) or vector(0)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 8,
+        "y": 80
+      }
+    },
+    {
+      "id": 34,
+      "type": "stat",
+      "title": "Peers sampled",
+      "description": "Connected peers in the last sample.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(goat_net_attribution_peers_sampled{host=~\"$host\"})",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 12,
+        "y": 80
+      }
+    },
+    {
+      "id": 35,
+      "type": "stat",
+      "title": "Sockets sampled",
+      "description": "TCP sockets with readable byte counters. UDP has none \u2014 that traffic is reported as not-measured, never as zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(goat_net_attribution_sockets_sampled{host=~\"$host\"})",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 16,
+        "y": 80
+      }
+    },
+    {
+      "id": 36,
+      "type": "stat",
+      "title": "Web/socket cross-check",
+      "description": "Access-log bytes over the socket bytes for the same connections. Two independent taps on one flow: near 1.0 means they agree. Well under 1.0 is expected (headers and TLS overhead are on the socket and not in the log); near 0 means the access log has stopped.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "no web traffic"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(goat_http_bytes_total{host=~\"$host\"}[$__rate_interval])) / clamp_min(sum(rate(goat_net_workload_bytes_total{host=~\"$host\",category=\"http-delegated\"}[$__rate_interval])), 1)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "gridPos": {
+        "w": 4,
+        "h": 4,
+        "x": 20,
+        "y": 80
+      }
+    }
+  ]
+}

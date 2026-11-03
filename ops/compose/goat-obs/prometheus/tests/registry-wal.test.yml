@@ -1,0 +1,230 @@
+# promtool unit tests for rules/registry-wal.yml.
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/registry-wal.test.yml
+#
+# Ground truth for the fixtures (ops/relay/health/registry-wal-signals.py +
+# ops/goat-zenoh-portal/internal/registry/registry.go):
+#   - journal_size_limit is 67108864 (64 MiB): steady state after a checkpoint
+#     is at or under it
+#   - goat_registry_db_mtime_seconds advances only when a checkpoint folds WAL
+#     frames into the main db; while a reader pins the checkpoint it FREEZES
+#     while the WAL grows — the starvation signature
+#   - absent files OMIT their gauges (null, not zero); a goatnet without the
+#     collector has no goat_registry_* series at all, and nothing here may
+#     fire on that
+
+rule_files:
+  - ../rules/registry-wal.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Case 1 — healthy steady state: WAL held at the 64 MiB limit, checkpoints
+  # advancing the main db's mtime. Nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'goat_registry_files_ok'
+        values: '1x120'
+      - series: 'goat_registry_wal_bytes'
+        values: '67108864x120'
+      - series: 'goat_registry_db_mtime_seconds'
+        values: '0+60x120'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: RegistryWalOversized
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: RegistryWalRunaway
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: RegistryCheckpointStalled
+        exp_alerts: []
+
+  # Case 2 — OVERSIZED. The WAL jumps to 384 MiB (6x the limit) at t=10m and
+  # holds: checkpoints have stopped truncating. Over the 256 MiB line from
+  # 10m; for:15m -> firing from 25m. Runaway (2 GiB) must stay silent.
+  - interval: 1m
+    input_series:
+      - series: 'goat_registry_files_ok'
+        values: '1x120'
+      - series: 'goat_registry_wal_bytes'
+        values: '67108864x9 402653184x111'
+      - series: 'goat_registry_db_mtime_seconds'
+        values: '0+60x120'
+    alert_rule_test:
+      # Still pending at 20m.
+      - eval_time: 20m
+        alertname: RegistryWalOversized
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: RegistryWalOversized
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: goat-zenoh-portal
+            exp_annotations:
+              summary: "portal registry WAL is 384MiB — 4x its 64 MiB journal_size_limit for 15m"
+              description: |
+                registry.db-wal is over 256 MiB and holding, which means
+                checkpoints are not folding frames back — the 2026-08-15
+                pinned-reader growth (recurred at 91.4 GB) is most likely underway.
+                Confirm and recover with the runbook, in order:
+                  docs/operations/disk-runway-and-retention.md §"goat-zenoh-portal WAL"
+                  1. Hold the out-of-band readers (budget-notify, sync-slot-anchors
+                     --check, reap-orphans, ad-hoc python) for the window.
+                  2. sudo docker stop -t 60 goat-zenoh-portal   # STOP, not restart — see runbook
+                  3. sudo lsof /opt/goat-zenoh-portal/registry.db*   # must be empty
+                  4. cp -a registry.db registry.db-wal registry.db-shm <backup dir, same volume>
+                     # quiescent copy of all three
+                  5. PRAGMA wal_checkpoint(TRUNCATE) offline via python3; record the
+                     (busy, log, checkpointed) triple; expect minutes on a large WAL.
+                  6. NEVER delete -wal or -shm. Verify registry.db mtime moved and the
+                     WAL is ~0 bytes, then docker start.
+                Cross-check goat_registry_db_mtime_seconds: frozen while this grows
+                is the starvation signature (RegistryCheckpointStalled).
+      - eval_time: 30m
+        alertname: RegistryWalRunaway
+        exp_alerts: []
+      # Checkpoints are advancing, so the starvation rule must not ride along.
+      - eval_time: 30m
+        alertname: RegistryCheckpointStalled
+        exp_alerts: []
+
+  # Case 3 — RUNAWAY. 3 GiB from t=10m. Runaway (for:5m) fires from 15m,
+  # while Oversized (for:15m) is still pending at 20m — the critical tier is
+  # deliberately the faster one.
+  - interval: 1m
+    input_series:
+      - series: 'goat_registry_wal_bytes'
+        values: '67108864x9 3221225472x111'
+      - series: 'goat_registry_db_mtime_seconds'
+        values: '0+60x120'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: RegistryWalRunaway
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: goat-zenoh-portal
+            exp_annotations:
+              summary: "CRITICAL: portal registry WAL is 3GiB and growing unchecked"
+              description: |
+                registry.db-wal is over 2 GiB — the unbounded pinned-reader growth,
+                not a burst a checkpoint will clean up. At the 2026-09 recurrence
+                rate (~200 GB/day) this fills a Thor in days (and would fill an
+                zagros-prod Orin’s
+                57 GB root in hours — that host does not run the collector yet, a
+                stated non-goal). Act now, in runbook order (quiesce and STOP first:
+                a backup is only valid quiescent):
+                  docs/operations/disk-runway-and-retention.md §"goat-zenoh-portal WAL"
+                  1. Hold the out-of-band readers (budget-notify, sync-slot-anchors
+                     --check, reap-orphans, ad-hoc python) for the window.
+                  2. sudo docker stop -t 60 goat-zenoh-portal   # STOP, not restart — see runbook
+                  3. sudo lsof /opt/goat-zenoh-portal/registry.db*   # must be empty
+                  4. cp -a registry.db registry.db-wal registry.db-shm <backup dir, same volume>
+                     # quiescent copy of all three
+                  5. PRAGMA wal_checkpoint(TRUNCATE) offline via python3; record the
+                     (busy, log, checkpointed) triple; expect minutes on a large WAL.
+                  6. NEVER delete -wal or -shm. Verify registry.db mtime moved and the
+                     WAL is ~0 bytes, then docker start.
+                Then verify goat_registry_wal_bytes actually fell — journal_size_limit
+                truncates to 64 MiB only at a checkpoint that RUNS.
+      - eval_time: 20m
+        alertname: RegistryWalOversized
+        exp_alerts: []
+
+  # Case 4 — CHECKPOINT STALLED. Last checkpoint at t=10m (mtime frozen at
+  # 600) while the WAL sits at 128 MiB: writes landing, nothing folding back.
+  # time()-mtime crosses 21600 at t=370m; for:15m -> firing from 385m. The
+  # size tiers stay silent at 128 MiB — this rule is the EARLY form of the
+  # same incident.
+  - interval: 5m
+    input_series:
+      - series: 'goat_registry_wal_bytes'
+        values: '134217728x80'
+      - series: 'goat_registry_db_mtime_seconds'
+        values: '600x80'
+    alert_rule_test:
+      # 350m: 20,400s since the last checkpoint — under the 6h bound.
+      - eval_time: 350m
+        alertname: RegistryCheckpointStalled
+        exp_alerts: []
+      - eval_time: 390m
+        alertname: RegistryCheckpointStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: goat-zenoh-portal
+            exp_annotations:
+              summary: "portal registry checkpoint has not completed in 6h+ while the WAL grows past its limit"
+              description: |
+                registry.db has not been written for over 6 hours while
+                registry.db-wal sits above the 64 MiB journal_size_limit: frames
+                are accumulating and no checkpoint is folding them back. This is
+                the pinned-reader mechanism itself — wal_checkpoint(PASSIVE) on
+                2026-08-15 moved 954 of 5,376,726 pages for exactly this reason —
+                and no ops-side checkpoint timer can drain it while the reader
+                holds its snapshot. Recover with the runbook (quiesce readers, STOP
+                the portal, prove zero holders, cold-copy all three files, then
+                TRUNCATE offline):
+                  docs/operations/disk-runway-and-retention.md §"goat-zenoh-portal WAL"
+      - eval_time: 390m
+        alertname: RegistryWalOversized
+        exp_alerts: []
+      - eval_time: 390m
+        alertname: RegistryWalRunaway
+        exp_alerts: []
+
+  # Case 5 — the AND guard: an IDLE registry (mtime 6h+ old, WAL parked under
+  # the 64 MiB limit) is a quiet weekend, not an incident. mtime alone must
+  # never page.
+  - interval: 5m
+    input_series:
+      - series: 'goat_registry_wal_bytes'
+        values: '1024x80'
+      - series: 'goat_registry_db_mtime_seconds'
+        values: '600x80'
+    alert_rule_test:
+      - eval_time: 390m
+        alertname: RegistryCheckpointStalled
+        exp_alerts: []
+
+  # Case 6 — a goatnet that does not run the collector: no goat_registry_*
+  # series exist at all. Every expr is a positive comparison (no absent()
+  # forms), so this file is safe to load fleet-wide — the obs_rule_files
+  # fitness test.
+  - interval: 1m
+    input_series:
+      - series: 'goat_zenoh_open_ms'
+        values: '8x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: RegistryWalOversized
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: RegistryWalRunaway
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: RegistryCheckpointStalled
+        exp_alerts: []
+
+  # Case 7 — the db itself is ABSENT. The collector emits files_ok=0 and OMITS
+  # every size gauge (null, not zero), so the size and staleness rules have no
+  # operands. A missing database must read as "unmeasured", never as a
+  # zero-byte WAL with a 1970 checkpoint — which is exactly what a fabricated
+  # zero would have alerted on.
+  - interval: 1m
+    input_series:
+      - series: 'goat_registry_files_ok'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: RegistryWalOversized
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: RegistryWalRunaway
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: RegistryCheckpointStalled
+        exp_alerts: []

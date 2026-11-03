@@ -1,0 +1,43 @@
+#cloud-config
+# Ubuntu 24.04 Server autoinstall answer file — full-disk LUKS, key-only SSH.
+# Before phase 1 of a host-site standup (docs/operations/bare-metal-install.md).
+# Fill the three <PLACEHOLDERS> before use. The LUKS passphrase comes from
+# .envrc.local.d/20-host-access.envrc (<SITE>_<ROLE>_LUKS_PASS) — NEVER commit it.
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard: {layout: us}
+  # Wired DHCP so the box is reachable the moment it boots.
+  network:
+    version: 2
+    ethernets:
+      any-nic:
+        match: {name: "en*"}
+        dhcp4: true
+  identity:
+    hostname: <HOSTNAME>
+    # Day-1 admin account. Password auth is disabled below; this is for console.
+    username: goat
+    # a hashed throwaway console password (mkpasswd -m sha-512); rotated by baseline.
+    password: "<MKPASSWD_SHA512_HASH>"
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - "<OPERATOR_SSH_PUBKEY>"
+  # Full-disk LUKS-on-LVM. subiquity's `lvm` layout with a password IS full-disk
+  # encryption: it produces nvme0n1p3 crypto_LUKS -> dm_crypt -> ubuntu-vg, the
+  # shape the LUKS node class enrolls TPM2 onto and carves docker-data from.
+  storage:
+    layout:
+      name: lvm
+      password: "<LUKS_PASSPHRASE>"
+    swap: {size: 0}
+  # No third-party drivers; keep the base minimal — the fleet baseline installs
+  # the rest so the image stays reproducible.
+  packages: [openssh-server, cryptsetup, lvm2, tpm2-tools]
+  late-commands:
+    # NOPASSWD sudo for the day-1 account so ansible become works before FIDO2.
+    - echo 'goat ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/goat
+    - chmod 0440 /target/etc/sudoers.d/goat
+  shutdown: reboot

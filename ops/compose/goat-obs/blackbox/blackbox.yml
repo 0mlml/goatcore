@@ -1,0 +1,157 @@
+# Blackbox exporter probe modules — goat-obs.
+#
+# Each module is a named recipe for a probe class. Prometheus scrapes
+# /probe?module=<name>&target=<url> and gets back metrics for that
+# specific probe instance. See prometheus.yml for scrape configs.
+
+modules:
+  # HTTPS health check — 2xx response from a TLS-terminated endpoint.
+  # Validates that Traefik + the LE cert + the upstream container are
+  # all happy.
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200, 301, 302, 401, 403]
+      method: GET
+      fail_if_ssl: false
+      fail_if_not_ssl: true
+      tls_config:
+        insecure_skip_verify: false
+
+  # ---------------------------------------------------------------------
+  # Surface canary modules (ADR 1133) — TWO PLANES, NEVER CONFLATED.
+  # ---------------------------------------------------------------------
+  # The gate plane. Probes a service at its PUBLIC mesh-zone name, through
+  # Traefik and the oauth2-proxy sidecar, exactly as a browser arrives.
+  #
+  # `follow_redirects: false` is the load-bearing line, and it was written
+  # after measuring the alternative. `http_2xx` above follows redirects, so
+  # probing https://panoscope.<zone>/healthz returned **200 in 195 ms** — and
+  # that 200 was ORY'S LOGIN PAGE, not panoscope. The probe chased the 302 to
+  # oauth2.<zone> and graded the identity provider while wearing panoscope's
+  # label. A canary that reports the wrong service as healthy is worse than no
+  # canary, so this module refuses to move: whatever answers first IS the
+  # reading.
+  #
+  # Consequently a 302 here is a SUCCESS and means precisely "DNS resolved,
+  # the mesh path worked, TLS verified, Traefik routed, and the auth gate is
+  # alive" — it does NOT mean the surface behind the gate is well. The
+  # difference is carried in probe_http_status_code and rendered as two
+  # distinct states; see docs/design/surface-canary.md §3.
+  http_gate:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      # "The thing answered" is the bar, and it is deliberately the SAME set as
+      # http_app below: the two planes must differ in WHERE they probe, never
+      # in what counts as alive, or a surface changes verdict for reasons that
+      # have nothing to do with its health.
+      #
+      #   200/204     the surface itself answered
+      #   301/302/303/307/308  a redirect — the front door is alive; whether
+      #               that is the auth gate or the app's own routing is read
+      #               from the status code by the consumer, not decided here
+      #   401/403     answered and refused. Proof of life, not a failure.
+      #
+      # 4xx-not-401/403 and every 5xx are EXCLUDED on purpose: a 404 means the
+      # registry's declared health path is wrong (the exact rot this replaced),
+      # and a 5xx means the thing is answering and broken.
+      #
+      # 303 is on this list because Ory's selfservice-ui answers 303 (Express
+      # redirect to /welcome); without it a perfectly healthy surface reads as
+      # `unreachable`. Every status a healthy service actually returns belongs
+      # here, not just the ones that seem likely.
+      valid_status_codes: [200, 204, 301, 302, 303, 307, 308, 401, 403]
+      follow_redirects: false
+      method: GET
+      fail_if_ssl: false
+      fail_if_not_ssl: true
+      tls_config:
+        insecure_skip_verify: false
+
+  # The app plane. Probes the service's own container by name over the shared
+  # `mgmt` docker network — the same seam isitup's check.sh uses, and the
+  # reason no credential is needed: this is upstream of Traefik and upstream of
+  # oauth2-proxy, so an Ory-gated surface is measurable without a session.
+  #
+  # Every surface answers in single-digit milliseconds on this plane, against
+  # hundreds of ms of redirect-chasing on the gate plane. The two numbers
+  # describe different things and must never be averaged, compared or summed.
+  #
+  # Same accepted-status set as http_gate above, for the reason given there.
+  # Not `[200]`: management-a's declared health path is /api/users, which
+  # correctly answers 401 to an uncredentialed probe, and the onboard API
+  # answers 403. Strict-200 reports both as `surface-down` — inventing an
+  # outage on two healthy services. An authenticated endpoint refusing an
+  # anonymous probe is the system working.
+  http_app:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200, 204, 301, 302, 303, 307, 308, 401, 403]
+      follow_redirects: false
+      method: GET
+
+  # Public HTTP (no TLS expectation) — used for upstream-of-Traefik
+  # things that listen plain.
+  http_plain_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200, 301, 302]
+      method: GET
+
+  # Generic TCP connect — "is this port open and accepting connections?"
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+
+  # TLS over raw TCP — for services that speak TLS on a non-HTTP port. The
+  # netbird relay tier is the case this exists for: `rels://<host>:33073`.
+  #
+  # `tls: true` is what makes blackbox complete a handshake and therefore
+  # export probe_ssl_earliest_cert_expiry. tcp_connect above does NOT set it,
+  # so it proves a socket opens and says nothing about the certificate — which
+  # is precisely the gap that lets a relay certificate expire unwatched.
+  # insecure_skip_verify is REQUIRED here, not laziness: an expired
+  # certificate fails verification, and refusing to complete the handshake
+  # would drop the metric at exactly the moment it matters most.
+  tls_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+      tls: true
+      tls_config:
+        insecure_skip_verify: true
+
+  # ICMP echo — "is this host pingable?" Mostly for mesh peers.
+  icmp:
+    prober: icmp
+    timeout: 5s
+    icmp:
+      preferred_ip_protocol: ip4
+
+  # DNS resolution check — "does this resolver answer for this name?"
+  # Generic A-record lookup; the target is the DNS server, the
+  # `query_name` is fixed (we pin the hostname we expect to resolve).
+  dns_nova_a:
+    prober: dns
+    timeout: 5s
+    dns:
+      preferred_ip_protocol: ip4
+      query_name: "{{ site_dns_zone }}"
+      query_type: A
+      valid_rcodes: [NOERROR]
+      validate_answer_rrs:
+        fail_if_not_matches_regexp:
+          - ".*"

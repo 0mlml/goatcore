@@ -1,0 +1,69 @@
+# admit-audit overlay for the mgmt-host stack.
+#
+# Adds the admit-audit read-only sidecar alongside the base stack
+# (docker-compose.yml) and the observability overlay
+# (docker-compose.obs.yml). The sidecar:
+#
+#   - Connects to postgres-a via the compose-internal `mgmt` network
+#     as the least-privilege `admit_audit` role (created by
+#     ops/ansible/roles/admit-audit/ before this stack is brought
+#     up). Role has SELECT on `public.peers` only.
+#   - Polls every 30s (configurable via ADMIT_AUDIT_POLL_INTERVAL),
+#     emits a JSON log line per detected admit to stdout (captured
+#     by `docker logs` and the host's log-shipping), and exposes
+#     Prometheus metrics on 127.0.0.1:9124.
+#   - Is scraped by the observability-overlay Prometheus via the
+#     shared `mgmt` network (container hostname `admit-audit:9124`).
+#     No public exposure — 127.0.0.1 binding is for local-debug
+#     curls only.
+#
+# Usage (driven by ops/ansible/roles/admit-audit/):
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.obs.yml \
+#     -f docker-compose.admit-audit.yml \
+#     up -d
+#
+# Environment inputs (rendered into .env by Ansible):
+#   SITE_NAME              — label applied to every admit-audit series (e.g. vega-a)
+#   ADMIT_AUDIT_PASSWORD   — password for the read-only `admit_audit` PG role
+#                            (created by the admit-audit Ansible role before
+#                            this stack is brought up)
+
+services:
+
+  admit-audit:
+    # Built and pushed by CI on the usareur-af/goatcore repo.
+    # Pinned tag is set by ops/ansible/roles/admit-audit/defaults/main.yml
+    # and rendered into the compose .env as ADMIT_AUDIT_IMAGE.
+    # NOTE (Block 13B): admit-audit image not yet built on ghcr.io. Default
+    # tag will fail at pull time until first CI build lands; ADMIT_AUDIT_IMAGE
+    # override must be supplied until then. Add digest pin to default once
+    # the first sha-* tag is published.
+    image: ${ADMIT_AUDIT_IMAGE:-ghcr.io/usareur-af/admit-audit:latest}
+    container_name: admit-audit
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 64M
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+    environment:
+      ADMIT_AUDIT_DSN: "postgres://admit_audit:${ADMIT_AUDIT_PASSWORD:?set ADMIT_AUDIT_PASSWORD in .env}@postgres-a:5432/netbird?sslmode=disable"
+      SITE_NAME: ${SITE_NAME:?set SITE_NAME in .env}
+    command:
+      - --listen=0.0.0.0:9124
+      - --poll=30s
+      - --window=5m
+    ports:
+      # Host-local 9124 — Prometheus scrapes via the compose network
+      # (admit-audit:9124). The host binding is debug-only.
+      - "127.0.0.1:9124:9124"
+    networks:
+      - mgmt

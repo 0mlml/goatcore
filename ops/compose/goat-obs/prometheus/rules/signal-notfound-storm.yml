@@ -1,0 +1,96 @@
+# Signal-plane amplification: peers calling peers that are not there.
+#
+# WHAT THIS CATCHES, and why it needed its own rule.
+#
+# A NetBird client attempts a P2P session with every peer it is PERMITTED to
+# reach. Each attempt is a signal offer. When the far end is not registered,
+# signal answers `notfound` and the client retries — there is no backoff
+# ceiling, so an unreachable-but-permitted peer is retried forever.
+#
+# That is normally invisible and harmless: a couple of absent peers produce a
+# trickle. It stops being harmless when a policy group grants one online peer
+# reach to MANY offline ones, because the retry cost is the product, not the
+# sum. A clique group is the worst shape — every member tries every other
+# member — and it degrades exactly as its membership goes offline.
+#
+# The shape: several peers leave the mesh together. One phone remains, permitted
+# to reach every other member of its clique, all of them offline. Within minutes
+# it makes many signal calls a second, 100% `notfound`, signal traffic grows
+# roughly tenfold and the management plane's stream churn much more. The mesh
+# looks healthy because it IS healthy. One client is simply shouting into a void.
+#
+# WHAT THIS CANNOT DO: name the peer. `signal_server_deliver_duration_seconds`
+# carries `outcome` and `path`, not the caller. The alert says the signal plane
+# is being amplified and by how much; identifying who needs the signal log
+# (`docker logs signal-a | grep '"from"' | sort | uniq -c | sort -rn`) or
+# microscope's mesh card. Saying so here beats an annotation that implies a
+# precision the metric does not have.
+groups:
+  - name: signal-notfound-storm
+    rules:
+      # ── Absolute rate ──────────────────────────────────────────────────
+      - alert: SignalNotFoundStorm
+        # Threshold reasoning: a healthy goatnet sits near zero here; the
+        # 5/s sustained for 30m is well clear of the churn a few absent peers
+        # produce and well under a real storm, so it catches this shape early
+        # without firing on a laptop that
+        # closed its lid.
+        expr: >-
+          sum by (node) (
+            rate(signal_server_deliver_duration_seconds_count{outcome="notfound"}[10m])
+          ) > 5
+        for: 30m
+        labels:
+          severity: warning
+          component: signal
+        annotations:
+          summary: 'signal plane on {{ $labels.node }} is answering notfound {{ $value | printf "%.1f" }}/s'
+          description: >-
+            Sustained for 30 minutes. Peers are retrying sessions to peers that
+            are not registered, and NetBird does not back off. This is load and
+            log volume, not an outage — the mesh keeps working for everyone who
+            is actually present. Find the caller in the signal log, then look at
+            what policy grants it reach to absent peers; a clique group whose
+            members have gone offline is the usual cause.
+          runbook_url: 'https://github.com/usareur-af/goatcore/blob/main/docs/design/mesh-acl.md'
+
+      # ── Ratio ──────────────────────────────────────────────────────────
+      # The absolute rule alone misses a small goatnet where the same pathology
+      # runs at 2/s. The ratio is the shape-independent statement: most of what
+      # the signal server does is now failing to find anybody.
+      - alert: SignalNotFoundRatioHigh
+        expr: >-
+          (
+            sum by (node) (rate(signal_server_deliver_duration_seconds_count{outcome="notfound"}[30m]))
+            /
+            clamp_min(sum by (node) (rate(signal_server_deliver_duration_seconds_count[30m])), 0.001)
+          ) > 0.4
+        # Long `for`: this legitimately spikes during a site restart or a mesh
+        # bringup, when everything is calling everything and nothing has
+        # registered yet. An hour of it is a standing condition, not a restart.
+        for: 1h
+        labels:
+          severity: warning
+          component: signal
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of signal traffic on {{ $labels.node }} is notfound'
+          description: >-
+            Over an hour, most signal delivery attempts are to peers that are
+            not registered. Expect this briefly during a bringup; sustained, it
+            means peers hold policy reach to peers that no longer exist and are
+            retrying them indefinitely. Reconcile the group membership against
+            who is actually on the mesh.
+          runbook_url: 'https://github.com/usareur-af/goatcore/blob/main/docs/design/mesh-acl.md'
+
+      # ── Why there is no absent() guard here ──────────────────────────
+      # The first version of this file carried SignalMeterUnread,
+      # `absent(signal_server_connected_peers)`, on the principle that a rule
+      # which is silent because nothing is wrong and a rule which is silent
+      # because nothing is scraped look identical. That principle is right and
+      # this is the wrong place for it: the alert would fire permanently on
+      # every goatnet that runs no signal server, and a guard that is red from
+      # its first run is a guard nobody reads.
+      #
+      # scrape-health.yml already makes that statement fleet-wide, once, for
+      # every job. Repeating it per rule file buys nothing and costs the
+      # silence property that admits a file to obs_rule_files at all.

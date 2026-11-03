@@ -1,0 +1,53 @@
+# Postgres WAL archiver alert.
+#
+# PostgreSQL cannot recycle a WAL segment until archive_command succeeds for
+# it, so a failing archiver turns pg_wal into an unbounded writer. One mechanism:
+# pgbackrest.conf delivered into postgres-a's writable layer by `docker cp` is lost
+# on a recreate while archive_command survives in PGDATA. The result runs for weeks
+# until the root filesystem fills, postgres-a crash-loops and the goatnet is down.
+#
+# failed_count climbing steadily is as plain a signal as Postgres emits, and the
+# disk-runway rules in thor-host.yml are a late, indirect proxy for it.
+#
+# Metrics: pg_stat_archiver_* from postgres_exporter (job postgres-exporter,
+# ops/pins/obs-metric-sources.yaml `pg_`). The co-located goat-obs stack loads
+# rules/*.yml, so this lands wherever that stack runs. The obs-host role does
+# NOT list it in obs_rule_files: a goatnet that does not scrape postgres-exporter
+# has an unfed rule.
+#
+# Why "failures AND no success", not failures alone: one failed push that the
+# retry clears is not an incident. Why no "archive is old" rule on its own: a
+# standby (archive_mode=on, not promoted) never archives, and a quiet primary
+# without archive_timeout legitimately goes hours between segments — an age
+# threshold false-fires on both.
+#
+# Runbook: docs/operations/disk-runway-and-retention.md §"Postgres WAL — the
+# archiver is failing".
+
+groups:
+  - name: postgres-archiver
+    interval: 1m
+    rules:
+
+      - alert: PostgresWalArchivingFailing
+        # Age on the left so $value in the description is the age.
+        expr: |
+          pg_stat_archiver_last_archive_age > 900
+            and increase(pg_stat_archiver_failed_count[15m]) > 0
+        for: 30m
+        labels:
+          severity: critical
+          component: postgres
+        annotations:
+          summary: "{{ $labels.server }}: WAL archiving has failed for 45m+ with no success — pg_wal is growing without bound"
+          description: |
+            archive_command is failing and nothing has archived for
+            {{ $value | humanizeDuration }}. PostgreSQL keeps every unarchived
+            segment, so pg_wal grows until the disk fills and postgres
+            crash-loops (zagros, 2026-10-13: the whole goatnet went down).
+            Read the error first:
+              sudo docker logs --since 10m postgres-a 2>&1 | grep -A2 "archive command failed"
+            The known cause ([055] unable to open missing file
+            '/etc/pgbackrest/pgbackrest.conf') and its repair are in
+              docs/operations/disk-runway-and-retention.md §"Postgres WAL — the archiver is failing"
+            Do NOT delete files from pg_wal.

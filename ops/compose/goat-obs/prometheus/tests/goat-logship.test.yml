@@ -1,0 +1,67 @@
+# promtool unit test for goat-logship.yml (ADR 1078 §4 — the F-169 closer).
+# Run:  promtool test rules ops/compose/goat-obs/prometheus/tests/goat-logship.test.yml
+#
+# Scenario — three collector instances:
+#   thor:9598    — up, but its durable sink has flushed ZERO events for the
+#                  whole window (constant counter -> rate 0). The silent-stop.
+#   healthy:9598 — up, durable sink steadily flushing. Must stay quiet.
+#   dead:9598    — scrape down (up==0). The collector-down case.
+#
+# Proves: GoatLogshipStreamSilent fires for thor only (not the healthy sink,
+# not the dead instance which has no sent-events series to match), and
+# GoatLogshipDown fires for dead only.
+rule_files:
+  - ../rules/goat-logship.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # Liveness.
+      - series: 'up{job="goat_logship",instance="thor:9598"}'
+        values: '1x30'
+      - series: 'up{job="goat_logship",instance="healthy:9598"}'
+        values: '1x30'
+      - series: 'up{job="goat_logship",instance="dead:9598"}'
+        values: '0x30'
+      # durable sink flushed-events counter.
+      - series: 'vector_component_sent_events_total{component_id="durable",instance="thor:9598"}'
+        values: '500x30'        # constant -> rate 0 -> silent
+      - series: 'vector_component_sent_events_total{component_id="durable",instance="healthy:9598"}'
+        values: '0+40x30'       # steadily increasing -> healthy, quiet
+
+    alert_rule_test:
+      # The silent-stop pages for thor, and ONLY thor.
+      - eval_time: 20m
+        alertname: GoatLogshipStreamSilent
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: goat-logship
+              job: goat_logship
+              instance: thor:9598
+            exp_annotations:
+              summary: "goat-logship off-box shipping is silent for thor:9598"
+              description: |
+                The S3 durable sink shipped no events for 15+ minutes while the
+                collector is up — a silent stop the operator would otherwise never
+                see. Triage: sink auth (LOGSHIP_S3_* key), the Object-Lock bucket,
+                and the disk buffer (`docker logs --tail 30 goat-logship`).
+
+      # The down instance pages GoatLogshipDown, and ONLY it.
+      - eval_time: 20m
+        alertname: GoatLogshipDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: goat-logship
+              job: goat_logship
+              instance: dead:9598
+            exp_annotations:
+              summary: "goat-logship collector down for dead:9598"
+              description: |
+                The off-box cyber-logging collector is unreachable for 5+ minutes.
+                Host/OS + fabric security events are not shipping to the durable
+                off-box tier. Do not read a silent collector as "no events" — that
+                is the F-169 mistake.

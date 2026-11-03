@@ -1,0 +1,1855 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goat · relay fleet health</title>
+<!--
+  relay-health.html — the goat relay-fleet health dashboard.
+
+  HACKABLE BY DESIGN: one self-contained file, vanilla JS, no build step, no
+  framework. Fetches relay-health.json (produced by relay-health-probe.sh)
+  every REFRESH_MS and renders it. To change what's shown, edit the render()
+  function below. To add a probe, add a field in the prober's JSON and a
+  cell() call here. Tweak CONFIG to taste.
+
+  FOUR-LEVEL DRILLDOWN, hash-routed (back-button works, zero framework):
+    1  fleet overview — every relay one compact row (list ⇄ map toggle,
+       #view=map persisted in localStorage)
+    2  per-relay detail (#relay=<name>) — the full probe/throughput/peers panel
+    3  peer baseball card (click a peer row; ADR 1055)
+    4  identity block inside the card (registry/id-console deep-link)
+
+  Honesty discipline (matches the rest of goat): never a false green. Stale
+  JSON greys out + shows age; unknown/unmeasured reads grey, not green; the
+  :443 flap shows its real ok-ratio (n) rather than a binary up/down; a relay
+  without declared geo= renders "unplaced", never at a guessed coordinate
+  (ADR 1080).
+-->
+<style>
+  :root{
+    --bg:#14110d; --panel:#1d1812; --panel2:#241d15; --line:#3a3026;
+    --ink:#f0e6d6; --dim:#9c8f7a; --faint:#6b6051;
+    --green:#5cb85c; --amber:#e0a32e; --red:#d9534f; --grey:#5b5346; --blue:#4c9fd6;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+    padding:18px 22px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{margin:0;font-size:18px;letter-spacing:.5px}
+  header h1 .goat{color:var(--amber)}
+  .sub{color:var(--dim);font-size:12px;font-family:var(--mono)}
+  .fleet{margin-left:auto;display:flex;gap:18px;align-items:center}
+  .fleet .big{font-size:26px;font-weight:700;font-family:var(--mono)}
+  .pill{padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700;
+    font-family:var(--mono);text-transform:uppercase;letter-spacing:.5px}
+  .p-green{background:rgba(92,184,92,.18);color:var(--green)}
+  .p-amber{background:rgba(224,163,46,.18);color:var(--amber)}
+  .p-red{background:rgba(217,83,79,.2);color:var(--red)}
+  .p-grey{background:rgba(91,83,70,.25);color:var(--dim)}
+  /* Top-of-page network-state verdict — the plain "is it me, or the network?"
+     answer, so anyone (not just an admin reading dots) can tell at a glance. */
+  .netverdict{margin:0 0 14px;padding:15px 18px;border-radius:11px;border:1px solid;
+    display:flex;gap:14px;align-items:flex-start}
+  .netverdict .vdot{width:13px;height:13px;border-radius:50%;flex:none;margin-top:5px}
+  .netverdict .vh{font-size:15px;font-weight:700;letter-spacing:.02em;margin:0 0 3px}
+  .netverdict .vt{color:var(--dim);font-size:13.5px;line-height:1.55;margin:0;max-width:80ch}
+  .nv-green{border-color:rgba(92,184,92,.45);background:rgba(92,184,92,.09)}
+  .nv-green .vdot{background:var(--green)} .nv-green .vh{color:var(--green)}
+  .nv-amber{border-color:rgba(224,163,46,.45);background:rgba(224,163,46,.09)}
+  .nv-amber .vdot{background:var(--amber)} .nv-amber .vh{color:var(--amber)}
+  .nv-red{border-color:rgba(217,83,79,.5);background:rgba(217,83,79,.10)}
+  .nv-red .vdot{background:var(--red)} .nv-red .vh{color:var(--red)}
+  .nv-grey{border-color:rgba(91,83,70,.4);background:rgba(91,83,70,.10)}
+  .nv-grey .vdot{background:var(--dim)} .nv-grey .vh{color:var(--dim)}
+  /* test-peer band: the "what a real user here would experience" implication */
+  .pimpl{color:var(--dim);font-size:11px;font-style:italic;margin-left:4px;
+    max-width:34ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Top-of-page status-history timeline (statuspage-style): per-day by default,
+     click a day to drill to per-hour. Worst-per-bucket, five severity levels. */
+  .statustl{margin:0 0 14px}
+  .statustl-h{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 6px;flex-wrap:wrap}
+  .statustl-h h3{margin:0;font-size:12px;letter-spacing:.4px;text-transform:uppercase;color:var(--dim)}
+  .statustl-h .lg{display:flex;gap:9px;font-size:10px;color:var(--dim);flex-wrap:wrap}
+  .statustl-h .lg i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:3px;vertical-align:-1px}
+  .statusbar{display:flex;gap:2px;height:26px}
+  .statusbar .seg{flex:1 1 0;border-radius:2px;cursor:pointer;min-width:3px;transition:transform .08s}
+  .statusbar .seg:hover{transform:scaleY(1.2)}
+  .seg-0{background:#3fa66a}.seg-1{background:#9ac53f}.seg-2{background:#e0a32e}
+  .seg-3{background:#e07b2e}.seg-4{background:#d1443f}.seg-x{background:var(--panel2)}
+  .statustl .crumbrow{font-size:11px;color:var(--dim);margin-top:5px}
+  .statustl .crumbrow a{color:var(--blue);cursor:pointer}
+  /* Rows, not tiles: each relay is a full-width card whose body splits into
+     a reachability/service-state column + a throughput column. */
+  main{padding:18px 22px;display:flex;flex-direction:column;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    overflow:hidden}
+  .card.stale{opacity:.55}
+  .card .body{display:grid;grid-template-columns:minmax(290px,1fr) minmax(330px,1.05fr)}
+  @media(max-width:820px){.card .body{grid-template-columns:1fr}}
+  .checks{padding:6px 14px 12px}
+  .tput{padding:8px 16px 12px;border-left:1px solid var(--line)}
+  @media(max-width:820px){.tput{border-left:0;border-top:1px solid var(--line)}}
+  .tput h4{margin:6px 0 8px;font-size:11px;letter-spacing:.4px;text-transform:uppercase;
+    color:var(--dim);font-weight:700}
+  .tput .nums{display:flex;gap:14px;font-family:var(--mono);font-size:12px;
+    margin-bottom:8px;flex-wrap:wrap}
+  .tput .nums b{color:var(--ink);font-weight:700}
+  .tput .none{color:var(--faint);font-size:12px;padding:14px 0;line-height:1.6}
+  .tput code{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+  .peers{padding:8px 16px 12px;border-left:1px solid var(--line)}
+  @media(max-width:820px){.peers{border-left:0;border-top:1px solid var(--line)}}
+  .peers h4{margin:6px 0 8px;font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:var(--dim)}
+  .peers .none{color:var(--faint);font-size:12px;padding:10px 0}
+  .prow{display:flex;align-items:center;gap:8px;margin:2px 0;font-family:var(--mono);font-size:11px;cursor:pointer;border-radius:3px;padding:1px 2px}
+  .prow:hover{background:var(--panel2)}
+  .pid{width:132px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:none}
+  .prow:hover .pid{color:var(--ink)}
+  .pbar{flex:1;height:10px;background:var(--panel2);border-radius:3px;overflow:hidden}
+  .pfill{display:block;height:100%;background:var(--blue)}
+  .pfill.hog{background:var(--red,#e5484d)}
+  .pval{width:118px;text-align:right;color:var(--ink);flex:none}
+  .hogtag{color:var(--red,#e5484d);font-size:10px}
+  /* Peer baseball-card modal (ADR 1055). */
+  .modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:50;align-items:center;justify-content:center}
+  .pcard{position:relative;background:var(--panel,#161a20);border:1px solid var(--line);border-radius:10px;padding:18px 20px;min-width:340px;max-width:min(560px,92vw);max-height:88vh;overflow:auto;box-shadow:0 12px 48px rgba(0,0,0,.5)}
+  .cx{position:absolute;top:10px;right:12px;background:none;border:0;color:var(--dim);font-size:16px;cursor:pointer}
+  .cx:hover{color:var(--ink)}
+  .ctitle{font-size:15px;font-weight:600;color:var(--ink);margin:0 20px 12px 0;word-break:break-word}
+  .crow{display:flex;gap:12px;padding:5px 0;border-top:1px solid var(--line);font-size:12px}
+  .crow .ck{width:96px;color:var(--dim);flex:none;text-transform:uppercase;letter-spacing:.3px;font-size:10px;padding-top:2px}
+  .crow .cv{color:var(--ink);word-break:break-word;font-family:var(--mono)}
+  .crow code{font-size:11px;color:var(--blue)}
+  .cdim{color:var(--faint)}
+  .cok{color:var(--green,#30a46c)}
+  .idlink{color:var(--blue);text-decoration:none;font-weight:600}
+  .idlink:hover{text-decoration:underline}
+  .cts{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+  .ctsh{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--dim);margin-bottom:6px}
+  .ctsrow{display:flex;align-items:center;gap:10px;padding:5px 0;color:var(--ink)}
+  .ctsl{width:66px;color:var(--dim);font-size:11px;flex:none}
+  .ctsv{display:flex;align-items:center;gap:8px;font-size:11px;font-family:var(--mono);min-width:0}
+  .spark{background:var(--panel2);border-radius:3px;flex:none}
+  .sparkv{white-space:nowrap;color:var(--ink)}
+  .spark-wrap{display:flex;gap:6px;align-items:stretch}
+  .spark-y{display:flex;flex-direction:column;justify-content:space-between;
+    font:10px/1 var(--mono);color:var(--faint);text-align:right;min-width:52px;padding:1px 0}
+  .spark{display:block;flex:1;height:48px;background:var(--panel2);border-radius:6px}
+  .gauge{margin-top:10px}
+  .gauge .track{height:12px;border-radius:6px;background:var(--panel2);
+    overflow:hidden;border:1px solid var(--line)}
+  .gauge .fill{height:100%;border-radius:6px 0 0 6px}
+  .gauge .lbl{display:flex;justify-content:space-between;gap:8px;
+    font-family:var(--mono);font-size:11px;margin-top:5px;color:var(--dim)}
+  .gf-green{background:var(--green)} .gf-amber{background:var(--amber)}
+  .gf-red{background:var(--red)} .gf-grey{background:var(--grey)}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .chip{font-family:var(--mono);font-size:11px;color:var(--dim);background:var(--panel2);
+    border:1px solid var(--line);border-radius:5px;padding:2px 7px}
+  .card .top{display:flex;align-items:center;gap:10px;padding:12px 14px;
+    border-bottom:1px solid var(--line)}
+  .dot{width:13px;height:13px;border-radius:50%;flex:none;box-shadow:0 0 0 3px rgba(0,0,0,.25)}
+  .d-green{background:var(--green)} .d-amber{background:var(--amber)}
+  .d-red{background:var(--red)} .d-grey{background:var(--grey)}
+  .card .name{font-weight:700;font-size:15px;font-family:var(--mono)}
+  .card .meta{color:var(--faint);font-size:11px;font-family:var(--mono)}
+  .card .meta a{color:var(--faint)}
+  .rows{padding:6px 14px 12px}
+  .row{display:flex;align-items:center;gap:8px;padding:6px 0;
+    border-top:1px dashed rgba(58,48,38,.6)}
+  .row:first-child{border-top:0}
+  .row .k{color:var(--dim);font-size:12px;width:104px;flex:none}
+  .row .v{font-family:var(--mono);font-size:12px;display:flex;align-items:center;gap:7px}
+  .sdot{width:9px;height:9px;border-radius:50%;flex:none}
+  .bars{display:inline-flex;gap:3px}
+  .bar{width:7px;height:14px;border-radius:2px;background:var(--grey)}
+  .bar.ok{background:var(--green)} .bar.bad{background:var(--red)}
+  .note{color:var(--faint);font-size:11px}
+  .vantnote{margin:0 22px 14px;padding:10px 14px;border-radius:8px;font-size:12.5px;
+    line-height:1.45;border:1px solid var(--line)}
+  .vantnote b{color:var(--fg)}
+  .vantnote code{font-family:var(--mono);font-size:11px;background:rgba(255,255,255,.06);
+    padding:1px 5px;border-radius:4px}
+  .vn-l1{color:var(--dim)}
+  .vn-l1 .vn-place{color:var(--fg);font-weight:700}
+  .vn-l2{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+  .vn-same,.vn-diff{padding:4px 10px;border-radius:6px;font-size:12px;color:var(--fg)}
+  .vn-same{background:rgba(64,192,120,.10);border:1px solid rgba(64,192,120,.32)}
+  .vn-diff{background:rgba(255,176,32,.10);border:1px solid rgba(255,176,32,.32)}
+  .vn-tag{display:inline-block;margin-right:7px;font-size:10px;font-weight:700;
+    text-transform:uppercase;letter-spacing:.04em;opacity:.85}
+  .vn-same .vn-tag{color:var(--green)} .vn-diff .vn-tag{color:var(--amber,#ffb020)}
+  .vn-thor{background:rgba(255,176,32,.05);border-color:rgba(255,176,32,.26)}
+  .vn-cloud{background:rgba(64,192,120,.05);border-color:rgba(64,192,120,.26)}
+  footer{padding:12px 22px;color:var(--faint);font-size:11px;border-top:1px solid var(--line);
+    font-family:var(--mono)}
+  .deepless{color:var(--faint);font-size:11px;padding:2px 0}
+  /* Level-1 fleet overview — every relay is one compact row (fits one screen at
+     5-20 relays); click a row -> level 2 = the full per-relay panel. */
+  .ovrow{display:flex;align-items:center;gap:14px;padding:10px 14px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;cursor:pointer}
+  .ovrow:hover{background:var(--panel2)}
+  .ovrow.stale{opacity:.55}
+  .ovrow .name{font-weight:700;font-family:var(--mono);font-size:14px;width:56px;flex:none}
+  .ovrow .gnet{color:var(--dim);font-family:var(--mono);font-size:11px;width:52px;flex:none}
+  .chip-place{font-family:var(--mono);font-size:11px;color:var(--dim);background:var(--panel2);
+    border:1px solid var(--line);border-radius:5px;padding:1px 7px;white-space:nowrap;flex:none}
+  .ovrow .lat{font-family:var(--mono);font-size:12px;width:110px;display:flex;gap:6px;
+    align-items:center;flex:none}
+  .ovrow .peers{font-family:var(--mono);font-size:11px;color:var(--dim);width:120px;flex:none}
+  .ovspark{margin-left:auto;flex:none;display:flex;align-items:center;gap:8px}
+  .crumb{padding:14px 22px 0;font-size:12px;font-family:var(--mono)}
+  .crumb a{color:var(--blue);text-decoration:none;cursor:pointer}
+  .crumb a:hover{text-decoration:underline}
+  .viewtog{margin-left:auto;display:flex;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .viewtog button{background:var(--panel);color:var(--dim);border:0;padding:3px 12px;
+    font:11px var(--mono);cursor:pointer;text-transform:uppercase;letter-spacing:.4px}
+  .viewtog button.on{background:var(--panel2);color:var(--ink);font-weight:700}
+  .ovbar{display:flex;align-items:center;gap:12px;margin-bottom:2px}
+  .mapwrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    overflow:hidden}
+  .mapwrap.stale{opacity:.55}
+  .ovtray{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 14px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px}
+  .ovtray code{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:11px}
+  /* Site-network-host band (host-net health) — condensed rows
+     above the relay fleet; same drill-down grammar as relays. */
+  .hostband-h{display:flex;align-items:baseline;gap:10px;margin:4px 0 0}
+  .hostband-h h3{margin:0;font-size:12px;letter-spacing:.4px;text-transform:uppercase;color:var(--dim)}
+  .hostrow{display:flex;align-items:center;gap:12px;padding:9px 14px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;cursor:pointer;flex-wrap:wrap}
+  .hostrow:hover{background:var(--panel2)}
+  .hostrow.stale{opacity:.6}
+  .hostrow .name{font-weight:700;font-family:var(--mono);font-size:13px;flex:none}
+  .hchip{font-family:var(--mono);font-size:11px;color:var(--dim);background:var(--panel2);
+    border:1px solid var(--line);border-radius:5px;padding:1px 7px;white-space:nowrap;
+    display:inline-flex;align-items:center;gap:5px}
+  /* wedge badge — a site node whose control plane is up but peers won't connect
+     Red, unmissable; this state is otherwise invisible. */
+  .wbadge{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.05em;
+    color:#fff;background:var(--red,#c0392b);border-radius:4px;padding:0 5px;margin-left:4px}
+  .heal{font-family:var(--mono);font-size:10px;color:var(--dim);margin-left:4px}
+  .hchip b{color:var(--ink);font-weight:700}
+  .hage{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint);white-space:nowrap}
+  .hage.bad{color:var(--red);font-weight:700}
+  /* Host detail page: metric-group cards in a grid; each drills to history. */
+  .hgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .hcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:12px 14px;cursor:pointer}
+  .hcard:hover{background:var(--panel2)}
+  .hcard h4{margin:0 0 8px;font-size:11px;letter-spacing:.4px;text-transform:uppercase;
+    color:var(--dim);display:flex;align-items:center;gap:8px}
+  .hcard .kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0;
+    font-size:12px;border-top:1px dashed rgba(58,48,38,.6)}
+  .hcard .kv:first-of-type{border-top:0}
+  .hcard .kv .k{color:var(--dim)}
+  .hcard .kv .v{font-family:var(--mono);color:var(--ink)}
+  .hcard .drill{margin-top:8px;font-size:10.5px;color:var(--faint);font-family:var(--mono)}
+  .stalebanner{padding:10px 14px;border:1px solid rgba(217,83,79,.5);border-radius:8px;
+    background:rgba(217,83,79,.08);font-size:12.5px;color:var(--ink)}
+  .bigchart{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .bigchart h4{margin:0 0 6px;font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:var(--dim)}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="goat">goat</span> · relay fleet health</h1>
+  <!-- Up-level link to the cross-goatnet overview. Hidden unless goatnets.json
+       declares MORE THAN ONE goatnet: on a single-goatnet deployment an "all
+       goatnets" link that leads to a one-row page is just a dead end. -->
+  <a id="upLevel" class="sub" href="goatnets.html"
+     style="display:none;color:var(--blue);text-decoration:none;border:1px solid var(--line);
+            border-radius:5px;padding:3px 9px">&#8593; all goatnets</a>
+  <span class="sub" id="scope">—</span>
+  <div class="fleet">
+    <div><div class="big" id="fleetCount">—</div><div class="sub">relays ok</div></div>
+    <span class="pill p-grey" id="fleetPill">loading</span>
+  </div>
+</header>
+<div id="statustl" class="statustl"></div>
+<div id="netverdict" class="netverdict nv-grey"><span class="vdot"></span><div><div class="vh" id="nvHead">Checking the network…</div><div class="vt" id="nvText">Probing the relay fleet from outside the mesh.</div></div></div>
+<div id="vantnote" class="vantnote"></div>
+<div id="crumb" class="crumb" style="display:none"></div>
+<main id="grid"></main>
+<footer id="foot">probed —</footer>
+
+<script>
+// Show the up-level link only when this deployment actually knows about other
+// goatnets. Fails silently: goatnets.json is absent on older deployments and a
+// missing cross-goatnet view must not break the fleet page.
+fetch("goatnets.json?t=" + Date.now())
+  .then(r => r.ok ? r.json() : null)
+  .then(c => { if (c && (c.goatnets || []).length > 1)
+                 document.getElementById("upLevel").style.display = ""; })
+  .catch(() => {});
+</script>
+<script>
+// ===================== CONFIG (hack here) =====================
+const REFRESH_MS   = 15000;                  // dashboard re-fetch cadence
+const JSON_URL     = "relay-health.json";    // produced by relay-health-probe.sh
+const NAMES_URL    = "ingest/peer-names.json";// relay-peer-id -> NetBird name (ADR 1055; site-host resolver, best-effort)
+const SERIES_URL   = "ingest/peer-series.json";// relay-peer-id -> downsampled fwd/rcv history (ADR 1055 Part B, this box)
+const STALE_AFTER  = 90;                      // seconds; older JSON greys the fleet
+// ==============================================================
+
+// Relay-peer-id -> friendly name map, resolved on the site host from the mgmt store
+// (the relay only knows the one-way hash). Best-effort: absent -> hex fallback.
+let PEER_NAMES = {};
+let ID_CONSOLE_URL = "";  // set from peer-names.json (site-host only); enables the person deep-link
+async function loadPeerNames(){
+  try{
+    const r = await fetch(NAMES_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); PEER_NAMES = (d && d.names) || {}; ID_CONSOLE_URL = (d && d.id_console_url) || ""; }
+  }catch(e){ /* names are optional; keep the last good map */ }
+}
+// Relay-peer-id -> {h,d,w:[[bucket_ts,fwd_bps,rcv_bps],...]} downsampled by the
+// ingest on THIS box. Best-effort; empty tier -> "collecting" in the card.
+let PEER_SERIES = {};
+async function loadPeerSeries(){
+  try{
+    const r = await fetch(SERIES_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); PEER_SERIES = (d && d.series) || {}; }
+  }catch(e){ /* series optional; keep last good */ }
+}
+// Site network hosts (host-net health). hosts.json carries each
+// host's LAST report — the ingest persists it, so this renders even while the
+// host is dark (staleness is graded honestly, never hidden). host-series.json
+// carries the downsampled h/d/w history for the drill-down charts.
+const HOSTS_URL = "ingest/hosts.json";
+const HOST_SERIES_URL = "ingest/host-series.json";
+let HOSTS = {};            // name -> last full report doc
+let HOST_SERIES = {};      // name -> {h,d,w:[[bucket,<metrics...>],...]}
+let HOST_SERIES_METRICS = [];  // column names for the series rows (after bucket)
+async function loadHosts(){
+  try{
+    const r = await fetch(HOSTS_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); HOSTS = (d && d.hosts) || {}; }
+  }catch(e){ /* band is optional (absent on boxes without host ingest) */ }
+}
+async function loadHostSeries(){
+  try{
+    const r = await fetch(HOST_SERIES_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); HOST_SERIES = (d && d.series) || {}; HOST_SERIES_METRICS = (d && d.metrics) || []; }
+  }catch(e){ /* optional */ }
+}
+// Zenoh router SERVICE health. zenoh-health.json carries each
+// router's LAST report — the ingest persists it, so this renders even while the
+// router is bounced/restarting (that surviving-a-restart is the whole point).
+// zenoh-series.json carries the downsampled h/d/w history for the drill-down
+// charts. This is a site-host-vantage aspect (the probe must sit next to the router),
+// so it's simply absent on the laptop outage view — honestly, never faked.
+const ZENOH_URL = "ingest/zenoh-health.json";
+const ZENOH_SERIES_URL = "ingest/zenoh-series.json";
+let ZENOH = {};                 // name -> last full report doc
+let ZENOH_SERIES = {};          // name -> {h,d,w:[[bucket,<metrics...>],...]}
+let ZENOH_SERIES_METRICS = [];  // column names for the series rows (after bucket)
+async function loadZenoh(){
+  try{
+    const r = await fetch(ZENOH_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); ZENOH = (d && d.routers) || {}; }
+  }catch(e){ /* band is optional (absent on boxes without the router probe) */ }
+}
+async function loadZenohSeries(){
+  try{
+    const r = await fetch(ZENOH_SERIES_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); ZENOH_SERIES = (d && d.series) || {}; ZENOH_SERIES_METRICS = (d && d.metrics) || []; }
+  }catch(e){ /* optional */ }
+}
+// Zenoh WEDGE events: WHEN the router wedged. The reliable
+// marker is a router restart (uptime reset — the watchdog auto-restarts a wedged
+// router); live "unhealthy"/open-failing reports are flagged too. Persisted by
+// the ingest, so the event timeline survives an ingest restart.
+const ZENOH_WEDGES_URL = "ingest/zenoh-wedges.json";
+let ZENOH_WEDGES = {};          // router -> {events,restarts_24h,restarts_7d,last_wedge_ts,currently_wedged,wedged_since}
+async function loadZenohWedges(){
+  try{
+    const r = await fetch(ZENOH_WEDGES_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); ZENOH_WEDGES = (d && d.routers) || {}; }
+  }catch(e){ /* optional */ }
+}
+// ---- Test-peer perspective band: the network as a NEWCOMER experiences it ----
+// Off-site canary peers each try the full newcomer journey and self-publish it
+// to this box's ingest, exactly like the host-net band. Data contract
+// (ingest/peers.json = {"peers": {"<name>": <report>}}), each report:
+//   { peer, goatnet, vantage, reported_at,
+//     overall: "green|amber|red",
+//     journey: {                              // st ∈ green|amber|red|grey
+//       signal:       {st, detail},           // reached signal + exchanged an offer
+//       management:   {st, detail},           // mgmt reachable/healthy
+//       name_service: {st, detail},           // resolved a mesh name via CoreDNS
+//       data_plane:   {st, detail} },         // WG up + a real service round-trip
+//     implication: "<plain sentence: what a real peer in this vantage sees>" }
+// A red here means a real peer in that position CANNOT get on — the
+// "is it me or the network?" answer at the peer altitude, from outside the mesh.
+const PEERS_URL = "ingest/peers.json";
+let PEERS = {};
+async function loadPeers(){
+  try{
+    const r = await fetch(PEERS_URL+"?t="+Date.now(), {cache:"no-store"});
+    if(r.ok){ const d = await r.json(); PEERS = (d && d.peers) || {}; }
+  }catch(e){ /* band is optional until canaries publish */ }
+}
+function peerAge(doc, now){ return Math.max(0, now - (doc.reported_at||doc.received_at||0)); }
+function peerStale(doc, now){ return peerAge(doc, now) > 180; }  // 3× a ~60s cadence
+// ---- top-of-page status-history timeline (persisted by relay-status-record.py) ----
+const STATUS_URL = "status-history.json";
+let STATUS = null, STATUS_DAY = null;
+async function loadStatusHistory(){
+  try{ const r = await fetch(STATUS_URL+"?t="+Date.now(), {cache:"no-store"}); if(r.ok) STATUS = await r.json(); }
+  catch(e){ /* timeline optional until the recorder has run */ }
+}
+function statusPickDay(ts){ STATUS_DAY = ts; renderStatusTimeline(); }
+function renderStatusTimeline(){
+  const el = $("statustl"); if(!el) return;
+  const S = STATUS;
+  if(!S || !((S.day && S.day.length) || (S.hour && S.hour.length))){ el.innerHTML = ""; return; }
+  const levels = S.levels || ["up","slightly","moderate","severe","down"];
+  const legend = levels.map((l,i)=>`<span><i class="seg-${i}"></i>${esc(l)}</span>`).join("");
+  let title, segs, crumb = "";
+  if(STATUS_DAY == null){
+    title = "network status · by day";
+    segs = (S.day||[]).map(([ts,sev])=>{
+      const d = new Date(ts*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"});
+      return `<div class="seg seg-${sev}" title="${esc(d)} · ${esc(levels[sev])}" onclick="statusPickDay(${ts})"></div>`;
+    }).join("");
+  } else {
+    const dayStart = STATUS_DAY, dayEnd = STATUS_DAY + 86400;
+    const hrs = (S.hour||[]).filter(([ts])=>ts>=dayStart && ts<dayEnd);
+    const dl = new Date(STATUS_DAY*1000).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"});
+    title = `network status · ${esc(dl)} · by hour`;
+    segs = hrs.length
+      ? hrs.map(([ts,sev])=>{
+          const h = new Date(ts*1000).toLocaleTimeString(undefined,{hour:"numeric"});
+          return `<div class="seg seg-${sev}" title="${esc(h)} · ${esc(levels[sev])}"></div>`;
+        }).join("")
+      : `<div class="note" style="padding:4px 0">no hourly detail retained for this day</div>`;
+    crumb = `<div class="crumbrow"><a onclick="statusPickDay(null)">← all days</a></div>`;
+  }
+  el.innerHTML = `<div class="statustl-h"><h3>${title}</h3><span class="lg">${legend}</span></div><div class="statusbar">${segs}</div>${crumb}`;
+}
+
+const $ = (id) => document.getElementById(id);
+const ago = (s) => s < 60 ? s+"s" : s < 3600 ? Math.round(s/60)+"m" : Math.round(s/3600)+"h";
+// human bytes/s with spelled-out units ("4.6 KB/s") — null = not yet sampled.
+function bps(n){ if(n==null) return "—"; const u=["B/s","KB/s","MB/s","GB/s"]; let i=0,v=n; while(v>=1024&&i<3){v/=1024;i++} return (i?v.toFixed(1):v)+" "+u[i]; }
+// bits/s -> Mbps (network speed convention — what a speed test / iperf3 reports).
+function mbps(bits){ if(bits==null) return "—"; const m=bits/1e6; return (m>=100?Math.round(m):m.toFixed(m>=10?0:1))+" Mbps"; }
+// Measured link CAPACITY (a short iperf3 speed test — what the link CAN do),
+// with provenance. hn.capacity is written by capacity-probe.sh (hourly + on
+// demand). Distinct from the usage rate; shown in Mbps.
+function capacityLine(hn){
+  const c = hn.capacity;
+  if(!c || !c.mesh || c.mesh.down_bps==null) return `<span class="note">not measured yet</span>`;
+  const up = c.mesh.up_bps!=null ? ` <span class="cdim">↑</span> <b>${mbps(c.mesh.up_bps)}</b>` : "";
+  const age = c.measured_at ? ` <span class="cdim">· ${ago((Date.now()/1000)-c.measured_at)} ago</span>` : "";
+  const pub = (c.public||{}).down_bps!=null ? ` <span class="cdim">· ${mbps(c.public.down_bps)} public</span>` : "";
+  // Cross-node federation-primary leg (node-to-node mesh, F-261/ADR 1085 D):
+  // shows whether multi-node adds a slower internal hop than the WAN mesh.
+  const cn = (c.crossnode||{}).down_bps!=null
+    ? ` <span class="cdim">· ${mbps(c.crossnode.down_bps)} → ${esc(c.crossnode.name||'peer node')}</span>` : "";
+  return `<span class="cdim">↓</span> <b>${mbps(c.mesh.down_bps)}</b>${up} <span class="cdim">mesh</span>${pub}${cn}${age}`;
+}
+// packets/s (datagrams), thousands as "1.2k".
+function pps(n){ if(n==null) return "—"; return n>=1000?(n/1000).toFixed(1)+"k":n+""; }
+// declared capacity rate, Gbit above 1000 Mbit.
+function capRate(mbit){ return mbit>=1000 ? (mbit/1000)+" Gbit/s" : mbit+" Mbit/s"; }
+// capacity PROVENANCE label — keeps a NIC ceiling from reading as the relay's
+// real limit (the goat-relay process saturates well below the NIC).
+function capSrc(s){ return {nic:"NIC ceiling — process saturates lower", measured:"measured high-water", target:"ops target"}[s] || "declared"; }
+// latency -> status (green<120ms, amber<300, red otherwise; -1 unknown)
+function latSt(ms){ return ms<0?"grey":ms<120?"green":ms<300?"amber":"red"; }
+
+// status -> css suffix. "grey" is the honest unknown, never a false green.
+function sdot(status){ return {green:"d-green",amber:"d-amber",red:"d-red"}[status]||"d-grey"; }
+
+// SVG sparkline points for one numeric series over a [0..w]x[0..h] box.
+function sparkPath(vals, w, h, max){
+  if(!vals.length || max<=0) return "";
+  const n=vals.length, dx = n>1 ? w/(n-1) : 0;
+  return vals.map((v,i)=> `${(i*dx).toFixed(1)},${(h-(v/max)*h).toFixed(1)}`).join(" ");
+}
+// Rolling-window mean of the dominant direction (max of rx,tx) over history.
+// history row = [t, rx_bps, tx_bps, rx_pps, tx_pps, peers]. null if empty.
+function rollMeanDominant(hist){
+  if(!hist.length) return null;
+  return hist.reduce((a,r)=> a + Math.max(r[1],r[2]), 0) / hist.length;
+}
+
+// Throughput panel: sparkline (rx+tx over the window) + utilization gauge vs
+// the operator-DECLARED capacity. Honest by construction: no deep data ->
+// "operator-deep only"; no declared capacity -> grey gauge, never a fake %.
+function throughputPanel(r, now){
+  const d = r.deep, cap = r.cap || {};
+  if(!d){
+    return `<div class="tput"><h4>throughput · host NIC rate</h4>
+      <div class="none">operator-deep only — run <code>serve.sh --deep</code><br>
+      the credential-free hosted probe can't read host throughput (no relay
+      metrics endpoint / port). Reachability above is the hosted signal.</div></div>`;
+  }
+  const hist = d.history || [];
+  // Freshness: age of the LATEST deep sample for THIS relay, from its own
+  // history timestamp (can lag the fleet `generated` if this relay's deep probe
+  // failed a pass). Graded — never implies "live" when the data is old.
+  const lastT = hist.length ? hist[hist.length-1][0] : null;
+  const ageS  = (lastT!=null && now!=null) ? Math.max(0, now-lastT) : null;
+  const fr = ageS==null  ? {t:"sample age unknown", c:"--faint"}
+           : ageS<=45    ? {t:`updated ${ago(ageS)} ago`, c:"--dim"}
+           : ageS<=150   ? {t:`aging · ${ago(ageS)} ago`, c:"--amber"}
+           :               {t:`STALE · last ${ago(ageS)} ago`, c:"--red"};
+  const W=300, H=48;
+  let maxv=1; hist.forEach(p=>{ maxv=Math.max(maxv,p[1],p[2]); });
+  const winMin = ((hist.length*REFRESH_MS/1000)/60).toFixed(1);   // window span covered
+  const yOf = v => (H-(v/maxv)*H).toFixed(1);
+  const lastIn = hist.length? hist[hist.length-1][1]:0, lastOut = hist.length? hist[hist.length-1][2]:0;
+  // Chart with reference: labeled y-axis (0 → window peak), a zero baseline, and
+  // an end-dot per series marking the current value (ties the line to the in/out
+  // numbers above). Auto-scaled per relay, so the axis label is what gives the
+  // line magnitude — without it the lines are just shapes.
+  const svg = hist.length>=2
+    ? `<div class="spark-wrap">
+         <div class="spark-y"><span>${bps(maxv)}</span><span>0</span></div>
+         <svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+           <line x1="0" y1="${H-0.5}" x2="${W}" y2="${H-0.5}" stroke="var(--line)" stroke-width="1"/>
+           <polyline fill="none" stroke="var(--blue)" stroke-width="1.5" points="${sparkPath(hist.map(p=>p[1]),W,H,maxv)}"/>
+           <polyline fill="none" stroke="var(--amber)" stroke-width="1.5" points="${sparkPath(hist.map(p=>p[2]),W,H,maxv)}"/>
+           <circle cx="${W-1.5}" cy="${yOf(lastIn)}" r="2.5" fill="var(--blue)"/>
+           <circle cx="${W-1.5}" cy="${yOf(lastOut)}" r="2.5" fill="var(--amber)"/>
+         </svg>
+       </div>
+       <div class="note" style="margin-top:3px"><span style="color:var(--blue)">━</span> in&nbsp;&nbsp;<span style="color:var(--amber)">━</span> out&nbsp;·&nbsp;y-axis 0 to ${bps(maxv)} (window peak)&nbsp;·&nbsp;${hist.length} samples / ~${winMin} min</div>`
+    : `<div class="none">chart needs 2+ deep samples (have ${hist.length} — each <code>--deep</code> pass adds one; fills to ~10 min)</div>`;
+  // utilization = rolling-window mean of the busier direction / declared capacity
+  const roll = rollMeanDominant(hist);
+  let gauge;
+  if(cap.bps==null){
+    gauge = `<div class="gauge" title="No utilization shown until a relay's sustainable throughput is established (measured high-water from a load test, or an ops target) and set as cap_mbit in relays.conf. The instance NIC line-rate is NOT that number — the goat-relay process saturates well below it.">
+      <div class="track"><div class="fill gf-grey" style="width:0%"></div></div>
+      <div class="lbl"><span>utilization</span><span>capacity not declared</span></div></div>`;
+  } else if(roll==null){
+    gauge = `<div class="gauge"><div class="track"><div class="fill gf-grey" style="width:0%"></div></div>
+      <div class="lbl"><span>utilization</span><span>warming up</span></div></div>`;
+  } else {
+    const pct = Math.min(100, (roll/cap.bps)*100);
+    const pctTxt = pct===0 ? "0" : pct<1 ? "<1" : pct.toFixed(pct<10?1:0);   // show "<1%", never a bare "0%" that hides real traffic
+    const gc = pct>=90?"gf-red":pct>=70?"gf-amber":"gf-green";
+    gauge = `<div class="gauge" title="busier direction ~${bps(roll)} averaged over ${hist.length} samples ÷ declared ${capRate(cap.mbit)} (${capSrc(cap.src)})">
+      <div class="track"><div class="fill ${gc}" style="width:${pct.toFixed(1)}%"></div></div>
+      <div class="lbl"><span><b>${pctTxt}%</b> of ${capRate(cap.mbit)} used <span class="note">(${capSrc(cap.src)})</span></span><span class="note">avg of ${hist.length} · ~${winMin} min</span></div></div>`;
+  }
+  const pw = d.peers_window_min || 5;
+  const pc = (d.peers_recent!=null) ? d.peers_recent : d.peers_5m;
+  const peers = (pc!=null) ? `<span class="chip">${pc} peers auth'd ≤${pw}m</span>` : "";
+  const capPps = (cap.pps!=null) ? ` <span class="note">/ ${pps(cap.pps)} cap</span>` : "";
+  return `<div class="tput">
+    <h4 title="Whole-host NIC rate: every byte on the relay host (control, SSH, our probes), not only relayed peer traffic. The relayed per-peer breakdown is the panel below.">throughput · host NIC rate</h4>
+    <div class="note" style="margin:-2px 0 6px">whole host, all traffic · <b>relayed per-peer breakdown below ↓</b></div>
+    <div class="note" style="margin:-3px 0 7px"><span style="color:var(${fr.c})">⟳ ${fr.t}</span></div>
+    <div class="nums">
+      <span><span style="color:var(--blue)">●</span> in <b>${bps(d.rx_bps)}</b></span>
+      <span><span style="color:var(--amber)">●</span> out <b>${bps(d.tx_bps)}</b></span>
+      <span><b>${pps(d.rx_pps)}/${pps(d.tx_pps)}</b> <span class="note">packets/s in/out</span>${capPps}</span></div>
+    ${svg}
+    ${gauge}
+    <div class="chips">${peers}<span class="chip">cpu ${d.cpu_pct}%</span><span class="chip">mem ${d.mem_pct}%</span></div>
+    ${deliveryCard(d.delivery)}
+  </div>`;
+}
+
+// Relay data-plane delivery health. Renders the relay's own
+// drop counters + the QUIC-vs-WS connection split. The load-bearing signals:
+//  - datagram_too_large: a WS peer sent a frame bigger than a QUIC peer can
+//    receive. After the F-275 fix these are DROPPED + COUNTED (not fatal), so a
+//    steady trickle is expected/benign; a SPIKE means a peer is pushing oversize
+//    frames cross-transport. Pre-fix this KILLED the QUIC peer's writer.
+//  - writer_death / evictions: a QUIC writer hit a connection-level failure and
+//    the relay closed the conn (post-fix behaviour). Should be ~0; a rising
+//    count is real distress worth a look.
+//  - peer_not_found: frames addressed to peers not in the registry (offline /
+//    departed). High-volume is normal churn; it's here for completeness.
+// Honest: null delivery (relay hasn't published it yet / pre-transport-vis
+// build) renders nothing rather than fabricating zeros.
+function deliveryCard(dv){
+  if(dv==null) return "";
+  const dr = dv.drops||{};
+  const dtl = +dv.datagram_too_large || +dr.datagram_too_large || 0;
+  const wdeath = +dv.writer_death||0, evict = +dv.evictions||0;
+  const win = dv.window_min!=null ? ` <span class="note">(${dv.window_min}m)</span>` : "";
+  // datagram_too_large / writer_death drive the colour: green at 0, amber on any,
+  // red when writer deaths are recurring (the actual wedge precursor).
+  const st = (wdeath>=3) ? "red" : (wdeath>0||dtl>0) ? "amber" : "green";
+  const tq = (dv.conns_quic!=null||dv.conns_ws!=null)
+    ? `<span class="chip" title="active relay connections by transport, from the relay's own stats endpoint. QUIC = UDP datagrams (path-MTU-bound frames); WS = TCP (frames to 8820 B). The size mismatch across transports is what F-275 was about.">transport <b>${cnt(dv.conns_quic)}</b> quic · <b>${cnt(dv.conns_ws)}</b> ws</span>`
+    : "";
+  return `<div class="chips" style="margin-top:4px">
+    <span class="chip" title="relay data-plane delivery (ADR 1055). Drops are silent at the wire (spec §3.3) but counted here. datagram_too_large = a WS→QUIC oversized frame, dropped+counted since the F-275 fix (was a writer-kill before). writer_death = a QUIC writer hit a connection-level failure and the relay closed the conn. Both should stay near 0; a rising trend is the signal.">
+      <span class="sdot ${sdot(st)}"></span>delivery${win} · <b>${cnt(dtl)}</b> too-large · <b>${cnt(wdeath)}</b> writer-death · <b>${cnt(evict)}</b> evict</span>
+    ${tq}
+    <span class="chip cdim" title="cumulative relay drop counters by reason (lifetime, since relay start).">drops pnf <b>${cnt(dr.peer_not_found)}</b> · wfull <b>${cnt(dr.writer_full)}</b> · wclosed <b>${cnt(dr.writer_closed)}</b></span>
+  </div>`;
+}
+
+// Per-peer forwarded-rate distribution (ADR 1055 §2b). Only renders when the
+// relay published a peers[] block (its --stats-addr endpoint + the Go
+// relay-probe publisher). Sorted desc by push rate — the bar shape shows flat
+// vs power-law, and a peer taking an outsized share is flagged HOG (a throttle/
+// evict candidate). Honest: rate null (first sample) falls back to cumulative
+// bytes + says so; all-zero reads "idle", never a fabricated bar.
+function hbytes(n){ if(n==null) return "—"; const u=["B","KB","MB","GB","TB"]; let i=0,v=n; while(v>=1024&&i<4){v/=1024;i++} return (i?v.toFixed(1):v)+" "+u[i]; }
+function shortId(h){ return (typeof h==="string" && h.length>12) ? h.slice(0,10)+"…" : (h||"?"); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// Display label for a relay peer id: the friendly NetBird name when resolved
+// (trimmed — the auto-onboard names carry a long -<goatnet>-<date>-<host> suffix),
+// else the short hex. The full name + full hex always ride in the title (hover).
+function trimName(n){
+  let s = n.replace(/^peer-/, "");                 // drop the onboard "peer-" prefix
+  s = s.replace(/-zagros-\d{4}-\d{2}-\d{2}.*$/, ""); // drop the -zagros-<date>-<host> tail
+  return (s.length>28 ? s.slice(0,27)+"…" : s) || n;
+}
+// PEER_NAMES[id] is a baseball-card object {name,id,aff,ip,os,host,seen,conn}
+// (or a bare string for legacy maps). Normalize to an object.
+function cardOf(id){ const v=PEER_NAMES[id]; if(v==null) return null; return (typeof v==="string")?{name:v}:v; }
+function nameFor(id){ const c=cardOf(id); return (c&&c.name) ? esc(trimName(c.name)) : shortId(id); }
+function titleFor(id){ const c=cardOf(id); return esc((c&&c.name) ? (c.name+"\n"+id+"\nclick for peer card") : (id+"\nclick for peer card")); }
+function peersPanel(r){
+  const d=r.deep; if(!d || !Array.isArray(d.peers) || d.peers.length===0) return "";
+  const haveRate = d.peers.some(p=>p.fwd_bps!=null);
+  const val = p => haveRate ? (p.fwd_bps||0) : (p.fwd_bytes||0);
+  const rows = d.peers.map(p=>({id:p.peer_id, v:val(p)})).sort((a,b)=>b.v-a.v);
+  const total = rows.reduce((s,x)=>s+x.v,0), max = rows.length?rows[0].v:0;
+  const fmt = haveRate ? bps : hbytes;
+  const unit = haveRate ? "rate" : "bytes";
+  if(total===0){
+    return `<div class="peers"><h4>per-peer forwarded ${unit} <span class="note">${rows.length} peer${rows.length!==1?"s":""} · idle</span></h4>
+      <div class="none">no forwarded bytes this sample</div></div>`;
+  }
+  const shareTop = max/total;                                  // power-law signal
+  const shape = shareTop>=0.40 ? `power-law · top ${(shareTop*100).toFixed(0)}%` : "roughly flat";
+  const TOPN=12, shown=rows.slice(0,TOPN);
+  const bars = shown.map(x=>{
+    const hog = (x.v/total)>=0.40;                             // >40% of total = hog
+    const w = max>0 ? Math.max(2,(x.v/max)*100) : 0;
+    return `<div class="prow" onclick="openCard('${x.id}','${esc(r.name)}','${fmt(x.v)}')" title="${titleFor(x.id)}">`
+      + `<span class="pid">${nameFor(x.id)}</span>`
+      + `<span class="pbar"><span class="pfill${hog?" hog":""}" style="width:${w.toFixed(1)}%"></span></span>`
+      + `<span class="pval">${fmt(x.v)}${hog?' <b class="hogtag">HOG</b>':""}</span></div>`;
+  }).join("");
+  const more = rows.length>TOPN ? `<div class="note" style="margin-top:4px">+${rows.length-TOPN} more</div>` : "";
+  // Relayed total across all peers, so the sum is directly comparable to the
+  // host-NIC throughput above (which also counts both directions + rathole +
+  // control + OS) — a peer sum well under the NIC rate is expected, not a gap.
+  const relayed = `<div class="note" style="margin-top:5px">relayed total (fwd, all ${rows.length} peers): <b>${fmt(total)}</b> — counted once, vs whole-host NIC rate above</div>`;
+  return `<div class="peers"><h4>per-peer forwarded ${unit} <span class="note">${rows.length} peers · ${shape}${haveRate?"":" · cumulative (first sample)"}</span></h4>${bars}${more}${relayed}</div>`;
+}
+
+// Peer baseball card (ADR 1055). Click a peer row -> identity/affiliation/NetBird
+// id + last-seen, plus the time-series section (Part B — the retention layer is
+// designed-not-built, so the windows are honestly labeled "retention pending").
+function fmtSeen(s){
+  if(!s) return "—";
+  const t=Date.parse(s); if(isNaN(t)) return esc(String(s));
+  const d=(Date.now()-t)/1000; if(d<0) return "just now";
+  return d<60?Math.round(d)+"s ago":d<3600?Math.round(d/60)+"m ago":d<86400?Math.round(d/3600)+"h ago":Math.round(d/86400)+"d ago";
+}
+// Inline-SVG sparkline of forwarded rate for one tier (no chart lib). Empty tier
+// reads "collecting" — honest: the window fills as samples accumulate, no backfill.
+function sparkline(pts){
+  if(!pts || pts.length===0) return '<span class="cdim">collecting…</span>';
+  const W=200,H=30, vals=pts.map(p=>+p[1]||0), max=Math.max(1,...vals), n=pts.length;
+  const x=i=> n<=1?W:(i/(n-1))*W, y=v=> H-2-(v/max)*(H-4);
+  const d=vals.map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+' '+y(v).toFixed(1)).join(' ');
+  const cur=vals[vals.length-1];
+  return `<svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`
+    + `<path d="${d}" fill="none" stroke="var(--blue)" stroke-width="1.5"/></svg>`
+    + `<span class="sparkv">${bps(cur)}<span class="cdim"> · peak ${bps(max)} · n=${n}</span></span>`;
+}
+function openCard(id, relay, rate){
+  const c = cardOf(id) || {};
+  const row=(k,v)=>`<div class="crow"><span class="ck">${k}</span><span class="cv">${v}</span></div>`;
+  // NetBird groups — the peer's mesh-ACL grouping (legacy role/affiliation encoding).
+  // NOT canonical affiliation: the identity grammar puts affiliation on the cert
+  // URI-SAN / identity registry (a different key than the relay's wg-pubkey hash),
+  // which is the Part-B registry join — shown honestly as "pending" below.
+  const grp = c.aff ? esc(c.aff).replace(/,/g,", ") : '<span class="cdim">— (default group only)</span>';
+  const conn = c.conn===true ? '<span class="cok">on mesh</span>' : c.conn===false ? '<span class="cdim">offline</span>' : '<span class="cdim">?</span>';
+  let h = `<div class="ctitle">${c.name?esc(c.name):shortId(id)}</div>`;
+  h += row("netbird groups", grp);
+  h += row("affiliation", '<span class="cdim">canonical (registry/cert) — pending join</span>');
+  h += row("netbird id", c.id?('<code>'+esc(c.id)+'</code>'):'<span class="cdim">—</span>');
+  h += row("relay id", '<code title="'+esc(id)+'">'+esc(id.slice(0,20))+'…</code>');
+  h += row("mesh ip", c.ip?esc(c.ip):'<span class="cdim">—</span>');
+  h += row("host / os", (c.host?esc(c.host):'—')+(c.os?(' · '+esc(c.os)):''));
+  h += row("last seen", fmtSeen(c.seen)+' · '+conn);
+  h += row("forwarding", 'via '+esc(relay)+' @ '+esc(rate));
+  // Deep-link into the id-admin-console person record (peer-identity-resolution.md).
+  // ID_CONSOLE_URL is set only on the mesh (site host) dashboard, and the whole page is
+  // ADMINS-gated, so the link is mesh + admin only. c.ory_id is baked by the site host
+  // resolver (peer name → registry → Ory id); absent → person unresolved, no link.
+  if(c.ory_id && ID_CONSOLE_URL){
+    const url = ID_CONSOLE_URL.replace(/\/+$/,"") + "/users/" + encodeURIComponent(c.ory_id);
+    h += row("full identity", '<a class="idlink" href="'+esc(url)+'" target="_blank" rel="noopener">open in id-admin-console →</a>');
+  } else if(ID_CONSOLE_URL){
+    h += row("full identity", '<span class="cdim">person unresolved — org via portal access view</span>');
+  }
+  const S = PEER_SERIES[id] || {};
+  const tsrow=(label,key)=>`<div class="ctsrow"><span class="ctsl">${label}</span><span class="ctsv">${sparkline(S[key])}</span></div>`;
+  h += `<div class="cts"><div class="ctsh">forwarded rate over time <span class="cdim">(this box)</span></div>`
+    + tsrow("last hour","h") + tsrow("last 24 h","d") + tsrow("last 7 days","w") + `</div>`;
+  document.getElementById("cardBody").innerHTML = h;
+  document.getElementById("cardModal").style.display = "flex";
+}
+function closeCard(){ document.getElementById("cardModal").style.display="none"; }
+document.addEventListener("keydown", e=>{ if(e.key==="Escape") closeCard(); });
+
+// Per-relay overall rollup from its probes (worst wins; unknown stays grey).
+function relayStatus(r, tunnelEndpoint){
+  const e = r.enroll;
+  const enroll = e.ok===0 ? "red" : e.ok<e.tries ? "amber" : "green";   // flap -> amber
+  const ctl    = r.rathole_ctl===true ? "green" : "red";
+  const stun   = r.stun===true ? "green" : r.stun===false ? "amber" : "grey";
+  const dp     = r.dataplane || {};
+  // The relay data plane (:33073) is served over TWO independent transports.
+  // WS/TCP is a direct path to the relay's own goat-relay (no hairpin), so it
+  // drives health on BOTH vantages. QUIC/UDP shares STUN's residential-UDP-
+  // egress caveat from the site host, so it's informational on a tunnel endpoint and
+  // health-driving only externally. quic false = amber (can't tell filtered
+  // from VN-disabled), never red, never a false green.
+  const wsTcp  = dp.ws_tcp===true ? "green" : dp.ws_tcp===false ? "red" : "grey";
+  const quic   = dp.quic_udp===true ? "green" : dp.quic_udp===false ? "amber" : "grey";
+  const order  = {red:0,amber:1,grey:2,green:3};
+  // From the tunnel ENDPOINT (the site host), :443 hairpins and STUN/QUIC are
+  // residential-UDP — unreliable from this vantage and NOT representative of
+  // what a real enrolling peer sees. Health there is :2333 control reachability
+  // + :33073 WS/TCP data-plane reach (both non-hairpin); :443/STUN/QUIC are
+  // informational only.
+  let worst = tunnelEndpoint ? [ctl, wsTcp] : [enroll, ctl, stun, wsTcp, quic];
+  if(r.deep){
+    if(r.deep.rathole && r.deep.rathole!=="active") worst.push("red");
+    if(r.deep.watchdog && r.deep.watchdog!=="active") worst.push("amber");
+    if(r.deep.relay_up===0) worst.push("red");
+    // F-229 — root-disk fill + runaway container log. A full root disk kills
+    // SSM on a relay; warn well before then.
+    const dk = +r.deep.disk_pct;
+    if(dk>=95) worst.push("red"); else if(dk>=85) worst.push("amber");
+    if(+r.deep.max_container_log_mb > 2000) worst.push("amber");
+    // F-269 — this relay is auth-rejecting a peer (stale cached token / WS
+    // upgrade never finished). A specific peer being turned away is a real
+    // per-peer fault, not "it's you." ws_handoff_eof is benign QUIC-race noise
+    // — never colored.
+    const ar = r.deep.auth_reject;
+    if(ar && ((+ar.expired_token||0)>0 || (+ar.ws_upgrade_timeout||0)>0)) worst.push("amber");
+  }
+  return worst.reduce((a,b)=> order[b]<order[a]?b:a, "green");
+}
+
+function bars(ok,tries){
+  let h="";
+  for(let i=0;i<tries;i++) h += `<span class="bar ${i<ok?'ok':'bad'}"></span>`;
+  return `<span class="bars">${h}</span>`;
+}
+
+function row(k, statusClass, vHtml){
+  return `<div class="row"><span class="k">${k}</span>
+    <span class="v"><span class="sdot ${statusClass}"></span>${vHtml}</span></div>`;
+}
+
+// ---- hash router (level 1 ⇄ 2; back-button = hashchange re-render) ----
+// #relay=<name> -> level-2 detail; #view=list|map -> level-1 flavor (persisted).
+let LAST_DATA = null;
+function routeState(){
+  const p = new URLSearchParams(location.hash.replace(/^#/,""));
+  let view = p.get("view") || localStorage.getItem("rh_view") || "list";
+  if(view !== "map") view = "list";
+  return { relay: p.get("relay"), view, host: p.get("host"), zenoh: p.get("zenoh"), card: p.get("card") };
+}
+function openRelay(n){ location.hash = "relay=" + encodeURIComponent(n); }
+function openHost(n){ location.hash = "host=" + encodeURIComponent(n); }
+function openHostCard(n,k){ location.hash = "host=" + encodeURIComponent(n) + "&card=" + encodeURIComponent(k); }
+function openZenoh(n){ location.hash = "zenoh=" + encodeURIComponent(n); }
+function openZenohCard(n,k){ location.hash = "zenoh=" + encodeURIComponent(n) + "&card=" + encodeURIComponent(k); }
+function goFleet(){
+  const v = routeState().view;
+  location.hash = v === "map" ? "view=map" : "";
+}
+function setView(v){
+  localStorage.setItem("rh_view", v);
+  location.hash = v === "map" ? "view=map" : "";
+}
+window.addEventListener("hashchange", ()=>{ if(LAST_DATA) render(LAST_DATA); });
+
+// Placement chip text (ADR 1080): declared place (underscores = spaces), else
+// the provider region, else an honest em-dash. Never a guessed location.
+function placeChip(r){
+  const p = r.placement || {};
+  const label = p.place ? esc(p.place).replace(/_/g," ") : (r.region ? esc(r.region) : "—");
+  const tip = [p.provider?("provider "+p.provider):null, r.region?("region "+r.region):null,
+               p.az?("az "+p.az):null,
+               (p.lat!=null)?("geo "+p.lat+","+p.lon):"no declared geo (unplaced on map)"]
+              .filter(Boolean).join(" · ");
+  return `<span class="chip-place" title="${esc(tip)}">${label}</span>`;
+}
+// Tiny overview sparkline: dominant direction over the deep history window.
+// No deep data -> an honest dash (hosted fast probes can't see throughput).
+function ovSpark(r){
+  const hist = (r.deep && r.deep.history) || [];
+  if(hist.length < 2) return `<span class="note" title="throughput needs deep data (--deep or relay self-publish)">—</span>`;
+  const W=110, H=22;
+  let maxv=1; hist.forEach(p=>{ maxv=Math.max(maxv, p[1], p[2]); });
+  const vals = hist.map(p=>Math.max(p[1],p[2]));
+  return `<svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:${H}px">
+      <polyline fill="none" stroke="var(--blue)" stroke-width="1.2" points="${sparkPath(vals,W,H,maxv)}"/>
+    </svg><span class="note">${bps(Math.max(hist[hist.length-1][1], hist[hist.length-1][2]))}</span>`;
+}
+// ---- geographic view (A3, ADR 1080) ----
+// Repo-baked equirectangular world silhouette — Natural Earth 110m land
+// (public domain), RDP-simplified. NO tile server, NO CDN, NO network fetch:
+// the map must render during exactly the outages this page exists for
+// (strict-CSP-safe, works off-mesh). viewBox is degrees: x=lon+180, y=90-lat.
+const WORLD_PATH = "M120.4 170 119.8 171 113.7 170.3 120.4 170ZM20.8 169.5 18.9 169.6 16.3 168.6 18.8 168.4 20.8 169.5ZM134.8 168 136.1 168.5 136.7 170 129.5 171 125.8 170.6 131.3 168 134.8 168ZM58.8 163.5 61.3 163.5 59.8 164.1 57.4 163.7 58.8 163.5ZM81 161.9 83.8 162.5 79.2 162.5 77.7 161.9 81 161.9ZM111.5 161 111.2 162.2 108.9 162.5 105.8 162.4 105 161.7 107.9 161.2 108.3 159.5 109.7 158.9 111.5 161ZM121.4 154.2 118 154.8 117.4 155.5 117.9 156.2 114.3 158 118.2 160.7 119.2 163.7 115.6 165.3 109.4 166.6 102.8 166.7 106.3 167.9 102.1 168.4 102 169.2 104.6 170.3 120.3 172.4 121.8 173.2 130.2 171.7 137.2 172.1 139.2 171.4 151.5 170.3 150.3 169.3 144.4 169.5 144.7 168.1 162.5 165.1 164.3 164.5 164.6 164.1 163.5 163.9 164.6 163.1 169.7 161.3 172.6 161.7 173.1 160.9 179.8 161.6 187.7 159.9 190.8 160.8 193.4 160 207.1 160.5 212 159.7 213.9 158.5 218.6 159.8 234.5 155.8 241.4 158 244.1 157.4 248.9 157.9 249.7 159.2 247.8 160.3 249.1 160.7 247.9 161.9 249.9 162.3 253.9 159.9 257.6 159.5 262.8 157.2 266.8 157.2 268 156.2 269.7 157.2 275.8 157.4 279.7 157.2 282.8 155.6 286.2 156.9 293.6 155.9 299.8 157.3 303.2 156.5 314.8 156.2 315.1 155.3 317.5 157 325.5 156.9 328.8 158.4 334.3 158.6 341.6 160.6 351.2 161.7 349.3 163.7 346.1 164.4 343.6 166.2 343.5 167.1 344.7 168.2 347 168.8 341.8 169.2 339.8 170.9 349.4 173.8 360 174.7 360 180 0 180 0 174.7 0.9 174.1 5.6 174.5 10 173.9 21.9 175.4 36.9 175 37.1 174.6 26.4 173.7 27.1 172 23.2 171.1 29.4 171.3 33.6 170.3 30.5 169.4 24.7 169.1 21.9 168 21.6 166.9 28.7 167.4 33.9 166.5 33.8 165.4 35.1 165.2 44.8 164.3 60.3 164.5 66.1 163.7 67.7 164.7 79.4 165.3 79.9 164.9 77.5 164.1 76.3 162.6 83.7 163.6 89.9 163.3 90.8 162.6 98.5 163.9 99.7 163.1 105.1 163.9 112.6 162.5 111.5 159.7 112.6 158.1 112.3 157.3 117 154.6 122.2 153.3 122.8 153.5 121.4 154.2ZM112.2 143.8 115 144.7 110.8 145.5 105.3 142.8 108.9 144.1 110.7 142.5 112.2 143.8ZM121.5 141.1 122 141.9 118.8 141.8 121.5 141.1ZM325.4 130.8 328.3 130.9 327.9 133.2 326 133.5 324.7 131.2 325.4 130.8ZM353 130.9 354.2 131.3 352.7 133.4 353.1 133.9 351.5 134.2 350.6 135.9 349.3 136.6 346.7 136.2 347 135.1 350.5 133 352.1 131 353 130.9ZM354.6 126.2 356.8 127.9 358.5 127.7 358 129.2 357.2 129.1 355.2 131.7 354.7 131.3 354.9 129.9 353.8 129.5 354.7 127.4 352.6 124.5 354.3 125.3 354.6 126.2ZM347.1 112.2 345.5 111.7 344 110.1 347.1 112.2ZM230.1 103.6 230.4 105.7 229.7 105.7 227.1 114.9 225.4 115.6 224 115 223.3 112.1 224.4 110.1 224 107.4 224.4 106.2 227.7 104.6 229.2 102 230.1 103.6ZM323.6 103.8 325.4 105 326.4 109 328.8 110.4 329.7 112.3 330.7 112.4 333.1 116.1 333.6 118.1 332.9 121.6 330.3 125.7 330 127.4 326.3 129 324.9 128.4 325 127.9 323.6 128.8 320.6 128 319.6 126.1 318.1 125.6 318.2 124.4 316.8 125.3 317.8 122.9 316 124.9 314.3 122.6 311.3 121.5 306.1 122.2 304.2 123 303.7 123.9 299.9 124 298 125.1 295 124.2 295.7 121.6 293.3 116.1 293.8 116.5 293.4 115.6 294.2 116.3 293.4 114.4 294.1 111.8 294.2 112.5 296.7 110.7 300.9 109.7 303 106.4 303.9 107.1 303.5 106.6 305.7 104.2 307.1 103.8 309.6 105 310.6 102.5 312.6 102.1 311.8 101.3 312.4 101.1 315.3 102.2 316.5 101.9 317 102.4 315.5 105 320.2 107.7 321.7 105 322.1 101 322.8 101.2 323.6 103.8ZM304.4 100.1 303.5 100.2 304 99.3 307.3 98.4 304.4 100.1ZM297.9 98.1 299.1 98.7 296.7 99 297.9 98.1ZM302.9 98.1 302.8 98.6 299.9 98.8 302.9 98.1ZM288.6 96.8 290.8 96.5 295.7 98.4 294.6 98.8 288.3 97.8 285.4 96.9 286.1 95.9 288.6 96.8ZM332 95.5 330.2 96.3 328.3 95.7 330.1 95 330.8 95.5 331.5 94.2 332.3 94.3 332 95.5ZM310.5 93.1 310.8 93.9 307.9 93.4 308.1 92.8 310.5 93.1ZM333.1 94.5 330.7 92.7 332.2 93.2 333.1 94.5ZM314.1 91.2 314.4 92.8 315.5 93.4 316.3 92.3 318.3 91.7 324.6 93.9 326 95.5 327.6 96.1 327.2 97.4 330.7 100.6 327.9 100.1 326 98.1 324.7 97.6 322.6 99.3 319.1 98.1 317.6 98.4 318.7 97.3 317.9 95.4 313.7 93.5 313 94.1 312 92.8 313.7 92.2 312.2 92.2 310.5 90.9 312.4 90.4 314.1 91.2ZM305.2 88.6 303.7 89.8 300.2 89.8 300.9 91.4 303.3 90.6 301.5 91.9 303.2 95.3 302.2 95.3 302.7 94.5 301.5 94.6 301 92.6 300.3 92.9 300.4 95.5 299.4 95.4 299.5 93.5 298.8 92.8 300 89.4 300.9 88.7 302.9 89.1 305.2 88.6ZM308.7 88.9 308.1 90.9 307.6 88.2 307.9 87.8 308.7 88.9ZM285.8 95.9 284.7 95.9 282.6 94.2 275.3 84.5 277.5 84.8 280.6 87.9 281.7 87.9 283.8 89.9 283.4 90.7 286.1 93.1 285.8 95.9ZM297.9 88.2 299 89.1 297.8 89.2 296.1 94 290.2 92.9 289.1 90.5 289.7 88 291.2 88.1 291.4 87.3 293 86.9 296.7 83.1 299.2 84.6 297.3 86.8 297.9 88.2ZM306.4 81.6 306.5 82.8 306.2 83.7 305.8 82.7 305.4 83.2 305.4 84.4 304.2 83.8 303.6 82.2 301.9 82.8 303.5 81.3 303.8 81.8 305.5 81 305.4 80.2 306.4 81.6ZM261.2 83.8 260.3 84 259.9 83.2 260.1 80.2 261.8 82.5 261.2 83.8ZM304 79.7 303 81 302.4 80.3 302.9 79.1 303.5 79.1 303.3 79.7 304.1 78.8 304 79.7ZM298.5 80.7 297.2 81.6 299.5 78.6 299.7 79.4 298.5 80.7ZM305.5 77.8 305.8 79 305 78.7 304.8 79.9 304.3 77.4 305.5 77.8ZM301.3 71.5 302.2 71.5 302.5 72.9 301.7 74.1 301.7 75.7 304 76.2 304.1 77.5 302.9 76.4 300.6 76.1 301 75.5 300.1 75 299.9 73.6 300.3 74 300.7 71.5 301.3 71.5ZM103.1 72.1 101.7 71.8 103.1 71.6 103.8 72.1 103.1 72.1ZM107.4 70.1 110 70.4 111.7 71.4 109.3 71.6 108.6 72.4 106.1 72 105.6 71.3 107.7 71.3 106.6 70.4 107.4 70.1ZM290.3 71.3 288.7 71.5 288.6 70.6 290.8 69.9 290.3 71.3ZM100.3 67.2 105.8 69.7 102.2 70.1 102.9 69.6 101.3 68.4 98.2 67.4 95 68.1 97.7 66.8 100.3 67.2ZM301.2 67.2 300.7 68 300.1 66.4 301.5 64.7 302 65 301.2 67.2ZM314.6 55.9 314.2 56.8 312.4 57 312.9 55.9 314.6 55.9ZM214.6 54.3 213 55.4 212.3 54.9 214.6 54.3ZM203.7 54.3 206.3 54.7 204.7 55.1 203.7 54.3ZM195.5 51.8 195.1 53.4 192.4 52.4 192.6 51.9 195.5 51.8ZM189.2 48.8 189.7 50.8 188.8 51.1 188.2 49 189.2 48.8ZM321 52.9 320.3 54.9 317.2 55.4 315.8 56.5 315.1 55.4 311 56.1 312 56.9 311.3 58.5 310.2 58.6 310.4 57.7 309.4 56.7 312.6 54.6 315.7 54.5 316.7 52.7 317.4 53.2 319.4 51.8 320.3 48.8 321.4 48.6 321.9 50 321 52.9ZM323.9 45.8 325.3 45.6 325.5 46.7 324.1 47 323.2 48 321.6 47.3 321.1 48.4 320 48.4 319.8 47.4 321.4 46.6 322 44.4 323.9 45.8ZM116.3 43.4 118 43.6 117.1 44 116.3 43.4ZM56.5 41.5 54.3 41.2 51.9 40 51.6 39.2 54.2 39.7 56.5 41.5ZM123.9 39.3 123.2 40.2 126.5 40.8 126.2 41.5 126.9 41.3 127.4 42.5 126.9 43.3 125.8 43.2 125.8 42.2 124.6 43.1 124 43.1 124.7 42.6 123.7 42.4 120.7 42.4 120.8 41.5 122.6 39.3 124.1 38.4 124.6 38.4 123.9 39.3ZM47.3 36 48.3 35.9 48 37 48.8 37.8 46.9 36.6 46.8 35.8 47.3 36ZM323.6 39.3 324.7 41 323.2 40.7 322.6 42.1 323.5 43.9 322.7 43.3 322.1 44 321.7 36.7 322.7 35.6 323.6 39.3ZM173.2 37.7 170 38.2 170.8 37.1 170.3 36.1 173.3 34.8 174.3 35.4 173.2 37.7ZM27 32.9 26 33.3 25.3 32.5 27.4 32.1 27.9 32.4 27 32.9ZM177 31.4 175.9 32.4 178 32.3 176.9 34 177.9 34.1 180.5 37.1 181.7 37.3 181.1 38.2 181.4 38.7 174.8 40 174.2 39.8 176.6 38.6 174.7 38 175.8 37.7 175.4 36.5 176.9 36.6 177.1 36 175.2 35.2 175 34.2 174.4 34.7 173.9 33.2 175 31.4 177 31.4ZM94.8 24.3 99.9 26.3 96.9 25.9 94.5 26.9 94.1 26.4 92.8 26.5 93.6 26 94.1 24.3 94.8 24.3ZM165.5 23.5 165.3 24.2 166.4 24.9 161.3 26.5 157.2 26 158.2 25.6 156 25.1 157.8 24.6 155.7 24.4 157.9 23.6 159.4 24.3 165.5 23.5ZM104.1 22.9 102.8 22.4 104.1 21.7 104.9 22.4 104.1 22.9ZM5 23.4 8.1 23.1 10.1 24 7.5 24.6 7 25.7 1.6 24.6 1.3 23.9 0.1 24.1 0.6 24.6 0 25 0 21 5.1 22.8 5 23.4ZM84.4 20.9 80.2 20.6 81.8 19.9 84.4 20.9ZM1.3 19.1 0 19.2 0 18.5 2.4 18.7 1.3 19.1ZM89.5 20.5 89.4 21.5 90.8 20.7 92 21.4 91.7 22.1 92.6 22.8 94.4 21.2 94.5 20.1 97.4 20.3 98.7 20.8 98 21.9 98.7 22.4 96.7 23.6 94.2 23.4 92.7 25.2 86.8 28 85.8 29.1 85.3 31.1 86.8 31.2 87.7 32.9 89.1 32.7 95 34.7 97.7 34.9 97.9 36.7 100.1 38.8 101.4 37.4 100.2 35.3 103.5 33.5 101.5 31.2 102.7 30.1 101.9 27.7 106.2 27.6 108.6 28.9 110.4 28.9 110.7 31 112.4 31.8 115.4 29.7 118.6 33 118.2 33.7 122.7 35.4 124.2 36.7 124.3 37.9 120 39.8 113.6 39.8 108.9 43.2 111.3 41.7 114.9 40.8 115.8 41.3 114.9 41.9 115.5 43.8 118.5 44.1 119.5 43 120.2 44.1 114.6 46.5 113.9 46.4 113.8 45.5 115.6 44.7 112.9 44.9 109.3 47 110 48.4 106.3 49.1 108.1 49.1 106 49.2 105.1 51.1 104.5 50.5 104.9 51.6 104.1 52.8 103.7 50.8 103.7 51.9 103 51.8 103.7 52.1 104.3 54.4 98.7 58.6 99.9 63.1 99.6 64.8 98.3 64.1 97.1 60.9 95.9 59.9 94.9 60.4 93.6 59.6 90.8 59.7 90.8 60.7 89.8 60.9 86.2 60.3 83.4 61.7 82.6 62.6 82.1 67.6 83.7 70.7 85.6 71.9 88 71.3 89.2 70.7 89.7 69 92.9 68.5 91.1 74.1 95 74 96.6 74.7 96.2 78.9 98.6 81.2 100.4 80.4 103.2 81.4 105.1 78.9 106.6 78.8 108.2 77.6 108.9 77.9 108.1 78.6 108.3 80.9 109 80.1 108.6 79 109.8 78.6 110.1 77.8 111.8 79.4 115.1 79.9 118.1 79.3 117.3 79.6 117.6 80.1 119.2 80.6 119.3 81.4 120.9 82 122.9 84 126 84.2 128.7 85.8 130 88.3 129.6 90.1 131.4 90.2 131.4 91.2 132.2 90.6 135.1 91.6 135.4 92.7 140 92.9 142.8 94.8 144.4 95.1 145.3 97.3 144.9 99 141.3 103.1 140.7 107.9 139.1 111.9 138 113 135.4 113.4 132.4 114.9 131.5 115.9 131.1 118.7 126.2 124.4 123.8 124.9 121.6 123.9 123.2 126.9 122.3 128.2 120.8 128.7 117.7 128.8 117.9 130.7 117.3 131 114.9 131.1 115 132.1 116.5 132.6 114.8 133.5 114.4 135 112.7 135.6 112.4 136.3 114.4 137.2 114 138.1 110.9 140.7 111.8 142.3 109.2 142.9 109 143.8 105.1 142.3 104.4 138.7 105.9 136.9 104.4 136.6 105.6 134.1 106.8 134.5 107.3 132.4 106.6 132.1 106.3 133.4 105.7 133.2 106.8 129.3 106.4 127.2 108.6 122.4 109.8 109.8 109.6 108.3 108.5 107.4 104 104.6 100.2 97.2 98.8 96.1 98.6 94.7 100.2 92.7 99 92.2 99.1 91.1 99.9 89.2 101.1 88.6 102.9 86.2 101.8 81.7 100.4 81.1 99.5 81.9 100 82.5 99.1 82.8 98.9 82.2 96.5 81.6 95 79.9 94.9 80.4 94.3 80.1 94.3 78.9 92.5 76.7 88.8 76.1 85.3 73.8 83.4 74.3 76.5 71.7 74.5 70.1 74.7 68.6 74 67.2 70.7 64.4 70.7 63.6 67.8 61 66.1 58.4 65.2 58.2 65.3 59.8 70.6 66.6 70 67.2 67.8 65.3 67.7 64 64.9 62.3 65.8 61.4 64.5 60.4 62.7 57 59.4 55.4 55.6 49.7 56.1 44.5 55.3 41.8 56.9 42 57.4 42.9 57.2 41 52.6 39.2 52.1 37.7 50.9 37.2 45.9 31.9 32.9 29.1 31.8 29.3 32 30 28.3 30.8 29.4 28.7 26 30.6 26.7 31.1 25.8 31.9 21.6 34 15.2 35.6 22.3 32.4 23 31.1 18 31.3 18.1 30.4 16.2 30.2 13.9 28.5 15.4 26.9 19.2 26.2 18.5 25.6 19.2 25.2 15 25.6 11.9 24.3 15.5 23.4 18.3 23.9 13.2 21.6 18.1 19.7 23.4 18.6 43.5 21.1 50.2 19.8 50.9 20.2 51.9 19.5 54.2 20.5 55.6 19.8 55.7 20.6 58.5 20.2 64.8 21.1 66.1 21.6 64.7 22.1 70.1 22 71.1 22.6 72.2 22.1 71.2 21.7 71.8 21.3 73.8 21.2 78.5 22.4 81.6 22.2 81.4 21.6 82.3 21.4 83.9 21.8 83.9 22.7 85.8 20.9 83.5 19.9 83.6 18.8 84.8 18.1 87.1 18.7 88.5 19.8 87.6 20.3 89.5 20.5ZM65.8 16.9 65.3 17.3 68.9 17.5 70.1 17 71.8 18.3 72.3 17.9 71.6 16.9 73.5 16.9 74.6 17.3 75.5 19 78.9 20.4 77.3 20.5 77.6 21.2 74 20.8 66.7 21.5 63.9 20.8 62.7 20 67.6 19.6 62.1 19.5 61.6 19.1 63.9 18.7 60.6 18.4 62.1 17.3 65.8 16.9ZM75.5 16.6 74.6 17.2 73.1 16.5 75.5 16.6ZM103.7 16.9 100.5 17.3 99.1 16.7 101.9 16.3 103.7 16.9ZM93.4 16.8 94.2 17.5 95.1 16.7 97.7 16.2 99.4 17.3 99.3 17.9 102.2 17.3 105.9 18.7 107.8 18.4 112.1 19.9 113 20.8 111.2 21.3 118.1 23.1 116.1 25 113.3 23.6 112 23.7 111.9 24.3 114.7 25.6 115.3 26.6 115 27.3 111.2 26.3 113.8 28.1 109 27.1 105.2 25.3 102.3 25.8 101.4 25.4 102.1 24.7 106 24.5 105.7 24.2 107.3 22.7 107.1 22.3 101 19.8 98.7 20.3 91.3 19.6 90.5 19.2 91.5 18.8 90.1 18.8 89.8 17.8 91.6 16.5 94.2 16.2 93.4 16.8ZM79.6 16.2 82.6 16.2 81.9 17 83.5 17.4 83.3 18.3 80.7 18.6 77.5 17.5 79.6 17.3 78.5 16.6 79.6 16.2ZM323.6 16.8 319.9 16.6 322.1 16.1 323.6 16.8ZM86.8 17.2 84.6 17.9 84 16.6 85.5 15.9 89.5 16.1 86.8 17.2ZM59.5 18.6 56.9 19.1 54.1 18.1 56.1 16.3 55.1 15.7 62.4 15.8 64.5 16.5 60.8 17.5 59.5 18.6ZM86.4 15 83.2 15.1 85.1 14.4 86.4 15ZM325.1 14.4 324.3 15.2 319 15.4 317 14.7 318.8 13.9 325.1 14.4ZM81.5 13.3 82.3 13.7 81.8 15 77.5 14.4 77.4 13.7 81.5 13.3ZM71.8 13.8 74.1 14 73.7 15 66.3 15.6 68.2 14.8 62.3 14.8 64.6 13.5 70.9 14.5 69.5 13.6 70.4 13.2 71.8 13.8ZM237.5 19.3 231.6 18.5 232.4 17.2 234.4 16.4 233.5 16.3 235.9 15.4 235.6 14.9 241.2 13.7 248.9 13.5 238.5 15.7 235.4 17.6 235.6 18.5 237.5 19.3ZM85.3 12.9 88.4 13.2 90.8 14.4 98.9 14.3 100.2 15.1 91.8 15.6 87.6 15.2 86.1 13.7 82.9 13.2 85.3 12.9ZM63.8 12.4 62.9 13.5 57.1 13.9 60.9 12.5 63.8 12.4ZM287 13 294.1 14.2 289.4 15.8 293 16 293.5 16.7 295.6 16.2 303.2 17 303.3 16.3 307 16.4 308.6 17 309.1 17.6 308.5 18 311.3 19.2 312.3 18.2 319.9 18.5 319.1 17.6 320.5 17.2 329.5 17.8 333 19.2 339 19.1 339.8 19.5 339.7 20.3 340.9 20.6 347.8 20.4 349.6 21.3 350.8 21 350 20.3 350.5 19.9 358.6 20.6 360 21 360 25 357.4 25.4 359.5 27.4 353.7 28.3 350.3 30.1 348.9 29.4 343.5 30.1 342 31.8 343.2 32.4 343.1 33.8 342.1 33.9 341.7 34.7 342.1 35.1 340.4 35.7 340 36.8 338.5 37 338.2 38.1 336.8 39 335.4 34.6 335.9 33.2 336.8 32.2 338.4 31.9 343.7 28.9 344.5 27.4 340.1 29.5 339.3 28.2 336.7 28.6 334.2 30.2 335 30.9 331.3 31.2 331.3 30.5 329.8 30.3 322.2 31 315.1 35.3 318.2 36.2 319.9 35.8 321.3 36.9 321.4 37.8 320.1 41.6 318.2 43.7 314.9 46.6 313.5 47.2 312.3 46.7 307.5 50.2 309.5 53.2 309.1 54.9 306.5 55.6 306.1 53.3 306.9 53.1 304.7 51.9 305.3 50.4 304.3 50.1 301.1 51.1 302.2 49.6 301.6 49.1 298 50.8 297.5 51.3 298.9 52.6 302.4 52.5 302.5 53.1 301.1 53.3 299.2 55.1 300.2 55.6 301.9 58.3 301.3 59.3 302.1 60.2 301.7 61.8 298.7 65.5 295.9 67.2 290.8 68.6 290.4 69.7 289.9 69.7 289.9 68.6 288.5 68.3 285.9 70.2 285.7 70.9 288.9 74.7 289.3 76.6 289.2 78.3 285.2 81.4 285.1 80.1 283.5 79.4 282.6 77.8 280.8 77.4 281 76.6 280.1 76.6 279.2 80.8 283 84.5 284.2 88.7 281.4 87.2 280.1 83.5 278.5 81.6 278.3 82.2 278.8 78.6 277.2 73.1 275.4 74.3 274.2 74 274.3 71.8 271.4 67.2 270.5 67.2 270.3 68.2 267 68.5 266.5 69.8 262.2 73.4 260.3 74.1 259.9 79.6 257.5 82 253.5 74 252.6 68.6 250.5 69.1 249.2 67.9 249.3 67.2 246.4 64.6 241.5 64.9 237.4 64.3 236.5 62.9 234.7 63.5 231.5 62.1 230.1 59.9 228 60 230.8 65.2 231 64 231.6 64.2 231.8 66 234 65.9 236.4 63.6 236.8 65.8 238.7 66.4 239.8 67.7 237.8 69.8 237.7 71.1 235.3 72.8 232.4 73.6 232.2 74.4 228.7 76 223.5 77.4 222.6 73.2 219.1 68.7 218.5 66.3 214.6 61.9 214.9 60.5 213.9 62.4 212.4 60.1 215.7 66.1 215.5 66.9 216.9 68 217.5 71.4 219.3 74.1 223.3 77.6 222.7 78.3 224.6 79.6 231.1 78 231 79.4 227.7 85.8 220.3 92.6 219.2 94.7 218.8 96.5 219.4 96.8 219.2 98.5 220.5 100.8 220.8 104.7 219.5 106.7 214.8 109.8 215.6 113.7 212.6 115.7 212.2 118.8 208.2 122.8 205.8 123.9 202.6 123.9 199.6 124.8 198.4 124.1 198.2 121.7 195.2 117.1 194.3 112.1 191.8 108.1 191.8 105.8 193.7 100.7 191.9 95 188.8 91.1 189.8 86.9 189.4 86.3 188.5 85.2 185.9 85.7 184.3 83.7 181.9 83.9 178 85.3 175.4 84.8 172.5 85.7 171 85.2 167.6 82.7 165.2 79.1 163.4 77.8 162.4 75.3 163.5 73.9 163.9 71.9 163 68.1 165.6 63.7 170.4 60.1 170.7 57.4 173.1 55.9 174.1 54.2 177.8 54.8 181.5 53.4 189.5 52.6 191.1 53.1 190.3 56.2 199.1 59.7 200.1 59 200.1 57.8 201.5 57.2 208.9 59.1 211 58.4 213.8 59 216 55.4 216.2 53.3 212.5 53.9 207.6 53.3 206.3 51.8 206.8 51 206.2 50.5 207.3 49.6 208.8 49.5 209.2 48.8 211.1 48.9 213.5 48 218.3 49.1 220.4 49 221.7 48 216.7 44.8 219.1 42.7 215 43.7 216.3 44.9 213.9 45.6 212.5 44.7 213.3 43.9 210.7 43.4 208.8 45.1 207.7 47.4 208.8 48.9 206.4 49.8 204.9 49.1 203.7 49.3 204.4 49.9 203.9 50 202.6 49.7 204 52.3 203.1 52.1 203.2 53.6 202.5 53.6 199.4 49.7 199.5 48.3 193.1 44.3 192.3 44.6 192.6 45.9 198.5 49.8 196.9 49.6 196.4 50.2 197.1 51.1 196.1 52 195.4 50 188.9 45.6 186.5 46.9 183.1 46.9 183 48.1 180.8 49 179.7 50.7 180.1 51.3 177.9 53.3 175.6 53.3 174.6 54.1 173.5 53.1 171.1 53.1 171.2 51.7 170.5 51.3 171.2 49.2 170.6 47 172 46.3 178.1 46.6 178.6 46 178.8 44 175.5 42 175.4 41.3 178.4 41.4 178.1 40.2 179 40.7 181.3 39.9 181.6 39.1 183.8 38.4 184.7 36.9 188.1 36.5 188.8 36 188.1 34.5 188.5 32.9 190.6 32.3 190.3 33.1 190.9 33.5 189.7 34.5 190.9 36 192.5 35.5 194.1 36.2 197.6 35.1 199.7 35.6 201.3 34.8 201.6 32.6 202.5 32.2 204.1 33 204.4 31.6 203.3 30.8 209.1 30 208.1 29.5 202.9 30.2 201.3 29.3 201.5 26.8 205.4 24.9 203.9 24 202.2 24.3 201.2 25 201.4 25.6 197.8 27.3 197.1 28.7 198.8 29.9 196.8 31.3 195.9 33.9 192.9 34.6 190.4 30.5 188.4 31.7 185.7 31.4 185 28 190.5 25.5 194.8 22.2 199.2 20.2 203 19.8 204.5 19 208.2 18.8 211.3 19.5 210 19.8 211.1 20.4 212.1 20.1 220.3 22.1 221.1 23.2 220 23.7 213.2 23.4 214.8 24.1 214.9 25.6 217 26.2 216.5 25.2 217.2 24.9 219.6 25.5 220.4 25.2 219.8 24.5 222.1 23.5 223.9 23.9 224.5 23.2 223.5 21.4 226.3 21.7 226.8 22.3 225.6 22.4 225.6 23 226.3 23.3 233.7 21.1 234.5 21.2 233.5 21.8 238.8 21.1 239.9 21.7 241.1 21.1 240 20.5 240.6 20.1 248.5 21.9 249.2 21.4 246.9 20.5 246.7 19 249.2 17.2 252.6 17.2 251.8 18.6 252.8 19.6 252.6 21 253.7 21.6 251.3 23.7 252.4 23.8 255.1 22.2 254.5 21.7 254.9 21 253.6 20.4 254.4 19.4 253.1 18.6 254.9 17.9 254.7 17.2 255.7 17.7 255.3 18.7 256.4 18.8 255.9 18.1 257.6 17.7 261.5 18.2 260.5 16.4 266.8 16.1 266 15.5 267.2 14.9 280.8 13.6 284.4 12.3 286.1 12.6 284.7 12.9 287 13ZM204.7 12.1 200.7 12.3 201.4 12.1 200.8 11.7 202.9 11.5 204.7 12.1ZM84.2 11.9 81.9 11.9 81.4 11.1 84.2 11.9ZM79.9 11.7 74.8 11.6 75.8 11.3 74.5 10.7 79.9 11.7ZM285.1 11.7 279.4 12.1 282.1 10.7 285.4 11.3 285.1 11.7ZM198.3 10.3 201.5 11 199 11.4 197.1 13.2 195.9 13.2 193.8 12.6 194.7 12.3 190.4 10.3 198.3 10.3ZM205.4 9.6 207.4 9.9 203 10.6 197.4 9.7 205.4 9.6ZM231.1 9.5 227.6 10 224.8 9.4 231.1 9.5ZM279.9 11.1 275 11 271.2 9.7 275.9 8.7 280.2 10.2 279.9 11.1ZM93 10.3 94.2 10.7 89.2 11.8 87.1 11.7 86 11.2 86.9 10.6 83.3 9.8 85.3 8.8 87.6 8.7 93 10.3ZM111.5 6.9 118.1 7.6 112.3 8.5 114.5 8.5 108.8 10.2 103.1 10.7 104.5 10.8 103.8 11 104.6 11.5 100.2 12.8 102.1 13.2 99.4 13.8 90.5 13.5 90.4 13 92.2 12.8 91.7 12.1 95 12.5 92 11.6 94.9 10.7 93.1 9.7 98.2 9.5 92.4 9.5 88.4 8.1 100.7 6.9 111.5 6.9ZM152.9 6.5 159.2 7.3 148.6 8 157.1 7.9 157.9 8.3 156.8 8.8 164.2 8.1 167.8 8.7 160 9.8 162.3 9.9 160.3 11.2 160.3 12.4 161.5 13 158.3 13.4 160.2 13.9 160.4 14.8 159.3 14.8 160.6 15.7 158.4 15.8 159.6 16.2 159.2 16.5 156.4 16.7 157.7 17.8 155.2 17.7 157.9 18.5 158.2 19.3 156.5 19.5 154.5 18.6 154.8 19.2 153.6 19.8 157.7 19.9 152.3 21.5 148.2 21.9 145.8 23.3 140.2 24.5 138.8 26.5 137.2 27.3 137.6 28.1 136.6 29.9 131.7 29.1 128.4 26.4 126 22.8 127 21.6 128.5 21.3 129.1 20.1 125.3 20.4 125.6 19.2 128.6 19.4 124.2 18.3 125.3 17.4 121.4 14.5 111.5 13.9 108.6 13 113.2 12.6 106.7 12 114.3 10.6 114.7 10.2 112 9.9 117.8 8.7 117.3 8.2 129.6 7.6 135.5 8.3 133.2 7.4 136.6 6.8 152.9 6.5Z";
+let MAP_EXPAND = null;   // cluster key currently fanned out (click toggles)
+function toggleCluster(key){
+  MAP_EXPAND = (MAP_EXPAND === key) ? null : key;
+  if(LAST_DATA) render(LAST_DATA);
+}
+const STATUS_ORDER = {red:0, amber:1, grey:2, green:3};
+function worstStatus(sts){ return sts.reduce((a,b)=> STATUS_ORDER[b]<STATUS_ORDER[a]?b:a, "green"); }
+function statusFill(st){ return {green:"var(--green)",amber:"var(--amber)",red:"var(--red)"}[st]||"var(--grey)"; }
+function mapView(relays, statusOf, stale){
+  const placed = [], unplaced = [];
+  relays.forEach(r=>{
+    const p = r.placement || {};
+    (p.lat!=null && p.lon!=null ? placed : unplaced).push(r);
+  });
+  // Cluster by identical declared coordinates (same region/az relays share a
+  // seed coordinate, so co-location falls out of the declaration itself).
+  const clusters = {};
+  placed.forEach(r=>{
+    const key = r.placement.lat + "," + r.placement.lon;
+    (clusters[key] = clusters[key] || []).push(r);
+  });
+  let marks = "";
+  Object.entries(clusters).forEach(([key, members])=>{
+    const x = members[0].placement.lon + 180, y = 90 - members[0].placement.lat;
+    const st = worstStatus(members.map(m=>statusOf[m.name]));
+    const label = members[0].placement.place ? esc(members[0].placement.place).replace(/_/g," ") : esc(members[0].name);
+    if(members.length === 1){
+      const r = members[0];
+      marks += `<g onclick="openRelay('${esc(r.name)}')" style="cursor:pointer">
+        <title>${esc(r.name)} · ${label} · ${st}</title>
+        <circle cx="${x}" cy="${y}" r="2.6" fill="${statusFill(stale?"grey":st)}" stroke="var(--bg)" stroke-width="0.6"/>
+        <text x="${x}" y="${y-3.4}" text-anchor="middle" font-size="5" fill="var(--ink)" font-family="var(--mono)">${esc(r.name)}</text></g>`;
+    } else if(MAP_EXPAND === key){
+      // fanned out: members on a small ring, click a dot -> its detail
+      const R = 7;
+      marks += `<g><circle cx="${x}" cy="${y}" r="${R+3.4}" fill="rgba(0,0,0,.25)" stroke="var(--line)" stroke-width="0.4" onclick="toggleCluster('${key}')" style="cursor:pointer"><title>collapse</title></circle>`;
+      members.forEach((m,i)=>{
+        const a = (2*Math.PI*i)/members.length - Math.PI/2;
+        const mx = x + R*Math.cos(a), my = y + R*Math.sin(a);
+        marks += `<g onclick="openRelay('${esc(m.name)}')" style="cursor:pointer">
+          <title>${esc(m.name)} · ${statusOf[m.name]}</title>
+          <circle cx="${mx}" cy="${my}" r="2.4" fill="${statusFill(stale?"grey":statusOf[m.name])}" stroke="var(--bg)" stroke-width="0.6"/>
+          <text x="${mx}" y="${my-3.2}" text-anchor="middle" font-size="4.6" fill="var(--ink)" font-family="var(--mono)">${esc(m.name)}</text></g>`;
+      });
+      marks += `</g>`;
+    } else {
+      // cluster badge: ×N, worst-status color wins; click to fan out
+      marks += `<g onclick="toggleCluster('${key}')" style="cursor:pointer">
+        <title>${members.map(m=>m.name+" · "+statusOf[m.name]).join("\n")} (click to fan out)</title>
+        <circle cx="${x}" cy="${y}" r="4.4" fill="${statusFill(stale?"grey":st)}" stroke="var(--bg)" stroke-width="0.8"/>
+        <text x="${x}" y="${y+1.7}" text-anchor="middle" font-size="4.6" font-weight="700" fill="var(--bg)">×${members.length}</text>
+        <text x="${x}" y="${y-5.6}" text-anchor="middle" font-size="5" fill="var(--ink)" font-family="var(--mono)">${label}</text></g>`;
+    }
+  });
+  const tray = unplaced.length
+    ? `<div class="ovtray"><span class="note">unplaced — no declared <code>geo=</code> in relays.conf (coordinates are never inferred, ADR 1080):</span>
+        ${unplaced.map(r=>`<span class="chip-place" style="cursor:pointer" onclick="openRelay('${esc(r.name)}')">
+          <span class="sdot ${sdot(stale?"grey":statusOf[r.name])}" style="display:inline-block;margin-right:5px"></span>${esc(r.name)}</span>`).join(" ")}</div>`
+    : "";
+  return `<div class="mapwrap ${stale?'stale':''}">
+    <svg viewBox="0 0 360 180" preserveAspectRatio="xMidYMid meet" style="width:100%;display:block">
+      <rect x="0" y="0" width="360" height="180" fill="var(--panel)"/>
+      <path d="${WORLD_PATH}" fill="var(--panel2)" stroke="var(--line)" stroke-width="0.35"/>
+      ${marks}
+    </svg></div>${tray}`;
+}
+function viewToggle(view){
+  return `<div class="ovbar"><span class="note">click a relay for detail · levels: fleet → relay → peer → identity</span>
+    <div class="viewtog">
+      <button class="${view==='list'?'on':''}" onclick="setView('list')">list</button>
+      <button class="${view==='map'?'on':''}" onclick="setView('map')">map</button>
+    </div></div>`;
+}
+
+function overviewRow(r, st, stale, vant){
+  const d = r.deep || {};
+  const pw = d.peers_window_min || 5;
+  const peers = (d.peers_recent!=null) ? `${d.peers_recent} peers ≤${pw}m`
+              : (Array.isArray(d.peers) ? `${d.peers.length} peers` : "—");
+  const lat = r.lat_ms>=0 ? `${r.lat_ms} ms` : "—";
+  return `<div class="ovrow ${stale?'stale':''}" onclick="openRelay('${esc(r.name)}')"
+      title="open ${esc(r.name)} detail">
+    <span class="dot ${sdot(st)}"></span>
+    <span class="name">${esc(r.name)}</span>
+    <span class="gnet">${esc(r.goatnet||"")}</span>
+    ${placeChip(r)}
+    <span class="lat"><span class="sdot ${sdot(latSt(r.lat_ms))}"></span>${lat}
+      <span class="note" title="tcp-connect rtt from ${esc(vant)} → :443">rtt</span></span>
+    <span class="peers">${peers}</span>
+    <span class="ovspark">${ovSpark(r)}</span>
+  </div>`;
+}
+
+// ===================== site network hosts (host-net health) =====================
+// The site hosts (mgmt hosts) are the rathole tunnel ENDPOINTS — when a
+// host's uplink degrades, relays read "flapping" and the mesh loses its control
+// plane. This band surfaces exactly those metrics,
+// from the host's own vantage, with stored last-known state while it's dark.
+function hostAge(doc, now){ return Math.max(0, now - (doc.received_at||0)); }
+function hostStale(doc, now){
+  const iv = ((doc.host_net||{}).interval_s) || 60;
+  return hostAge(doc, now) > 3*iv;
+}
+// Per-group status: {st, note}. Thresholds are the RCA-derived degradation
+// signals; every threshold rides in the tooltip so a color is never unexplained.
+function wanSt(hn){
+  const w = hn.wan||{};
+  if(w.loss_pct==null) return {st:"grey", note:"loss unmeasured"};
+  if(w.loss_pct>=20 || (w.rtt_avg_ms!=null && w.rtt_avg_ms>400)) return {st:"red", note:"uplink failing"};
+  if(w.loss_pct>=5  || (w.rtt_avg_ms!=null && w.rtt_avg_ms>150)) return {st:"amber", note:"lossy/slow"};
+  return {st:"green", note:"clean"};
+}
+function tunSt(hn){
+  const t = hn.tunnels||{};
+  if(t.total==null) return {st:"grey", note:"unmeasured"};
+  if((t.active??0) < (t.total??0)) return {st:"red", note:"tunnel down"};
+  if((t.errs_15m??0) >= 30) return {st:"red", note:"flapping hard"};
+  if((t.errs_15m??0) >= 5)  return {st:"amber", note:"flapping"};
+  return {st:"green", note:"stable"};
+}
+function ctlSt(hn){
+  const c = hn.control||{};
+  if(c.signal_container==="down" || c.mgmt_container==="down") return {st:"red", note:"container down"};
+  // Health keys on BACKPRESSURE (outbound_full: the recipient IS connected but
+  // its receive queue is saturated) — the genuine signal-plane distress signal.
+  // notfound is deliberately NOT a health input: it counts offers to OFFLINE
+  // peers (retry overhead, not a fault — the dominant term in a mesh with many
+  // peers down), and its one real dysfunction case (cross-shard misses while
+  // federation is unhealthy) is owned by the federation band. Thresholds/min are
+  // provisional — calibrate to the observed healthy baseline. See
+  // relay-health-dashboard.md §"signal chip: offline-retry vs backpressure".
+  const bp = c.signal_backpressure_60s;
+  if(bp!=null && bp>=300) return {st:"red", note:"signal backpressure — recipient queues saturated"};
+  if(bp!=null && bp>=30)  return {st:"amber", note:"signal backpressure building"};
+  if(c.signal_container==null) return {st:"grey", note:"no mgmt plane here"};
+  return {st:"green", note:"normal"};
+}
+function meshSt(hn){
+  const m = hn.mesh||{};
+  // Node health is NOT derived from the connected-peer COUNT .
+  // peers_total is the full registered roster — mostly OFFLINE at any instant —
+  // so connected/total just tracks how many peers happen to be powered on, not
+  // this node's health or reachability. The old ratio (r<0.10 "dark", r<0.50
+  // "degraded") and the selfheal_wedged floor both false-alarmed on offline
+  // peers: a node can read 10% connected from offline peers alone while its
+  // relay-fronted services are fully reachable. Authoritative reachability = the relay
+  // front door (probed above) + the net-health reachability-canary (off-node;
+  // the correct F-261-class lockout detector — to be wired into this verdict).
+  // Peer count + self-heal wedge are shown as INFO annotations on the chip only,
+  // never a health color. The one real per-node signal here is control plane.
+  if(m.management && m.management!=="Connected")
+    return {st:"amber", note:"control plane not Connected ("+m.management+")"};
+  if(m.peers_total==null) return {st:"grey", note:"unmeasured"};
+  return {st:"green", note:"control plane up; "+(m.peers_connected||0)+"/"+m.peers_total+" self-reported peers (a peer count is not a health measure)"};
+}
+function sysSt(hn){
+  const s = hn.sys||{};
+  if(s.disk_pct==null) return {st:"grey", note:"unmeasured"};
+  if(s.disk_pct>=95) return {st:"red", note:"disk critical"};
+  if(s.disk_pct>=85) return {st:"amber", note:"disk high"};
+  return {st:"green", note:"nominal"};
+}
+function hostStatus(doc, now){
+  if(hostStale(doc, now)) return "grey";      // not reporting — honest unknown, never a guessed red
+  const hn = doc.host_net||{};
+  return worstStatus([wanSt(hn).st, tunSt(hn).st, ctlSt(hn).st, meshSt(hn).st, sysSt(hn).st]);
+}
+function pct(n){ return n==null ? "—" : (+n).toFixed(0)+"%"; }
+function ms(n){ return n==null ? "—" : (+n)<10 ? (+n).toFixed(1)+" ms" : Math.round(+n)+" ms"; }
+function cnt(n){ return n==null ? "—" : String(n); }
+// netbird self-heal restart chip + its cross-boot HISTORY. The chip
+// shows this-boot count (selfheal_restart_total); the tooltip lists the recent
+// restart TIMELINE (selfheal_restart_history = [[unixtime,connected,total],…],
+// newest last) so "how often is this node self-healing" is answerable, not just
+// "did it restart this boot". Nothing when the node has never self-healed.
+function healChip(m){
+  const tot = m.selfheal_restart_total;
+  const hist = Array.isArray(m.selfheal_restart_history) ? m.selfheal_restart_history : [];
+  if(!(tot>0) && hist.length===0) return "";
+  let tip = "netbird self-heal restarts this boot.";
+  if(hist.length){
+    const lines = hist.slice(-8).reverse().map(e=>{
+      const t=e[0], c=e[1], tt=e[2];
+      return `  ${ago(Date.now()/1000 - t)} ago — restarted at ${c}/${tt} peers`;
+    }).join("\n");
+    tip += `\nrecent self-heal restarts (newest first):\n${lines}`;
+  }
+  const n = (tot>0)?tot:hist.length;
+  return `<span class="heal" title="${esc(tip)}">· ${cnt(n)} self-heal↻${hist.length>1?` <span class="cdim">(${hist.length} logged)</span>`:''}</span>`;
+}
+// Condensed band row (level 1): the collapsed view — status + the four
+// degradation-relevant numbers + report age. Click -> host page.
+function hostRow(doc, now){
+  const hn = doc.host_net||{}, w = hn.wan||{}, t = hn.tunnels||{}, c = hn.control||{}, m = hn.mesh||{};
+  const stale = hostStale(doc, now), age = hostAge(doc, now);
+  const st = hostStatus(doc, now);
+  const nf = (c.signal_msgs_60s>=1 && c.signal_notfound_60s!=null) ? Math.round(100*c.signal_notfound_60s/c.signal_msgs_60s) : null;
+  const ageHtml = stale
+    ? `<span class="hage bad" title="no report for ${ago(age)} — host down or unreachable; values below are its LAST report">NOT REPORTING · last ${ago(age)} ago</span>`
+    : `<span class="hage">reported ${ago(age)} ago</span>`;
+  return `<div class="hostrow ${stale?'stale':''}" onclick="openHost('${esc(hn.host||doc.host)}')" title="open ${esc(hn.host||doc.host)} host-network detail">
+    <span class="dot ${sdot(st)}"></span>
+    <span class="name">${esc(hn.host||doc.host)}</span>
+    <span class="gnet">${esc(hn.goatnet||"")}</span>
+    <span class="hchip" title="uplink packet loss / rtt avg, ${esc(w.sent||'?')} pings → ${esc(w.ping_target||'?')} from the host (loss ≥5% amber, ≥20% red — loss is what kills the tunnels)"><span class="sdot ${sdot(stale?'grey':wanSt(hn).st)}"></span>uplink <b>${pct(w.loss_pct)}</b> loss · <b>${ms(w.rtt_avg_ms)}</b></span>
+    <span class="hchip" title="rathole tunnels active/total · client WARN/ERROR count last 15m (≥5 amber, ≥30 red — the relay-side FLAPPING you see is these tunnels dropping)"><span class="sdot ${sdot(stale?'grey':tunSt(hn).st)}"></span>tunnels <b>${cnt(t.active)}/${cnt(t.total)}</b> · <b>${cnt(t.errs_15m)}</b> errs</span>
+    ${c.signal_msgs_60s!=null ? `<span class="hchip" title="signal activity/min. 'offline-retry' = share of offers whose recipient is OFFLINE (not on the mesh right now) — expected overhead in a mesh with peers down, NOT a fault, so it does not color this chip. 'backpressure' = recipient present but its receive queue is saturated (the real signal-plane distress) — that drives the color. Cross-shard delivery health lives in the federation band."><span class="sdot ${sdot(stale?'grey':ctlSt(hn).st)}"></span>signal <b>${cnt(c.signal_msgs_60s)}</b>/min${nf==null?'':` · <span class="cdim">${nf}% offline-retry</span>`}${(c.signal_backpressure_60s)?` · <b>${cnt(c.signal_backpressure_60s)}</b> backpressure`:''}</span>` : ""}
+    <span class="hchip" title="${esc(stale?'this host\'s own netbird peer view':meshSt(hn).note)}"><span class="sdot ${sdot(stale?'grey':meshSt(hn).st)}"></span>mesh <b>${cnt(m.peers_connected)}/${cnt(m.peers_total)}</b>${(!stale && m.selfheal_wedged===1)?'<span class="wbadge" title="self-reported low connected-peer count with the control plane up (self-heal engaged, F-261). INFORMATIONAL only — a peer count is not a reachability measure; relay-fronted services can be fully reachable at a low count. Verify via the relay front door / reachability probe.">low-peers?</span>':''}${healChip(m)}</span>
+    ${hostRowSpark(hn)}
+    ${ageHtml}
+  </div>`;
+}
+function hostRowSpark(hn){
+  const hist = hn.history||[], i = hn.iface||{};
+  // L0 throughput number (visible before drill-down). Lead with measured
+  // CAPACITY (Mbps — what the link can do) when the capacity probe has run;
+  // else fall back to peak USAGE, then current rate. Matches the host card.
+  const cap = hn.capacity && hn.capacity.mesh && hn.capacity.mesh.down_bps;
+  const havePeak = (i.rx_bps_peak!=null || i.tx_bps_peak!=null);
+  const num = (cap!=null)
+    ? `<span class="note">${mbps(cap)} <span class="cdim">cap</span></span>`
+    : havePeak
+    ? `<span class="note">${bps(Math.max(i.rx_bps_peak||0, i.tx_bps_peak||0))} <span class="cdim">peak</span></span>`
+    : (i.rx_bps!=null ? `<span class="note">${bps(Math.max(i.rx_bps||0, i.tx_bps||0))}</span>` : "");
+  if(hist.length<2) return num ? `<span class="ovspark">${num}</span>` : "";
+  const W=110,H=22; let maxv=1; hist.forEach(p=>{maxv=Math.max(maxv,p[1]||0,p[2]||0);});
+  const vals = hist.map(p=>Math.max(p[1]||0,p[2]||0));
+  return `<span class="ovspark" title="host uplink rate (dominant direction), last ${hist.length} samples · number = peak of the busier direction"><svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:${H}px">
+    <polyline fill="none" stroke="var(--blue)" stroke-width="1.2" points="${sparkPath(vals,W,H,maxv)}"/></svg>${num}</span>`;
+}
+function hostsBand(now){
+  const names = Object.keys(HOSTS);
+  if(!names.length) return "";
+  const rows = names.sort().map(n=>hostRow(HOSTS[n], now)).join("");
+  return `<div class="hostband-h"><h3>site network hosts</h3>
+    <span class="note">rathole tunnel endpoints — each self-reports its uplink/tunnel/control-plane health; last-known state persists here when a host is dark</span></div>${rows}`;
+}
+// ---- test-peer perspective band (newcomer journey), same grammar as hosts ----
+function peerRow(doc, now){
+  const j = doc.journey||{};
+  const stale = peerStale(doc, now), age = peerAge(doc, now);
+  const st = stale ? 'grey' : (doc.overall||'grey');
+  const ageHtml = stale
+    ? `<span class="hage bad" title="no report for ${ago(age)} — this canary is down; values below are its LAST report">NOT REPORTING · last ${ago(age)} ago</span>`
+    : `<span class="hage">reported ${ago(age)} ago</span>`;
+  const dim = (label, d, tip) => `<span class="hchip" title="${esc(tip)}"><span class="sdot ${sdot(stale?'grey':((d&&d.st)||'grey'))}"></span>${label} <b>${esc((d&&d.detail)||(d&&d.st)||'—')}</b></span>`;
+  return `<div class="hostrow ${stale?'stale':''}" title="${esc(doc.peer||'')} — a test peer's lived view of the mesh from outside">
+    <span class="dot ${sdot(st)}"></span>
+    <span class="name">${esc(doc.peer||'?')}</span>
+    <span class="gnet">${esc(doc.vantage||doc.goatnet||'')}</span>
+    ${dim('door', j.front_door, 'raw TCP+TLS to the relay public :443 from OUTSIDE the mesh — the front-door reachability a locked-out user shares; needs no enrollment, the primary external signal')}
+    ${dim('signal', j.signal, 'reached the signal server and exchanged an offer — the step that fails when signal is wedged')}
+    ${dim('mgmt', j.management, 'management server reachable/healthy from this peer')}
+    ${dim('name', j.name_service, 'resolved a mesh hostname via CoreDNS')}
+    ${dim('service', j.data_plane, 'WireGuard up + a real service round-trip (e.g. isitup returns 200)')}
+    ${doc.implication ? `<span class="pimpl" title="what a real user in this position would experience">${esc(doc.implication)}</span>` : ""}
+    ${ageHtml}
+  </div>`;
+}
+function peersBand(now){
+  const names = Object.keys(PEERS);
+  if(!names.length) return "";
+  const rows = names.sort().map(n=>peerRow(PEERS[n], now)).join("");
+  return `<div class="hostband-h"><h3>test peers — the network as a newcomer sees it</h3>
+    <span class="note">off-site canaries each try the newcomer journey (signal · management · name · service); red here means a real peer in that spot can't get on — the "is it me, or the network?" answer at the peer altitude</span></div>${rows}`;
+}
+// ---- federation band: cross-node signal transport health (ADR 1085 / F-256) --
+// Its own category because federation is a CROSS-node fact — no single host card
+// can show it. A peer present on signal server A can only exchange offers with a
+// peer on server B via federation, whose transport can be the fragile node-to-node
+// mesh (primary) or the partition-independent relay path (backup). This band
+// reads each node's federation-proxy leg + its live signal-stream count and
+// tells the operator the one thing the host cards can't: is cross-shard
+// signaling healthy, is failover ready, and how is live signal split across
+// nodes. Only appears where ≥1 host runs the proxy (multi-node signal goatnets).
+// mode (ADR 1107): "active-active" = split-across-nodes is the ideal; "loose-site"/
+// "single" = each site homes its own peers, so a severed cross-site leg is island-
+// mode (not a severed fabric) and a missing backup is lower-criticality.
+function fedSt(f, loose){
+  if(!f || f.leg==null) return {st:"grey", note:"no federation on this node"};
+  if(f.leg==="down")   return loose
+    ? {st:"amber", note:"cross-site transport down — this site keeps serving its OWN peers (island-mode); only connections BETWEEN sites stall, until the link heals"}
+    : {st:"red",   note:"transport SEVERED — mesh primary down and no relay backup up"};
+  if(f.leg==="backup") return {st:"amber", note:"on the relay-backup leg — mesh primary flapped, failover carrying"};
+  if((f.backup_ready||0)===0) return loose
+    ? {st:"grey",  note:"mesh primary up; no relay backup leg ready — cross-site path only, lower criticality in loose federation"}
+    : {st:"amber", note:"mesh primary up but NO backup leg ready — a flap would sever"};
+  return {st:"green", note:"mesh primary, relay backup ready"};
+}
+function fedRow(name, f, crossnode, loose){
+  const s = fedSt(f, loose);
+  const streamsTitle = loose
+    ? "live signal streams homed on this node. In loose federation each site homes its OWN peers — single-homing per site is the design, not a split to rebalance."
+    : "live signal streams homed on this node (signal connected_peers). Compare across nodes: this is the active-active split. All on one node = active-passive in practice (sticky long-lived streams).";
+  const legLabel = f.leg==="mesh" ? "MESH primary" : f.leg==="backup" ? "RELAY backup" : f.leg==="down" ? "SEVERED" : "—";
+  return `<div class="hostrow" title="${esc(name)} — cross-node signal federation from this node's federation-proxy">
+    <span class="dot ${sdot(s.st)}"></span>
+    <span class="name">${esc(name)}</span>
+    <span class="hchip" title="which bearer carries THIS node's cross-shard offers to its peer right now: mesh = node-to-node WireGuard (fast, dies with a node-to-node partition); relay = public path via the relay fleet (survives that partition — the F-256 fix). Failover mesh→relay takes ~4s of health checks."><span class="sdot ${sdot(s.st)}"></span>leg <b>${legLabel}</b></span>
+    <span class="hchip" title="relay backup legs health-checked UP right now = failover depth if the mesh primary drops. 0 while on mesh = a flap would have nowhere to go."><span class="sdot ${sdot((f.backup_ready||0)>0?'green':'amber')}"></span>backup <b>${cnt(f.backup_ready)}</b> ready</span>
+    <span class="hchip" title="${streamsTitle}"><span class="sdot ${sdot(f.signal_streams>0?'green':'grey')}"></span>signal <b>${cnt(f.signal_streams)}</b> streams</span>
+    <span class="hchip" title="cross-shard offers this node FORWARDED to its peer in the last publish window — federation actually delivering, not merely reachable"><span class="sdot d-grey"></span>fwd <b>${f.fwd_60s==null?'—':f.fwd_60s+'/min'}</b></span>
+    ${crossnode ? `<span class="hchip" title="measured node-to-node mesh-leg capacity (the federation PRIMARY transport) — short iperf3, hourly. The relay-backup leg's capacity is the relay-path measurement."><span class="sdot d-grey"></span>mesh link <b>${mbps(crossnode.down_bps)}</b></span>` : ""}
+  </div>`;
+}
+function federationBand(now){
+  const parts = Object.keys(HOSTS).map(n=>{
+    const hn = HOSTS[n].host_net||{};
+    return {name: hn.host||n, f: hn.federation||null, cap: hn.capacity||null};
+  }).filter(p => p.f && (p.f.leg!=null || p.f.signal_streams!=null));
+  if(!parts.length) return "";
+  parts.sort((a,b)=>a.name.localeCompare(b.name));
+  const legs = parts.map(p=>p.f.leg);
+  const streams = parts.map(p=>p.f.signal_streams||0);
+  const totStreams = streams.reduce((a,b)=>a+b,0);
+  // Federation MODE (ADR 1107) — grade against what this goatnet's federation is
+  // MEANT to be, not against active-active by assumption. loose-site/single: each
+  // site homes its own peers, so single-homing is the DESIGN (not active-passive)
+  // and a cross-site cut is island-mode (not a severed fabric).
+  const fmode = parts.map(p=>p.f && p.f.mode).find(Boolean) || "active-active";
+  const loose = (fmode==="loose-site" || fmode==="single");
+  let vst, vh, vt;
+  if(legs.includes("down")){
+    if(loose){ vst="amber"; vh="Cross-site path down — sites serving locally";
+      vt="A node's cross-site signal transport has no path right now. In a loosely-federated goatnet this is island-mode, NOT an outage: each site keeps matchmaking its own peers; only connections BETWEEN sites stall, and they resume when the link heals. This is not the active-active sharding failure."; }
+    else { vst="red"; vh="Federation severed";
+      vt="A node's cross-shard transport has no path — mesh primary down and no relay backup up. Peers on different signal servers can't exchange offers; the mesh will shard into islands (the F-256 failure mode)."; }
+  }
+  else if(legs.includes("backup")){ vst="amber"; vh="Failover leg carrying";
+    vt="A node's mesh primary flapped and cross-shard signaling is riding the relay-backup leg — working exactly as the F-256 fix intends (partition-independent), at higher latency. It self-recovers to the mesh primary when the node-to-node link heals."; }
+  else if(fmode==="single"){ vst="green"; vh="Single-signal by design";
+    vt=`This goatnet runs ONE signal node by design; ${totStreams} live streams are homed on it. There is no cross-shard federation to fail — no split, no forwarding dependency — so a lone node reporting here is healthy, not a missing peer. A second node can be stood up as a loosely-federated site without changing this being green.`; }
+  else if(parts.length<2){
+    if(loose){ vst="grey"; vh="One site reporting";
+      vt="Only one site is publishing to this ingest, so the other site's federation health can't be seen from here. In loose federation each site is independently healthy — this greys the cross-site view, it is not itself a fault."; }
+    else { vst="grey"; vh="Single federation node reporting";
+      vt="Only one federation node is reporting, so cross-node health can't be assessed here. On a two-node goatnet this means the peer node is dark or not publishing to this ingest."; }
+  }
+  else if(loose){ vst="green"; vh="Loose federation healthy";
+    vt=`Each site homes its own signal (streams ${streams.join(" / ")} across ${parts.length} sites) with the cross-site path up. Signal is deliberately NOT split hot across sites — single-homing per site is the design, not active-passive to rebalance. Cross-site offers forward on demand; a link cut degrades to island-mode, not an outage.`; }
+  else if(streams.filter(x=>x>0).length<=1){ vst="amber"; vh="Signal single-homed in practice";
+    vt=`All ${totStreams} live signal streams are homed on one node — the fabric is running active-passive right now (signal streams are sticky and long-lived, so they stay put after a rebalance). Active-active is configured and both legs are healthy; peers re-home to the other node on their next reconnect. No action needed unless it persists.`; }
+  else { vst="green"; vh="Active-active healthy";
+    vt=`Both signal nodes are on the mesh-primary leg with a relay backup ready, and ${totStreams} live streams are split across the fabric. A node-to-node partition fails cross-shard signaling over to the relays automatically — the healer no longer rides the patient.`; }
+  const crossnode = (parts.map(p=>p.cap && p.cap.crossnode).find(Boolean)) || null;
+  const rows = parts.map(p=>fedRow(p.name, p.f, crossnode, loose)).join("");
+  const sub = loose
+    ? "how each site homes its own peers and whether the cross-site path is ready (ADR 1107): single-homing per site is by design — a cross-site cut is island-mode, not an outage"
+    : "how peers on different signal servers reach each other (ADR 1085 · F-256): which transport carries cross-shard offers, whether failover is ready, and how live signal is split across nodes";
+  return `<div class="hostband-h"><h3>federation — cross-node signal health</h3>
+    <span class="note">${sub}</span></div>
+    <div class="netverdict nv-${vst}" style="margin:8px 0 4px"><span class="vdot"></span><div><div class="vh">${esc(vh)}</div><div class="vt">${esc(vt)}</div></div></div>
+    ${rows}`;
+}
+// ---- level 2: one host, metric-group cards (each drills to history) ----
+const HOST_CARDS = [
+  {key:"wan",     title:"wan uplink"},
+  {key:"tunnels", title:"rathole tunnels"},
+  {key:"control", title:"control plane"},
+  {key:"mesh",    title:"mesh (own view)"},
+  {key:"sys",     title:"system"},
+];
+function kv(k,v,tip){ return `<div class="kv" ${tip?`title="${esc(tip)}"`:""}><span class="k">${k}</span><span class="v">${v}</span></div>`; }
+// rate in/out: lead with the PEAK (the "up to N Mbps" a speed test shows) and
+// keep the 60s AVG as context. host-net-ratesample.sh feeds rx/tx_bps_peak;
+// hosts not yet running it (peak absent) fall back to the plain avg display.
+// Compact, scannable: busier direction only — peak then avg — so it reads as
+// one clean line instead of four slashed numbers. The in/out split lives in the
+// row's tooltip.
+function rateInOut(i){
+  const havePeak = (i.rx_bps_peak!=null || i.tx_bps_peak!=null);
+  if(!havePeak && i.rx_bps==null) return "—";
+  const peak = havePeak ? Math.max(i.rx_bps_peak||0, i.tx_bps_peak||0) : Math.max(i.rx_bps||0, i.tx_bps||0);
+  const avg  = Math.max(i.rx_bps||0, i.tx_bps||0);
+  return `<b>${bps(peak)}</b> <span class="cdim">peak</span> · ${bps(avg)} <span class="cdim">avg ${i.peak_window_s||60}s</span>`;
+}
+function hostCardBody(key, hn){
+  const w=hn.wan||{}, t=hn.tunnels||{}, c=hn.control||{}, m=hn.mesh||{}, s=hn.sys||{}, l=hn.lan||{}, i=hn.iface||{};
+  switch(key){
+    case "wan": return kv("packet loss", `<b>${pct(w.loss_pct)}</b> of ${cnt(w.sent)} pings`, "to "+(w.ping_target||"?")+" from the host — bursty loss kills long-lived TCP (tunnels) regardless of bandwidth")
+      + kv("rtt", `${ms(w.rtt_avg_ms)} <span class="note">(${ms(w.rtt_min_ms)}–${ms(w.rtt_max_ms)})</span>`)
+      + kv("jitter", ms(w.jitter_ms))
+      + kv("capacity", capacityLine(hn), "measured link capacity — a short iperf3 speed test to "+((hn.capacity||{}).target||"a mesh target")+", run hourly + on demand. What the link CAN do (Mbps). This is the throughput-health metric; the usage line below is how much is actually flowing now.")
+      + kv("usage now", rateInOut(i), "actual traffic on the iface (busier direction, bytes/s — not capacity). in/out avg now: ↓ "+bps(i.rx_bps)+" ↑ "+bps(i.tx_bps)+". peak = highest 1s rate over the last "+((i.peak_window_s||60))+"s; avg = bytes ÷ that window. A mostly-idle fast link reads LOW here and high on capacity above.")
+      + kv("public ip", esc(w.public_ip||"—"), "the site egress — if this changes, the uplink itself changed")
+      + kv("lan", `${esc(l.ip||"—")} via ${esc(l.gw||"—")} · gw ${ms(l.gw_rtt_ms)}`);
+    case "tunnels": {
+      const by = t.errs_by_relay||{};
+      const bys = Object.keys(by).sort().map(r=>`${esc(r)}:${by[r]}`).join(" · ") || "—";
+      return kv("active", `<b>${cnt(t.active)}/${cnt(t.total)}</b> units`)
+        + kv("errors 15m", `<b>${cnt(t.errs_15m)}</b>`, "rathole-client WARN/ERROR — every drop kills the mgmt/signal fronting riding that tunnel")
+        + kv("by relay", bys);
+    }
+    case "control": {
+      const nf = (c.signal_msgs_60s>=1 && c.signal_notfound_60s!=null) ? Math.round(100*c.signal_notfound_60s/c.signal_msgs_60s) : null;
+      return kv("signal container", c.signal_container==null?"— (not this host)":esc(c.signal_container))
+        + kv("mgmt container", c.mgmt_container==null?"—":esc(c.mgmt_container))
+        + kv("signal rate", `${bps(c.signal_rx_bps)} in / ${bps(c.signal_tx_bps)} out`, "a signal server forwards what it receives — sustained in≫out = storm of undeliverable retries")
+        + kv("messages", `${cnt(c.signal_msgs_60s)}/min`, "logged signal relay activity per minute")
+        + kv("offline-retry", nf==null?"—":`<b>${nf}%</b>`, "share of offers whose recipient is OFFLINE (absent locally AND across federation) = signal-server 'notfound'. This is retry overhead to peers that aren't on the mesh right now — inefficiency, NOT a fault, and NOT counted toward signal health. Its one dysfunction case (cross-shard misses while federation is down) is surfaced by the federation band.")
+        + kv("backpressure", c.signal_backpressure_60s==null?"—":`<b>${cnt(c.signal_backpressure_60s)}</b>/min`, "signal 'outbound_full': the recipient IS connected but its receive queue is saturated. THIS is the real signal-plane distress signal (recipient can't keep up), and it — not offline-retry — colors control-plane health.");
+    }
+    case "mesh": return kv("management", esc(m.management||"—"))
+      + kv("peers", `<b>${cnt(m.peers_connected)}/${cnt(m.peers_total)}</b> connected`, "this host's own netbird view — collapses when signaling breaks");
+    case "sys": return kv("load 1m", cnt(s.load1)) + kv("memory", pct(s.mem_pct)) + kv("disk /", pct(s.disk_pct))
+      + kv("uptime", s.uptime_s!=null ? ago(s.uptime_s) : "—", "a shared uptime step across site hosts = a site power event");
+  }
+  return "";
+}
+function hostCardSt(key, hn){ return {wan:wanSt, tunnels:tunSt, control:ctlSt, mesh:meshSt, sys:sysSt}[key](hn); }
+function staleBanner(doc, now){
+  if(!hostStale(doc, now)) return "";
+  return `<div class="stalebanner"><b>NOT REPORTING for ${ago(hostAge(doc,now))}</b> — the host is down or its uplink can't reach this ingest.
+    Everything below is its <b>last stored report</b> (${new Date((doc.received_at||0)*1000).toLocaleString()}), kept precisely for this moment.</div>`;
+}
+function hostPage(doc, now){
+  const hn = doc.host_net||{};
+  const cards = HOST_CARDS.map(cd=>{
+    const st = hostStale(doc,now) ? {st:"grey",note:"last known"} : hostCardSt(cd.key, hn);
+    return `<div class="hcard" onclick="openHostCard('${esc(hn.host)}','${cd.key}')">
+      <h4><span class="sdot ${sdot(st.st)}"></span>${cd.title} <span class="note">· ${esc(st.note)}</span></h4>
+      ${hostCardBody(cd.key, hn)}
+      <div class="drill">click for history →</div>
+    </div>`;
+  }).join("");
+  return staleBanner(doc, now) + `<div class="hgrid">${cards}</div>`;
+}
+// ---- level 3: one metric group's history (h/d/w tiers from the ingest) ----
+const CARD_SERIES = {   // which stored columns each card charts: [label, col, color, fmt]
+  wan:     [["packet loss %","loss","var(--red)",pct],["rtt avg ms","rtt","var(--amber)",ms],["uplink in B/s","rx","var(--blue)",bps],["uplink out B/s","tx","var(--amber)",bps]],
+  tunnels: [["tunnel errors (15m window)","tun_errs","var(--red)",cnt]],
+  control: [["signal in B/s","sig_rx","var(--blue)",bps],["signal out B/s","sig_tx","var(--amber)",bps],["signal msgs/min","sig_msgs","var(--blue)",cnt],["signal offline-retry/min","sig_nf","var(--dim)",cnt]],
+  mesh:    [["peers connected","peers","var(--green)",cnt]],
+  sys:     [],
+};
+function bigChart(label, rows, col, color, fmt, tierLabel, metrics){
+  const ci = (metrics||HOST_SERIES_METRICS).indexOf(col)+1;
+  if(ci<=0 || !rows || rows.length<2) return `<div class="bigchart"><h4>${label} · ${tierLabel}</h4><div class="none" style="color:var(--faint);font-size:12px">collecting — needs 2+ stored samples in this window</div></div>`;
+  const W=640,H=80, vals=rows.map(r=>+r[ci]||0), maxv=Math.max(1,...vals);
+  const t0=rows[0][0], t1=rows[rows.length-1][0];
+  const fmtT = t=>new Date(t*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+  return `<div class="bigchart"><h4>${label} · ${tierLabel}</h4>
+    <div class="spark-wrap">
+      <div class="spark-y"><span>${fmt(maxv)}</span><span>0</span></div>
+      <svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:${H}px">
+        <line x1="0" y1="${H-0.5}" x2="${W}" y2="${H-0.5}" stroke="var(--line)" stroke-width="1"/>
+        <polyline fill="none" stroke="${color}" stroke-width="1.5" points="${sparkPath(vals,W,H,maxv)}"/>
+      </svg>
+    </div>
+    <div class="note" style="margin-top:3px">${fmtT(t0)} → ${fmtT(t1)} · ${rows.length} buckets · latest <b>${fmt(vals[vals.length-1])}</b> · peak <b>${fmt(maxv)}</b></div>
+  </div>`;
+}
+function hostCardHistoryPage(doc, now, cardKey){
+  const hn = doc.host_net||{};
+  const S = HOST_SERIES[hn.host] || {};
+  const specs = CARD_SERIES[cardKey] || [];
+  const tiers = [["last hour · 1-min buckets","h"],["last 24 h · 15-min buckets","d"],["last 7 days · 2-h buckets","w"]];
+  let out = staleBanner(doc, now);
+  if(!specs.length) out += `<div class="note">no stored history for this group (current values only — see the host page)</div>`;
+  specs.forEach(([label,col,color,fmt])=>{
+    tiers.forEach(([tl,tk])=>{ out += bigChart(label, S[tk], col, color, fmt, tl); });
+  });
+  return `<div style="display:flex;flex-direction:column;gap:12px">${out}</div>`;
+}
+
+// ===================== zenoh router service health =====================
+// The router can wedge in ways its container HEALTHCHECK can't see: the transport
+// accept path seizes while REST + established sessions keep flowing (new-session
+// opens stall to the 10s timeout; CLOSE-WAIT climbs unbounded — F-253). This band
+// surfaces exactly the signals that catch it — a real mTLS new-session OPEN, the
+// CLOSE-WAIT count, FD headroom — from the site host's vantage, with stored
+// last-known state + h/d/w history that survives the router restarting. Same
+// drill-down grammar as the site-host band: row → metric-group cards → history.
+function mb(n){ return n==null ? "—" : (+n>=1024 ? (+n/1024).toFixed(1)+" GB" : Math.round(+n)+" MB"); }
+function zenohAge(doc, now){ return Math.max(0, now - (doc.received_at||0)); }
+function zenohStale(doc, now){
+  const iv = ((doc.zenoh||{}).interval_s) || 30;
+  return zenohAge(doc, now) > 3*iv;
+}
+// Per-group status: {st, note}. Thresholds come from FD exhaustion and accept-loop stall behaviour;
+// every threshold rides in the tooltip so a color is never unexplained. Only the
+// four HEALTH groups (container/admission/wedge/capacity) drive the router dot;
+// sessions is informational and crypto is posture (graded, not a health input).
+function zContainerSt(z){
+  const c = z.container||{};
+  if(c.oom===true) return {st:"red", note:"OOMKilled"};
+  if(c.running===false) return {st:"red", note:"stopped"};
+  if(c.health==="unhealthy") return {st:"red", note:"container unhealthy"};
+  if(c.health==="starting") return {st:"amber", note:"starting"};
+  if(c.health==="healthy") return {st:"green", note:"healthy"};
+  if(c.running==null) return {st:"grey", note:"unmeasured"};
+  return {st:"grey", note:"no healthcheck"};   // running but no HEALTHCHECK verdict
+}
+function zAdmissionSt(z){
+  const a = z.admission||{};
+  if(a.rest_ok===false) return {st:"red", note:"REST adminspace stalled"};
+  if(a.open_ok===false) return {st:"red", note:"new-session open FAILED — seizure"};
+  if(a.open_ms!=null && a.open_ms>=10000) return {st:"red", note:"opens stalling to timeout — seizure"};
+  if(a.open_ms!=null && a.open_ms>=2000) return {st:"amber", note:"new-session opens slow"};
+  if(a.open_ms!=null) return {st:"green", note:"opens fast"};
+  // open probe not run (no client cert): REST alone CANNOT confirm admission —
+  // F-253 wedged the transport while REST answered. Honest grey, never a green.
+  if(a.rest_ms!=null && a.rest_ms>=15000) return {st:"red", note:"REST stalled"};
+  if(a.rest_ms!=null && a.rest_ms>=5000) return {st:"amber", note:"REST slow"};
+  if(a.rest_ms!=null) return {st:"grey", note:"open unmeasured — REST ok but can't confirm admission (deploy probe cert)"};
+  return {st:"grey", note:"unmeasured"};
+}
+function zWedgeSt(z){
+  const w = z.wedge||{};
+  if(w.close_wait==null) return {st:"grey", note:"unmeasured"};
+  if(w.close_wait>=200) return {st:"red", note:"CLOSE-WAIT pileup — wedge building"};
+  if(w.close_wait>=25)  return {st:"amber", note:"CLOSE-WAIT climbing"};
+  return {st:"green", note:"0 leaked / nominal"};
+}
+function zSessionsSt(z){
+  const s = z.sessions||{};
+  if(s.estab==null) return {st:"grey", note:"unmeasured"};
+  if(s.estab===0) return {st:"amber", note:"no established sessions"};
+  return {st:"green", note:"flowing"};
+}
+function zCapacitySt(z){
+  const c = z.capacity||{};
+  if(c.fd_used==null || c.fd_cap==null || !c.fd_cap) return {st:"grey", note:"fd unmeasured"};
+  const r = c.fd_used/c.fd_cap;
+  if(r>=0.8) return {st:"red", note:"fd exhaustion risk"};
+  if(r>=0.5) return {st:"amber", note:"fd elevated"};
+  return {st:"green", note:"headroom ok"};
+}
+function zCryptoSt(z){
+  const c = z.container||{}, cr = z.crypto||{};
+  if(c.variant==="stock") return {st:"amber", note:"stock image — un-patched accept loop"};
+  if(cr.attest_present===true && cr.attest_fips===true) return {st:"green", note:"FIPS module attested"};
+  if(c.variant==="pqc"||c.variant==="pqc-fips") return {st:"green", note:"PQC/patched image"};
+  if(cr.version) return {st:"grey", note:"posture — see goat health --domain crypto"};
+  return {st:"grey", note:"unmeasured"};
+}
+function zenohStatus(doc, now){
+  if(zenohStale(doc, now)) return "grey";     // bounced/unreachable — honest unknown, never a guessed red
+  const z = doc.zenoh||{};
+  return worstStatus([zContainerSt(z).st, zAdmissionSt(z).st, zWedgeSt(z).st, zCapacitySt(z).st]);
+}
+// A wedge within this window = "unstable now"; older wedges are historical
+// context (shown as a count in the band), not a live alarm. Keeps a stale
+// cluster of wedges from N hours ago reading as ongoing instability.
+const RECENT_WEDGE_S = 3 * 3600;
+// Fleet-level zenoh rollup — folds the router band into the TOP-OF-PAGE verdict
+// + pill. Alarms (pill/verdict) fire only on the CURRENT state: wedged now, or a
+// wedge within RECENT_WEDGE_S. wedges24h is the trailing-24h count (a rolling
+// window, refreshed each report) carried for context, NOT an alarm by itself —
+// a router that wedged repeatedly but has been stable for hours reads stable.
+// Stale routers count as honest-unknown, never a fault.
+function zenohRollup(now){
+  const r = {wedgedNow:false, unhealthy:false, amber:false,
+             wedges24h:0, lastWedgeAgoS:null, wedgedRecently:false, names:[]};
+  Object.values(ZENOH||{}).forEach(doc=>{
+    const name = (doc.zenoh&&doc.zenoh.router)||doc.router;
+    const wd = (ZENOH_WEDGES||{})[name] || {};
+    if(wd.currently_wedged){ r.wedgedNow=true; if(name) r.names.push(name); }
+    if((wd.restarts_24h||0) > r.wedges24h) r.wedges24h = wd.restarts_24h||0;
+    if(wd.last_wedge_ts){ const ago = now - wd.last_wedge_ts;
+      if(r.lastWedgeAgoS===null || ago < r.lastWedgeAgoS) r.lastWedgeAgoS = ago; }
+    if(zenohStale(doc, now)) return;
+    const st = zenohStatus(doc, now);
+    if(st==="red") r.unhealthy=true; else if(st==="amber") r.amber=true;
+  });
+  r.wedgedRecently = r.wedges24h>=3 && r.lastWedgeAgoS!==null && r.lastWedgeAgoS < RECENT_WEDGE_S;
+  return r;
+}
+// Condensed band row (level 1): status + the wedge-relevant headline numbers +
+// report age. open latency is THE seizure signal; CLOSE-WAIT is the leading
+// indicator; fd is F-248. Click -> router page.
+function zenohRow(doc, now){
+  const z = doc.zenoh||{}, c = z.container||{}, a = z.admission||{}, w = z.wedge||{}, cap = z.capacity||{}, s = z.sessions||{};
+  const stale = zenohStale(doc, now), age = zenohAge(doc, now);
+  const st = zenohStatus(doc, now);
+  const openTxt = a.open_ms==null ? "unmeasured" : (a.open_ok===false ? "FAILED" : ms(a.open_ms));
+  const fdTxt = (cap.fd_used==null||cap.fd_cap==null) ? "—" : `${cnt(cap.fd_used)}/${cnt(cap.fd_cap)}`;
+  const ageHtml = stale
+    ? `<span class="hage bad" title="no report for ${ago(age)} — router bounced or the probe is down; values below are its LAST report">NOT REPORTING · last ${ago(age)} ago</span>`
+    : `<span class="hage">reported ${ago(age)} ago</span>`;
+  return `<div class="hostrow ${stale?'stale':''}" onclick="openZenoh('${esc(z.router||doc.router)}')" title="open ${esc(z.router||doc.router)} zenoh router detail">
+    <span class="dot ${sdot(st)}"></span>
+    <span class="name">${esc(z.router||doc.router)}</span>
+    <span class="gnet">${esc(z.goatnet||"")}</span>
+    <span class="hchip" title="container image variant — the F-253 accept-loop fix rides the pqc/pqc-fips images; a router on bare eclipse/zenoh still carries the wedge">${esc(c.variant||"?")}</span>
+    <span class="hchip" title="container HEALTHCHECK verdict + uptime (RestartCount ${cnt(c.restart_count)})"><span class="sdot ${sdot(stale?'grey':zContainerSt(z).st)}"></span>${esc(c.health||"—")}${c.uptime_s!=null?` · up ${ago(c.uptime_s)}`:""}</span>
+    <span class="hchip" title="a real mTLS NEW-SESSION open against the transport port — THE seizure signal (stalls toward the 10s open_timeout under the wedge while REST/established stay fine, F-253); 'unmeasured' = no probe cert deployed"><span class="sdot ${sdot(stale?'grey':zAdmissionSt(z).st)}"></span>open <b>${openTxt}</b></span>
+    <span class="hchip" title="CLOSE-WAIT sockets in the router netns — 0 healthy, climbing is the wedge building ; ≥25 amber, ≥200 red"><span class="sdot ${sdot(stale?'grey':zWedgeSt(z).st)}"></span>close-wait <b>${cnt(w.close_wait)}</b></span>
+    <span class="hchip" title="open file descriptors vs the nofile soft limit — F-248 was FD exhaustion; the rocksdb store set dominates the baseline"><span class="sdot ${sdot(stale?'grey':zCapacitySt(z).st)}"></span>fd <b>${fdTxt}</b></span>
+    <span class="hchip" title="established sessions — TLS/TCP on :7447 (countable); QUIC on :7448 multiplexes one UDP socket (see the sessions card for TLS bytes vs QUIC datagrams)"><span class="sdot ${sdot(stale?'grey':zSessionsSt(z).st)}"></span>sessions <b>${cnt(s.estab)}</b> <span class="note">${s.tls_bps_tx!=null?bps(s.tls_bps_tx)+" tls":""}</span></span>
+    ${zenohWedgeChip(z.router||doc.router, now)}
+    ${zenohRowSpark(z)}
+    ${ageHtml}
+  </div>`;
+}
+// WHEN it wedged — a distinct chip from the live-health dot: the dot is the router's
+// state NOW, this is the recurrence history (a router healthy this instant can still
+// be wedging hourly). Red "WEDGED NOW" if live-deadlocked; else N wedge-recoveries/24h.
+function zenohWedgeChip(name, now){
+  const wd = (ZENOH_WEDGES||{})[name];
+  if(!wd) return "";
+  if(wd.currently_wedged){
+    const since = wd.wedged_since ? " · "+ago(now-wd.wedged_since) : "";
+    return `<span class="hchip" style="background:rgba(217,83,79,.2)" title="the router is WEDGED right now (deadlocked; the watchdog will auto-restart it). Click for the wedge-events timeline."><span class="sdot ${sdot('red')}"></span><b style="color:var(--red)">WEDGED NOW</b>${since}</span>`;
+  }
+  const n = wd.restarts_24h||0;
+  if(n<=0) return "";                          // no wedges in 24h → no chip (band dot carries health)
+  const ageS = wd.last_wedge_ts!=null ? now - wd.last_wedge_ts : null;
+  // recency-graded: recent cluster = red, hours-old = amber, stale (recovered) = grey.
+  const st = (n>=3 && ageS!=null && ageS < RECENT_WEDGE_S) ? "red"
+           : (ageS!=null && ageS < 2*RECENT_WEDGE_S) ? "amber" : "grey";
+  const lastTxt = ageS!=null ? ago(ageS)+" ago" : "—";
+  return `<span class="hchip" title="watchdog wedge-recoveries (auto-restarts) in the trailing 24h window; each is a wedge episode. Dot: red = recent, grey = none recent (recovered). Click the router for the event timeline."><span class="sdot ${sdot(st)}"></span>wedges <b>${n}</b>/24h · last <b>${lastTxt}</b></span>`;
+}
+function zenohRowSpark(z){
+  const hist = z.history||[];   // [t, open_ms, close_wait, estab, fd_used]
+  if(hist.length<2) return "";
+  const W=110,H=22; let maxv=1; hist.forEach(p=>{maxv=Math.max(maxv,p[1]||0);});
+  const vals = hist.map(p=>p[1]||0);   // open latency trend — the seizure signature
+  return `<span class="ovspark" title="new-session open latency, last ${hist.length} samples (a rising staircase = admission seizing)"><svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:${H}px">
+    <polyline fill="none" stroke="var(--blue)" stroke-width="1.2" points="${sparkPath(vals,W,H,maxv)}"/></svg></span>`;
+}
+function zenohBand(now){
+  const names = Object.keys(ZENOH);
+  if(!names.length) return "";
+  const rows = names.sort().map(n=>zenohRow(ZENOH[n], now)).join("");
+  return `<div class="hostband-h"><h3>zenoh routers</h3>
+    <span class="note">the fabric's routers self-report their service health from the site host — new-session open latency, CLOSE-WAIT, FD headroom (the F-248/F-253 wedge signals); history persists here across a router restart</span></div>${rows}`;
+}
+// ---- level 2: one router, metric-group cards (each drills to history) ----
+const ZENOH_CARDS = [
+  {key:"wedges",    title:"wedge events (when it deadlocked)"},
+  {key:"liveness",  title:"liveness"},
+  {key:"admission", title:"admission (new-session open)"},
+  {key:"wedge",     title:"socket wedge"},
+  {key:"sessions",  title:"sessions"},
+  {key:"capacity",  title:"capacity"},
+  {key:"crypto",    title:"crypto posture"},
+];
+// Live-vs-recurrence status for the wedge-events card (distinct from the health dot).
+function zWedgesSt(z){
+  const wd = (ZENOH_WEDGES||{})[z.router] || {};
+  if(wd.currently_wedged) return {st:"red", note:"WEDGED now"};
+  const n = wd.restarts_24h||0;
+  if(n>=3) return {st:"red", note:n+" wedges/24h"};
+  if(n>0)  return {st:"amber", note:n+" wedges/24h"};
+  return {st:"green", note:"none in 24h"};
+}
+function zenohCardBody(key, z){
+  const c=z.container||{}, a=z.admission||{}, w=z.wedge||{}, s=z.sessions||{}, cap=z.capacity||{}, sto=z.storage||{}, cr=z.crypto||{};
+  switch(key){
+    case "wedges": {
+      const wd = (ZENOH_WEDGES||{})[z.router] || {};
+      const now = Math.floor(Date.now()/1000);
+      const head = kv("last 24h", `<b>${wd.restarts_24h||0}</b> wedge-recoveries`, "watchdog router-restarts in 24h — each = one auto-recovered deadlock. The reliable count (Docker RestartCount stays 0 for a manual restart).")
+        + kv("last 7d", cnt(wd.restarts_7d))
+        + kv("status now", wd.currently_wedged ? `<b style="color:var(--red)">WEDGED</b>${wd.wedged_since?" · "+ago(now-wd.wedged_since):""}` : "healthy", "the router's state right now — distinct from the recurrence count above")
+        + kv("last event", wd.last_wedge_ts ? ago(now-wd.last_wedge_ts)+" ago" : "none seen");
+      const evs = (wd.events||[]).slice().reverse();
+      if(!evs.length) return head + `<div class="note" style="margin-top:6px">no wedge events recorded yet (the ingest has been watching since deploy)</div>`;
+      const color = {wedged:"var(--red)", restart:"var(--amber)", recovered:"var(--green)"};
+      const rows = evs.slice(0,25).map(e=>{
+        const when = new Date((e.ts||0)*1000).toLocaleString();
+        const sig = (e.open_ms!=null?`open ${ms(e.open_ms)}`:"") + (e.close_wait!=null?` · cw ${cnt(e.close_wait)}`:"");
+        return `<div class="kv"><span class="k" style="width:158px">${esc(when)}</span><span class="v"><b style="color:${color[e.type]||'var(--dim)'}">${esc(e.type)}</b> <span class="note">${esc(e.detail||"")}${sig?" · "+sig:""}</span></span></div>`;
+      }).join("");
+      return head + `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:6px">${rows}</div>`
+        + `<div class="note" style="margin-top:6px">root-cause + how to debug: docs/operations/zenoh-wedge-investigation-playbook.md</div>`;
+    }
+    case "liveness": return kv("state", `${esc(c.status||"—")}${c.running===false?" <b>(not running)</b>":""}`)
+      + kv("healthcheck", esc(c.health||"—"), "the container HEALTHCHECK verdict — the one signal that caught both F-248 and F-253 (Up but unhealthy)")
+      + kv("uptime", c.uptime_s!=null?ago(c.uptime_s):"—", "since the container last (re)started — a restart clears a wedge, so a short uptime after a red is expected")
+      + kv("restarts", cnt(c.restart_count), "docker RestartCount — a climbing count is a crash/wedge loop")
+      + kv("image", `${esc(c.variant||"?")}${c.digest?` <span class="note">${esc(c.digest)}</span>`:""}`, "the F-253 accept-throttle fix is in the pqc/pqc-fips images; stock eclipse/zenoh still carries the wedge")
+      + kv("oom", c.oom===true?"<b>KILLED</b>":c.oom===false?"no":"—", "OOMKilled — the router runs under a 4G bulkhead");
+    case "admission": return kv("new-session open", `<b>${a.open_ms==null?"unmeasured":(a.open_ok===false?"FAILED after "+ms(a.open_ms):ms(a.open_ms))}</b>`, "a full mTLS session open against the transport port — under the F-253 seizure this stalls toward the 10s open_timeout while REST stays fast. 'unmeasured' = no probe client cert deployed (REST alone can't confirm admission)")
+      + kv("REST adminspace", `${a.rest_ok===false?"<b>not answering</b>":ms(a.rest_ms)}`, "@/local/router latency — the healthcheck target; seizes in step with the transport (shared single-thread runtime)")
+      + kv("established", `${cnt(a.estab)} <span class="note">/ ~100 accept slots</span>`, "the router admits accept_pending=100 concurrent opens; established near the cap under a storm is the pressure signal");
+    case "wedge": return kv("CLOSE-WAIT", `<b>${cnt(w.close_wait)}</b>`, "half-closed inbound sockets the accept loop hasn't reaped — 0 healthy; climbs ~1/6s during the wedge. THE leading indicator.")
+      + kv("TIME-WAIT", cnt(w.time_wait), "normal churn; only interesting alongside a CLOSE-WAIT climb");
+    case "sessions": return kv("established", `<b>${cnt(s.estab)}</b>`, "total ESTABLISHED sessions in the router netns")
+      + kv("TLS sessions :7447", `<b>${cnt(s.tls_7447)}</b>`, "classical/PQ-hybrid mTLS transport sessions (TCP)")
+      + kv("TLS throughput", `${bps(s.tls_bps_rx)} in / ${bps(s.tls_bps_tx)} out`, "TLS byte rate summed over the :7447 sessions (ss -ti). zenoh 1.9.0 exposes NO per-transport message count, so transport bytes are the honest signal — not a fabricated message tally")
+      + kv("QUIC :7448", s.quic_listen===true?"listener up":s.quic_listen===false?"not enabled":"—", "QUIC transport (ADR 1086). One demuxed UDP socket serves ALL flows, so QUIC sessions are NOT socket-countable — the datagram rate below is the honest volume proxy")
+      + kv("QUIC datagrams", `${s.quic_dps_rx==null?"—":cnt(s.quic_dps_rx)+"/s"} in / ${s.quic_dps_tx==null?"—":cnt(s.quic_dps_tx)+"/s"} out`, "UDP datagrams/s in the router netns (≈ QUIC on :7448; the router netns carries no other significant UDP). ~0 when QUIC is unused — all traffic on TLS");
+    case "capacity": return kv("file descriptors", `<b>${cnt(cap.fd_used)}</b> / ${cnt(cap.fd_cap)}`, "open FDs vs the nofile soft limit — F-248 was FD exhaustion (fix raised the cap to 1048576). The rocksdb set dominates the baseline, so this number falls with the store count under lazy storage")
+      + kv("cpu", cap.cpu_pct==null?"—":(+cap.cpu_pct).toFixed(1)+"%", "a wedged router is IDLE, not busy — a blocked/sleeping await, not a spin")
+      + kv("memory", `${mb(cap.mem_mb)}${cap.mem_limit_mb!=null?` / ${mb(cap.mem_limit_mb)}`:""}`, "vs the 4G bulkhead (prior OOM)")
+      + kv("rocksdb storages", cnt(sto.storages!=null?sto.storages:cap.storages), "one rocksdb store per LIVE slot under lazy storage (ADR 1101). Count should track live slots, not pool size — a count near the pool size means the pre-cut regression is back")
+      + kv("rocksdb on disk", mb(sto.rocksdb_mb), "total storage bytes — growth trend matters more than the absolute");
+    case "crypto": return kv("router version", esc(cr.version||"—"), "from @/local/router — the fleet pins zenoh =1.9.0")
+      + kv("image variant", esc(c.variant||"—"))
+      + kv("kx group", esc(cr.kx_group||"—"), "negotiated key exchange — left to goat health --domain crypto (the live-probe source of truth); '—' here is honest, not a gap")
+      + kv("FIPS attestation", cr.attest_present===true?`present${cr.attest_fips===true?" · fips marker":""}${cr.attest_age_s!=null?` · ${ago(cr.attest_age_s)} old`:""}`:(cr.attest_present===false?"absent":"—"), "the host-side FIPS module attestation the router writes at boot");
+  }
+  return "";
+}
+function zenohCardSt(key, z){ return {wedges:zWedgesSt, liveness:zContainerSt, admission:zAdmissionSt, wedge:zWedgeSt, sessions:zSessionsSt, capacity:zCapacitySt, crypto:zCryptoSt}[key](z); }
+function zenohStaleBanner(doc, now){
+  if(!zenohStale(doc, now)) return "";
+  return `<div class="stalebanner"><b>NOT REPORTING for ${ago(zenohAge(doc,now))}</b> — the router was bounced or the probe can't reach this ingest.
+    Everything below is its <b>last stored report</b> (${new Date((doc.received_at||0)*1000).toLocaleString()}) — kept precisely so the wedge that led to the restart stays visible.</div>`;
+}
+function zenohPage(doc, now){
+  const z = doc.zenoh||{};
+  const cards = ZENOH_CARDS.map(cd=>{
+    const st = zenohStale(doc,now) ? {st:"grey",note:"last known"} : zenohCardSt(cd.key, z);
+    return `<div class="hcard" onclick="openZenohCard('${esc(z.router||doc.router)}','${cd.key}')">
+      <h4><span class="sdot ${sdot(st.st)}"></span>${cd.title} <span class="note">· ${esc(st.note)}</span></h4>
+      ${zenohCardBody(cd.key, z)}
+      <div class="drill">click for history →</div>
+    </div>`;
+  }).join("");
+  return zenohStaleBanner(doc, now) + `<div class="hgrid">${cards}</div>`;
+}
+// ---- level 3: one metric group's history (h/d/w tiers from the ingest) ----
+const ZENOH_CARD_SERIES = {   // [label, stored-column, color, fmt]
+  admission: [["new-session open ms","open_ms","var(--red)",ms],["REST adminspace ms","rest_ms","var(--amber)",ms]],
+  wedge:     [["CLOSE-WAIT sockets","close_wait","var(--red)",cnt],["TIME-WAIT sockets","time_wait","var(--grey)",cnt]],
+  sessions:  [["established sessions","estab","var(--green)",cnt],["TLS out B/s","tls_bps","var(--blue)",bps],["QUIC out datagrams/s","quic_dps","var(--amber)",cnt]],
+  capacity:  [["file descriptors used","fd_used","var(--blue)",cnt],["rocksdb storages","storages","var(--amber)",cnt],["rocksdb on disk (MB)","rocksdb_mb","var(--blue)",mb]],
+  liveness:  [],
+  crypto:    [],
+};
+function zenohCardHistoryPage(doc, now, cardKey){
+  const z = doc.zenoh||{};
+  const S = ZENOH_SERIES[z.router||doc.router] || {};
+  const specs = ZENOH_CARD_SERIES[cardKey] || [];
+  const tiers = [["last hour · 1-min buckets","h"],["last 24 h · 15-min buckets","d"],["last 7 days · 2-h buckets","w"]];
+  let out = zenohStaleBanner(doc, now);
+  if(!specs.length) out += `<div class="note">no stored history for this group (current values only — see the router page)</div>`;
+  specs.forEach(([label,col,color,fmt])=>{
+    tiers.forEach(([tl,tk])=>{ out += bigChart(label, S[tk], col, color, fmt, tl, ZENOH_SERIES_METRICS); });
+  });
+  return `<div style="display:flex;flex-direction:column;gap:12px">${out}</div>`;
+}
+// ================================================================================
+
+function render(data){
+  const now = Math.floor(Date.now()/1000);
+  const age = now - (data.generated||0);
+  const stale = age > STALE_AFTER;
+  const relays = data.relays||[];
+  const gn = [...new Set(relays.map(r=>r.goatnet))].join(", ") || "—";
+  const te = data.tunnel_endpoint === true;   // probed from the rathole tunnel endpoint (site host)?
+  // Vantage: external probes (:443/:2333/:3478/:33073/latency) are measured FROM
+  // here across the internet to each relay's PUBLIC IP — so the latency etc. are
+  // "from this vantage", NOT the relay's latency to its peers. Deep metrics
+  // (throughput/cpu/peers) are read ON the relay host. Make both explicit.
+  const vant = data.vantage || "prober";
+  $("scope").textContent = `${relays.length} relays · ${gn} · external probes from ${vant} → relay public IP${data.deep ? " · deep metrics read on relay host" : ""}${te ? " · tunnel-endpoint vantage" : ""}`;
+
+  // Vantage explainer — this dashboard is ONE of two surfaces over the same
+  // relay fleet. Spell out which measurements are comparable across them and
+  // which legitimately differ because they're probed from different places.
+  // Throughput is present when ANY relay carries deep data — either the prober
+  // did an --deep read (data.deep) OR relays self-published + were folded in
+  // (--ingest-dir). Key the banner on real per-relay data, not the top flag.
+  const hasDeep = relays.some(r=>r.deep) || data.deep === true;
+  const vn = $("vantnote");
+  // Line 2 is the same split on both surfaces: what's comparable vs vantage-bound.
+  const same = `enroll · rathole · WS/TCP${hasDeep ? " · throughput" : ""}`;
+  if (te) {
+    // On-prem site host, tunnel-endpoint vantage (the hairpin).
+    vn.className = "vantnote vn-thor";
+    vn.innerHTML =
+      `<div class="vn-l1"><span class="vn-place">${vant}</span> — on-prem, tunnel-endpoint (<b>hairpin</b>): probes loop back through each relay's own tunnel, so :443/STUN/QUIC are informational and latency is this host's uplink.</div>` +
+      `<div class="vn-l2"><span class="vn-same"><span class="vn-tag">same on both</span>${same}</span>` +
+      `<span class="vn-diff"><span class="vn-tag">differs · vantage</span>latency · QUIC/STUN — informational here; honest view: <code>the cloud relay-health box</code></span></div>`;
+  } else {
+    // Cloud, external vantage (the honest peer-eye view).
+    vn.className = "vantnote vn-cloud";
+    vn.innerHTML =
+      `<div class="vn-l1"><span class="vn-place">${vant}</span> — cloud, external (<b>peer-eye</b>): probes hit each relay's public IP directly, so :443/QUIC/STUN and latency are representative of a real enrolling peer.</div>` +
+      `<div class="vn-l2"><span class="vn-same"><span class="vn-tag">same on both</span>${same}</span>` +
+      `<span class="vn-diff"><span class="vn-tag">differs · vantage</span>latency · QUIC/STUN — more honest here (no hairpin, F-213)</span></div>`;
+  }
+
+  LAST_DATA = data;
+  let okCount=0, anyRed=false, anyAmber=false;
+  const statusOf = {};
+  relays.forEach(r=>{
+    const st = stale ? "grey" : relayStatus(r, te);
+    statusOf[r.name] = st;
+    if(st==="green") okCount++; if(st==="red") anyRed=true; if(st==="amber") anyAmber=true;
+  });
+  // ---- per-peer auth-rejection rollup — a specific peer being turned
+  // away IS a real per-peer fault, the explicit counter to "if you can't connect
+  // it's you." expired_token = a stale/corrupt local netbird profile presenting a
+  // dead relay token (the profile-drift single-peer isolation); ws_upgrade_timeout
+  // = the peer never finished the WS upgrade. ws_handoff_eof is EXCLUDED from the
+  // amber — benign QUIC-race-loser noise, surfaced for context only.
+  let authExpired=0, authWsTimeout=0, authEof=0; const authOffMap={};
+  relays.forEach(r=>{
+    const ar=(r.deep||{}).auth_reject; if(!ar) return;
+    authExpired   += (+ar.expired_token||0);
+    authWsTimeout += (+ar.ws_upgrade_timeout||0);
+    authEof       += (+ar.ws_handoff_eof||0);
+    (ar.top_offenders||[]).forEach(o=>{ if(o&&o.ip) authOffMap[o.ip]=(authOffMap[o.ip]||0)+(+o.count||0); });
+  });
+  const authOffenders = Object.entries(authOffMap).map(([ip,count])=>({ip,count})).sort((a,b)=>b.count-a.count);
+  const authAmber = !stale && (authExpired>0 || authWsTimeout>0);
+  const relayCard = (r)=>{
+    const st = statusOf[r.name];
+    const e=r.enroll;
+    // On a tunnel-endpoint vantage, :443/STUN are informational (grey dot + tag), not health.
+    const enrollSt = te ? "grey" : (e.ok===0?"red":e.ok<e.tries?"amber":"green");
+    const stunSt   = te ? "grey" : (r.stun===true?"green":r.stun===false?"amber":"grey");
+    const infoTag  = te ? ` <span class="note">(hairpin — info)</span>` : "";
+    let rows = "";
+    rows += row(":443 enroll", sdot(enrollSt),
+      `${bars(e.ok,e.tries)} ${e.ok}/${e.tries} ${e.code?`<span class="note">${e.code} · ${(+e.tls_s||0).toFixed(2)}s</span>`:""}${infoTag}`);
+    rows += row(":2333 rathole", sdot(r.rathole_ctl?"green":"red"), r.rathole_ctl?"reachable":"DOWN");
+    rows += row(":3478 stun", sdot(stunSt),
+      `${r.stun===true?"binding ok":r.stun===false?"no response":"—"}${te?` <span class="note">(udp — info)</span>`:""}`);
+    // :33073 data plane, broken out by transport. WS/TCP drives health on both
+    // vantages; QUIC/UDP is informational on a tunnel endpoint (residential-udp).
+    const dp = r.dataplane || {};
+    const wsTcpSt = dp.ws_tcp===true ? "green" : dp.ws_tcp===false ? "red" : "grey";
+    const quicSt  = dp.quic_udp===true ? "green" : (te ? "grey" : (dp.quic_udp===false ? "amber" : "grey"));
+    const wsRtt   = (dp.ws_rtt_ms!=null && dp.ws_rtt_ms>=0) ? ` ${dp.ws_rtt_ms} ms` : "";
+    const quicRtt = (dp.quic_rtt_ms!=null && dp.quic_rtt_ms>=0) ? ` ${dp.quic_rtt_ms} ms` : "";
+    rows += row(":33073 ws/tcp", sdot(wsTcpSt),
+      `${dp.ws_tcp===true?"reachable":dp.ws_tcp===false?"unreachable":"—"} <span class="note">tcp-connect rtt${wsRtt} · from ${vant}</span>`);
+    rows += row(":33073 quic/udp", sdot(quicSt),
+      `${dp.quic_udp===true?"handshake ok":dp.quic_udp===false?"no VN reply":"—"} <span class="note">quic-handshake rtt${quicRtt} · from ${vant}</span>${te?` <span class="note">(udp — info)</span>`:""}`);
+    rows += row("latency", sdot(latSt(r.lat_ms)), r.lat_ms<0?"—":`${r.lat_ms} ms <span class="note">tcp-connect rtt · from ${vant} → :443</span>`);
+    // Left column carries deep SERVICE-STATE checks; throughput moves to the
+    // right panel (sparkline + utilization gauge).
+    if(r.deep){
+      const d=r.deep;
+      rows += row("rathole svc", sdot(d.rathole==="active"?"green":"red"), d.rathole);
+      rows += row("watchdog", sdot(d.watchdog==="active"?"green":"amber"),
+        `${d.watchdog}${d.heals_1h>0?` <span class="note">· ${d.heals_1h} heal/1h</span>`:""}`);
+      rows += row("goat-relay", sdot(d.relay_up?"green":"red"),
+        `${d.relay_up?"up":"DOWN"} <span class="note">:33073 ${d.dataplane_listen?"✓":"✗"}</span>`);
+      rows += row("coturn", sdot(d.coturn_listen?"green":"amber"), d.coturn_listen?":3478 listening":"not listening");
+      // F-229 — disk fill + biggest container log. This row makes it visible before 100%.
+      const dk = +d.disk_pct, logMb = +d.max_container_log_mb;
+      const logBig = logMb > 2000;
+      const diskSt = dk>=95 ? "red" : (dk>=85 || logBig) ? "amber" : "green";
+      rows += row("disk", sdot(diskSt),
+        `${isNaN(dk)?"—":dk+"% used"} <span class="note">· top container log ${isNaN(logMb)?"—":logMb+" MB"}${logBig?" ⚠":""}</span>`);
+      // F-269 — per-peer auth rejections in the last 5m, by reason + top
+      // offender egress IPs. amber on expired_token / ws_upgrade_timeout (a real
+      // per-peer isolation); ws_handoff_eof stays a grey note (benign, F-041).
+      const ar = d.auth_reject;
+      if(ar){
+        const ax=+ar.expired_token||0, awt=+ar.ws_upgrade_timeout||0, aeof=+ar.ws_handoff_eof||0;
+        const arSt = (ax>0||awt>0) ? "amber" : "green";
+        const off = (ar.top_offenders||[]).filter(o=>o&&o.ip).slice(0,3)
+                      .map(o=>`${esc(String(o.ip))}×${+o.count||0}`).join(", ");
+        rows += row("auth rejects", sdot(arSt),
+          `${ax} expired-token${awt>0?` · ${awt} ws-timeout`:""} `
+          + `<span class="note">≤${ar.window_min||5}m${off?` · turning away ${off}`:""} · ${aeof} handoff-eof (benign, F-041)</span>`);
+      }
+    } else {
+      rows += `<div class="deepless">deep service-state not probed (run with --deep)</div>`;
+    }
+    return `<div class="card ${stale?'stale':''}">
+      <div class="top">
+        <span class="dot ${'d-'+st}"></span>
+        <div><div class="name">${r.name}</div>
+          <div class="meta">${r.region} · ${r.ip}</div></div>
+        ${placeChip(r)}
+      </div>
+      <div class="body"><div class="checks">${rows}</div>${throughputPanel(r, now)}${peersPanel(r)}</div>
+    </div>`;
+  };
+
+  // ---- route: host pages / relay panel / fleet overview ----
+  const route = routeState();
+  const sel = route.relay ? relays.find(x=>x.name===route.relay) : null;
+  const hostDoc = route.host ? HOSTS[route.host] : null;
+  const zenohDoc = route.zenoh ? ZENOH[route.zenoh] : null;
+  const crumb = $("crumb");
+  if(hostDoc && route.card){
+    const title = (HOST_CARDS.find(c=>c.key===route.card)||{}).title || route.card;
+    crumb.style.display = "block";
+    crumb.innerHTML = `<a onclick="goFleet()">← fleet overview</a> <span class="note">·</span> <a onclick="openHost('${esc(route.host)}')">${esc(route.host)}</a> <span class="note">· ${esc(title)} · history</span>`;
+    $("grid").innerHTML = hostCardHistoryPage(hostDoc, now, route.card);
+  } else if(hostDoc){
+    crumb.style.display = "block";
+    crumb.innerHTML = `<a onclick="goFleet()">← fleet overview</a> <span class="note">· ${esc(route.host)} · site network host — click a card for history</span>`;
+    $("grid").innerHTML = hostPage(hostDoc, now);
+  } else if(route.host){
+    crumb.style.display = "block";
+    crumb.innerHTML = `<a onclick="goFleet()">← fleet overview</a>`;
+    $("grid").innerHTML = `<div class="note">no stored report for host "${esc(route.host)}" on this box</div>`;
+  } else if(zenohDoc && route.card){
+    const title = (ZENOH_CARDS.find(c=>c.key===route.card)||{}).title || route.card;
+    crumb.style.display = "block";
+    crumb.innerHTML = `<a onclick="goFleet()">← fleet overview</a> <span class="note">·</span> <a onclick="openZenoh('${esc(route.zenoh)}')">${esc(route.zenoh)}</a> <span class="note">· ${esc(title)} · history</span>`;
+    $("grid").innerHTML = zenohCardHistoryPage(zenohDoc, now, route.card);
+  } else if(zenohDoc){
+    crumb.style.display = "block";
+    crumb.innerHTML = `<a onclick="goFleet()">← fleet overview</a> <span class="note">· ${esc(route.zenoh)} · zenoh router — click a card for history</span>`;
+    $("grid").innerHTML = zenohPage(zenohDoc, now);
+  } else if(route.zenoh){
+    crumb.style.display = "block";
+    crumb.innerHTML = `<a onclick="goFleet()">← fleet overview</a>`;
+    $("grid").innerHTML = `<div class="note">no stored report for router "${esc(route.zenoh)}" on this box</div>`;
+  } else if(sel){
+    crumb.style.display = "block";
+    crumb.innerHTML = `<a onclick="goFleet()" title="back to the fleet overview (or use the browser back button)">← fleet overview</a> <span class="note">· ${esc(sel.name)} · ${esc(sel.region||"")}</span>`;
+    $("grid").innerHTML = relayCard(sel);
+  } else {
+    crumb.style.display = "none";
+    crumb.innerHTML = "";
+    const body = route.view === "map"
+      ? mapView(relays, statusOf, stale)
+      : relays.map(r=>overviewRow(r, statusOf[r.name], stale, vant)).join("");
+    $("grid").innerHTML = hostsBand(now) + federationBand(now) + zenohBand(now) + peersBand(now) + viewToggle(route.view) + (body || `<div class="note">no relays in relays.conf</div>`);
+  }
+
+  $("fleetCount").textContent = `${okCount}/${relays.length}`;
+  const pill=$("fleetPill");
+  // The pill is the OVERALL health glance, not relays-only: a wedged/flapping
+  // fabric router or a wedged site node must show here too (else the header
+  // reads green while the fabric is down — the gap this closes).
+  const zr = zenohRollup(now);
+  let hostWedgedTop=false;
+  Object.values(HOSTS).forEach(doc=>{ if(!hostStale(doc,now) && (((doc.host_net||{}).mesh||{}).selfheal_wedged===1 || meshSt(doc.host_net||{}).st==="red")) hostWedgedTop=true; });
+  if(stale){ pill.className="pill p-grey"; pill.textContent=`stale ${ago(age)}`; }
+  else if(anyRed || zr.wedgedNow || zr.unhealthy){ pill.className="pill p-red"; pill.textContent="degraded"; }
+  else if(anyAmber || hostWedgedTop || zr.amber || zr.wedgedRecently){ pill.className="pill p-amber"; pill.textContent="degraded"; }
+  else { pill.className="pill p-green"; pill.textContent="healthy"; }
+  // Plain-language network verdict — the "is it me, or the network?" answer,
+  // legible to anyone, not just an admin reading per-relay dots. Driven by the
+  // same non-flapping reachability roll-up as the fleet pill.
+  (function(){
+    const box=$("netverdict"), vh=$("nvHead"), vt=$("nvText"), n=relays.length;
+    // Site-host trouble roll-up. A lockout can be INVISIBLE to this verdict: all
+    // relays green, but the ACTIVE node wedged (control plane up, peers not
+    // connecting). It must never tell a user "it's you" while a site node is
+    // wedged. Only REPORTING hosts count — a stale host is an honest unknown.
+    // A node's connected-peer COUNT is
+    // NOT a reachability measure (peers_total is the mostly-offline roster), so
+    // it does not drive this verdict: a peer-count "wedge" false-alarms
+    // "this may not be you" on nodes whose services are fully reachable. Real
+    // per-node trouble surfaced here = control plane down (ctlSt red / meshSt
+    // amber). The self-heal wedge / low-peer count is surfaced as an honest INFO
+    // aside, never an alarm. The correct F-261-class lockout detector (a node
+    // truly unreachable while relays are green) is the net-health reachability-
+    // canary (off-node probe), not the peer count.
+    let hostDegraded=false; const selfReportNames=[];
+    Object.values(HOSTS).forEach(doc=>{
+      if(hostStale(doc, now)) return;
+      const hn=doc.host_net||{}, m=hn.mesh||{}, ms_=meshSt(hn).st;
+      if(ms_==="amber" || ctlSt(hn).st==="red"){ hostDegraded=true; }
+      if(m.selfheal_wedged===1){ selfReportNames.push(hn.host||doc.host); }
+    });
+    // A self-heal-wedged node is a
+    // real event, surfaced as its own amber verdict (matches the top pill's
+    // hostWedgedTop → amber); it supersedes the weaker INFO-aside treatment.
+    const wedgedNames = selfReportNames; const hostWedged = wedgedNames.length>0;
+    let cls, head, text;
+    if(stale){
+      cls="nv-grey"; head="Status unknown — data is stale";
+      text=`The last probe is ${ago(age)} old, so this can't confirm the network's state right now. Give it a moment and reload.`;
+    } else if(okCount===0){
+      cls="nv-red"; head="The network is down — it's not you";
+      text=`None of the ${n} relays are answering from this outside-the-mesh vantage. The mesh's front door is unreachable, so nobody can get on right now — this is a network/relay outage, not your device or connection.`;
+    } else if(anyRed || okCount<n){
+      cls="nv-amber"; head="Degraded — real trouble on the network";
+      text=`Only ${okCount} of ${n} relays are reachable. Whether you can connect depends on which relay you land on, so if you're struggling it may not be only you. This is partial network/relay trouble.`;
+    } else if(zr.wedgedNow){
+      cls="nv-red"; head=`Fabric router WEDGED${zr.names.length?" — "+zr.names.join(", "):""}`;
+      text=`state: deadlocked now · wedges (24h): ${zr.wedges24h} · recovery: watchdog restart ~1–2 min · impact: data plane down, relay front door up · detail: zenoh routers band.`;
+    } else if(hostWedged){
+      cls="nv-amber"; head=`Site node mesh WEDGED — ${wedgedNames.join(", ")}`;
+      text=`state: control plane up, peers not connecting (boot-wedge) · recovery: self-heal restarting netbird · impact: services on that node may be unreachable to peers; relay front door up.`;
+    } else if(hostDegraded){
+      cls="nv-amber"; head="A site node reports a degraded control plane";
+      text=`The relay front door is up, but a site node's control plane is not fully connected. Enrollment and config updates on that node may be affected; peers already connected keep running over WireGuard. If one specific service is unreachable, it may be that node rather than you.`;
+    } else if(zr.wedgedRecently){
+      cls="nv-amber"; head=`Fabric router unstable — ${zr.wedges24h} wedge/24h`;
+      text=`state: answering now · wedges (24h): ${zr.wedges24h} · last: ${ago(zr.lastWedgeAgoS)} ago · each auto-recovered ~1–2 min · detail: zenoh routers band timeline.`;
+    } else if(authAmber){
+      // F-269 — the explicit counter to "if you can't connect it's you." The
+      // network's front door is up, but the relay is turning SPECIFIC peers away
+      // (a stale/corrupt local netbird profile presenting a dead relay token).
+      // If you are one of the named peers, this is NOT you.
+      cls="nv-amber"; head="The network is up — but specific peer(s) are being turned away";
+      const who = authOffenders.slice(0,3).map(o=>`${o.ip} (${o.count})`).join(", ");
+      text=`All ${n} relays are healthy from outside the mesh, but the relay is auth-rejecting one or more peers`
+        + (authExpired>0 ? ` — ${authExpired} expired-auth-token rejection(s) in 5m${who?` from egress IP ${who}`:""}` : "")
+        + (authWsTimeout>0 ? `${authExpired>0?"; ":" — "}${authWsTimeout} WS-upgrade timeout(s)` : "")
+        + `. If you are one of the named peers this is NOT you: a stale/corrupt local netbird profile is presenting a dead relay token. Recreate the profile (remove → add → re-enroll) — a soft reset (down/up, re-login, daemon restart, re-enroll) does NOT clear it.`;
+    } else {
+      cls="nv-green"; head="The network is up — if you can't connect, it's most likely you";
+      text=`All ${n} relays are answering and healthy from outside the mesh. The front door is up, so if you can't get on, the problem is most likely your own device or connection — run the client-side recovery steps first.`
+        + (zr.wedges24h>0 && !zr.wedgedRecently ? ` (fabric router: ${zr.wedges24h} wedge/24h, last ${ago(zr.lastWedgeAgoS)} ago — stable now.)` : "");
+    }
+    box.className="netverdict "+cls; vh.textContent=head; vt.textContent=text;
+  })();
+  $("foot").textContent = `probed ${age>=0?ago(age)+" ago":"—"} · refresh ${REFRESH_MS/1000}s · ${new Date((data.generated||0)*1000).toLocaleString()}`;
+}
+
+async function tick(){
+  try{
+    const [r] = await Promise.all([
+      fetch(JSON_URL+"?t="+Date.now(), {cache:"no-store"}),
+      loadPeerNames(),                 // best-effort; never blocks the health render
+      loadPeerSeries(),                // best-effort per-peer history (Part B)
+      loadHosts(),                     // best-effort site-host band (host-net health)
+      loadHostSeries(),                // best-effort host history for drill-downs
+      loadZenoh(),                     // best-effort zenoh-router band
+      loadZenohSeries(),               // best-effort router history for drill-downs
+      loadZenohWedges(),               // best-effort wedge-event timeline
+      loadPeers(),                     // best-effort test-peer perspective band
+      loadStatusHistory(),             // best-effort top-of-page status timeline
+    ]);
+    render(await r.json());
+    renderStatusTimeline();
+  }catch(e){
+    // A gated dashboard whose oauth2-proxy login SESSION expired gets its
+    // background fetches 302'd cross-origin to the Dex login — which surfaces
+    // as "TypeError: Failed to fetch" and dead-ends the page (an XHR can't
+    // follow a cross-origin redirect; a full navigation can). Detect that and
+    // re-auth by reloading, guarded so we never loop.
+    if(await authExpired()){
+      const now=Date.now(), last=+(sessionStorage.getItem("rhReauth")||0);
+      if(now-last > 20000){ sessionStorage.setItem("rhReauth", String(now)); location.reload(); return; }
+    }
+    $("fleetPill").className="pill p-red";
+    $("fleetPill").textContent="no data";
+    $("foot").textContent = "could not load "+JSON_URL+" — is the prober running, or did your login session expire? ("+e+")";
+  }
+}
+// True when the login session has expired: a same-origin fetch gets redirected
+// (cross-origin) to the oauth2-proxy/Dex login, an opaque redirect under
+// redirect:"manual". A valid session returns 200; an ungated deploy also 200.
+async function authExpired(){
+  try{
+    const r = await fetch(JSON_URL+"?auth="+Date.now(), {cache:"no-store", redirect:"manual"});
+    return r.type === "opaqueredirect" || r.status === 0;
+  }catch(_){ return false; }
+}
+tick(); setInterval(tick, REFRESH_MS);
+</script>
+<div id="cardModal" class="modal" onclick="if(event.target===this)closeCard()">
+  <div class="pcard"><button class="cx" onclick="closeCard()" title="close (Esc)">✕</button><div id="cardBody"></div></div>
+</div>
+</body>
+</html>

@@ -1,0 +1,157 @@
+# promtool unit tests for rules/luks-unlock.yml.
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/luks-unlock.test.yml
+
+rule_files:
+  - ../rules/luks-unlock.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Case 1 — host locked, 0 of 2 Tang servers
+  # answering, both siblings' tangd.socket down, cycles in the graph. Every rule fires.
+  - interval: 1m
+    input_series:
+      - series: 'goat_luks_volume_unlocked{instance="orin-a",volume="docker-data"}'
+        values: '0x20'
+      - series: 'goat_luks_tang_bound{instance="orin-a",volume="docker-data"}'
+        values: '2x20'
+      - series: 'goat_luks_tang_reachable{instance="orin-a",volume="docker-data"}'
+        values: '0x20'
+      - series: 'goat_tang_server_up{instance="orin-b"}'
+        values: '0x20'
+      - series: 'goat_boot_ordering_cycles{instance="orin-b",reading="next"}'
+        values: '4x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: LuksVolumeLocked
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: orin-a, volume: docker-data}
+            exp_annotations:
+              summary: "orin-a: LUKS volume docker-data is locked"
+              description: "The post-boot unlock has not opened docker-data for 10 minutes, so every service on it (Docker on a mgmt host) is down. goat-unlock-health restarts the unlock unit every 2 min; if this stays red, its Tang servers are not answering (see LuksTangQuorumLost) — start tangd.socket on a sibling, or unlock with the installer passphrase. Runbook: docs/design/os-baseline-and-luks.md §3.2a (Recovery)."
+      - eval_time: 16m
+        alertname: TangServerDown
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: orin-b}
+            exp_annotations:
+              summary: "orin-b: tangd.socket is enabled but not listening"
+              description: "A sibling host's LUKS unlock depends on this Tang server. `sudo systemctl start tangd.socket`, then find out why it did not start at boot (ordering cycle? see BootOrderingCycle)."
+
+  # Case 2 — healthy host: unlocked, 2/2 Tang, no cycles, Tang up. Nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'goat_luks_volume_unlocked{instance="orin-a",volume="docker-data"}'
+        values: '1x30'
+      - series: 'goat_luks_tang_bound{instance="orin-a",volume="docker-data"}'
+        values: '2x30'
+      - series: 'goat_luks_tang_reachable{instance="orin-a",volume="docker-data"}'
+        values: '2x30'
+      - series: 'goat_tang_server_up{instance="orin-b"}'
+        values: '1x30'
+      - series: 'goat_boot_ordering_cycles{instance="orin-b",reading="next"}'
+        values: '0x30'
+      - series: 'goat_boot_ordering_cycles{instance="orin-b",reading="boot"}'
+        values: '3x30'
+    alert_rule_test:
+      - {eval_time: 25m, alertname: LuksVolumeLocked, exp_alerts: []}
+      - {eval_time: 25m, alertname: LuksTangQuorumLost, exp_alerts: []}
+      - {eval_time: 25m, alertname: TangServerDown, exp_alerts: []}
+      - {eval_time: 25m, alertname: BootOrderingCycle, exp_alerts: []}
+
+  # Case 3 — unlocked now, but one Tang server of two gone: the NEXT boot is at
+  # risk. Quorum rule fires while the volume rule stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'goat_luks_volume_unlocked{instance="orin-a",volume="docker-data"}'
+        values: '1x20'
+      - series: 'goat_luks_tang_bound{instance="orin-a",volume="docker-data"}'
+        values: '2x20'
+      - series: 'goat_luks_tang_reachable{instance="orin-a",volume="docker-data"}'
+        values: '1x20'
+    alert_rule_test:
+      - {eval_time: 15m, alertname: LuksVolumeLocked, exp_alerts: []}
+      # `bound > 0` must not be on the LEFT of `and`, or the summary reports the
+      # bound count (2) instead of the answering count (1).
+      - eval_time: 15m
+        alertname: LuksTangQuorumLost
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: orin-a, volume: docker-data}
+            exp_annotations:
+              summary: "orin-a: 1 Tang server(s) answer for docker-data"
+              description: "Fewer than the configured minimum Tang servers answer for docker-data. The volume may be open now, but the next reboot of this host will not unlock unattended. Check tangd.socket on the servers named by `clevis luks list -d <device>`."
+
+  # Case 4 — a host with no clevis volume emits none of these series. Silence.
+  - interval: 1m
+    input_series:
+      - series: 'node_load1{instance="thor"}'
+        values: '1x30'
+    alert_rule_test:
+      - {eval_time: 25m, alertname: LuksVolumeLocked, exp_alerts: []}
+      - {eval_time: 25m, alertname: BootOrderingCycle, exp_alerts: []}
+
+  # Declared Tang client: missing bindings must page even while mounted.
+  - interval: 1m
+    input_series:
+      - series: 'goat_luks_volume_unlocked{instance="fixture",volume="data"}'
+        values: '1x20'
+      - series: 'goat_luks_tang_bound{instance="fixture",volume="data"}'
+        values: '0x20'
+      - series: 'goat_luks_tang_reachable{instance="fixture",volume="data"}'
+        values: '0x20'
+      - series: 'goat_luks_tang_min_reachable{instance="fixture",volume="data"}'
+        values: '2x20'
+      - series: 'goat_luks_binding_read_ok{instance="fixture",volume="data"}'
+        values: '1x20'
+    alert_rule_test:
+      - {eval_time: 15m, alertname: LuksVolumeLocked, exp_alerts: []}
+      - eval_time: 15m
+        alertname: LuksTangQuorumLost
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: fixture, volume: data}
+            exp_annotations:
+              summary: "fixture: 0 Tang server(s) answer for data"
+              description: "Fewer than the configured minimum Tang servers answer for data. The volume may be open now, but the next reboot of this host will not unlock unattended. Check tangd.socket on the servers named by `clevis luks list -d <device>`."
+
+  # Unreadable bindings are unknown, not a measured zero quorum.
+  - interval: 1m
+    input_series:
+      - series: 'goat_luks_tang_bound{instance="fixture",volume="data"}'
+        values: '0x20'
+      - series: 'goat_luks_tang_reachable{instance="fixture",volume="data"}'
+        values: '0x20'
+      - series: 'goat_luks_tang_min_reachable{instance="fixture",volume="data"}'
+        values: '2x20'
+      - series: 'goat_luks_binding_read_ok{instance="fixture",volume="data"}'
+        values: '0x20'
+    alert_rule_test:
+      - {eval_time: 15m, alertname: LuksTangQuorumLost, exp_alerts: []}
+      - eval_time: 15m
+        alertname: LuksBindingReadFailed
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: fixture, volume: data}
+            exp_annotations:
+              summary: "fixture: cannot read LUKS bindings for data"
+              description: "Clevis could not read the volume bindings, so unattended-unlock health is unknown. Check device access and `clevis luks list -d <device>` before claiming reboot readiness."
+
+  # SSS without Tang is valid. A recorded one-server override is honored too.
+  - interval: 1m
+    input_series:
+      - series: 'goat_luks_tang_bound{instance="fixture",volume="sss"}'
+        values: '0x20'
+      - series: 'goat_luks_tang_reachable{instance="fixture",volume="sss"}'
+        values: '0x20'
+      - series: 'goat_luks_tang_min_reachable{instance="fixture",volume="sss"}'
+        values: '0x20'
+      - series: 'goat_luks_binding_read_ok{instance="fixture",volume="sss"}'
+        values: '1x20'
+      - series: 'goat_luks_tang_bound{instance="fixture",volume="override"}'
+        values: '1x20'
+      - series: 'goat_luks_tang_reachable{instance="fixture",volume="override"}'
+        values: '1x20'
+      - series: 'goat_luks_tang_min_reachable{instance="fixture",volume="override"}'
+        values: '1x20'
+      - series: 'goat_luks_binding_read_ok{instance="fixture",volume="override"}'
+        values: '1x20'
+    alert_rule_test:
+      - {eval_time: 15m, alertname: LuksTangQuorumLost, exp_alerts: []}
+      - {eval_time: 15m, alertname: LuksBindingReadFailed, exp_alerts: []}

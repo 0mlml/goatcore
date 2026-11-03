@@ -1,0 +1,87 @@
+# oauth2-proxy-dashboard overlay — L7 admin-fence in front of netbird-dashboard.
+# Block 83C.2-L7; closes the L7 portion of F-132.
+#
+# Used as a compose OVERLAY on top of mgmt-host docker-compose.yml +
+# docker-compose.dashboard.yml:
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.dashboard.yml \
+#                  -f docker-compose.oauth2-proxy-dashboard.yml \
+#                  up -d
+#
+# Driven by the Ansible role ops/ansible/roles/oauth2-proxy-dashboard/, which:
+#   1. Renders /opt/mgmt-host/oauth2-proxy-dashboard.env (mode 0600 —
+#      oauth2-proxy client_secret + cookie secret + ADMINS gate).
+#   2. Provisions the Hydra OIDC client `oauth2-proxy-dashboard` via the
+#      sibling oauth2-proxy-dashboard-oidc-client role.
+#   3. Brings up oauth2-proxy-dashboard on the `mgmt` network.
+#
+# Routing (rendered into the Traefik dynamic file by traefik-acme.yml's
+# mgmt-dynamic.yml.j2 template when dashboard_oauth2_proxy_enabled is true):
+#   https://dashboard.<site>.<zone>/*  → oauth2-proxy-dashboard:4180
+#                                        (which then forwards to dashboard:80
+#                                         once the session cookie + ADMINS
+#                                         group claim check pass).
+#
+# Auth flow (browser-driven):
+#   1. Operator browses to https://dashboard.<site>.<zone>/.
+#   2. Traefik routes to oauth2-proxy-dashboard:4180. No session cookie →
+#      302 to /oauth2/start → /oauth2/sign_in → Hydra /oauth2/auth.
+#   3. Hydra delegates to Kratos (same Kratos that gates isitup + grafana).
+#   4. On consent, Hydra mints a JWT carrying the patched-consent-UI
+#      `groups` claim (ADR 0857) from the user's Kratos traits.groups.
+#   5. oauth2-proxy decodes the JWT. If `groups` contains ADMINS, the
+#      session cookie is set and the request forwards to dashboard:80.
+#      If not, oauth2-proxy returns 403 "User has no allowed groups" —
+#      the gate has done its job.
+#   6. The dashboard SPA loads and does its OWN PKCE flow against Hydra
+#      (for the existing `dashboard` OIDC client) to fetch a mgmt-API
+#      access token; the user's Kratos session cookie from step 3 makes
+#      this silent.
+
+services:
+  oauth2-proxy-dashboard:
+    # SHA-pinned per ADR 0859 (easy rollback). Per-service env var
+    # (OAUTH2_PROXY_DASHBOARD_IMAGE) so this container's rollback is
+    # independent of oauth2-proxy-isitup. The role writes
+    # OAUTH2_PROXY_DASHBOARD_IMAGE to /opt/mgmt-host/.env from its
+    # dashboard_oauth2_proxy_image default; rollback.sh flips it via
+    # the env_file path in deploy-history.yml.
+    image: ${OAUTH2_PROXY_DASHBOARD_IMAGE:-quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d}
+    container_name: oauth2-proxy-dashboard
+    restart: unless-stopped
+    # On-host OIDC-discovery resolution (F-126 pattern — same shape as
+    # oauth2-proxy-isitup). Docker's embedded resolver (127.0.0.11) forwards
+    # to the host's /etc/resolv.conf — it does NOT know about mesh CoreDNS
+    # at <nova-a mesh IP>:5353. Without this static entry, oauth2-proxy
+    # crash-loops on startup trying to resolve oauth2.<site>.<zone>.
+    # The role-rendered .env sets:
+    #   OAUTH2_PROXY_DASHBOARD_OIDC_HOST_ENTRY=oauth2.<site>.<zone>:<nova-a mesh IP>
+    # Default is a no-op localhost mapping so compose stays valid without
+    # site-specific env (sites that don't gate the dashboard won't run
+    # this overlay).
+    extra_hosts:
+      - "${OAUTH2_PROXY_DASHBOARD_OIDC_HOST_ENTRY:-localhost.invalid:127.0.0.1}"
+    env_file:
+      - oauth2-proxy-dashboard.env
+    # Loopback-only diagnostic port. Production traffic comes via Traefik
+    # service-name resolution on the mgmt docker network. Lets the role's
+    # post-bringup ping hit /ping without going through Traefik.
+    ports:
+      - "127.0.0.1:${DASHBOARD_OAUTH2_PROXY_HOST_PORT:-4181}:4180"
+    networks:
+      - mgmt
+    # No exec healthcheck: the oauth2-proxy image is distroless (no wget / sh /
+    # curl), so this wget probe is unrunnable and leaves the container
+    # perpetually "unhealthy" despite the proxy serving fine. oauth2-
+    # proxy ships no self-health subcommand; liveness is observable via Traefik
+    # forwardAuth (auth fails loudly if it is down) + its access logs.
+    healthcheck:
+      test: ["NONE"]
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "block=83C.2-L7"
+
+networks:
+  mgmt:
+    external: true
+    name: mgmt

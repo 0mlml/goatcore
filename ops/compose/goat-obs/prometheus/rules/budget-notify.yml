@@ -1,0 +1,138 @@
+# budget-notify health — the tenant notifier's own watchdog.
+#
+# budget-notify (ops/zenoh-trial-peers/budget-notify/budget-notify.py, systemd
+# timer installed by ops/ansible/roles/budget-notify) mails topic-budget
+# verdicts to tenant owners. It is a oneshot timer job, which is the silent
+# death class the 2026-08-01 identity fragility audit flagged: when it dies the
+# unit just stops, nothing is written and nothing off-host changes. The role's
+# hardening pass added run-outcome metrics; these are the rules on them.
+#
+# Cadence: budget_notify_interval defaults to 15min (OnUnitActiveSec) and no
+# group_vars overrides it, so the staleness bound below is three missed runs.
+#
+# THE TWO VALUE RULES ARE NOT REDUNDANT — they cover disjoint failures, and
+# each is blind to the other's:
+#
+#   BudgetNotifyDown   fires when a run FAILED. The OnFailure unit
+#                      (budget-notify-failure.service.j2) rewrites the textfile
+#                      WHOLESALE with up=0 + last_failure_timestamp, which means
+#                      goat_budget_notify_last_run_timestamp_seconds DISAPPEARS
+#                      on a failed run and the staleness rule below goes silent
+#                      exactly when things break.
+#   BudgetNotifyStale  fires when the TIMER stopped firing at all. Nothing
+#                      rewrites the textfile then, so the last successful
+#                      content persists — up=1 forever, a frozen last_run — and
+#                      BudgetNotifyDown stays silent while nobody is mailed.
+#
+#   BudgetNotifyBandStale  fires when the notifier RUNS but the band file it
+#                      reads is not being written (the crawler's json_out was
+#                      unset, or the crawler is down). The notifier declines
+#                      honestly — up=1, last_run fresh — so the two rules above
+#                      are silent by design while nobody is mailed. ZAGROS ran
+#                      21 days like this (2026-08-19 → 09-09, F-509).
+#
+# Both directions are pinned in tests/budget-notify.test.yml, including the
+# blindness: a future edit that makes one rule "also cover" the other's case
+# would be a regression in honesty, not an improvement.
+#
+# Deployment gate: the role skips its whole metrics block when
+# budget_notify_metrics_out is empty (no node-exporter textfile dir on the
+# host), so on such a goatnet these series never exist. That is why the first
+# two rules are value comparisons rather than absent() forms — a bare absent()
+# would fire forever wherever the notifier deploys without metrics. The third
+# rule adds the deleted-metric case back with a presence guard, the same shape
+# as ZenohFabricSamplerAbsent / ZenohTopicBudgetSourceAbsent in zenoh-wedge.yml.
+
+groups:
+  - name: budget-notify
+    interval: 30s
+    rules:
+
+      - alert: BudgetNotifyDown
+        expr: goat_budget_notify_up == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "budget-notify's last run failed — tenant budget verdicts are not being mailed"
+          description: |
+            goat_budget_notify_up=0 for 30m (two missed 15-minute cycles). Either
+            the notifier raised and its OnFailure unit recorded the death, or it
+            is crash-looping. Owners at or over their topic-budget allowance are
+            NOT being told, and the one-time notice ledger is not advancing.
+            Note the sibling signal: on a failed run the textfile no longer
+            carries goat_budget_notify_last_run_timestamp_seconds, so
+            BudgetNotifyStale cannot corroborate this — do not read its silence
+            as reassurance. Triage on the mgmt host:
+              systemctl status budget-notify.service budget-notify.timer
+              journalctl -u budget-notify.service -n 80
+
+      - alert: BudgetNotifyStale
+        expr: time() - goat_budget_notify_last_run_timestamp_seconds > 2700
+        for: 10m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "budget-notify has not completed a run in 45m+ (timer stopped)"
+          description: |
+            The last COMPLETED run is over three 15-minute cycles old. This is
+            the dead-timer case, not the failed-run case: nothing has rewritten
+            the textfile, so goat_budget_notify_up is frozen at its last
+            successful 1 and BudgetNotifyDown is silent while no tenant is being
+            mailed. Textfile metrics never expire, which is exactly why this
+            rule has to exist. Check the timer on the mgmt host:
+              systemctl list-timers budget-notify.timer
+              systemctl status budget-notify.timer
+
+      # The STALE-INPUT case: the run completes (up=1, last_run fresh) but the
+      # band JSON it read is older than the notifier's own decline threshold
+      # (budget_notify_max_sample_age, 600 s). One old read is a crawler
+      # hiccup; 30m is two consecutive declined runs, which means the file is
+      # not being written at all. -1 (no sampled_at) is excluded: that is a
+      # malformed file, which the notifier also declines — a separate rule if
+      # it ever happens.
+      - alert: BudgetNotifyBandStale
+        expr: goat_budget_notify_band_age_seconds > 600
+        for: 30m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "budget-notify is running but its band file is stale — the crawler is not feeding it"
+          description: |
+            goat_budget_notify_band_age_seconds has been over 600 for 30m: two
+            consecutive runs read a zenoh-fabric.json older than the notifier's
+            decline threshold, so it mailed nobody and said so only in its
+            journal. Both BudgetNotifyDown and BudgetNotifyStale are silent here
+            by design — the run completed. Either the fabric crawler is down, or
+            it is not writing the file (fabric_crawler_json_out_host_path empty
+            on this host — F-509). On the mgmt host:
+              journalctl -u budget-notify.service -n 5
+              ls -l /opt/relay-health/www/ingest/zenoh-fabric.json
+              docker inspect fabric-crawler | grep '"Destination": "/out"'   # expect one line
+
+      # The DELETED-metric case: the node-exporter textfile was removed, or the
+      # role was re-run with the metrics block disabled, so BOTH rules above
+      # lose their operands and go quiet together. Guarded by
+      # count_over_time(...[6h]) > 0 so it fires only where the metric was
+      # recently present — a goatnet that deploys the notifier without a
+      # textfile dir never had the series and stays silent.
+      - alert: BudgetNotifyMetricsAbsent
+        expr: absent(goat_budget_notify_up) and on() (count_over_time(goat_budget_notify_up[6h]) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "budget-notify's run-outcome metrics DISAPPEARED (not stale — gone)"
+          description: |
+            goat_budget_notify_up was being published within the last 6h and is
+            now absent entirely, so both BudgetNotifyDown and BudgetNotifyStale
+            have nothing to compare and report nothing. The notifier's textfile
+            was deleted, node-exporter lost its textfile dir, or the role was
+            re-applied with budget_notify_metrics_out empty. Whether tenants are
+            being mailed is now UNKNOWN, not fine. Check on the mgmt host:
+              ls -l /var/lib/node_exporter/textfile_collector/budget-notify.prom
+              systemctl status budget-notify.timer

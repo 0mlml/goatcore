@@ -1,0 +1,138 @@
+# isitup overlay — mesh-internal status page + Hydra-OIDC gate (oauth2-proxy).
+#
+# Rendered by ops/ansible/roles/isitup/ (template, not copy) → laid down at
+# /opt/mgmt-host/docker-compose.isitup.yml and used as a compose OVERLAY on
+# top of mgmt-host docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.isitup.yml up -d
+#
+# Templated so the isitup container can join site-specific extra Docker networks
+# via `isitup_extra_networks`. A fabric host sets it to ["goat-zenoh_default"] so
+# check.sh can probe the Zenoh router's REST plugin (:8000) — the router lives on
+# the zenoh compose project's own network, unreachable from `mgmt`. Default [] =
+# mgmt-only.
+#
+# Driven by the Ansible role ops/ansible/roles/isitup/, which:
+#   1. Renders /opt/mgmt-host/isitup/{index.html,nginx.conf,check.sh,services.env}.
+#   2. Renders /opt/mgmt-host/isitup.env (mode 0600 — oauth2-proxy client_secret +
+#      cookie secret) and /opt/mgmt-host/isitup-services.env (the service list
+#      sourced by check.sh on each cron tick).
+#   3. Provisions the Hydra OIDC client `isitup-<site>` (via the
+#      isitup-oidc-client role).
+#   4. Renders /etc/traefik/dynamic/isitup-<site>.yml (Traefik routers — the
+#      forwardAuth middleware points at oauth2-proxy:4180).
+#   5. Brings up isitup + oauth2-proxy-isitup on the `mgmt` Docker network
+#      (plus any isitup_extra_networks for isitup).
+#   6. Installs a cron entry that runs check.sh every 5 minutes inside the
+#      `isitup` container; results land in /opt/mgmt-host/isitup/data/ which
+#      is bind-mounted into the container.
+#
+# Routing (rendered into the Traefik dynamic file by the role):
+#   https://isitup.<site>.<zone>/oauth2/*  → oauth2-proxy-isitup:4180   (auth-flow paths)
+#   https://isitup.<site>.<zone>/*         → isitup:80 via forwardAuth → oauth2-proxy-isitup:4180/oauth2/auth
+#
+# Auth flow (browser-driven):
+#   1. Operator browses to https://isitup.<site>.<zone>/.
+#   2. Traefik forwardAuth calls oauth2-proxy /oauth2/auth — returns 401 (no session).
+#   3. oauth2-proxy 302s to /oauth2/start → /oauth2/sign_in → Hydra /oauth2/auth.
+#   4. Hydra delegates to Kratos for login (same Kratos that gates the dashboard).
+#   5. On consent, oauth2-proxy sets an _oauth2_proxy session cookie scoped to
+#      the isitup host and forwards the request to nginx.
+#   6. nginx serves the static index.html + /data/{current,history}.json that
+#      check.sh has been writing.
+
+services:
+  isitup:
+    # Pinned by digest from nginx:1.27-alpine.
+    image: ${ISITUP_IMAGE:-nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
+    container_name: isitup
+    restart: unless-stopped
+    volumes:
+      - /opt/mgmt-host/isitup/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /opt/mgmt-host/isitup/index.html:/usr/share/nginx/html/index.html:ro
+      - /opt/mgmt-host/isitup/icons:/usr/share/nginx/html/icons:ro
+      - /opt/mgmt-host/isitup/check.sh:/usr/local/bin/check.sh:ro
+      - /opt/mgmt-host/isitup/data:/usr/share/nginx/html/data:rw
+      - /opt/mgmt-host/isitup/services.env:/etc/isitup/services.env:ro
+      # Read access to the host Docker socket lets check.sh use
+      # `docker inspect` to verify container-state for `type: container`
+      # entries in services.env.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # check.sh needs bash + curl + dig + python3 + docker CLI. nginx:alpine
+    # ships none of these; install at container start. CRITICAL: nginx
+    # MUST NOT be gated on the apk install — the prior `apk add ... && nginx`
+    # made the whole page's availability depend on a live-internet package
+    # download succeeding on every restart; an apk failure/hang (network blip,
+    # CDN, lock contention) short-circuited the `&&` and nginx never started →
+    # total 502. Now the install runs in the BACKGROUND (failure-tolerant via
+    # `|| true`) and nginx starts immediately, so the page serves regardless;
+    # check.sh just waits for the tools on its next 5-min cron tick.
+    command: >
+      sh -c "(apk add --no-cache bash curl bind-tools python3 docker-cli || true) &
+             exec nginx -g 'daemon off;'"
+    # Static host entries so check.sh can probe `type: external` services whose
+    # mesh hostnames the container's resolver can't see (the mgmt-host's resolver
+    # doesn't query the mesh CoreDNS — same reason oauth2-proxy needs its
+    # OIDC_HOST_ENTRY below). Each is "host:ip" (e.g. the Zero-Trust Sandbox row
+    # maps its mesh hostname to the cloud VM's mesh IP so it probes green).
+{% if isitup_extra_hosts | default([]) | length > 0 %}
+    extra_hosts:
+{% for he in isitup_extra_hosts %}
+      - "{{ he }}"
+{% endfor %}
+{% endif %}
+    networks:
+      - mgmt
+{% for net in isitup_extra_networks | default([]) %}
+      - {{ net }}
+{% endfor %}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "block=isitup"
+
+  oauth2-proxy-isitup:
+    # Pinned by digest from quay.io/oauth2-proxy/oauth2-proxy:v7.6.0.
+    # Bumps must go through the same digest-pin gate as other compose images.
+    image: ${OAUTH2_PROXY_IMAGE:-quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d}
+    container_name: oauth2-proxy-isitup
+    restart: unless-stopped
+    # On-host OIDC-discovery resolution.
+    # Docker's embedded resolver (127.0.0.11) forwards to the host's
+    # /etc/resolv.conf — it does NOT know about the mesh CoreDNS.
+    # Without this static entry, oauth2-proxy crash-
+    # loops on startup trying to resolve oauth2.<site>.<zone> (the OIDC
+    # issuer URL). The role-rendered isitup.env sets:
+    #   OAUTH2_PROXY_OIDC_HOST_ENTRY=oauth2.<site>.<zone>:<mgmt host mesh IP>
+    # Default is a no-op localhost mapping so the compose stays valid
+    # without site-specific env.
+    extra_hosts:
+      - "${OAUTH2_PROXY_OIDC_HOST_ENTRY:-localhost.invalid:127.0.0.1}"
+    env_file:
+      - isitup.env
+    networks:
+      - mgmt
+    # No exec healthcheck: the oauth2-proxy image is distroless (no wget / sh /
+    # curl), so this wget probe is unrunnable and leaves the container
+    # perpetually "unhealthy" despite the proxy serving fine. oauth2-
+    # proxy ships no self-health subcommand; liveness is observable via Traefik
+    # forwardAuth (auth fails loudly if it is down) + its access logs.
+    healthcheck:
+      test: ["NONE"]
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "block=isitup"
+
+networks:
+  mgmt:
+    external: true
+    name: mgmt
+{% for net in isitup_extra_networks | default([]) %}
+  {{ net }}:
+    external: true
+    name: {{ net }}
+{% endfor %}

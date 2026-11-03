@@ -1,0 +1,371 @@
+# promtool unit tests for rules/grant-keyd.yml.
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/grant-keyd.test.yml
+#
+# The load-bearing assertions here are the ones about what must NOT fire:
+#   - a quiet fabric (rotation days old, sweeps turning) is HEALTHY and must
+#     stay silent — keyd rotates only when an audience changes
+#   - the derived staleness bound must work at a SHORT poll interval, where
+#     the 90s floor applies. An earlier draft used `> 90 or vector(90)`, which
+#     silently never fires there because the fallback is label-less and cannot
+#     match the labelled left-hand side. Case 3 is that regression test.
+
+rule_files:
+  - ../rules/grant-keyd.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Case 1 — HEALTHY QUIET FABRIC. Sweeps turn every 60s; nothing has rotated
+  # in days because no audience changed. Nothing may fire.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x60'
+      - series: 'grant_keyd_up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x60'
+      - series: 'grant_keyd_poll_interval_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '60x60'
+      # Sweep clock keeps pace with wall clock (fresh every minute).
+      - series: 'grant_keyd_last_sweep_timestamp_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '0+60x60'
+      # Rotation clock frozen 5 days in the past — CORRECT on a quiet fabric.
+      - series: 'grant_keyd_last_rotation_timestamp_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '-432000x60'
+      - series: 'grant_keyd_key_source_validated{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: GrantKeydSweepStale
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: GrantKeydTargetDown
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: GrantKeydUnvalidatedKeySource
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: GrantKeydMetricsAbsent
+        exp_alerts: []
+
+  # Case 2 — ALIVE BUT NOT SWEEPING. Scrape stays green, the poll loop stops.
+  # Poll interval 300s -> bound is 3x = 900s, above the 90s floor.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x90'
+      - series: 'grant_keyd_up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x90'
+      - series: 'grant_keyd_poll_interval_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '300x90'
+      # Advances to t=10m then freezes at 600.
+      - series: 'grant_keyd_last_sweep_timestamp_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '0+60x10 600x79'
+    alert_rule_test:
+      # age = 900s at t=25m — not yet OVER the bound.
+      - eval_time: 24m
+        alertname: GrantKeydSweepStale
+        exp_alerts: []
+      # age > 900s from t=25m; for:5m -> firing by 31m.
+      - eval_time: 35m
+        alertname: GrantKeydSweepStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: identity
+              job: grant-keyd
+              instance: grant-keyd:9464
+            exp_annotations:
+              summary: "CRITICAL: grant-keyd is up but has not completed a sweep in 3 poll intervals"
+              description: |
+                grant-keyd answers /metrics but its poll loop has stopped turning —
+                the process is alive and the work is not happening, which no
+                container-level signal can see. Note this is the SWEEP clock, which
+                advances even when every release set is Unchanged, so this is a
+                genuine stall and not a quiet fabric. Its own /healthz will be
+                returning 503 on the same threshold. Triage on the Thor:
+                  docker logs --tail 120 grant-keyd
+                  docker exec grant-keyd true   # process responsive at all?
+      # The scrape is fine, so the hard-down rule must stay silent — the whole
+      # point of having both.
+      - eval_time: 35m
+        alertname: GrantKeydTargetDown
+        exp_alerts: []
+
+  # Case 3 — REGRESSION TEST for the staleness floor. Poll interval 10s, so
+  # 3x = 30s and the 90s floor governs. With the `or vector(90)` form this
+  # alert could never fire; with clamp_min it fires on schedule.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x40'
+      - series: 'grant_keyd_up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x40'
+      - series: 'grant_keyd_poll_interval_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '10x40'
+      # Frozen at 0 from the start: sweep age == wall clock.
+      - series: 'grant_keyd_last_sweep_timestamp_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '0x40'
+    alert_rule_test:
+      # age 90s at t=1m30s — floor not yet exceeded, and for:5m unmet anyway.
+      - eval_time: 1m
+        alertname: GrantKeydSweepStale
+        exp_alerts: []
+      # age > 90s from t=1m30s; for:5m -> firing by 6m30s.
+      - eval_time: 10m
+        alertname: GrantKeydSweepStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: identity
+              job: grant-keyd
+              instance: grant-keyd:9464
+            exp_annotations:
+              summary: "CRITICAL: grant-keyd is up but has not completed a sweep in 3 poll intervals"
+              description: |
+                grant-keyd answers /metrics but its poll loop has stopped turning —
+                the process is alive and the work is not happening, which no
+                container-level signal can see. Note this is the SWEEP clock, which
+                advances even when every release set is Unchanged, so this is a
+                genuine stall and not a quiet fabric. Its own /healthz will be
+                returning 503 on the same threshold. Triage on the Thor:
+                  docker logs --tail 120 grant-keyd
+                  docker exec grant-keyd true   # process responsive at all?
+
+  # Case 4 — BREAK-GLASS KEY SOURCE. Everything else is healthy: sweeps turn,
+  # scrape is green, no errors. Only the posture rule may fire.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x40'
+      - series: 'grant_keyd_up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x40'
+      - series: 'grant_keyd_poll_interval_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '60x40'
+      - series: 'grant_keyd_last_sweep_timestamp_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '0+60x40'
+      - series: 'grant_keyd_key_source_validated{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: GrantKeydUnvalidatedKeySource
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: identity
+              job: grant-keyd
+              instance: grant-keyd:9464
+            exp_annotations:
+              summary: "grant-keyd is running the UNVALIDATED break-glass key source"
+              description: |
+                grant_keyd_key_source_validated=0 — recipient keys are being read
+                from the cert-dir source without portal-CA or SVID validation. Key
+                bundles are still being distributed normally, so no other signal
+                will fire: sweeps succeed, errors stay flat, /healthz stays 200.
+                If this is an intentional break-glass window, close it; if it is
+                not, the daemon's key-source configuration regressed. Posture
+                labels are on grant_keyd_build_info{key_source,audience_source}.
+      # Explicitly: nothing else may fire. The break-glass mode is invisible to
+      # every other signal, which is why it needs its own rule.
+      - eval_time: 30m
+        alertname: GrantKeydSweepStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: GrantKeydTargetDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: GrantKeydErrorsSustained
+        exp_alerts: []
+
+  # Case 4b — F-569: the portal refuses keyd's token, so every sweep's
+  # enumerate call errors (one per 30s sweep). Must PAGE: no new grant becomes a
+  # key while this lasts. Before F-569 this was a warning and sat for 3 days.
+  - interval: 1m
+    input_series:
+      - series: 'grant_keyd_errors_total{job="grant-keyd",instance="grant-keyd:9464",stage="enumerate"}'
+        values: '0+2x90'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GrantKeydErrorsSustained
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: GrantKeydErrorsSustained
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: identity
+              stage: enumerate
+            exp_annotations:
+              summary: "grant-keyd erroring continuously in stage enumerate"
+              description: |
+                grant-keyd has produced errors in the enumerate stage
+                continuously for 30m — not a transient blip during a portal or
+                router restart. resolve = recipient certs are not resolving
+                (portal unreachable, or a member has no published key);
+                rotate = bundle publish is failing (router ACL / SVID);
+                enumerate = the audience source is not answering. Per-release-set
+                attribution is on grant_keyd_release_set_failures_total.
+
+  # Case 5 — TARGET DOWN, then metrics gone. up=0 must page; the absent-guard
+  # must NOT double-fire while the target is merely down (up is synthesized by
+  # Prometheus, so it exists even when the scrape fails, but grant_keyd_up does
+  # not — the guard is for an exporter answering 200 with an empty body).
+  - interval: 1m
+    input_series:
+      - series: 'up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x10 0x50'
+      - series: 'grant_keyd_up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: GrantKeydTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: identity
+              job: grant-keyd
+              instance: grant-keyd:9464
+            exp_annotations:
+              summary: "CRITICAL: grant-keyd /metrics unreachable for 5m+"
+              description: |
+                Prometheus cannot scrape grant-keyd:9464. The daemon is stopped,
+                crash-looping, wedged before binding, or lost its route to the obs
+                stack. Key-bundle distribution is not happening: a `goat access
+                grant` will not reach its recipients until this clears. Triage on
+                the Thor:
+                  docker ps -a | grep grant-keyd
+                  docker logs --tail 80 grant-keyd
+
+  # Case 6 — a goatnet that never scraped grant-keyd (the gate is false). The
+  # 6h presence guard must keep the absent-rule silent forever.
+  - interval: 1m
+    input_series:
+      - series: 'goat_identity_reconcile_up{env="nova"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: GrantKeydMetricsAbsent
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: GrantKeydTargetDown
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: GrantKeydSweepStale
+        exp_alerts: []
+
+  # Case 7 — A REVOKE THAT NEVER PUBLISHED. The daemon is entirely healthy by
+  # every other signal: scrape green, sweeps turning every minute, key source
+  # validated. One release-set's resolved audience stopped matching its
+  # published generation 20 minutes ago and has stayed that way, because the
+  # publish leg is refusing. Only GrantKeydAudienceDriftSustained may fire —
+  # and the sweep rule must stay silent, which is the whole point of the rule
+  # existing separately.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x60'
+      - series: 'grant_keyd_up{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x60'
+      - series: 'grant_keyd_poll_interval_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '30x60'
+      - series: 'grant_keyd_last_sweep_timestamp_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '0+60x60'
+      - series: 'grant_keyd_key_source_validated{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '1x60'
+      # In sync for 10m, then a change is read and never lands: the gauge is
+      # re-published every sweep and climbs by 60s a minute.
+      - series: 'grant_keyd_release_set_audience_drift_seconds{job="grant-keyd",instance="grant-keyd:9464",release_set="e7a9c75b"}'
+        values: '0x10 0+60x50'
+      # A second set that stays in sync throughout must NOT be alerted on.
+      - series: 'grant_keyd_release_set_audience_drift_seconds{job="grant-keyd",instance="grant-keyd:9464",release_set="quiet"}'
+        values: '0x60'
+    alert_rule_test:
+      # 5m in: drift is 0, nothing pending.
+      - eval_time: 5m
+        alertname: GrantKeydAudienceDriftSustained
+        exp_alerts: []
+      # 30m in: drift ~20m, far past the 90s floor, and held for 5m+.
+      - eval_time: 30m
+        alertname: GrantKeydAudienceDriftSustained
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: identity
+              job: grant-keyd
+              instance: grant-keyd:9464
+              release_set: e7a9c75b
+            exp_annotations:
+              summary: "CRITICAL: grant-keyd cannot publish the new audience for e7a9c75b"
+              description: |
+                The audience grant-keyd resolves for release-set
+                e7a9c75b has not matched its published generation
+                for longer than three poll intervals. A membership change has been
+                read and not distributed: if it was a revoke, the member is still
+                in the live generation and can still open the stream. The daemon is
+                otherwise healthy — it keeps sweeping, so GrantKeydSweepStale will
+                not fire, and its rotation clock legitimately stays put.
+                Cause is almost always the publish leg (router ACL on keys/**, or
+                the signer SVID) — check grant_keyd_errors_total{stage="rotate"}
+                and grant_keyd_release_set_failures_total for the same set, then:
+                  docker logs --tail 120 grant-keyd
+                Containment while it is stuck is the read side: withdraw the
+                keys/<release-set>/** scope on the edge (grant-keyed-encryption.md
+                §4, ADR 1169) rather than waiting for the rotation.
+      # The daemon is NOT stalled — the drift rule must not be reachable via
+      # the liveness rule, or the two would be redundant and one of them wrong.
+      - eval_time: 30m
+        alertname: GrantKeydSweepStale
+        exp_alerts: []
+
+  # Case 8 — the two ways this rule breaks silently, at a SHORT poll interval
+  # where the 90s floor is load-bearing. Both were negative-probed: strike
+  # either construct out of the rule and this case fails.
+  #
+  #   1. LABEL MATCHING. The poll-interval gauge carries no release_set label
+  #      while the drift gauge does, so a bare `>` finds no matching pairs and
+  #      the rule fires nothing at all. Same class as the `or vector()` bug
+  #      case 3 guards, one level up: a label-less right-hand side there, a
+  #      missing on(...) group_left() here. The 100s series covers it.
+  #   2. THE 90s FLOOR. At a 10s poll interval 3x is 30s, so without the floor
+  #      a release-set only 50s behind would page — during the ordinary window
+  #      where a rotation is simply in flight. The floor's job is to SUPPRESS
+  #      that, so its regression test is a must-not-fire, not a must-fire: the
+  #      50s series below.
+  - interval: 1m
+    input_series:
+      - series: 'grant_keyd_poll_interval_seconds{job="grant-keyd",instance="grant-keyd:9464"}'
+        values: '10x60'
+      # 100s of drift — past the floor, fires only if the labels also match.
+      - series: 'grant_keyd_release_set_audience_drift_seconds{job="grant-keyd",instance="grant-keyd:9464",release_set="rs"}'
+        values: '100x60'
+      # 50s of drift — past 3x a 10s poll but inside the floor. Must stay quiet.
+      - series: 'grant_keyd_release_set_audience_drift_seconds{job="grant-keyd",instance="grant-keyd:9464",release_set="within-floor"}'
+        values: '50x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GrantKeydAudienceDriftSustained
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: identity
+              job: grant-keyd
+              instance: grant-keyd:9464
+              release_set: rs
+            exp_annotations:
+              summary: "CRITICAL: grant-keyd cannot publish the new audience for rs"
+              description: |
+                The audience grant-keyd resolves for release-set
+                rs has not matched its published generation
+                for longer than three poll intervals. A membership change has been
+                read and not distributed: if it was a revoke, the member is still
+                in the live generation and can still open the stream. The daemon is
+                otherwise healthy — it keeps sweeping, so GrantKeydSweepStale will
+                not fire, and its rotation clock legitimately stays put.
+                Cause is almost always the publish leg (router ACL on keys/**, or
+                the signer SVID) — check grant_keyd_errors_total{stage="rotate"}
+                and grant_keyd_release_set_failures_total for the same set, then:
+                  docker logs --tail 120 grant-keyd
+                Containment while it is stuck is the read side: withdraw the
+                keys/<release-set>/** scope on the edge (grant-keyed-encryption.md
+                §4, ADR 1169) rather than waiting for the rotation.

@@ -1,0 +1,215 @@
+# promtool unit tests for rules/budget-notify.yml.
+#
+# Run by .github/workflows/prometheus-rules.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/budget-notify.test.yml
+#
+# The point of these three rules is that they cover DISJOINT failures and each
+# is blind to the other's, so the tests assert the blindness too — a future
+# edit that makes one rule "also cover" the other's case would be a regression
+# in honesty, not an improvement.
+#
+# Ground truth for the fixtures (ops/ansible/roles/budget-notify):
+#   - the timer is OnUnitActiveSec=15min (budget_notify_interval default)
+#   - a SUCCESSFUL run writes up=1 + last_run_timestamp (+ sends/failures/...)
+#   - a FAILED run's OnFailure unit rewrites the file WHOLESALE with up=0 and
+#     last_failure_timestamp only, so last_run_timestamp is GONE
+#   - a DEAD TIMER rewrites nothing, so the last successful file persists
+
+rule_files:
+  - ../rules/budget-notify.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Case 1 — FAILED RUN. up flips to 0 and last_run_timestamp disappears,
+  # exactly as the OnFailure unit leaves the textfile.
+  - interval: 1m
+    input_series:
+      - series: 'goat_budget_notify_up'
+        values: '1x20 0x60'
+      - series: 'goat_budget_notify_last_run_timestamp_seconds'
+        values: '0+60x20'
+    alert_rule_test:
+      # Healthy stretch: nothing fires.
+      - eval_time: 15m
+        alertname: BudgetNotifyDown
+        exp_alerts: []
+      # up=0 from 21m; for:30m satisfied by 55m.
+      - eval_time: 55m
+        alertname: BudgetNotifyDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: identity
+            exp_annotations:
+              summary: "budget-notify's last run failed — tenant budget verdicts are not being mailed"
+              description: |
+                goat_budget_notify_up=0 for 30m (two missed 15-minute cycles). Either
+                the notifier raised and its OnFailure unit recorded the death, or it
+                is crash-looping. Owners at or over their topic-budget allowance are
+                NOT being told, and the one-time notice ledger is not advancing.
+                Note the sibling signal: on a failed run the textfile no longer
+                carries goat_budget_notify_last_run_timestamp_seconds, so
+                BudgetNotifyStale cannot corroborate this — do not read its silence
+                as reassurance. Triage on the mgmt host:
+                  systemctl status budget-notify.service budget-notify.timer
+                  journalctl -u budget-notify.service -n 80
+      # The documented blindness: last_run_timestamp is GONE, so the staleness
+      # rule has no operands and stays silent through the whole failure.
+      - eval_time: 55m
+        alertname: BudgetNotifyStale
+        exp_alerts: []
+      # up is still being published (as 0), so the absent-guard must NOT fire.
+      - eval_time: 55m
+        alertname: BudgetNotifyMetricsAbsent
+        exp_alerts: []
+
+  # Case 2 — DEAD TIMER. Nothing rewrites the textfile: up stays frozen at its
+  # last successful 1 and last_run_timestamp stops advancing. Textfile metrics
+  # never expire, so node-exporter keeps re-serving both values indefinitely.
+  - interval: 1m
+    input_series:
+      - series: 'goat_budget_notify_up'
+        values: '1x120'
+      # Stops advancing at t=10m: the value stays 600 while the clock runs on.
+      - series: 'goat_budget_notify_last_run_timestamp_seconds'
+        values: '0+60x10 600x109'
+    alert_rule_test:
+      # 45m bound + for:10m — not yet due at 50m.
+      - eval_time: 50m
+        alertname: BudgetNotifyStale
+        exp_alerts: []
+      # Last run at 600s, bound 2700s -> stale from 55m, firing from 65m.
+      - eval_time: 70m
+        alertname: BudgetNotifyStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: identity
+            exp_annotations:
+              summary: "budget-notify has not completed a run in 45m+ (timer stopped)"
+              description: |
+                The last COMPLETED run is over three 15-minute cycles old. This is
+                the dead-timer case, not the failed-run case: nothing has rewritten
+                the textfile, so goat_budget_notify_up is frozen at its last
+                successful 1 and BudgetNotifyDown is silent while no tenant is being
+                mailed. Textfile metrics never expire, which is exactly why this
+                rule has to exist. Check the timer on the mgmt host:
+                  systemctl list-timers budget-notify.timer
+                  systemctl status budget-notify.timer
+      # The documented blindness in the other direction: up is frozen at 1, so
+      # the failure rule reports nothing while nobody is being mailed.
+      - eval_time: 70m
+        alertname: BudgetNotifyDown
+        exp_alerts: []
+
+  # Case 3 — TEXTFILE DELETED. Every series vanishes at once, so both rules
+  # above lose their operands; only the absent-guard can see this.
+  - interval: 1m
+    input_series:
+      - series: 'goat_budget_notify_up'
+        values: '1x30'
+      - series: 'goat_budget_notify_last_run_timestamp_seconds'
+        values: '0+60x30'
+    alert_rule_test:
+      # Last sample 30m + 5m lookback -> absent from 35m; for:15m -> fires 50m.
+      - eval_time: 45m
+        alertname: BudgetNotifyMetricsAbsent
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: BudgetNotifyMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: identity
+            exp_annotations:
+              summary: "budget-notify's run-outcome metrics DISAPPEARED (not stale — gone)"
+              description: |
+                goat_budget_notify_up was being published within the last 6h and is
+                now absent entirely, so both BudgetNotifyDown and BudgetNotifyStale
+                have nothing to compare and report nothing. The notifier's textfile
+                was deleted, node-exporter lost its textfile dir, or the role was
+                re-applied with budget_notify_metrics_out empty. Whether tenants are
+                being mailed is now UNKNOWN, not fine. Check on the mgmt host:
+                  ls -l /var/lib/node_exporter/textfile_collector/budget-notify.prom
+                  systemctl status budget-notify.timer
+      # Both value comparisons are structurally silent here — the gap the
+      # absent-guard exists to cover.
+      - eval_time: 60m
+        alertname: BudgetNotifyDown
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: BudgetNotifyStale
+        exp_alerts: []
+
+  # Case 4 — a goatnet that deploys the notifier with NO textfile dir, so the
+  # metrics block is skipped and the series never exist. Nothing may ever fire
+  # here; this is what the count_over_time presence guard buys.
+  - interval: 1m
+    input_series:
+      - series: 'goat_identity_reconcile_up{env="zagros"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: BudgetNotifyMetricsAbsent
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: BudgetNotifyDown
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: BudgetNotifyStale
+        exp_alerts: []
+
+  # Case 5 — STALE INPUT. The timer keeps firing and every run completes
+  # (up=1, last_run advancing), but the band file is not being written, so
+  # each run reads an ever-older sample and declines. Down and Stale stay
+  # silent by design; BandStale is the only rule that sees it. Age crosses
+  # 600 at 11m; for:30m satisfied by 41m.
+  - interval: 1m
+    input_series:
+      - series: 'goat_budget_notify_up'
+        values: '1x90'
+      - series: 'goat_budget_notify_last_run_timestamp_seconds'
+        values: '0+60x90'
+      - series: 'goat_budget_notify_band_age_seconds'
+        values: '0+60x90'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BudgetNotifyBandStale
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: BudgetNotifyBandStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: identity
+            exp_annotations:
+              summary: "budget-notify is running but its band file is stale — the crawler is not feeding it"
+              description: |
+                goat_budget_notify_band_age_seconds has been over 600 for 30m: two
+                consecutive runs read a zenoh-fabric.json older than the notifier's
+                decline threshold, so it mailed nobody and said so only in its
+                journal. Both BudgetNotifyDown and BudgetNotifyStale are silent here
+                by design — the run completed. Either the fabric crawler is down, or
+                it is not writing the file (fabric_crawler_json_out_host_path empty
+                on this host — F-509). On the mgmt host:
+                  journalctl -u budget-notify.service -n 5
+                  ls -l /opt/relay-health/www/ingest/zenoh-fabric.json
+                  docker inspect fabric-crawler | grep '"Destination": "/out"'   # expect one line
+      # The documented blindness: the run completed, so neither sibling fires.
+      - eval_time: 45m
+        alertname: BudgetNotifyDown
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: BudgetNotifyStale
+        exp_alerts: []
+
+  # Case 6 — a healthy band (age held under 600) never fires BandStale.
+  - interval: 1m
+    input_series:
+      - series: 'goat_budget_notify_band_age_seconds'
+        values: '60x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: BudgetNotifyBandStale
+        exp_alerts: []

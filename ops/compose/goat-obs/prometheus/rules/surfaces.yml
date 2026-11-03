@@ -1,0 +1,30 @@
+# Web surfaces probed on their own health path, inside the container network,
+# upstream of Traefik and of any oauth2-proxy door (prometheus.yml
+# `blackbox-surface-app`). Until 2026-09-07 that job had no rule: netvis
+# answered "ok" on /healthz for three days while every management-API call it
+# made came back 401, and the only thing that noticed was an operator's
+# screenshot. Its /healthz now returns 503 with the refusal; this is the rule
+# that turns a 503 into a page.
+groups:
+  - name: surfaces
+    rules:
+      - alert: SurfaceHealthPathFailing
+        expr: probe_success{job="blackbox-surface-app"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: surfaces
+        annotations:
+          summary: "surface {{ $labels.surface }} is failing its own health path ({{ $labels.instance }})"
+          description: |
+            The in-network probe of {{ $labels.surface }}'s health path has failed
+            for 5m+. The process may be down, or — where the surface checks its
+            upstream (netvis: the NetBird management API) — the surface is up
+            and the thing it draws from is refusing it, which from the browser
+            looks like a page that explains it has nothing to show. Read the
+            body the health path returns; it names the refusal. From the
+            mgmt host, through the probe's own network (the blackbox-exporter
+            container is named per site, e.g. zagros-obs-blackbox-exporter):
+              docker exec <blackbox-exporter container> wget -qO- {{ $labels.instance }}
+            A wrong or rotated API token is the usual cause; redeploy the
+            surface with the current one.

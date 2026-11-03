@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Alerts on what makes a mesh link UNUSABLE rather than DOWN.
+#
+# A path can carry a 1280-byte MTU while WireGuard hands TCP 1420, so every
+# full-size segment is silently dropped, on a link also showing high mean RTT
+# with spikes. Both peers report Connected and every dashboard stays green:
+# mesh-health (ADR 1042) excludes jitter/loss from v1 and has no MTU field,
+# and the blackbox ICMP job targets public relay IPs and no mesh peers.
+#
+# Fed by ops/obs/mesh-path-quality/ via the node-exporter textfile collector.
+groups:
+  - name: mesh-path-quality
+    rules:
+      # THE PRIMARY SIGNAL. A path MTU below the tunnel MTU
+      # means full-size packets are dropped with no ICMP getting back — TCP
+      # stalls and retries by timeout. Symptoms present as "the app is slow",
+      # which sends people to the app rather than the network.
+      - alert: MeshPathMTUBlackhole
+        expr: |
+          goat_mesh_path_mtu_bytes > 0
+          and goat_mesh_path_mtu_bytes < goat_mesh_tunnel_mtu_bytes
+        for: 10m
+        labels:
+          severity: warning
+          domain: mesh
+        annotations:
+          summary: "Path MTU to {{ $labels.peer }} is below the tunnel MTU"
+          description: >-
+            Path to {{ $labels.peer }} ({{ $labels.ip }}) carries
+            {{ $value }} bytes but the tunnel hands TCP
+            {{ with printf "goat_mesh_tunnel_mtu_bytes{peer='%s'}" $labels.peer }}{{ end }}
+            more than that. Full-size segments are being silently dropped:
+            large transfers stall or never complete while small ones look fine.
+            Lower the tunnel MTU to fit the path, or find what is clamping it.
+
+      # Jitter, not mean RTT. A 239 ms mean hides a 78-545 ms spread, and that
+      # spread is what turns every loss into a timeout instead of a fast
+      # retransmit. Mean-only alerting misses exactly the case that hurts.
+      - alert: MeshLinkJitterHigh
+        expr: goat_mesh_rtt_jitter_ms > 50
+        for: 15m
+        labels:
+          severity: warning
+          domain: mesh
+        annotations:
+          summary: "Mesh link to {{ $labels.peer }} is jittery ({{ $value | printf \"%.0f\" }} ms stddev)"
+          description: >-
+            RTT standard deviation to {{ $labels.peer }} ({{ $labels.ip }}) is
+            {{ $value | printf "%.0f" }} ms. High jitter makes TCP treat losses
+            as timeouts; throughput collapses long before the link reports down.
+
+      - alert: MeshLinkLatencyHigh
+        expr: goat_mesh_rtt_ms > 250
+        for: 15m
+        labels:
+          severity: warning
+          domain: mesh
+        annotations:
+          summary: "Mesh RTT to {{ $labels.peer }} is {{ $value | printf \"%.0f\" }} ms"
+          description: >-
+            Sustained high RTT to {{ $labels.peer }} ({{ $labels.ip }}). Check
+            whether the peer has fallen back to a relay path
+            (`netbird status -d`) or moved networks.
+
+      - alert: MeshLinkPacketLoss
+        expr: goat_mesh_packet_loss_ratio > 0.02
+        for: 10m
+        labels:
+          severity: warning
+          domain: mesh
+        annotations:
+          summary: "{{ $value | humanizePercentage }} packet loss to {{ $labels.peer }}"
+          description: >-
+            Loss to {{ $labels.peer }} ({{ $labels.ip }}) over the probe window.
+
+      - alert: MeshPeerUnreachable
+        expr: goat_mesh_peer_up == 0
+        for: 5m
+        labels:
+          severity: critical
+          domain: mesh
+        annotations:
+          summary: "Mesh peer {{ $labels.peer }} is unreachable"
+          description: >-
+            No ICMP response from {{ $labels.peer }} ({{ $labels.ip }}).
+
+      # The probe going quiet must not read as "everything is fine". This is
+      # the same absent-guard discipline the rest of the rule set uses: a
+      # missing signal is a signal.
+      - alert: MeshPathQualityProbeStale
+        # The absent() arm carries a count_over_time guard for a reason: this
+        # file is in the obs-host role's DEFAULT obs_rule_files, so every obs
+        # host installs it, while obs_mesh_pq_enabled defaults to false. On any
+        # goatnet that has not enabled the probe the metric never exists, and a
+        # bare absent() would fire after 10m and never stop — the exact trap the
+        # explicit-list comment in the role warns about ("false alerts are how
+        # alerting gets switched off"), reintroduced via the default list.
+        # With the guard it fires only where the probe HAS reported recently,
+        # which is the case the alert is actually for.
+        expr: |
+          (
+            absent(goat_mesh_path_quality_probe_timestamp_seconds)
+            and on() (count_over_time(goat_mesh_path_quality_probe_timestamp_seconds[6h]) > 0)
+          )
+          or (time() - goat_mesh_path_quality_probe_timestamp_seconds) > 1800
+        for: 10m
+        labels:
+          severity: warning
+          domain: mesh
+        annotations:
+          summary: "mesh path-quality probe has stopped reporting"
+          description: >-
+            No fresh mesh path-quality sample. The link-quality alerts above
+            are blind until this returns — treat their silence as unknown,
+            not as healthy.

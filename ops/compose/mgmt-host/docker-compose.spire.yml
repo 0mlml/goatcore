@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# SPIRE overlay for the mgmt-host stack — ZAGROS Phase A (spike
+# docs/project/spiffe-spire-spike-2026-06-09.md §7 + the impl plan
+# docs/project/zagros-spire-implementation-plan.md). Deployed via
+# spire-deploy.yml -e target=zagros_hosts. NOT deployed on nova-a.
+#
+# Two co-located containers on a single Thor: a SPIRE server (postgres-a
+# datastore) and a SPIRE agent (docker workload attestor). The agent's
+# Workload API socket is exposed on a HOST path so a spiffe-helper sidecar
+# in a separate compose project (e.g. fabric-health) can fetch + rotate an
+# SVID for the workload it fronts.
+#
+# Invoke from /opt/mgmt-host with the base compose so the `mgmt` network +
+# postgres-a are in scope:
+#   docker compose -f docker-compose.yml -f docker-compose.spire.yml up -d spire-server spire-agent
+#
+# Config files (server.conf, agent.conf) + the agent .env carrying the
+# one-time join token are rendered onto the host by the `spire` role and
+# bind-mounted read-only.
+
+services:
+  spire-server:
+    # Tag-only dev default; deploy overrides SPIRE_SERVER_IMAGE with a digest
+    # from group_vars/zagros_hosts/spire.yml. Allowlisted in
+    # ops/ci/check-pin-compat.sh (digest-not-achievable-yet — confirm SPIRE
+    # license + source before the real digest pin, ADR 0412).
+    image: ${SPIRE_SERVER_IMAGE:-ghcr.io/spiffe/spire-server:1.11.2}
+    container_name: spire-server
+    restart: unless-stopped
+    command: ["-config", "/run/spire/config/server.conf", "-expandEnv"]
+    # Node attestation port. DEFAULTS TO LOOPBACK so this file cannot widen
+    # exposure on any host that does not opt in: the co-located agent reaches
+    # the server over the compose network and needs no published port at all.
+    # A goatnet with an AGENT-ONLY node (ADR 0412 Phase B) sets
+    # SPIRE_SERVER_BIND to the address that node attests over — on a three-Orin
+    # site the internal inter-node substrate (192.168.243.0/24), NEVER the mesh
+    # and NEVER 0.0.0.0: attestation must not be reachable by every mesh peer.
+    ports:
+      # Host port is configurable, not just the bind address: a goatnet running
+      # the NTP admit-fail-safe sidecar takes :8080 and moves management-a to
+      # :8081 (universal-ntp-hygiene.md §6), which collided with this hardcoded
+      # 8081. The container port stays 8081 — only the host side moves.
+      - "${SPIRE_SERVER_BIND:-127.0.0.1}:${SPIRE_SERVER_HOST_PORT:-8081}:8081"
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+    environment:
+      # Datastore password — expanded into server.conf via -expandEnv.
+      SPIRE_DB_PASSWORD: "${SPIRE_DB_PASSWORD:?set SPIRE_DB_PASSWORD}"
+    volumes:
+      - "/opt/spire/config/server.conf:/run/spire/config/server.conf:ro"
+      - "/opt/spire/data/server:/opt/spire/data/server"
+    networks:
+      - mgmt
+    healthcheck:
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  spire-agent:
+    # Tag-only dev default; deploy overrides SPIRE_AGENT_IMAGE with a digest
+    # from group_vars (allowlisted in ops/ci/check-pin-compat.sh, ADR 0412).
+    image: ${SPIRE_AGENT_IMAGE:-ghcr.io/spiffe/spire-agent:1.11.2}
+    container_name: spire-agent
+    restart: unless-stopped
+    command: ["-config", "/run/spire/config/agent.conf", "-expandEnv"]
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    environment:
+      # SPIRE_JOIN_TOKEN — one-time node-attestation token, rendered into
+      # .env.spire by the `spire` role after `spire-server token generate`.
+      # Only consulted on first attestation; the agent reuses its persisted
+      # SVID thereafter (so it is empty on steady-state reruns).
+      SPIRE_JOIN_TOKEN: "${SPIRE_JOIN_TOKEN:-}"
+    pid: "host"
+    volumes:
+      - "/opt/spire/config/agent.conf:/run/spire/config/agent.conf:ro"
+      - "/opt/spire/data/agent:/opt/spire/data/agent"
+      # Docker workload attestor needs the daemon socket (read-only).
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      # Expose the Workload API socket on a host dir for sidecars in other
+      # compose projects (fabric-health spiffe-helper) to mount.
+      - "/run/spire/sockets:/run/spire/sockets"
+    networks:
+      - mgmt
+
+networks:
+  mgmt:
+    name: mgmt
+    external: true

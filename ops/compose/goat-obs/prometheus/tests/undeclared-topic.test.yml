@@ -1,0 +1,49 @@
+# promtool unit test for undeclared-topic.yml.
+# Run:  promtool test rules ops/compose/goat-obs/prometheus/tests/undeclared-topic.test.yml
+#
+# Scenario: anchor `notional` has declared `notional/mantis/*`. It keeps
+# publishing that (healthy) AND starts publishing an undeclared class
+# `notional/aprs/*` (the F-216 gap — onboarded anchor, unregistered topic).
+# Anchor `org59x` has a declared class and publishes only it (healthy).
+# Anchor `squatter` publishes but has NO declared topic at all (the fully
+# unknown anchor — owned by UnexpectedVendorProducing, NOT this rule, so this
+# rule must stay quiet for it).
+#
+# Proves: TopicProducingUndeclared fires for (notional, notional/aprs/*) only —
+# the declared class, the healthy anchor, and the no-declared-topic squatter all
+# stay quiet.
+rule_files:
+  - ../rules/undeclared-topic.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      # Declared expectation (the snapshot, as node-exporter exposes it).
+      - series: 'goat_declared_topic{vendor="notional",key_pattern="notional/mantis/*"}'
+        values: '1x30'
+      - series: 'goat_declared_topic{vendor="org59x",key_pattern="org59x/c2/*"}'
+        values: '1x30'
+      # Actuals (audit-subscriber counter, <anchor>/<class>/* key_pattern).
+      - series: 'goat_audit_samples_total{vendor="notional",key_pattern="notional/mantis/*"}'
+        values: '0+10x30'        # declared + producing -> healthy, no alert
+      - series: 'goat_audit_samples_total{vendor="notional",key_pattern="notional/aprs/*"}'
+        values: '0+8x30'         # producing, NOT declared -> the F-216 gap, fires
+      - series: 'goat_audit_samples_total{vendor="org59x",key_pattern="org59x/c2/*"}'
+        values: '0+5x30'         # declared + producing -> healthy, no alert
+      - series: 'goat_audit_samples_total{vendor="squatter",key_pattern="squatter/x/*"}'
+        values: '0+7x30'         # producing but anchor has NO declared topic -> not this rule
+
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: TopicProducingUndeclared
+        exp_alerts:
+          - exp_labels:
+              vendor: notional
+              key_pattern: notional/aprs/*
+              severity: info
+              component: zenoh-fabric
+            exp_annotations:
+              summary: "anchor notional is producing undeclared topic-class notional/aprs/*"
+              description: "notional is publishing notional/aprs/* but that topic-class is not registered in the portal under it (the anchor has other declared topics, so it's onboarded — this is an unregistered topic, not a squat). The write lands because the ACL grants the whole <anchor>/** subtree, but the topic has no schema/format and is invisible to the Data-Access COP. Triage: stethoscope-diagnose the key, then either register it in the portal or re-key the publisher. If the class IS legitimately declared, add it to expected-topics/declared-topics.yml."

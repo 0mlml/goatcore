@@ -1,0 +1,50 @@
+# Expected-vs-actual reconciliation for the data fabric (ADR 1022, F-177).
+#
+# The runtime arm of declared-state reconciliation: join the expected-vendor
+# manifest (goat_expected_vendor, from expected-vendors/) against what the
+# audit-subscriber actually saw (goat_audit_samples_total{vendor}).
+#
+# Why a metric and not just `rate == 0`: a vendor that produces NOTHING has no
+# goat_audit_samples_total series at all, so `rate == 0` never fires for it.
+# Joining the always-present goat_expected_vendor against actuals via `unless`
+# is what makes a *totally-silent* expected vendor alert.
+groups:
+  - name: zenoh-expected-vendor
+    rules:
+      # GATE (the F-177 silent-denial detector): an expected-active vendor has
+      # produced nothing in 15m. Fires even when the vendor's samples series is
+      # entirely absent, because goat_expected_vendor carries the expectation.
+      - alert: ExpectedVendorSilent
+        expr: |
+          goat_expected_vendor{active="true"} == 1
+          unless on(vendor)
+          (sum by (vendor) (increase(goat_audit_samples_total[15m])) > 0)
+        for: 5m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "expected vendor {{ $labels.vendor }} has produced no samples in 15m"
+          description: "{{ $labels.vendor }} is expected-active but the audit-subscriber saw zero samples for 15m — likely a silently-denied write, a dead publisher, or a retired vendor (then remove it from expected-vendors.yml). Triage: goat sub '{{ $labels.vendor }}/**' --count 1; check the portal registry + live ACL."
+
+      # SQUAT: a vendor is producing but is not in the manifest (active ∪
+      # allowed). Either un-onboarded ingress (the lattice class) or a
+      # legitimately-onboarded vendor missing from `allowed`.
+      #
+      # severity=info DELIBERATELY: v1's `allowed` set is NOT yet complete (it
+      # doesn't list all ~90 onboarded vendors), so a dormant vendor waking up
+      # will trip this. Treat as "is this a known vendor?" until `allowed` is
+      # auto-derived from the declared pub/sub state (see the track follow-on),
+      # then raise to warning. The promtool test proves the rule logic
+      # independent of manifest completeness.
+      - alert: UnexpectedVendorProducing
+        expr: |
+          sum by (vendor) (rate(goat_audit_samples_total[10m])) > 0
+          unless on(vendor) goat_expected_vendor
+        for: 10m
+        labels:
+          severity: info
+          component: zenoh-fabric
+        annotations:
+          summary: "un-onboarded vendor {{ $labels.vendor }} is producing on the fabric"
+          description: "{{ $labels.vendor }} is producing but is absent from the expected-vendor manifest — an un-onboarded squat (verify it has no ACL subject / storage / schema), or an onboarded vendor missing from expected-vendors.yml allowed. Confirm against the portal registry before treating as a squat."

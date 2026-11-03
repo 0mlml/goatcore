@@ -1,0 +1,111 @@
+# Signal + federation alerting.
+#
+# WHY THIS FILE EXISTS: a signal server can forward offers to its federation peer
+# and deliver zero of them, at a real cost in relay bandwidth, because every
+# surface says "healthy" and each is telling the truth about its own question: the
+# circuit breaker is closed, forward timeouts are zero, durations are normal, Spock
+# is caught up. NOTHING ELSE ASKS WHETHER THE WORK ARRIVED. A forward that fails is
+# visible; a forward that succeeds at reaching a node which cannot possibly hold the
+# recipient is not.
+#
+# So these rules grade OUTCOME, not health. An RPC's success is not its
+# usefulness.
+#
+# EXPRESSIBILITY NOTE, load-bearing for anyone extending this: a single-Thor
+# goat-obs Prometheus scrapes only its OWN signal-server. The peer's
+# `signal_server_connected_peers` — the gauge that most directly says "you are
+# forwarding into a drain" — is on the OTHER host and is not visible here. So
+# the rules below infer the same condition from the local outcome counters,
+# which is weaker but actually available. Do not rewrite them against the
+# remote gauge without first making the peer a scrape target.
+
+groups:
+  - name: signal-federation
+    rules:
+      # ---------------------------------------------------------------
+      # THE PRIMARY RULE.
+      # ---------------------------------------------------------------
+      # Forwards are leaving and NOTHING is arriving. Not "some fail" —
+      # the delivered rate is flat zero while the not-found rate is not.
+      #
+      # `or vector(0)` is required, not decorative: signal-server does not
+      # create the {outcome="delivered"} series until the first delivery, so
+      # on a federation that has NEVER delivered the selector is ABSENT.
+      # A bare `== 0` against an absent series matches nothing and the alert
+      # silently never fires — which is the same class of bug as the one this
+      # rule exists to catch, one level up.
+      #
+      # 1h, because a peer restart or a brief drain is not a finding; a
+      # federation link that delivers nothing for an hour while actively
+      # sending is.
+      - alert: FederationForwardsNeverDeliver
+        expr: |
+          (sum(rate(signal_server_forward_sent_total{outcome="notfound"}[15m])) > 0)
+          and
+          ((sum(rate(signal_server_forward_sent_total{outcome="delivered"}[15m])) or vector(0)) == 0)
+        for: 1h
+        labels:
+          severity: warning
+          domain: signal
+        annotations:
+          summary: "Signal federation is forwarding and delivering NOTHING ({{ $labels.node }})"
+          description: >-
+            Offers are being federated to the peer signal-server and not one has
+            been delivered in the last 15m, sustained for an hour. The usual
+            cause is that the peer HOLDS NO PEERS — e.g. it is drained at the
+            relays' haproxy (`state maint`) while this node still has
+            `federation_peers_for_a` pointing at it. That combination is pure
+            cost: every forward crosses the metered relay to discover the
+            recipient was never there. Check the peer's
+            `signal_server_connected_peers` (on the peer's own metrics port,
+            not here) and the relay haproxy state together — F-333 exists
+            because those two facts live in different systems and nothing
+            compared them. Same-shard delivery is unaffected by this alert.
+
+      # ---------------------------------------------------------------
+      # The routing-blind state that makes the above expensive.
+      # ---------------------------------------------------------------
+      # presence is the table that says WHERE a peer lives. Empty, signal
+      # cannot localise anything it does not itself hold, so every unresolved
+      # offer falls through to federation one-for-one: presence routes/sec and
+      # forwards sent/sec read the same number, because it is the same event.
+      - alert: SignalPresenceEmptyWhileFederating
+        expr: |
+          (max(signal_server_presence_keys) == 0)
+          and
+          (sum(rate(signal_server_forward_sent_total[15m])) > 0)
+        for: 30m
+        labels:
+          severity: info
+          domain: signal
+        annotations:
+          summary: "Signal presence table is EMPTY while federating ({{ $labels.node }})"
+          description: >-
+            `signal_server_presence_keys` is 0, so this signal-server cannot
+            tell which shard a peer belongs to and forwards everything it does
+            not itself hold. Expect forwards/sec to track presence-routes/sec
+            exactly. Presence-sync is compiled into the binary but is not
+            enabled by any flag or env on this deployment.
+
+      # ---------------------------------------------------------------
+      # The transport-side cost, kept separate on purpose.
+      # ---------------------------------------------------------------
+      # A high rpc_error rate means the federation path itself is unreliable —
+      # distinct from "the path works and the recipient is absent". Conflating
+      # them is how a drained peer reads as a network fault.
+      - alert: FederationTransportUnreliable
+        expr: |
+          sum(rate(signal_server_forward_sent_total{outcome="rpc_error"}[15m]))
+          / clamp_min(sum(rate(signal_server_forward_sent_total[15m])), 0.001)
+          > 0.05
+        for: 30m
+        labels:
+          severity: warning
+          domain: signal
+        annotations:
+          summary: "Over 5% of signal federation forwards are RPC errors ({{ $labels.node }})"
+          description: >-
+            The federation transport is failing, which is a different fault
+            from the recipient being absent — read this one as a path problem
+            (mesh flap, relay tunnel, proxy backend) and
+            FederationForwardsNeverDeliver as a topology problem.

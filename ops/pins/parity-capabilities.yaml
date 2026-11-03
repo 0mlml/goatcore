@@ -1,0 +1,432 @@
+---
+# ops/pins/parity-capabilities.yaml — which group_vars booleans the parity
+# report tracks, and why each one earns a row.
+#
+# Read by ops/pins/report.py (stage 1 of the parity report,
+# docs/design/environment-parity.md §5). The pin half of the report comes from
+# ops/pins/fleet-pins.yaml; this file is the CURATED half — "selected group_vars
+# booleans" is a judgement call, so the judgement is committed, reviewable, and
+# carries its reason next to the key instead of living in the renderer.
+#
+# SELECTION BAR (why this list is short): a row must be a per-GOATNET or
+# per-NODE capability decision — something a new environment has to decide
+# consciously, or something whose absence on one federated node of a goatnet is
+# the F-272 skew shape. `zagros_hosts` alone carries ~40 `*_enabled` keys; most
+# are per-service micro-toggles whose right value is "whatever that service's
+# role defaults to". Those are noise in a parity matrix and are deliberately
+# NOT listed. Add a row when a flag graduates to a real environment decision.
+#
+# ---------------------------------------------------------------------------
+# SCHEMA
+# ---------------------------------------------------------------------------
+# capabilities:            # graded rows: members of one goatnet are compared
+#   - var: <ansible var>
+#     why: <one line — why this is a parity question, not a service toggle>
+#
+# node_shape:              # UNGRADED rows: per-node by design (ADR 1084)
+#   - var: <ansible var>   # rendered so intra-goatnet skew below is
+#     why: <one line>      # interpretable rather than alarming
+#
+# retired:                 # keys that must NOT come back; the report asserts
+#   - var: <ansible var>   # their absence across every governed member
+#     why: <one line, with the change that retired them>
+#
+# deviations:              # declared, reasoned exceptions to a graded row
+#   <var>:
+#     <goatnet|member>:
+#       reason: <required — a deviation without a reason is a schema error,
+#                design doc §2 principle 2>
+#       until: <YYYY-MM-DD>   # optional; triaged on the reconciliation pass
+#
+# A declared deviation renders as `declared` instead of `skew`. Nothing here
+# changes any deployed value — this file is read by a renderer, never by
+# ansible.
+
+capabilities:
+
+  - var: portal_mesh_key_mint_enabled
+    why: >-
+      Whether the portal mints the machine setup key itself with auto_groups
+      DERIVED from the node-class (ADR 1116 §9), or only reports the derived
+      groups for a human to assign. Earns a row because the default is
+      restrictive (off = report-only): a goatnet that declares nothing inherits
+      report-only silently, and hand-assigned keys quietly become its only
+      enrollment path — the side door machine-mesh-alignment welds shut. The
+      ZAGROS-on / zagros-prod-off window is a declared ADR 1120 skew, closed by the
+      Phase-5 flag flip after the portal-image graduation.
+
+  - var: id_admin_console_oauth2_proxy_allowed_groups
+    why: >-
+      Who the identity console's oauth2-proxy admits. Earns a row because it is a
+      conscious per-goatnet decision with a user-visible consequence, not a
+      service toggle: empty admits any authenticated member and lets adminGate do
+      the enforcing, while a group list also blocks the self-service pages
+      (/ssh-key, /operator-key) that exist for members with no admin rights.
+      ZAGROS-PROD inherited the restrictive role default silently until 2026-08-10.
+      Presence is separately enforced by ops/ci/check-console-door-declared.sh,
+      because a single-member goatnet cannot skew against itself and so grades
+      green while declaring nothing.
+
+  - var: rosenpass_enabled
+    why: >-
+      Intra-mesh PQC (ADR 0602). Named in design doc §5. The single per-goatnet
+      knob that makes every enrollment surface hand new peers
+      `--enable-rosenpass`; fleet default is false in group_vars/all.yml, so a
+      goatnet that wants PQ WireGuard must say so on every node that enrolls
+      peers.
+
+  - var: name_snapshot_enabled
+    why: >-
+      Signed name-fallback snapshots (ADR 1082) — resolve mesh names when DNS
+      is down. Named in design doc §5. Site opt-in with no fleet default, which
+      is exactly the shape that goes missing on a second node.
+
+  - var: netbird_selfheal_enabled
+    why: >-
+      F-261/F-262 boot-wedge watchdog + netbird service ordering. A federated
+      node without it reboots into a wedge its peer self-heals from — the
+      single clearest "one node re-rendered, its peer left behind" shape.
+
+  - var: ory_spock_enabled
+    why: >-
+      Identity-plane replication (ory_narrow repset). Cluster-shared Class-B by
+      doctrine: the members of one goatnet share ONE identity plane, so this
+      must agree across them or replication is asymmetric.
+
+  - var: snitch_enabled
+    why: >-
+      Fleet-visibility probe (Block 61). A cheap, whole-node capability that a
+      new environment decides once.
+
+  - var: isitup_enabled
+    why: >-
+      Hosted-service health surface; also gates the generated per-site DNS zone
+      Whether a node publishes service health is an environment
+      decision, not a service default.
+
+  - var: node_net_health_enabled
+    why: >-
+      Environment-health `net` domain (ADR 1042). Which node holds the
+      host-net vantage is a real per-goatnet choice, so it is rendered rather
+      than assumed.
+
+  - var: host_net_publish_enabled
+    why: >-
+      The per-host half of the same net domain — each node self-publishes its
+      own link health. Unlike the rollup above, this is expected on every node
+      that has a link worth reporting.
+
+  - var: oci_t2_sync_enabled
+    why: >-
+      Whether this goatnet's obs node runs the Block 68C T1 → T2 image-mirror
+      sync cron (ADR 0838). Graduated to a real environment decision on
+      2026-08-03 when the T1 endpoints were wired and the role gained a
+      playbook slot; false everywhere until an operator flips it per site. The
+      T1 ENDPOINTS themselves are deliberately NOT here — they are one
+      cross-goatnet shared service in group_vars/all.yml, so comparing them
+      across members would render permanent false agreement.
+
+  - var: id_admin_console_mtls_onboard_enabled
+    why: >-
+      Whether the identity console authenticates the mint-capable onboarding leg
+      with SPIFFE mTLS instead of the shared bearer fallback
+      (runner-console-mtls.md). Earns a row because it is NOT a service toggle:
+      it is a proxy for whether this goatnet HAS A SPIRE DEPLOYMENT AT ALL, and
+      SPIRE has no boolean of its own to grade (zagros carries a whole
+      group_vars/zagros_hosts/spire.yml; zagros_prod carries no such file). ADR 0412
+      is Accepted-DEFERRED and Phase A is zagros-only, so the split is real and
+      long-lived — exactly the "something a new environment has to decide
+      consciously" bar. Added 2026-08-17 after this divergence was found by
+      reading a code comment rather than by any guard: the fact lived in four
+      lines of prose beside the flag and in nothing the parity report reads.
+      READ THE GRADING CAVEAT in docs/design/environment-parity.md §5 before
+      trusting a green row here — `Node parity` compares members WITHIN one
+      goatnet, so an zagros-true / zagros_prod-false split is rendered side by side
+      but never graded SKEW.
+
+  - var: onboard_runner_mtls_enabled
+    why: >-
+      The runner half of the same leg, and the reason this is two rows rather
+      than one: the two flags must be flipped in ORDER (console first, then the
+      runner, per the note at zagros_hosts/vars.yml:1952) so a half-flipped pair
+      is a real state a reader needs to see, not a redundant duplicate of the
+      row above. Same SPIRE dependency, same deviations.
+
+
+node_shape:
+
+  - var: mgmt_stack_profile
+    why: "Which mgmt-stack profile the node runs (Block 22L.4 axis var)."
+
+  - var: has_mgmt_api
+    why: "Node serves signal + management + Traefik + Ory."
+
+  - var: participates_in_spock
+    why: "Node is a Spock multi-master peer (ADR 1084)."
+
+  - var: intra_site_pair
+    why: "Node has a same-site streaming-replication peer."
+
+  - var: has_durable_independent_state
+    why: "Node carries its own pgBackRest durability rather than inheriting it via replication."
+
+  - var: has_obs_host
+    why: "Node has a paired observability host."
+
+  - var: goatnet_founder
+    why: >-
+      Node minted the goatnet's account/policy rows vs joined an existing
+      goatnet (ADR 1084). Explains most legitimate node asymmetry, so it is
+      rendered first.
+
+retired:
+
+  - var: zenoh_enabled
+    why: >-
+      Retired 2026-08-02 by WS4 of this arc. It gated the integdev-lab
+      `roles/zenoh` (plain TCP, no mTLS, no ACL), whose 0.0.0.0:7447 publish
+      collides with the live fabric router's mesh-IP bind.
+      `site-bootstrap.yml` Phase 7D now fails closed on a surviving key. The
+      design doc §5 names this flag as a report column; it is tracked here as
+      an ABSENCE assertion instead, so retiring it did not silently drop it.
+      Canon: docs/design/zenoh-data-fabric.md §"Which role deploys a goatnet's
+      router".
+
+deviations:
+
+  id_admin_console_oauth2_proxy_allowed_groups:
+    zagros_b_hosts:
+      reason: >-
+        zagros-b does not run goat-id-console at all (id_admin_console_enabled is
+        not true there; the console is single-homed on zagros-a, ADR 1084 §D3), so
+        it resolves this key from the role default and appears to disagree with
+        zagros-a's declared "". That is a component it does not have, not a door
+        it chose differently. Declared so the row reads as "not applicable here"
+        rather than as skew — and so that if zagros-b ever DOES stand the console
+        up, removing this stanza is the step that forces a conscious decision
+        about its door instead of letting it inherit the restrictive default.
+        Presence on the members that DO run the console is enforced by
+        ops/ci/check-console-door-declared.sh, which derives its list from
+        id_admin_console_enabled rather than from this file.
+
+
+  # THE SPIFFE mTLS PAIR — both flags below carry the SAME two deviations, and
+  # they are different in kind. zagros_b_hosts is "component not present here";
+  # zagros_prod is "the SPIRE substrate does not exist here". Do not collapse them:
+  # the first is closed by zagros-b standing up the console, the second only by
+  # SPIRE landing on zagros-prod, and conflating them would let the second hide
+  # behind the first. No `until:` on the zagros_prod stanzas ON PURPOSE — SPIRE on
+  # zagros-prod is not scheduled, and inventing a date would make a real,
+  # open-ended architectural gap look like a tracked deadline.
+
+  id_admin_console_mtls_onboard_enabled:
+    zagros_b_hosts:
+      reason: >-
+        Same shape as the oauth2 door above: zagros-b does not run goat-id-console
+        at all (single-homed on zagros-a, ADR 1084 §D3 — its id_admin_console_image
+        renders as an `absent` deviation in the pin table), so it resolves this
+        key from the role default `false` and appears to disagree with zagros-a's
+        `true`. A component it does not have, not an authentication decision it
+        made differently.
+    zagros_prod:
+      reason: >-
+        UPDATED 2026-08-17, SAME DAY: the issuer now EXISTS here. SPIRE server +
+        agent were deployed to zagros-prod (group_vars/zagros_prod_hosts/spire.yml,
+        ADR 0412 addendum), so the original reason for this deviation — "no SPIRE
+        deployment" — no longer holds and has been replaced rather than left to
+        rot. What remains true is that NOTHING CONSUMES IT: the deployment is
+        issuer-only by design, every consumption key is deliberately absent, and
+        this flag stays false until the mTLS onboard leg is turned on as its own
+        separately verifiable change. The console works portal-minted meanwhile.
+        Flipping it is a change to a LIVE onboarding path on production, which is
+        why it is not bundled with standing the issuer up. This flag flips FIRST
+        of the pair; see zagros_hosts/vars.yml:1952 for the ordering and
+        zagros_prod_hosts/vars.yml:290-293 for the original note this row promoted
+        out of a code comment.
+
+  onboard_runner_mtls_enabled:
+    zagros_b_hosts:
+      reason: >-
+        zagros-b does not run onboard-runner (single-homed on zagros-a, ADR 1084 §D3;
+        its onboard_runner_image is an `absent` deviation in the pin table), so
+        the role default `false` here is a component it does not have.
+    zagros_prod:
+      reason: >-
+        UPDATED 2026-08-17: the issuer exists here now (see the console flag's
+        reason above and the ADR 0412 addendum), so the dependency is no longer
+        "no SPIRE" but "nothing consumes SPIRE yet". Flipped SECOND, after the
+        console, per the ordering note at zagros_hosts/vars.yml:1952 — the runner
+        fails closed against a console that is not yet listening for mTLS, so
+        flipping this one first buys an outage rather than a feature.
+
+  # node_net_health_enabled resolved 2026-08-09 for ZAGROS'S MEMBERS (P3a of the
+  # zagros-b full-standby build): zagros-b now runs the node-net-health PUBLISHER
+  # (standby_safe — ops/net/health/<node> on its own isolated router), matching
+  # zagros-a. The net-domain ROLLUP stays single-homed on zagros-a
+  # (node_net_health_rollup_enabled: false on zagros-b) — that split is governed by
+  # the cutover-gated class, not tracked here (ops/standby/service-classes.yaml).
+  # The CROSS-GOATNET half is a different question and is declared below.
+
+  node_net_health_enabled:
+    zagros_prod:
+      until: '2026-09-30'
+      reason: >-
+        The environment-health `net` domain is NOT DEPLOYED on zagros-prod, so
+        false is the truthful value and the difference against ZAGROS (true on
+        both members, publisher + rollup containers up on the Thor) is real.
+        Probed on the hosts 2026-08-12 through the ADR 1117 env-door: neither
+        Orin-A nor Orin-B has /opt/node-net-health or a container, and
+        /opt/relay-health/www carries no `net` subdirectory for the rollup's
+        node-list page. This is declared rather than fixed because the exit is
+        deploy work, not an edit: roles/node-net-health fail-closes on
+        `node_net_health_node_class != 'unknown'` and zagros-prod declares no node
+        class and no baseline rules, so the node-class egress contract has to be
+        written for the prod Orins, leaf certs minted, and
+        node-net-health-deploy.yml run. Declared WITH an `until:` on purpose —
+        an undeclared row that is really a deploy gap gets excused into silence,
+        and this one already survived from M-105 (2026-08-09, where it was the
+        single named undeclared SKEW on the aggregator's first day) to 2026-08-12
+        while three comments in the tree described a rollup topology no host
+        carried. F-324.
+
+  snitch_enabled:
+    zagros:
+      reason: >-
+        Deliberate and long-standing, previously recorded only as a group_vars
+        comment where no surface could read it. The Block 61 snitch COLLECTOR is
+        a prod-tree service keyed to the prod mesh and the prod offline-CA
+        chain, so turning the probe on for ZAGROS would require standing up a
+        second collector for the sandbox goatnet rather than flipping a flag
+        (group_vars/zagros_hosts/vars.yml states this at the key). zagros-prod
+        enables it because its collector landed on Orin-C and the probe key
+        comes from the inventory path — snitch-probe.service observed active on
+        Orin-A 2026-08-12. No `until:`: this is a settled per-goatnet decision
+        about where a collector lives, not a deferral. It reverts to a graded
+        row the day ZAGROS gains its own collector.
+
+  name_snapshot_enabled:
+    zagros_b_hosts:
+      reason: >-
+        Dormant-deferred. The DNS-down name-fallback resolver (ADR 1082) needs
+        the mesh_dns_* config keys — bundles carry no nameservers
+        (name-fallback-resolver.md §9) — which land with zagros-b's later
+        serving-surface phase (P2/P3 of the full-standby build). Declared false
+        with a reason now so the skew is intentional, not a missed second-node
+        key; revisit when the mesh_dns_* keys are set.
+
+  isitup_enabled:
+    zagros_b_hosts:
+      reason: >-
+        Single-homed on zagros-a while zagros-b is a DORMANT standby. isitup
+        publishes per-service DNS + health records; on a dormant node that would
+        advertise zagros-b service names that must not resolve to it until
+        promotion (the F-197 declared-but-dark shape). The service-DNS/health
+        vantage stays on zagros-a; zagros-b's isitup is started as part of the
+        promotion runbook, alongside the other dormant serving surfaces.
+
+# ---------------------------------------------------------------------------
+# cross_goatnet: capabilities that differ BETWEEN goatnets.
+# ---------------------------------------------------------------------------
+# The graded `capabilities:` rows above compare MEMBERS INSIDE one goatnet —
+# that is the F-272 skew shape and the only comparison ops/pins/report.py made.
+# Nothing compared goatnets to each other, so a divergence that runs both ways
+# was not merely undeclared, it was UNSAYABLE: there was no row shape that
+# could hold it.
+#
+# It matters because the two goatnets run DIFFERENT observability stacks —
+# zagros the co-resident goat-obs compose, zagros-prod the obs-host role — and
+# capabilities have diverged in both directions. The consequence lands on an
+# operator reading a dashboard, not on an engineer reading group_vars: a panel
+# that says "not measured" looks identical whether the probe is absent by
+# decision or absent by accident.
+#
+#   - capability:  short name, the words an operator would use
+#     var:         the ansible flag, or null when the capability is STACK-shaped
+#                  (present because of which compose project runs, with no
+#                  boolean anywhere to point at)
+#     present/absent: goatnet keys from ops/pins/fleet-pins.yaml
+#     why:         why the difference exists
+#     consequence: what a reader of a surface actually sees because of it
+#
+# Ungraded by design: these are declarations, not assertions. A cross-goatnet
+# difference is usually deliberate; the value is that it is written down once,
+# next to the reason, instead of being rediscovered from a blank panel.
+
+cross_goatnet:
+
+  - capability: mesh path quality (jitter, packet loss, path MTU)
+    var: obs_mesh_pq_enabled
+    present: [zagros_prod]
+    absent: [zagros]
+    why: >-
+      The prober ships with the obs-host role, which only zagros-prod runs; zagros's
+      co-resident goat-obs stack has no equivalent. Enabled on zagros-prod's
+      Orin-C after the 2026-08-07 goat-map RCA. It deliberately has NO graded
+      `capabilities:` row: the flag is set on `zagros_prod_obs_hosts`, which is
+      not a governed member of the zagros_prod goatnet, so a graded row would
+      resolve to the role default `false` on every member it CAN see and print
+      "match" — flatly contradicting this line. The capability is real and the
+      graded table is the wrong instrument for it.
+    consequence: >-
+      netview's jitter and packet-loss readings render "not measured" on zagros
+      and carry real numbers on zagros-prod. Same page, same words, different
+      meaning — which is why this row exists rather than a comment.
+
+  - capability: per-process and per-container resource attribution
+    var: null
+    present: [zagros]
+    absent: [zagros_prod]
+    why: >-
+      process-exporter and cadvisor are unconditional containers in the
+      goat-obs compose project. There is no boolean gating them, so this is
+      stack-shaped: zagros has them because it runs goat-obs, zagros-prod does not
+      because it runs obs-host. Nothing in group_vars can express that, which
+      is the reason `var` is null here rather than omitted.
+    consequence: >-
+      Container-level CPU/memory drill-down and per-process rollups exist on
+      zagros only. On zagros-prod those panels are empty, and empty reads as idle.
+
+  - capability: active HTTP probing of hosted surfaces (blackbox), GATE plane
+    var: obs_blackbox_enabled
+    present: [zagros, zagros_prod]
+    absent: []
+    # MOVED to present 2026-09-05 by running the test this row itself named.
+    # On mgmt-zagros-prod-03-orin:
+    #   count(probe_ssl_earliest_cert_expiry)      -> 25
+    #   count(probe_success{job="blackbox-https"}) -> 25
+    # The play applied at some point after 2026-08-19 and nothing moved the row,
+    # so this file spent weeks asserting production had no certificate
+    # observability while it had 25 series of it. A parity row that is stale in
+    # the SAFE direction still misleads: it was read as evidence that zagros-prod
+    # is the thinner goatnet, which it is not.
+    why: >-
+      The obs-host role grows a blackbox-exporter, a `blackbox-https` scrape job
+      and tls-cert-renewal.yml when obs_blackbox_enabled is set, and both
+      goatnets now set it. The gate plane is at parity; this row is kept to
+      carry that history and to point at the plane that is not.
+    consequence: >-
+      None outstanding for the gate plane. All 25 probe_gate vhosts on zagros-prod
+      report a certificate expiry, so the renewal alerts can fire.
+      ops/ci/check-blackbox-covers-registry.sh keeps the probe list and the
+      service registry from drifting apart.
+
+  - capability: active HTTP probing of hosted surfaces, APP plane (behind the gate)
+    var: null
+    present: [zagros]
+    absent: [zagros_prod]
+    # Verified 2026-09-05: count(probe_success{job="blackbox-surface-app"})
+    # returns an empty vector on zagros-prod and 27 targets on zagros.
+    why: >-
+      goat-obs runs `blackbox-surface-app`, probing each service's own container
+      over the shared docker network. The obs-host role has no equivalent and
+      cannot have a like-for-like one: Orin-C does not share a docker network
+      with the services it watches, because they are on a different machine.
+      `var` is null because no flag can express this — it follows from the
+      split-obs-host topology, which is the topology this fleet is moving
+      TOWARD. Closing it needs a probe agent on the mgmt hosts reachable over
+      the mesh, the same shape as the Traefik metrics gap in ADR 1161, not a
+      flag on the obs host.
+    consequence: >-
+      The ADR 1133 surface canary is single-plane on zagros-prod. A surface that
+      answers at the gate while broken behind it reads healthy there, and would
+      not on zagros.

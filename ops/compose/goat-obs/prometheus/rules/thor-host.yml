@@ -1,0 +1,193 @@
+# Thor host-health alerts — goat-obs.
+#
+# Co-resident obs caveat applies: if Thor itself dies these alerts
+# never fire (because Prometheus dies with it). Useful for graceful
+# degradation (high temp, low disk, runaway CPU/mem) and post-mortem
+# inspection via persisted TSDB.
+
+groups:
+  - name: thor-host
+    interval: 30s
+    rules:
+
+      - alert: ThorNodeExporterDown
+        expr: up{job="node-exporter"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "node-exporter on Thor is unreachable"
+          description: "Prometheus has not been able to scrape node-exporter for 5+ minutes. Either the container is down or the docker network is broken."
+
+      - alert: ThorHighCPU
+        expr: 100 - (avg by (host) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thor sustained CPU >90% for 15m"
+          description: "Investigate which container is consuming the budget. Mgmt-host stack expects bursts but not sustained saturation."
+
+      - alert: ThorLowMemory
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thor available memory below 10% for 10m"
+          description: "OOM-killer is one bad allocation away. Audit container memory reservations vs. limits."
+
+      - alert: ThorLowDisk
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thor root filesystem below 15% free for 30m"
+          description: "Disk pressure on /. Prom TSDB or Docker layers usually the culprit. Check /var/lib/docker and /prometheus volume."
+
+      # A percentage threshold is a poor smoke alarm on a large disk. On the
+      # large disk, 15% free can be 140 GiB — under four days of warning at a
+      # heavy burn — while the rule stays silent at far more free space than
+      # the runway deserves. Rate, not level, is what gives usable lead time.
+      #
+      # deriv over 24h, not the 6h the Capacity & Forecast board uses: 6h is
+      # short enough that one docker build or log burst forecasts an outage.
+      # Two weeks of runway is roughly "fix it next working day."
+      # TWO TIERS, and the split is about DELIVERY, not just urgency.
+      #
+      # An alertmanager may route severity=warning to `webhook-noop`, with only
+      # `critical` reaching a person. A warning-only rule would then be an alarm
+      # that cannot reach anyone.
+      #
+      # So: the 14-day tier is the operator-facing "fix it next working day"
+      # signal, visible in the Prom UI and delivered wherever warning IS routed;
+      # the 5-day tier is the one that pages. Neither is a substitute for the
+      # other — drop the warning and you lose the early notice, drop the
+      # critical and nobody on such a goatnet is told at all.
+      - alert: ThorDiskRunwayShort
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/"}
+            / clamp_min(-deriv(node_filesystem_avail_bytes{mountpoint="/"}[24h]), 1)
+            / 86400 < 14
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Thor / has under 14 days of disk runway at the current 24h burn rate"
+          description: >-
+            Free space is trending to zero. Find the grower before trimming:
+            `du -xh -d1 /opt` then drill. Known unbounded writers and their
+            bounds are in docs/operations/disk-runway-and-retention.md.
+            NOTE: on ZAGROS, severity=warning is routed to webhook-noop — if you
+            are reading this in the Prom UI, nobody was paged.
+
+      - alert: ThorDiskRunwayCritical
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/"}
+            / clamp_min(-deriv(node_filesystem_avail_bytes{mountpoint="/"}[24h]), 1)
+            / 86400 < 5
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "Thor / has under 5 days of disk runway — act today"
+          description: >-
+            At the current 24h burn the root filesystem fills within the week.
+            docs/operations/disk-runway-and-retention.md lists the four writers
+            that caused this in 2026-08 and the one-command reclaim for each;
+            `du -xh -d1 /opt` first, because the next one will be a new writer.
+
+      # The two rules above both regress over 24h, which lags an accelerating
+      # burn: the 24h-deriv average stays diluted by the slower earlier hours and
+      # can sit just above ThorDiskRunwayCritical's <5d line while the last-6h
+      # rate alone is already under 2 days.
+      #
+      # This rule is the acceleration detector: same runway formula, [6h]
+      # instead of [24h], with a tighter 3-day line and a short for: (30m,
+      # not 1h) because a 6h window is noisy enough that a single scrape
+      # blip should not page, but waiting a full hour defeats the point of
+      # a fast-burn tier. severity=critical (not warning) on purpose — see
+      # the webhook-noop note above ThorDiskRunwayShort; a fast-burn signal
+      # that cannot reach a person is the same failure this rule exists to
+      # close.
+      - alert: ThorDiskRunwayFastBurn
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/"}
+            / clamp_min(-deriv(node_filesystem_avail_bytes{mountpoint="/"}[6h]), 1)
+            / 86400 < 3
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Thor / has under 3 days of disk runway at the current 6h burn rate — accelerating, act now"
+          description: >-
+            The last-6h burn rate implies a shorter runway than the 24h
+            average does — the disk is accelerating toward full faster than
+            ThorDiskRunwayCritical's 24h-deriv can show. Find the grower
+            before trimming: `du -xh -d1 /opt` then drill. Known unbounded
+            writers and their bounds are in
+            docs/operations/disk-runway-and-retention.md. Confirm with the
+            Capacity & Forecast board's 6h series before acting.
+
+      # Deliberately NOT scoped to mountpoint="/opt/docker-data": on many hosts
+      # that path is a directory on the root filesystem, not a mount, so
+      # node_exporter never emits the series and a scoped rule cannot fire. Matching every real
+      # rule could not fire on any host in the fleet. Matching every real
+      # non-root data mount keeps it meaningful where a separate Tier-3 NVMe
+      # does exist and silent, rather than falsely reassuring,
+      # where it does not.
+      - alert: ThorLowDiskDataMount
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint=~"/opt/.*|/var/lib/.*", fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{mountpoint=~"/opt/.*|/var/lib/.*", fstype!~"tmpfs|overlay|squashfs"}) * 100 < 15
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.mountpoint }} below 15% free for 30m"
+          description: "Data-mount pressure. Audit postgres + prom-tsdb + grafana-data volumes."
+
+      # The kernel OOM killer fired — host-wide OR inside a container
+      # memory cgroup (the counter increments for both). A zenohd kill at its
+      # memory bulkhead has no other operator-visible signal; this covers it
+      # independently of cadvisor.
+      - alert: ThorOOMKill
+        expr: increase(node_vmstat_oom_kill[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "OOM killer fired on Thor in the last 15m"
+          description: |
+            A process was OOM-killed (host-wide counter; container-cgroup
+            kills increment it too). Identify the victim:
+              journalctl -k --since "1 hour ago" | grep -i oom-kill
+            Then compare the container's working set against its compose
+            memory limit (ContainerMemoryNearLimit should have fired
+            first if cadvisor was healthy).
+
+      # Container working set approaching its compose memory limit — the
+      # preventive form of ThorOOMKill (a zenohd can sit near its limit for
+      # weeks before the kill). Raw-cgroup
+      # cadvisor series carry no container NAME; resolve the cid label
+      # against `docker ps` or join goat_container_info (textfile) on(id).
+      # Limit-less containers are excluded: the raw factory reports
+      # their spec limit as 0 (dividing by it would
+      # yield +Inf and false-fire), and any huge-sentinel encoding is
+      # dropped by the < 5.5e11 bound.
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          100 * container_memory_working_set_bytes{id=~"/system.slice/docker-.+"}
+            / (container_spec_memory_limit_bytes{id=~"/system.slice/docker-.+"} > 0 < 5.5e11)
+          > 90
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "container {{ $labels.cid }} at >90% of its memory limit for 15m"
+          description: |
+            Working set is within 10% of the compose memory limit —
+            OOM-kill territory. Map cid to a name:
+              docker ps | grep {{ $labels.cid }}
+            Fix = raise the limit in the owning compose template (repo)
+            and redeploy; never edit compose files on the host.

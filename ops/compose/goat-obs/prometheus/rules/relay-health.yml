@@ -1,0 +1,42 @@
+# Relay-health band staleness.
+#
+# WHY THIS FILE EXISTS. goat_relay_probe_timestamp_seconds is a REPORT clock —
+# it says when the relay fleet was last probed, not when some exporter last ran.
+# If the prober stops, node-exporter keeps serving the relay-health.prom the
+# prober left behind, so goat_relay_up stays green off a probe that has not run.
+#
+# Textfile metrics never expire. That is the whole hazard: a stopped producer
+# does not retract what it published, so the LAST value is served forever with
+# nothing marking it as old. Any band fed from a textfile needs its report clock
+# aged, or it can only ever fail green.
+#
+# ABSENCE IS NOT AN ALARM HERE, deliberately. A retired band should disappear,
+# and this expression cannot fire when the metric is gone. That is correct:
+# `absent()` would page every time a dashboard was legitimately sunset. What we
+# refuse to tolerate is the third state — present, green, and frozen.
+#
+# See docs/project/fabric-instrument-repair.md and
+# docs/design/relay-health-dashboard.md §"Mesh-dashboard sunset".
+groups:
+  - name: relay-health
+    rules:
+      - alert: RelayHealthReportStale
+        # 15 min against a 15s probe interval — 60x headroom, so a slow or
+        # briefly-failing probe cycle never pages, and a stopped one always does.
+        expr: time() - goat_relay_probe_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          component: relay-health
+        annotations:
+          summary: "relay-health probe report is {{ $value | humanizeDuration }} old — the band is frozen"
+          description: |
+            Every goat_relay_* series on this host is being served from a probe
+            that has not run recently, so relay health reads as whatever it was
+            when the prober stopped — including green.
+
+            Check relay-health-probe.timer first: if it is disabled, the band was
+            retired and the leftover .prom should have been removed with it
+            (the role's sunset path does this; a host that predates that fix may
+            still be carrying the orphan). If the timer is active, the probe
+            itself is failing.

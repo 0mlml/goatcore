@@ -1,0 +1,212 @@
+# relay-health standalone PUBLIC compose (ADR 1061 Phase 2 — break-glass).
+#
+# Adds the gated public surface: a self-contained Traefik (:80/:443, Let's
+# Encrypt via Cloudflare DNS-01) + oauth2-proxy (login via the public Dex at
+# auth.<zone>) fronting the relay-health nginx. Used INSTEAD OF
+# docker-compose.standalone.yml when public_enabled. nginx ALSO still publishes
+# the mesh host port (:8888) — so the dashboard is reachable BOTH ways at once:
+# Dex-gated from the public internet, and unauthenticated from the private mesh
+# (the SG opens only :443/:80 to the world, so :8888 stays mesh-only).
+#
+# Why this exists: the Thor is the worst vantage to watch cloud relays from and
+# the most fragile node, so relay monitoring must survive a Thor/mesh outage —
+# this is the permanent break-glass path, reachable off-mesh (ADR 1061's
+# deliberate divergence from the compliance dashboard, which converges to
+# mesh-only). The gate is a real Dex login; the SG + oauth2-proxy are the access
+# control. No ALB (we terminate our own TLS; the mesh already exists, so no
+# compliance-style cold-start dilemma).
+#
+# Auth flow: browser → :443 Traefik → oauth2-proxy (unauth → 302 to Dex login
+# → Kanidm) → on success, proxies to relay-health:80 (the dashboard).
+#
+# All compose-time vars come from /opt/relay-health/.env (rendered by the
+# relay-health role): RELAY_HEALTH_FQDN, ACME_EMAIL, CLOUDFLARE_DNS_API_TOKEN,
+# the oauth2-proxy.env file holds the OIDC client + cookie secrets.
+#
+#   docker compose -f docker-compose.public.yml up -d traefik oauth2-proxy relay-health
+
+services:
+  # Public edge — TLS termination + ACME. Routes the one host to oauth2-proxy.
+  traefik:
+    # traefik:v3.7.16 multi-arch INDEX digest — same pin the mgmt-host Traefik runs.
+    image: ${RELAY_HEALTH_TRAEFIK_IMAGE:-traefik:v3.7.16@sha256:1336e85aaed293bd63d005086e0dd013b04078b26aaeb1c18b26a2f928af7e65}
+    container_name: relay-health-traefik
+    restart: unless-stopped
+    command:
+      # FILE provider (not docker) — no docker.sock, and avoids the Docker-29
+      # API-version incompatibility with Traefik v3.2's docker client. The router
+      # + service are rendered by the role into /etc/traefik/dynamic/.
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.dnschallenge=true
+      - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
+      - --log.level=INFO
+      - --accesslog=true
+      - --accesslog.format=json
+      - --api.dashboard=false
+      - --api.insecure=false
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # CVE-2026-98432 mitigation (IPv4 TCP request-socket use-after-free, CVSS
+      # 9.8): the published exploit needs an MPTCP listener and Go 1.24+ listeners
+      # request one by default. GODEBUG keeps this Go listener plain TCP on any
+      # kernel; a container sysctl would refuse to start on Tegra, which has no
+      # MPTCP. Remove with the host sysctl once the fixed Ubuntu kernel is live.
+      - GODEBUG=multipathtcp=0
+      # Zone Cloudflare token (DNS-01); from /opt/relay-health/.env.
+      - CLOUDFLARE_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN:?CLOUDFLARE_DNS_API_TOKEN must be set in /opt/relay-health/.env}
+    volumes:
+      - /opt/relay-health/traefik-dynamic:/etc/traefik/dynamic:ro
+      - /opt/relay-health/letsencrypt:/letsencrypt
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # The Dex login gate. Unauth → 302 to https://auth.<zone>; on success proxies
+  # to the dashboard. Gates on AUTHENTICATED (any Kanidm user) — Dex emits no
+  # groups claim today (matches the compliance dashboard; group-scoping is a
+  # future enhancement). Its OIDC client + cookie secrets live in oauth2-proxy.env.
+  oauth2-proxy:
+    image: ${RELAY_HEALTH_OAUTH2_PROXY_IMAGE:-quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d}
+    container_name: relay-health-oauth2-proxy
+    restart: unless-stopped
+    env_file:
+      - /opt/relay-health/oauth2-proxy.env
+    volumes:
+      # Explicit email allowlist (OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE). Only
+      # these addresses pass the gate; rendered by the relay-health role from
+      # relay_health_public_allowed_emails. Read-only.
+      - /opt/relay-health/authenticated-emails.txt:/etc/oauth2-proxy/authenticated-emails.txt:ro
+      # Custom refusal page. The stock 403 is bare: it names neither the
+      # identity presented nor the fact that authorization here is an email
+      # allowlist, so a door working exactly as configured is indistinguishable
+      # from a broken one. Only error.html is overridden; sign_in.html keeps the
+      # built-in. OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR (oauth2-proxy.env) points here.
+      - /opt/relay-health/oauth2-proxy-templates:/etc/oauth2-proxy/templates:ro
+    expose:
+      - "4180"
+    depends_on:
+      - relay-health
+    healthcheck:
+      test: ["NONE"]
+
+  # The dashboard. Reached TWO ways at once:
+  #   1. PUBLIC (off-mesh): Traefik :443 → oauth2-proxy (Dex login) → this nginx.
+  #   2. MESH (private): the published host port (default :8888), reachable only
+  #      from mesh WireGuard peers — the egress-only-plus-:443/:80 SG does NOT
+  #      open :8888 to the public internet, so mesh membership is the trust
+  #      boundary (same as Phase 1, unauthenticated). Both serve the same www.
+  relay-health:
+    image: ${RELAY_HEALTH_NGINX_IMAGE:-nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
+    container_name: relay-health
+    restart: unless-stopped
+    ports:
+      # Mesh-only view (SG blocks this port from the public internet).
+      - "${RELAY_HEALTH_LISTEN_PORT:-8888}:80"
+    expose:
+      - "80"
+    volumes:
+      - /opt/relay-health/www:/usr/share/nginx/html:ro
+      # View selection by group (ADR 1066). Without this the stock image serves
+      # the FULL document to everyone admitted by the gate.
+      - /opt/relay-health/nginx-relay-health.conf:/etc/nginx/conf.d/default.conf:ro
+    labels:
+      - "traefik.enable=false"   # fronted by oauth2-proxy, never Traefik directly
+      - "site_id=${SITE_ID:-unknown}"
+      - "adr=1061"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # Relay-metrics ingest (ADR 1058 / 1061 throughput parity) — token-gated sink
+  # for relays self-publishing their host metrics DIRECTLY to this cloud box
+  # (not the Thor hairpin). Fronted by Traefik on :443 at /relay-metrics-ingest
+  # (file-provider router below); writes per-relay files the prober folds in.
+  # ntfy — the self-hosted pager (ADR 1168, amends ADR 1059). Lives HERE, on the
+  # cloud box, because a pager on the host it watches dies with that host. Traefik
+  # fronts it on its own hostname with a Let's Encrypt cert; ntfy does its own
+  # auth (auth-default-access: deny-all), so there is NO oauth2-proxy in front —
+  # the phone apps speak basic auth / tokens, not an OIDC login flow. Started only
+  # when relay_health role has ntfy_enabled (it is appended to the `up` list).
+  ntfy:
+    image: ${NTFY_IMAGE:-binwiederhier/ntfy:v2.28.0@sha256:6ef4b819f722fccdc036af611c4774cfdc2de821ab74fdd48bbf4c9d6f8973da}
+    container_name: relay-health-ntfy
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      TZ: UTC
+    volumes:
+      - /opt/relay-health/ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - /opt/relay-health/ntfy/cache:/var/cache/ntfy
+      - /opt/relay-health/ntfy/data:/var/lib/ntfy
+    expose:
+      - "80"
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "adr=1168"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+  relay-metrics-ingest:
+    image: ${RELAY_METRICS_INGEST_IMAGE:-python:3.12-alpine@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df}
+    container_name: relay-metrics-ingest
+    restart: unless-stopped
+    command: ["python3", "/app/relay-metrics-ingest.py"]
+    environment:
+      RELAY_METRICS_BEARER_TOKEN: "${RELAY_METRICS_BEARER_TOKEN:?relay-metrics ingest requires a bearer token}"
+      RELAY_METRICS_ALLOWED_NAMES: "${RELAY_METRICS_ALLOWED_NAMES:?relay-metrics ingest requires the relay-name allowlist}"
+      # Site network hosts allowed to publish host-net health
+      # (host-net-publish.sh). Empty = route 404s.
+      HOST_NET_ALLOWED_NAMES: "${HOST_NET_ALLOWED_NAMES:-}"
+      # Zenoh routers allowed to publish their SERVICE health (zenoh-health-probe.sh,
+      # F-248/F-253). Empty = /zenoh-health-ingest 404s.
+      ZENOH_HEALTH_ALLOWED_NAMES: "${ZENOH_HEALTH_ALLOWED_NAMES:-}"
+      # Cross-goatnet rollup ingest (goatnets.html). Its OWN token so a sibling
+      # goatnet never holds this box's full ingest credential; both empty ⇒ the
+      # route 404s and the feature is simply off.
+      CROSS_FLEET_TOKEN: "${CROSS_FLEET_TOKEN:-}"
+      CROSS_FLEET_ALLOWED_NAMES: "${CROSS_FLEET_ALLOWED_NAMES:-}"
+      RELAY_METRICS_INGEST_DIR: "/ingest"
+      RELAY_METRICS_LISTEN_PORT: "8090"
+      # Allowlist auto-sync (ADR 1093 Phase 1) — publishers allowed to POST the
+      # active roster; empty = feature off (route 404s). Fail-closed floor below.
+      ALLOWLIST_PUBLISHERS: "${ALLOWLIST_PUBLISHERS:-}"
+      ALLOWLIST_FILE: "/allowlist/authenticated-emails.txt"
+      ALLOWLIST_MIN: "${ALLOWLIST_MIN:-20}"
+    expose:
+      - "8090"
+    volumes:
+      - /opt/relay-health/relay-metrics-ingest.py:/app/relay-metrics-ingest.py:ro
+      - /opt/relay-health/www/ingest:/ingest
+      # rw so the allowlist route can write the gate file IN-PLACE (same inode
+      # oauth2-proxy bind-mounts read-only above; a rename would strand it).
+      - /opt/relay-health/authenticated-emails.txt:/allowlist/authenticated-emails.txt:rw
+    labels:
+      - "adr=1058"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+networks:
+  # Match the Phase-1 standalone compose (default network named relay-health) so
+  # switching modes doesn't hit a docker network-label conflict. All three
+  # services join it + resolve each other by service name.
+  default:
+    name: relay-health

@@ -1,0 +1,76 @@
+# standup-dag.yaml — which phase-12 steps need which, for both avenues
+# (goat-standup.sh and `goatbuilder standup`, ADR 1201).
+#
+# Phase 12 runs fourteen steps one after another, though only some depend on
+# others. With `--parallel`, each avenue runs the steps whose needs are met
+# together, wave by wave; without it the order is the serial one it always was.
+# Both plans print each step's `needs:` line, so the standup parity gate checks
+# that the two avenues read the same graph.
+#
+# A step is matched by the start of its label (after any "[internet] " tag). A
+# need on a step the site does not run (a joiner applies no ACL and seeds no
+# account) is met. A step not listed here is not part of the graph: it runs
+# serially where it stands (the Forgejo bot mint, which ends the run on purpose
+# so the operator can reload the token it wrote).
+#
+# Every edge cites the dependency the script itself states. Where the evidence
+# is "both write the same NetBird account", the edge serialises the writers
+# rather than guessing that concurrent writes are safe.
+phase: 12
+steps:
+  - id: acl-groups
+    label: "declared NetBird groups"
+    needs: []
+    why: "the declared ACL first (ADR 1185): groups, then policies, then enforce"
+  - id: acl-policies
+    label: "declared NetBird policies"
+    needs: [acl-groups]
+    why: "policies reference the declared groups"
+  - id: acl-enforce
+    label: "enforce: no Default All->All"
+    needs: [acl-policies]
+    why: "enforce deletes any Default All->All once the declared policies exist"
+  - id: acl-gate
+    label: "the live NetBird account holds only the declared ACL"
+    needs: [acl-enforce]
+    why: "the gate reads the account the three steps above wrote"
+  - id: si-mint
+    label: "mint the NetBird service identities"
+    needs: [acl-groups]
+    why: "the mint writes service users into the same NetBird account the ACL steps write; serialised after the groups"
+  - id: si-gate
+    label: "every required NetBird service identity"
+    needs: [si-mint]
+    why: "the gate verifies what the mint wrote"
+  - id: account-baseline
+    label: "netbird account baseline"
+    needs: [acl-groups]
+    why: "writes the mesh-DNS nameserver group into the same account; serialised after the declared groups"
+  - id: mesh-dns
+    label: "mesh CoreDNS"
+    needs: [account-baseline]
+    why: "\"after the account baseline created the mesh-DNS group it attaches to\""
+  - id: portal
+    label: "portal (registry"
+    needs: [acl-gate, si-gate]
+    why: "\"every later phase that crosses the mesh depends on [the declared ACL]\"; every consumer role \"refuses to deploy without its token\""
+  - id: pubsub-mirror
+    label: "pubsub-state Repl mirror"
+    needs: [portal]
+    why: "mirrors the portal registry to Forgejo"
+  - id: intake
+    label: "onboarding intake front desk"
+    needs: [portal]
+    why: "\"the grant rows the rest of phase 12 depends on (onboarding intake + runner, grant-keyd)\""
+  - id: runner
+    label: "onboard-runner"
+    needs: [portal]
+    why: "\"the grant rows the rest of phase 12 depends on (onboarding intake + runner, grant-keyd)\""
+  - id: grant-keyd
+    label: "grant-keyd"
+    needs: [portal]
+    why: "\"Needs the portal (above) and SPIRE (phase 9)\""
+  - id: synth
+    label: "notional pub/sub"
+    needs: [portal]
+    why: "mints a slot anchor and cert per synthetic peer via the portal; needs PORTAL_OPERATOR_API_KEY"

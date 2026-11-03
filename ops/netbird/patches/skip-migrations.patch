@@ -1,0 +1,56 @@
+diff --git a/management/internals/server/boot.go b/management/internals/server/boot.go
+index 24dfb641b..0a2c808de 100644
+--- a/management/internals/server/boot.go
++++ b/management/internals/server/boot.go
+@@ -7,6 +7,7 @@ import (
+ 	"crypto/tls"
+ 	"net/http"
+ 	"net/netip"
++	"os"
+ 	"slices"
+ 	"time"
+ 
+@@ -74,7 +75,7 @@ func (s *BaseServer) CacheStore() cachestore.StoreInterface {
+ 
+ func (s *BaseServer) Store() store.Store {
+ 	return Create(s, func() store.Store {
+-		store, err := store.NewStore(context.Background(), s.Config.StoreConfig.Engine, s.Config.Datadir, s.Metrics(), false)
++		store, err := store.NewStore(context.Background(), s.Config.StoreConfig.Engine, s.Config.Datadir, s.Metrics(), os.Getenv("NETBIRD_SKIP_MIGRATIONS") == "true")
+ 		if err != nil {
+ 			log.Fatalf("failed to create store: %v", err)
+ 		}
+diff --git a/management/server/activity/store/sql_store.go b/management/server/activity/store/sql_store.go
+index 73e8e295c..e82e73dd4 100644
+--- a/management/server/activity/store/sql_store.go
++++ b/management/server/activity/store/sql_store.go
+@@ -62,13 +62,24 @@ func NewSqlStore(ctx context.Context, dataDir string, encryptionKey string) (*St
+ 		return nil, fmt.Errorf("initialize database: %w", err)
+ 	}
+ 
+-	if err = migrate(ctx, fieldEncrypt, db); err != nil {
+-		return nil, fmt.Errorf("events database migration: %w", err)
+-	}
++	// Only honor NETBIRD_SKIP_MIGRATIONS for the Postgres activity store, which
++	// is the one that participates in multi-master logical replication.
++	// A per-node SQLite activity store still needs its schema created on fresh
++	// nodes, so the skip must not apply there.
++	skipMigrations := os.Getenv("NETBIRD_SKIP_MIGRATIONS") == "true" &&
++		os.Getenv(storeEngineEnv) == string(types.PostgresStoreEngine)
++
++	if !skipMigrations {
++		if err = migrate(ctx, fieldEncrypt, db); err != nil {
++			return nil, fmt.Errorf("events database migration: %w", err)
++		}
+ 
+-	err = db.AutoMigrate(&activity.Event{}, &activity.DeletedUser{})
+-	if err != nil {
+-		return nil, fmt.Errorf("events auto migrate: %w", err)
++		err = db.AutoMigrate(&activity.Event{}, &activity.DeletedUser{})
++		if err != nil {
++			return nil, fmt.Errorf("events auto migrate: %w", err)
++		}
++	} else {
++		log.WithContext(ctx).Info("NETBIRD_SKIP_MIGRATIONS=true and activity store engine is Postgres; skipping events database migration and AutoMigrate/schema updates")
+ 	}
+ 
+ 	return &Store{

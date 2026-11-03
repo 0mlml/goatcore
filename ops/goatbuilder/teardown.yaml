@@ -1,0 +1,106 @@
+# teardown.yaml — how each standup step comes down, for `goatbuilder teardown`
+# and ops/scripts/goat-teardown.sh (ADR 1201: both avenues read this file).
+#
+# A teardown walks the standup's applied steps in reverse. Each step is matched
+# by the start of its label (after any "[internet] ", "[lan] " or "[joiner] "
+# tag) and declared as one of:
+#
+#   compose-down  stop the service's compose projects; volumes are KEPT, so a
+#                 standup brings it back with its data. Proved from the host:
+#                 `docker compose ps -q` lists nothing for each project.
+#   keep          nothing to reverse here (a gate, a file written on the laptop,
+#                 the host baseline the next standup reuses).
+#   refused       reversing it destroys data (the NetBird account, the identity
+#                 store, the database). A teardown that reaches one refuses
+#                 (exit 3) before touching anything; take it down by hand.
+#   designed      the reverse is defined but not built yet (named, dated).
+#
+# Teardown writes /var/lib/goat/<component>/teardown.jsonl and never touches
+# deploy-history.jsonl, so rollback's history is unchanged.
+#
+# `dirs` names each compose directory as the role variable that sets it and the
+# role's default; the play reads the site's own value when it overrides one.
+steps:
+  - label: "notional pub/sub"
+    action: compose-down
+    component: synth-vendors
+    dirs: [{var: synth_vendor_compose_dir, default: /opt/synth-vendors}]
+  - label: "grant-keyd"
+    action: compose-down
+    component: grant-keyd
+    dirs: [{var: grant_keyd_compose_dir, default: /opt/grant-keyd}]
+  - label: "onboard-runner"
+    action: compose-down
+    component: onboard-runner
+    dirs: [{var: onboard_runner_dir, default: /opt/onboard-runner}]
+  - label: "onboarding intake front desk"
+    action: compose-down
+    component: onboard-intake
+    dirs: [{var: onboard_intake_dir, default: /opt/onboard-intake}, {var: intake_mesh_advisory_compose_dir, default: /opt/intake-mesh-advisory}]
+  - label: "pubsub-state Repl mirror"
+    action: keep
+    why: "the mirror writes into the portal's directory and the obs host's Forgejo; it stops with the portal"
+  - label: "portal (registry"
+    action: compose-down
+    component: goat-zenoh-portal
+    dirs: [{var: portal_data_dir, default: /opt/goat-zenoh-portal}]
+  - label: "mesh CoreDNS"
+    action: designed
+    why: "the mesh-DNS server is a systemd-managed CoreDNS under /opt/goat/dns, not a compose project; its stop + the nameserver-group removal land with the account teardown (2026-11-20)"
+  - label: "netbird account baseline"
+    action: refused
+    why: "writes rows into the NetBird account; removing them is an account change, not a service stop"
+  - label: "mint the NetBird service identities"
+    action: refused
+    why: "service users live in the NetBird account and their tokens in the secrets store"
+  - label: "declared NetBird"
+    action: refused
+    why: "the declared ACL lives in the NetBird account"
+  - label: "enforce: no Default All->All"
+    action: refused
+    why: "the declared ACL lives in the NetBird account"
+  - label: "register OIDC clients"
+    action: refused
+    why: "clients live in the identity store (Hydra)"
+  - label: "dashboard"
+    action: designed
+    why: "the dashboard shares the mgmt-host compose project with the control plane; a per-service stop lands with the mgmt-stack split (2026-11-20)"
+  - label: "SPIRE server on the founder"
+    action: designed
+    why: "SPIRE shares the mgmt-host compose project; its CA is data (2026-11-20)"
+  - label: "zenoh router"
+    action: designed
+    why: "the router's compose path is templated per site; the teardown play needs the rendered path (2026-11-20)"
+  - label: "relay tier"
+    action: refused
+    why: "the relays are shared cloud infrastructure, torn down by terraform, not by a site"
+  - label: "public TLS certificate"
+    action: keep
+    why: "a certificate left on disk costs nothing and is reissued on the next standup"
+  - label: "ory (kratos/hydra/ui)"
+    action: refused
+    why: "the identity store holds every person's account"
+  - label: "re-run site-bootstrap"
+    action: refused
+    why: "the mgmt stack holds the database: NetBird account, Ory identities, Spock replication"
+  - label: "mgmt-stack (site-bootstrap)"
+    action: refused
+    why: "the mgmt stack holds the database: NetBird account, Ory identities, Spock replication"
+  - label: "relay-connect"
+    action: designed
+    why: "stopping the rathole client unwires the site from its relays; lands with the relay teardown (2026-11-20)"
+  - label: "host baseline + LUKS"
+    action: keep
+    why: "the host keeps its OS, encryption and baseline; the next standup reuses them"
+  - label: "[obs]"
+    action: designed
+    why: "the obs host's stacks come down with the obs leg teardown (2026-11-20)"
+  - label: "join the cross-goatnet surfaces"
+    action: designed
+    why: "removing the site from every relay-health overview is a cross-env.yaml change plus a redeploy of every box (2026-11-20)"
+  - label: "network-jump host"
+    action: keep
+    why: "a rescue node is the way in when the mesh and control plane are both down; a site teardown leaves it standing (ADR 1183)"
+  - label: "break-glass node"
+    action: keep
+    why: "a rescue node is the way in when the mesh and control plane are both down; a site teardown leaves it standing (ADR 1183)"

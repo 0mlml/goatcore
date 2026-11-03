@@ -1,0 +1,715 @@
+# Zenoh router WEDGE alerts — the restart-rate gap.
+#
+# FabricRouterUnhealthy (container-health.yml) has for:10m, but the wedge-watch
+# watchdog auto-restarts a wedged router in ~1-2 min, so `unhealthy` never
+# persists 10m and that alert NEVER fires — a router can wedge hourly with
+# PagerDuty silent. The load-bearing signal is the RESTART RATE.
+#
+# Metrics: goat_zenoh_* from ops/relay/health/zenoh-health-to-prom.py (reads the
+# relay-health ingest's zenoh-health.json + zenoh-wedges.json → node-exporter
+# textfile). Playbook: docs/operations/zenoh-wedge-investigation-playbook.md.
+# Critical severity pages via PagerDuty (ADR 1059).
+groups:
+  - name: zenoh-wedge
+    interval: 30s
+    rules:
+
+      # THE alert the fast-recovering wedges need. Catches recurrence that
+      # FabricRouterUnhealthy (for:10m, self-recovers before it fires) misses.
+      - alert: ZenohRouterWedging
+        expr: goat_zenoh_restarts_24h >= 3
+        for: 5m
+        labels:
+          severity: critical
+          component: zenoh-router
+        annotations:
+          summary: "CRITICAL: zenoh router {{ $labels.router }} wedging repeatedly ({{ $value }} auto-restarts/24h)"
+          description: |
+            The wedge-watch watchdog has auto-restarted the zenoh router
+            {{ $value }} time(s) in 24h — it is deadlocking recurrently. Each
+            restart is a ~1-2 min fabric blip; FabricRouterUnhealthy (for:10m)
+            does NOT catch these because they self-recover. Ongoing incident.
+            Do NOT clean rocksdb / disable replication (debunked red herring).
+            Capture a SYMBOLIZED stack of the next wedge and follow the playbook:
+              docs/operations/zenoh-wedge-investigation-playbook.md
+              /var/log/zenoh-symcap/          # armed symbolized captures on the Thor
+
+      # A wedge the watchdog can't clear (it normally recovers in ~1-2 min).
+      - alert: ZenohRouterWedgedStuck
+        expr: goat_zenoh_currently_wedged == 1
+        for: 5m
+        labels:
+          severity: critical
+          component: zenoh-router
+        annotations:
+          summary: "CRITICAL: zenoh router {{ $labels.router }} WEDGED and not auto-recovering (5m+)"
+          description: |
+            The router is deadlocked and the watchdog has NOT cleared it in 5m.
+            The watchdog (wedge-watch.service) may be down. Capture a symbolized
+            stack, then restart:
+              sudo /usr/local/sbin/zenoh-symcap.sh   # or the gdb block in the playbook
+              docker restart <the zenoh-router container>
+
+      # Admission degrading (the wedge building) — warning tier.
+      # Router memory, measured as the part the kernel cannot reclaim.
+      #
+      # WHY NOT goat_zenoh_mem_bytes: it comes from `docker stats` and still
+      # counts active page cache. On a router holding hundreds of rocksdb
+      # instances that is GiBs and sits near the cap normally, and the cgroup can
+      # hit the limit many times WITHOUT a single OOM kill. Alerting on
+      # that number pages for healthy reclaim.
+      #
+      # anon + swap is what an allocation cannot take back, so it is what
+      # decides the kill. F-564: the ceiling is structural, not a leak — every
+      # live slot opens its own rocksdb with a 32 MiB block cache that is not
+      # shared and no budget spanning the instances, so the configured ceiling
+      # can exceed the container limit and the number never falls back, because
+      # nothing closes a storage.
+      - alert: ZenohRouterMemoryHigh
+        expr: >
+          (goat_zenoh_mem_anon_bytes + goat_zenoh_mem_swap_bytes)
+            / goat_zenoh_mem_limit_bytes > 0.75
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} at {{ $value | humanizePercentage }} of its memory cap (unreclaimable)"
+          description: |
+            Anonymous memory plus swap has been over 75% of the container cap
+            for 15m. This does not fall back on its own: a storage is never
+            closed, so the number tracks how many slots have gone live since
+            the router started, not current traffic.
+            Read it, do not restart reflexively:
+              id=$(docker inspect -f '{{ "{{" }}.Id{{ "}}" }}' <router>)
+              grep -E '^(anon|file) ' /sys/fs/cgroup/system.slice/docker-$id.scope/memory.stat
+            Headroom without a restart:  docker update --memory <N>g --memory-swap <2N>g <router>
+            Finding: docs/findings/F-564-zenoh-per-slot-storages-have-no-shared-memory-budget.md
+
+      # The same signal past the point where reclaim can still save it. A kill
+      # here drops every session at once and every client re-declares together,
+      # which is the churn half of the wedge recipe — so this pages.
+      - alert: ZenohRouterMemoryCritical
+        expr: >
+          (goat_zenoh_mem_anon_bytes + goat_zenoh_mem_swap_bytes)
+            / goat_zenoh_mem_limit_bytes > 0.90
+        for: 5m
+        labels:
+          severity: critical
+          component: zenoh-router
+        annotations:
+          summary: "CRITICAL: zenoh router {{ $labels.router }} at {{ $value | humanizePercentage }} of its memory cap — OOM kill is next"
+          description: |
+            Unreclaimable memory is within 10% of the cap. An OOM kill stops the
+            whole fabric until the router restarts, reloads its storages and
+            every client reconnects.
+            Buy headroom NOW, without a restart:
+              docker update --memory <N>g --memory-swap <2N>g <router>
+            Then decide the durable fix with F-564, not at 03:00.
+
+      # The band above is unmeasurable where the probe cannot read the cgroup —
+      # say so rather than letting a missing series read as healthy.
+      - alert: ZenohRouterMemoryUnmeasured
+        expr: >
+          absent(goat_zenoh_mem_anon_bytes)
+            and present_over_time(goat_zenoh_mem_bytes[1h])
+        for: 30m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router memory band is unmeasured (anon/swap series absent while the probe reports)"
+          description: |
+            The probe is reporting but is not emitting goat_zenoh_mem_anon_bytes,
+            so the two alerts above cannot fire and the router's memory is
+            effectively unwatched. Usually the probe cannot read
+            /sys/fs/cgroup/<container>/memory.stat.
+
+      # Session table (#1922). Teardown that never finishes leaves linkless
+      # entries that still count toward max_sessions (1000, the zenoh default;
+      # the router config does not set it). At the limit the router refuses
+      # every new transport with close reason INVALID and logs it only at trace
+      # level, so existing clients keep working while every new one is locked
+      # out, silently. The table can fill in about a week.
+      - alert: ZenohRouterSessionTableFilling
+        expr: goat_zenoh_sessions_total >= 600
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} holds {{ $value }} sessions (limit 1000)"
+          description: |
+            The transport table is over 60% of max_sessions. When it reaches the
+            limit, new clients are refused silently while existing ones keep
+            working. Check how many entries are linkless (leaked, not live):
+              curl -s 'http://127.0.0.1:8000/@/*/router' | python3 -c 'import sys,json; s=json.load(sys.stdin)[0]["value"]["sessions"]; d=[x for x in s if not x.get("links")]; print("linkless", len(d), "live", len(s)-len(d))'
+            A router restart clears the leaked entries (about 75s for clients
+            to reconnect). Before restarting, capture the evidence #1922 asks
+            for: the session list above and the router's start time.
+            Issue: #1922.
+
+      - alert: ZenohRouterSessionTableNearFull
+        expr: goat_zenoh_sessions_total >= 900
+        for: 5m
+        labels:
+          severity: critical
+          component: zenoh-router
+        annotations:
+          summary: "CRITICAL: zenoh router {{ $labels.router }} session table at {{ $value }} of 1000 — new clients will be refused"
+          description: |
+            The transport table is within 10% of max_sessions. At the limit the
+            router refuses every new transport (close reason INVALID, logged only
+            at trace level): bridges that restart cannot re-attach and new
+            clients never connect. Save the session list for #1922, then restart
+            the router in a quiet window before the table fills:
+              curl -s 'http://127.0.0.1:8000/@/*/router' > /tmp/zenoh-sessions-$(date -u +%Y%m%dT%H%M%SZ).json
+
+      - alert: ZenohRouterLinklessSessionsAccumulating
+        expr: goat_zenoh_sessions_linkless >= 100
+        for: 30m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} holds {{ $value }} linkless sessions"
+          description: |
+            Sessions that reference no network link are entries whose teardown
+            never finished (#1922). They are not live, and they still use
+            max_sessions slots. On 2026-10-22 they accumulated at about 113 a
+            day until the table filled. A restart clears them; the fix is the
+            teardown defect tracked in #1922.
+
+      - alert: ZenohRouterOpenLatencyHigh
+        expr: goat_zenoh_open_ms > 3000
+        for: 5m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} new-session open latency high ({{ $value }} ms)"
+          description: |
+            mTLS new-session opens are taking >3s (healthy ~8 ms) — admission is
+            degrading. goat health fails while goat status stays green.
+
+      # F-568: the TCP/TLS proxy timed out while container health stayed green.
+      # Raw 15s scrapes peaked at 495 CLOSE-WAIT; the coarse read saw only 146.
+      # This is a proxy, not a Zenoh OPEN or a diagnosis of F-253's mechanism.
+      # A classified TLS rejection alone belongs to the probe warning below;
+      # a slow attempt with CLOSE-WAIT still pages regardless of its exception.
+      # Unclassified older producers retain failed-proxy detection. A healthy
+      # container and a report younger than 2m exclude startup and frozen data.
+      - alert: ZenohRouterAdmissionSeizure
+        expr: >
+          (
+            (goat_zenoh_open_ok == 0
+              unless ignoring(reason) (goat_zenoh_open_probe_status{reason="tls_error"} == 1))
+            or (goat_zenoh_open_ms > 3000 and goat_zenoh_close_wait > 20)
+          )
+          and (goat_zenoh_healthy == 1)
+          and (time() - goat_zenoh_report_timestamp_seconds < 120)
+        for: 0m
+        labels:
+          severity: critical
+          component: zenoh-router
+        annotations:
+          summary: "CRITICAL: zenoh router {{ $labels.router }} TCP/TLS admission proxy failed or stalled with CLOSE-WAIT"
+          description: |
+            A fresh TCP/TLS attempt failed, excluding a classified TLS rejection,
+            or took >3s with >20 CLOSE-WAIT sockets while the container was healthy.
+            This proxy does not exchange Zenoh OPEN messages or prove F-253's
+            cause. TLS 1.3 may return before a client-auth rejection arrives.
+            Capture sockets and logs now, before a transient drains:
+              pid=$(docker inspect -f '{{ "{{" }}.State.Pid{{ "}}" }}' <router>)
+              sudo nsenter -t "$pid" -n ss -tan state close-wait
+              docker logs --since 5m <router>
+            CLOSE-WAIT is netns-wide; inspect ports before attributing it to TLS.
+            Correlate open latency, client sessions and delivery. zenoh-symcap
+            waits for container unhealthy, so it is not a capture-now command here.
+            Evidence and the unresolved mechanism: docs/findings/F-568-f253-admission-seizure-recurred-on-patched-image-and-detection-missed-the-transient.md
+
+      # Anchor on each reporting source, not global absent() or past presence.
+      # This catches a never-configured probe and one missing router while a
+      # sibling (or a second scrape identity for the same router) stays healthy.
+      - alert: ZenohRouterAdmissionProbeUnmeasured
+        expr: >
+          (
+            (goat_zenoh_report_timestamp_seconds
+              unless (goat_zenoh_open_ok and goat_zenoh_open_ms))
+            or sum without(reason) (goat_zenoh_open_probe_status{reason="tls_error"} == 1)
+          )
+          and (goat_zenoh_healthy == 1)
+          and (time() - goat_zenoh_report_timestamp_seconds < 120)
+        for: 5m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} admission proxy is unmeasured or TLS-rejected"
+          description: |
+            A healthy reporting router has no complete TCP/TLS proxy measurement,
+            or its probe has been TLS-rejected for 5m. Admission detection is
+            incomplete. Check client certificate/key, probe status and service
+            logs; do not interpret missing samples as healthy admission.
+
+      # The file-descriptor leak as a TREND - the slow build the transient alert
+      # above only catches at the moment of seizure. CLOSE-WAIT can climb from
+      # hundreds to thousands in ~30 min before admission seizes; this warns on
+      # that ramp. Healthy is 0.
+      - alert: ZenohRouterCloseWaitClimbing
+        expr: goat_zenoh_close_wait > 100
+        for: 2m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} netns CLOSE-WAIT at {{ $value }}"
+          description: |
+            CLOSE-WAIT sockets have exceeded 100 in the router netns for 2m.
+            The gauge counts all ports, not just inbound TLS. Inspect addresses
+            and ports before attributing a cause; correlate admission and delivery:
+              sudo nsenter -t <router-pid> -n ss -tan state close-wait
+            docs/findings/F-253-zenoh-router-admission-seizure-close-wait.md
+
+      # The exporter died -> goat_zenoh_* freeze and mask a wedge (textfile
+      # metrics never expire).
+      - alert: ZenohHealthExporterStale
+        expr: time() - goat_zenoh_prom_last_run_timestamp_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh-health-to-prom stale 10m+ — wedge metrics frozen"
+          description: |
+            The zenoh metrics exporter hasn't completed a run in 10m; the
+            goat_zenoh_* metrics are frozen at their last value and could mask a
+            real wedge. Check zenoh-health-to-prom on the Thor.
+
+      # TWO CLOCKS, TWO FAILURES. The alert above ages the EXPORTER; this one
+      # ages the DATA. They are not the same question, and only the second
+      # catches a report frozen in time: the exporter runs every single minute —
+      # perfectly healthy by the rule above — while faithfully republishing an old
+      # report because the ingest feeding it has stopped. That is a green band on
+      # fossil data, with a staleness alert that cannot fire because the thing it
+      # watches is working exactly as designed.
+      #
+      # Whenever a metric carries both "when did the pipeline run" and "when was
+      # the data produced", age the second one. Precedent, done right already:
+      # mesh-path-quality.yml's goat_mesh_path_quality_probe_timestamp_seconds.
+      - alert: ZenohHealthReportStale
+        expr: time() - goat_zenoh_report_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} health REPORT is {{ $value | humanizeDuration }} old"
+          description: |
+            The goat_zenoh_* band is being published from a stale report. The
+            exporter may well be running — check goat_zenoh_report_timestamp_seconds
+            against goat_zenoh_prom_last_run_timestamp_seconds: if the run clock is
+            current and the report clock is not, the exporter's INPUT has stopped
+            advancing, not the exporter. Usual cause is the ingest that feeds
+            /opt/relay-health/www/ingest/zenoh-health.json no longer running.
+            See docs/project/fabric-instrument-repair.md.
+
+      # ---- WEDGE PRECURSORS (fire BEFORE the restart-rate alarm) ----
+      # docs/design/zenoh-wedge-instrumentation.md. Cardinality — not message
+      # rate — is what grows the routing table the wedge contends on. These give
+      # a lead on a stall instead of only counting restarts after the fact.
+
+      # Cardinality-budget: one owner dominating the keyspace is the user93x/video
+      # pattern (9,149 stored video keys → 64k routing edges). Threshold is a
+      # STORED-key lower bound; tune per goatnet once producer-3 gives true edges.
+      # --- Topic budget (cardinality-budget strategy layer 2) -------------
+      # Reconciliation, not interception: these PAGE a human, they never block
+      # a publisher. The tier comes from the crawler, which measures every
+      # owner continuously from disk — so an over-allocation is caught before
+      # it becomes everyone's problem, which is the whole point of the budget.
+      - alert: ZenohTopicBudgetException
+        expr: goat_zenoh_owner_budget_state{tier="exception"} == 1
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "topic budget: owner {{ $labels.owner }} on {{ $labels.router }} is in EXCEPTION tier"
+          description: |
+            With the allocation half live (layer 2b), exception means this
+            owner's distinct-key count EXCEEDS ITS GRANTED ALLOWANCE — over
+            what was agreed, not merely "big". Compare
+            goat_zenoh_owner_budget_observed vs goat_zenoh_owner_budget_granted.
+            Remedy: either a bigger allowance through the approval tiers
+            (sponsor <= request tier, platform-admin above it — record it in
+            the per-goatnet topic-budget grants), or the owner needs the
+            stable-key contract (docs/design/pubsub-best-practices.md §1b) —
+            high cardinality is what stalls the fabric for every tenant
+            , and it cannot be fixed with more hardware. (On a goatnet
+            without a budget source the tier is still the global-default
+            awareness classification: "big", pending an allocation.)
+
+      - alert: ZenohTopicBudgetSourceDown
+        expr: goat_zenoh_budget_source_live == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "topic budget: allowance source on {{ $labels.router }} is stale/unavailable"
+          description: |
+            The crawler could not re-read its topic-budget allowance source.
+            Stale = classifying against the last good map (grant changes are
+            NOT landing); unavailable = never loaded, every owner reads
+            unmeasured and ZenohTopicBudgetException is silently blind — the
+            F-177 failure class applied to the instrument. Check the rendered
+            budgets projection next to the fabric-crawler compose dir.
+
+      # The DELETED-metric companion to ZenohTopicBudgetSourceDown.
+      #
+      # `goat_zenoh_budget_source_live == 0` only fires while the series still
+      # exists. But the exporter emits it ONLY when the band carries a
+      # budget_source_state (zenoh-health-to-prom.py: "Absent entirely in
+      # legacy mode") — so if the band's fabric block loses that field, or the
+      # band JSON is deleted rather than frozen, the series vanishes and the
+      # value comparison matches nothing. Silence then reads as health.
+      #
+      # The `count_over_time(...[6h]) > 0` guard is what makes this safe to ship
+      # fleet-wide from one rules file: it fires only where the metric was
+      # present at some point in the last 6h, so a goatnet running in legacy
+      # mode (deliberately no budget source, so the series never existed) is
+      # never alerted, and the alert self-clears 6h after a deliberate
+      # decommission rather than nagging forever.
+      - alert: ZenohTopicBudgetSourceAbsent
+        expr: absent(goat_zenoh_budget_source_live) and on() (count_over_time(goat_zenoh_budget_source_live[6h]) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "topic budget: the allowance-source metric DISAPPEARED (not stale — gone)"
+          description: |
+            goat_zenoh_budget_source_live was being published within the last 6h
+            and is now absent entirely. ZenohTopicBudgetSourceDown cannot see
+            this — a value comparison matches nothing when the series is gone.
+            Either the band JSON lost its budget_source_state field (the crawler
+            fell back to legacy mode), or the band file was deleted/replaced.
+            Every owner is classifying as `unmeasured` and
+            ZenohTopicBudgetException is silently disarmed. Check the band JSON
+            + the fabric-crawler's budget source on the Thor.
+
+      - alert: ZenohTopicBudgetCountTruncated
+        expr: goat_zenoh_owner_count_truncated == 1
+        for: 30m
+        labels:
+          severity: info
+          component: zenoh-fabric
+        annotations:
+          summary: "topic budget: owner {{ $labels.owner }} count is a lower bound (enumeration truncated)"
+          description: |
+            The census stopped enumerating this owner at the lazy threshold, so
+            the reported count is a floor, not a total. Sustained truncation
+            means the owner sprawls far past the threshold. On router hosts the
+            rocksdb-direct source counts exactly and should not truncate —
+            persistent truncation here suggests the crawler fell back to the
+            bounded fabric walk (check its identity/ACL).
+
+      - alert: ZenohOwnerCardinalityHigh
+        expr: goat_zenoh_owner_stored_keys > 5000
+        for: 10m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh {{ $labels.router }}: owner {{ $labels.owner }} holds {{ $value }} keys (cardinality abuser)"
+          description: |
+            One owner namespace dominates the keyspace — the routing-table-bloat
+            pattern behind the wedge. Stored keys are a LOWER BOUND on routing
+            edges (the real driver), so the true fan-out is larger. Move the load
+            off the shared plane / bound per-identity cardinality / use volatile.
+            See docs/design/zenoh-wedge-instrumentation.md (H4).
+
+      # Read-hold precursor: the admin `**` walk latency climbing = the routing
+      # read lock is being held longer (bigger table or active contention) — the
+      # window a DECLARE writer can wedge into is widening.
+      - alert: ZenohAdminWalkLatencyHigh
+        expr: goat_zenoh_admin_walk_ms > 2000
+        for: 10m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh {{ $labels.router }}: admin walk {{ $value }} ms (read-hold widening)"
+          description: |
+            The admin-space `**` walk holds the routing read lock this long; a
+            rising trend means the wedge window is widening (H1). Correlate with
+            goat_zenoh_declare_rate_proxy and the next symcap capture's VERDICT
+            SUMMARY. docs/design/zenoh-wedge-instrumentation.md.
+
+      # The fabric sampler stopped -> cardinality precursors freeze.
+      - alert: ZenohFabricSamplerStale
+        expr: time() - goat_zenoh_fabric_sampled_at_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh-fabric-sampler stale 10m+ — cardinality precursors frozen"
+          description: |
+            zenoh-fabric-sampler hasn't published in 10m; goat_zenoh_stored_keys_*
+            / owner cardinality are frozen. Check the sampler timer on the Thor.
+
+      # DEGRADED, NOT DOWN. The crawler now survives losing its zenoh session
+      # when it has a usable rocksdb source — census and topic-budget
+      # classification are router-independent, so it keeps measuring. That is
+      # deliberate (it decouples the crawler from the router), but it retired
+      # the signal that used to mean "the router is gone": the process no
+      # longer exits, so container health stays green and the crawl keeps
+      # publishing. What silently stops is the router-derived half —
+      # publishers and liveliness go null rather than wrong.
+      #
+      # Deliberately NOT critical and deliberately NOT a crawler-health alert:
+      # the crawler is fine. This says the FABRIC VIEW is partial. Pairs with
+      # the crawler's container healthcheck, which is a liveness probe only and
+      # stays green here on purpose — routing state belongs on the data
+      # surface, not in docker health, or the two get re-coupled through docker
+      # instead of through the process.
+      - alert: ZenohCrawlerSessionDegraded
+        expr: goat_zenoh_crawler_session_live == 0
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "fabric crawler on {{ $labels.router }} is measuring from rocksdb with NO zenoh session"
+          description: |
+            The crawler has had no zenoh session for 15m+ and is running
+            rocksdb-only. Still trustworthy: stored-key census, per-owner
+            cardinality, topic-budget classification. NOT being measured at
+            all: publishers, liveliness, admin declarations — those facets are
+            null, not zero, so any panel or query reading them is looking at an
+            absence and must not report it as "no publishers". The crawler
+            itself is healthy and will re-attach on its own; the question is
+            why the router is unreachable from it. Check the router first
+            (FabricRouterUnhealthy / ZenohRouterWedging may also be firing),
+            then the crawler's cert/ACL if the router is fine.
+
+      # The DELETED-metric companion to ZenohFabricSamplerStale.
+      #
+      # `time() - goat_zenoh_fabric_sampled_at_seconds > 600` catches a FROZEN
+      # sample. It cannot catch a DELETED one: remove the band JSON and the
+      # exporter simply stops emitting the series, the subtraction has no
+      # operands, and nothing fires. Same guard rationale as
+      # ZenohTopicBudgetSourceAbsent — only alerts where the metric existed in
+      # the last 6h, so goatnets that never ran the sampler stay quiet.
+      #
+      # Distinct from ZenohHealthExporterStale: that one fires when the exporter
+      # itself dies (all goat_zenoh_* freeze together). This one fires when the
+      # exporter is alive and healthy but its INPUT lost the fabric block —
+      # exactly the case that looks fine from every other angle.
+      - alert: ZenohFabricSamplerAbsent
+        expr: absent(goat_zenoh_fabric_sampled_at_seconds) and on() (count_over_time(goat_zenoh_fabric_sampled_at_seconds[6h]) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "fabric-sample metric DISAPPEARED (not stale — gone)"
+          description: |
+            goat_zenoh_fabric_sampled_at_seconds was being published within the
+            last 6h and is now absent entirely, so ZenohFabricSamplerStale has
+            nothing to compare and stays silent. The band JSON was deleted or
+            lost its `fabric` block while zenoh-health-to-prom keeps running.
+            Cardinality precursors (goat_zenoh_stored_keys_*, owner cardinality,
+            admin walk latency) are not frozen — they are GONE, and every
+            precursor alert riding on them is disarmed. Check the band JSON on
+            the Thor + the zenoh-fabric-sampler timer.
+
+  # ---- DELIVERY STALLS ----------------------------------------------------
+  #
+  # Everything above watches the router PROCESS. A router can stop delivering for
+  # most of an hour while the healthcheck, REST and new-session opens all read
+  # green: it blocks its receive threads for ~5 s at a time pushing to one slow
+  # `**` subscriber after another, and nothing restarts it because nothing is
+  # dead. These alerts watch DELIVERY instead.
+  #
+  # Two observers, deliberately:
+  #   * goat_audit_samples_total — the audit tap subscribes to `**` (minus
+  #     volatile/**) and counts every sample it receives. Rate-zero is the
+  #     outage as a consumer sees it. The existing AuditSubscriberStalled
+  #     (audit-subscriber.yml, for 15m on a 5m rate) fires ~20 min after a
+  #     long outage begins; these fire in ~3.
+  #   * goat_zenoh_slow_consumer_closes_total — counted by the Thor probe from
+  #     the router log (zenoh-router-signals.py). It names the mechanism and,
+  #     via goat_zenoh_slow_consumer_last_close_timestamp_seconds, the ZID.
+  #
+  - name: zenoh-delivery
+    interval: 30s
+    rules:
+
+      # Nothing reached the fabric-wide observer for 2 minutes, on a goatnet
+      # that was carrying > 1 msg/s over the previous hour. The baseline guard
+      # keeps a quiet goatnet (or one with no audit tap) silent; it looks back
+      # from 10 minutes ago so the stall itself does not drag the baseline down.
+      - alert: FabricDeliveryStopped
+        expr: |
+          sum(rate(goat_audit_samples_total[2m])) == 0
+          and on() sum(rate(goat_audit_samples_total[1h] offset 10m)) > 1
+        for: 1m
+        labels:
+          severity: critical
+          component: zenoh-fabric
+        annotations:
+          summary: "CRITICAL: fabric delivery STOPPED — the audit tap has received nothing for 3m"
+          description: |
+            The audit subscriber (a `**` tap) received zero samples for 3 minutes
+            on a goatnet that carried more than 1 msg/s over the prior hour.
+            The router is probably ALIVE — check it is not blocked on a slow
+            consumer before restarting anything:
+              goat_zenoh_slow_consumer_closes_total / ZenohSlowConsumerStalling
+              docker logs --since 5m <router> | grep "Unable to push non droppable"
+            Restarting the router does NOT fix a slow consumer (it reconnects).
+            Capture first: sudo /usr/local/sbin/zenoh-symcap.sh
+            F-287 amendment; docs/design/zenoh-router-health.md.
+
+      # Delivery collapsed rather than stopped: < 5% of the prior hour. This is
+      # the shape of short stall windows (a few msgs/min from two anchors
+      # against thousands). Warning, because a large publisher legitimately
+      # stopping (a replay ending) produces the same ratio.
+      - alert: FabricDeliveryCollapsed
+        expr: |
+          sum(rate(goat_audit_samples_total[3m]))
+            < 0.05 * sum(rate(goat_audit_samples_total[1h] offset 10m))
+          and on() sum(rate(goat_audit_samples_total[1h] offset 10m)) > 1
+        for: 2m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "fabric delivery below 5% of the previous hour"
+          description: |
+            The audit tap's receive rate fell below 5% of its prior-hour average
+            for 2m. Either a large publisher stopped (benign — check which) or
+            the router is stalling on a slow consumer (see
+            ZenohSlowConsumerStalling). F-287 amendment.
+
+      # The mechanism itself. One stuck subscriber produces a close every ~5 s
+      # (12/min) for as long as it stays attached; a single blip is 1-3.
+      - alert: ZenohSlowConsumerStalling
+        expr: increase(goat_zenoh_slow_consumer_closes_total[5m]) >= 10
+        for: 2m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} is blocking on slow consumers ({{ $value | humanize }} transport closes in 5m)"
+          description: |
+            The router cannot push non-droppable messages to at least one
+            subscriber and is closing it every ~5 s. While it does, delivery from
+            the sources routed to that subscriber stalls for everyone.
+            Which subscriber:
+              goat_zenoh_slow_consumer_last_close_timestamp_seconds{router="{{ $labels.router }}"}
+            Usual causes: an inspection surface or CLI holding a `**` subscription
+            that stopped draining (panoscope did on 2026-09-17), or a remote peer
+            on a stalled link. F-287 amendment.
+
+      # Sustained: a quarter-hour of it is an outage, not a blip.
+      - alert: ZenohSlowConsumerOutage
+        expr: increase(goat_zenoh_slow_consumer_closes_total[15m]) >= 90
+        for: 5m
+        labels:
+          severity: critical
+          component: zenoh-router
+        annotations:
+          summary: "CRITICAL: zenoh router {{ $labels.router }} blocked on slow consumers for 15m+"
+          description: |
+            {{ $value | humanize }} slow-consumer transport closes in 15 minutes —
+            the 2026-09-17 zagros outage shape. Identify the subscriber from
+            goat_zenoh_slow_consumer_last_close_timestamp_seconds and stop it
+            (stop the container or revoke the peer) rather than restarting the
+            router, which it will simply reconnect to. F-287 amendment.
+
+      # F-287's router-mode peer inventory. A remote node joined as a zenoh
+      # router is a routing participant: when its link stalls it stops
+      # draining, and the goatnet router blocks on it. Declared exceptions go in
+      # zenoh_health_router_peer_allow (group_vars).
+      - alert: ZenohUndeclaredRouterPeer
+        expr: goat_zenoh_remote_router_sessions > 0
+        for: 30m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "{{ $value }} remote peer(s) joined zenoh router {{ $labels.router }} in router/peer mode, undeclared"
+          description: |
+            Remote sessions in router or peer mode are routing participants, and
+            one on a stalled link can stall the fabric. Move them to
+            `mode: client` (docs/design/pubsub-best-practices.md §3), or declare
+            them in zenoh_health_router_peer_allow. List them:
+              curl -s http://127.0.0.1:8000/@/local/router   # sessions[].whatami (in the router netns)
+
+      # ---- WHOLE-KEYSPACE SUBSCRIBERS (the ACL's blind spot) --------------
+      #
+      # The ACL refuses a `**` subscription to any peer not on the goatnet's
+      # named list. It cannot refuse the EQUIVALENT spellings:
+      # zenoh canonizes `**/*` to `*/**`, and `*/**` matches every key with at
+      # least one chunk — the whole fabric under another name. No rule can
+      # refuse those without refusing ordinary keys too, and a denial is silent
+      # at both ends. So the policy is enforced for the common spelling
+      # and OBSERVED for the rest: the probe counts the shape per session, and
+      # these two alerts turn "someone found the workaround" into a page
+      # instead of a silent success.
+      - alert: ZenohFabricWideWorkaroundShape
+        expr: goat_zenoh_fabric_wide_shape_present{shape!="**"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "a peer is subscribing to the whole keyspace as `{{ $labels.shape }}` on {{ $labels.router }}"
+          description: |
+            `{{ $labels.shape }}` selects every key with at least one chunk —
+            the whole fabric — and the ACL cannot refuse it while still allowing
+            ordinary keys. Nobody used a spelling other than `**` when this was
+            written, so this is either a new integration that needs the named
+            grant or someone working around the refusal. Identify the session,
+            then decide: scope the subscription, add the peer to
+            zenoh_fabric_wide_read, or stop it. F-287 amendment.
+
+      # More whole-keyspace subscribers than the goatnet has granted.
+      - alert: ZenohFabricWideSubscriberUnexpected
+        expr: |
+          goat_zenoh_fabric_wide_subscribers
+            > goat_zenoh_fabric_wide_expected
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-fabric
+        annotations:
+          summary: "{{ $value }} whole-keyspace subscribers on {{ $labels.router }}, more than the named list grants"
+          description: |
+            The named list (zenoh_fabric_wide_read) is a grandfather list: it
+            names the peers that already held a whole-fabric subscription, so
+            enforcement broke nobody, and its purpose is to stop the NEXT one.
+            This counts SESSIONS, not identities: one named peer held three at
+            once on zagros, so the ceiling is a measured number plus headroom
+            (zenoh_health_fabric_wide_max_sessions), never the length of the
+            grant list. Over it means a new whole-fabric subscriber appeared, or
+            an existing one multiplied its sessions. Reconcile against the list
+            before granting anything.
+
+      # The delivery counters above read null, not zero, when the probe cannot
+      # read the router log; without this a broken tail looks like a quiet router.
+      - alert: ZenohRouterSignalsUnmeasured
+        expr: goat_zenoh_log_tail_ok == 0
+        for: 15m
+        labels:
+          severity: warning
+          component: zenoh-router
+        annotations:
+          summary: "zenoh router {{ $labels.router }} delivery-stall counters are UNMEASURED"
+          description: |
+            zenoh-health-probe could not read the router's container log, so
+            ZenohSlowConsumerStalling / ZenohSlowConsumerOutage cannot fire. Check
+            the probe runs as root and the container still uses the json-file
+            log driver (docker inspect <router> --format '{{ "{{" }}.LogPath{{ "}}" }}').

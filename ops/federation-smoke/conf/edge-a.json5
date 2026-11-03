@@ -1,0 +1,40 @@
+// Sovereign A — EDGE router, dedicated to partner B. Trusts B's CA and NOTHING else.
+// Empty-by-construction: no storages, no REST, no adminspace write, no gossip.
+{
+  mode: "router",
+  listen:  { endpoints: ["tls/0.0.0.0:7448"] },   // faces the partner
+  // PER-ENDPOINT TRUST OVERRIDE, and it is REQUIRED — not a nicety.
+  // root_ca_certificate below is GLOBAL to this process and holds the PARTNER's
+  // CA, which is right for the listener facing them. But this router is the TLS
+  // CLIENT on the inward link and must verify OUR core's server cert, which the
+  // partner's CA cannot chain. Without the override the dial fails UnknownCA.
+  connect: { endpoints: ["tls/core-a:7447#root_ca_certificate_file=/pki/a-ca.pem"] },
+  scouting: { gossip: { enabled: false }, multicast: { enabled: false } },
+  adminspace: { permissions: { read: true, write: false } },
+  transport: { link: { tls: {
+    root_ca_certificate: "/pki/b-ca.pem",          // B ONLY — the partner's authority
+    listen_certificate:  "/pki/a-edge.pem",        // what we present to the partner
+    listen_private_key:  "/pki/a-edge-key.pem",
+    connect_certificate: "/pki/a-edge-core.pem",   // what we present inward, CN=edge-a
+    connect_private_key: "/pki/a-edge-core-key.pem",
+    enable_mtls: true,
+    close_link_on_expiration: true,
+  }}},
+  access_control: {
+    enabled: true,
+    default_permission: "deny",
+    rules: [
+      { id: "partner-land",    messages: ["put","delete"],
+        flows: ["ingress"], permission: "allow", key_exprs: ["from/svn/**"] },
+      { id: "partner-receive", messages: ["declare_subscriber","query"],
+        flows: ["egress","ingress"], permission: "allow", key_exprs: ["release/all/**"] },
+    ],
+    subjects: [
+      // ONLY the agreed peering name. Not a wildcard, not link_protocols.
+      { id: "partner-svn", cert_common_names: ["peer-svn"] },
+    ],
+    policies: [
+      { rules: ["partner-land","partner-receive"], subjects: ["partner-svn"] },
+    ],
+  },
+}

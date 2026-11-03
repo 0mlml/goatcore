@@ -1,0 +1,404 @@
+# Prometheus config for a single-Thor goatnet's on-mgmt-host obs stack.
+# Single-node — no peer scrape, no federation, no remote_write.
+#
+# Per-site: rendered by ops/ansible/obs.yml (ansible.builtin.template), so the
+# {{ site_id }} values below resolve at deploy. All targets
+# live on the Thor; siblings resolve by docker-compose service name on the
+# shared `mgmt` network. Reload after edits:
+# `docker exec <site>-obs-prometheus killall -HUP prometheus`.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+  external_labels:
+    site: {{ site_id }}
+    cluster: {{ site_id }}
+
+# Alertmanager (same goat-obs compose, mgmt network). Critical alerts route to
+# PagerDuty there (ADR 1059); when no PD key is configured the receiver is a
+# webhook-noop so rules still show in the UI.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # node-exporter runs with network_mode:host (host-NIC visibility — a
+  # bridge-networked exporter only sees its own veth) bound to the docker
+  # bridge gateway IP; host.docker.internal resolves there via the
+  # prometheus service's extra_hosts host-gateway entry.
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          host: {{ site_id }}-thor
+
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # signal-server runs in the mgmt-host compose project on the same
+  # `mgmt` network. Container name `signal-a` exposes /metrics on :9090.
+  - job_name: signal-server
+    static_configs:
+      - targets: ["signal-a:9090"]
+
+  # Traefik /metrics — entrypoint :8082 in the mgmt-host compose
+  # (--metrics.prometheus + --entrypoints.metrics.address=:8082).
+  - job_name: traefik
+    static_configs:
+      - targets: ["traefik:8082"]
+    # ---------------------------------------------------------------------
+    # STRIP THE LEGACY `nova-` PREFIX AT INGEST (ADR 1132).
+    # ---------------------------------------------------------------------
+    # Traefik routers and services can carry a legacy `nova-` name
+    # (`nova-portal`, `nova-signal`, `nova-mgmt`…). Unstripped, every dashboard and
+    # netview page reads as though it shows a different goatnet.
+    #
+    # Renaming the ROUTERS is the real fix and it is a separate, larger change
+    # that breaks historical continuity because the label VALUE changes. This
+    # relabels at ingest, so old and new series land on ONE label value and
+    # history joins across an eventual rename instead of showing a gap at the
+    # cutover.
+    #
+    # Applies to `service` AND `router` — the router label arrives with
+    # `--metrics.prometheus.addRoutersLabels=true` and would otherwise
+    # reintroduce the prefix on the very split that exists to remove noise.
+    #
+    # Deliberately anchored `^nova-`: a service legitimately containing "nova"
+    # elsewhere in its name is untouched. Services already un-prefixed
+    # (`netvis`, `microscope`, `demogame`, `consistency-console`) pass
+    # through unchanged — this narrows three live naming conventions toward
+    # one without renaming anything.
+    #
+    # Reversible: delete this block and the raw labels return on the next
+    # scrape. Nothing on the host or in the routing table changes.
+    metric_relabel_configs:
+      - source_labels: [service]
+        regex: '^nova-(.*)$'
+        target_label: service
+        replacement: '${1}'
+      - source_labels: [router]
+        regex: '^nova-(.*)$'
+        target_label: router
+        replacement: '${1}'
+
+  # cAdvisor — per-container CPU/mem/network/disk + uptime + restart
+  # count + start time. Drives the "Services overview" dashboard.
+  #
+  # Raw-cgroup mode: cadvisor's docker factory can't read docker's
+  # containerd-snapshotter storage driver (see the cadvisor service in
+  # docker-compose.yml), so series carry
+  # id="/system.slice/docker-<64hex>.scope" and NO name label. `cid`
+  # (short 12-hex, relabeled below) matches `docker ps`; the full
+  # id→name join metric is goat_container_info (job=node-exporter,
+  # textfile).
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      - source_labels: [id]
+        regex: "/system\\.slice/docker-([0-9a-f]{12})[0-9a-f]*\\.scope"
+        target_label: cid
+        replacement: "$1"
+
+  # process-exporter — per-process CPU / mem / IO / threads grouped
+  # by executable name (see process-exporter/process-exporter.yml for
+  # the group rules). Complements cAdvisor's per-container view.
+  - job_name: process-exporter
+    static_configs:
+      - targets: ["process-exporter:9256"]
+
+  # goat-audit-subscriber — external Zenoh subscriber capturing publishes
+  # to MinIO `audit-integrity` bucket with Object-Lock COMPLIANCE 1y per
+  # ADR 0811. Replaces the in-process audit-logger plugin per ADR 0858 +
+  # docs/design/zenoh-audit-external-subscriber.md. Metric shape:
+  # goat_audit_samples_total{vendor,key_pattern},
+  # goat_audit_sample_bytes_total{vendor},
+  # goat_audit_batches_uploaded_total / write_errors_total / drop_total,
+  # goat_audit_subscriber_session_state. Container `audit-subscriber`
+  # runs in the goat-zenoh_default docker network; scraped at :9303.
+  - job_name: audit-subscriber
+    static_configs:
+      - targets: ["audit-subscriber:9303"]
+
+  # goat-logship — the off-box cyber-logging collector (Vector, ADR 1078).
+  # Runs in its own compose project (goat-logship-net) with the metrics port
+  # host-published, so it is scraped via host.docker.internal like minio /
+  # node-exporter, not by in-network name. The GoatLogshipStreamSilent rule
+  # (rules/goat-logship.yml) rides on this job's vector_component_sent_events
+  # metric — the F-169 silent-shipping closer. Job label is goat_logship
+  # (underscore) to match the alert `up{job="goat_logship"}`.
+  - job_name: goat_logship
+    static_configs:
+      - targets: ["host.docker.internal:9598"]
+
+  # MinIO — bucket-level usage metrics via the upstream Prometheus
+  # endpoint. The `cluster` profile exposes per-bucket usage. F-169's
+  # AuditBucketQuotaHigh rule consumes minio_bucket_usage_total_bytes
+  # from this job.
+  #
+  # Target is the HOST-published port via host.docker.internal (the
+  # prometheus service carries an extra_hosts host-gateway entry): minio
+  # runs in its own compose project on minio-net, which the roles/minio
+  # network model deliberately keeps isolated from mgmt — the in-network
+  # name `minio:9000` does not resolve from this stack.
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    # MinIO runs MINIO_PROMETHEUS_AUTH_TYPE=public (roles/minio compose), so
+    # cluster metrics need NO bearer token. A `bearer_token_file` pointing at a
+    # file nothing creates makes prometheus fail config load + crash-loop on a
+    # fresh deploy. Public auth ⇒ no token line.
+    static_configs:
+      - targets: ["host.docker.internal:9000"]
+
+  # MinIO per-BUCKET metrics moved to their own endpoint in current
+  # MinIO releases: /minio/v2/metrics/bucket carries
+  # minio_bucket_usage_total_bytes AND minio_bucket_quota_total_bytes —
+  # the native quota metric. This job (not a sidecar) feeds
+  # AuditBucketQuotaHigh/Critical.
+  - job_name: minio-bucket
+    metrics_path: /minio/v2/metrics/bucket
+    static_configs:
+      - targets: ["host.docker.internal:9000"]
+
+  # grant-keyd — the E1 key-distribution daemon. It serves /metrics on
+  # :9464 and the grant-keyd role joins it to the `mgmt` network so this job
+  # can reach it by container name. Gated because a goatnet that does not run
+  # grant-keyd would otherwise carry a permanently-down target — and a
+  # perpetually-red target trains people to ignore red.
+  #
+  # Alerting note (rules/grant-keyd.yml): liveness is
+  # grant_keyd_last_sweep_timestamp_seconds, which advances every poll even
+  # when nothing changes. Do NOT alert on rotation age — keyd rotates only
+  # when an audience changes, so days-old is correct on a quiet fabric.
+  #
+  # `--once` caveat: the daemon ignores metrics_listen under --once, and the
+  # grant-keyd role correspondingly skips the mgmt network join, so a one-shot
+  # run has nothing to scrape. This job does not condition on that, and does
+  # not need to: --once is passed as an ad-hoc `-e` extra-var to
+  # grant-keyd-deploy.yml, never as a group_var, so obs.yml (which renders this
+  # file) cannot see it and the two cannot disagree on a real deploy.
+{% if grant_keyd_metrics_scrape_enabled | default(false) %}
+  - job_name: grant-keyd
+    static_configs:
+      - targets: ["grant-keyd:9464"]
+{% endif %}
+
+  # Blackbox HTTPS probes — the GATE plane (ADR 1133).
+  #
+  # Targets are rendered per site from isitup_services plus
+  # obs_blackbox_extra_targets, and the probe is split into two planes. Both
+  # are load-bearing; neither subsumes the other. Keep the canary's modules in
+  # blackbox.yml referenced from here.
+  #
+  # Only LIVE, listed rows are probed, on both planes. A
+  # `lifecycle: planned` row has not been brought up and a `retiring` one is on
+  # its way out; probing either pages someone about a service nobody expects to
+  # answer. `listed: false` takes a row off the status page and out of here,
+  # and so does a `retire_after` date that has passed. Changing the row in
+  # isitup_services is the whole edit — no second list.
+  - job_name: blackbox-https
+    metrics_path: /probe
+    params:
+      module: [http_gate]
+    static_configs:
+{% for s in (isitup_services | default([])) if (s.probe_gate | default(true)) and (s.lifecycle | default('live')) == 'live' and (s.listed | default(true) | string | lower) != 'false' and not ((s.retire_after | default('') | string) and (s.retire_after | string) < now(utc=True, fmt='%Y-%m-%d')) and (s.fqdn | default('')) | length > 0 %}
+      - targets: ["https://{{ s.fqdn }}{{ s.health_path | default('/') }}"]
+        labels:
+          surface: {{ s.id }}
+          plane: gate
+          access: {{ s.access | default('unknown') }}
+{% endfor %}
+{% for t in obs_blackbox_extra_targets | default([]) %}
+      - targets: ["{{ t }}"]
+        labels:
+          surface: extra
+          plane: gate
+          access: unknown
+{% endfor %}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ---------------------------------------------------------------------
+  # Relay tier TLS.
+  # ---------------------------------------------------------------------
+  # Relays are not mesh peers and have no isitup_services row, so every
+  # existing blackbox job misses them by construction. A relay certificate whose
+  # renewal is failing can expire with no instrument anywhere reading its expiry.
+  #
+  # Targets come from obs_relay_tls_targets, a plain list of host:port set per
+  # goatnet, because the relay endpoints live in a generated inventory rather
+  # than in any registry Prometheus can see. Empty by default: a goatnet whose
+  # relays genuinely do not terminate TLS declares nothing and this job stays
+  # empty rather than alerting on an absence that is correct.
+  #
+  # A goatnet with no obs host of its own is listed by whichever obs box
+  # carries the cross-goatnet role. Relay
+  # endpoints are public names, so this needs no mesh reach, and every relay
+  # alert's summary carries $labels.instance (the FQDN), so a firing alert
+  # names the goatnet without a per-target label.
+  - job_name: blackbox-relay-tls
+    metrics_path: /probe
+    params:
+      module: [tls_connect]
+    static_configs:
+{% for t in obs_relay_tls_targets | default([]) %}
+      - targets: ["{{ t }}"]
+        labels:
+          plane: relay
+          tier: relay
+{% endfor %}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ---------------------------------------------------------------------
+  # Surface canary — APP PLANE (ADR 1129).
+  # ---------------------------------------------------------------------
+  # The same services, probed at their own container over the shared `mgmt`
+  # docker network — upstream of Traefik and upstream of oauth2-proxy. This is
+  # the seam that makes an Ory-gated surface measurable WITHOUT a credential,
+  # and it is not a new idea: isitup's check.sh has probed container IPs this
+  # way all along. blackbox-exporter is already on `mgmt`, so a container name
+  # resolves with no extra_hosts entry and no F-127 mesh-CoreDNS problem.
+  #
+  # This closes the gap the operator named: panoscope, goat-map, flashlight and
+  # netvis were watched from NEITHER direction — no passive traffic (netview's
+  # representative set is "services with requests in the last hour", and these
+  # had zero) and no active probe. An actively-fetched surface is watched
+  # whether or not anybody happens to click it.
+  #
+  # HONEST LIMIT, stated here so the panel cannot overclaim: /healthz on
+  # panoscope is a constant handler. A 200 proves the process is answering and
+  # — because main.rs opens the zenoh session BEFORE binding HTTP — that the
+  # session came up at start. It does NOT exercise a fabric query, so this is
+  # not yet the ADR 1123 fabric-pressure signal that makes panoscope the most
+  # interesting canary on the fleet. Measuring that needs an authenticated deep
+  # path; designed in docs/design/surface-canary.md §5, deliberately not built
+  # here.
+  #
+  # Cost, said out loud per ADR 1123: 30s interval, one HEAD-weight GET per
+  # surface, against a constant handler. No fabric query, so the canary applies
+  # no fabric pressure at this rung.
+  - job_name: blackbox-surface-app
+    metrics_path: /probe
+    scrape_interval: 30s
+    params:
+      module: [http_app]
+    static_configs:
+{% for s in (isitup_services | default([])) if (s.probe_app | default(true)) and (s.lifecycle | default('live')) == 'live' and (s.listed | default(true) | string | lower) != 'false' and not ((s.retire_after | default('') | string) and (s.retire_after | string) < now(utc=True, fmt='%Y-%m-%d')) and (s.type | default('container')) == 'container' and (s.container | default('')) | length > 0 and (s.port | default('')) | string | length > 0 %}
+      - targets: ["http://{{ s.container }}:{{ s.port }}{{ s.health_path | default('/') }}"]
+        labels:
+          surface: {{ s.id }}
+          plane: app
+          access: {{ s.access | default('unknown') }}
+{% endfor %}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+
+  # Blackbox DNS — does each public resolver answer for our zone?
+  - job_name: blackbox-dns
+    metrics_path: /probe
+    params:
+      module: [dns_nova_a]
+    static_configs:
+      - targets:
+          - 1.1.1.1
+          - 8.8.8.8
+          - 9.9.9.9
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # Blackbox ICMP — Thor mesh-peer reach (extend later as more
+  # peers come online; v1 lists relays we expect to be reachable).
+  - job_name: blackbox-icmp
+    metrics_path: /probe
+    params:
+      module: [icmp]
+    static_configs:
+      - targets:
+          # Public relay IPs (3 Cloudflare A records resolve here too).
+          - 203.0.113.5
+          - 203.0.113.19
+          - 198.51.100.234
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # node-exporter on OTHER mesh hosts (ADR 1128). The `node-exporter`
+  # job above scrapes exactly one target — this Thor — so before this
+  # job there was no fleet-wide per-host network series in Prometheus
+  # at all, and "how much of THAT host's pipe is in use" was
+  # unanswerable for every host but one.
+  #
+  # These hosts are mesh peers, so they are scraped over their mesh
+  # IPs (the Thor's own exporter binds the docker bridge gateway and
+  # is deliberately NOT mesh-reachable — different role, different
+  # binding, see roles/node-exporter node_exporter_listen_addr).
+  #
+  # Targets come from group_vars, NOT hand-maintained here: a target
+  # written ahead of the thing it names is precisely F-289, and
+  # obs.yml renders this list from the same inventory that decides
+  # where the exporter is deployed.
+  #
+  # Carries the ADR 1128 textfile metrics too — goat_net_* from the
+  # node-net-health attribution pass and goat_link_capacity_* from
+  # the exporter's own capacity declaration — so one scrape covers
+  # the NIC totals, the attribution and the denominator.
+{% if obs_mesh_node_targets | default([]) | length > 0 %}
+  - job_name: node-exporter-mesh
+    scrape_timeout: 10s
+    static_configs:
+{% for t in obs_mesh_node_targets %}
+      - targets: ["{{ t.address }}:{{ t.port | default(9100) }}"]
+        labels:
+          host: {{ t.host }}
+          node_class: {{ t.node_class | default('unknown') }}
+{% endfor %}
+{% else %}
+  # (no obs_mesh_node_targets declared for this goatnet — job omitted
+  #  rather than rendered empty, so a down target always means a real
+  #  host is down)
+{% endif %}
+
+  # netbird-mgmt /metrics is NOT enabled in the current mgmt-host
+  # compose — netbirdio/management:0.68.3 listens on :80 only and
+  # doesn't expose a Prometheus endpoint by default. When that
+  # changes (or we move to the patched ghcr.io/goat-maintainer image with
+  # metrics on), add:
+  #   - job_name: netbird-mgmt
+  #     static_configs:
+  #       - targets: ["management-a:<port>"]

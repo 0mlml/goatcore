@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ADR 1128 — per-host link utilisation and bandwidth attribution.
+#
+# The question these answer is PREEMPTIVE: "is this host's pipe filling up, and
+# with what", asked before saturation rather than after someone notices pages
+# loading slowly. Before this file the fleet had no per-host network series at
+# all outside the Thor, and no declared capacity anywhere to divide by.
+#
+# TWO PLANES, NEVER SUMMED (ADR 1128 §1). A Zenoh message crossing the mesh is
+# counted twice on one host at one instant — as WireGuard UDP on the NIC, and
+# as TCP :7447 inside the tunnel. The recording rules below keep them apart on
+# purpose; nothing here ever adds a `goat:link_*` series to a `goat:workload_*`
+# one, and neither should any dashboard panel.
+#
+# Fed by: roles/node-exporter (NIC counters + goat_link_capacity_* textfile)
+#         roles/node-net-health --fast (goat_net_* textfile)
+
+groups:
+  # Group name == file stem, deliberately: the obs-host role asserts that every
+  # file in obs_rule_files has a LOADED group of the same name, and a file whose
+  # groups are all named something else would fail that check (it exists because
+  # a rule file sitting on disk unloaded alerts on nothing while looking fine).
+  - name: bandwidth-attribution
+    interval: 30s
+    rules:
+      # PHYSICAL NIC ONLY. The exclusion list is load-bearing, not hygiene:
+      # `wt0` is the NetBird interface, and leaving it in would add the
+      # decrypted tunnel payload to the encrypted transport carrying it — the
+      # exact double-count the two-plane split exists to prevent, reintroduced
+      # inside the denominator itself.
+      - record: goat:link_bits_per_second:tx
+        expr: |
+          sum by (host) (
+            rate(node_network_transmit_bytes_total{
+              device!~"lo|wt0|nb-.*|veth.*|docker.*|br-.*|virbr.*|tun.*|tap.*|wg.*"
+            }[5m])
+          ) * 8
+
+      - record: goat:link_bits_per_second:rx
+        expr: |
+          sum by (host) (
+            rate(node_network_receive_bytes_total{
+              device!~"lo|wt0|nb-.*|veth.*|docker.*|br-.*|virbr.*|tun.*|tap.*|wg.*"
+            }[5m])
+          ) * 8
+
+      # Transport plane: what the mesh itself is costing the pipe.
+      - record: goat:mesh_bits_per_second:tx
+        expr: |
+          sum by (host) (rate(goat_net_transport_bytes_total{direction="tx"}[5m])) * 8
+      - record: goat:mesh_bits_per_second:rx
+        expr: |
+          sum by (host) (rate(goat_net_transport_bytes_total{direction="rx"}[5m])) * 8
+
+      # Utilisation. The `> 0` on capacity is the honesty gate: a host with no
+      # declaration produces NO series here at all, so every panel and alert
+      # downstream is silent for it rather than showing a percentage derived
+      # from an assumed pipe.
+      - record: goat:link_utilisation_ratio:tx
+        expr: |
+          goat:link_bits_per_second:tx
+          / on (host) group_left ()
+          (
+            # PARENTHESES ARE LOAD-BEARING. `/` and `*` share precedence and
+            # associate LEFT, so `a / b * 8` multiplies the RESULT by 8 rather
+            # than the divisor — a 64x error that reads as a plausible
+            # percentage. Caught by the unit tests, not by inspection.
+            max by (host) (goat_link_capacity_bytes_per_second{direction="tx"} > 0) * 8
+          )
+
+      - record: goat:link_utilisation_ratio:rx
+        expr: |
+          goat:link_bits_per_second:rx
+          / on (host) group_left ()
+          (
+            # PARENTHESES ARE LOAD-BEARING. `/` and `*` share precedence and
+            # associate LEFT, so `a / b * 8` multiplies the RESULT by 8 rather
+            # than the divisor — a 64x error that reads as a plausible
+            # percentage. Caught by the unit tests, not by inspection.
+            max by (host) (goat_link_capacity_bytes_per_second{direction="rx"} > 0) * 8
+          )
+
+      # Workload-plane coverage: how much of the mesh transport the category
+      # map actually accounts for.
+      #
+      # The numerator EXCLUDES the same two categories the dashboard stack
+      # excludes, and for the same reason — they are not mesh payload.
+      # transport-underlay is the relay tunnel, which egresses to relay public
+      # IPs and is therefore not in the mesh transport denominator at all;
+      # including it made the ratio exceed 1 and CLAMP to a confident-looking
+      # 100% on live ZAGROS while real coverage was a few percent. A coverage
+      # metric that reports completeness by clamping is worse than none.
+      #
+      # Still clamped into [0,1], but now only for genuine sampling skew: the
+      # two planes are read by different taps at slightly different instants.
+      - record: goat:workload_attribution_coverage:ratio
+        expr: |
+          clamp_max(
+            clamp_min(
+              sum by (host) (rate(goat_net_workload_bytes_total{
+                category!~"http-delegated|transport-underlay"
+              }[5m]))
+              / on (host) group_left ()
+              clamp_min(sum by (host) (rate(goat_net_transport_bytes_total[5m])), 1)
+            , 0)
+          , 1)
+
+  - name: bandwidth-attribution-alerts
+    rules:
+      # --- the capacity question -------------------------------------------
+      - alert: LinkUtilisationHigh
+        expr: goat:link_utilisation_ratio:tx > 0.75 or goat:link_utilisation_ratio:rx > 0.75
+        for: 15m
+        labels:
+          severity: warning
+          domain: net
+        annotations:
+          summary: "{{ $labels.host }} is using >75% of its declared link"
+          description: >-
+            Sustained for 15m at {{ $value | humanizePercentage }} of the
+            DECLARED capacity (declared, not measured, unless the capacity
+            source label says measured). Open the Mesh Bandwidth Attribution
+            dashboard and filter to this host: the workload plane says which
+            category is driving it and which peers inside that category.
+            Bulk categories (image-pull, backup, audit-offload, replication)
+            are schedulable; surface-stream scales with concurrent viewers.
+
+      - alert: LinkUtilisationCritical
+        expr: goat:link_utilisation_ratio:tx > 0.90 or goat:link_utilisation_ratio:rx > 0.90
+        for: 5m
+        labels:
+          severity: critical
+          domain: net
+        annotations:
+          summary: "{{ $labels.host }} link is saturating (>90% declared)"
+          description: >-
+            {{ $value | humanizePercentage }} of declared capacity for 5m. At
+            this level the mesh control plane and time sync — both small and
+            both things nothing else can be fixed without — are competing with
+            bulk transfer for the same pipe.
+
+      # Relayed traffic is the scarcest and the only metered-and-billed path,
+      # and a peer silently falling back from P2P to relayed is a common,
+      # quiet, expensive regression.
+      - alert: RelayedMeshShareHigh
+        expr: |
+          sum by (host) (rate(goat_net_transport_bytes_total{class="mesh-relayed"}[15m]))
+          / on (host) group_left ()
+          clamp_min(sum by (host) (rate(goat_net_transport_bytes_total[15m])), 1)
+          > 0.5
+        for: 30m
+        labels:
+          severity: warning
+          domain: net
+        annotations:
+          summary: "{{ $labels.host }} is sending most mesh traffic via relay"
+          description: >-
+            {{ $value | humanizePercentage }} of this host's mesh bytes are
+            going through a relay rather than peer-to-peer, sustained 30m.
+            Relay bandwidth is metered and the same payload is paid for twice
+            (node to relay, relay to peer). Usually a NAT/ICE regression on
+            specific peers — the per-peer breakdown names them.
+
+      # --- honesty about the measurement itself ----------------------------
+      - alert: BandwidthAttributionStale
+        expr: |
+          time() - max by (host) (
+            timestamp(goat_net_attribution_up)
+          ) > 600
+        for: 10m
+        labels:
+          severity: warning
+          domain: net
+        annotations:
+          summary: "Bandwidth attribution has stopped reporting on {{ $labels.host }}"
+          description: >-
+            No fresh sample for over 10 minutes from the node-net-health
+            --fast timer. The attribution panels for this host are showing the
+            LAST KNOWN values, which age silently — treat them as unknown, not
+            as quiet. Check node-net-health-attribution.timer on the host.
+
+      - alert: BandwidthAttributionMeshPlaneBlind
+        expr: goat_net_attribution_mesh_plane_up == 0
+        for: 15m
+        labels:
+          severity: warning
+          domain: net
+        annotations:
+          summary: "Transport plane is blind on {{ $labels.host }}"
+          description: >-
+            `netbird status` was unreadable, so per-peer WireGuard counters are
+            absent. The transport plane for this host reads as zero mesh
+            traffic, which is indistinguishable on a chart from an idle mesh
+            and is NOT the same thing. Utilisation totals from the NIC are
+            still valid; the p2p-vs-relayed split is not.
+
+      # The remainder alarm. A category map that has fallen behind reality does
+      # not break anything — it just quietly attributes less and less, and the
+      # chart still looks complete. This is the only thing that catches it.
+      - alert: BandwidthAttributionCoverageLow
+        expr: goat:workload_attribution_coverage:ratio < 0.5
+        for: 1h
+        labels:
+          severity: info
+          domain: net
+        annotations:
+          summary: "Workload attribution explains <50% of mesh traffic on {{ $labels.host }}"
+          description: >-
+            Only {{ $value | humanizePercentage }} of this host's mesh
+            transport is landing in a named category; the rest shows as
+            Unattributed. Some gap is expected and permanent (socket byte
+            counters are TCP-only, short-lived connections close between
+            samples).
+            FIRST, READ THE CATCH-ALL ROWS — they discriminate between the two
+            causes and they point opposite ways. If Undeclared and Other
+            (declared) are LARGE, the category map has fallen behind and a rule
+            is missing. If they are BOTH ZERO, nothing is arriving to be
+            categorised and the map is innocent: check
+            goat_net_attribution_netns_read against
+            goat_net_attribution_netns_targets, because sockets in container
+            network namespaces are invisible to a host-only collector (F-331,
+            measured at 7.2% coverage with both catch-alls flat zero). Adding
+            category rules in that state cannot move the number.
+
+      # --- the denominator itself ------------------------------------------
+      - alert: LinkCapacityUndeclared
+        expr: |
+          goat_link_capacity_declared == 0
+          and on (host) (goat_net_attribution_up == 1)
+        for: 24h
+        labels:
+          severity: info
+          domain: net
+        annotations:
+          summary: "{{ $labels.host }} has no declared link capacity"
+          description: >-
+            This host is measuring its bandwidth but nothing says how big its
+            pipe is, so every percent-of-link panel refuses to render a number
+            for it — deliberately, rather than assuming a default. Set
+            node_exporter_link_capacity in group_vars, with source measured if
+            a throughput test was run and declared if it is the contracted
+            figure.
+
+      - alert: LinkCapacityDeclarationStale
+        expr: |
+          (time() - goat_link_capacity_asserted_timestamp_seconds) > (365 * 86400)
+        for: 1h
+        labels:
+          severity: info
+          domain: net
+        annotations:
+          summary: "Link capacity for {{ $labels.host }} has not been re-affirmed in a year"
+          description: >-
+            A capacity nobody has re-checked is a claim, not a fact, and every
+            utilisation percentage on this host rests on it. Re-affirm or
+            re-measure, then bump asserted_on.

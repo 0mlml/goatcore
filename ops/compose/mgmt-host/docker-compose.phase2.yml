@@ -1,0 +1,67 @@
+# Phase 2 override — adds a second instance of each service on the SAME
+# host so we can exercise multi-master Spock + signal federation with
+# minimum blast radius. See docs/design/ha-multi-site.md §13 Phase 2.
+#
+# Usage (on the pilot):
+#   docker compose -f docker-compose.yml -f docker-compose.phase2.yml up -d
+#
+# Spock node registration and subscriptions between postgres-a and
+# postgres-b are NOT in this file — they need site identity + a replicator
+# password and are driven by Ansible after both PGs are up.
+#
+# When the pilot ships to region A (Phase 2→3 gate), we stop using this
+# override — each site runs a single instance.
+
+services:
+  postgres-b:
+    # See note in docker-compose.yml — pinned to the build with complete pg_hba.conf.
+    image: ${POSTGRES_SPOCK_IMAGE:-ghcr.io/usareur-af/postgres-spock@sha256:cccb075b140ec40815e3f3e40bf969459f6363bad1441a7bcecc51451973f9a1}
+    container_name: postgres-b
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+    ports:
+      # Distinct loopback port — A is 5432, B is 5433.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      # See mgmt-host/docker-compose.yml comment — pgedge image uses the
+      # Red Hat PGDATA path; mounting elsewhere = ephemeral in-container data.
+      - pgdata-b:/var/lib/pgsql/16/data
+      # pgBackRest local repo + log + spool for the B-side stanza. Distinct
+      # host paths from postgres-a (which binds /opt/docker-data/pgbackrest)
+      # so the two stanzas never collide on one host. When this compose
+      # overlay isn't in use (production: one Postgres per host), these
+      # host paths are inert. See docs/design/pgbackrest.md §2 + the
+      # pgbackrest Ansible role README "Router-B invocation example."
+      - /opt/docker-data/pgbackrest-b:/var/lib/pgbackrest
+      - /var/log/pgbackrest-b:/var/log/pgbackrest
+      - /var/spool/pgbackrest-b:/var/spool/pgbackrest
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mgmt
+
+  signal-b:
+    # See note in docker-compose.yml — pinned to the build that accepts -federation-peers.
+    image: ${SIGNAL_SERVER_IMAGE:-ghcr.io/usareur-af/signal-server:sha-dced051@sha256:1122f0fb3f08b19443717c8215020c27e0a6059891a6aef90528fc433a635c67}
+    container_name: signal-b
+    restart: unless-stopped
+    command:
+      - --node=${SITE_NAME:-pilot}-b
+      - --grpc-addr=:10000
+      - --metrics-addr=:9090
+    ports:
+      - "127.0.0.1:10010:10000"   # gRPC — A is 10000, B is 10010
+      - "127.0.0.1:9091:9090"     # /metrics — A is 9090, B is 9091
+    networks:
+      - mgmt
+
+volumes:
+  pgdata-b:

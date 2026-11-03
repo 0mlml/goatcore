@@ -1,0 +1,64 @@
+# Flow map — which end-to-end flows a code change can affect (ADR 1173,
+# docs/design/release-candidate-validation.md).
+#
+# One entry per flow. `paths` are the repo path globs whose change makes the
+# flow suspect; `cheap` names the CI-side suite that runs on every PR and on
+# every release-candidate tag (mocked backend, minutes, no goatnet); `live`
+# names the acceptance-manifest rows (ops/validation/acceptance-tests.yaml
+# `id`) that a release candidate must pass on the dev goatnet before it can
+# become a preprod candidate. A flow with no `live` rows yet says so with an
+# empty list — that is a gap to fill, not a flow that is covered.
+#
+# `ops/validation/affected-flows.py <base>..<head>` reads this file and prints
+# the flows a diff touches. The rc-validate workflow runs it on every RC tag.
+schema: flow-map/v0
+flows:
+  - id: candidate-intake
+    what: a candidate opens the invite link and submits the public intake form (ADR 1062 stage 2)
+    paths:
+      - ops/goat-id-console/web/static/onboard.html
+      - ops/goat-id-console/web/static/org-suggest.js
+      - ops/goat-id-console/web/static/affiliation-derive.js
+      - ops/goat-id-console/internal/handlers/onboard_public.go
+      - ops/goat-id-console/internal/handlers/onboard_api.go
+      - ops/ansible/roles/onboard-intake-collector/**
+    cheap:
+      - dir: ops/goat-id-console/web/e2e
+        run: npm ci && npx playwright install --with-deps chromium && npm test
+    live: [intake-form-browser-submit]
+
+  - id: onboarding-review-and-mint
+    what: sponsor vouch, admin approve, the runner mints, the welcome email goes out (ADR 1062 stages 2b-3)
+    paths:
+      - ops/goat-id-console/internal/handlers/onboarding.go
+      - ops/goat-id-console/internal/handlers/onboard_api.go
+      - ops/goat-id-console/internal/onboardstore/**
+      - ops/goat-id-console/internal/welcome/**
+      - ops/goat-id-console/internal/mailer/**
+      - ops/goat-id-console/web/templates/onboarding.html
+      - ops/goat-id-console/web/static/onboard-queue.js
+      - ops/onboard-runner/**
+      - ops/ansible/roles/onboard-runner/**
+    cheap:
+      - dir: ops/onboard-runner
+        run: go test ./...
+    live: [review-gate-accepts-open-field-invite, onboard-runner-reaches-mgmt-api]
+
+  - id: portal-topic-registration
+    what: an org registers a topic in the data-fabric portal (the F-162 protobuf footgun)
+    paths:
+      - ops/goat-zenoh-portal/web/**
+      - ops/goat-zenoh-portal/internal/api/**
+    cheap:
+      - dir: ops/goat-zenoh-portal/web/e2e
+        run: npm ci && npx playwright install --with-deps chromium && npm test
+    live: []
+
+  - id: panoscope-frontend
+    what: the fabric common-operating-picture renders and its typecheck passes
+    paths:
+      - ops/panoscope/frontend/**
+    cheap:
+      - dir: ops/panoscope/frontend
+        run: npm ci && npm run typecheck && npx playwright install --with-deps chromium && npm run build
+    live: []

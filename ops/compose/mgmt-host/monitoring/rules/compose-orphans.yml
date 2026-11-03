@@ -1,0 +1,151 @@
+# Block 78E — compose-orphan alert rules.
+#
+# Catches any compose-defined service that's been not-running for >5m,
+# regardless of revive policy. Closes the 2026-05-09 selfservice-ui
+# orphan gap: service exited 9 hours, watcher allowlist didn't include
+# it for revive, no alert anywhere → operator only learned about it
+# when the dashboard auth flow returned Bad Gateway.
+#
+# Metric: compose_service_running{service="<name>",site="<host>",state="<state>",project="<project>"}
+# Source: /var/lib/node_exporter/textfile/compose_service_running.prom
+#         emitted by the mgmt-host-compose-watch.sh script every poll cycle
+#         (default 30s) on each Orin running the mgmt-host-compose-watch role.
+#
+# Alert design:
+#   - 5m `for` clause debounces normal restart cycles (kratos-migrate, etc.)
+#   - severity:warning by default — operator-investigable, not paging
+#     (most orphans are one-shot migration containers that genuinely
+#     completed; only sustained orphans on long-running services warrant
+#     pages, gated by per-service criticality below)
+#   - critical-tier alert names long-running services explicitly so they
+#     do page; one-shot/migration services stay at warning level
+#
+# #1365 (2026-10-29): the metric now carries every compose project on the
+# host, not just mgmt-host — the watcher's reporting half no longer filters
+# on `label=com.docker.compose.project=mgmt-host` (see that script). The two
+# alerts below accept mgmt-host and the old watcher's absent project label.
+# Old watchers report only mgmt-host; retain them during rollout so scope and paging
+# behavior do not change with that widening: #1366 documents eleven
+# containers from a goatnet retired 2026-09-09 sitting exited on a live
+# host, plus several unlabelled load-rig leftovers, and letting a generic
+# not-running alert see every project for the first time would page on that
+# backlog instead of on anything new. The wider metric is there now for a
+# dashboard or an ad-hoc query across all 33 projects; paging stays scoped
+# until that cleanup is tracked somewhere narrower than "every alert that
+# reads this series." #1364's ComposeMgmtHostRestartPolicyDrift alert below
+# is new and mgmt-host-only from the start, so it was never exposed to the
+# #1366 backlog.
+
+groups:
+  - name: compose.orphans
+    interval: 30s
+    rules:
+
+      # Any compose-defined service not in 'running' state for >5m.
+      # Default warning severity — covers the broad case (selfservice-ui,
+      # admit-audit, mgmt-host-bootstrap, etc. that don't have explicit
+      # criticality declarations).
+      - alert: ComposeServiceNotRunning
+        expr: compose_service_running{project=~"mgmt-host|"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: compose
+        annotations:
+          summary: "Compose service {{ $labels.service }} on {{ $labels.site }} not running ({{ $labels.state }})"
+          description: |
+            Service `{{ $labels.service }}` defined in /opt/mgmt-host/docker-compose.*.yml
+            has been in state `{{ $labels.state }}` (not running) for >5m on
+            {{ $labels.site }}. Either:
+              (a) it's a one-shot migration / bootstrap container that genuinely
+                  completed — confirm via `docker logs {{ $labels.service }}`
+                  on the host and silence the alert if expected, OR
+              (b) it crashed and the watcher's allowlist doesn't include it
+                  for auto-revive — investigate via `docker logs --tail 50
+                  {{ $labels.service }}` + decide whether to add to the
+                  MGMT_HOST_COMPOSE_WATCH_SERVICES env var or fix the
+                  underlying crash.
+            This alert was added 2026-05-09 after the selfservice-ui orphan
+            class surfaced during dashboard validation.
+
+      # Critical-tier — long-running services that ARE expected to always
+      # be Up. Page on these.
+      - alert: ComposeCriticalServiceNotRunning
+        expr: |
+          compose_service_running{project=~"mgmt-host|",service=~"traefik|management-a|signal-a|postgres-a|mgmt-host-kratos-1|mgmt-host-hydra-1|selfservice-ui|dashboard|admit-audit"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: compose
+        annotations:
+          summary: "CRITICAL: {{ $labels.service }} on {{ $labels.site }} not running"
+          description: |
+            Long-running mgmt-stack service `{{ $labels.service }}` is
+            not in 'running' state on {{ $labels.site }}. This is in the
+            critical-services list (traefik / management-a / signal-a /
+            postgres-a / kratos / hydra / selfservice-ui / dashboard /
+            admit-audit) — the dashboard auth flow + mesh-mgmt API depend
+            on these. Investigate immediately.
+            Runbook: docs/operations/troubleshooting.md.
+
+      # Watcher-itself-down: the metric file hasn't been refreshed in >2 min.
+      # If the watcher dies, all compose_service_running metrics go stale —
+      # which would silently mask a real orphan. Detect via metric staleness.
+      #
+      # F-472 (2026-09-07): this used to read
+      #   time() - max by (site) (compose_service_running) > 120
+      # which subtracts a 0-or-1 gauge from a Unix timestamp and is therefore
+      # true on every evaluation — the alert fired permanently or was silenced,
+      # and watcher death was unwatched either way. The watcher now writes
+      # compose_watch_last_run_timestamp_seconds at the END of each cycle;
+      # node_exporter keeps serving the last file it read, so a dead watcher
+      # shows as a timestamp that stops advancing. That is the subtraction.
+      - alert: ComposeWatcherStale
+        expr: |
+          time() - compose_watch_last_run_timestamp_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+          component: compose
+        annotations:
+          summary: "mgmt-host-compose-watch watcher on {{ $labels.site }} has not refreshed metrics in >2m"
+          description: |
+            The mgmt-host-compose-watch service emits compose_service_running
+            metrics every 30s. If those metrics haven't refreshed in 2+ min,
+            the watcher is either down or wedged — neither container revive
+            nor orphan detection is happening. Check
+            `systemctl status mgmt-host-compose-watch` on the host.
+
+      # #1364 — a container's restart policy is fixed at creation and nothing
+      # reconciles it against what the compose file on disk declares now. A
+      # 2026-09-22 measurement found 5 of 17 /opt/mgmt-host services with a
+      # stored config hash differing from the rendered one, `dashboard`
+      # among them (RestartPolicy=no on a container Docker will never try to
+      # restart). Report-only, same reasoning as ComposeServiceNotRunning
+      # above: the fix is `docker compose up -d --force-recreate <svc>`,
+      # applied by a human — automating that touches postgres-a, traefik and
+      # management-a the moment it is wrong. Scoped to project="mgmt-host"
+      # by construction (the watcher only renders that project's compose
+      # config — see mgmt-host-compose-watch.sh) so it was never exposed to
+      # the #1366 retired-goatnet backlog on other projects.
+      - alert: ComposeMgmtHostRestartPolicyDrift
+        expr: goat_mgmt_host_restart_policy_drift == 1
+        for: 15m
+        labels:
+          severity: warning
+          component: compose
+        annotations:
+          summary: "{{ $labels.service }} on {{ $labels.site }}: live RestartPolicy ({{ $labels.live }}) does not match the compose file ({{ $labels.declared }})"
+          description: |
+            `docker compose config` renders restart="{{ $labels.declared }}"
+            for `{{ $labels.service }}` from the files on disk now; the
+            running container's HostConfig.RestartPolicy is
+            "{{ $labels.live }}". Re-running the ansible role does not fix
+            this (measured on goat-get, 2026-09-19: role ran clean, stale
+            container untouched). Repair:
+              cd /opt/mgmt-host && docker compose up -d --force-recreate {{ $labels.service }}
+            This recreates the container — do not run it unattended against
+            traefik, postgres-a or management-a without checking what that
+            implies for the services depending on it right now.
+            See docs/findings/F-546 and
+            ops/ansible/roles/mgmt-host-compose-watch/README.md.

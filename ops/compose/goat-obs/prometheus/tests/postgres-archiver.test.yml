@@ -1,0 +1,88 @@
+# promtool unit tests for rules/postgres-archiver.yml.
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/postgres-archiver.test.yml
+#
+# Ground truth for the fixtures (postgres_exporter v0.15.0 against postgres-a):
+#   - pg_stat_archiver_failed_count is a counter; a failing archiver adds
+#     ~2 per minute (three attempts, then postgres backs off 60s)
+#   - pg_stat_archiver_last_archive_age is seconds since the last SUCCESS;
+#     with archive_timeout=1min a healthy primary holds it under ~120
+
+rule_files:
+  - ../rules/postgres-archiver.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Case 1 — healthy primary: archiving every minute, no failures.
+  - interval: 1m
+    input_series:
+      - series: 'pg_stat_archiver_failed_count{server="postgres-a:5432"}'
+        values: '0x180'
+      - series: 'pg_stat_archiver_last_archive_age{server="postgres-a:5432"}'
+        values: '30x180'
+    alert_rule_test:
+      - eval_time: 180m
+        alertname: PostgresWalArchivingFailing
+        exp_alerts: []
+
+  # Case 2 — the F-581 shape. The config vanishes at t=10m: every attempt
+  # fails and the last-success age climbs one minute per minute. Age crosses
+  # 900s at ~25m, so the expr is true from ~25m; for:30m -> firing by 60m.
+  - interval: 1m
+    input_series:
+      - series: 'pg_stat_archiver_failed_count{server="postgres-a:5432"}'
+        values: '0x10 2+2x170'
+      - series: 'pg_stat_archiver_last_archive_age{server="postgres-a:5432"}'
+        values: '30x10 60+60x170'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: PostgresWalArchivingFailing
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: PostgresWalArchivingFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: postgres
+              server: postgres-a:5432
+            exp_annotations:
+              summary: "postgres-a:5432: WAL archiving has failed for 45m+ with no success — pg_wal is growing without bound"
+              description: |
+                archive_command is failing and nothing has archived for
+                1h 0m 0s. PostgreSQL keeps every unarchived
+                segment, so pg_wal grows until the disk fills and postgres
+                crash-loops (zagros, 2026-10-13: the whole goatnet went down).
+                Read the error first:
+                  sudo docker logs --since 10m postgres-a 2>&1 | grep -A2 "archive command failed"
+                The known cause ([055] unable to open missing file
+                '/etc/pgbackrest/pgbackrest.conf') and its repair are in
+                  docs/operations/disk-runway-and-retention.md §"Postgres WAL — the archiver is failing"
+                Do NOT delete files from pg_wal.
+
+  # Case 3 — a transient failure the retry clears: failures tick up once but
+  # archives keep succeeding. Must stay silent.
+  - interval: 1m
+    input_series:
+      - series: 'pg_stat_archiver_failed_count{server="postgres-a:5432"}'
+        values: '0x20 3x160'
+      - series: 'pg_stat_archiver_last_archive_age{server="postgres-a:5432"}'
+        values: '30x180'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: PostgresWalArchivingFailing
+        exp_alerts: []
+
+  # Case 4 — a standby that never archives: age is huge, failures are zero.
+  # Must stay silent (an age-only rule would page here forever).
+  - interval: 1m
+    input_series:
+      - series: 'pg_stat_archiver_failed_count{server="postgres-b:5432"}'
+        values: '0x180'
+      - series: 'pg_stat_archiver_last_archive_age{server="postgres-b:5432"}'
+        values: '864000+60x180'
+    alert_rule_test:
+      - eval_time: 180m
+        alertname: PostgresWalArchivingFailing
+        exp_alerts: []

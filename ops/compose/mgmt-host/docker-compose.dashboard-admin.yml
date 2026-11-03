@@ -1,0 +1,52 @@
+# netbird-dashboard ADMIN overlay — the write address of mesh change control
+# (docs/design/mesh-change-control.md §2, ADR 1189).
+#
+# A second netbirdio/dashboard container, same pinned image as `dashboard`
+# (docker-compose.dashboard.yml, NETBIRD_DASHBOARD_IMAGE), whose env points at
+# the FULL management API on mgmt.<site>. The everyday `dashboard` container
+# points at mgmt-read.<site>, which forwards only GET/HEAD/OPTIONS on /api.
+#
+# Served at https://admin-dashboard.<site>.<zone>/ through Traefik ->
+# oauth2-proxy-dashboard-admin:4180 (NETBIRD-ADMIN only) -> dashboard-admin:80.
+#
+# Deployed only when netbird_dashboard_split_enabled is true, by the
+# netbird-dashboard role (dashboard-deploy.yml). That role renders
+# /opt/mgmt-host/dashboard-admin.env (mode 0600) from the same template as
+# dashboard.env, with the API endpoint and self URL changed.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dashboard-admin.yml up -d dashboard-admin
+
+services:
+  dashboard-admin:
+    # Same image variable as `dashboard`, so the two can never run different
+    # dashboard builds. Tag+digest default per ADR 0703 / check-pin-compat.sh.
+    image: ${NETBIRD_DASHBOARD_IMAGE:-netbirdio/dashboard:latest@sha256:e3ee15351a46345d338a5f9d20cf49bcc3d3594d6d61bc4e5d6f640dda2cbdb0}
+    container_name: dashboard-admin
+    restart: unless-stopped
+    env_file:
+      - dashboard-admin.env
+    networks:
+      - mgmt
+    # Loopback-only diagnostic port (3000 = dashboard, 3001 = selfservice-ui).
+    ports:
+      - "127.0.0.1:${DASHBOARD_ADMIN_HOST_PORT:-3002}:80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # nginx serving a static bundle; the everyday dashboard sits at ~32 MiB.
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "router_role=${ROUTER_ROLE:-a}"
+      - "block=mesh-change-control"
+
+networks:
+  mgmt:
+    external: true
+    name: mgmt

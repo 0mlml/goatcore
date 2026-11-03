@@ -1,0 +1,78 @@
+---
+# JSON Schema (YAML form) for Block 68 first-boot userdata.yml.
+#
+# Validate operator-prepared USB userdata against this before
+# flashing — laptop-side via `yq` + a JSON Schema validator, on-host
+# at first-boot.sh entry.
+#
+# Spec: docs/project/block-68a-config-input-spike.md
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://goat.goat-maintainer.dev/schemas/first-boot/userdata-1.json"
+title: "Block 68 rapid-bringup userdata.yml"
+type: object
+required:
+  - schema_version
+  - site_id
+  - mgmt_stack_profile
+  - hardware_class
+  - scenario
+  - wg_cp0_endpoint
+  - wg_cp0_relay_pubkey
+properties:
+  schema_version:
+    type: integer
+    enum: [1]
+    description: "Schema version. Increment on incompatible changes."
+  site_id:
+    type: string
+    pattern: "^[a-z][a-z0-9-]{1,30}$"
+    description: "Site name. Lowercase, hyphenated. e.g. vega, prov-rla, wbn-eur."
+  mgmt_stack_profile:
+    type: string
+    enum: [full, postgres-spock-only]
+    description: "Architectural profile. See docs/design/turnkey-three-orin-bringup.md §Mgmt-stack profile taxonomy."
+  router_role:
+    type: string
+    enum: [A, B, C]
+    description: "Per-host role in the site. A/B = mgmt-host pair (full profile only). C = obs-host. Omit for single-Orin sites (postgres-spock-only)."
+  hardware_class:
+    type: string
+    enum: [orin-mgmt, orin-obs, karbon-mgmt]
+    description: "Image build target. Must match the image flashed to this host."
+  scenario:
+    type: string
+    enum: [total-loss, spock-join]
+    description: "S1 = no surviving Spock peer (empty fresh state). S2 = link to existing peer (Spock subscription)."
+  wg_cp0_endpoint:
+    type: string
+    pattern: "^[a-z0-9.-]+:[0-9]+$"
+    description: "Public-internet wg-cp0 listener URL. e.g. relay-rla.goat.example:51820. Reachability data, NOT secret."
+  wg_cp0_relay_pubkey:
+    type: string
+    pattern: "^[A-Za-z0-9+/]{43}=$"
+    description: "wg-cp0 relay's WireGuard public key (base64). Public-by-construction."
+  peer_site_mgmt_api:
+    type: string
+    pattern: "^https://[a-z0-9.-]+(:[0-9]+)?$"
+    description: "(spock-join only) URL of the existing Spock peer site's mgmt-API. e.g. https://198.18.0.1:443"
+  peer_site_pg_endpoint:
+    type: string
+    pattern: "^[0-9.]+:[0-9]+$"
+    description: "(spock-join only) Spock subscription target (publisher PG endpoint over wg-cp0). e.g. 198.18.0.1:5432"
+allOf:
+  - if:
+      properties:
+        scenario:
+          const: spock-join
+    then:
+      required:
+        - peer_site_mgmt_api
+        - peer_site_pg_endpoint
+  - if:
+      properties:
+        mgmt_stack_profile:
+          const: full
+    then:
+      required:
+        - router_role
+additionalProperties: false

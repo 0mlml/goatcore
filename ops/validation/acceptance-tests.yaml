@@ -1,0 +1,1048 @@
+# Goatnet e2e acceptance-test manifest — SEED (designed-not-built; ADR 1115).
+#
+# One row per provisioned aspect; probe TYPES are a small library the rows
+# parameterize (docs/design/goatnet-acceptance-suite.md). `requires` uses
+# deploy-ledger component names (ADR 1060) — RECONCILE against each role's
+# deploy-history.yml at build increment 1; names here are best-effort.
+# `caught_would_have` names the failure this test catches; the seed corpus is
+# the defect list of a real standup.
+#
+# Verdicts: PASS | FAIL | UNKNOWN | SKIPPED(dep-unmet) | N/A(not-applicable).
+# Nothing-heard is never green. Every probe type ships a red-first fixture.
+
+schema: acceptance-tests/v0
+probe_types: [http-ok, tls-identity, tls-alpn, dns-resolve, bus-liveliness,
+              bus-roundtrip, container-health, cmd-assert, oidc-flow, enroll-probe]
+
+tests:
+  # ---- onboarding (ADR 1062 stage 2 — the public candidate form) ----
+  # Browser-driven: the page's own script against the page's own markup. On
+  # a markup rename left the submit handler throwing before its
+  # fetch; nothing server-side, and no log line, could see it (#569 → #601).
+  # Runs from the operator laptop (host: localhost). The goat legs run on the
+  # host that holds the context (--var goat_via=user@host, e.g. the goatnet's
+  # management host through its door; --var goat_context=<ctx>); the browser
+  # leg is local against the public page. Mints, submits in Chromium,
+  # requires 201, sponsor-rejects its own proposal.
+  - id: intake-form-browser-submit
+    aspect: onboarding/candidate-intake
+    probe: cmd-assert
+    params: {host: localhost, cmd: "ops/scripts/onboard-intake-smoke.sh --context {{ goat_sponsor_context }} --env {{ env }} --goat-via {{ goat_via }}", expect: "smoke: PASS", unknown_rc: 2, timeout: 240}
+    requires: [id-admin-console, onboard-intake-collector]
+    caught_would_have: "every candidate submit dies at the intake page"
+  # The stage-2b gate on an invite whose fields the sponsor left open — the
+  # shape the console's web invite page mints. such proposals
+  # landed as incomplete drafts both gates refused ("complete it in the
+  # console", no such path), while pre-bound CLI invites passed, so a
+  # CLI-only check read green. Needs an operator context for the admin-stage reject.
+  - id: review-gate-accepts-open-field-invite
+    aspect: onboarding/review-gate
+    probe: cmd-assert
+    params: {host: localhost, cmd: "ops/scripts/onboard-intake-smoke.sh --context {{ goat_sponsor_context }} --env {{ env }} --goat-via {{ goat_via }} --stage sponsor", expect: "smoke: PASS", unknown_rc: 2, timeout: 300}
+    requires: [id-admin-console, onboard-intake-collector]
+    caught_would_have: "every web-form-minted invite strands at review"
+
+  # ---- mgmt stack (turnkey phases 5-7) ----
+  # Every NetBird service identity this goatnet's config calls for exists, its
+  # token is in the operator environment, and it authenticates as the service
+  # user the registry names. Without them a portal refuses every machine
+  # enrollment. Runs from the operator laptop, where the tokens live.
+  - id: netbird-service-identities
+    aspect: mgmt-stack/netbird-service-identities
+    probe: cmd-assert
+    params: {host: localhost, cmd: "ops/scripts/netbird-service-identities.py {{ env }} --live",
+             expect: "OK: every required identity is present and verified.", timeout: 180}
+    requires: [netbird-mgmt]
+    caught_would_have: "portal, console watcher and both guards unconfigured"
+  - id: mgmt-api-answers
+    applies_when: goatnet_founder   # founder-owned surface; a joiner uses the founder's
+    aspect: mgmt-stack/netbird-mgmt
+    probe: http-ok
+    # auth names the env var to read the bearer token from, not a literal
+    # token. nb_api_token_env resolves per site (generate-values.py) to the
+    # <SITE>_NB_API_TOKEN convention; the literal "nb_api_token" named no
+    # real env var and always read UNKNOWN.
+    params: {url: "https://{{ public_mgmt_fqdn }}/api/setup-keys", auth: "{{ nb_api_token_env }}", expect: 200}
+    requires: [netbird-mgmt, traefik]
+    caught_would_have: "F-140 class — also asserts auto_groups != null on every key"
+  - id: signal-tls-not-cleartext
+    aspect: mgmt-stack/signal
+    probe: tls-alpn
+    params: {host: "{{ public_mgmt_fqdn }}", port: 443, expect_tls: true}
+    requires: [signal-server, traefik]
+    caught_would_have: "row 22 — signal_proto http; peers registered but Signal-disconnected"
+  - id: enrollment-entrypoint-cert-identity
+    aspect: mgmt-stack/enrollment
+    probe: tls-identity
+    # expect_issuer is per site (generate-values.py, from
+    # dashboard_cert_delivery_mode): "Let's Encrypt" on an ACME site, the
+    # internal CA's CN on a site that uses one. The literal always passed on
+    # every ACME site and could never pass on an internal-CA site.
+    params: {host: "{{ public_mgmt_fqdn }}", port: 8443, expect_issuer: "{{ entrypoint_cert_issuer }}", refuse_cn: "TRAEFIK DEFAULT CERT"}
+    requires: [traefik]
+    caught_would_have: "row 40 — enrollment entrypoint served traefik.default; netbird refused; forced re-enroll cascade"
+  - id: oidc-dashboard-login-flow
+    aspect: identity/netbird-oidc
+    probe: oidc-flow
+    # Discovery + JWKS; netbird-dashboard exists in Hydra and a login STARTS for it
+    # (a login_challenge, and the login UI answers); an unregistered client is
+    # refused; management.json's AuthIssuer/AuthAudience are set and the issuer
+    # matches. Writes only transient login requests that expire unused.
+    params: {issuer: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}/", host: "{{ orin_a }}", client: netbird-dashboard,
+             assert_nonempty: [AuthIssuer, AuthAudience], config_file: "{{ netbird_mgmt_config }}"}
+    requires: [hydra, kratos, netbird-mgmt]
+    caught_would_have: "row 21 — empty auth fields; every dashboard token rejected at first Owner login"
+  # ---- unattended boot ----
+  # Would this host come back by itself after a power cut? goat-unlock-health
+  # (installed by roles/luks-unlock on every host with a Tang-unlocked volume)
+  # checks the volume is open, at least two bound Tang servers answer, the unit
+  # graph has no ordering cycle, and an enabled tangd.socket is listening. Any of
+  # these false can lose the whole mgmt stack at the next boot. One row per host role; C is the obs node,
+  # which also serves Tang for A.
+  - id: unattended-boot-health-a
+    aspect: host/unattended-boot
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd: "/usr/local/sbin/goat-unlock-health.sh", expect: "unlock-health: PASS", timeout: 60}
+    requires: [luks-unlock]
+    applies_when: luks_tang_unlock
+    caught_would_have: "a core node locked at boot, sibling Tang sockets deleted by a boot ordering cycle"
+  - id: unattended-boot-health-b
+    aspect: host/unattended-boot
+    probe: cmd-assert
+    params: {host: "{{ orin_b }}", cmd: "/usr/local/sbin/goat-unlock-health.sh", expect: "unlock-health: PASS", timeout: 60}
+    requires: [luks-unlock]
+    applies_when: {luks_tang_unlock: true, intra_site_pair: true}
+    caught_would_have: "second core node's tangd.socket never started"
+  - id: unattended-boot-health-c
+    aspect: host/unattended-boot
+    probe: cmd-assert
+    params: {host: "{{ orin_c }}", cmd: "/usr/local/sbin/goat-unlock-health.sh", expect: "unlock-health: PASS", timeout: 60}
+    requires: [luks-unlock]
+    applies_when: {luks_tang_unlock: true, has_obs_host: true}
+    caught_would_have: "obs node's tangd.socket never started"
+  - id: pg-replication-standby-streaming
+    aspect: data/postgres-pair
+    probe: cmd-assert
+    params: {host: "{{ orin_b }}", cmd: "docker exec postgres-a psql -tAc \"select status from pg_stat_wal_receiver\"", expect: "streaming"}
+    requires: [postgres-spock, postgres-streaming-replication]
+    applies_when: intra_site_pair
+    caught_would_have: "rows 36/38/44 — pg_hba admit missing; Phase 6A structurally impossible fresh"
+  - id: pg-standby-encoding-utf8
+    aspect: data/postgres-pair
+    probe: cmd-assert
+    params: {host: "{{ orin_b }}", cmd: "docker exec postgres-a psql -tAc \"show server_encoding\"", expect: "UTF8"}
+    requires: [postgres-streaming-replication]
+    applies_when: intra_site_pair
+    caught_would_have: "row 45 — initdb defaulting SQL_ASCII on the rebuilt standby"
+  - id: pgbackrest-stanza-and-first-backup
+    aspect: data/backups
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd: "docker exec postgres-a pgbackrest --stanza={{ site_id }}-netbird info --output=json", expect_jq: '.[0].status.code == 0'}
+    requires: [pgbackrest]
+    caught_would_have: "row 37 — stanza-create against the standby; backups silently absent"
+
+  # ---- federation (JOINER axis; ADR 1084, node-addition.md §4/§6) ----------
+  # pg-replication-standby-streaming above is INTRA-site (A→B on the same site's
+  # pair). It says nothing about the property a SECOND HOST SITE has to prove:
+  # inter-site Spock multi-master actually moving mgmt + identity state BOTH
+  # WAYS between the joiner and the founder. Every row here gates on
+  # `spock_joiner` — participates_in_spock AND NOT goatnet_founder — so it fires
+  # only on a node that JOINED an existing goatnet, never on the founder (where
+  # seed-from-peer never ran) and never on a single-site goatnet.
+  #
+  # F-396 is why "the subscription reports replicating" is not enough. Both
+  # consoles can say `replicating` while a row written on the founder never
+  # reaches the joiner, because (1) the founder published a
+  # netbird_mgmt repset holding ZERO tables and (2) the DSN host fell back
+  # to the public enrolment apex, which does not listen on 5432. sub_show_status
+  # describes the subscription, not whether the publication carries anything, so
+  # these rows assert data-carrying content and reachability, per direction —
+  # the evidence node-addition.md §6 demands ("a write on the founder visible in
+  # the joiner's postgres, and the same deletion replicated back").
+  - id: fed-inter-site-netbird-subscriptions-replicating
+    aspect: federation/inter-site-spock
+    probe: cmd-assert
+    applies_when: spock_joiner
+    params:
+      host: "{{ orin_a }}"
+      # ≥1 subscription AND every one 'replicating'. count=0 -> 'no-subscriptions'
+      # (a joiner that never wired the inbound sub_{{ spock_peer_node }}_to_{{ spock_local_node }}),
+      # never a silent green. This is the inbound (founder→joiner) leg's status.
+      cmd: "docker exec postgres-a psql -U postgres -d netbird -tAc \"SELECT CASE WHEN count(*)=0 THEN 'no-subscriptions' WHEN count(*)=count(*) FILTER (WHERE status='replicating') THEN 'all-replicating' ELSE 'some-not-replicating' END FROM spock.sub_show_status()\""
+      expect: "all-replicating"
+    requires: [postgres-spock, spock-mesh-peering]
+    severity: gate
+    caught_would_have: >-
+      A joiner whose inbound subscription never reached `replicating` (slot
+      creation failed, walsender handshake stalled) would otherwise finish
+      standup with no federation and nothing saying so. Empty result is
+      'no-subscriptions', not a pass.
+  - id: fed-netbird-mgmt-repset-carries-the-curated-tables
+    aspect: federation/inter-site-spock
+    probe: cmd-assert
+    applies_when: spock_joiner
+    params:
+      host: "{{ orin_a }}"
+      # F-396 defect #1, DIRECTLY: the joiner PUBLISHES netbird_mgmt to the
+      # founder; if that repset holds 0 tables the founder's subscription still
+      # reads 'replicating' while nothing this node writes ever travels. ADR
+      # 1084 D1 curates exactly 20 tables — fewer means the publication is
+      # incomplete (0 is the empty-repset extreme F-396 documents).
+      cmd: "docker exec postgres-a psql -U postgres -d netbird -tAc \"SELECT count(*) FROM spock.tables WHERE set_name='netbird_mgmt'\""
+      expect_min: 20
+    requires: [postgres-spock, spock-mesh-peering]
+    severity: gate
+    caught_would_have: >-
+      A founder publishing a netbird_mgmt repset of 0 tables against the
+      joiner's 20: both subscriptions show `replicating` and a founder write
+      never appears on the joiner. Counting the joiner's own published repset
+      is the joiner→founder direction's proof-of-content.
+  - id: fed-founder-mgmt-rows-present-on-joiner
+    aspect: federation/inter-site-spock
+    probe: cmd-assert
+    applies_when: spock_joiner
+    params:
+      host: "{{ orin_a }}"
+      # The founder→joiner direction, shown by real rows: a joiner federated
+      # with an established founder has the founder's identity + mesh state in
+      # its own tables (seeded, then kept live by replication). LEAST across
+      # accounts/users/peers so an empty ANY of them fails — "a write on the
+      # founder is visible in the joiner's postgres" (node-addition.md §6).
+      cmd: "docker exec postgres-a psql -U postgres -d netbird -tAc \"SELECT LEAST((SELECT count(*) FROM accounts),(SELECT count(*) FROM users),(SELECT count(*) FROM peers))\""
+      expect_min: 1
+    requires: [postgres-spock, spock-mesh-peering]
+    severity: gate
+    caught_would_have: >-
+      A joiner that wired subscriptions but received no rows (empty publication,
+      or the seed never ran) has accounts/users/peers all at 0 while every
+      status field reads healthy — the F-396 shape, seen from the receiving end.
+  - id: fed-seed-from-peer-completed
+    aspect: federation/seed-from-peer
+    probe: cmd-assert
+    applies_when: spock_joiner
+    params:
+      host: "{{ orin_a }}"
+      # <site>-seed-from-peer.yml REMOVES this marker once the guarded
+      # data-only copy of identity + mesh state from the founder lands. PASS 1
+      # of bootstrap touches it on the empty DB, so a PRESENT marker means the
+      # seed step was skipped — the joiner came up on an un-seeded schema.
+      cmd: "test ! -e {{ spock_seed_marker }} && echo seed-complete || echo marker-present-seed-not-run"
+      expect: "seed-complete"
+    requires: [postgres-spock]
+    severity: gate
+    caught_would_have: >-
+      The three-pass joiner (node-addition.md §4) fails silently if PASS 2
+      (seed-from-peer) is skipped: subscriptions wire over an empty schema and
+      look healthy. The removed marker is the only durable evidence the seed
+      actually ran. Paired with fed-founder-mgmt-rows-present-on-joiner it
+      distinguishes "seeded" from "marker never existed".
+  - id: fed-ory-narrow-subscriptions-replicating
+    aspect: federation/ory-narrow
+    probe: cmd-assert
+    applies_when: spock_ory_dbs
+    params:
+      host: "{{ orin_a }}"
+      # ory_narrow (ADR 1084 D2) replicates the kratos + hydra DBs via their own
+      # ory_sub_* subscriptions. Same all-or-'no-subscriptions' shape as the
+      # netbird leg, per Ory DB. Gated on spock_ory_dbs so a netbird-only joiner
+      # is N/A rather than a spurious UNKNOWN.
+      cmd_template: "docker exec postgres-a psql -U postgres -d {item} -tAc \"SELECT CASE WHEN count(*)=0 THEN 'no-subscriptions' WHEN count(*)=count(*) FILTER (WHERE status='replicating') THEN 'all-replicating' ELSE 'some-not-replicating' END FROM spock.sub_show_status()\""
+      for_each: spock_ory_dbs
+      expect: "all-replicating"
+    requires: [postgres-spock, ory-narrow-repset]
+    severity: gate
+    caught_would_have: >-
+      Ory identities + OAuth2 clients replicate over a SEPARATE subscription set
+      from netbird_mgmt; a joiner can have netbird federation healthy while
+      kratos/hydra never subscribed, so its login plane silently diverges from
+      the founder's. Checked per Ory DB, both must be replicating.
+  - id: fed-ory-identities-replicated-to-joiner
+    aspect: federation/ory-narrow
+    probe: cmd-assert
+    applies_when: spock_ory_dbs
+    params:
+      host: "{{ orin_a }}"
+      # ory_narrow working means the founder's kratos identities are present on
+      # the joiner under the SHARED nid (ADR 1009/1084 D2). A count of 0 with
+      # the subscription 'replicating' is F-396 in the Ory plane: subscribed to
+      # an empty publication. Non-empty proves identity rows actually traversed.
+      cmd: "docker exec postgres-a psql -U postgres -d kratos -tAc \"SELECT count(*) FROM identities\""
+      expect_min: 1
+    requires: [postgres-spock, ory-narrow-repset]
+    severity: gate
+    caught_would_have: >-
+      A joiner whose kratos subscription is 'replicating' over an empty
+      ory_narrow publication has 0 identities and would authenticate no one who
+      exists only on the founder — invisible until a real login is attempted.
+  - id: fed-inter-site-postgres-dsn-reachable
+    aspect: federation/inter-site-spock
+    probe: cmd-assert
+    applies_when: spock_joiner
+    params:
+      host: "{{ orin_a }}"
+      # F-396 defect #2, DIRECTLY: the peer's Postgres :5432 DSN host must be the
+      # peer's mesh IP, not the public enrolment apex (which resolves to the
+      # relays and drops :5432). pg_isready needs no credentials and reports
+      # whether the founder's postgres actually answers on the DSN endpoint.
+      cmd: "docker exec postgres-a pg_isready -h {{ spock_peer_dsn_host }} -p 5432"
+      expect: "accepting connections"
+    requires: [postgres-spock, spock-mesh-peering]
+    severity: gate
+    caught_would_have: >-
+      spock_mesh_publisher_host falling back to the public apex: every
+      sub_create dials the relay IPs and times out on 5432. It reads as a
+      network fault; it is a missing variable.
+      This asserts the DSN host the joiner peers with answers on 5432.
+
+  # ---- fabric (phases 8-9) ----
+  - id: router-tls-identity-mesh-ip
+    aspect: fabric/router
+    probe: tls-identity
+    params: {host: "{{ mesh_ip_a }}", port: 7447, expect_san_ip: "{{ mesh_ip_a }}", expect_cn: "{{ zenoh_router_cn }}"}
+    requires: [zenoh-router]
+    caught_would_have: "rows 39/41 — stale mesh-IP SAN after re-enroll; cert/key KeyMismatch crash-loop"
+  - id: router-storages-spawned
+    aspect: fabric/router-storage
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd: "docker logs {{ site_id }}-zenoh-router --since 10m 2>&1 | grep -c 'Cannot find volume' || true", expect: "0"}
+    requires: [zenoh-router]
+    caught_would_have: "row 25 — pqc-fips image without fips_variant: every storage dead behind a healthy container"
+  - id: health-keys-carry-own-site-id
+    aspect: fabric/health-publishers
+    probe: bus-roundtrip
+    # One mesh beat, under this site's own key, whose EnvHealthV1 scope is this
+    # site. Through the goat CLI when a context speaks for the goatnet, else the
+    # router's REST plugin on the host's loopback (a read: a subscription).
+    params: {subscribe: "ops/mesh/health/{{ site_id }}", expect_field: {site: "{{ site_id }}"}, timeout_s: 90,
+             context: "{{ probe_context }}", via: "{{ probe_via }}", rest_host: "{{ orin_a }}", rest_port: "{{ zenoh_rest_port }}"}
+    requires: [zenoh-router, mesh-health-publisher]
+    caught_would_have: "row 43 — publishers writing under another goatnet's keys on this goatnet's router"
+
+  # ---- host substrate (phases 1-2, obs leg) ----
+  - id: docker-data-on-encrypted-mount
+    aspect: host/f093-data-root
+    probe: cmd-assert
+    applies_when: docker_data_separate_mount
+    params: {hosts_from: all_orins, cmd: "findmnt -n /opt/docker-data", expect_nonempty: true}
+    requires: [mgmt-host-baseline]
+    caught_would_have: "rows 27/33 — obs Orin writing to unencrypted eMMC beside an empty LUKS volume"
+
+  # ---- observability CAPABILITY: an outage goes unnoticed not because an alert
+  #      is missed but because the capability to notice is absent — zero rules
+  #      loaded, scrape targets dead. These rows prove
+  #      the capability exists; a standup must not pass while blind.
+  #
+  #      THEY ARE KEYED ON WHERE PROMETHEUS IS, NOT ON SITE TOPOLOGY. Until
+  #      all five carried `requires: [obs-host]` + `applies_when:
+  #      has_obs_host` and hardcoded `{{ orin_c }}` + localhost:9090.
+  #      `has_obs_host` answers "does this SITE have a separate obs node"; these
+  #      rows were reading it as "does this site have monitoring", which are
+  #      different questions — the same confusion already written down in
+  #      roles/deadman-watch/tasks/main.yml, where testing it for "is this host
+  #      the obs host" inverted that guard in both directions.
+  #
+  #      A goatnet can run Prometheus as an obs host or as a co-resident stack,
+  #      and both must be checked. A row that applies to only one shape lets a
+  #      relay-certificate scrape job sit unconverged with this gate green.
+  #      `obs_prometheus_host` / `_url` / `obs_alertmanager_config`
+  #      are derived per stack in generate-values.py, so a goatnet is checked
+  #      because it RUNS one, not because someone set a flag. `requires:` is
+  #      gone deliberately: naming a component that only one of the two stacks
+  #      deploys is what let absence skip the row. ----
+
+  # bringup-access-invariant — the golden path must never hand back an encrypted
+  # box the operator who built it can't log into . These rows
+  # fail phase-14 CLOSED if operator SSH login to a booted node is absent.
+  - id: operator-ssh-login-core-a
+    aspect: host/access-fullos
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd: "echo ok", expect: "ok"}
+    requires: [mgmt-host-baseline]
+    caught_would_have: "a node encrypted and booted with no admin key on the full OS: operator locked out, undetected."
+
+  - id: operator-ssh-login-core-b
+    aspect: host/access-fullos
+    probe: cmd-assert
+    params: {host: "{{ orin_b }}", cmd: "echo ok", expect: "ok"}
+    applies_when: {intra_site_pair: true}
+    requires: [mgmt-host-baseline]
+    caught_would_have: "the warm-standby node built without operator access."
+
+  - id: operator-ssh-login-obs
+    aspect: host/access-fullos
+    probe: cmd-assert
+    params: {host: "{{ obs_prometheus_host }}", cmd: "echo ok", expect: "ok"}
+    applies_when: {has_obs_host: true}
+    requires: [mgmt-host-baseline]
+    caught_would_have: "the obs node built without operator access."
+  - id: prometheus-scrape-targets-up
+    requires: [prometheus]
+    aspect: observability/scrape-targets
+    probe: cmd-assert
+    params:
+      host: "{{ obs_prometheus_host }}"
+      cmd: "curl -s {{ obs_prometheus_url }}/api/v1/targets | jq '[.data.activeTargets[] | select(.health!=\"up\")] | length'"
+      expect: "0"
+    applies_when: obs_prometheus_host
+    caught_would_have: "F-289 — 4/5 targets down (stale mesh IPs after re-enroll, pre-renumber LAN, node-exporter 503)"
+  - id: prometheus-alert-rules-loaded
+    requires: [prometheus]
+    aspect: observability/alert-rules
+    probe: cmd-assert
+    params:
+      host: "{{ obs_prometheus_host }}"
+      cmd: "curl -s {{ obs_prometheus_url }}/api/v1/rules | jq '.data.groups | length'"
+      expect_min: 1
+    applies_when: obs_prometheus_host
+    caught_would_have: "F-289 — zero alert rules loaded; the absent capability, now shipped by the obs-host role"
+  - id: prometheus-reaches-alertmanager
+    requires: [prometheus, alertmanager]
+    aspect: observability/alerting-delivery
+    probe: cmd-assert
+    params:
+      host: "{{ obs_prometheus_host }}"
+      cmd: "curl -s '{{ obs_prometheus_url }}/api/v1/query?query=prometheus_notifications_alertmanagers_discovered' | jq '.data.result[0].value[1] | tonumber'"
+      expect_min: 1
+    applies_when: obs_prometheus_host
+    caught_would_have: "F-289 delivery half — rules that fire into a void when no Alertmanager is reachable"
+  - id: deadman-switch-firing
+    requires: [prometheus, alertmanager]
+    aspect: observability/alerting-deadman
+    probe: cmd-assert
+    params:
+      host: "{{ obs_prometheus_host }}"
+      cmd: "curl -s {{ obs_prometheus_url }}/api/v1/rules | jq '[.data.groups[].rules[] | select(.name==\"Watchdog\" and .state==\"firing\")] | length'"
+      expect: "1"
+    applies_when: obs_prometheus_host
+    caught_would_have: "F-289 — every other rule assumes Prometheus is alive. The Watchdog is the only signal that survives Prometheus dying; if it is not firing, nothing is watching the watcher."
+  - id: deadman-switch-has-external-receiver
+    aspect: observability/alerting-deadman
+    probe: cmd-assert
+    params:
+      host: "{{ obs_prometheus_host }}"
+      # The Watchdog firing proves nothing on its own — it has to LEAVE the box.
+      # Routed to webhook-noop it is decorative: a dead Prometheus stops the
+      # heartbeat and no external watcher ever notices, which is precisely the
+      # looks-fine-but-blind state F-289 documents.
+      cmd: "sudo awk '/alertname = \"Watchdog\"/{f=1} f&&/receiver:/{print $2; exit}' {{ obs_alertmanager_config }} | grep -qx 'webhook-noop' && echo decorative || echo external"
+      expect: "external"
+    applies_when: obs_prometheus_host
+    caught_would_have: "F-289 — a dead-man's switch wired to webhook-noop, which looks identical to a working one until the day Prometheus dies"
+
+  # ---- declared-vs-scraped coverage ----
+  # Every probe target a goatnet DECLARES must actually be scraped by its
+  # Prometheus. No `requires:` — absence is the failure this row exists to
+  # catch, not a reason to skip it.
+  #
+  # The failure it catches: a variable declared in group_vars that only the
+  # stack this goatnet does NOT run reads. The declaration reaches no template,
+  # the relay certificates are watched by nothing, and no deploy changes that
+  # because no playbook reads it.
+  #
+  # prometheus-scrape-targets-up cannot catch this by construction: a job that
+  # was never rendered contributes no targets, therefore no UNHEALTHY targets,
+  # and it passes. Absence is not failure — F-478 applied to the gate itself.
+  # This row compares the declaration against /api/v1/targets, so a declaration
+  # wired to nothing is red on whichever stack the goatnet runs.
+  - id: relay-tls-targets-are-scraped
+    aspect: observability/declared-coverage
+    probe: cmd-assert
+    params:
+      host: "{{ obs_prometheus_host }}"
+      cmd_template: "curl -s {{ obs_prometheus_url }}/api/v1/targets | jq -e '[.data.activeTargets[].labels.instance] | index(\"{item}\")' >/dev/null && echo scraped || echo missing"
+      for_each: obs_relay_tls_targets
+      expect: "scraped"
+    applies_when: obs_relay_tls_targets
+    caught_would_have: "relay TLS targets declared that the stack never renders, or a scrape job merged and unconverged"
+
+  # ---- DNS + services (phase 12) ----
+  # An enrolled peer that loses its tunnel to the management host re-signals
+  # through the relay addresses the mesh DNS lists after the mesh IP for the
+  # enrollment apex. They must be this goatnet's own relays: another
+  # goatnet's relays answer the name with a certificate for nothing.
+  - id: mesh-apex-fallback-is-this-goatnets-relays
+    aspect: dns/mesh-apex-fallback
+    probe: cmd-assert
+    applies_when: mesh_apex_fallback_ips
+    # The live mesh answer (minus mesh addresses) against the public answer.
+    # The declared list is `mesh_apex_fallback_ips`; a fix there is live only
+    # once the zone is redeployed, and this row says which.
+    params:
+      host: localhost
+      cmd: >-
+        python3 -c 'import ast,ipaddress,subprocess,sys;
+        c=ipaddress.ip_network("100.64.0.0/10");
+        a=[x for x in subprocess.run(["dig","+short","+time=3","+tries=1",sys.argv[1],"@"+sys.argv[2],"-p","5353"],capture_output=True,text=True).stdout.split() if x.replace(".","").isdigit() and x.count(".")==3];
+        a or sys.exit("no answer from the mesh DNS at %s:5353" % sys.argv[2]);
+        m={x for x in a if x.count(".")==3 and ipaddress.ip_address(x) not in c}; p=set(ast.literal_eval(sys.argv[3]));
+        print("same" if m==p else "differ: mesh-only %s, public-only %s" % (sorted(m-p), sorted(p-m)))'
+        "{{ public_mgmt_fqdn }}" "{{ mesh_ip_a }}" "{{ relay_public_ips }}"
+      expect: "same"
+      unknown_rc: 1
+    requires: [mesh-coredns]
+    caught_would_have: >-
+      A goatnet's mesh DNS listing a sibling's relays as the fallback for its
+      enrolment name (copied with the record from the sibling's group_vars):
+      each answers that name with Traefik's default certificate, so a peer
+      whose tunnel flaps has no working path to re-signal.
+  - id: every-declared-service-resolves
+    aspect: dns/mesh-zone
+    probe: dns-resolve
+    params: {names_from: isitup_services, resolver: "{{ mesh_ip_a }}:5353", expect: "{{ mesh_ip_a }}"}
+    requires: [mesh-coredns]
+    caught_would_have: "F-197 — declared-but-unresolvable deploys dark"
+  - id: declared-service-actually-deployed
+    aspect: services/deploy-join
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd_template: "docker ps --format '{{ '{{' }}.Names{{ '}}' }}' | grep -qx {item}", for_each: isitup_containers}
+    requires: [mesh-coredns]
+    caught_would_have: "row 30 — whole tiers declared in isitup_services, silently never deployed. EXACT: each declared service's own container name (isitup_containers) must be running, or this row hard-FAILs — a goatnet cannot pass the gate with a declared service missing."
+  - id: public-auth-fqdns-not-flagged
+    aspect: enrollment/safe-browsing
+    probe: safe-browsing
+    params: {names_from: public_auth_fqdns}
+    caught_would_have: "the Google Safe Browsing 'dangerous site' interstitial on a fresh public login/consent domain (F-class none yet) — every enroller hits a full-page red block before reaching the portal, and it reads as a phishing verdict, not a TLS error. Graded here needs SAFE_BROWSING_API_KEY (else UNKNOWN, not a false pass); FAIL means file a review in Google Search Console for the zone."
+  - id: panoscope-serves-authenticated
+    aspect: surfaces/panoscope
+    probe: http-ok
+    params: {url: "https://panoscope.{{ site_id }}.{{ site_dns_zone }}", expect: [200, 302], from: mesh}
+    requires: [panoscope, mesh-coredns]
+    caught_would_have: "row 26 — wrong network + cleartext dial; hard fail then crash-loop"
+
+  # ---- enrollment e2e (Gate 1 rows, migrated from fresh-peer-probe.sh) ----
+  - id: fresh-peer-enrolls
+    aspect: enrollment/e2e
+    probe: enroll-probe
+    # Writes, so opt-in (--var enroll_probe=1 --var enroll_peer_host=<docker host>,
+    # $<SITE>_NB_API_TOKEN): mints an ephemeral one-off key, proves a made-up key
+    # gets no address, enrols a throwaway netbird client container, then deletes
+    # the peer and the key and checks the peer is gone. Default: SKIPPED.
+    params: {part: enroll, opt_in: "{{ enroll_probe }}", mgmt_url: "https://{{ public_mgmt_fqdn }}", peer_host: "{{ enroll_peer_host }}",
+             image: "{{ enroll_client_image }}", token_env: "{{ nb_api_token_env }}", reach_ip: "{{ mesh_ip_a }}", reach_port: 443}
+    requires: [netbird-mgmt, signal-server, traefik, relay-fleet]
+    caught_would_have: "F-188 family — the four-part Gate 1 composite, now rows"
+  - id: fresh-peer-mesh-reaches-mgmt
+    aspect: enrollment/e2e
+    probe: enroll-probe
+    params: {part: mesh-reach, opt_in: "{{ enroll_probe }}", mgmt_url: "https://{{ public_mgmt_fqdn }}", peer_host: "{{ enroll_peer_host }}",
+             image: "{{ enroll_client_image }}", token_env: "{{ nb_api_token_env }}", reach_ip: "{{ mesh_ip_a }}", reach_port: 443}
+    requires: [netbird-mgmt, relay-fleet]
+  - id: relay-cert-system-trust
+    applies_when: goatnet_founder   # founder-owned surface; a joiner uses the founder's
+    aspect: relays/tls
+    probe: tls-identity
+    params: {hosts_from: relay_public_ips, port: 443, sni: "{{ public_mgmt_fqdn }}", expect_system_trust: true}
+    requires: [relay-fleet]
+    caught_would_have: "Hazard 2 / F-188 — self-signed rels:// cert = Relays 0/N forever"
+  # The row above names the rels:// hazard and probes 443, which is NOT where
+  # rels:// lives. Relay certificates can expire on 33073 while 443 serves a
+  # valid one from a different mechanism, which would keep that row green
+  # throughout an outage. This is the same
+  # assertion against the port the relay protocol actually terminates on.
+  # THE ROW FOR A GOATNET WITH NO RELAY TIER, and the reason the ones below it
+  # could not. Every other relay row carries `requires: [relay-fleet]`, and a
+  # row whose requires are unmet becomes SKIPPED — the gate counts only PASS
+  # over ELIGIBLE rows, so a goatnet with no relay tier at all skips every
+  # relay assertion and goes green. A goatnet with relay VPSes and no ansible
+  # inventory covering them has a tier that is never deployable, and nothing
+  # in the standup says so.
+  #
+  # This row therefore has NO `requires`. It runs whenever the goatnet declares
+  # relay_public_ips, which is the goatnet asserting it HAS a relay tier. If
+  # something answers TLS on the relay port, PASS. If nothing does the probe
+  # returns UNKNOWN (unreachable),
+  # which is the state this row exists for. UNKNOWN is not PASS, and the gate
+  # exits zero only when every eligible row is PASS, so the standup fails
+  # rather than skipping past an absent tier. That distinction is the whole
+  # point: SKIPPED reads like consent, UNKNOWN reads like "nobody checked".
+  #
+  # A goatnet that deliberately has no rels:// tier (TURN-only through coturn
+  # is a legitimate shape) declares that by leaving relay_public_ips empty.
+  # Absence has to be declared, not inferred from a missing listener.
+  - id: relay-fleet-answers-if-declared
+    applies_when: {goatnet_founder: true, relay_public_ips: true}   # founder-owned relay fleet; a joiner uses the founder's
+    aspect: relays/presence
+    probe: tls-identity
+    params: {hosts_from: relay_public_ips, port: 33073, verify_name: false, expect_system_trust: true}
+    caught_would_have: "relay VPSes with no inventory, no rels:// listener, acceptance gate green"
+
+  - id: relay-protocol-cert-system-trust
+    applies_when: goatnet_founder   # founder-owned surface; a joiner uses the founder's
+    aspect: relays/tls
+    probe: tls-identity
+    params: {hosts_from: relay_public_ips, port: 33073, verify_name: false, expect_system_trust: true}
+    requires: [relay-fleet]
+    caught_would_have: "expired rels:// certs take the relay tier down fleet-wide; the 443 row cannot see it"
+
+  # ---- capability probes (corpus) ----
+  # Every row above asks "is the thing there". These ask "can it do its job",
+  # which is the distinction the findings turned on: the portal,
+  # microscope, panoscope and the console were all deployed, all healthy on
+  # every container probe, all green on isitup — and four of them could not
+  # perform the function they exist for. A liveness gate cannot see that. Each
+  # row below names a defect that survived a full standup plus three days of
+  # green dashboards.
+  - id: portal-resolves-a-person
+    aspect: portal/identity-layer
+    probe: http-ok
+    params: {url: "https://portal.{{ site_id }}.{{ site_dns_zone }}/api/access/who?id={{ acceptance_known_person_email }}",
+             auth: portal_operator_key, expect: 200, expect_json_nonempty: resolved}
+    requires: [goat-zenoh-portal, kratos]
+    severity: gate
+    caught_would_have: >-
+      portal_kratos_admin_url absent: the identity layer is dark and
+      /api/access/who answers "no identity matched" for EVERY person while
+      the portal stays healthy. Asserting a 200 does NOT catch it; asserting
+      that `resolved` is non-empty does, on standup day.
+  - id: portal-anchor-linkage-is-recorded
+    aspect: portal/identity-layer
+    probe: http-ok
+    params: {url: "https://portal.{{ site_id }}.{{ site_dns_zone }}/api/access/who?id={{ acceptance_known_person_email }}",
+             auth: portal_operator_key, expect: 200, expect_json_equals: {anchor_linkage: recorded}}
+    requires: [goat-zenoh-portal, kratos]
+    severity: warn
+    caught_would_have: >-
+      slots.identity_id NULL -> person->anchor
+      ownership derived by an alias<->handle NAME JOIN, the fallback ADR 1051
+      added the recorded linkage to retire. `warn` not `gate`: a tag-join answer is
+      degraded, not broken, and the row exists to keep the degradation VISIBLE
+      instead of letting the fallback quietly remain the mechanism.
+  - id: microscope-every-source-live
+    aspect: microscope/adapters
+    probe: http-ok
+    params: {url: "https://microscope.{{ site_id }}.{{ site_dns_zone }}/api/entity?id={{ acceptance_known_person_email }}",
+             auth: portal_operator_key, expect: 200, expect_json_none_equals: {"sources[].state": skipped}}
+    requires: [microscope]
+    severity: gate
+    caught_would_have: >-
+      A goatnet declaring only microscope's three oauth2-proxy keys, so most
+      adapters self-disable on empty role defaults and the page renders an
+      honest but entirely empty shell. Container healthy, isitup green, n=0
+      everywhere.
+  - id: admin-fences-are-enforcing
+    applies_when: goatnet_founder   # founder-owned surface; a joiner uses the founder's
+    aspect: identity/rbac
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd: "grep -h RBAC_MODE /opt/microscope/.env /opt/panoscope/.env",
+             expect_all_match: "=enforce$"}
+    requires: [microscope, panoscope]
+    severity: gate
+    caught_would_have: >-
+      MICROSCOPE/PANOSCOPE_RBAC_MODE=off (role default) on production, so each
+      admin fence runs its authn half with authz DARK: any authenticated Ory
+      identity reaches a behavior-of-persons surface.
+  - id: fenced-surface-oidc-client-exists
+    aspect: identity/oidc
+    probe: oidc-flow
+    # The clients are read from the running fences themselves: every container
+    # whose *CLIENT_ID env names a client of this issuer. Each must exist in Hydra
+    # and start a login; an unregistered client must be refused.
+    params: {clients_from_containers: true, host: "{{ orin_a }}", issuer: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}"}
+    requires: [hydra]
+    severity: gate
+    caught_would_have: >-
+      microscope's fence presented client_id=microscope to a Hydra that had never
+      heard of it — no code created that client, and a hand-made one on another
+      goatnet hides the gap. Every load ends at Ory `invalid_client`
+      while the container, its DNS record, its Traefik router and its TLS are all
+      green.
+  - id: audit-offload-pipeline-runs
+    aspect: audit/three-tier
+    probe: container-health
+    params: {host: "{{ orin_a }}", container: audit-subscriber}
+    requires: [audit-subscriber]
+    severity: gate
+    caught_would_have: >-
+      audit-subscriber never deployed, so the goatnet has no audit offload at
+      all (ADR 0811's three-tier shape) and audit-integrity is empty.
+  - id: console-audit-path-is-a-file
+    applies_when: goatnet_founder   # founder-owned surface; a joiner uses the founder's
+    aspect: id-console/audit
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd: "test -f /var/lib/goat-id-console/audit.jsonl && echo file", expect_match: "^file$"}
+    requires: [goat-id-console]
+    severity: gate
+    caught_would_have: >-
+      Docker creates a missing bind-mount source AS A DIRECTORY. If microscope
+      comes up before the console has written its audit file, the path becomes a
+      directory and BOTH break: microscope reads "Is a directory (os error 21)"
+      and the console's own appends have nowhere to land, so console audit is
+      silently lost.
+  # ---- mesh PQC (redteam) ----
+  - id: rosenpass-pq-negotiated
+    aspect: mesh/pqc
+    probe: cmd-assert
+    applies_when: rosenpass_enabled
+    params: {host: "{{ orin_a }}", cmd: "sudo netbird status -d | grep -q 'Quantum resistance: true' && echo present", expect: "present"}
+    requires: [netbird-mgmt]
+    severity: gate
+    caught_would_have: >-
+      A goatnet carrying rosenpass_enabled:true while every peer reports Quantum
+      resistance:false. --rosenpass-permissive fails open, so nothing static can prove PQ is on;
+      only this live probe from an enrolled peer distinguishes "PQ declared" from
+      "PQ negotiated". check-rosenpass-pq-actually-negotiated.sh is its static twin.
+
+  # ---- name-fallback snapshot (ADR 1082; turnkey when name_snapshot_enabled) ----
+  - id: name-snapshot-served
+    aspect: dns/name-fallback
+    probe: cmd-assert
+    applies_when: name_snapshot_enabled
+    params: {host: "{{ orin_a }}", cmd: "sudo docker exec goat-get sh -c 'wget -q -O /dev/null http://127.0.0.1/name-snapshot.json && wget -q -O /dev/null http://127.0.0.1/name-snapshot.json.sig' && echo present", expect: "present"}
+    requires: [goat-get]
+    severity: gate
+    caught_would_have: >-
+      name_snapshot_enabled:true renders + signs the snapshot,
+      but goat-get only PUBLISHES it when re-deployed with a contents:read release
+      token, and the group_var can be flipped on without the deploy. This
+      asserts the signed bytes are actually served from get.<site>, not merely
+      committed — the difference between "declared" and "resolvable when DNS is down".
+  # ---- pub/sub state-of-record Repl (Block 86; turnkey when pubsub_state_repl_enabled) ----
+  - id: pubsub-state-forgejo-primary-up
+    aspect: fabric/state-of-record
+    probe: cmd-assert
+    applies_when: pubsub_state_repl_enabled
+    # The PRIMARY tier answers on the obs host. The mirror timer being active
+    # (next row) proves nothing about this: it ran every 5 minutes for four
+    # weeks against a Forgejo that did not exist.
+    params: {host: "{{ orin_c }}", cmd: "curl -sf -m 5 http://127.0.0.1:3030/api/v1/version -o /dev/null && echo up", expect: "up"}
+    requires: []
+    severity: gate
+    caught_would_have: >-
+      A goatnet running without its pub/sub state-of-record primary: Forgejo's
+      containers lost in docker data-root rebuilds on the obs host and nothing
+      re-creating them, while the mirror fails silently every 5 minutes and the
+      MinIO shadow keeps the timer looking healthy.
+  - id: pubsub-state-mirror-live
+    aspect: fabric/state-of-record
+    probe: cmd-assert
+    applies_when: pubsub_state_repl_enabled
+    params: {host: "{{ orin_a }}", cmd: "systemctl is-active pubsub-state-mirror.timer", expect: "active"}
+    requires: []
+    severity: gate
+    caught_would_have: >-
+      The portal registry (vendors/topics/schemas) lives only in
+      the portal DB; without the mirror timer a rebuild stops at an empty fabric. A
+      goatnet that declares Repl but never ran the mirror deploy would look done yet
+      have no durable state-of-record. This asserts the mirror is actually cycling.
+
+  # ---- onboarding (three-stage; turnkey when onboard_runner_enabled) -------
+  # The four walls a NEW goatnet hits before its first person can be minted. Each is invisible
+  # until the previous one was fixed, and none of them appears on a goatnet stood
+  # up before the code that introduced it — which is exactly what an acceptance
+  # suite is for.
+  - id: onboard-runner-knows-this-goatnet
+    aspect: onboarding/goat-cli-config
+    probe: cmd-assert
+    applies_when: onboard_runner_enabled
+    params: {host: "{{ orin_a }}", cmd: "docker exec onboard-runner sh -c 'strings /usr/local/bin/goat | grep -c \"{{ site_id }}\"' || echo 0", expect_min: 1}
+    requires: [onboard-runner]
+    severity: gate
+    caught_would_have: >-
+      F-485 wall 1 + wall 2 — goat-cli hardcodes per-goatnet endpoints in three
+      match arms, so a goatnet stood up after those arms were last edited is
+      invisible to the onboarder and every mint refuses. Asserting against the
+      binary the CONTAINER sees also catches wall 2: the runner bind-mounts the
+      host binary, so replacing that file leaves the container on the old inode
+      until something restarts it.
+  - id: onboard-runner-reaches-mgmt-api
+    aspect: onboarding/runner-reachability
+    probe: cmd-assert
+    applies_when: onboard_runner_enabled
+    params: {host: "{{ orin_a }}", cmd: "docker exec onboard-runner sh -c 'curl -s -o /dev/null -w %{http_code} --max-time 8 https://{{ public_mgmt_fqdn }}/api/groups'", expect: "401"}
+    requires: [onboard-runner, traefik, netbird-mgmt]
+    severity: gate
+    caught_would_have: >-
+      F-485 wall 4 — the goatnet's public mgmt FQDN resolves through the host's
+      /etc/hosts to 127.0.0.1, which inside a container is the container itself,
+      so the mint died at "NetBird GET /api/groups failed" saying nothing about
+      DNS. 401 is the PASS: reachable and demanding auth. A 000 is the defect.
+      Also a role's extra_hosts pin carrying a literal docker bridge IP that is
+      traefik on one goatnet and something else on another, which brings the
+      same error line back on a goatnet that has onboarded for months. The pin
+      is host-gateway now.
+  - id: onboard-runner-audit-reaches-the-fabric
+    aspect: onboarding/operator-action-audit
+    probe: cmd-assert
+    applies_when: onboard_runner_enabled
+    params: {host: "{{ orin_a }}", cmd: "docker exec onboard-runner sh -c 'grep -c router_endpoint /home/runner/.goat/contexts/default/profile.toml' || echo 0", expect_min: 1}
+    requires: [onboard-runner]
+    caught_would_have: >-
+      F-485 wall 5 — the entrypoint materialised a profile carrying only
+      portal_endpoint, so the OperatorActionV1 emit at the `goat admin`
+      chokepoint fell back to a log file inside a container nothing collects. It
+      warned twice per mint and was never once read. Not a gate: the mint
+      succeeds without it, and losing the per-person audit silently is the harm.
+
+  - id: zenoh-router-answers
+    aspect: fabric/goat-zenoh
+    probe: cmd-assert
+    params: {host: "{{ orin_a }}", cmd: "curl -s -o /dev/null -w %{http_code} --max-time 5 http://127.0.0.1:{{ zenoh_rest_port }}/@/local/router", expect: "200"}
+    requires: [goat-zenoh]
+    caught_would_have: >-
+      The fabric had no acceptance row at all: a goatnet could finish standup
+      with its router wedged and the suite would say nothing. This is also the
+      paired positive that makes the adminspace refusal below mean something.
+
+  # ==========================================================================
+  # NEGATIVE ROWS — the things that must be REFUSED.
+  #
+  # Every row above asserts that something works. None of them asserts that
+  # anything is denied, so a goatnet could pass the whole suite with its
+  # boundaries wide open. That is acceptance tier 3 missing
+  # (docs/design/staged-delivery-pattern.md), and it is the half federation had
+  # and standup did not.
+  #
+  # `must_refuse: true` inverts the verdict — the probe answering normally means
+  # the thing we require to be denied was ALLOWED, which is the finding.
+  #
+  # `paired_positive` is not optional bookkeeping. A denial is indistinguishable
+  # from a path that was never live: run a refusal check against a broken
+  # deployment and it passes vacuously, reporting a boundary that is really an
+  # outage. Each row below therefore names the positive that proves the path was
+  # carrying, and the runner SKIPS it — never passes it — when that positive did
+  # not pass. A check that cannot fail is not a check.
+  # ==========================================================================
+
+  - id: mgmt-api-refuses-an-unauthenticated-caller
+    aspect: mgmt-stack/netbird-mgmt
+    probe: http-ok
+    must_refuse: true
+    paired_positive: mgmt-api-answers
+    params: {url: "https://{{ public_mgmt_fqdn }}/api/setup-keys", expect: 200}
+    requires: [netbird-mgmt, traefik]
+    severity: gate
+    caught_would_have: >-
+      The paired positive sends a bearer token and asserts 200. Nothing asserted
+      what happens WITHOUT one, so an API that had stopped checking authorization
+      would pass the suite. This row sends no Authorization header and requires
+      the 200 not to happen.
+
+  - id: enrollment-entrypoint-refuses-the-default-cert
+    aspect: mgmt-stack/enrollment
+    probe: tls-identity
+    must_refuse: true
+    paired_positive: enrollment-entrypoint-cert-identity
+    params: {host: "{{ public_mgmt_fqdn }}", port: 8443, expect_cn: "TRAEFIK DEFAULT CERT"}
+    requires: [traefik]
+    severity: gate
+    caught_would_have: >-
+      Traefik serves its self-signed default when no route matches, and an
+      enrolling peer sees a TLS handshake that succeeds against the wrong
+      identity. The positive asserts the Let's Encrypt issuer; this asserts the
+      default cert is NOT what answers, which is the failure that actually
+      happens when a router is misconfigured.
+
+  - id: adminspace-is-not-writable-from-the-fabric
+    aspect: fabric/goat-zenoh
+    probe: cmd-assert
+    must_refuse: true
+    paired_positive: zenoh-router-answers
+    # The REST plugin answers 200 to any PUT, landed or not, so the probe
+    # writes a marker and reads it back: the write landed only if it comes back.
+    params: {host: "{{ orin_a }}", cmd: "sh -c 'curl -s -o /dev/null --max-time 5 -X PUT -H content-type:text/plain -d assay http://127.0.0.1:{{ zenoh_rest_port }}/@/local/router/config/assay_probe; curl -s --max-time 5 http://127.0.0.1:{{ zenoh_rest_port }}/@/local/router/config/assay_probe | grep -c assay'", expect: "1"}
+    requires: [goat-zenoh]
+    caught_would_have: >-
+      The router's adminspace is configured read:false write:false. Nothing ever
+      asserted it, so a config regression that opened it would be invisible —
+      and a writable adminspace is a path to changing access control at runtime.
+
+  # ---- rescue nodes (ADR 1183, turnkey phase 14) ----
+  # A break-glass node is only break-glass if it is THERE when the mesh and the
+  # control plane are not. Two rows, because two different things can be true:
+  # the node can be on the mesh, and the node can survive losing power.
+  - id: breakglass-node-is-on-the-mesh
+    aspect: rescue/breakglass
+    probe: cmd-assert
+    applies_when: has_breakglass_node
+    params: {host: "{{ orin_a }}", cmd: "netbird status -d | grep -A6 breakglass | grep -c 'Status: Connected'", expect: "1", timeout: 60}
+    requires: [netbird-mgmt]
+    caught_would_have: >-
+      A break-glass node off the mesh for days after a site power cut with
+      nothing grading it, because it was never added to the mesh-health roster.
+      This row fails on the absence itself.
+  # The clock is the thing that took the node out, so the row asserts the
+  # recovery path is armed rather than that the clock is currently right — a
+  # correct clock proves nothing about the next power cut.
+  - id: breakglass-clock-recovery-armed
+    aspect: rescue/breakglass
+    probe: cmd-assert
+    applies_when: has_breakglass_node
+    params: {host: "{{ breakglass_host }}", cmd: "systemctl is-enabled breakglass-clock-step.service fake-hwclock-load.service | sort -u", expect: "enabled", timeout: 60}
+    requires: [breakglass-node]
+    caught_would_have: >-
+      A node that comes back far in the past and cannot step its own clock, so
+      both transports fail TLS. Without this row the only evidence
+      the fix is in place is that someone ran the play once.
+
+  # ---- the goat CLI legs: the goatnet as its operators see it ----
+  # The rows above probe each component from outside. These run the operator's
+  # own CLI against the finished goatnet, so the assay proves what a person who
+  # was handed a context will see: the chain from router to portal answers,
+  # every health domain has a fresh beat and it is green, a sample round-trips
+  # the fabric, and the deploy ledgers match what main declares. The rows that
+  # read the fabric need a goat context holding a fabric identity for this
+  # goatnet: `probe_context` on `probe_via`. A goatnet that sets
+  # assay_probe_enabled gets the non-person `assay-probe` context on its first
+  # management machine (ops/scripts/create-assay-probe-identity.sh;
+  # goatnet-acceptance-suite.md §"The probe identity"); otherwise they fall back
+  # to the operator's own `goat_context` on `goat_via`. Without one each row is
+  # UNKNOWN with E_PROFILE_MISSING: the probe cannot speak for the goatnet,
+  # which is not the goatnet failing.
+  - id: goat-status-chain
+    aspect: fabric/operator-chain
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "status --json",
+             # The portal leg is graded only when the context holds a portal
+             # key: the assay's probe identity holds none, so goat disables its
+             # portal client, and portal-health-answers grades the portal instead.
+             expect_jq: "([.ztol, .session, .cert] | all(.ok)) and (.portal.ok or (.portal.summary | test(\"client disabled\")))",
+             expect_rc: graded-by-json, timeout: 60}
+    requires: [goat-zenoh, goat-zenoh-portal]
+    caught_would_have: >-
+      the first `goat status` a new operator runs: router port, an mTLS session,
+      the portal and the operator's own cert, each graded on its own line.
+  - id: portal-health-answers
+    aspect: fabric/operator-chain
+    probe: cmd-assert
+    # From the management machine, so it answers wherever the assay runs; the
+    # portal is mesh-only.
+    params: {host: "{{ orin_a }}", cmd: "curl -fsS {{ curl_ca_opt }} -o /dev/null -w '%{http_code}' --max-time 15 https://portal.{{ site_id }}.{{ site_dns_zone }}/api/health",
+             expect: "200", timeout: 30}
+    requires: [goat-zenoh-portal]
+    caught_would_have: >-
+      a portal that does not answer its health route, graded on its own so the
+      goat status row above can run as a context with no portal key.
+  - id: goat-hello-roundtrip
+    aspect: fabric/round-trip
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "hello --json",
+             expect_jq: ".mode == \"real\" and .round_trip", timeout: 60}
+    requires: [goat-zenoh]
+    caught_would_have: >-
+      a router that answers its port and the health surfaces while refusing or
+      dropping a real put and subscribe.
+      Self-cleaning: `hello/<context>` carries one `lo` and nothing is stored.
+  - id: fabric-put-subscribe-roundtrip
+    aspect: fabric/round-trip
+    probe: bus-roundtrip
+    # A fresh nonce published on a volatile key (routed, never stored) and read
+    # back by a subscriber. Through the goat CLI when a context speaks for the
+    # goatnet, else the router's REST plugin on the host, so the round trip is
+    # graded even where no operator context exists yet.
+    params: {publish: true, key: "volatile/goat-assay/{{ site_id }}", timeout_s: 20,
+             context: "{{ probe_context }}", via: "{{ probe_via }}", rest_host: "{{ orin_a }}", rest_port: "{{ zenoh_rest_port }}"}
+    requires: [goat-zenoh]
+    caught_would_have: >-
+      a router up and answering its port that does not carry a put to a
+      subscriber; the goat CLI round trip above cannot grade it on a goatnet
+      with no operator context yet.
+  - id: goat-presence-has-peers
+    aspect: fabric/presence
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "presence --json",
+             expect_jq: "type == \"array\" and length >= 1",
+             unknown_jq: "type == \"array\" and length == 0",
+             unknown_reason: "no presence token is live: an idle goatnet and a silently denied liveliness query look the same here; goat-health-presence grades the presence plane",
+             timeout: 60}
+    requires: [goat-zenoh]
+  - id: goat-health-fabric
+    aspect: fabric/health
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "health --domain fabric --json",
+             expect_jq: ".beat and .age_secs <= 300 and (.overall_color | IN(\"green\", \"idle\"))", timeout: 60}
+    requires: [fabric-health]
+    caught_would_have: >-
+      Health publishers declared and never deployed, so every health surface is
+      blank and nothing grades the blank.
+  - id: goat-health-mesh
+    aspect: mesh/health
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "health --domain mesh --json",
+             expect_jq: ".beat and .age_secs <= 300 and .overall_color == \"green\"", timeout: 90}
+    requires: [mesh-health]
+  - id: goat-health-presence
+    aspect: fabric/presence-health
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "health --domain presence --json",
+             expect_jq: ".beat and .age_secs <= 300 and (.overall_color | IN(\"green\", \"idle\"))", timeout: 90}
+    requires: [presence-health]
+  - id: goat-health-time
+    aspect: time/health
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "health --domain time --json",
+             expect_jq: ".beat and .age_secs <= 300 and .overall_color == \"green\"", timeout: 90}
+    requires: [time-health]
+  - id: goat-health-net
+    aspect: host/net-health
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "health --domain net --json",
+             expect_jq: ".beat and .age_secs <= 300 and .overall_color == \"green\"", timeout: 90}
+    requires: [node-net-health]
+  - id: goat-health-consistency
+    aspect: deploy/consistency
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "health --domain consistency --json",
+             expect_jq: ".beat and .age_secs <= 600 and .overall_color == \"green\"", timeout: 90}
+    requires: [consistency-health]
+  - id: goat-who-roster
+    aspect: identity/roster
+    probe: goat-cli
+    params: {via: "{{ probe_via }}", context: "{{ probe_context }}", verb: "who --once", timeout: 60}
+    requires: [goat-zenoh-portal, kratos]
+    caught_would_have: >-
+      a portal whose roster call fails for an operator token while /api/health
+      answers 2xx.
+  - id: goat-acl-declaration-holds
+    aspect: mesh/acl-declaration
+    probe: goat-cli
+    params: {via: "localhost", context: "{{ goat_context }}", verb: "acl test {{ site_id }} --json",
+             expect_jq: "all(.[]; .verdict == \"satisfied\")", timeout: 60}
+    requires: [netbird-mgmt]
+    caught_would_have: >-
+      a declared ACL assertion (allow or deny) that the goatnet's declaration
+      no longer satisfies. The declaration, not the live mesh: the must_refuse
+      rows are the live boundary checks.
+  - id: deploy-ledgers-match-main
+    aspect: deploy/ledgers
+    probe: goat-cli
+    params: {via: "localhost", bin: goatbuilder, verb: "diff --env {{ goatbuilder_env }}", expect_rc: 0, timeout: 240}
+    requires: [mgmt-host-baseline]
+    caught_would_have: >-
+      a component declared on main that the hosts never received, or received
+      at another ref: `goatbuilder diff` reads every host's newest ledger row
+      against main's declared ref, and an unreadable ledger is unknown, never same.
+  # ---- tutorial 2: the first federated node, seen from both sides ----
+  # A joiner site's sample reaches a subscriber on the founder's router, and
+  # the joiner's identity cannot write into the founder's keyspace. Both need
+  # a context for each goatnet site on the same machine (`goat_context` for
+  # this joiner, `goat_context_peer` for the founder).
+  - id: goat-xsite-roundtrip
+    aspect: federation/fabric-round-trip
+    probe: cmd-assert
+    applies_when: spock_joiner
+    params: {host: localhost, cmd: "ops/validation/goat-xsite-roundtrip.sh {{ goat_context }} {{ goat_context_peer }}",
+             expect: "xsite: PASS", timeout: 90}
+    requires: [goat-zenoh]
+    caught_would_have: >-
+      two routers that each answer their own operators while the link between
+      the sites carries nothing.
+  # The negative: what must stay at its own site does not cross. ADR 1084
+  # keeps three tables out of the published set (no primary key, or a SERIAL
+  # id that would collide); a repset that carried them would replicate
+  # rows each site numbers independently. Paired with the repset row, so a
+  # joiner that publishes nothing cannot pass it.
+  - id: fed-site-local-tables-stay-local
+    aspect: federation/inter-site-spock
+    probe: cmd-assert
+    applies_when: spock_joiner
+    must_refuse: true
+    paired_positive: fed-netbird-mgmt-repset-carries-the-curated-tables
+    params:
+      host: "{{ orin_a }}"
+      cmd: "docker exec postgres-a psql -U postgres -d netbird -tAc \"SELECT count(*) FROM spock.tables WHERE set_name='netbird_mgmt' AND relname IN ('installations','extra_settings','network_addresses')\""
+      expect_min: 1
+    requires: [postgres-spock, spock-mesh-peering]
+    caught_would_have: >-
+      a repset built with repset_add_all_tables, which ADR 1084 rejects: it
+      couples replication to every future table, including ones that must not
+      leave their site.

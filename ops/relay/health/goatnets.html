@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goat · goatnet overview</title>
+<!--
+  goatnets.html — the CROSS-GOATNET level, one step out from relay-health.html's
+  fleet overview. The relay dashboard's drilldown is:
+
+      (this page)  goatnet overview   -- every goatnet, one row each
+        level 1    fleet overview     -- every relay in ONE goatnet
+        level 2    per-relay detail
+        level 3    peer baseball card
+        level 4    identity block
+
+  Same discipline as its sibling: one self-contained file, vanilla JS, no build
+  step, no framework. Reads goatnets.json (rendered by the relay-health ansible
+  role from relay_health_goatnets) and one summary file per goatnet.
+
+  WHY IT DOES NOT FETCH THE OTHER DASHBOARD DIRECTLY
+  The obvious design — have the browser fetch each sibling's relay-health.json
+  and aggregate client-side — does not work, and the reason is worth recording
+  so nobody re-attempts it. Each dashboard sits behind its own oauth2-proxy on
+  its own domain, and oauth2-proxy sets its session cookie SameSite=Lax. A
+  cross-origin fetch therefore arrives unauthenticated, is 302'd to the IdP, and
+  fails CORS. Making it work would mean SameSite=None on a session cookie
+  guarding a recon-sensitive surface (ADR 1066) — a real security loosening to
+  buy a convenience. So each goatnet PUBLISHES a compact summary instead, the
+  same reveal-only idiom the health bands already use.
+
+  HONESTY RULE, inherited from ADR 1034 and non-negotiable here:
+  a goatnet we have no summary for renders as UNKNOWN (grey), never as down.
+  Absence of data is not evidence of failure — and on this page the most likely
+  cause of absence is that a publisher is not wired yet, which has nothing to do
+  with whether those relays are up. A grey row says so in words.
+-->
+<style>
+  /* Tokens lifted verbatim from relay-health.html so the two levels read as one
+     surface. Change them there first, then here. */
+  :root{
+    --bg:#14110d; --panel:#1d1812; --panel2:#241d15; --line:#3a3026;
+    --ink:#f0e6d6; --dim:#9c8f7a; --faint:#6b6051;
+    --green:#5cb85c; --amber:#e0a32e; --red:#d9534f; --grey:#5b5346; --blue:#4c9fd6;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+    padding:18px 22px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{margin:0;font-size:18px;letter-spacing:.5px}
+  header h1 .goat{color:var(--amber)}
+  .sub{color:var(--dim);font-size:12px;font-family:var(--mono)}
+  .roll{margin-left:auto;display:flex;gap:18px;align-items:center}
+  .roll .big{font-size:26px;font-weight:700;font-family:var(--mono)}
+  main{padding:18px 22px;max-width:1100px}
+  .note{color:var(--dim);font-size:12.5px;margin:0 0 16px;max-width:70ch}
+  .gn{display:block;text-decoration:none;color:inherit;
+    background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:14px 16px;margin-bottom:12px;transition:border-color .12s}
+  .gn:hover{border-color:var(--blue)}
+  /* A goatnet with no dashboard to open. Not an error state — the verdict
+     above still reports it — so it stays legible and simply does not offer
+     a hover affordance it cannot honour. */
+  .gn-nolink{cursor:default}
+  .gn-nolink:hover{border-color:var(--line)}
+  .gn-top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .dot{width:11px;height:11px;border-radius:50%;flex:0 0 auto}
+  .gn-name{font-size:16px;font-weight:700}
+  .gn-role{font-size:11px;font-family:var(--mono);color:var(--bg);
+    background:var(--dim);border-radius:4px;padding:1px 6px;text-transform:uppercase}
+  .gn-role.prod{background:var(--amber)}
+  .gn-verdict{margin-left:auto;font-family:var(--mono);font-size:13px}
+  .gn-stats{display:flex;gap:22px;flex-wrap:wrap;margin-top:10px;
+    font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+  .gn-stats b{color:var(--ink);font-weight:700}
+  .gn-why{margin-top:9px;font-size:12.5px;color:var(--amber);max-width:80ch}
+  .gn-why.grey{color:var(--dim)}
+  .gn-host{margin-top:8px;font-family:var(--mono);font-size:11.5px;color:var(--faint);
+    word-break:break-all}
+  /* Access condition for a link that is real but not reachable from
+     everywhere — a standalone dashboard resolves only inside its own goatnet.
+     Stated on the card so a timeout is expected rather than read as a fault. */
+  .gn-access{margin-top:4px;font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+  footer{padding:14px 22px;color:var(--faint);font-size:11.5px;
+    border-top:1px solid var(--line);font-family:var(--mono)}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="goat">goat</span> · goatnet overview</h1>
+  <span class="sub" id="sub">loading…</span>
+  <div class="roll">
+    <div><div class="big" id="rollN">–</div><div class="sub">goatnets</div></div>
+    <div><div class="big" id="rollR">–</div><div class="sub">relays up</div></div>
+  </div>
+</header>
+
+<main>
+  <p class="note">
+    One row per goatnet. Click through for that goatnet's own relay fleet.
+    Each goatnet reports itself — a row with no summary is shown as
+    <b>unknown</b>, not as down.
+  </p>
+  <div id="rows"></div>
+</main>
+
+<footer id="foot"></footer>
+
+<script>
+const REFRESH_MS = 30000;
+
+// Grey is a real verdict here, not a fallback colour: it means "this page has
+// no evidence", which is different from "those relays are unhealthy".
+const FILL = {green:"var(--green)", amber:"var(--amber)", red:"var(--red)", grey:"var(--grey)"};
+
+function fmtAge(sec){
+  if (sec == null) return "—";
+  if (sec < 90) return sec + "s ago";
+  if (sec < 5400) return Math.round(sec/60) + "m ago";
+  if (sec < 172800) return Math.round(sec/3600) + "h ago";
+  return Math.round(sec/86400) + "d ago";
+}
+
+// Worst-wins across relays, with staleness demoting to grey rather than red.
+// A summary older than its own goatnet's staleness budget tells us the
+// PUBLISHER stopped, which says nothing about the relays themselves.
+function verdictOf(s, nowSec){
+  if (!s) return {st:"grey", text:"no summary", why:
+    "No summary published for this goatnet yet. That is a wiring gap on this page, not a relay fault — open the goatnet to see its real state."};
+  const age = s.generated ? (nowSec - s.generated) : null;
+  const staleAfter = s.stale_after_s || 300;
+  if (age != null && age > staleAfter) return {st:"grey", text:"stale", why:
+    "Last summary " + fmtAge(age) + ". The publisher has stopped reporting; the relays below are the last known state, not current." +
+    (age > 86400 ? " Silent for more than a day: if this goatnet has been retired, this box has not been redeployed since it left the roster." : "")};
+  const up = s.relays_up, tot = s.relays_total;
+  if (tot == null) return {st:"grey", text:"no relay data", why:"Summary carries no relay counts."};
+  if (up === tot) return {st:"green", text:up + "/" + tot + " up", why:null};
+  if (up === 0)   return {st:"red",   text:"0/" + tot + " up", why:"Every relay in this goatnet is failing its probes."};
+  return {st:"amber", text:up + "/" + tot + " up", why:(tot-up) + " relay(s) not fully healthy."};
+}
+
+function row(gn, s, nowSec){
+  const v = verdictOf(s, nowSec);
+  // A goatnet with no dashboard URL must not render as an <a href="#">:
+  // indistinguishable from the linked cards, clicking it silently does nothing
+  // and the card reads as broken rather than as
+  // "there is nothing to open". Same hidden-not-dead rule the consistency
+  // console applies to its sibling links: render the affordance only when
+  // there is somewhere to go, and say why when there isn't.
+  //
+  // A third case sits between those two: a surface that IS real but reachable
+  // only from its own mesh: a gateless standalone dashboard — nginx on a host
+  // port, no Traefik and no public name —
+  // resolves and answers only for a reader on that mesh. Such a row
+  // carries `mesh_only` plus an `access` string, and renders as a LINK on its
+  // own goatnet's page and as plain TEXT on a sibling's, where clicking it
+  // could only ever fail. The address is still printed either way: knowing
+  // where a thing lives is useful even when you cannot open it from here.
+  // A mesh-only surface is reachable ONLY from its own goatnet's mesh, so on a
+  // SIBLING's dashboard there is no viewer who could open it — its name is
+  // served by that goatnet's CoreDNS to that goatnet's peers, and resolves
+  // nowhere else (ERR_NAME_NOT_RESOLVED). On its OWN dashboard every
+  // viewer is on that mesh by definition, so there it is a real link.
+  //
+  // This is the correction to a half-fix: the row used to render unlinked
+  // saying "no dashboard URL configured", which was wrong because the
+  // dashboard exists. Giving it a URL made the text right and the affordance
+  // wrong. `local` already encodes the only thing that decides it.
+  const linked = Boolean(gn.url) && !(gn.mesh_only && !gn.local);
+  const a = document.createElement(linked ? "a" : "div");
+  a.className = linked ? "gn" : "gn gn-nolink";
+  if (linked) { a.href = gn.url; a.target = "_blank"; a.rel = "noopener"; }
+  const age = s && s.generated ? fmtAge(nowSec - s.generated) : "—";
+  const stats = s ? `
+      <span>vantage <b>${s.vantage || "—"}</b></span>
+      <span>worst latency <b>${s.worst_lat_ms != null ? s.worst_lat_ms + " ms" : "—"}</b></span>
+      <span>reported <b>${age}</b></span>` : "";
+  a.innerHTML = `
+    <div class="gn-top">
+      <span class="dot" style="background:${FILL[v.st]}"></span>
+      <span class="gn-name">${gn.label || gn.id}</span>
+      <span class="gn-role ${gn.role === "production" ? "prod" : ""}">${gn.role || "goatnet"}</span>
+      <span class="gn-verdict" style="color:${FILL[v.st]}">${v.text}</span>
+    </div>
+    <div class="gn-stats">${stats}</div>
+    ${v.why ? `<div class="gn-why ${v.st === "grey" ? "grey" : ""}">${v.why}</div>` : ""}
+    <div class="gn-host">${gn.url || "no dashboard URL configured"}${
+      gn.url && !linked ? " — not reachable from this goatnet" : ""}</div>
+    ${gn.access ? `<div class="gn-access">${gn.access}</div>` : ""}`;
+  return a;
+}
+
+async function load(){
+  const nowSec = Math.floor(Date.now()/1000);
+  let cfg;
+  try {
+    cfg = await (await fetch("goatnets.json?t=" + Date.now())).json();
+  } catch (e) {
+    document.getElementById("rows").innerHTML =
+      '<p class="note">Cannot read <code>goatnets.json</code>. The relay-health role renders it from <code>relay_health_goatnets</code>; an empty list means this deployment has not declared its siblings.</p>';
+    document.getElementById("sub").textContent = "config unavailable";
+    return;
+  }
+  const goatnets = cfg.goatnets || [];
+  const rows = document.getElementById("rows");
+  rows.innerHTML = "";
+
+  let upTotal = 0, known = 0;
+  for (const gn of goatnets){
+    // The local goatnet reads its own live relay-health.json — authoritative and
+    // always fresh. Siblings read a published summary. Both funnel through the
+    // same verdict function so one cannot flatter itself relative to the other.
+    let s = null;
+    try {
+      if (gn.local){
+        const d = await (await fetch("relay-health.json?t=" + Date.now())).json();
+        const st = (d.relays || []).filter(r => r.enroll && r.enroll.ok > 0 && r.rathole_ctl === true);
+        s = { generated: d.generated, vantage: d.vantage,
+              relays_up: st.length, relays_total: (d.relays || []).length,
+              worst_lat_ms: (d.relays || []).reduce((m,r)=> r.lat_ms!=null && r.lat_ms>m ? r.lat_ms : m, 0) || null,
+              stale_after_s: 300 };
+      } else {
+        s = await (await fetch("ingest/goatnet-" + gn.id + ".json?t=" + Date.now())).json();
+      }
+    } catch (e) { s = null; }
+    if (s && s.relays_up != null){ upTotal += s.relays_up; known++; }
+    rows.appendChild(row(gn, s, nowSec));
+  }
+
+  document.getElementById("rollN").textContent = goatnets.length;
+  document.getElementById("rollR").textContent = known ? upTotal : "–";
+  document.getElementById("sub").textContent =
+    known === goatnets.length ? "all goatnets reporting"
+                              : known + " of " + goatnets.length + " reporting";
+  // Which roster this box is showing. A registry is only as current as the last
+  // deploy of this box, so the page says which commit that deploy came from.
+  const src = cfg.source || {};
+  const registry = src.ref ? " · registry from commit " + src.ref + (src.date ? " (" + src.date + ")" : "") : " · registry commit unknown";
+  document.getElementById("foot").textContent =
+    "cross-goatnet view · each goatnet self-reports · a goatnet with no summary reads UNKNOWN, never down" + registry + " · refreshed " +
+    new Date().toISOString().replace("T"," ").slice(0,19) + "Z";
+}
+
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>

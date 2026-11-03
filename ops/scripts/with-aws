@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# with-aws — run ONE command with AWS credentials for a named profile.
+#
+#   ops/scripts/with-aws <profile> -- <command> [args...]
+#
+# goat's own laptops hold AWS keys in the OS keychain through aws-vault and use
+# no STS session (`--no-session`: session tokens are refused as
+# InvalidClientTokenId). A team without aws-vault declares a simpler mode (ADR 1204):
+#   GOAT_AWS_MODE=aws-vault  aws-vault exec <profile> --no-session -- <command>   (default when installed)
+#   GOAT_AWS_MODE=profile    AWS_PROFILE=<profile> <command>   (keys in ~/.aws/credentials or SSO)
+#   GOAT_AWS_MODE=none       <command> as is                   (no AWS needed: a mesh-only deploy)
+# Unset and aws-vault absent: profile mode, said once on stderr.
+set -euo pipefail
+[ $# -ge 3 ] && [ "$2" = "--" ] || { echo "usage: with-aws <profile> -- <command> [args...]" >&2; exit 2; }
+profile="$1"; shift 2
+# Already inside an aws-vault subshell: the credentials are in the environment.
+[ -n "${AWS_VAULT:-}" ] && exec "$@"
+mode="${GOAT_AWS_MODE:-}"
+if [ -z "$mode" ]; then
+  if command -v aws-vault >/dev/null 2>&1; then mode=aws-vault
+  else mode=profile; echo "with-aws: aws-vault is not installed; using AWS_PROFILE=$profile (GOAT_AWS_MODE=profile)" >&2
+  fi
+fi
+case "$mode" in
+  aws-vault) exec aws-vault exec "$profile" --no-session -- "$@" ;;
+  profile)   AWS_PROFILE="$profile" exec "$@" ;;
+  none)      exec "$@" ;;
+  *) echo "with-aws: unknown GOAT_AWS_MODE='$mode' (aws-vault | profile | none)" >&2; exit 2 ;;
+esac

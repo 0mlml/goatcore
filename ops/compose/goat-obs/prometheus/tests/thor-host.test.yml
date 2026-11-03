@@ -1,0 +1,92 @@
+# promtool unit tests for rules/thor-host.yml ThorDiskRunwayFastBurn.
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/thor-host.test.yml
+#
+# Ground truth for the fixtures (an accelerating burn):
+# avail fell at ~2.6 GB/h for the first 18h of the 24h window, then
+# accelerated to ~9.8 GB/h for the last 6h. The 24h-deriv average (diluted
+# by the slower 18h) implies a runway over 5 days — ThorDiskRunwayCritical
+# stays silent — while the 6h-deriv alone implies under 2 days. This is
+# exactly the unpaged gap the issue reports.
+
+rule_files:
+  - ../rules/thor-host.yml
+
+evaluation_interval: 30m
+
+tests:
+  # Case 1 — ACCELERATING BURN. 18h at ~2.6 GB/h (slow phase, 36 samples,
+  # -1.3 GB per 30m step), then 6h at ~9.83 GB/h (fast phase, 12 samples,
+  # -5 GB per 30m step), continuous (no jump at the handoff). By t=24h:
+  #   6h-deriv runway  ~= 1.98 days  -> under the 3-day FastBurn line
+  #   24h-deriv runway ~= 5.42 days  -> NOT under the 5-day Critical line
+  # ThorDiskRunwayFastBurn must fire where ThorDiskRunwayCritical cannot.
+  - interval: 30m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{mountpoint="/"}'
+        values: '557000000000-1300000000x36 511500000000-5000000000x12'
+      - series: 'node_filesystem_size_bytes{mountpoint="/"}'
+        values: '1000000000000x48'
+    alert_rule_test:
+      # Pending: the fast phase has not yet been sustained for 30m.
+      - eval_time: 18h30m
+        alertname: ThorDiskRunwayFastBurn
+        exp_alerts: []
+      # Firing: fast-rate burn has been sustained for 30m+, and stays
+      # sustained through the rest of the fast phase.
+      - eval_time: 24h
+        alertname: ThorDiskRunwayFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              mountpoint: "/"
+            exp_annotations:
+              summary: "Thor / has under 3 days of disk runway at the current 6h burn rate — accelerating, act now"
+              description: >-
+                The last-6h burn rate implies a shorter runway than the 24h
+                average does — the disk is accelerating toward full faster than
+                ThorDiskRunwayCritical's 24h-deriv can show. Find the grower
+                before trimming: `du -xh -d1 /opt` then drill. Known unbounded
+                writers and their bounds are in
+                docs/operations/disk-runway-and-retention.md. Confirm with the
+                Capacity & Forecast board's 6h series before acting.
+      # The 24h average is still diluted by the slower 18h behind it:
+      # ThorDiskRunwayCritical (<5d, for:1h) must NOT be firing at the same
+      # instant — this is the gap #1379 reports.
+      - eval_time: 24h
+        alertname: ThorDiskRunwayCritical
+        exp_alerts: []
+
+  # Case 2 — HEALTHY / FLAT. No burn at all over 24h. Neither the existing
+  # tiers nor the new fast-burn rule may fire.
+  - interval: 30m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{mountpoint="/"}'
+        values: '700000000000x48'
+      - series: 'node_filesystem_size_bytes{mountpoint="/"}'
+        values: '1000000000000x48'
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: ThorDiskRunwayFastBurn
+        exp_alerts: []
+      - eval_time: 24h
+        alertname: ThorDiskRunwayShort
+        exp_alerts: []
+      - eval_time: 24h
+        alertname: ThorDiskRunwayCritical
+        exp_alerts: []
+
+  # Case 3 — STEADY SLOW BURN, no acceleration: the 6h rate matches the 24h
+  # rate (no handoff), well outside both runway lines. FastBurn must not
+  # false-positive on an ordinary, non-accelerating decline.
+  - interval: 30m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{mountpoint="/"}'
+        values: '700000000000-1300000000x48'
+      - series: 'node_filesystem_size_bytes{mountpoint="/"}'
+        values: '1000000000000x48'
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: ThorDiskRunwayFastBurn
+        exp_alerts: []

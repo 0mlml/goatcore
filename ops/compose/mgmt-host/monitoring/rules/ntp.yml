@@ -1,0 +1,135 @@
+# NTP hygiene alert rules — production source of truth (per-site).
+#
+# This file is the authoritative ruleset deployed to mgmt-hosts via the
+# ops/ansible/roles/observability/ role. The earlier "mirrors
+# ops/monitoring/prometheus/rules/ntp.yml skeleton" contract is retired
+# (Block 50E.9, 2026-05-05): ops/monitoring/ is now scoped as a
+# local-dev sandbox + alert-rule R&D area, not a source of truth.
+#
+# Metrics are emitted by github.com/SuperQ/chrony_exporter
+# (pinned to v0.13.3 in ops/ansible/roles/ntp-hygiene/defaults/main.yml).
+# Sources:
+#   - chrony_tracking_last_offset_seconds   collector/tracking.go
+#   - chrony_tracking_frequency_ppms        collector/tracking.go
+#   - chrony_sources_state_info             collector/sources.go
+#       Labels: source_address, source_name, source_state, source_mode
+#   - chrony_sources_reachability_success   collector/sources.go
+#   - up{job="chrony"}                      prometheus built-in
+#
+# Scrape job `chrony` is defined in prometheus.yml; target is
+# host.docker.internal:9123 (the chrony_exporter systemd unit on the
+# host, bound to 127.0.0.1:9123, reachable from the container via the
+# docker-compose.obs.yml `host-gateway` alias).
+#
+# `site` label is set at scrape time via external_labels (SITE_NAME
+# per-node: vega-a, vega-b).
+#
+# Implements docs/design/mgmt-plane-threat-mitigations.md §1.1 (N1-N5)
+# and docs/design/universal-ntp-hygiene.md — the five alerts specified
+# in the region A-ship MVP brief.
+#
+# Known client-side NTS-auth-failure metric gap: chrony_exporter does
+# NOT currently emit a client-side NTS-KE handshake failure counter
+# (the `serverstats` NTS metrics are for when chrony serves time, not
+# when it consumes it). The NtpSourceAuthFailure alert below treats
+# sustained source unreachability on a configured NTS source as the
+# best available proxy. Tighten when ntp-health-agent v1 lands (debt
+# item 22) — it will surface real NTS-KE failures via its daemon API.
+
+groups:
+
+  - name: ntp.correctness
+    interval: 30s
+    rules:
+
+      # Clock offset >500ms for 2 minutes. LWW conflict resolution in
+      # Spock becomes semantically wrong when two sites disagree on the
+      # clock by more than the inter-site commit latency. 500ms is the
+      # tight bound we're willing to run the multi-master cluster at;
+      # re-evaluate if real-world Satlink latency pushes sample
+      # variance higher than expected.
+      - alert: ChronyClockOffsetHigh
+        expr: abs(chrony_tracking_last_offset_seconds) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          component: chrony
+        annotations:
+          summary: "chrony at {{ $labels.site }}:{{ $labels.instance }} offset >500ms for 2m"
+          description: "Last offset {{ $value }}s exceeds 500ms for 2 minutes. LWW conflict resolution across sites is no longer safe — Spock will silently pick wrong winners for conflicts whose clock-skew exceeds their commit-latency gap. Investigate local NTS source health (chronyc sources -v), network path to NTS servers, and whether the VM's underlying clock is misbehaving."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/ntp-runbook.md"
+
+      # NTS authentication-failure proxy. chrony_exporter v0.13 doesn't
+      # emit a real client-side NTS-KE failure metric, so we treat
+      # sustained unreachability on any configured NTS source as an
+      # auth-OR-connectivity failure (both need operator attention).
+      # When any chrony source stays in source_state="Unreachable" for
+      # >5m, fire. Chrony's source_state values per chrony_exporter
+      # collector/sources.go: "Selected", "Selectable", "Not scheduled",
+      # "Not reachable" / "Unreachable", "No samples", etc.
+      - alert: ChronyNtsSourceUnreachable
+        expr: |
+          max by (site, source_name, source_address) (
+            chrony_sources_state_info{source_state=~"(?i)unreachable|not.?reachable"}
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: chrony
+        annotations:
+          summary: "chrony source {{ $labels.source_name }} unreachable at {{ $labels.site }} for 5m"
+          description: "NTS source {{ $labels.source_name }} ({{ $labels.source_address }}) has been unreachable for >5 minutes. Either NTS key-exchange is failing (cert mismatch, clock skew on our side large enough to reject the NTS-KE handshake, upstream NTS server down) or basic UDP reachability to the source is blocked. With only 4 configured NTS sources (time.cloudflare.com, nts.ntp.rnl.se, ptbtime1.ptb.de, ohio.time.system76.com), losing even one narrows the quorum. Investigate before the next source drops."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/ntp-runbook.md"
+
+      # Daemon-down. chrony_exporter pulls state from chronyd over the
+      # Unix control socket; if chronyd is stopped the exporter still
+      # answers /metrics but with stale/empty values. `up{}` goes to 0
+      # if the exporter itself is stopped; `absent()` catches the case
+      # where the exporter is up but has never succeeded in reading
+      # tracking. Both are treated as daemon-not-running.
+      - alert: ChronyDaemonDown
+        expr: |
+          up{job="chrony"} == 0
+          or absent(chrony_tracking_last_offset_seconds)
+        for: 2m
+        labels:
+          severity: critical
+          component: chrony
+        annotations:
+          summary: "chrony daemon appears down at {{ $labels.site }}:{{ $labels.instance }} for 2m"
+          description: "Either chrony_exporter is unscrape-able, or chronyd itself isn't producing tracking data. Without chronyd disciplining the clock, the host will drift — and that drift will silently poison LWW conflict resolution before any other alert notices. Check `systemctl status chrony chrony_exporter` on the host."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/ntp-runbook.md"
+
+      # No reachable source for 5m. chrony_sources_reachability_success
+      # is 1 when the source's last reachability register had a 1 in
+      # it, 0 otherwise. Sum across all sources at the site; zero sum
+      # means chrony has nothing to sync against.
+      - alert: ChronyNoReachableSource
+        expr: |
+          sum by (site, instance) (chrony_sources_reachability_success) == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: chrony
+        annotations:
+          summary: "chrony at {{ $labels.site }}:{{ $labels.instance }} has NO reachable source for 5m"
+          description: "Zero NTS sources reachable for >5 minutes. The host's clock is free-running — steady-state drift at ~1ppm means ~0.1s / day, but an uncorrected oscillator bug can drift orders of magnitude faster. This is a Spock-correctness blocker: get at least one NTS source back before the cluster's been in this state long enough for LWW to silently decide inter-site conflicts on stale timestamps."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/ntp-runbook.md"
+
+      # Drift rate >50 ppm for 10m. chrony_tracking_frequency_ppms is
+      # the rate (in ppm, despite the `_ppms` suffix upstream chose) at
+      # which the system clock is drifting relative to an ideal clock,
+      # as estimated by chrony's discipline loop. Healthy hardware
+      # sits well under 10 ppm. Sustained >50 ppm means the kernel
+      # clock source is misbehaving (bad crystal, thermal, VM host
+      # clock-steering, etc.) and the system needs investigation.
+      - alert: ChronyDriftRateHigh
+        expr: abs(chrony_tracking_frequency_ppms) > 50
+        for: 10m
+        labels:
+          severity: warning
+          component: chrony
+        annotations:
+          summary: "chrony at {{ $labels.site }}:{{ $labels.instance }} drifting >50 ppm for 10m"
+          description: "Hardware clock drift rate {{ $value }} ppm (absolute) sustained for 10m. Typical healthy hardware runs under 10 ppm; >50 ppm suggests the underlying clock source is misbehaving. On a cloud VM this can be hypervisor clock-steering; on an Orin this is a hardware concern worth investigating before the unit ships."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/ntp-runbook.md"

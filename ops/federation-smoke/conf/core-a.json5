@@ -1,0 +1,37 @@
+// Sovereign A — CORE router. Trusts A's CA and NOTHING else.
+// This is the fabric that must stay unreachable to a partner.
+{
+  mode: "router",
+  listen: { endpoints: ["tls/0.0.0.0:7447"] },
+  transport: { link: { tls: {
+    root_ca_certificate: "/pki/a-ca.pem",          // A only — never a concat
+    listen_certificate:  "/pki/a-router.pem",
+    listen_private_key:  "/pki/a-router-key.pem",
+    enable_mtls: true,
+  }}},
+  access_control: {
+    enabled: true,
+    default_permission: "deny",
+    rules: [
+      { id: "local-read",  messages: ["declare_subscriber","query","declare_queryable","reply"],
+        flows: ["egress","ingress"], permission: "allow", key_exprs: ["**"] },
+      { id: "local-write", messages: ["put","delete"],
+        flows: ["ingress"], permission: "allow", key_exprs: ["**"] },
+      // What the edge is allowed to hand inward: the partner's landing area only.
+      { id: "edge-ingress", messages: ["put","delete"],
+        flows: ["ingress"], permission: "allow", key_exprs: ["from/svn/**"] },
+      { id: "edge-deliver", messages: ["put","delete"],
+        flows: ["egress"], permission: "allow", key_exprs: ["release/all/**"] },
+    ],
+    subjects: [
+      { id: "operator",  cert_common_names: ["operator-trial-peer"] },
+      { id: "edge-peer", cert_common_names: ["edge-a"] },
+    ],
+    policies: [
+      { rules: ["local-read","local-write"], subjects: ["operator"] },
+      // NOTE: the edge gets NO `local-read`. It may land data in from/svn/**
+      // and receive only release/all/**. This is the AC-4 flow rule.
+      { rules: ["edge-ingress","edge-deliver"], subjects: ["edge-peer"] },
+    ],
+  },
+}

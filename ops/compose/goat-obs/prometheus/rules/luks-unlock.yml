@@ -1,0 +1,64 @@
+# Unattended-boot health for clevis-unlocked LUKS volumes.
+#
+# Series come from goat-unlock-health.sh (roles/luks-unlock), a node_exporter
+# textfile written every 2 minutes on each host with a clevis volume. On a
+# goatnet or host without that volume the series do not exist and every expr
+# here is an empty vector — nothing uses absent(), so nothing false-fires.
+#
+# A host can stay locked for days after a site power cycle when both Tang servers
+# it trusts are down (systemd can delete tangd.socket to break a boot ordering
+# cycle), with only a generic TargetDown to page on. Each rule below names the
+# actual fault at boot.
+groups:
+  - name: luks-unlock
+    interval: 60s
+    rules:
+      - alert: LuksVolumeLocked
+        expr: goat_luks_volume_unlocked == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: LUKS volume {{ $labels.volume }} is locked"
+          description: "The post-boot unlock has not opened {{ $labels.volume }} for 10 minutes, so every service on it (Docker on a mgmt host) is down. goat-unlock-health restarts the unlock unit every 2 min; if this stays red, its Tang servers are not answering (see LuksTangQuorumLost) — start tangd.socket on a sibling, or unlock with the installer passphrase. Runbook: docs/design/os-baseline-and-luks.md §3.2a (Recovery)."
+      - alert: LuksTangQuorumLost
+        # New producers publish the declared floor even with zero bindings.
+        # Keep the legacy path while hosts converge; unreadable bindings have
+        # their own alert rather than claiming a measured zero quorum.
+        expr: |
+          (
+            (goat_luks_tang_reachable < on(instance, volume) goat_luks_tang_min_reachable)
+            or
+            (goat_luks_tang_reachable < 2 and on(instance, volume) goat_luks_tang_bound > 0
+              unless on(instance, volume) goat_luks_tang_min_reachable)
+          ) unless on(instance, volume) (goat_luks_binding_read_ok == 0)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} Tang server(s) answer for {{ $labels.volume }}"
+          description: "Fewer than the configured minimum Tang servers answer for {{ $labels.volume }}. The volume may be open now, but the next reboot of this host will not unlock unattended. Check tangd.socket on the servers named by `clevis luks list -d <device>`."
+      - alert: LuksBindingReadFailed
+        expr: goat_luks_binding_read_ok == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: cannot read LUKS bindings for {{ $labels.volume }}"
+          description: "Clevis could not read the volume bindings, so unattended-unlock health is unknown. Check device access and `clevis luks list -d <device>` before claiming reboot readiness."
+      - alert: TangServerDown
+        expr: goat_tang_server_up == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: tangd.socket is enabled but not listening"
+          description: "A sibling host's LUKS unlock depends on this Tang server. `sudo systemctl start tangd.socket`, then find out why it did not start at boot (ordering cycle? see BootOrderingCycle)."
+      - alert: BootOrderingCycle
+        expr: goat_boot_ordering_cycles{reading="next"} > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: the unit graph has {{ $value }} systemd ordering cycle(s)"
+          description: "On the next boot systemd will delete a job of its choosing to break each cycle — on 2026-09-26 it deleted tangd.socket and locked zagros-prod for 53 h. Run `systemd-analyze verify default.target` on the host to name the units."

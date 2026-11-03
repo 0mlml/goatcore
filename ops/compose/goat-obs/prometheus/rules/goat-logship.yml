@@ -1,0 +1,72 @@
+# goat-logship off-box cyber-logging collector — absence-alarm rules.
+#
+# ADR 1078 §4. A collector that silently STOPS shipping must page, not vanish.
+# This is the same failure class as audit-subscriber S3 puts failing
+# with no operator-visible signal, applied to the host/OS + fabric export
+# lane. The single-Thor goat-obs stack carries these statically; the Orin-C
+# obs-host stack gets the templated equivalent dropped by the goat-logship
+# role (prom-rules-goat-logship.yml.j2).
+#
+# Metric sources (Vector internal_metrics → prometheus_exporter on :9598,
+# job=goat_logship in prometheus.yml):
+#   - vector_component_sent_events_total{component_id} — events flushed per sink
+#   - vector_buffer_byte_size{component_id}            — disk buffer occupancy
+#   - up{job="goat_logship"}                           — scrape liveness
+#
+# Severity discipline matches audit-subscriber.yml:
+#   critical = data being lost / not shipped right now; warning = eyes within a day.
+
+groups:
+  - name: goat-logship.shipping
+    rules:
+
+      - alert: GoatLogshipDown
+        expr: up{job="goat_logship"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: goat-logship
+        annotations:
+          summary: "goat-logship collector down for {{ $labels.instance }}"
+          description: |
+            The off-box cyber-logging collector is unreachable for 5+ minutes.
+            Host/OS + fabric security events are not shipping to the durable
+            off-box tier. Do not read a silent collector as "no events" — that
+            is the F-169 mistake.
+
+      # The F-169 closer: the S3 durable sink has flushed ZERO events for 15m
+      # while the collector is up. Either every source went silent (implausible
+      # on a live host) or shipping broke upstream of the buffer. Page.
+      - alert: GoatLogshipStreamSilent
+        expr: |
+          (up{job="goat_logship"} == 1)
+          and on(instance)
+          (sum by (instance) (rate(vector_component_sent_events_total{component_id="durable"}[15m])) == 0)
+        for: 15m
+        labels:
+          severity: critical
+          component: goat-logship
+        annotations:
+          summary: "goat-logship off-box shipping is silent for {{ $labels.instance }}"
+          description: |
+            The S3 durable sink shipped no events for 15+ minutes while the
+            collector is up — a silent stop the operator would otherwise never
+            see. Triage: sink auth (LOGSHIP_S3_* key), the Object-Lock bucket,
+            and the disk buffer (`docker logs --tail 30 goat-logship`).
+
+      # Disk buffer is sized for a transport outage, not retention (§5).
+      # Sustained growth means the off-box path is down and the near-zero
+      # local footprint is being consumed. Threshold tracks the role default
+      # logship_buffer_max_bytes (512 MiB); 0.75 * 512 MiB = 402653184.
+      - alert: GoatLogshipBufferFilling
+        expr: vector_buffer_byte_size{component_id="durable"} > 402653184
+        for: 10m
+        labels:
+          severity: warning
+          component: goat-logship
+        annotations:
+          summary: "goat-logship disk buffer >75% for {{ $labels.instance }}"
+          description: |
+            The transport buffer is filling — the off-box sink is not draining.
+            When it fills, when_full=block backpressures collection. Restore the
+            S3 path before the buffer caps.

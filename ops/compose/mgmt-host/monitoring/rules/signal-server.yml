@@ -1,0 +1,92 @@
+# Signal-server alert rules — production source of truth (per-site).
+#
+# This file is the authoritative ruleset deployed to mgmt-hosts via the
+# ops/ansible/roles/observability/ role. The earlier "copied from
+# ops/monitoring/prometheus/rules/signal-server.yml skeleton" contract
+# is retired (Block 50E.9, 2026-05-05): ops/monitoring/ is now scoped
+# as a local-dev sandbox + alert-rule R&D area, not a source of truth.
+#
+# Operating notes:
+# - Scrape labels match the prometheus.yml scrape_config `job` names
+#   (signal-server, signal-server-peer).
+# - `site` label is set at scrape time via external_labels (SITE_NAME
+#   per-node), so $labels.site resolves to vega-a / vega-b.
+#
+# Implements docs/design/ha-multi-site.md §7.3 federation / relay /
+# availability criteria.
+
+groups:
+
+  - name: signal-server.federation
+    interval: 30s
+    rules:
+
+      - alert: SignalServerNoConnectedPeers
+        expr: signal_server_connected_peers == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: signal-server
+        annotations:
+          summary: "signal-server {{ $labels.site }}:{{ $labels.instance }} has 0 connected peers for 10m"
+          description: "Either no clients are enrolled at this site, or ConnectStream registrations are failing. Check that netbird-management at this site publishes the correct Signal.URI to clients (management.json), and that clients can TCP-reach the signal-server port."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/signal-server-runbook.md"
+
+      - alert: SignalServerForwardRPCErrors
+        expr: |
+          sum by (site, peer) (
+            rate(signal_server_forward_sent_total{outcome="rpc_error"}[5m])
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: signal-server
+        annotations:
+          summary: "signal-server {{ $labels.site }} getting forward-RPC errors to peer {{ $labels.peer }}"
+          description: "Sustained >6/min rpc_error outcomes forwarding to {{ $labels.peer }}. Cross-site peer connectivity via that peer is broken — verify peer signal-server reachability over WireGuard mesh, gRPC TLS cert validity, and federation_peers flag value."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/signal-server-runbook.md"
+
+      - alert: SignalServerRelayMissSpike
+        expr: |
+          sum by (site) (
+            rate(signal_server_relay_total{outcome="notfound"}[5m])
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: signal-server
+        annotations:
+          summary: "signal-server {{ $labels.site }} seeing >60 notfound relays/min for 5m"
+          description: "Likely cause: federation partners unreachable (so Broadcast returns false for every peer not locally registered). Check federation peer health first, then look for a dropped site."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/signal-server-runbook.md"
+
+      - alert: SignalServerOutboundFull
+        expr: |
+          sum by (site) (
+            rate(signal_server_relay_total{outcome="outbound_full"}[5m])
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: signal-server
+        annotations:
+          summary: "signal-server {{ $labels.site }} dropping messages to at least one slow peer"
+          description: "outbound_full > 30/min sustained 10m. The peer(s) can't consume messages fast enough — check gRPC stream on the affected peer."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/signal-server-runbook.md"
+
+  - name: signal-server.availability
+    interval: 30s
+    rules:
+
+      # Covers both local (job=signal-server) and peer (job=signal-server-peer)
+      # scrapes. The latter gives each node a cross-check against the other.
+      - alert: SignalServerDown
+        expr: up{job=~"signal-server|signal-server-peer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: signal-server
+        annotations:
+          summary: "signal-server {{ $labels.site }}:{{ $labels.instance }} /metrics unscrape-able for 2m"
+          description: "Prometheus cannot reach signal-server at its /metrics endpoint. Container may have crashed, or network path to the metrics port is broken. Signal handling is likely also broken — check compose / docker logs first."
+          runbook_url: "https://github.com/usareur-af/goatcore/blob/main/docs/operations/signal-server-runbook.md"

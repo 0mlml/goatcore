@@ -1,0 +1,178 @@
+# Prometheus scrape config for a vega mgmt-host node.
+#
+# Both vega nodes run an identical Prometheus; each scrapes its own
+# local services AND the peer's node-exporter + signal-server
+# /metrics via the Netbird mesh. This gives each site a full view
+# of both nodes — no central hub needed for the Phase 2 PoC. A
+# future Phase 3 federated-central rollup (region B) will
+# remote_write from here; not in scope yet.
+#
+# Environment variables are expanded at scrape time from the
+# container's env (rendered by Ansible into compose .env):
+#   SITE_NAME                   — e.g. vega-a, vega-b. Applied to every
+#                                  series via external_labels so queries
+#                                  like signal_server_connected_peers{site="vega-a"}
+#                                  work uniformly across both nodes.
+#   PEER_NODE_EXPORTER_TARGET   — "<peer-mesh-ip>:9100"
+#   PEER_SIGNAL_METRICS_TARGET  — "<peer-mesh-ip>:9090"
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    site: "${SITE_NAME}"
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+
+  # ------------------------------------------------------------------
+  # Prometheus itself (self-monitoring).
+  # ------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          instance: prometheus-local
+
+  # ------------------------------------------------------------------
+  # signal-server — local /metrics via the compose network.
+  # The base docker-compose.yml exposes :9090 host-locally; inside
+  # the mgmt network we hit the container hostname directly.
+  # ------------------------------------------------------------------
+  - job_name: signal-server
+    static_configs:
+      - targets:
+          - "signal-a:9090"
+        labels:
+          instance: signal-a
+          role: local
+
+  # ------------------------------------------------------------------
+  # signal-server — PEER /metrics over the Netbird mesh. The peer's
+  # signal-a binds 0.0.0.0:9090 on its host (base docker-compose.yml)
+  # so we can reach it via the peer's mesh IP.
+  # ------------------------------------------------------------------
+  - job_name: signal-server-peer
+    static_configs:
+      - targets:
+          - "${PEER_SIGNAL_METRICS_TARGET}"
+        labels:
+          instance: signal-peer
+          role: peer
+
+  # ------------------------------------------------------------------
+  # postgres-exporter — sidecar to local postgres-a. Exposes
+  # pg_stat_*, pg_replication_slots, and the Spock-specific custom
+  # queries in monitoring/postgres-exporter-queries.yml.
+  # ------------------------------------------------------------------
+  - job_name: postgres
+    static_configs:
+      - targets:
+          - "postgres-exporter:9187"
+        labels:
+          instance: postgres-a
+          role: local
+
+  # ------------------------------------------------------------------
+  # node-exporter — local host metrics.
+  # ------------------------------------------------------------------
+  - job_name: node
+    static_configs:
+      - targets:
+          - "node-exporter:9100"
+        labels:
+          instance: node-local
+          role: local
+
+  # ------------------------------------------------------------------
+  # node-exporter — PEER host metrics over the Netbird mesh. Peer
+  # node-exporter binds 0.0.0.0:9100; mesh ACLs restrict who can
+  # reach it. This gives each Prometheus a symmetric view of both
+  # nodes.
+  # ------------------------------------------------------------------
+  - job_name: node-peer
+    static_configs:
+      - targets:
+          - "${PEER_NODE_EXPORTER_TARGET}"
+        labels:
+          instance: node-peer
+          role: peer
+
+  # ------------------------------------------------------------------
+  # chrony_exporter — LOCAL host clock health. Deployed by the
+  # ntp-hygiene Ansible role as a systemd unit (NOT a container —
+  # needs to read /run/chrony/chronyd.sock). Bound to 127.0.0.1:9123;
+  # Prometheus reaches the host loopback via the host-gateway alias
+  # declared in docker-compose.obs.yml.
+  # Metrics consumed by ops/compose/mgmt-host/monitoring/rules/ntp.yml.
+  # ------------------------------------------------------------------
+  - job_name: chrony
+    static_configs:
+      - targets:
+          - "host.docker.internal:9123"
+        labels:
+          instance: chrony-local
+          role: local
+
+  # ------------------------------------------------------------------
+  # audit-subscriber — emits Prometheus metrics on :9303 (the rust
+  # service's internal axum metrics handler). Block 82S audit-tail
+  # service. Container is on the audit-subscriber compose network;
+  # if Prometheus and audit-subscriber are on different docker
+  # networks, attach Prometheus to the audit-subscriber network in
+  # docker-compose.obs.yml.
+  # Metrics consumed by ops/compose/mgmt-host/monitoring/rules/audit-subscriber.yml
+  #.
+  # ------------------------------------------------------------------
+  - job_name: audit-subscriber
+    static_configs:
+      - targets:
+          - "audit-subscriber:9303"
+        labels:
+          instance: audit-subscriber-local
+          role: local
+
+  # ------------------------------------------------------------------
+  # MinIO — bucket-level usage metrics via the upstream Prometheus
+  # endpoint. The `cluster` profile exposes per-bucket usage; the
+  # `bucket` profile (different URL) adds per-bucket request metrics.
+  # We need usage for F-169's AuditBucketQuotaHigh rule.
+  #
+  # The configured *quota* is NOT in upstream MinIO metrics — only
+  # actual usage is. The quota gauge `minio_bucket_quota_bytes` used
+  # by audit-subscriber.yml's quota-utilization rules is produced by
+  # the minio-quota-scraper sidecar (Phase B follow-on to F-169;
+  # exposed at the second `targets` entry below once that ships).
+  # Without it, the quota-utilization alerts won't trigger but the
+  # AuditSubscriberPutsFailing rule still catches the failure mode.
+  # ------------------------------------------------------------------
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    bearer_token_file: /etc/prometheus/minio-bearer-token
+    static_configs:
+      - targets:
+          - "minio:9000"
+        labels:
+          instance: minio-local
+          role: local
+
+  - job_name: minio-quota-scraper
+    # Phase B follow-on to F-169 — sidecar that polls `mc quota info`
+    # for each tracked bucket and exposes minio_bucket_quota_bytes.
+    # Until it ships, this job emits target-down metrics but no real
+    # bucket-quota data; the AuditBucketQuotaHigh + Critical rules
+    # then silently no-op (which is acceptable — AuditSubscriberPutsFailing
+    # still catches the symptom 10 minutes after writes stop).
+    static_configs:
+      - targets:
+          - "minio-quota-scraper:9404"
+        labels:
+          instance: minio-quota-scraper-local
+          role: local

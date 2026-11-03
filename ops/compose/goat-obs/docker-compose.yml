@@ -1,0 +1,449 @@
+# Minimal on-mgmt-host observability stack for a single-Thor goatnet.
+# Per-goatnet: container/volume names derive from ${OBS_PREFIX} (set to
+# <site_id>-obs by ops/ansible/obs.yml) — so a sibling goatnet never inherits
+# another's names (the same
+# severance the portal/lexicon stacks follow). Co-resident on the AGX Thor
+# alongside the mgmt-host stack.
+#
+# Trade-off accepted:
+# this breaks the "obs must not co-fail with the thing it observes" rule.
+# Accepted because these single-Thor goatnets have no dedicated obs Orin
+# (has_obs_host=false). When one is procured, lift to a parity topology with
+# the production obs-host role.
+#
+# Inspired by — not extending — ops/compose/mgmt-host/docker-compose.obs.yml
+# and ops/ansible/roles/obs-host/. Kept minimal:
+#   - prometheus + node-exporter + postgres-exporter + grafana
+#   - alertmanager (critical → PagerDuty; ADR 1059). The config is rendered
+#     per-site by obs.yml (PD key from env); empty key -> webhook-noop.
+#   - grafana behind site Ory via Traefik on grafana.<site_id>.<zone>
+#
+# Joins the `mgmt` docker network as external so the existing Traefik
+# (mgmt-host compose project) can route to `grafana:3000`.
+#
+# Driven by ops/ansible/obs.yml — operator runs that playbook;
+# do not docker compose up by hand.
+
+services:
+
+  prometheus:
+    # ARM64 digest — Thor is aarch64. An amd64 host needs
+    # a different pin or a per-arch group_vars override.
+    image: prom/prometheus:v2.54.1@sha256:0375e523ffe0ce7522a9968793b57cb36372a4a2a9a570572b48082227790ed7
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-prometheus
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    environment:
+      SITE_NAME: ${SITE_NAME:?set SITE_NAME in .env}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+      - --web.listen-address=:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      # Loopback only — admin access via SSH tunnel.
+      # Host port 9192 to avoid collision with signal-server's 9090.
+      - "127.0.0.1:9192:9090"
+    # Scrape targets that live OUTSIDE the mgmt network (minio in its own
+    # minio-net compose project; node-exporter in the host netns) are
+    # reached through the host: host-gateway resolves to the default
+    # docker bridge gateway, and both services bind/publish there.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - mgmt
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2@sha256:1eabab826c9d9f0c534e4e8fa745445f743fef9aee276d561d12811edea74004
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-node-exporter
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # 1.0, not 0.25: the host-namespace collectors walk /proc and /sys
+          # for every container on each scrape, and a quarter core throttles them.
+          cpus: "1.0"
+          memory: 128M
+        reservations:
+          memory: 32M
+    pid: host
+    # Host network namespace — the netdev collector reads /proc/self/net,
+    # which resolves inside the READER's netns regardless of the /host/proc
+    # mount, so a bridge-networked node-exporter only ever sees its own veth
+    # and there is no host-NIC throughput history at all.
+    # Bind scope: NODE_EXPORTER_LISTEN_ADDR (rendered per-host by obs.yml)
+    # is the default docker bridge gateway IP — reachable from containers
+    # (prometheus scrapes host.docker.internal:9100), NOT from LAN/mesh.
+    network_mode: host
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/docker/.+)($$|/)
+      # Textfile collector — exposes static facts dropped as *.prom files.
+      # Carries goat_expected_vendor (the expected-vendor manifest, rendered by
+      # expected-vendors/generate.py) for the silent-failure alert rules,
+      # goat_declared_topic (the declared-topic snapshot, rendered by
+      # expected-topics/generate.py) for the undeclared-topic rule,
+      # and goat_container_info from the goat-obs-textfile cron (obs.yml)
+      # — the id→name join for raw-cgroup cadvisor series.
+      - --collector.textfile.directory=/textfile
+      - --web.listen-address=${NODE_EXPORTER_LISTEN_ADDR:?set NODE_EXPORTER_LISTEN_ADDR in .env}:9100
+    volumes:
+      - /:/host:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      # Read-only mount of the generated .prom (only *.prom in this dir is
+      # parsed; the manifest yaml + generator live one level up, unmounted).
+      - ./expected-vendors/textfile:/textfile:ro
+      # Declared-topic snapshot — a single-file bind into the same
+      # collector dir, so it's parsed alongside goat_expected_vendor without
+      # moving the existing path. Rendered by expected-topics/generate.py.
+      - ./expected-topics/textfile/goat_declared_topic.prom:/textfile/goat_declared_topic.prom:ro
+      # Identity-reconcile strays (the user209x backstop) are written by
+      # identity-reconcile/reconcile.py (obs.yml cron) directly INTO the mounted
+      # expected-vendors/textfile dir above (atomic rename → needs a whole-dir
+      # mount, not a single-file bind), so no extra bind is needed here.
+
+  cadvisor:
+    # Per-container CPU/mem/network/disk + restart count + uptime.
+    # Multi-arch manifest-LIST digest (Thor is aarch64). Upstream can
+    # garbage-collect an arch-specific digest, which fails `docker compose pull`.
+    # Pin the index digest so docker resolves the right arch + survives gc.
+    image: gcr.io/cadvisor/cadvisor:v0.49.1@sha256:3cde6faf0791ebf7b41d6f8ae7145466fed712ea6f252c935294d2608b1af388
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-cadvisor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+        reservations:
+          memory: 64M
+    privileged: true
+    # Host cgroup namespace — on cgroup v2 docker defaults containers to a
+    # PRIVATE cgroupns, so cadvisor would see only its own subtree (root cgroup,
+    # zero per-container series).
+    cgroup: host
+    devices:
+      - /dev/kmsg
+    command:
+      - --housekeeping_interval=10s
+      # RAW cgroup factory, whitelisted to docker container scopes.
+      # cadvisor's docker factory does NOT support docker's containerd-
+      # snapshotter storage driver (`overlayfs` on the mgmt-host baseline
+      # daemon.json) — it fails every container with "failed to identify
+      # the read-write layer ID" (v0.49.1 and v0.52.1). The docker socket is
+      # deliberately NOT mounted: with
+      # the socket present the docker factory registers, CLAIMS every
+      # docker-*.scope cgroup, errors, and the scope never falls through
+      # to the raw factory (socketed raw mode yields 0
+      # container series; sockless yields one per container). Raw series
+      # are keyed by id="/system.slice/docker-<64hex>.scope" with NO name
+      # label; the id→name join lives in goat_container_info
+      # (goat-obs-textfile cron via node-exporter's textfile collector).
+      # Revisit docker mode when upstream learns the snapshotter.
+      - --raw_cgroup_prefix_whitelist=/system.slice/docker-
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+    ports:
+      - "127.0.0.1:9080:8080"
+    networks:
+      - mgmt
+
+  process-exporter:
+    # Per-process CPU / mem / IO / threads / fd / context-switches.
+    # Groups processes by name (configurable in
+    # ./process-exporter/process-exporter.yml). Complements cAdvisor:
+    # cAdvisor tells you which container is hogging; process-exporter
+    # tells you which PROCESS inside (across all containers + bare host).
+    # ARM64 digest.
+    image: ncabatoff/process-exporter:0.7.10@sha256:2d6b20224a282fd80604e9aaeb74ddae1c78311a61e530753e1da992ce38c042
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-process-exporter
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # 1.0, not 0.25: a quarter core throttles the scrape past
+          # ScrapeDurationHigh, because it walks /proc for every containerd-shim
+          # and udev worker every 15s.
+          cpus: "1.0"
+          # 256M, not 128M: it sits near 128M with dozens of containers'
+          # worth of processes tracked.
+          memory: 256M
+        reservations:
+          memory: 32M
+    # Needs to see the host's /proc (not the container's).
+    privileged: true
+    command:
+      - --procfs=/host/proc
+      - --config.path=/etc/process-exporter/config.yml
+      - --web.listen-address=:9256
+    volumes:
+      - /proc:/host/proc:ro
+      - ./process-exporter/process-exporter.yml:/etc/process-exporter/config.yml:ro
+    ports:
+      - "127.0.0.1:9256:9256"
+    networks:
+      - mgmt
+
+  blackbox-exporter:
+    # HTTP / TCP / ICMP / DNS reachability probes. Used for "is this
+    # public hostname / mesh peer / DNS resolver answering?" panels.
+    image: prom/blackbox-exporter:v0.25.0@sha256:9761529b5ff576deb4e823e298ec5ca70e738086fd7d073a84698332c9ae3554
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-blackbox
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          memory: 32M
+    # ICMP probes need raw sockets — keep the cap but drop everything else.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    # F-127/F-282: docker embedded DNS cannot reach mesh CoreDNS (:5353), so
+    # mesh-zone probe targets are mapped here — rendered per-site into .env by
+    # obs.yml. Portal-less goatnets get a no-op .invalid entry.
+    extra_hosts:
+      - "${BLACKBOX_EXTRA_PROBE_HOST:-blackbox-extra-probe-host-unused.invalid:127.0.0.1}"
+    ports:
+      - "127.0.0.1:9115:9115"
+    networks:
+      - mgmt
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0@sha256:ba7adea9206f9a8c6e745c4e305039aa9b740b00ca2964cd6a04b7e51bc0bf5b
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-postgres-exporter
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          memory: 64M
+    environment:
+      # Reuses the 'monitoring' PG role created by obs.yml.
+      # Connects to postgres-a (the mgmt-host postgres) over the
+      # shared mgmt docker network.
+      DATA_SOURCE_NAME: "postgresql://monitoring:${POSTGRES_EXPORTER_PASSWORD:?set POSTGRES_EXPORTER_PASSWORD in .env}@postgres-a:5432/postgres?sslmode=disable"
+    ports:
+      - "127.0.0.1:9187:9187"
+    networks:
+      - mgmt
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-grafana
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+    environment:
+      # Local-admin fallback. Required even when OIDC is on — used for
+      # recovery and provisioning verification. Mesh-only via Traefik
+      # + Ory in front; admin login disabled at the UI for normal use.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SERVER_DOMAIN: ${GRAFANA_SERVER_DOMAIN:?set GRAFANA_SERVER_DOMAIN in .env}
+      GF_SERVER_ROOT_URL: "https://${GRAFANA_SERVER_DOMAIN}"
+
+      # OIDC via site Hydra (oauth2.<site>.<zone>).
+      # A goatnet with one Ory cluster has site Hydra serve both end-user and
+      # operator flows.
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_NAME: "Ory (${SITE_NAME})"
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: "grafana"
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: ${GRAFANA_OIDC_CLIENT_SECRET:?set GRAFANA_OIDC_CLIENT_SECRET in .env}
+      # `offline_access` requests a refresh_token from Hydra so Grafana's
+      # generic_oauth plugin can roll the session at access-token expiry
+      # (Hydra default ~1h) instead of bouncing the user back to /login.
+      # Must match the OIDC client's allowed scopes (grafana-oidc-client
+      # role defaults).
+      GF_AUTH_GENERIC_OAUTH_SCOPES: "openid profile email groups offline_access"
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: "${GRAFANA_OIDC_ISSUER_URL}/oauth2/auth"
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: "${GRAFANA_OIDC_ISSUER_URL}/oauth2/token"
+      # API_URL deliberately empty:
+      # Hydra v2.3.0 + OAuth2 clients with `skip_consent: true` (the F-077
+      # mitigation for first-party clients including Grafana) persist
+      # `granted_scope: null` in the stored consent session regardless of
+      # what the consent UI sends in `grant_scope` on
+      # `acceptOAuth2ConsentRequest`. Hydra then strips ALL claims from
+      # `/userinfo` responses for scopes not in granted_scope (the OIDC-
+      # standard scope-to-claim filter), so `/userinfo` returns only
+      # `sub` and Grafana's `ALLOWED_GROUPS` check fails with
+      # "user not a member of one of the required groups" despite the
+      # Kratos identity carrying GRAFANA-ADMIN.
+      #
+      # Hydra does NOT filter the *id_token* JWT by granted_scope (id_token
+      # claims are written from session.id_token verbatim by the patched
+      # consent UI's `extractSession` per ADR 0857 patch 1). So the id_token
+      # DOES carry the groups claim. Leaving API_URL empty makes Grafana
+      # skip the /userinfo call entirely and read claims from the id_token
+      # directly, where groups is present.
+      #
+      # Companion required: `GF_AUTH_GENERIC_OAUTH_GROUPS_ATTRIBUTE_PATH`
+      # (below) — Grafana 11.x doesn't auto-extract groups from id_token
+      # without an explicit JMESPath. Without it, the id_token is parsed
+      # for name/email/sub but `data.Attributes` lands empty and the
+      # ALLOWED_GROUPS check fires against [].
+      #
+      # F-161's patch 3 (scope-fallback in the consent UI) was the wrong
+      # layer — `body.requested_scope` IS populated; Hydra discards
+      # `grant_scope` regardless of what the UI sends on the skip-consent
+      # path. Patch 3 stays as a harmless additive fallback that does not
+      # trigger under any observed condition.
+      GF_AUTH_GENERIC_OAUTH_API_URL: ""
+      GF_AUTH_GENERIC_OAUTH_GROUPS_ATTRIBUTE_PATH: "groups"
+      GF_AUTH_GENERIC_OAUTH_USE_PKCE: "true"
+      # JWT role mapping — groups-based RBAC (Block 82B-rbac landed).
+      # JMESPath against the JWT's `groups` claim, now forwarded by the
+      # patched ops/ory-consent/ image running as site Hydra's consent
+      # UI. UPPERCASE because the site Kratos identity schema at
+      # /opt/mgmt-host/ory/identity-schema.json restricts groups to
+      # `^[A-Z][A-Z0-9-]{0,40}$` (uppercase + hyphens).
+      #
+      #   OBS-ADMIN OR GRAFANA-ADMIN       → Admin
+      #   OBS-READONLY OR GRAFANA-READONLY → Viewer
+      #   anything else                    → STRICT=true rejects login
+      #
+      # ALLOW_SIGN_UP=true so Grafana auto-creates the user record on
+      # first login (no manual Grafana-side provisioning).
+      #
+      # Predecessor (literal-'Admin' constant + STRICT=false) was the
+      # v1 pragma when the upstream consent app dropped traits.groups
+      # before reaching the JWT; retired by Block 82B-rbac landing.
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: "contains(groups, 'OBS-ADMIN') && 'Admin' || contains(groups, 'GRAFANA-ADMIN') && 'Admin' || contains(groups, 'OBS-READONLY') && 'Viewer' || contains(groups, 'GRAFANA-READONLY') && 'Viewer'"
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_STRICT: "true"
+      # Belt-and-suspenders gate at the OAuth handshake itself (F-132
+      # follow-on). STRICT=true + the JMESPath above is supposed to
+      # fail-close on empty-result identities, but ALLOWED_GROUPS makes
+      # the rejection happen one layer earlier (login refused outright,
+      # no user record is auto-created via ALLOW_SIGN_UP). Set must
+      # remain a superset of the JMESPath role-mapping groups; if a new
+      # *-ADMIN or *-READONLY group lands in the matrix, add it here in
+      # the same change-set.
+      GF_AUTH_GENERIC_OAUTH_ALLOWED_GROUPS: "OBS-ADMIN,GRAFANA-ADMIN,OBS-READONLY,GRAFANA-READONLY"
+      GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP: "true"
+      # Hydra issues an LE-signed cert (publicly trusted) — no custom
+      # CA needed. A dedicated operator-IdP Hydra with an offline-CA leaf
+      # cert would need it mounted into Grafana.
+
+      GF_LOG_LEVEL: "info"
+
+      # NO EGRESS. Grafana is a mesh-internal service and must make no
+      # outbound call of its own. Left at defaults, the version + plugin update
+      # checkers call grafana.com every 10 min, the home page fetches
+      # grafana.com's blog feed, avatars proxy gravatar.com, and the plugin
+      # catalog / signing-key fetch stay open. Every switch below closes one of
+      # those paths.
+      GF_ANALYTICS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_PLUGINS_PLUGIN_CATALOG_HIDDEN: "true"
+      GF_HELP_ENABLED: "false"
+    # Server-to-server OAuth2 token exchange targets Hydra's public-facing
+    # URL `https://oauth2.<site>/oauth2/token`. Docker's embedded DNS resolver
+    # can't resolve the mesh hostname from inside the container, so without this
+    # entry fresh logins fail at the token-exchange step with
+    # `dial tcp: lookup ... no such host`. DERIVED per-site: the playbook renders GRAFANA_OIDC_HYDRA_HOST
+    # = oauth2.<site_id>.<site_dns_zone>:<mesh_ip_a> into .env, so a forked
+    # goatnet can NEVER inherit another site's value. Same fix shape as the
+    # oauth2-proxy-dashboard sibling.
+    extra_hosts:
+      - "${GRAFANA_OIDC_HYDRA_HOST}"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    # No host-port binding — Traefik in the mgmt-host compose project
+    # reaches `grafana:3000` over the shared `mgmt` network.
+    networks:
+      - mgmt
+    labels:
+      # Reserved for future Traefik label-based discovery. Current
+      # routing is declared in the file provider at
+      # ops/ansible/templates/traefik-acme/mgmt-dynamic.yml.j2
+      # (router grafana → service grafana@docker:3000).
+      org.opencontainers.image.title: "Grafana (${SITE_NAME})"
+
+  alertmanager:
+    # Critical alerts → PagerDuty (ADR 1059 — a bounded sovereignty delta;
+    # PD sees only alert metadata, never fabric data). The config is RENDERED
+    # per-site by obs.yml from ops/ansible/roles/observability/templates/
+    # alertmanager.yml.j2 (PD key from env); an empty key collapses the
+    # critical route to webhook-noop, so the stack is valid with or without PD.
+    # Multi-arch INDEX digest (Thor is arm64 — never a per-arch manifest).
+    image: prom/alertmanager:v0.27.0@sha256:e13b6ed5cb929eeaee733479dce55e10eb3bc2e9c4586c705a4e8da41e5eacf5
+    container_name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-alertmanager
+    restart: unless-stopped
+    # Run as root so it can read the 0640 root-owned alertmanager.yml (which
+    # carries the PagerDuty routing key) without making that secret
+    # world-readable on the host. Config is mounted read-only.
+    user: "0:0"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          memory: 32M
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=:9093
+    volumes:
+      # Rendered into the dest dir by obs.yml AFTER the compose-tree copy
+      # (the secret stays off the repo; this dir holds only the rendered yml).
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      # Loopback only — Prometheus reaches it over the mgmt network at
+      # alertmanager:9093; the relay-health prober's --alert-sink targets the
+      # same in-network address.
+      - "127.0.0.1:9193:9093"
+    networks:
+      - mgmt
+
+volumes:
+  prometheus-data:
+    name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-prometheus-data
+  grafana-data:
+    name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-grafana-data
+  alertmanager-data:
+    name: ${OBS_PREFIX:?set OBS_PREFIX in .env}-alertmanager-data
+
+networks:
+  mgmt:
+    name: mgmt
+    external: true

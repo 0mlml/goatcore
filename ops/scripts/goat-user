@@ -1,0 +1,518 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["ruamel.yaml>=0.18"]
+# ///
+"""goat-user — manage site_admins entries for goat sites.
+
+The canonical CLI for adding / removing / updating per-site Kratos identities
+in `ops/ansible/group_vars/<site>_hosts/vars.yml` `site_admins:` lists.
+Composes with F-124 (group-aware first-login URL) + F-125 (Kratos→netbird-mgmt
+admin reconciler) — together this is the operator-facing primitive that closes
+the "edit YAML by hand, remember which playbooks to run" friction.
+
+Usage:
+    goat-user add <email> --name "..." --groups ADMINS [--site nova] [--apply]
+    goat-user remove <email> [--site nova] [--apply]
+    goat-user update <email> --groups VENDOR [--site nova] [--apply]
+    goat-user list [--site nova]
+    goat-user sites
+
+Site auto-detection:
+    If --site is omitted, scans `ops/ansible/group_vars/*_hosts/vars.yml` for
+    files declaring `site_admins:`. If exactly one matches, uses it. If
+    multiple, fails with the available list — pass --site explicitly.
+
+After a mutating action (add/remove/update), prints the next two
+ansible-playbook commands you'd run to apply the change end-to-end. `--apply`
+runs them subprocess-style (foreground, output streams to your terminal).
+
+Comments + ordering in vars.yml are preserved via ruamel.yaml round-trip.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+from ruamel.yaml import YAML
+
+# Identity-schema regex from ops/ansible/roles/ory/templates/ory/identity-schema.json.j2.
+GROUP_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,40}$")
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+NAME_MAX = 80
+
+
+def repo_root() -> Path:
+    p = Path(__file__).resolve().parent.parent.parent  # ops/scripts/ → repo
+    if not (p / "ops" / "ansible").is_dir():
+        sys.exit(f"goat-user: cannot locate repo root from {Path(__file__)}")
+    return p
+
+
+def group_vars_dir() -> Path:
+    return repo_root() / "ops" / "ansible" / "group_vars"
+
+
+def yaml_load() -> YAML:
+    """Read-only YAML for parsing site_admins lookups. We never write back via
+    ruamel's full-file round-trip — it collapses column-aligned whitespace in
+    unrelated sections and produces noisy diffs. Mutations go through the
+    surgical text-edit functions below, which only touch the site_admins block.
+    """
+    y = YAML(typ="safe")
+    return y
+
+
+def discover_sites() -> dict[str, Path]:
+    """Return {<site_group>: <vars.yml path>} for every group that has site_admins."""
+    out: dict[str, Path] = {}
+    y = yaml_load()
+    for vars_yml in sorted(group_vars_dir().glob("*_hosts/vars.yml")):
+        site_group = vars_yml.parent.name
+        try:
+            data = y.load(vars_yml.read_text())
+        except Exception:
+            continue
+        if isinstance(data, dict) and "site_admins" in data:
+            out[site_group] = vars_yml
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Surgical text-edit primitives — find the site_admins block in the file's
+# raw text and mutate only those lines, preserving every other byte.
+# ---------------------------------------------------------------------------
+
+# Each entry is exactly 3 lines:
+#   "  - email: <email>"
+#   "    name: \"<name>\""
+#   "    groups: [\"G1\", \"G2\", ...]"
+ENTRY_LINES = 3
+ENTRY_INDENT = "  "       # entries are indented 2 spaces (dash position)
+FIELD_INDENT = "    "     # continuation fields indented 4 spaces
+
+ADMINS_HEADER_RE = re.compile(r"^site_admins:\s*$")        # multi-line form
+ADMINS_EMPTY_RE = re.compile(r"^site_admins:\s*\[\s*\]\s*$")  # `site_admins: []`
+ENTRY_EMAIL_RE = re.compile(r"^  - email:\s*(\S.*?)\s*$")
+
+
+def find_admins_block(lines: list[str]) -> tuple[int, int, bool]:
+    """Return (start_line, end_line_exclusive, was_empty_inline).
+
+    For the multi-line form (`site_admins:` followed by `  - email: ...`
+    entries) end_line_exclusive points at the first line AFTER the last entry.
+    For the empty inline form (`site_admins: []`) start == header line and
+    end == header+1 (the line itself); was_empty_inline=True so callers know
+    they need to convert the line to the multi-line shape on first add.
+    """
+    header_idx = None
+    empty_inline = False
+    for i, line in enumerate(lines):
+        if ADMINS_EMPTY_RE.match(line):
+            header_idx = i
+            empty_inline = True
+            break
+        if ADMINS_HEADER_RE.match(line):
+            header_idx = i
+            break
+    if header_idx is None:
+        sys.exit("goat-user: vars.yml has no `site_admins:` key (expected at column 0)")
+
+    if empty_inline:
+        return header_idx, header_idx + 1, True
+
+    end_idx = header_idx + 1
+    while end_idx < len(lines):
+        line = lines[end_idx]
+        if not line.strip():
+            break  # blank line ends the block
+        if line.startswith("#"):
+            break  # top-level comment ends the block
+        if not line.startswith(ENTRY_INDENT):
+            break  # next top-level key ends the block
+        end_idx += 1
+    return header_idx, end_idx, False
+
+
+def render_entry(email: str, name: str, groups: list[str]) -> list[str]:
+    """Render a single entry as 3 lines matching the in-tree convention."""
+    groups_inline = "[" + ", ".join(f'"{g}"' for g in groups) + "]"
+    return [
+        f"{ENTRY_INDENT}- email: {email}\n",
+        f'{FIELD_INDENT}name: "{name}"\n',
+        f"{FIELD_INDENT}groups: {groups_inline}\n",
+    ]
+
+
+def parse_entry_at(lines: list[str], idx: int) -> dict | None:
+    """Parse the entry starting at lines[idx] (an `  - email:` line)."""
+    if idx >= len(lines):
+        return None
+    m = ENTRY_EMAIL_RE.match(lines[idx])
+    if not m:
+        return None
+    email = m.group(1)
+    name = None
+    groups: list[str] = []
+    j = idx + 1
+    while j < len(lines) and lines[j].startswith(FIELD_INDENT):
+        s = lines[j].strip()
+        if s.startswith("name:"):
+            v = s.split(":", 1)[1].strip()
+            if v.startswith('"') and v.endswith('"'):
+                v = v[1:-1]
+            name = v
+        elif s.startswith("groups:"):
+            v = s.split(":", 1)[1].strip()
+            if v.startswith("[") and v.endswith("]"):
+                inner = v[1:-1]
+                groups = [g.strip().strip('"').strip("'") for g in inner.split(",") if g.strip()]
+        j += 1
+    return {"email": email, "name": name or "", "groups": groups, "start": idx, "end": j}
+
+
+def find_entry(lines: list[str], header_idx: int, end_idx: int, email: str) -> dict | None:
+    i = header_idx + 1
+    while i < end_idx:
+        entry = parse_entry_at(lines, i)
+        if entry and entry["email"] == email:
+            return entry
+        i = entry["end"] if entry else i + 1
+    return None
+
+
+def list_entries(lines: list[str], header_idx: int, end_idx: int) -> list[dict]:
+    out = []
+    i = header_idx + 1
+    while i < end_idx:
+        entry = parse_entry_at(lines, i)
+        if entry:
+            out.append(entry)
+            i = entry["end"]
+        else:
+            i += 1
+    return out
+
+
+def resolve_site(site_arg: str | None, sites: dict[str, Path]) -> tuple[str, Path]:
+    if site_arg:
+        # Accept "nova", "nova_hosts", or "nova-hosts" interchangeably.
+        norm = site_arg.replace("-", "_")
+        candidates = [
+            norm,
+            f"{norm}_hosts",
+            *(k for k in sites if k.startswith(norm)),
+        ]
+        for c in candidates:
+            if c in sites:
+                return c, sites[c]
+        sys.exit(
+            f"goat-user: site '{site_arg}' not found. Known: "
+            + ", ".join(sorted(sites.keys()))
+        )
+    if len(sites) == 1:
+        return next(iter(sites.items()))
+    if not sites:
+        sys.exit("goat-user: no sites with site_admins found under ops/ansible/group_vars/")
+    sys.exit(
+        "goat-user: multiple sites have site_admins; pass --site. Known: "
+        + ", ".join(sorted(sites.keys()))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_email(email: str) -> None:
+    if not EMAIL_RE.match(email):
+        sys.exit(f"goat-user: '{email}' does not look like an email address")
+
+
+def validate_name(name: str) -> None:
+    if not name or len(name) > NAME_MAX:
+        sys.exit(f"goat-user: name must be 1..{NAME_MAX} chars")
+
+
+def validate_groups(groups: list[str]) -> None:
+    for g in groups:
+        if not GROUP_RE.match(g):
+            sys.exit(
+                f"goat-user: group '{g}' must match {GROUP_RE.pattern} "
+                "(uppercase letter, then up to 40 of [A-Z0-9-])"
+            )
+
+
+def parse_groups(s: str) -> list[str]:
+    return [g.strip() for g in s.split(",") if g.strip()]
+
+
+# ---------------------------------------------------------------------------
+# YAML mutation
+# ---------------------------------------------------------------------------
+
+def cmd_add(args, site_group: str, vars_path: Path) -> None:
+    validate_email(args.email)
+    validate_name(args.name)
+    groups = parse_groups(args.groups)
+    if not groups:
+        sys.exit("goat-user: --groups must list ≥1 group (e.g. ADMINS)")
+    validate_groups(groups)
+
+    text = vars_path.read_text()
+    lines = text.splitlines(keepends=True)
+    header, end, was_empty = find_admins_block(lines)
+    if not was_empty and find_entry(lines, header, end, args.email):
+        sys.exit(f"goat-user: {args.email} already in {vars_path.relative_to(repo_root())}")
+
+    new_entry = render_entry(args.email, args.name, groups)
+    if was_empty:
+        # Convert `site_admins: []` → `site_admins:\n  - email: ...`
+        lines[header] = "site_admins:\n"
+        lines[header + 1 : header + 1] = new_entry
+    else:
+        # Insert before the block-ending line (preserves the trailing blank
+        # line that separates site_admins from the next section).
+        lines[end:end] = new_entry
+    vars_path.write_text("".join(lines))
+    print(
+        f"+ added {args.email} ({args.name}) groups={groups} → "
+        f"{vars_path.relative_to(repo_root())}"
+    )
+    next_steps(site_group, args)
+
+
+def cmd_remove(args, site_group: str, vars_path: Path) -> None:
+    text = vars_path.read_text()
+    lines = text.splitlines(keepends=True)
+    header, end, was_empty = find_admins_block(lines)
+    if was_empty:
+        sys.exit(f"goat-user: site_admins is empty in {vars_path.relative_to(repo_root())}")
+    entry = find_entry(lines, header, end, args.email)
+    if entry is None:
+        sys.exit(f"goat-user: {args.email} not in {vars_path.relative_to(repo_root())}")
+    del lines[entry["start"] : entry["end"]]
+    # If the removal emptied the block, collapse `site_admins:\n` back to
+    # `site_admins: []\n` so YAML semantics stay an-empty-list (not null).
+    new_header, new_end, _ = find_admins_block(lines)
+    if new_end == new_header + 1 and lines[new_header].rstrip() == "site_admins:":
+        lines[new_header] = "site_admins: []\n"
+    vars_path.write_text("".join(lines))
+    print(f"- removed {args.email} (was groups={entry['groups']})")
+    print(
+        "  Note: this only removes the YAML entry. The Kratos identity persists.\n"
+        "  To delete the identity entirely, on the mgmt-host:\n"
+        "    curl -X DELETE http://127.0.0.1:4434/admin/identities/<sub-id>\n"
+        "  (find sub-id via: curl -fsS http://127.0.0.1:4434/admin/identities | "
+        "jq -r '.[] | select(.traits.email==\"<email>\") | .id')"
+    )
+    next_steps(site_group, args)
+
+
+def cmd_update(args, site_group: str, vars_path: Path) -> None:
+    if not args.name and not args.groups:
+        sys.exit("goat-user: update needs at least one of --name or --groups")
+    text = vars_path.read_text()
+    lines = text.splitlines(keepends=True)
+    header, end, was_empty = find_admins_block(lines)
+    if was_empty:
+        sys.exit(f"goat-user: site_admins is empty in {vars_path.relative_to(repo_root())}")
+    entry = find_entry(lines, header, end, args.email)
+    if entry is None:
+        sys.exit(f"goat-user: {args.email} not in {vars_path.relative_to(repo_root())}")
+    new_name = args.name or entry["name"]
+    if args.groups:
+        new_groups = parse_groups(args.groups)
+        if not new_groups:
+            sys.exit("goat-user: --groups must list ≥1 group")
+        validate_groups(new_groups)
+    else:
+        new_groups = entry["groups"]
+    if args.name:
+        validate_name(args.name)
+
+    new_entry = render_entry(args.email, new_name, new_groups)
+    lines[entry["start"] : entry["end"]] = new_entry
+    vars_path.write_text("".join(lines))
+    print(f"~ updated {args.email}: name={new_name!r} groups={new_groups}")
+    next_steps(site_group, args)
+
+
+def cmd_list(args, site_group: str, vars_path: Path) -> None:
+    text = vars_path.read_text()
+    lines = text.splitlines(keepends=True)
+    header, end, was_empty = find_admins_block(lines)
+    entries = [] if was_empty else list_entries(lines, header, end)
+    print(f"# {site_group} ({vars_path.relative_to(repo_root())})")
+    if not entries:
+        print("  (no site_admins entries)")
+        return
+    w_email = max(len(e["email"]) for e in entries)
+    w_name = max(len(e["name"]) for e in entries)
+    print(f"  {'EMAIL':<{w_email}}  {'NAME':<{w_name}}  GROUPS")
+    for e in entries:
+        groups = ",".join(e["groups"]) or "-"
+        print(f"  {e['email']:<{w_email}}  {e['name']:<{w_name}}  {groups}")
+
+
+def cmd_sites(args, *_) -> None:  # noqa: ARG001
+    sites = discover_sites()
+    if not sites:
+        print("(no sites with site_admins discovered)")
+        return
+    for site, path in sorted(sites.items()):
+        print(f"{site:<20s} {path.relative_to(repo_root())}")
+
+
+# ---------------------------------------------------------------------------
+# Next-step ansible-playbook commands
+# ---------------------------------------------------------------------------
+
+def site_invocation(site_group: str) -> dict:
+    """Per-site ansible invocation. Reads inventory + group_vars to derive."""
+    site_id = None
+    y = yaml_rt()
+    vars_path = group_vars_dir() / site_group / "vars.yml"
+    if vars_path.is_file():
+        data = y.load(vars_path.read_text())
+        site_id = (data or {}).get("site_id") if isinstance(data, dict) else None
+
+    inv = repo_root() / "ops" / "ansible" / "inventory" / "mgmt-hosts.ini"
+    mesh_inv = repo_root() / "ops" / "ansible" / "inventory" / "mgmt-hosts-mesh.ini"
+    mgmt_host = None
+    has_mesh_override = False
+    if inv.is_file():
+        in_section = False
+        for line in inv.read_text().splitlines():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                in_section = s == f"[{site_group}]"
+                continue
+            if in_section and s and not s.startswith("#") and not s.endswith(":vars]"):
+                mgmt_host = s.split()[0]
+                break
+    if mesh_inv.is_file():
+        has_mesh_override = f"[{site_group}]" in mesh_inv.read_text()
+
+    pg_env = f"{(site_id or site_group).upper().replace('-', '_')}_PG_PASS"
+
+    inventory_chain = ["-i", "inventory/mgmt-hosts.ini"]
+    if has_mesh_override:
+        inventory_chain += ["-i", "inventory/mgmt-hosts-mesh.ini"]
+
+    return {
+        "site_id": site_id or site_group.removesuffix("_hosts"),
+        "mgmt_host": mgmt_host,
+        "inventory_chain": inventory_chain,
+        "pg_env": pg_env,
+    }
+
+
+def playbook_cmd(playbook: str, inv: dict) -> list[str]:
+    cmd = ["ansible-playbook", *inv["inventory_chain"]]
+    if inv["mgmt_host"]:
+        cmd += ["-l", inv["mgmt_host"]]
+    cmd += [playbook, "-e", f"postgres_superuser_password=${inv['pg_env']}"]
+    return cmd
+
+
+def next_steps(site_group: str, args) -> None:
+    inv = site_invocation(site_group)
+    if not inv["mgmt_host"]:
+        print(f"\n!! could not derive mgmt-host for {site_group} from inventory; skipping next-steps print")
+        return
+    ory_cmd = playbook_cmd("ory-deploy.yml", inv)
+    dash_cmd = playbook_cmd("dashboard-deploy.yml", inv)
+    pre = "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES "
+    ory_str = pre + " ".join(shlex.quote(c) for c in ory_cmd)
+    dash_str = pre + " ".join(shlex.quote(c) for c in dash_cmd)
+
+    if getattr(args, "apply", False):
+        print("\n→ applying (foreground, ory then dashboard) …")
+        run_in_ansible_dir(ory_cmd, inv["pg_env"])
+        run_in_ansible_dir(dash_cmd, inv["pg_env"])
+        return
+
+    print("\nNext steps (run from ops/ansible/, requires direnv-loaded $%s):" % inv["pg_env"])
+    print(f"  1. {ory_str}")
+    print(f"  2. SSH to {inv['mgmt_host']} and read the bootstrap-password file:")
+    print(f"     ssh <mesh-IP-or-hostname> 'sudo cat /opt/mgmt-host/.bootstrap-passwords/<email>.txt'")
+    print(f"  3. Hand {{email, password, first-login URL}} to the user OOB.")
+    print(f"  4. After they log in, for ADMINS-group users, run:")
+    print(f"     {dash_str}")
+    print(f"  5. After they change their password: ssh ... 'sudo rm /opt/mgmt-host/.bootstrap-passwords/<email>.txt'")
+    print("\n(Re-run with --apply to fire steps 1 + 4 automatically.)")
+
+
+def run_in_ansible_dir(cmd: list[str], pg_env: str) -> None:
+    ansible_dir = repo_root() / "ops" / "ansible"
+    if not os.environ.get(pg_env):
+        sys.exit(
+            f"goat-user --apply: ${pg_env} is not set in the environment. "
+            "Run `direnv allow` in the repo root, or pass it inline."
+        )
+    env = {**os.environ, "OBJC_DISABLE_INITIALIZE_FORK_SAFETY": "YES"}
+    print(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}")
+    rc = subprocess.run(cmd, cwd=ansible_dir, env=env).returncode
+    if rc != 0:
+        sys.exit(f"goat-user --apply: command exited {rc}")
+
+
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="goat-user",
+        description="Manage site_admins entries for goat sites (Kratos identities + netbird-mgmt roles).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--site", help="Site group (e.g. nova, vega). Auto-detects if only one site has site_admins.")
+    common.add_argument("--apply", action="store_true", help="After mutating the YAML, also run the next ansible playbooks.")
+
+    p_add = sub.add_parser("add", parents=[common], help="Add a new identity to site_admins.")
+    p_add.add_argument("email")
+    p_add.add_argument("--name", required=True)
+    p_add.add_argument("--groups", default="ADMINS", help="Comma-separated. Default: ADMINS.")
+    p_add.set_defaults(func=cmd_add)
+
+    p_rm = sub.add_parser("remove", parents=[common], help="Remove an identity from site_admins (does not delete the Kratos identity).")
+    p_rm.add_argument("email")
+    p_rm.set_defaults(func=cmd_remove)
+
+    p_up = sub.add_parser("update", parents=[common], help="Update name and/or groups for an existing identity.")
+    p_up.add_argument("email")
+    p_up.add_argument("--name")
+    p_up.add_argument("--groups")
+    p_up.set_defaults(func=cmd_update)
+
+    p_ls = sub.add_parser("list", parents=[common], help="List site_admins for a site.")
+    p_ls.set_defaults(func=cmd_list)
+
+    p_sites = sub.add_parser("sites", help="List sites with site_admins.")
+    p_sites.set_defaults(func=cmd_sites, site=None, apply=False)
+
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.cmd == "sites":
+        args.func(args, None, None)
+        return
+    sites = discover_sites()
+    site_group, vars_path = resolve_site(getattr(args, "site", None), sites)
+    args.func(args, site_group, vars_path)
+
+
+if __name__ == "__main__":
+    main()

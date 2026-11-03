@@ -1,0 +1,301 @@
+# promtool unit tests for rules/bandwidth-attribution.yml (ADR 1128).
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/bandwidth-attribution.test.yml
+#
+# The load-bearing assertions here are about the HONESTY GATES, not the happy
+# path. Three of them:
+#
+#   Case 2 — a host with NO declared capacity must produce no utilisation
+#     series and no utilisation alert. The whole point of the `> 0` gate is
+#     that an uncharacterised host is silent rather than judged against an
+#     assumed pipe, and a regression there would be invisible: the panels would
+#     simply start showing plausible percentages.
+#
+#   Case 3 — the physical-NIC recording rules must EXCLUDE wt0. Including the
+#     NetBird interface would add decrypted tunnel payload to the encrypted
+#     transport carrying it, inflating the denominator's numerator by roughly
+#     2x on a mesh-heavy host. This is the two-plane double-count reappearing
+#     inside the utilisation figure itself, and it is a one-character regex
+#     edit away at all times.
+#
+#   Case 5 — a blind transport plane must alert rather than read as an idle
+#     mesh. Zero traffic and no measurement look identical on a chart.
+
+rule_files:
+  - ../rules/bandwidth-attribution.yml
+
+evaluation_interval: 1m
+
+tests:
+  # -- Case 1: healthy host, capacity declared, comfortable headroom ---------
+  - interval: 1m
+    name: "declared capacity, 20% utilisation, nothing fires"
+    input_series:
+      # 2.5 MB/s tx = 20 Mbit/s against a declared 100 Mbit/s uplink.
+      - series: 'node_network_transmit_bytes_total{host="thor-1",device="eno1"}'
+        values: '0+150000000x40'
+      - series: 'node_network_receive_bytes_total{host="thor-1",device="eno1"}'
+        values: '0+150000000x40'
+      - series: 'goat_link_capacity_bytes_per_second{host="thor-1",direction="tx",source="declared"}'
+        values: '12500000x40'
+      - series: 'goat_link_capacity_bytes_per_second{host="thor-1",direction="rx",source="declared"}'
+        values: '12500000x40'
+      - series: 'goat_link_capacity_declared{host="thor-1",source="declared"}'
+        values: '1x40'
+      - series: 'goat_net_attribution_up{host="thor-1"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: goat:link_bits_per_second:tx
+        eval_time: 20m
+        exp_samples:
+          - labels: '{__name__="goat:link_bits_per_second:tx", host="thor-1"}'
+            value: 2.0e7
+      - expr: goat:link_utilisation_ratio:tx
+        eval_time: 20m
+        exp_samples:
+          - labels: '{__name__="goat:link_utilisation_ratio:tx", host="thor-1"}'
+            value: 0.2
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LinkUtilisationHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LinkUtilisationCritical
+        exp_alerts: []
+
+  # -- Case 2: NO declared capacity — silence, not a guessed percentage ------
+  - interval: 1m
+    name: "undeclared capacity produces no utilisation series at all"
+    input_series:
+      # Same heavy traffic as case 4, but nobody has said how big the pipe is.
+      - series: 'node_network_transmit_bytes_total{host="orin-c",device="eth0"}'
+        values: '0+750000000x40'
+      - series: 'goat_link_capacity_declared{host="orin-c",source="unknown"}'
+        values: '0x40'
+      - series: 'goat_net_attribution_up{host="orin-c"}'
+        values: '1x40'
+    promql_expr_test:
+      # The NIC rate is still known...
+      - expr: goat:link_bits_per_second:tx
+        eval_time: 20m
+        exp_samples:
+          - labels: '{__name__="goat:link_bits_per_second:tx", host="orin-c"}'
+            value: 1.0e8
+      # ...but utilisation is ABSENT, not zero and not a guess.
+      - expr: goat:link_utilisation_ratio:tx
+        eval_time: 20m
+        exp_samples: []
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LinkUtilisationHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LinkUtilisationCritical
+        exp_alerts: []
+
+  # -- Case 3: wt0 must not count toward the physical link -------------------
+  - interval: 1m
+    name: "NetBird interface is excluded from the physical NIC total"
+    input_series:
+      - series: 'node_network_transmit_bytes_total{host="thor-2",device="eno1"}'
+        values: '0+60000000x40'
+      # Same payload seen again on the tunnel device. Counting both would
+      # double the figure every utilisation panel rests on.
+      - series: 'node_network_transmit_bytes_total{host="thor-2",device="wt0"}'
+        values: '0+60000000x40'
+      - series: 'node_network_transmit_bytes_total{host="thor-2",device="docker0"}'
+        values: '0+300000000x40'
+      - series: 'node_network_transmit_bytes_total{host="thor-2",device="lo"}'
+        values: '0+540000000x40'
+    promql_expr_test:
+      - expr: goat:link_bits_per_second:tx
+        eval_time: 20m
+        exp_samples:
+          # eno1 alone: 60e6 B/min = 1e6 B/s, x8 = 8e6 bit/s.
+          # With wt0 counted it would be 16e6; with all four, 152e6. THAT is
+          # the assertion — the trailing ulp is rate()'s window extrapolation,
+          # and promtool has no tolerance syntax, so the exact float is pinned.
+          - labels: '{__name__="goat:link_bits_per_second:tx", host="thor-2"}'
+            value: 8.000000000000001e6
+
+  # -- Case 4: saturation pages -----------------------------------------------
+  - interval: 1m
+    name: "95% of declared capacity fires warning then critical"
+    input_series:
+      # 11.875 MB/s = 95 Mbit/s against a declared 100 Mbit/s.
+      - series: 'node_network_transmit_bytes_total{host="edge-1",device="eno1"}'
+        values: '0+712500000x40'
+      - series: 'goat_link_capacity_bytes_per_second{host="edge-1",direction="tx",source="measured"}'
+        values: '12500000x40'
+      - series: 'goat_link_capacity_declared{host="edge-1",source="measured"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: LinkUtilisationCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              domain: net
+              host: edge-1
+            exp_annotations:
+              summary: "edge-1 link is saturating (>90% declared)"
+              description: >-
+                95% of declared capacity for 5m. At this level the mesh control
+                plane and time sync — both small and both things nothing else
+                can be fixed without — are competing with bulk transfer for the
+                same pipe.
+
+  # -- Case 5: blind transport plane is not an idle mesh ----------------------
+  - interval: 1m
+    name: "unreadable netbird status alerts rather than reading as idle"
+    input_series:
+      - series: 'goat_net_attribution_up{host="orin-b"}'
+        values: '1x40'
+      - series: 'goat_net_attribution_mesh_plane_up{host="orin-b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BandwidthAttributionMeshPlaneBlind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              domain: net
+              host: orin-b
+            exp_annotations:
+              summary: "Transport plane is blind on orin-b"
+              description: >-
+                `netbird status` was unreadable, so per-peer WireGuard counters
+                are absent. The transport plane for this host reads as zero mesh
+                traffic, which is indistinguishable on a chart from an idle mesh
+                and is NOT the same thing. Utilisation totals from the NIC are
+                still valid; the p2p-vs-relayed split is not.
+
+  # -- Case 6: relayed-share alarm -------------------------------------------
+  - interval: 1m
+    name: "most mesh traffic via relay warns"
+    input_series:
+      - series: 'goat_net_transport_bytes_total{host="edge-2",class="mesh-relayed",direction="tx"}'
+        values: '0+900000x60'
+      - series: 'goat_net_transport_bytes_total{host="edge-2",class="mesh-p2p",direction="tx"}'
+        values: '0+100000x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: RelayedMeshShareHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              domain: net
+              host: edge-2
+            exp_annotations:
+              summary: "edge-2 is sending most mesh traffic via relay"
+              description: >-
+                90% of this host's mesh bytes are going through a relay rather
+                than peer-to-peer, sustained 30m. Relay bandwidth is metered and
+                the same payload is paid for twice (node to relay, relay to
+                peer). Usually a NAT/ICE regression on specific peers — the
+                per-peer breakdown names them.
+
+  # -- Case 7: coverage ratio is clamped and honest ---------------------------
+  - interval: 1m
+    name: "workload coverage ratio stays in [0,1] and flags a stale map"
+    input_series:
+      # 10 MB/s crossing the mesh, only 1 MB/s landing in named categories.
+      - series: 'goat_net_transport_bytes_total{host="thor-3",class="mesh-p2p",direction="rx"}'
+        values: '0+600000000x90'
+      - series: 'goat_net_workload_bytes_total{host="thor-3",category="fabric",direction="rx"}'
+        values: '0+60000000x90'
+    promql_expr_test:
+      - expr: goat:workload_attribution_coverage:ratio
+        eval_time: 30m
+        exp_samples:
+          - labels: '{__name__="goat:workload_attribution_coverage:ratio", host="thor-3"}'
+            value: 0.1
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: BandwidthAttributionCoverageLow
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              domain: net
+              host: thor-3
+            exp_annotations:
+              summary: "Workload attribution explains <50% of mesh traffic on thor-3"
+              description: >-
+                Only 10% of this host's mesh transport is landing in a named
+                category; the rest shows as Unattributed. Some gap is expected
+                and permanent (socket byte counters are TCP-only, short-lived
+                connections close between samples). FIRST, READ THE CATCH-ALL
+                ROWS — they discriminate between the two causes and they point
+                opposite ways. If Undeclared and Other (declared) are LARGE, the
+                category map has fallen behind and a rule is missing. If they
+                are BOTH ZERO, nothing is arriving to be categorised and the map
+                is innocent: check goat_net_attribution_netns_read against
+                goat_net_attribution_netns_targets, because sockets in container
+                network namespaces are invisible to a host-only collector
+                (F-331, measured at 7.2% coverage with both catch-alls flat
+                zero). Adding category rules in that state cannot move the
+                number.
+
+  # -- Case 8: a goatnet with NONE of these metrics must stay silent ----------
+  # These rules ship in the obs-host default list, so they load on goatnets that
+  # have not deployed the attribution collector at all. A rule that fires on
+  # absence would page every one of them forever, and an operator paged for
+  # normal conditions learns to ignore the pager — which disables the alerting
+  # this whole surface depends on.
+  - interval: 1m
+    name: "no attribution metrics at all: nothing fires"
+    input_series:
+      - series: 'up{job="node-exporter"}'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: LinkUtilisationHigh
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: LinkUtilisationCritical
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: RelayedMeshShareHigh
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: BandwidthAttributionStale
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: BandwidthAttributionMeshPlaneBlind
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: BandwidthAttributionCoverageLow
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: LinkCapacityUndeclared
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: LinkCapacityDeclarationStale
+        exp_alerts: []
+
+  # -- Case 9: the underlay must not inflate coverage -------------------------
+  # On live ZAGROS the relay tunnel (transport-underlay) is larger than the mesh
+  # payload and egresses off-mesh, so counting it in the numerator pushed the
+  # ratio above 1 and it clamped to a confident 100% while real coverage was a
+  # few percent. Coverage that reports completeness by clamping is worse than
+  # no coverage metric.
+  - interval: 1m
+    name: "transport-underlay does not inflate coverage to a clamped 100%"
+    input_series:
+      # 10 MB/s of mesh transport...
+      - series: 'goat_net_transport_bytes_total{host="thor-9",class="mesh-p2p",direction="rx"}'
+        values: '0+600000000x90'
+      # ...1 MB/s genuinely attributed...
+      - series: 'goat_net_workload_bytes_total{host="thor-9",category="fabric",direction="rx"}'
+        values: '0+60000000x90'
+      # ...and 50 MB/s of relay tunnel, which is NOT mesh payload.
+      - series: 'goat_net_workload_bytes_total{host="thor-9",category="transport-underlay",direction="rx"}'
+        values: '0+3000000000x90'
+    promql_expr_test:
+      - expr: goat:workload_attribution_coverage:ratio
+        eval_time: 30m
+        exp_samples:
+          # 1/10, not a clamped 1.0.
+          - labels: '{__name__="goat:workload_attribution_coverage:ratio", host="thor-9"}'
+            value: 0.1

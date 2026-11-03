@@ -1,0 +1,173 @@
+# Observability overlay for the mgmt-host stack.
+#
+# Phase 2 MVP for the region A production PoC (two cloud EC2 hosts in
+# eu-central-1 modeling two Orins at one region A site). Each host runs
+# a self-contained Prometheus + Alertmanager + node-exporter +
+# postgres-exporter; Prometheus scrapes local services AND the PEER's
+# node-exporter via its Netbird mesh IP, so every site has a full
+# view of both nodes without a central hub.
+#
+# Composes on top of docker-compose.yml (and optionally
+# docker-compose.phase2.yml). Do NOT merge into the base compose:
+# keeping observability isolated lets us pull / restart / upgrade the
+# monitoring pipeline without touching the data plane.
+#
+# Usage (driven by ops/ansible/roles/observability/):
+#   docker compose -f docker-compose.yml -f docker-compose.obs.yml up -d
+#
+# Environment inputs (rendered into .env by Ansible):
+#   SITE_NAME                  — label applied to every series (e.g. vega-a)
+#   PEER_NODE_EXPORTER_TARGET  — "<peer-mesh-ip>:9100" (peer node-exporter)
+#   PEER_SIGNAL_METRICS_TARGET — "<peer-mesh-ip>:9090" (peer signal-server /metrics)
+#                                Peer signal-server /metrics is already bound
+#                                to 0.0.0.0:9090 in the base compose, so we
+#                                scrape it directly via the mesh IP.
+#   POSTGRES_EXPORTER_PASSWORD — password for the 'monitoring' PG role
+#                                (created by the observability Ansible role
+#                                before this stack is brought up)
+#
+# Ports (all bind localhost-only except node-exporter which must be
+# reachable by the peer over the Netbird mesh):
+#   127.0.0.1:9092   prometheus web UI (NOT 9090 — signal-a owns that;
+#                    NOT 9091 — phase2's signal-b owns that)
+#   127.0.0.1:9093   alertmanager web UI
+#   0.0.0.0:9100     node-exporter (mesh-reachable; SG/mesh ACL restricts)
+#   127.0.0.1:9187   postgres-exporter (loopback only; Prometheus scrapes
+#                    via the docker network, but the port binding helps
+#                    local-debug curls)
+
+services:
+
+  prometheus:
+    # Pinned per ADR 0703 — index digest captured 2026-04-27.
+    image: prom/prometheus:v2.54.1@sha256:69961df6ffa67598048a31aa2822d61f3c93b91d7db24e44d9bb03f99d520da9
+    container_name: prometheus
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    environment:
+      SITE_NAME: ${SITE_NAME:?set SITE_NAME in .env}
+      # Peer scrape targets — substituted into prometheus.yml at config
+      # load time. Empty defaults keep single-node dev working; the
+      # vega observability role pins these to the peer's private-VPC IP
+      # (see ops/ansible/roles/observability/tasks/main.yml → .env).
+      PEER_NODE_EXPORTER_TARGET: ${PEER_NODE_EXPORTER_TARGET:-}
+      PEER_SIGNAL_METRICS_TARGET: ${PEER_SIGNAL_METRICS_TARGET:-}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+      - --web.listen-address=:9090
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      # Host-local 9092 — signal-a already owns 127.0.0.1:9090 and
+      # phase2's signal-b owns 127.0.0.1:9091.
+      - "127.0.0.1:9092:9090"
+    # chrony_exporter runs as a systemd unit on the host (not a
+    # container) so it can read /run/chrony/chronyd.sock. Prometheus
+    # needs to reach 127.0.0.1:9123 on the host's loopback; the
+    # docker "host-gateway" alias resolves to the host IP on the
+    # bridge network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - mgmt
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0@sha256:45c3a586d4332d710bef92b06e90380c0b1f588968c00100d4b5e4e44c40ca5f
+    container_name: alertmanager
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          memory: 64M
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=:9093
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks:
+      - mgmt
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2@sha256:065914c03336590ebed517e7df38520f0efb44465fde4123c3f6b7328f5a9396
+    container_name: node-exporter
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          memory: 32M
+    # Standard host-facts mounts so node-exporter can read the host's
+    # /proc, /sys, and root filesystem (NOT the container's view).
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/docker/.+)($$|/)
+      - --web.listen-address=:9100
+    volumes:
+      - /:/host:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    ports:
+      # 0.0.0.0 intentional — the peer mgmt-host scrapes us via our
+      # Netbird mesh IP. Mesh ACLs restrict who can reach port 9100.
+      - "9100:9100"
+    networks:
+      - mgmt
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0@sha256:31bdf410910646a05c7edde8d95ab771c9d78fbfbc26b50a52548707496c284d
+    container_name: postgres-exporter
+    restart: unless-stopped
+    # Bulkhead — cgroup limits per failure-isolation.md §10.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          memory: 64M
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+    environment:
+      # Connects to postgres-a via the compose-internal network as the
+      # least-privilege 'monitoring' role (created by the observability
+      # Ansible role before this stack is brought up). Role has
+      # pg_monitor membership + SELECT on spock.* views.
+      DATA_SOURCE_NAME: "postgresql://monitoring:${POSTGRES_EXPORTER_PASSWORD:?set POSTGRES_EXPORTER_PASSWORD in .env}@postgres-a:5432/postgres?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: "/etc/postgres-exporter/queries.yml"
+    volumes:
+      - ./monitoring/postgres-exporter-queries.yml:/etc/postgres-exporter/queries.yml:ro
+    ports:
+      - "127.0.0.1:9187:9187"
+    networks:
+      - mgmt
+
+volumes:
+  prometheus-data:
+  alertmanager-data:

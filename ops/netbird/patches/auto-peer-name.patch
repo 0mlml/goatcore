@@ -1,0 +1,331 @@
+diff --git a/management/server/account/manager.go b/management/server/account/manager.go
+index b4516d512..6d10cc427 100644
+--- a/management/server/account/manager.go
++++ b/management/server/account/manager.go
+@@ -30,7 +30,7 @@ type Manager interface {
+ 	GetOrCreateAccountByUser(ctx context.Context, userAuth auth.UserAuth) (*types.Account, error)
+ 	GetAccount(ctx context.Context, accountID string) (*types.Account, error)
+ 	CreateSetupKey(ctx context.Context, accountID string, keyName string, keyType types.SetupKeyType, expiresIn time.Duration,
+-		autoGroups []string, usageLimit int, userID string, ephemeral bool, allowExtraDNSLabels bool) (*types.SetupKey, error)
++		autoGroups []string, usageLimit int, userID string, ephemeral bool, allowExtraDNSLabels bool, autoPeerName string) (*types.SetupKey, error)
+ 	SaveSetupKey(ctx context.Context, accountID string, key *types.SetupKey, userID string) (*types.SetupKey, error)
+ 	CreateUser(ctx context.Context, accountID, initiatorUserID string, key *types.UserInfo) (*types.UserInfo, error)
+ 	CreateUserInvite(ctx context.Context, accountID, initiatorUserID string, invite *types.UserInfo, expiresIn int) (*types.UserInvite, error)
+diff --git a/management/server/account/manager_mock.go b/management/server/account/manager_mock.go
+index 36e5fe39f..df3098609 100644
+--- a/management/server/account/manager_mock.go
++++ b/management/server/account/manager_mock.go
+@@ -240,18 +240,18 @@ func (mr *MockManagerMockRecorder) CreateRoute(ctx, accountID, prefix, networkTy
+ }
+ 
+ // CreateSetupKey mocks base method.
+-func (m *MockManager) CreateSetupKey(ctx context.Context, accountID, keyName string, keyType types.SetupKeyType, expiresIn time.Duration, autoGroups []string, usageLimit int, userID string, ephemeral, allowExtraDNSLabels bool) (*types.SetupKey, error) {
++func (m *MockManager) CreateSetupKey(ctx context.Context, accountID, keyName string, keyType types.SetupKeyType, expiresIn time.Duration, autoGroups []string, usageLimit int, userID string, ephemeral, allowExtraDNSLabels bool, autoPeerName string) (*types.SetupKey, error) {
+ 	m.ctrl.T.Helper()
+-	ret := m.ctrl.Call(m, "CreateSetupKey", ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels)
++	ret := m.ctrl.Call(m, "CreateSetupKey", ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels, autoPeerName)
+ 	ret0, _ := ret[0].(*types.SetupKey)
+ 	ret1, _ := ret[1].(error)
+ 	return ret0, ret1
+ }
+ 
+ // CreateSetupKey indicates an expected call of CreateSetupKey.
+-func (mr *MockManagerMockRecorder) CreateSetupKey(ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels interface{}) *gomock.Call {
++func (mr *MockManagerMockRecorder) CreateSetupKey(ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels, autoPeerName interface{}) *gomock.Call {
+ 	mr.mock.ctrl.T.Helper()
+-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateSetupKey", reflect.TypeOf((*MockManager)(nil).CreateSetupKey), ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels)
++	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateSetupKey", reflect.TypeOf((*MockManager)(nil).CreateSetupKey), ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels, autoPeerName)
+ }
+ 
+ // CreateUser mocks base method.
+diff --git a/management/server/http/handlers/setup_keys/setupkeys_handler.go b/management/server/http/handlers/setup_keys/setupkeys_handler.go
+index d267b6eea..901418de6 100644
+--- a/management/server/http/handlers/setup_keys/setupkeys_handler.go
++++ b/management/server/http/handlers/setup_keys/setupkeys_handler.go
+@@ -85,8 +85,13 @@ func (h *handler) createSetupKey(w http.ResponseWriter, r *http.Request) {
+ 		allowExtraDNSLabels = *req.AllowExtraDnsLabels
+ 	}
+ 
++	var autoPeerName string
++	if req.AutoPeerName != nil {
++		autoPeerName = *req.AutoPeerName
++	}
++
+ 	setupKey, err := h.accountManager.CreateSetupKey(r.Context(), accountID, req.Name, types.SetupKeyType(req.Type), expiresIn,
+-		req.AutoGroups, req.UsageLimit, userID, ephemeral, allowExtraDNSLabels)
++		req.AutoGroups, req.UsageLimit, userID, ephemeral, allowExtraDNSLabels, autoPeerName)
+ 	if err != nil {
+ 		util.WriteError(r.Context(), err, w)
+ 		return
+@@ -235,6 +240,12 @@ func ToResponseBody(key *types.SetupKey) *api.SetupKey {
+ 		state = "valid"
+ 	}
+ 
++	var autoPeerName *string
++	if key.AutoPeerName != "" {
++		t := key.AutoPeerName
++		autoPeerName = &t
++	}
++
+ 	return &api.SetupKey{
+ 		Id:                  key.Id,
+ 		Key:                 key.KeySecret,
+@@ -251,5 +262,6 @@ func ToResponseBody(key *types.SetupKey) *api.SetupKey {
+ 		UsageLimit:          key.UsageLimit,
+ 		Ephemeral:           key.Ephemeral,
+ 		AllowExtraDnsLabels: key.AllowExtraDNSLabels,
++		AutoPeerName:        autoPeerName,
+ 	}
+ }
+diff --git a/management/server/mock_server/account_mock.go b/management/server/mock_server/account_mock.go
+index ff369355e..ea3c37501 100644
+--- a/management/server/mock_server/account_mock.go
++++ b/management/server/mock_server/account_mock.go
+@@ -31,7 +31,7 @@ type MockAccountManager struct {
+ 	GetOrCreateAccountByUserFunc func(ctx context.Context, userAuth auth.UserAuth) (*types.Account, error)
+ 	GetAccountFunc               func(ctx context.Context, accountID string) (*types.Account, error)
+ 	CreateSetupKeyFunc           func(ctx context.Context, accountId string, keyName string, keyType types.SetupKeyType,
+-		expiresIn time.Duration, autoGroups []string, usageLimit int, userID string, ephemeral bool, allowExtraDNSLabels bool) (*types.SetupKey, error)
++		expiresIn time.Duration, autoGroups []string, usageLimit int, userID string, ephemeral bool, allowExtraDNSLabels bool, autoPeerName string) (*types.SetupKey, error)
+ 	GetSetupKeyFunc                       func(ctx context.Context, accountID, userID, keyID string) (*types.SetupKey, error)
+ 	AccountExistsFunc                     func(ctx context.Context, accountID string) (bool, error)
+ 	GetAccountIDByUserIdFunc              func(ctx context.Context, userAuth auth.UserAuth) (string, error)
+@@ -300,9 +300,10 @@ func (am *MockAccountManager) CreateSetupKey(
+ 	userID string,
+ 	ephemeral bool,
+ 	allowExtraDNSLabels bool,
++	autoPeerName string,
+ ) (*types.SetupKey, error) {
+ 	if am.CreateSetupKeyFunc != nil {
+-		return am.CreateSetupKeyFunc(ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels)
++		return am.CreateSetupKeyFunc(ctx, accountID, keyName, keyType, expiresIn, autoGroups, usageLimit, userID, ephemeral, allowExtraDNSLabels, autoPeerName)
+ 	}
+ 	return nil, status.Errorf(codes.Unimplemented, "method CreateSetupKey is not implemented")
+ }
+diff --git a/management/server/peer.go b/management/server/peer.go
+index a02e34e0d..3a8e69dd0 100644
+--- a/management/server/peer.go
++++ b/management/server/peer.go
+@@ -562,12 +562,13 @@ func (am *DefaultAccountManager) GetPeerNetwork(ctx context.Context, peerID stri
+ }
+ 
+ type peerAddAuthConfig struct {
+-	AccountID           string
+-	SetupKeyID          string
+-	SetupKeyName        string
+-	GroupsToAdd         []string
+-	AllowExtraDNSLabels bool
+-	Ephemeral           bool
++	AccountID            string
++	SetupKeyID           string
++	SetupKeyName         string
++	SetupKeyAutoPeerName string // already-resolved peer Name ("<label>-<hostname>") when the key carries AutoPeerName; empty otherwise
++	GroupsToAdd          []string
++	AllowExtraDNSLabels  bool
++	Ephemeral            bool
+ }
+ 
+ func (am *DefaultAccountManager) processPeerAddAuth(ctx context.Context, accountID, userID, encodedHashedKey string, peer *nbpeer.Peer, temporary, addedByUser, addedBySetupKey bool, opEvent *activity.Event) (*peerAddAuthConfig, error) {
+@@ -648,6 +649,9 @@ func (am *DefaultAccountManager) handleSetupKeyAddedPeer(ctx context.Context, en
+ 	config.Ephemeral = sk.Ephemeral
+ 	config.SetupKeyID = sk.Id
+ 	config.SetupKeyName = sk.Name
++	if sk.AutoPeerName != "" {
++		config.SetupKeyAutoPeerName = sk.ResolvePeerName(peer.Meta.Hostname)
++	}
+ 	config.AllowExtraDNSLabels = sk.AllowExtraDNSLabels
+ 	config.AccountID = sk.AccountID
+ 
+@@ -705,6 +709,11 @@ func (am *DefaultAccountManager) AddPeer(ctx context.Context, accountID, setupKe
+ 		}
+ 	}
+ 
++	peerName := peer.Meta.Hostname
++	if peerAddConfig.SetupKeyAutoPeerName != "" {
++		peerName = peerAddConfig.SetupKeyAutoPeerName
++	}
++
+ 	if err := domain.ValidateDomainsList(peer.ExtraDNSLabels); err != nil {
+ 		return nil, nil, nil, status.Errorf(status.InvalidArgument, "invalid extra DNS labels: %v", err)
+ 	}
+@@ -715,7 +724,7 @@ func (am *DefaultAccountManager) AddPeer(ctx context.Context, accountID, setupKe
+ 		AccountID:                   accountID,
+ 		Key:                         peer.Key,
+ 		Meta:                        peer.Meta,
+-		Name:                        peer.Meta.Hostname,
++		Name:                        peerName,
+ 		UserID:                      userID,
+ 		Status:                      &nbpeer.PeerStatus{Connected: false, LastSeen: registrationTime},
+ 		SSHEnabled:                  false,
+diff --git a/management/server/setupkey.go b/management/server/setupkey.go
+index 8d0509871..45a22492a 100644
+--- a/management/server/setupkey.go
++++ b/management/server/setupkey.go
+@@ -53,8 +53,10 @@ type SetupKeyUpdateOperation struct {
+ 
+ // CreateSetupKey generates a new setup key with a given name, type, list of groups IDs to auto-assign to peers registered with this key,
+ // and adds it to the specified account. A list of autoGroups IDs can be empty.
++// autoPeerName is optional; when non-empty, peers enrolled with this key
++// are named "<autoPeerName>-<hostname>" instead of bare hostname.
+ func (am *DefaultAccountManager) CreateSetupKey(ctx context.Context, accountID string, keyName string, keyType types.SetupKeyType,
+-	expiresIn time.Duration, autoGroups []string, usageLimit int, userID string, ephemeral bool, allowExtraDNSLabels bool) (*types.SetupKey, error) {
++	expiresIn time.Duration, autoGroups []string, usageLimit int, userID string, ephemeral bool, allowExtraDNSLabels bool, autoPeerName string) (*types.SetupKey, error) {
+ 
+ 	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.SetupKeys, operations.Create)
+ 	if err != nil {
+@@ -73,7 +75,7 @@ func (am *DefaultAccountManager) CreateSetupKey(ctx context.Context, accountID s
+ 			return status.Errorf(status.InvalidArgument, "invalid auto groups: %v", err)
+ 		}
+ 
+-		setupKey, plainKey = types.GenerateSetupKey(keyName, keyType, expiresIn, autoGroups, usageLimit, ephemeral, allowExtraDNSLabels)
++		setupKey, plainKey = types.GenerateSetupKey(keyName, keyType, expiresIn, autoGroups, usageLimit, ephemeral, allowExtraDNSLabels, autoPeerName)
+ 		setupKey.AccountID = accountID
+ 
+ 		events := am.prepareSetupKeyEvents(ctx, transaction, accountID, userID, autoGroups, nil, setupKey)
+diff --git a/management/server/types/setupkey.go b/management/server/types/setupkey.go
+index 3d421342d..e16996311 100644
+--- a/management/server/types/setupkey.go
++++ b/management/server/types/setupkey.go
+@@ -56,6 +56,13 @@ type SetupKey struct {
+ 	Ephemeral bool
+ 	// AllowExtraDNSLabels indicates if the key allows extra DNS labels
+ 	AllowExtraDNSLabels bool
++	// AutoPeerName, when non-empty, is the operator-assigned label combined with
++	// the device-reported hostname to form the peer Name at registration time:
++	// "<AutoPeerName>-<hostname>". Both halves are preserved so an operator can
++	// match mint-intent (the assigned label) to the physical device (its
++	// self-reported identifier). Empty preserves the historical behavior
++	// (Name = peer.Meta.Hostname only).
++	AutoPeerName string
+ }
+ 
+ // Copy copies SetupKey to a new object
+@@ -82,6 +89,7 @@ func (key *SetupKey) Copy() *SetupKey {
+ 		UsageLimit:          key.UsageLimit,
+ 		Ephemeral:           key.Ephemeral,
+ 		AllowExtraDNSLabels: key.AllowExtraDNSLabels,
++		AutoPeerName:        key.AutoPeerName,
+ 	}
+ }
+ 
+@@ -151,9 +159,12 @@ func (key *SetupKey) IsOverUsed() bool {
+ 	return limit > 0 && key.UsedTimes >= limit
+ }
+ 
+-// GenerateSetupKey generates a new setup key
++// GenerateSetupKey generates a new setup key.
++// autoPeerName is optional; when non-empty, peers enrolled with this key are
++// named "<autoPeerName>-<hostname>" at registration. An empty string preserves
++// the historical hostname-only behavior.
+ func GenerateSetupKey(name string, t SetupKeyType, validFor time.Duration, autoGroups []string,
+-	usageLimit int, ephemeral bool, allowExtraDNSLabels bool) (*SetupKey, string) {
++	usageLimit int, ephemeral bool, allowExtraDNSLabels bool, autoPeerName string) (*SetupKey, string) {
+ 	key := strings.ToUpper(uuid.New().String())
+ 	limit := usageLimit
+ 	if t == SetupKeyOneOff {
+@@ -183,11 +194,24 @@ func GenerateSetupKey(name string, t SetupKeyType, validFor time.Duration, autoG
+ 		UsageLimit:          limit,
+ 		Ephemeral:           ephemeral,
+ 		AllowExtraDNSLabels: allowExtraDNSLabels,
++		AutoPeerName:        autoPeerName,
+ 	}, key
+ }
+ 
++// ResolvePeerName returns the peer Name to assign at registration. When
++// AutoPeerName is set, the operator-assigned label is combined with the
++// device-reported hostname so both halves of the identity are preserved:
++// "<AutoPeerName>-<hostname>". When AutoPeerName is empty, returns the bare
++// hostname (historical behavior).
++func (key *SetupKey) ResolvePeerName(hostname string) string {
++	if key.AutoPeerName == "" {
++		return hostname
++	}
++	return key.AutoPeerName + "-" + hostname
++}
++
+ // GenerateDefaultSetupKey generates a default reusable setup key with an unlimited usage and 30 days expiration
+ func GenerateDefaultSetupKey() (*SetupKey, string) {
+ 	return GenerateSetupKey(DefaultSetupKeyName, SetupKeyReusable, DefaultSetupKeyDuration, []string{},
+-		SetupKeyUnlimitedUsage, false, false)
++		SetupKeyUnlimitedUsage, false, false, "")
+ }
+diff --git a/shared/management/http/api/openapi.yml b/shared/management/http/api/openapi.yml
+index 0b855db67..26c8d07a6 100644
+--- a/shared/management/http/api/openapi.yml
++++ b/shared/management/http/api/openapi.yml
+@@ -1133,6 +1133,15 @@ components:
+           description: Allow extra DNS labels to be added to the peer
+           type: boolean
+           example: true
++        auto_peer_name:
++          description: |
++            Optional operator-assigned label. When non-empty, peers enrolled
++            with this key are named "<auto_peer_name>-<hostname>" at
++            registration so both the mint-intent label and the device-reported
++            hostname are preserved on the peer Name. Empty preserves the
++            historical behavior (Name = device-reported hostname).
++          type: string
++          example: "vendor-acme-tactical-team-A"
+       required:
+         - id
+         - key
+@@ -1222,6 +1231,15 @@ components:
+           description: Allow extra DNS labels to be added to the peer
+           type: boolean
+           example: true
++        auto_peer_name:
++          description: |
++            Optional operator-assigned label. When non-empty, peers enrolled
++            with this key are named "<auto_peer_name>-<hostname>" at
++            registration so both the mint-intent label and the device-reported
++            hostname are preserved on the peer Name. Empty preserves the
++            historical behavior (Name = device-reported hostname).
++          type: string
++          example: "vendor-acme-tactical-team-A"
+       required:
+         - name
+         - type
+diff --git a/shared/management/http/api/types.gen.go b/shared/management/http/api/types.gen.go
+index 0317b8183..61b1e80c9 100644
+--- a/shared/management/http/api/types.gen.go
++++ b/shared/management/http/api/types.gen.go
+@@ -1761,6 +1761,9 @@ type CreateSetupKeyRequest struct {
+ 	// AutoGroups List of group IDs to auto-assign to peers registered with this key
+ 	AutoGroups []string `json:"auto_groups"`
+ 
++	// AutoPeerName Optional operator-assigned label. When non-empty, peers enrolled with this key are named "<auto_peer_name>-<hostname>" at registration so both the mint-intent label and the device-reported hostname are preserved on the peer Name. Empty preserves the historical behavior (Name = device-reported hostname).
++	AutoPeerName *string `json:"auto_peer_name,omitempty"`
++
+ 	// Ephemeral Indicate that the peer will be ephemeral or not
+ 	Ephemeral *bool `json:"ephemeral,omitempty"`
+ 
+@@ -4150,6 +4153,9 @@ type SetupKey struct {
+ 	// AutoGroups List of group IDs to auto-assign to peers registered with this key
+ 	AutoGroups []string `json:"auto_groups"`
+ 
++	// AutoPeerName Optional operator-assigned label. When non-empty, peers enrolled with this key are named "<auto_peer_name>-<hostname>" at registration so both the mint-intent label and the device-reported hostname are preserved on the peer Name. Empty preserves the historical behavior (Name = device-reported hostname).
++	AutoPeerName *string `json:"auto_peer_name,omitempty"`
++
+ 	// Ephemeral Indicate that the peer will be ephemeral or not
+ 	Ephemeral bool `json:"ephemeral"`
+ 
+@@ -4198,6 +4204,9 @@ type SetupKeyBase struct {
+ 	// AutoGroups List of group IDs to auto-assign to peers registered with this key
+ 	AutoGroups []string `json:"auto_groups"`
+ 
++	// AutoPeerName Optional operator-assigned label. When non-empty, peers enrolled with this key are named "<auto_peer_name>-<hostname>" at registration so both the mint-intent label and the device-reported hostname are preserved on the peer Name. Empty preserves the historical behavior (Name = device-reported hostname).
++	AutoPeerName *string `json:"auto_peer_name,omitempty"`
++
+ 	// Ephemeral Indicate that the peer will be ephemeral or not
+ 	Ephemeral bool `json:"ephemeral"`
+ 
+@@ -4243,6 +4252,9 @@ type SetupKeyClear struct {
+ 	// AutoGroups List of group IDs to auto-assign to peers registered with this key
+ 	AutoGroups []string `json:"auto_groups"`
+ 
++	// AutoPeerName Optional operator-assigned label. When non-empty, peers enrolled with this key are named "<auto_peer_name>-<hostname>" at registration so both the mint-intent label and the device-reported hostname are preserved on the peer Name. Empty preserves the historical behavior (Name = device-reported hostname).
++	AutoPeerName *string `json:"auto_peer_name,omitempty"`
++
+ 	// Ephemeral Indicate that the peer will be ephemeral or not
+ 	Ephemeral bool `json:"ephemeral"`
+ 

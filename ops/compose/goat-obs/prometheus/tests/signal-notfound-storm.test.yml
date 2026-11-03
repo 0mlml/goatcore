@@ -1,0 +1,131 @@
+# promtool unit tests for rules/signal-notfound-storm.yml.
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/signal-notfound-storm.test.yml
+#
+# The load-bearing cases are 1 and 4 — the ones that must NOT fire. A signal
+# plane always answers some notfound (a peer closes its laptop mid-negotiation
+# and the offer lands on nobody), and a mesh bringup makes everything call
+# everything before anything has registered. A rule that pages on either teaches
+# people to ignore it, which is the failure the whole surface exists to prevent.
+#
+# Counters are given as cumulative totals, since that is what
+# `signal_server_deliver_duration_seconds_count` is; the rules take rate() over
+# them. Series are written long enough to cover each rule's `for:`.
+
+rule_files:
+  - ../rules/signal-notfound-storm.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Case 1 — HEALTHY. A trickle of notfound against heavy delivered traffic:
+  # 0.5/s notfound, 50/s delivered (1% ratio). Under both thresholds. Nothing
+  # may fire. This is the resting state of a working goatnet.
+  - interval: 1m
+    input_series:
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="notfound",path="unary_send"}'
+        values: '0+30x120'
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="delivered",path="unary_send"}'
+        values: '0+3000x120'
+      - series: 'signal_server_connected_peers{node="orin-a"}'
+        values: '6x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SignalNotFoundStorm
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: SignalNotFoundRatioHigh
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: SignalMeterUnread
+        exp_alerts: []
+
+  # Case 2 — THE STORM. ~13 notfound/s sustained, almost no
+  # delivered traffic. Both the absolute rule and the ratio rule must fire.
+  # 13/s = 780/min.
+  - interval: 1m
+    input_series:
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="notfound",path="unary_send"}'
+        values: '0+780x120'
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="delivered",path="unary_send"}'
+        values: '0+6x120'
+      - series: 'signal_server_connected_peers{node="orin-a"}'
+        values: '6x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SignalNotFoundStorm
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: signal
+              node: orin-a
+            exp_annotations:
+              summary: 'signal plane on orin-a is answering notfound 13.0/s'
+              description: >-
+                Sustained for 30 minutes. Peers are retrying sessions to peers that are not registered, and NetBird does not back off. This is load and log volume, not an outage — the mesh keeps working for everyone who is actually present. Find the caller in the signal log, then look at what policy grants it reach to absent peers; a clique group whose members have gone offline is the usual cause.
+              runbook_url: 'https://github.com/usareur-af/goatcore/blob/main/docs/design/mesh-acl.md'
+
+  # Case 3 — THE SMALL-GOATNET SHAPE. Same pathology, low volume: 2/s notfound
+  # against 0.5/s delivered. Below the absolute threshold, so the storm rule
+  # stays quiet — the ratio rule is the one that must catch it. This is why
+  # there are two rules rather than one.
+  - interval: 1m
+    input_series:
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="notfound",path="unary_send"}'
+        values: '0+120x180'
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="delivered",path="unary_send"}'
+        values: '0+30x180'
+      - series: 'signal_server_connected_peers{node="orin-a"}'
+        values: '3x180'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: SignalNotFoundStorm
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: SignalNotFoundRatioHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: signal
+              node: orin-a
+            exp_annotations:
+              summary: '80% of signal traffic on orin-a is notfound'
+              description: >-
+                Over an hour, most signal delivery attempts are to peers that are not registered. Expect this briefly during a bringup; sustained, it means peers hold policy reach to peers that no longer exist and are retrying them indefinitely. Reconcile the group membership against who is actually on the mesh.
+              runbook_url: 'https://github.com/usareur-af/goatcore/blob/main/docs/design/mesh-acl.md'
+
+  # Case 4 — BRINGUP, MUST NOT PAGE. 100% notfound for 45 minutes while a site
+  # comes up and nothing has registered yet, then it clears. The ratio rule's
+  # 1h `for:` is what makes this quiet; shortening it would page on every
+  # planned restart.
+  - interval: 1m
+    input_series:
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="notfound",path="unary_send"}'
+        values: '0+60x45 2700+0x75'
+      - series: 'signal_server_deliver_duration_seconds_count{node="orin-a",outcome="delivered",path="unary_send"}'
+        values: '0+0x45 0+3000x75'
+      - series: 'signal_server_connected_peers{node="orin-a"}'
+        values: '0x45 6x75'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: SignalNotFoundRatioHigh
+        exp_alerts: []
+      - eval_time: 110m
+        alertname: SignalNotFoundRatioHigh
+        exp_alerts: []
+
+  # Case 6 — THE FITNESS TEST FOR obs_rule_files. No input series at all: a
+  # goatnet whose prometheus scrapes no signal server. Every alert in this file
+  # must be silent, or the file cannot be in the shared rule list. This is the
+  # assertion the defaults/main.yml note points at; it is why the absent()
+  # guard was removed rather than kept.
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 120m
+        alertname: SignalNotFoundStorm
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: SignalNotFoundRatioHigh
+        exp_alerts: []

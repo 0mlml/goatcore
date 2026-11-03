@@ -1,0 +1,131 @@
+# promtool tests for rules/signal-federation.yml.
+#
+# The case that matters most is `never_delivered_absent_series`: on a
+# federation that has NEVER delivered, signal-server never creates the
+# {outcome="delivered"} series at all. A rule written as a bare `== 0` matches
+# nothing against an absent selector and stays silent forever — failing in
+# exactly the direction the alert exists to catch. That test pins the
+# `or vector(0)` guard; delete the guard and it goes red.
+
+rule_files:
+  - ../rules/signal-federation.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------
+  # F-333 exactly: forwards leaving, delivered series ABSENT (never created).
+  # ---------------------------------------------------------------------
+  - interval: 1m
+    name: never_delivered_absent_series
+    input_series:
+      - series: 'signal_server_forward_sent_total{outcome="notfound",node="thor-a"}'
+        values: '0+200x90'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: FederationForwardsNeverDeliver
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              domain: signal
+            exp_annotations:
+              summary: "Signal federation is forwarding and delivering NOTHING ()"
+              description: >-
+                Offers are being federated to the peer signal-server and not one has been delivered in the last 15m, sustained for an hour. The usual cause is that the peer HOLDS NO PEERS — e.g. it is drained at the relays' haproxy (`state maint`) while this node still has `federation_peers_for_a` pointing at it. That combination is pure cost: every forward crosses the metered relay to discover the recipient was never there. Check the peer's `signal_server_connected_peers` (on the peer's own metrics port, not here) and the relay haproxy state together — F-333 exists because those two facts live in different systems and nothing compared them. Same-shard delivery is unaffected by this alert.
+
+  # ---------------------------------------------------------------------
+  # Healthy federation: deliveries are happening -> MUST stay silent.
+  # ---------------------------------------------------------------------
+  - interval: 1m
+    name: delivering_normally_is_quiet
+    input_series:
+      - series: 'signal_server_forward_sent_total{outcome="notfound",node="thor-a"}'
+        values: '0+50x90'
+      - series: 'signal_server_forward_sent_total{outcome="delivered",node="thor-a"}'
+        values: '0+30x90'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: FederationForwardsNeverDeliver
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------
+  # Idle federation: nothing sent at all -> not a finding, stay silent.
+  # A drained goatnet that has correctly turned federation OFF must not page.
+  # ---------------------------------------------------------------------
+  - interval: 1m
+    name: federation_off_is_quiet
+    input_series:
+      - series: 'signal_server_forward_sent_total{outcome="notfound",node="thor-a"}'
+        values: '1000x90'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: FederationForwardsNeverDeliver
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------
+  # Presence empty while federating.
+  # ---------------------------------------------------------------------
+  - interval: 1m
+    name: presence_empty_while_federating
+    input_series:
+      - series: 'signal_server_presence_keys{node="thor-a"}'
+        values: '0x60'
+      - series: 'signal_server_forward_sent_total{outcome="notfound",node="thor-a"}'
+        values: '0+200x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: SignalPresenceEmptyWhileFederating
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              domain: signal
+            exp_annotations:
+              summary: "Signal presence table is EMPTY while federating ()"
+              description: >-
+                `signal_server_presence_keys` is 0, so this signal-server cannot tell which shard a peer belongs to and forwards everything it does not itself hold. Expect forwards/sec to track presence-routes/sec exactly. Presence-sync is compiled into the binary but is not enabled by any flag or env on this deployment.
+
+  # Presence populated -> silent even while federating (cross-site is normal).
+  - interval: 1m
+    name: presence_populated_is_quiet
+    input_series:
+      - series: 'signal_server_presence_keys{node="thor-a"}'
+        values: '42x60'
+      - series: 'signal_server_forward_sent_total{outcome="notfound",node="thor-a"}'
+        values: '0+200x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: SignalPresenceEmptyWhileFederating
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------
+  # Transport unreliability is a DIFFERENT fault from an absent recipient.
+  # ---------------------------------------------------------------------
+  - interval: 1m
+    name: rpc_errors_over_threshold
+    input_series:
+      - series: 'signal_server_forward_sent_total{outcome="rpc_error",node="thor-a"}'
+        values: '0+20x60'
+      - series: 'signal_server_forward_sent_total{outcome="delivered",node="thor-a"}'
+        values: '0+100x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: FederationTransportUnreliable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              domain: signal
+            exp_annotations:
+              summary: "Over 5% of signal federation forwards are RPC errors ()"
+              description: >-
+                The federation transport is failing, which is a different fault from the recipient being absent — read this one as a path problem (mesh flap, relay tunnel, proxy backend) and FederationForwardsNeverDeliver as a topology problem.
+
+  # A clean transport stays quiet even at high volume.
+  - interval: 1m
+    name: clean_transport_is_quiet
+    input_series:
+      - series: 'signal_server_forward_sent_total{outcome="delivered",node="thor-a"}'
+        values: '0+500x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: FederationTransportUnreliable
+        exp_alerts: []

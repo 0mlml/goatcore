@@ -1,0 +1,151 @@
+# Container-healthcheck alerts.
+#
+# A fabric router can sit `Up (unhealthy)` for hours with zero operator-visible
+# signal, on FD exhaustion or a new-session admission seizure. `docker ps`
+# says Up, the process is alive, but the service is dead or seized:
+# exactly the state a docker HEALTHCHECK exists to catch, and the one
+# state none of the other alerts cover (ThorOOMKill needs a kill,
+# ComposeServiceNotRunning needs an exit, up{} needs a scrape target).
+#
+# Metric: goat_container_health_status{cid,name,status} 1
+# Source: goat-obs-textfile.sh (*/5 root cron) → node-exporter textfile
+#         collector. Raw-cgroup cadvisor cannot see State.Health, so the
+#         textfile path is the only source for this.
+#
+# Cadence honesty: the publisher runs every 5m and node-exporter scrapes
+# every 15s, so worst-case time-to-fire is ~cron(5m) + for(10m) ≈ 15m.
+# That is deliberate — docker marks containers unhealthy transiently
+# during slow starts and deploys, and a real seizure runs far longer.
+#
+# Textfile metrics never expire: if the cron dies, the last written
+# state persists and would silently mask a later wedge. The staleness
+# alert below closes that masking loop.
+
+groups:
+  - name: container-health
+    interval: 30s
+    rules:
+
+      # Any container whose own HEALTHCHECK has been failing for 10m.
+      # Warning tier — Slack/email/ntfy fan-out, operator-investigable.
+      - alert: ContainerUnhealthy
+        expr: goat_container_health_status{status="unhealthy"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          component: container-health
+        annotations:
+          summary: "container {{ $labels.name }} reports docker health=unhealthy for 10m+"
+          description: |
+            The container's own HEALTHCHECK has been failing for 10+
+            minutes while the process stays up — `docker ps` will show
+            `Up (unhealthy)`. This is the hang class, not the crash
+            class: nothing restarts it and nothing else alerts on it.
+            Triage on the host:
+              docker inspect {{ $labels.name }} | jq '.[0].State.Health'
+              docker logs --tail 50 {{ $labels.name }}
+            A restart clears the July 2026 router variants (F-248 fd
+            exhaustion, F-253 admission seizure) but file/annotate a
+            finding before restarting — the wedged state is the evidence.
+
+      # Critical tier — the fabric router. When it seizes, every new
+      # zenoh session on the goatnet fails while established traffic
+      # keeps flowing, so the outage is invisible from most surfaces
+      # (goat status stays green; goat health fails). Pages via
+      # PagerDuty per ADR 1059.
+      - alert: FabricRouterUnhealthy
+        expr: goat_container_health_status{status="unhealthy", name=~".*zenoh-router.*"} == 1
+        for: 10m
+        labels:
+          severity: critical
+          component: container-health
+        annotations:
+          summary: "CRITICAL: fabric router {{ $labels.name }} unhealthy for 10m+"
+          description: |
+            The zenoh router's HEALTHCHECK (REST admin query) has been
+            failing 10+ minutes. New session opens are likely stalling
+            or failing fleet-wide on this goatnet while established
+            sessions keep flowing — goat health fails, goat status
+            stays green. Prior art: F-248 (fd exhaustion, 2-day hang),
+            F-253 (admission seizure, CLOSE-WAIT accumulation).
+            Capture evidence, then restart:
+              ss -tan state close-wait | wc -l   # inside the container netns
+              docker restart {{ $labels.name }}
+
+      # Critical tier — other LOAD-BEARING services (netbird signal/mgmt, the
+      # identity plane, postgres, the metrics ingest). If any of these hangs,
+      # the goatnet degrades. Pages via PagerDuty. Coverage caveat: this fires
+      # only for containers that ship a docker HEALTHCHECK (goat_container_health_status
+      # only exists for those); a service with no healthcheck won't be seen here —
+      # see the ComposeServiceNotRunning / up{} alerts for hard-down coverage.
+      # The set below includes the Thor's identity containers — portal,
+      # id-console, grant-keyd — so they cannot hang without anything at this tier
+      # firing. They are load-bearing in the same sense as kratos: cert mint,
+      # firing. They are load-bearing in the same sense as kratos: cert mint,
+      # the onboarding contract, and grant key distribution respectively.
+      # (fabric-crawler + onboard-runner are measurement/automation, not
+      # enforcement — they get the warning tier below instead of a page.)
+      # `grant-keyd` also matches grant-keyd-spiffe-helper via the trailing
+      # `.*`, which is intended: without a fresh SVID the daemon cannot
+      # publish. Deliberately NOT `.*zenoh.*` — that would double-page with
+      # FabricRouterUnhealthy on the router.
+      - alert: CriticalServiceUnhealthy
+        expr: goat_container_health_status{status="unhealthy", name=~"(signal|management|.*kratos.*|.*hydra.*|.*postgres.*|relay-metrics-ingest|goat-zenoh-portal|goat-id-console|grant-keyd).*"} == 1
+        for: 5m
+        labels:
+          severity: critical
+          component: container-health
+        annotations:
+          summary: "CRITICAL: load-bearing service {{ $labels.name }} unhealthy 5m+"
+          description: |
+            A load-bearing service (netbird signal/management, Ory kratos/hydra,
+            postgres, the relay-metrics ingest, or a Thor identity container —
+            portal / id-console / grant-keyd) has reported docker
+            health=unhealthy for 5m+ while its process stays up. The goatnet is
+            degrading. Triage on the host:
+              docker inspect {{ $labels.name }} | jq '.[0].State.Health'
+              docker logs --tail 80 {{ $labels.name }}
+
+      # Identity-plane measurement + automation. A hang here does not degrade
+      # the goatnet, it degrades what you can SEE of it (the crawler's census +
+      # budget classification) or delays onboarding execution — so it is a
+      # warning, not a page. Faster than the generic 10m ContainerUnhealthy
+      # because a blind crawler silently blanks the topic-budget exception tier
+      # (the F-177 failure class applied to the instrument).
+      - alert: IdentityPlaneServiceUnhealthy
+        expr: goat_container_health_status{status="unhealthy", name=~"(fabric-crawler|onboard-runner).*"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "identity-plane service {{ $labels.name }} unhealthy 5m+"
+          description: |
+            fabric-crawler (fabric census + topic-budget classification) or
+            onboard-runner (the pull-model onboarding auto-executor) has
+            reported docker health=unhealthy for 5m+. Nothing is denied while
+            this holds, but measurement or automation has stopped — a blind
+            crawler makes every owner read `unmeasured` and silently disarms
+            ZenohTopicBudgetException. Triage on the host:
+              docker inspect {{ $labels.name }} | jq '.[0].State.Health'
+              docker logs --tail 80 {{ $labels.name }}
+
+      # The publisher itself died — without this, the last-written
+      # health state persists in the textfile forever and masks any
+      # later wedge. Canary metric has existed since F-242; this is
+      # the first alert on it.
+      - alert: ObsTextfileStale
+        expr: time() - goat_obs_textfile_last_run_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          component: container-health
+        annotations:
+          summary: "goat-obs-textfile cron stale for 15m+ — health metrics frozen"
+          description: |
+            goat-obs-textfile.sh (*/5 root cron) has not completed a run
+            in 15+ minutes. Every textfile metric — container id→name
+            map, container health status — is frozen at its last value
+            and can silently mask a real failure. Check on the host:
+              sudo grep goat-obs /var/log/syslog | tail
+              sudo crontab -l | grep goat-obs

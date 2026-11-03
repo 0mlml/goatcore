@@ -1,0 +1,131 @@
+diff --git a/management/cmd/service_user.go b/management/cmd/service_user.go
+new file mode 100644
+--- /dev/null
++++ b/management/cmd/service_user.go
+@@ -0,0 +1,114 @@
++package cmd
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"regexp"
++	"strings"
++
++	"github.com/spf13/cobra"
++
++	"github.com/netbirdio/netbird/management/server/store"
++	"github.com/netbirdio/netbird/management/server/types"
++)
++
++// newServiceUserCommands builds the `service-user` command tree. Its purpose is
++// IaC bootstrap: mint an admin service user + API token OFFLINE, directly against
++// the store, with no dashboard and no OIDC login. This closes the chicken-and-egg
++// where every scripted NetBird API call needs an admin token, but the only
++// documented way to create the first one was a human clicking through the web UI.
++func newServiceUserCommands() *cobra.Command {
++	var (
++		suName      string
++		suRole      string
++		suExpires   int
++		suAccountID string
++	)
++
++	suCmd := &cobra.Command{
++		Use:   "service-user",
++		Short: "Manage service users offline (store-direct, no OIDC)",
++	}
++
++	bootstrapCmd := &cobra.Command{
++		Use:   "bootstrap-token",
++		Short: "Idempotently ensure an admin service user exists and mint an API token",
++		Long: "Creates (idempotently, by a deterministic id derived from --name) a service\n" +
++			"user with the given role and mints a fresh personal access token for it,\n" +
++			"writing ONLY the plaintext token to stdout so a deploy step can capture it.\n" +
++			"Runs directly against the management store — no dashboard, no OIDC. Intended\n" +
++			"to be invoked once per goatnet standup by the IaC deploy, replacing the manual\n" +
++			"dashboard token-creation step.",
++		RunE: func(cmd *cobra.Command, _ []string) error {
++			return withTokenStore(cmd, func(ctx context.Context, s store.Store) error {
++				return runServiceUserBootstrap(ctx, s, cmd.OutOrStdout(), suName, suRole, suExpires, suAccountID)
++			})
++		},
++	}
++	bootstrapCmd.Flags().StringVar(&suName, "name", "", "Service-user + token name (required, e.g. onboard-runner)")
++	bootstrapCmd.Flags().StringVar(&suRole, "role", "admin", "Role: admin | user | network_admin | auditor")
++	bootstrapCmd.Flags().IntVar(&suExpires, "expires-in-days", 365, "Token lifetime in days")
++	bootstrapCmd.Flags().StringVar(&suAccountID, "account-id", "", "Account id (default: the sole account)")
++	if err := bootstrapCmd.MarkFlagRequired("name"); err != nil {
++		panic(err)
++	}
++
++	suCmd.AddCommand(bootstrapCmd)
++	suCmd.PersistentFlags().StringVar(&tokenDatadir, "datadir", "", "Override the data directory from config (where store.db is located)")
++	return suCmd
++}
++
++var svcIDSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
++
++func runServiceUserBootstrap(ctx context.Context, s store.Store, w io.Writer, name, role string, expiresInDays int, accountID string) error {
++	if strings.TrimSpace(name) == "" {
++		return fmt.Errorf("--name is required")
++	}
++	if expiresInDays <= 0 {
++		return fmt.Errorf("--expires-in-days must be positive")
++	}
++
++	if accountID == "" {
++		accounts := s.GetAllAccounts(ctx)
++		switch len(accounts) {
++		case 0:
++			return fmt.Errorf("no account exists yet — an owner must complete first login (dashboard bootstrap) before a token can be minted")
++		case 1:
++			accountID = accounts[0].Id
++		default:
++			return fmt.Errorf("%d accounts present; disambiguate with --account-id", len(accounts))
++		}
++	}
++
++	ur := types.StrRoleToUserRole(role)
++	if ur == types.UserRoleUnknown {
++		return fmt.Errorf("unknown role %q (expected admin|user|network_admin|auditor)", role)
++	}
++
++	// Deterministic id so re-running the standup upserts the SAME service user
++	// rather than piling up duplicates — the IaC-idempotent property.
++	userID := "svc-" + svcIDSanitizer.ReplaceAllString(strings.ToLower(name), "-")
++
++	// Name/Email are field-ENCRYPTED at rest (User.EncryptSensitiveData); on read
++	// GetUserByPATID calls DecryptSensitiveData and errors on a plaintext value,
++	// which surfaces as a 401 at auth time. A service user needs neither — its
++	// identity is ServiceUserName (not encrypted) — so leave both empty.
++	user := types.NewUser(userID, ur, true, false, name, []string{}, "api", "", "")
++	user.AccountID = accountID
++	if err := s.SaveUser(ctx, user); err != nil {
++		return fmt.Errorf("save service user: %w", err)
++	}
++
++	gen, err := types.CreateNewPAT(name, expiresInDays, user.Id, "netbird-mgmt service-user bootstrap-token")
++	if err != nil {
++		return fmt.Errorf("generate token: %w", err)
++	}
++	if err := s.SavePAT(ctx, &gen.PersonalAccessToken); err != nil {
++		return fmt.Errorf("save token: %w", err)
++	}
++
++	// ONLY the token on stdout — the deploy captures it. Diagnostics go to stderr.
++	fmt.Fprintln(w, gen.PlainToken)
++	return nil
++}
+diff --git a/management/cmd/root.go b/management/cmd/root.go
+--- a/management/cmd/root.go
++++ b/management/cmd/root.go
+@@ -86,4 +86,8 @@
+ 	tc := newTokenCommands()
+ 	tc.PersistentFlags().StringVar(&nbconfig.MgmtConfigPath, "config", defaultMgmtConfig, "Netbird config file location")
+ 	rootCmd.AddCommand(tc)
++
++	su := newServiceUserCommands()
++	su.PersistentFlags().StringVar(&nbconfig.MgmtConfigPath, "config", defaultMgmtConfig, "Netbird config file location")
++	rootCmd.AddCommand(su)
+ }

@@ -1,0 +1,292 @@
+# Audit-subscriber + audit-integrity bucket observability alert rules.
+#
+# audit-subscriber S3 puts can silently fail with no operator-visible
+# signal, which loses audit data until something else surfaces it.
+#
+# Metric sources:
+#   - audit-subscriber emits Prometheus metrics on :9303
+#     (job=audit-subscriber). Notable series, as REGISTERED in
+#     ops/zenoh-trial-peers/audit-subscriber/src/main.rs:
+#       goat_audit_samples_total{vendor,key_pattern}  — samples observed
+#       goat_audit_write_errors_total                 — S3 PutObject failures
+#       goat_audit_batches_uploaded_total             — batches uploaded OK
+#       goat_audit_drop_total                         — writer channel full
+#       goat_audit_subscriber_session_state           — 1 when subscribed
+#
+#     Key alerts on these registered names; other names in old notes
+#     (goat_audit_subscriber_s3_put_failed_total and friends) are not emitted
+#     by the exporter.
+#   - MinIO emits per-bucket usage AND the configured quota on
+#     /minio/v2/metrics/bucket (job=minio-bucket in prometheus.yml):
+#     minio_bucket_usage_total_bytes + minio_bucket_quota_total_bytes.
+#     (Current MinIO exports the quota natively.)
+#
+# Severity discipline matches postgres-storage.yml:
+#   - critical: drives an immediate page (data being lost right now).
+#   - warning: needs human eyes within a working day.
+#   - info: trend / capacity-planning signal — never paging.
+#
+# See also:
+#   - docs/findings/F-169-audit-subscriber-s3-puts-silently-fail-no-alert.md
+#   - docs/findings/F-171-minio-lifecycle-vs-object-lock-retention-retains-longer-than-policy.md
+#   - docs/design/zenoh-audit-external-subscriber.md
+#   - ADR 0811 (audit-log integrity)
+
+groups:
+  - name: audit-subscriber.writes
+    rules:
+
+      # Any sustained put failures = data being dropped right now. The
+      # audit-subscriber buffers in-memory and drops batches when S3
+      # writes fail (no on-disk spool), so every failed put is lost
+      # events. The 10m hold-down prevents single-batch transient
+      # flakes from paging while still surfacing the genuine "stuck"
+      # case within the same hour.
+      - alert: AuditSubscriberPutsFailing
+        expr: rate(goat_audit_write_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+          component: audit-subscriber
+        annotations:
+          summary: "audit-subscriber S3 puts failing for {{ $labels.instance }}"
+          description: |
+            audit-subscriber is dropping audit batches on S3 PUT failure
+            for at least 10 minutes. Every failed batch = lost audit
+            events (no on-disk spool).
+
+            Common causes (in observed order):
+              - audit-integrity bucket quota exceeded — see
+                AuditBucketQuotaHigh below; the underlying error is
+                often masked as a misleading 403 AccessDenied for
+                non-root MinIO users.
+              - MinIO container down or unhealthy.
+              - audit-subscriber's S3 credentials rotated without the
+                role re-applying.
+              - Bucket policy drift removed write permission.
+
+            Triage:
+              - `docker logs --tail 30 audit-subscriber` for the
+                underlying SDK error.
+              - `mc cp /tmp/probe.ndjson root/audit-integrity/probe.ndjson`
+                as the MinIO root user to see the unmasked error
+                
+
+      # Subscriber receives events from Zenoh but emits nothing — the
+      # service is wedged upstream of S3 (zenoh session dropped,
+      # subscriber task exited, container is alive but not doing work).
+      # A clock-sync race at boot can leave audit-subscriber in this state.
+      - alert: AuditSubscriberStalled
+        expr: |
+          sum by (instance) (rate(goat_audit_samples_total[5m])) == 0
+          AND ON(instance)
+          sum by (instance) (rate(goat_audit_samples_total[1h] offset 1h)) > 0
+        for: 15m
+        labels:
+          severity: critical
+          component: audit-subscriber
+        annotations:
+          summary: "audit-subscriber stopped receiving events for {{ $labels.instance }}"
+          description: |
+            audit-subscriber received 0 events in the last 5m but was
+            receiving them an hour ago. Subscriber task likely exited
+            (zenoh session drop, clock skew on container start, ACL
+            change). Container may show "Up" while the loop is dead.
+
+            Triage:
+              - `docker logs audit-subscriber | grep "subscriber task exited"`
+              - `docker inspect audit-subscriber --format "{{ .State.StartedAt }}"`
+                — if epoch 1970, hit F-165 chrony-presync race; restart.
+              - Cross-check with flashlight — if flashlight shows live
+                events on the fabric, the wire is OK and the gap is
+                audit-subscriber-side.
+
+  - name: audit-integrity.bucket
+    rules:
+
+      # Approaching the configured quota gives multi-day forecasting
+      # horizon before writes start failing. Even at correct lifecycle the
+      # bucket can hold >7d of data. Warn at 85%, page at 95%.
+      # The quota IS natively exported as minio_bucket_quota_total_bytes on
+      # job=minio-bucket → /minio/v2/metrics/bucket.
+      - alert: AuditBucketQuotaHigh
+        expr: |
+          minio_bucket_usage_total_bytes{bucket="audit-integrity"}
+            / on(bucket) group_left() minio_bucket_quota_total_bytes{bucket="audit-integrity"}
+            > 0.85
+        for: 30m
+        labels:
+          severity: warning
+          component: minio
+        annotations:
+          summary: "audit-integrity bucket >85% of configured quota"
+          description: |
+            audit-integrity bucket is approaching its configured quota.
+            Once the quota is exceeded, every PUT fails silently from
+            the audit-subscriber's point of view and audit
+            events start dropping.
+
+            Triage:
+              - `mc quota info local/audit-integrity` for the current
+                hard quota.
+              - `mc du local/audit-integrity` for actual size.
+              - If F-171 hasn't been resolved yet, the bucket may hold
+                more than its documented retention; check
+                `mc admin info local` for last scanner pass.
+
+            Forecasting:
+              - At current growth rate, page-level (>95%) reaches in
+                approximately `(0.95 - current_ratio) / daily_growth`
+                days.
+
+      - alert: AuditBucketQuotaCritical
+        expr: |
+          minio_bucket_usage_total_bytes{bucket="audit-integrity"}
+            / on(bucket) group_left() minio_bucket_quota_total_bytes{bucket="audit-integrity"}
+            > 0.95
+        for: 15m
+        labels:
+          severity: critical
+          component: minio
+        annotations:
+          summary: "audit-integrity bucket >95% of configured quota"
+          description: |
+            audit-integrity bucket will start rejecting writes within
+            hours at current growth rate. Once that happens, every
+            audit batch is dropped. This is a compliance
+            gap — ADR 0811 puts audit-integrity on the substrate's
+            critical-write path.
+
+            Immediate action:
+              - Raise the quota: `mc quota set local/audit-integrity --size <new>GiB`.
+                Underlying disk usually has plenty of room (nova-a had
+                841 GB free behind a 12 GiB cap during the F-169
+                incident).
+              - Verify writes resume: `docker logs --tail 5 audit-subscriber`
+                should show `batch uploaded` within ~70s — one
+                `batch_interval_ms` (60s since F-374) plus upload. This
+                said 10s when the interval was 5s; at the current
+                cadence a healthy subscriber can legitimately be quiet
+                for a minute, so do not read silence as failure.
+
+      # Oldest object age in the bucket helps detect F-171-class
+      # issues — lifecycle not running on schedule. Documented
+      # retention is 7d in trial, 1y in production; if the oldest
+      # object is more than (retention + 1 day slack) old, the
+      # lifecycle scanner is not keeping up.
+      #
+      # Trial: 7d + 1d slack = 8d = 691200s
+      # Prod:  365d + 1d slack = 366d = 31622400s
+      #
+      # We alert against the trial threshold by default; production
+      # deployments override this rule's `for` and `expr` thresholds
+      # via prometheus's rule-overrides mechanism.
+      #
+      # minio_bucket_oldest_object_seconds has no emitter, so a rule on it is
+      # dead. And lifecycle drift is not a BYTES problem, so AuditBucketQuotaHigh
+      # trending does not catch it. Expiring a current version
+      # on a versioned bucket writes a delete marker; prune the versions
+      # underneath and the marker is all that is left at that key. It stores
+      # nothing. Quota utilisation never moves. The bucket stops growing in
+      # bytes and keeps growing in keys, and MinIO's scanner walks every key
+      # on every pass, burning disk read far above client traffic while the quota
+      # alert stays correctly quiet.
+      #
+      # This rule watches a metric that does exist:
+      # minio_bucket_usage_deletemarker_total, exported natively by MinIO and
+      # scraped by job=minio-bucket.
+      #
+      # NOTE ON THE OTHER STACK: roles/minio/templates/prom-rules-minio.yml.j2
+      # carries the same two alerts for the obs-host Prometheus. That is
+      # deliberate, not a stray copy — the two stacks have separate rule
+      # delivery paths and neither reads the other's directory. Change both or
+      # one goatnet keeps the gap.
+
+      - alert: AuditBucketDeleteMarkersNeverReclaimed
+        # WHY min_over_time AND NOT A BARE THRESHOLD WITH `for:`.
+        # A healthy versioned bucket carries markers transiently: one appears
+        # when a current version expires and disappears on the next
+        # ExpiredObjectDeleteMarker pass. The ratio is a SAWTOOTH with a ~24h
+        # period (scanner speed=default), so any bare threshold has to sit
+        # above the peak — which puts it above the broken state too.
+        #
+        # min_over_time asks the question that matters: across two full scanner
+        # passes, did the ratio ever come DOWN? If the floor is still a fifth,
+        # nothing is being reclaimed, whatever the peak looks like.
+        #
+        # 0.2 IS VALIDATED FROM BOTH SIDES, which is the only way a threshold is
+        # worth anything:
+        #
+        #   broken (no reclaim)                 ~0.39   fires
+        #   healthy (one pass after reclaim)    ~0.06   quiet
+        #
+        # 0.2 sits with a ~3.5x margin above healthy and a ~2x margin below
+        # broken. If you retune it, retune against BOTH sides again. A threshold
+        # calibrated only on the failure it was written for will not fire.
+        expr: >-
+          min_over_time(
+            (
+              minio_bucket_usage_deletemarker_total{bucket="audit-integrity"}
+              / clamp_min(minio_bucket_usage_version_total{bucket="audit-integrity"}, 1)
+            )[48h:10m]
+          ) > 0.2
+        for: 1h
+        labels:
+          severity: warning
+          component: minio
+        annotations:
+          summary: "audit-integrity delete markers are never reclaimed (48h floor {{ $value | humanizePercentage }} of versions)"
+          description: |
+            Across two full scanner passes, delete markers never fell below a
+            fifth of audit-integrity's object versions. They are accumulating,
+            not cycling.
+
+            This will NOT show up in bucket size, quota utilisation, or any
+            other byte-oriented metric — a delete marker with nothing beneath
+            it stores nothing. It shows up as CPU: the scanner walks every one
+            of them on every pass.
+
+            FIRST THING TO CHECK — is the clause even there:
+              mc ilm rule list <alias>/audit-integrity
+            The EXPIRE DELETEMARKER column must read `true` on a rule. If no
+            rule has it, this is F-171's tail returning: re-run the
+            audit-subscriber role with `--tags lifecycle`. If a rule DOES have
+            it, the clause is present and the scanner is behind — check
+            `mc admin config get <alias> scanner`.
+
+            F-171, F-372, docs/design/audit-cold-storage-offload.md.
+
+      # -- No AuditBucketLifecycleMissing rule -------------------------------
+      #
+      # Such a rule would assert: zero delete markers on a bucket over 10,000
+      # objects means no lifecycle policy exists, because expiring a current
+      # version writes a delete marker.
+      #
+      # The second rule of the policy this repository applies —
+      # `audit-integrity-zombie-delete-markers`, ExpiredObjectDeleteMarker,
+      # 0 days, set fleet-wide by roles/audit-subscriber — exists to DELETE
+      # delete markers. So on a
+      # correctly configured bucket the marker count is reaped continuously and
+      # sits at or near zero, and zero markers is the signature of a WORKING
+      # lifecycle rather than a missing one.
+      #
+      # AuditBucketDeleteMarkersNeverReclaimed above states the correct
+      # model in its own comment (a sawtooth with a ~24h period and a low healthy
+      # floor). The two would hold contradictory models of the same series.
+      #
+      # RETIRED, NOT RETUNED. No threshold repairs it: the quantity is pinned
+      # near zero by a rule whose job is to pin it near zero, in both the
+      # healthy and the broken state, and MinIO exports no "a lifecycle exists"
+      # metric.
+      #
+      # COVERAGE LOST: nothing now alerts on a bucket with NO lifecycle at all,
+      # the F-372 condition. AuditBucketQuotaHigh and
+      # AuditBucketDeleteMarkersNeverReclaimed cover the consequences, neither
+      # names the cause, and the quota alert only speaks once the bucket is
+      # already large.
+      #
+      # TO RESTORE IT: a direct signal instead of an inference — a host-side
+      # timer running `mc ilm rule list` into a textfile metric
+      # `goat_minio_bucket_lifecycle_rules{bucket="..."}`, then
+      # `... == 0`. Same shape as every other goat_* textfile producer here.
+      # Not built. See docs/findings/F-450-....md.

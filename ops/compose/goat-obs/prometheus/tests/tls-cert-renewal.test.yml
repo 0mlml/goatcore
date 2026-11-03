@@ -1,0 +1,271 @@
+# promtool unit tests for rules/tls-cert-renewal.yml.
+#
+# Run by .github/workflows/goat-obs-checks.yml; locally with
+#   promtool test rules ops/compose/goat-obs/prometheus/tests/tls-cert-renewal.test.yml
+#
+# What is being pinned, in order of how easily each would rot unnoticed:
+#
+#   1. The two tiers are MUTUALLY EXCLUSIVE. A cert inside 7 days must page
+#      once, not page and email for the same fault. That property lives
+#      entirely in the warning rule's lower bound, which is one `and` clause
+#      away from being dropped as redundant-looking.
+#   2. A HEALTHY cert is silent on all three. The renewal window is 30 days
+#      and the warning threshold is 21, so a cert renewed on schedule spends
+#      its entire life outside these rules.
+#   3. The absent() companion fires when the series is DELETED, and the two
+#      value comparisons stay silent there — that asymmetry is the whole
+#      reason the companion exists.
+#   4. The companion does NOT fire while the series is present. An absent()
+#      guard that fires in the healthy case is worse than no guard.
+#
+# Series values are absolute unix timestamps (notAfter), which is what
+# blackbox emits. promtool's clock starts at 0, so a value of N*86400 reads as
+# "N days of life left at eval_time 0" and shrinks as the test advances —
+# the same arithmetic the rules do against time().
+
+rule_files:
+  - ../rules/tls-cert-renewal.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── 1. Healthy cert: 60 days left, renewal will fire at 30. Silence. ──────
+  - interval: 1m
+    input_series:
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-https", instance="https://mgmt.zagros.netbird.zagros.example"}'
+        values: '5184000+0x420'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: TlsCertRenewalOverdue
+        exp_alerts: []
+      - eval_time: 7h
+        alertname: TlsCertRenewalCritical
+        exp_alerts: []
+      # The countdown is observed, so the companion must stay quiet. This is
+      # the case that catches an absent() guard with a matcher that selects
+      # nothing — it would fire here, permanently, on a healthy goatnet.
+      - eval_time: 7h
+        alertname: TlsCertExpiryUnobserved
+        exp_alerts: []
+
+  # ── 2. Renewal overdue: 15 days left. Warning only. ──────────────────────
+  # Traefik should have renewed this at 30 days, 15 days ago.
+  - interval: 1m
+    input_series:
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-https", instance="https://onboard.zagros.netbird.zagros.example"}'
+        values: '1296000+0x420'
+    alert_rule_test:
+      # for: 6h not yet met.
+      - eval_time: 5h
+        alertname: TlsCertRenewalOverdue
+        exp_alerts: []
+      - eval_time: 6h30m
+        alertname: TlsCertRenewalOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: tls
+              job: blackbox-https
+              instance: https://onboard.zagros.netbird.zagros.example
+            exp_annotations:
+              summary: "TLS renewal overdue — https://onboard.zagros.netbird.zagros.example not renewed past the 30-day mark"
+              description: |
+                https://onboard.zagros.netbird.zagros.example has 14d 17h 30m 0s of
+                certificate life left. Traefik's ACME resolver renews at 30 days,
+                so it has failed to renew this leaf for at least 9 days and is
+                still failing. Nothing is broken for users yet; it will be.
+
+                Renewal stops for a small number of reasons, in the order worth
+                checking. On the mgmt host:
+
+                  # 1. is the le resolver still loaded? (F-312: a bare compose up
+                  #    recreates Traefik without the ACME overlay)
+                  sudo docker inspect traefik | grep -i certificatesresolvers
+                  sudo grep COMPOSE_FILE /opt/mgmt-host/.env
+
+                  # 2. what is ACME actually saying?
+                  sudo docker logs traefik --since 168h 2>&1 | grep -i acme
+
+                  # 3. can it still answer the DNS-01 challenge?
+                  #    (token must verify "active"; a re-scoped token fails the
+                  #     zone edit, not the auth, so read the ACME log for which)
+                  TOK=$(sudo grep -m1 CLOUDFLARE_DNS_API_TOKEN /opt/mgmt-host/.env | cut -d= -f2-)
+                  curl -s -H "Authorization: Bearer $TOK" \
+                    https://api.cloudflare.com/client/v4/user/tokens/verify
+
+                  # 4. can it persist the result?
+                  sudo ls -l /opt/mgmt-host/letsencrypt/acme.json
+      # Still three weeks of runway — must NOT page.
+      - eval_time: 6h30m
+        alertname: TlsCertRenewalCritical
+        exp_alerts: []
+
+  # ── 3. Under a week: critical only, warning suppressed. ──────────────────
+  # The mutual-exclusion assertion. Drop the `>= 7 * 86400` clause from the
+  # warning rule and this test goes red.
+  - interval: 1m
+    input_series:
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-https", instance="https://mgmt.zagros.netbird.zagros.example"}'
+        values: '259200+0x420'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TlsCertRenewalCritical
+        exp_alerts: []
+      - eval_time: 1h30m
+        alertname: TlsCertRenewalCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: tls
+              job: blackbox-https
+              instance: https://mgmt.zagros.netbird.zagros.example
+            exp_annotations:
+              summary: "CRITICAL: https://mgmt.zagros.netbird.zagros.example TLS cert expires in 2d 22h 30m 0s, renewal is failing"
+              description: |
+                https://mgmt.zagros.netbird.zagros.example has under 7 days of certificate life and
+                automatic renewal has been failing for 3+ weeks. When it expires,
+                every client of this vhost fails the handshake.
+
+                Read the wider blast radius before triaging: if this is the mgmt
+                vhost, expiry takes the goatnet off management — netbird peers
+                included, per F-312 — and it also takes the goatnet
+                UN-AUDITABLE, because the live mesh guards refuse to run against a
+                mesh they cannot verify. A TLS fault becomes an audit blackout.
+
+                Triage is TlsCertRenewalOverdue's, in the same order. If renewal
+                cannot be repaired inside the window, forcing a re-mint is
+                deleting this leaf from acme.json and restarting Traefik WITH the
+                overlay — never a bare `docker compose up -d`, which is the
+                command that causes this class:
+                  cd /opt/mgmt-host && sudo docker compose \
+                    -f docker-compose.yml -f docker-compose.acme.yml up -d traefik
+      - eval_time: 1h30m
+        alertname: TlsCertRenewalOverdue
+        exp_alerts: []
+
+  # ── 4. Series DELETED — the F-312 shape. ─────────────────────────────────
+  # blackbox verifies certs, so a Traefik serving CN=TRAEFIK DEFAULT CERT
+  # fails every handshake and emits no cert-expiry series for ANY target.
+  # Two healthy targets vanish together; the companion must fire and the
+  # value comparisons must not.
+  - interval: 1m
+    input_series:
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-https", instance="https://mgmt.zagros.netbird.zagros.example"}'
+        values: '5184000+0x30'
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-https", instance="https://auth.zagros.netbird.zagros.example"}'
+        values: '5184000+0x30'
+    alert_rule_test:
+      # t=20m: still publishing.
+      - eval_time: 20m
+        alertname: TlsCertExpiryUnobserved
+        exp_alerts: []
+      # Last sample at 30m, +5m lookback -> absent from 35m; for:30m unmet.
+      - eval_time: 50m
+        alertname: TlsCertExpiryUnobserved
+        exp_alerts: []
+      # t=70m: absent since 35m -> 35m > for:30m -> FIRING.
+      - eval_time: 70m
+        alertname: TlsCertExpiryUnobserved
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: tls
+              job: blackbox-https
+            exp_annotations:
+              summary: "CRITICAL: TLS cert-expiry observability is dark — no blackbox-https target reports a cert"
+              description: |
+                No `probe_ssl_earliest_cert_expiry` series exists for any
+                blackbox-https target for 30m+. The renewal countdown is
+                unobserved, so TlsCertRenewalOverdue and TlsCertRenewalCritical
+                are both structurally unable to fire.
+
+                Two causes, and they are not equally urgent:
+
+                  1. TLS IS BROKEN NOW on every vhost. blackbox verifies certs, so
+                     a Traefik serving its default cert (F-312: recreated without
+                     the ACME overlay) fails every handshake and emits no cert
+                     metric at all. Confirm from anywhere on the mesh — a default
+                     cert names itself:
+                       echo | openssl s_client -connect <mgmt-fqdn>:443 2>/dev/null \
+                         | openssl x509 -noout -subject -issuer
+
+                  2. Collection is broken — blackbox exporter stopped, or the
+                     blackbox-https job lost its targets. ScrapeTargetDownProlonged
+                     (rules/scrape-health.yml) covers the exporter being
+                     unreachable; check it before assuming (1).
+      # The gap the companion closes: neither value rule can see a deleted
+      # series, so both are silent while every cert on the host is unverifiable.
+      - eval_time: 70m
+        alertname: TlsCertRenewalOverdue
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: TlsCertRenewalCritical
+        exp_alerts: []
+
+  # ── 5. PARTIAL blackout — the case absent() structurally cannot see. ─────
+  # Reproduces 2026-08-16: an obs deploy rewrote the target list to another
+  # goatnet's DNS zone. Most certificate series vanished and every remaining
+  # probe failed, but ONE target still resolved and reported a certificate, so
+  # absent() stayed false and TlsCertExpiryUnobserved never fired. The
+  # per-target rule is what closes it. Both assertions matter: the new alert
+  # must fire, AND the absent-guard must be shown to stay silent — otherwise
+  # this test would pass for the wrong reason.
+  - interval: 1m
+    input_series:
+      # The survivor: healthy, keeps absent() false.
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-https", instance="https://netbird.nova.example"}'
+        values: '5184000+0x40'
+      - series: 'probe_success{job="blackbox-https", instance="https://netbird.nova.example"}'
+        values: '1+0x40'
+      # The casualty: probe failing, no certificate series at all.
+      - series: 'probe_success{job="blackbox-https", instance="https://oauth2.zagros.netbird.zagros.example"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TlsCertUnreadable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TlsCertUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: tls
+              job: blackbox-https
+              instance: https://oauth2.zagros.netbird.zagros.example
+            exp_annotations:
+              summary: "CRITICAL: no certificate readable from https://oauth2.zagros.netbird.zagros.example — probe failing 15m+"
+              description: |
+                The blackbox probe of https://oauth2.zagros.netbird.zagros.example has failed for 15m+.
+                Because the prober verifies certificates, this endpoint's
+                certificate cannot be read at all, so TlsCertRenewalOverdue and
+                TlsCertRenewalCritical are blind to it for as long as this holds.
+
+                Check the cheap causes before the alarming one. In order:
+
+                  # 1. Is the target list even right? A deploy can rewrite it to
+                  #    another goatnet's DNS zone, where every name renders and
+                  #    none resolve. Compare against this site's group_vars:
+                  grep -A20 'job_name: blackbox-https' \
+                    /opt/<site>-obs/prometheus/prometheus.yml
+
+                  # 2. Does the name resolve from this host at all? Mesh CoreDNS
+                  #    answers on port 5353, so a plain dig looks like a dead zone.
+                  getent hosts <fqdn>
+
+                  # 3. Is it the certificate? A proxy serving its own placeholder
+                  #    fails verification and names itself in the subject:
+                  echo | openssl s_client -connect <fqdn>:443 2>/dev/null \
+                    | openssl x509 -noout -subject -issuer
+
+                If EVERY target is failing at once, prefer causes 1 and 3 — a
+                whole-site failure is a config or terminator fault, not many
+                simultaneous service outages.
+      # The whole point: the survivor keeps absent() false, so the site-wide
+      # guard is silent while a certificate is genuinely unobservable.
+      - eval_time: 20m
+        alertname: TlsCertExpiryUnobserved
+        exp_alerts: []
+      # A healthy probe must NOT trip the new rule.
+      - eval_time: 20m
+        alertname: TlsCertRenewalCritical
+        exp_alerts: []

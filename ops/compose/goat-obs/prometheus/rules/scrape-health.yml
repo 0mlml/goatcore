@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Alerts on the MONITORING ITSELF. Nothing here watches an application; every
+# rule watches whether we are still able to watch.
+#
+# WHY: a Prometheus can have most of its targets down — a stale mesh IP, an old
+# LAN address, a hung collector, a target declared but never deployed — and
+# nothing notices without a rule on scrape health.
+#
+# The point is not "watch node_exporter". It is that a monitoring stack fails
+# silently by construction: when collection breaks, the alerts that depend on
+# that collection go quiet, and quiet is indistinguishable from healthy. The
+# only defence is a rule whose firing condition is the ABSENCE of data.
+#
+# DELIBERATELY NOT HERE: a plain `up == 0` rule. `base-availability` already
+# ships `TargetDown` on exactly that expression.
+# Two alerts on one condition is double-paging, and double-paging is how a rule
+# set teaches people to ignore it — the same reason the rules below are an
+# explicit list rather than a glob. Everything here is ADDITIVE to TargetDown:
+# duration, prolonged-down, empty-but-reachable, and self-scrape absence.
+groups:
+  - name: scrape-health
+    rules:
+      # A target down for a day is not an incident anyone is handling — it is a
+      # target everyone has stopped seeing. Separate severity so it cannot hide
+      # inside the noise of the 15m rule.
+      - alert: ScrapeTargetDownProlonged
+        expr: up == 0
+        for: 24h
+        labels:
+          severity: critical
+          domain: observability
+        annotations:
+          summary: "{{ $labels.instance }} has been unscrapeable for 24h"
+          description: >-
+            Either fix it or remove the target. A permanently-down scrape target
+            trains people to ignore the down state, which is how the next real
+            outage gets missed.
+
+      # Slow scrapes precede failed ones. A collector that hangs fills
+      # node_exporter's 40 request slots and then 503s EVERYTHING — the
+      # duration climbing is the early warning that was there to be seen.
+      - alert: ScrapeDurationHigh
+        expr: scrape_duration_seconds > 5
+        for: 15m
+        labels:
+          severity: warning
+          domain: observability
+        annotations:
+          summary: "Scraping {{ $labels.instance }} takes {{ $value | printf \"%.1f\" }}s"
+          description: >-
+            A scrape this slow usually means one collector is blocking on a
+            device or sysfs read. Isolate with
+            `curl 'http://<target>/metrics?collect[]=<name>'` per collector —
+            the healthy ones return in milliseconds.
+
+      # Prometheus dropping samples means the alerts above are evaluated on
+      # incomplete data, which is worse than no data because it looks complete.
+      - alert: ScrapeSampleLimitHit
+        expr: scrape_samples_scraped == 0 and up == 1
+        for: 15m
+        labels:
+          severity: warning
+          domain: observability
+        annotations:
+          summary: "{{ $labels.instance }} scrapes OK but returns no samples"
+          description: >-
+            The target is reachable and yields nothing. An exporter that answers
+            200 with an empty body reads as healthy to `up` while delivering no
+            data at all.
+
+      # The floor: if Prometheus cannot see ITSELF, no other rule in this file
+      # can fire, and their silence means nothing.
+      - alert: PrometheusSelfScrapeMissing
+        expr: absent(up{job="prometheus"})
+        for: 10m
+        labels:
+          severity: critical
+          domain: observability
+        annotations:
+          summary: "Prometheus is not scraping itself — treat all alert silence as unknown"
+          description: >-
+            The self-scrape is the liveness proof for the whole rule set. With
+            it absent, every quiet alert in this stack is uninformative rather
+            than reassuring.

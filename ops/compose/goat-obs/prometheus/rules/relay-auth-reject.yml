@@ -1,0 +1,53 @@
+# Relay per-peer AUTH-REJECTION alert (netbird profile drift → stale
+# relay token → single-peer isolation).
+#
+# One device whose netbird profile carries a STALE cached relay auth token cannot
+# hold ANY mesh data-plane bridge. goat-relay logs `validator rejected: ... expired
+# auth token` repeatedly, all from one egress IP and none from any other peer,
+# while every health surface stays green: the relay-health dashboard measures
+# relay front-door LIVENESS, not per-peer AUTH, so nothing else surfaces WHICH
+# peer is being turned away. This alert makes that per-peer isolation loud.
+#
+# Metrics: goat_relay_auth_reject_5m{relay,reason} +
+# goat_relay_auth_reject_top_offender_5m{relay,peer_ip} from
+# ops/relay/health/relay-health-to-prom.py (reads the relay-health deep block's
+# auth_reject counts, log-derived, no goat-relay rebuild → node-exporter textfile).
+# The offender gauge NAMES the peer egress IP so the alert points straight at the
+# isolated device.
+groups:
+  - name: relay-auth-reject
+    interval: 30s
+    rules:
+
+      # A specific peer sustained above a small threshold of expired-auth-token
+      # rejections — the profile-drift single-peer isolation. Warning tier (it is
+      # one device, not a fleet outage), but it must never be silent again. Fires
+      # per offending peer_ip (the top-offender gauge carries the IP label).
+      - alert: RelayPeerAuthRejected
+        expr: goat_relay_auth_reject_top_offender_5m >= 3
+        for: 10m
+        labels:
+          severity: warning
+          component: relay
+        annotations:
+          summary: "relay {{ $labels.relay }} is auth-rejecting peer {{ $labels.peer_ip }} ({{ $value }} expired-token rejects/5m)"
+          description: |
+            Peer egress {{ $labels.peer_ip }} has {{ $value }} expired-auth-token
+            rejections on relay {{ $labels.relay }} in the last 5m and has
+            sustained it 10m+ — a real per-peer isolation, NOT "it's you." This is
+            the signal the relay-health dashboard missed for ~a day: the
+            relay logged every rejection, but the dashboard measures front-door
+            liveness, not per-peer auth.
+
+            Root-cause pattern: that device's local netbird profile carries
+            a stale/corrupt cached relay token. A 24h-TTL token reading "expired"
+            (mgmt Relay.CredentialsTTL=24h, clocks synced) means a genuinely-stale
+            CACHED token, not a short-TTL/transit/clock issue. Fix ON that device —
+            recreate the profile clean:
+              netbird profile remove <env>
+              netbird profile add <env>
+              netbird up --setup-key <key>
+            A soft reset (down/up, re-login, daemon restart, kill -9, re-enroll,
+            even `profile select`) does NOT clear it — they all operate inside the
+            existing profile state.
+            docs/findings/F-269-netbird-profile-drift-stale-relay-token-single-peer-isolation.md

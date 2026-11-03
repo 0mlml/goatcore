@@ -1,0 +1,76 @@
+# promtool unit test for identity-reconcile.yml.
+# Run:  promtool test rules ops/compose/goat-obs/prometheus/tests/identity-reconcile.test.yml
+#
+# Scenario: an env carries unallowlisted strays (fires), then the reconciler
+# goes stale (fires), then a fetch fail (up=0, fires). Proves each rule fires
+# for the right condition and stays quiet when clean.
+rule_files:
+  - ../rules/identity-reconcile.yml
+
+evaluation_interval: 1m
+
+tests:
+  # 1. Unallowlisted strays present -> IdentityStrayUntracked fires; healthy
+  #    reconcile (up=1, fresh) so the down/stale rules stay quiet.
+  - interval: 1m
+    input_series:
+      - series: 'goat_identity_strays{env="zagros",scope="unallowlisted"}'
+        values: '12x30'
+      - series: 'goat_identity_strays{env="zagros",scope="all"}'
+        values: '21x30'
+      - series: 'goat_identity_reconcile_up{env="zagros"}'
+        values: '1x30'
+      # last_run tracks wall-clock so it never goes stale in this window.
+      - series: 'goat_identity_reconcile_last_run_timestamp_seconds'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: IdentityStrayUntracked
+        exp_alerts:
+          - exp_labels:
+              env: zagros
+              scope: unallowlisted
+              severity: warning
+              component: identity
+            exp_annotations:
+              summary: "12 live identity(ies) on zagros have no declared record"
+              description: "12 unallowlisted person-stray(s) reconcile to out_of_band — live (login/mesh) but absent from the declared registry (roster.json). Each is a real participant needing a manifest backfill (see the user209x backfill) or an identity to revoke; if it's a legitimate test/service account, add it to identity-reconcile-allowlist.txt. Names: `journalctl -t identity-reconcile` on the mgmt host."
+      - eval_time: 20m
+        alertname: IdentityReconcileStale
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: IdentityReconcileDown
+        exp_alerts: []
+
+  # 2. Clean env (zero unallowlisted strays) -> no stray alert.
+  - interval: 1m
+    input_series:
+      - series: 'goat_identity_strays{env="zagros",scope="unallowlisted"}'
+        values: '0x30'
+      - series: 'goat_identity_reconcile_up{env="zagros"}'
+        values: '1x30'
+      - series: 'goat_identity_reconcile_last_run_timestamp_seconds'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: IdentityStrayUntracked
+        exp_alerts: []
+
+  # 3. Fetch failing (up=0) -> IdentityReconcileDown fires after 30m.
+  - interval: 1m
+    input_series:
+      - series: 'goat_identity_reconcile_up{env="zagros"}'
+        values: '0x40'
+      - series: 'goat_identity_reconcile_last_run_timestamp_seconds'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: IdentityReconcileDown
+        exp_alerts:
+          - exp_labels:
+              env: zagros
+              severity: warning
+              component: identity
+            exp_annotations:
+              summary: "identity-reconcile cannot reach the portal on zagros"
+              description: "goat_identity_reconcile_up=0 for 30m — the reconciler is running but the portal /api/access/roster fetch is failing (portal down, token invalid, or mesh DNS). Stray counts are stale. Check the portal + the reconciler's PORTAL_URL/PORTAL_OPERATOR_API_KEY."

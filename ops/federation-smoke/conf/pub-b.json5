@@ -1,0 +1,46 @@
+// Sovereign B's PUBLISHER — a real zenoh session carrying B's identity.
+//
+// This exists because the eclipse/zenoh image ships NO client binary:
+// only /zenohd and two plugins. The previous harness called `zenoh-put`, which
+// does not exist, so every publish failed identically and every negative case
+// "passed" on the error string. A router in CLIENT mode IS a zenoh client, and
+// the REST plugin turns it into one we can drive over HTTP.
+//
+// The certificate is supplied per-run with --cfg so one config serves all three
+// identities (agreed peering, impersonation, unagreed CN).
+{
+  mode: "client",
+
+  // Dial the edge exactly as a partner would. B never listens.
+  connect: { endpoints: ["tls/edge-a:7448"] },
+  listen:  { endpoints: [] },
+
+  scouting: { multicast: { enabled: false }, gossip: { enabled: false } },
+
+  transport: {
+    link: {
+      tls: {
+        // MUST be true or the client never PRESENTS its certificate, and the
+        // edge answers `CertificateRequired` at the handshake. That failure is
+        // indistinguishable at a glance from a correctly REFUSED identity, which
+        // would make cases 2 and 3 pass for the wrong reason all over again.
+        enable_mtls: true,
+
+        // B verifies OUR edge against A's root — the partner trusts us, as they
+        // would in a real peering.
+        root_ca_certificate: "/pki/a-ca.pem",
+        // Overridden per run via --cfg. Left as the agreed identity by default
+        // so a bare `up` is the honest case rather than the attack.
+        connect_certificate: "/pki/b-peering.pem",
+        connect_private_key: "/pki/b-peering-key.pem",
+      },
+    },
+  },
+
+  // Loopback only, inside this container. It is the drive belt for the test,
+  // never a surface: nothing outside the container can reach it.
+  plugins_loading: { enabled: true, search_dirs: ["/"] },
+  plugins: { rest: { http_port: "127.0.0.1:8000" } },
+
+  adminspace: { permissions: { read: false, write: false } },
+}
