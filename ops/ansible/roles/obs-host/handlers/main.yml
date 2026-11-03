@@ -1,0 +1,48 @@
+---
+# Reload-not-restart for prometheus + alertmanager (both support
+# --web.enable-lifecycle / SIGHUP). Avoid full container restart so
+# scrape counters stay continuous across config edits.
+
+- name: prometheus reload
+  ansible.builtin.uri:
+    url: http://localhost:9090/-/reload
+    method: POST
+    status_code: 200
+  failed_when: false  # if Prometheus isn't up yet, the next-up handler picks up
+
+- name: alertmanager reload
+  ansible.builtin.uri:
+    url: http://localhost:9093/-/reload
+    method: POST
+    status_code: 200
+  failed_when: false
+
+- name: obs-host compose changed
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ obs_compose_dir }}"
+  changed_when: true
+
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# blackbox-exporter reads its config once at start and has no reload endpoint,
+# so a changed module file needs the container recreated. Scoped to the one
+# service: recreating the whole project would bounce Prometheus and break the
+# scrape continuity the reload-not-restart handlers above exist to preserve.
+- name: blackbox restart
+  ansible.builtin.command:
+    cmd: docker compose up -d --force-recreate blackbox-exporter
+    chdir: "{{ obs_compose_dir }}"
+  changed_when: true
+
+# Grafana loads provisioning at boot. The file provider rescans dashboards on a
+# timer (updateIntervalSeconds: 30) but does NOT pick up a NEW provider file
+# without a restart, so a first install needs one.
+- name: obs-host restart grafana
+  ansible.builtin.command:
+    cmd: docker compose restart grafana
+    chdir: "{{ obs_compose_dir }}"
+  changed_when: true
+

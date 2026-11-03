@@ -1,0 +1,325 @@
+---
+# ops/ansible/roles/observability/tasks/main.yml
+#
+# Deploys the Phase 2 observability MVP onto an mgmt-host:
+#   1. Creates a least-privilege 'monitoring' PG role (idempotent).
+#   2. Copies the compose overlay + monitoring/ tree into /opt/mgmt-host.
+#   3. Appends observability-specific keys to /opt/mgmt-host/.env
+#      (SITE_NAME is already written by mgmt-host.yml).
+#   4. docker compose pull + up -d with the overlay layered on the base.
+#
+# Assumes the base mgmt-host stack is already up (postgres-a at least
+# healthy) — run ops/ansible/mgmt-host.yml first for a greenfield host.
+#
+# Host variables consumed:
+#   site_name                    — e.g. vega-a (already set by inventory)
+#   peer_node_exporter_target    — "<peer-mesh-ip>:9100"
+#   peer_signal_metrics_target   — "<peer-mesh-ip>:9090"
+#   postgres_superuser_password  — to bootstrap the monitoring role
+#   postgres_exporter_password   — password the new role will be given
+
+- name: Require site_name
+  ansible.builtin.assert:
+    that: site_name is defined and site_name | length > 0
+    fail_msg: "site_name must be set per-host in inventory (e.g. vega-a)."
+
+- name: Require peer_node_exporter_target
+  ansible.builtin.assert:
+    that: peer_node_exporter_target is defined and peer_node_exporter_target | length > 0
+    fail_msg: >
+      peer_node_exporter_target must be set per-host (e.g. 100.104.X.Y:9100).
+      It is the peer mgmt-host's Netbird mesh IP + node-exporter port.
+
+- name: Require peer_signal_metrics_target
+  ansible.builtin.assert:
+    that: peer_signal_metrics_target is defined and peer_signal_metrics_target | length > 0
+    fail_msg: >
+      peer_signal_metrics_target must be set per-host (e.g. 100.104.X.Y:9090).
+      It is the peer mgmt-host's Netbird mesh IP + signal-server /metrics port.
+
+- name: Require postgres_superuser_password
+  ansible.builtin.assert:
+    that: postgres_superuser_password is defined and postgres_superuser_password | length > 0
+    fail_msg: "Pass -e postgres_superuser_password=... to bootstrap the monitoring role."
+
+- name: Require postgres_exporter_password
+  ansible.builtin.assert:
+    that: postgres_exporter_password is defined and postgres_exporter_password | length > 0
+    fail_msg: >
+      Pass -e postgres_exporter_password=... — password for the least-privilege
+      'monitoring' PG role used by postgres-exporter. Rotate via re-run.
+
+# ---------------------------------------------------------------------------
+# 1. Least-privilege monitoring role in postgres.
+# ---------------------------------------------------------------------------
+# Executed via `docker exec postgres-a psql` — no psycopg2 needed on the host,
+# no remote PG connection needed. Idempotent: CREATE ROLE uses a DO block;
+# ALTER ROLE resets the password on every run (so rotation is just re-run).
+
+- name: Create 'monitoring' PG role if missing
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - |
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ pg_monitoring_role }}') THEN
+            CREATE ROLE {{ pg_monitoring_role }} LOGIN;
+          END IF;
+        END
+        $$;
+  changed_when: false
+
+- name: Set 'monitoring' role password (idempotent-on-rotate)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "ALTER ROLE {{ pg_monitoring_role }} WITH PASSWORD '{{ postgres_exporter_password }}';"
+  changed_when: true
+  no_log: true
+
+- name: Grant pg_monitor to 'monitoring' role
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "GRANT pg_monitor TO {{ pg_monitoring_role }};"
+  changed_when: false
+
+- name: Grant CONNECT on target DB to 'monitoring' role
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "GRANT CONNECT ON DATABASE {{ pg_monitoring_db }} TO {{ pg_monitoring_role }};"
+  changed_when: false
+
+# Spock views live in the spock schema of the replicated DB. pg_monitor
+# membership isn't enough — spock schema USAGE + SELECT on its views are
+# separate grants. Use `IF EXISTS` so this no-ops cleanly if the role is
+# run before spock is installed (greenfield day-0 ordering).
+- name: Grant USAGE + SELECT on spock schema to 'monitoring' (best-effort)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ pg_monitoring_db }}"
+      - -v
+      - ON_ERROR_STOP=0
+      - -c
+      - |
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'spock') THEN
+            EXECUTE 'GRANT USAGE ON SCHEMA spock TO {{ pg_monitoring_role }}';
+            EXECUTE 'GRANT SELECT ON ALL TABLES IN SCHEMA spock TO {{ pg_monitoring_role }}';
+            EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA spock GRANT SELECT ON TABLES TO {{ pg_monitoring_role }}';
+          END IF;
+        END
+        $$;
+  changed_when: false
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# 2. Copy the compose overlay + monitoring/ tree.
+# ---------------------------------------------------------------------------
+
+- name: Ensure monitoring tree exists on target
+  ansible.builtin.file:
+    path: "{{ compose_dir }}/monitoring/rules"
+    state: directory
+    mode: "0755"
+
+- name: Copy docker-compose.obs.yml
+  ansible.builtin.copy:
+    src: "../compose/mgmt-host/docker-compose.obs.yml"
+    dest: "{{ compose_dir }}/docker-compose.obs.yml"
+    mode: "0644"
+
+- name: Render prometheus.yml from template (substitutes peer_*_target)
+  # Prometheus does NOT expand ${VAR} in scrape_configs (only in
+  # external_labels via --enable-feature=expand-external-labels).
+  # Render the peer targets at deploy time from inventory vars.
+  # Docker bind-mounts single files by inode, so the `notify:` must
+  # restart the container — a `POST /-/reload` won't pick up the new
+  # inode after an atomic file replace. See
+  # docs/operations/region-a-deploy.md troubleshooting section.
+  ansible.builtin.template:
+    src: "prometheus.yml.j2"
+    dest: "{{ compose_dir }}/monitoring/prometheus.yml"
+    mode: "0644"
+  notify: Restart prometheus container
+
+- name: Render alertmanager.yml from template (vendor-swappable receivers)
+  # Same inode pinning caveat as prometheus.yml — the handler docker-
+  # restarts alertmanager on template change. Receivers are gated on
+  # credential presence; unset vendor vars fall back to webhook-noop.
+  # See failure-isolation.md §9 for the paging pattern.
+  ansible.builtin.template:
+    src: "alertmanager.yml.j2"
+    dest: "{{ compose_dir }}/monitoring/alertmanager.yml"
+    mode: "0644"
+  notify: Restart alertmanager container
+
+- name: Copy postgres-exporter-queries.yml
+  ansible.builtin.copy:
+    src: "../compose/mgmt-host/monitoring/postgres-exporter-queries.yml"
+    dest: "{{ compose_dir }}/monitoring/postgres-exporter-queries.yml"
+    mode: "0644"
+
+- name: Copy rule files
+  ansible.builtin.copy:
+    src: "../compose/mgmt-host/monitoring/rules/"
+    dest: "{{ compose_dir }}/monitoring/rules/"
+    mode: "0644"
+
+# ---------------------------------------------------------------------------
+# 3. Append observability-specific keys to /opt/mgmt-host/.env.
+# ---------------------------------------------------------------------------
+# The base mgmt-host.yml writes a fresh .env each run. We can't rely on that
+# having left our keys behind, so add them with blockinfile (idempotent,
+# re-run-safe).
+
+- name: Append observability env vars to /opt/mgmt-host/.env
+  ansible.builtin.blockinfile:
+    path: "{{ compose_dir }}/.env"
+    marker: "# {mark} ANSIBLE MANAGED: observability"
+    block: |
+      PEER_NODE_EXPORTER_TARGET={{ peer_node_exporter_target }}
+      PEER_SIGNAL_METRICS_TARGET={{ peer_signal_metrics_target }}
+      POSTGRES_EXPORTER_PASSWORD={{ postgres_exporter_password }}
+    mode: "0600"
+    create: false
+
+# ---------------------------------------------------------------------------
+# 4. Pull + up the observability services alongside the base stack.
+# ---------------------------------------------------------------------------
+
+# Declared end state (ADR 1206): the site's flags choose which overlay services
+# run (prometheus_enabled, alertmanager_enabled, obs_exporters_enabled; unset = on).
+- name: Declared end state | the overlay services this site runs
+  ansible.builtin.set_fact:
+    _obs_overlay_services: >-
+      {{ (['prometheus'] if (prometheus_enabled | default(true) | bool) else [])
+       + (['alertmanager'] if (alertmanager_enabled | default(true) | bool) else [])
+       + (['node-exporter', 'postgres-exporter'] if (obs_exporters_enabled | default(true) | bool) else []) }}
+
+- name: docker compose pull (overlay)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      -f docker-compose.yml
+      {% if phase2 | bool %}-f docker-compose.phase2.yml{% endif %}
+      -f docker-compose.obs.yml
+      pull {{ _obs_overlay_services | join(' ') }}
+    chdir: "{{ compose_dir }}"
+  changed_when: true
+  when: _obs_overlay_services | length > 0
+
+# F-312 RECURRENCE: same shape as admit-audit — an explicit -f set
+# overrides the COMPOSE_FILE pin, and a bare `up -d` rebuilt traefik along with
+# the obs stack. Carry the acme overlay AND name the services this role owns.
+- name: Detect the ACME compose overlay (traefik-acme.yml)
+  ansible.builtin.stat:
+    path: "{{ compose_dir }}/docker-compose.acme.yml"
+  register: _obs_acme_overlay
+
+- name: docker compose up -d with observability overlay (overlay-aware, service-scoped)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      -f docker-compose.yml
+      {% if phase2 | bool %}-f docker-compose.phase2.yml{% endif %}
+      {% if _obs_acme_overlay.stat.exists %}-f docker-compose.acme.yml{% endif %}
+      -f docker-compose.obs.yml
+      up -d {{ _obs_overlay_services | join(' ') }}
+    chdir: "{{ compose_dir }}"
+  changed_when: true
+  when: _obs_overlay_services | length > 0
+
+# ---------------------------------------------------------------------------
+# 5. Smoke checks — surface is-it-up for the operator.
+# ---------------------------------------------------------------------------
+
+- name: Wait for Prometheus /-/ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9092/-/ready"
+    status_code: 200
+  register: prom_ready
+  retries: 30
+  delay: 2
+  until: prom_ready.status == 200
+
+- name: Wait for Alertmanager /-/ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9093/-/ready"
+    status_code: 200
+  register: am_ready
+  retries: 30
+  delay: 2
+  until: am_ready.status == 200
+
+- name: List Prometheus targets (for diagnostic log)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9092/api/v1/targets?state=active"
+    return_content: true
+  register: prom_targets
+
+- name: Show Prometheus target summary
+  ansible.builtin.debug:
+    msg: >-
+      Scrape targets active:
+      {{ (prom_targets.json.data.activeTargets | map(attribute='scrapePool') | list) | join(', ') }}

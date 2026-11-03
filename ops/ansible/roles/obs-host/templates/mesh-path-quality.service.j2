@@ -1,0 +1,23 @@
+# Rendered by ops/ansible/roles/obs-host/ — DO NOT EDIT ON HOST.
+#
+# Probes mesh link QUALITY (path MTU / jitter / loss), not just reachability,
+# from the observability host — the vantage that actually serves users.
+# See ops/obs/mesh-path-quality/mesh-path-quality.sh for why each signal is here.
+[Unit]
+Description=Mesh path-quality probe (path MTU, jitter, loss) -> Prometheus textfile
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# ping with DF needs raw sockets; nothing else here is privileged.
+ExecStart={{ obs_mesh_pq_dir }}/mesh-path-quality.sh \
+  --out {{ obs_textfile_host_dir }}/mesh-path-quality.prom \
+{% for peer in obs_mesh_pq_peers %}
+  --peer {{ peer.name }}={{ peer.ip }}{% if not loop.last %} \{% endif %}
+
+{% endfor %}
+Environment=MESH_PQ_PING_COUNT={{ obs_mesh_pq_ping_count | default(20) }}
+Environment=MESH_PQ_TUNNEL_MTU={{ obs_mesh_pq_tunnel_mtu | default(1420) }}
+# A probe that hangs must not wedge the timer.
+TimeoutStartSec=180

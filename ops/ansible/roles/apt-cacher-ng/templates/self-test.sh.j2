@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Rendered by ops/ansible/roles/apt-cacher-ng on {{ ansible_date_time.iso8601 }}.
+# Source: ops/ansible/roles/apt-cacher-ng/templates/self-test.sh.j2
+#
+# Operator-runnable self-test for apt-cacher-ng.
+
+set -euo pipefail
+
+PORT="{{ apt_cacher_ng_port }}"
+PASS=0
+FAIL=0
+
+check() {
+    local name=$1
+    shift
+    if "$@" >/dev/null 2>&1; then
+        printf '  [ok]   %s\n' "$name"
+        PASS=$((PASS + 1))
+    else
+        printf '  [FAIL] %s (cmd: %s)\n' "$name" "$*" >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+printf 'apt-cacher-ng self-test (host: %s, port: %s)\n\n' "$(hostname)" "$PORT"
+
+check "systemd unit active"  systemctl is-active --quiet apt-cacher-ng
+# Quote the ss filter expression as one arg + grep-check the result.
+# The earlier "ss -lnt sport = :$PORT -H -t -o state listening" form
+# had argv-splitting that ss-iproute2 in 22.04 rejects.
+check "listener up on port"  bash -c "ss -lnt 'sport = :$PORT' | grep -q LISTEN"
+check "cache dir present"    test -d "{{ apt_cacher_ng_cache_dir }}"
+check "report endpoint"      curl -sf "http://127.0.0.1:$PORT/acng-report.html" -o /dev/null
+
+printf '\nresult: %d pass, %d fail\n' "$PASS" "$FAIL"
+exit $((FAIL > 0 ? 1 : 0))

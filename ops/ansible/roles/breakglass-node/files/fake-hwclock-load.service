@@ -1,0 +1,28 @@
+[Unit]
+# F-533, and the same mechanism as F-251 on the Tegra hosts: this board has no
+# battery-backed RTC, so a cold boot starts at the power-on epoch and every TLS
+# handshake fails "not yet valid" until a time source is reached. Restore the
+# last-saved wall clock BEFORE anything time-sensitive starts.
+#
+# WHY THIS FILE EXISTS AT ALL. Ubuntu ships the packaged unit MASKED —
+# /lib/systemd/system/fake-hwclock.service is a symlink to /dev/null — so
+# `apt install fake-hwclock` gives you the hourly SAVE timer and no LOAD at
+# boot. Installing the package and assuming a restore is a silent no-op.
+# ops/ansible/roles/ntp-hygiene ships the identical unit for the Tegra fleet;
+# this is its sibling, kept here because a break-glass node deliberately does
+# not run ntp-hygiene (NTP is unreachable on these site networks).
+#
+# `fake-hwclock load` only ever advances the clock, never regresses it, so this
+# is a no-op on an RTC-equipped or already-correct host.
+Description=Restore saved wall clock before network/TLS services
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target breakglass-clock-step.service tailscaled.service netbird.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/fake-hwclock load
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

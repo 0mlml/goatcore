@@ -1,0 +1,125 @@
+---
+# ops/ansible/roles/docker-registry-mirror/tasks/main.yml
+#
+# Docker / OCI pull-through cache on Orin-C. Idempotent. Brings up one
+# registry:2 instance per upstream (docker.io, ghcr.io, quay.io) via
+# docker-compose.
+
+- name: Pre-flight — NVMe at /opt/docker-data exists
+  ansible.builtin.stat:
+    path: /opt/docker-data
+  register: _drm_nvme_stat
+
+- name: Fail if /opt/docker-data missing
+  ansible.builtin.assert:
+    that:
+      - _drm_nvme_stat.stat.exists | default(false)
+      - _drm_nvme_stat.stat.isdir | default(false)
+    fail_msg: "Run ops/ansible/mgmt-host-luks.yml against this host first."
+
+- name: Pre-flight — docker engine present
+  ansible.builtin.command: docker version
+  register: _drm_docker_check
+  changed_when: false
+  failed_when: _drm_docker_check.rc != 0
+
+- name: Ensure compose dir exists
+  become: true
+  ansible.builtin.file:
+    path: "{{ docker_registry_mirror_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure per-upstream storage dirs exist
+  become: true
+  ansible.builtin.file:
+    path: "{{ docker_registry_mirror_storage_root }}/{{ item.name }}"
+    state: directory
+    # registry:2 image runs as uid 65533/gid 65533 (registry user).
+    owner: "65533"
+    group: "65533"
+    mode: "0755"
+  loop: "{{ docker_registry_mirror_upstreams }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Render per-upstream config.yml
+  become: true
+  ansible.builtin.template:
+    src: config.yml.j2
+    dest: "{{ docker_registry_mirror_compose_dir }}/config-{{ item.name }}.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ docker_registry_mirror_upstreams }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Render docker-compose.yml
+  become: true
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ docker_registry_mirror_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Bring up the mirrors
+  become: true
+  community.docker.docker_compose_v2:
+    project_src: "{{ docker_registry_mirror_compose_dir }}"
+    state: present
+    pull: missing
+
+- name: Render GC cron
+  become: true
+  ansible.builtin.template:
+    src: gc.sh.j2
+    dest: /usr/local/bin/docker-registry-mirror-gc.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Schedule weekly GC
+  become: true
+  ansible.builtin.cron:
+    name: docker-registry-mirror-gc
+    user: root
+    job: "/usr/local/bin/docker-registry-mirror-gc.sh"
+    cron_file: docker-registry-mirror-gc
+    minute: "{{ docker_registry_mirror_gc_schedule.split() | list | first if docker_registry_mirror_gc_schedule else '0' }}"
+    hour: "{{ docker_registry_mirror_gc_schedule.split() | list | length > 1 and (docker_registry_mirror_gc_schedule.split() | list)[1] or '4' }}"
+    day: "{{ docker_registry_mirror_gc_schedule.split() | list | length > 2 and (docker_registry_mirror_gc_schedule.split() | list)[2] or '*' }}"
+    month: "{{ docker_registry_mirror_gc_schedule.split() | list | length > 3 and (docker_registry_mirror_gc_schedule.split() | list)[3] or '*' }}"
+    weekday: "{{ docker_registry_mirror_gc_schedule.split() | list | length > 4 and (docker_registry_mirror_gc_schedule.split() | list)[4] or '0' }}"
+    state: "{{ 'present' if docker_registry_mirror_gc_schedule else 'absent' }}"
+
+- name: Render metrics emitter
+  become: true
+  ansible.builtin.template:
+    src: emit-metrics.sh.j2
+    dest: /usr/local/bin/docker-registry-mirror-emit-metrics.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: docker_registry_mirror_emit_node_exporter_metrics
+
+- name: Schedule metrics emission
+  become: true
+  ansible.builtin.cron:
+    name: docker-registry-mirror-metrics
+    user: root
+    minute: "*/5"
+    job: "/usr/local/bin/docker-registry-mirror-emit-metrics.sh"
+    state: "{{ 'present' if docker_registry_mirror_emit_node_exporter_metrics else 'absent' }}"
+
+- name: Render self-test
+  become: true
+  ansible.builtin.template:
+    src: self-test.sh.j2
+    dest: /usr/local/bin/docker-registry-mirror-self-test
+    owner: root
+    group: root
+    mode: "0755"

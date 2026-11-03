@@ -1,0 +1,288 @@
+---
+# surface-visit — deploy the per-door visit emitters (ADR 1163).
+
+- name: surface-visit | require inputs
+  ansible.builtin.assert:
+    that:
+      - surface_visit_image | length > 0
+      - surface_visit_surfaces | length > 0
+      - surface_visit_age_recipients | length > 0
+    fail_msg: >-
+      surface-visit needs an image, at least one surface, and a non-empty
+      operator age roster. The roster is not optional: the emitter encrypts
+      every visit record to it, and an empty one would mean publishing a
+      browsing trail in the clear. The binary refuses to start on an empty
+      recipients file; this fails earlier and says why.
+
+# Each door must actually be writing a request log before an emitter is pointed
+# at it. Without this the emitter starts, finds no file, and reports zero visits
+# — which looks exactly like a surface nobody visited.
+- name: surface-visit | each door must be writing a request log
+  ansible.builtin.stat:
+    path: "{{ surface_visit_door_log_dir }}/{{ item.name }}/request.log"
+  register: surface_visit_door_logs
+  become: true
+  loop: "{{ surface_visit_surfaces }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: surface-visit | refuse to emit for a door that writes no log
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+    fail_msg: >-
+      {{ surface_visit_door_log_dir }}/{{ item.item.name }}/request.log does not
+      exist, so oauth2-proxy-{{ item.item.name }} is still logging to stdout.
+      Set oauth2_proxy_surface_request_log_file for that door and re-run
+      authenticated-doors.yml first — an emitter pointed at a missing file
+      reports zero visits and looks healthy.
+  loop: "{{ surface_visit_door_logs.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: surface-visit | compose directory
+  ansible.builtin.file:
+    path: "{{ surface_visit_compose_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+# THE CERT DIR AND ITS CONTENTS BELONG TO 65532, NOT root.
+#
+# The image is Chainguard glibc-dynamic, which runs as uid 65532. A key left
+# root:root 0640 inside a 0750 root directory is unreadable to the process that
+# needs it, and zenoh reports that as "Unable to connect to any of
+# [tls/...:7447]" — indistinguishable from the router being down, a wrong
+# endpoint, or a rejected certificate. That cost a deploy cycle here: TCP was
+# open, a sibling peer on the same endpoint was healthy, the trust bundle was
+# byte-identical, and the leaf was signed by the right CA. The only difference
+# from the working peer was ownership.
+#
+# Matches what mesh-health carries: dir 0755 65532, cert 0644, key 0400.
+- name: surface-visit | cert directory owned by the runtime user
+  ansible.builtin.file:
+    path: "{{ surface_visit_cert_dir }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0755"
+  become: true
+
+# PUBLIC keys only. Written 0644 because the container runs unprivileged and
+# must read it; there is nothing secret in a list of age recipients.
+- name: surface-visit | write the operator age roster (public recipients)
+  ansible.builtin.copy:
+    content: |
+      # Operator age roster — PUBLIC recipients. Rendered by
+      # ops/ansible/roles/surface-visit/. The emitter encrypts every
+      # SurfaceVisitV1 to these and holds no identity, so it cannot read back
+      # what it writes; decryption is operator-side.
+      {% for r in surface_visit_age_recipients %}
+      {{ r }}
+      {% endfor %}
+    dest: "{{ surface_visit_age_recipients_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: "restart surface-visit"
+
+- name: surface-visit | the leaf cert and key must already be staged
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: surface_visit_certs
+  loop:
+    - "{{ surface_visit_cert_file }}"
+    - "{{ surface_visit_key_file }}"
+  become: true
+
+- name: surface-visit | refuse to deploy without the leaf
+  ansible.builtin.assert:
+    that:
+      - surface_visit_certs.results | map(attribute='stat.exists') | select('equalto', false) | list | length == 0
+    fail_msg: >-
+      Missing {{ surface_visit_cert_file }} or {{ surface_visit_key_file }}.
+      Mint offline with Subject CN=goat-surface-visit-trial-peer — that exact
+      CN is the Zenoh ACL subject match (Zenoh 1.9.0 has no URI-SAN matcher),
+      so a leaf with any other CN connects and is then denied silently on every
+      publish. See ops/enrollment/ca/<goatnet>/README.md.
+
+- name: surface-visit | stage the CA root beside the leaf
+  ansible.builtin.copy:
+    src: "{{ surface_visit_ca_root_src }}"
+    dest: "{{ surface_visit_cert_dir }}/ca-root-cert.pem"
+    remote_src: true
+    owner: "65532"
+    group: "65532"
+    mode: "0644"
+  become: true
+  notify: "restart surface-visit"
+
+# The leaf is staged by the operator, so its ownership is whatever the copy left
+# behind. Reconcile it here rather than documenting a manual chown: the failure
+# it prevents is a connect error that names the router, not the file.
+- name: surface-visit | the leaf must be readable by the runtime user
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: "65532"
+    group: "65532"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ surface_visit_cert_file }}", mode: "0644" }
+    - { path: "{{ surface_visit_key_file }}", mode: "0400" }
+  become: true
+  notify: "restart surface-visit"
+
+- name: surface-visit | render the compose overlay
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ surface_visit_compose_root }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: "restart surface-visit"
+
+- name: surface-visit | pull the image
+  community.docker.docker_image:
+    name: "{{ surface_visit_image }}"
+    source: pull
+    force_source: true
+    pull:
+      platform: "{{ surface_visit_image_platform }}"
+  become: true
+
+- name: surface-visit | bring the emitters up
+  community.docker.docker_compose_v2:
+    project_src: "{{ surface_visit_compose_root }}"
+    state: present
+    pull: missing
+  become: true
+
+- name: surface-visit | flush handlers before checking
+  ansible.builtin.meta: flush_handlers
+
+# A crash-looping container reports Running=true between restarts, so status
+# plus a held restart counter is the check that actually distinguishes a
+# working emitter from one failing on a bad roster or an unresolvable log.
+# Learned on the oauth2-proxy-surface live fire the same day.
+- name: surface-visit | each emitter must be running, not restarting
+  ansible.builtin.command:
+    cmd: "docker inspect -f '{{ '{{' }}.State.Status{{ '}}' }}' surface-visit-{{ item.name }}"
+  register: surface_visit_status
+  retries: 12
+  delay: 5
+  until: surface_visit_status.stdout | trim == "running"
+  changed_when: false
+  become: true
+  loop: "{{ surface_visit_surfaces }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: surface-visit | let them settle
+  ansible.builtin.pause:
+    seconds: 15
+
+- name: surface-visit | none may be crash-looping
+  ansible.builtin.command:
+    cmd: "docker inspect -f '{{ '{{' }}.RestartCount{{ '}}' }}' surface-visit-{{ item.name }}"
+  register: surface_visit_restarts
+  changed_when: false
+  become: true
+  loop: "{{ surface_visit_surfaces }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# THE CHECK THAT MATTERS. "Running" says the process is alive; it says nothing
+# about whether the emitter found its door's log. An emitter tailing nothing
+# runs happily forever and reports zero visits, which is indistinguishable from
+# a quiet surface — the F-177 shape this whole design keeps meeting. The
+# startup line names the resolved path, so require it.
+- name: surface-visit | each emitter must have resolved a door log
+  ansible.builtin.shell:
+    cmd: "docker logs surface-visit-{{ item.name }} 2>&1 | grep -c 'tailing the door log' || true"
+  register: surface_visit_tailing
+  changed_when: false
+  become: true
+  loop: "{{ surface_visit_surfaces }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: surface-visit | refuse to call a non-tailing emitter deployed
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim | int > 0
+    fail_msg: >-
+      surface-visit-{{ item.item.name }} started but never logged a resolved
+      door log, so it is tailing nothing and will report zero visits forever
+      while looking healthy. Check that
+      {{ surface_visit_door_log_dir }}/{{ item.item.name }}/request.log exists
+      on the host and is readable by uid 65532.
+  loop: "{{ surface_visit_tailing.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+# THE ONLY CHECK THAT PROVES THE GRANT. Everything above proves the emitter is
+# alive and reading; none of it proves the router ACCEPTED a write. A Zenoh put
+# is fire-and-forget, so the emitter cannot tell, and an ingress ACL
+# denial leaves no trace — which is how a stale ACL silently dropped
+# every publish for two hours.
+#
+# So write a marker through the real path and read it back off the router. If
+# the grant is missing or the ACL is stale, this fails HERE, at deploy time.
+- name: surface-visit | write a deploy marker through the door log
+  ansible.builtin.shell:
+    cmd: >-
+      printf '%s\n'
+      '{"ts":"{{ ansible_date_time.date | regex_replace("-", "/") }} {{ ansible_date_time.time }}","user":"deploy-marker","host":"marker","method":"GET","path":"/deploy-marker","status":200,"dur":0.001,"client":"127.0.0.1"}'
+      >> {{ surface_visit_door_log_dir }}/{{ surface_visit_surfaces[0].name }}/request.log
+  become: true
+  changed_when: false
+
+- name: surface-visit | the router must have ACCEPTED that marker
+  ansible.builtin.shell:
+    cmd: >-
+      docker run --rm --network {{ surface_visit_zenoh_network }} curlimages/curl:latest
+      -s --max-time 15
+      'http://{{ surface_visit_zenoh_endpoint | regex_replace("^tls/", "") | regex_replace(":7447$", "") }}:8000/ops/audit/surface/{{ surface_visit_surfaces[0].name }}/**'
+  register: surface_visit_readback
+  retries: 6
+  delay: 5
+  until: "'deploy-marker' in (surface_visit_readback.stdout | default(''))"
+  changed_when: false
+  become: true
+
+- name: surface-visit | refuse to report success on a write the router dropped
+  ansible.builtin.assert:
+    that:
+      - "'deploy-marker' in (surface_visit_readback.stdout | default(''))"
+    fail_msg: >-
+      The emitter is running and reading its door log, but a marker written
+      through it never appeared on the router. The write is being DROPPED —
+      almost always the ACL: either the grant for ops/audit/surface/** is
+      missing, or it is present in config.json5 and the RUNNING router never
+      loaded it (F-463 — SIGHUP does not reload access_control; restart the
+      router). A Zenoh put is fire-and-forget, so nothing upstream of this check
+      can tell you that.
+
+- name: surface-visit | deploy summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ surface_visit_surfaces | map(attribute='name') | join(', ') }} emitting
+      to ops/audit/surface/<surface>/<actor>, age-encrypted to
+      {{ surface_visit_age_recipients | length }} operator recipient(s).
+      Visits appear in microscope's surface-visits adapter; counts and times
+      come from the key path, and the per-request detail decrypts operator-side.
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: surface-visit | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "surface-visit"
+    rollback_ref: "{{ surface_visit_image }}"

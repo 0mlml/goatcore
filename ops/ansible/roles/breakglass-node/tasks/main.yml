@@ -1,0 +1,281 @@
+---
+# breakglass-node — see defaults/main.yml for why each of these exists.
+# Every block is gated; the role is a complete no-op with defaults.
+
+# ---- 0. the bad-day transport ------------------------------------------------
+- name: breakglass-node | tailscale package
+  when: breakglass_tailscale_installed | bool
+  block:
+    - name: breakglass-node | tailscale apt key
+      ansible.builtin.get_url:
+        url: "https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_distribution_release }}.noarmor.gpg"
+        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+        mode: "0644"
+
+    - name: breakglass-node | tailscale apt source
+      ansible.builtin.get_url:
+        url: "https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_distribution_release }}.tailscale-keyring.list"
+        dest: /etc/apt/sources.list.d/tailscale.list
+        mode: "0644"
+
+    - name: breakglass-node | tailscale installed
+      ansible.builtin.apt:
+        name: tailscale
+        state: present
+        update_cache: true
+
+    - name: breakglass-node | tailscaled enabled
+      ansible.builtin.systemd:
+        name: tailscaled
+        enabled: true
+        state: started
+
+# ---- 1. tailscale / netbird coexistence -------------------------------------
+- name: breakglass-node | tailscale netfilter assertion
+  when: breakglass_tailscale_netfilter_off | bool
+  block:
+    - name: breakglass-node | assert tailscale is present before claiming to manage it
+      ansible.builtin.stat:
+        path: /usr/bin/tailscale
+      register: bg_ts_bin
+
+    - name: breakglass-node | refuse rather than install a silent no-op unit
+      ansible.builtin.fail:
+        msg: >-
+          breakglass_tailscale_netfilter_off is set but /usr/bin/tailscale is
+          absent. The unit would start, fail every retry and leave the node
+          looking configured. Install tailscale first or unset the flag.
+      when: not bg_ts_bin.stat.exists
+
+    - name: breakglass-node | netfilter assertion unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/tailscale-netfilter-off.service
+        mode: "0644"
+        content: |
+          # Managed by ops/ansible/roles/breakglass-node — DO NOT EDIT ON HOST.
+          # Tailscale's default NetfilterMode=2 drops netbird's fwmark-routed
+          # traffic and takes this node off the mesh. Re-asserted here so a
+          # reboot, a tailscaled restart or a later `tailscale up` cannot
+          # silently reintroduce it.
+          [Unit]
+          Description=Assert tailscale netfilter-mode=off so netbird routing survives
+          After=tailscaled.service
+          Requires=tailscaled.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/sh -c 'for i in $(seq 1 30); do /usr/bin/tailscale set --netfilter-mode=off --accept-routes=false && exit 0; sleep 2; done; exit 1'
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: breakglass restart netfilter assertion
+
+    - name: breakglass-node | enable the netfilter assertion
+      ansible.builtin.systemd:
+        name: tailscale-netfilter-off.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+# ---- 2. time where NTP cannot work ------------------------------------------
+- name: breakglass-node | HTTP time source
+  when: breakglass_http_time_enabled | bool
+  block:
+    - name: breakglass-node | htpdate installed
+      ansible.builtin.apt:
+        name: htpdate
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: breakglass-node | htpdate configuration
+      ansible.builtin.copy:
+        dest: /etc/default/htpdate
+        mode: "0644"
+        content: |
+          # Managed by ops/ansible/roles/breakglass-node — DO NOT EDIT ON HOST.
+          # This site blocks udp/123, so NTP can never discipline this clock and
+          # the board has no RTC battery. Time comes from HTTPS Date headers.
+          # Expect NTPSynchronized to read "no" here permanently.
+          # -D daemon, NOT -s. The packaged unit is Type=forking with
+          # PIDFile=/run/htpdate.pid; -s sets the clock once and exits, so no
+          # pidfile appears and systemd marks the unit failed EVEN THOUGH the
+          # time was corrected. That failure mode is quiet and easy to miss:
+          # the journal shows "Set time:" immediately above "Failed with
+          # result 'protocol'".
+          # -t disables the sanity limit on how far the clock may jump. It does
+          # NOT make daemon mode step the clock: -D SLEWS, and a slew cannot
+          # cover a large offset. This daemon therefore handles steady-state
+          # drift ONLY. The large-offset case — a board with no RTC that boots
+          # months out — belongs to breakglass-clock-step.service, and
+          # believing this line covered it left a break-glass node dark for two
+          # days.
+          HTP_OPTIONS="-D -l -t"
+          HTP_SERVERS="{{ breakglass_http_time_servers | join(' ') }}"
+      notify: breakglass restart htpdate
+
+    - name: breakglass-node | timesyncd disabled — two time daemons is worse than one
+      ansible.builtin.systemd:
+        name: systemd-timesyncd
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: breakglass-node | htpdate enabled
+      ansible.builtin.systemd:
+        name: htpdate
+        enabled: true
+        state: started
+
+# ---- 2a. the clock step that recovers a node the daemon cannot ------
+- name: breakglass-node | boot-time clock step
+  when:
+    - breakglass_http_time_enabled | bool
+    - breakglass_clock_step_enabled | bool
+  block:
+    - name: breakglass-node | fake-hwclock installed (cold boot starts at last-known-good)
+      ansible.builtin.apt:
+        name: fake-hwclock
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: breakglass_fake_hwclock_enabled | bool
+
+    - name: breakglass-node | fake-hwclock load-at-boot unit (the packaged one is masked)
+      # Ubuntu masks /lib/systemd/system/fake-hwclock.service, so the package
+      # alone saves the clock hourly and never restores it. Role owns the unit.
+      ansible.builtin.copy:
+        src: fake-hwclock-load.service
+        dest: /etc/systemd/system/fake-hwclock-load.service
+        owner: root
+        group: root
+        mode: "0644"
+      when: breakglass_fake_hwclock_enabled | bool
+
+    - name: breakglass-node | fake-hwclock load-at-boot unit enabled
+      ansible.builtin.systemd:
+        name: fake-hwclock-load.service
+        enabled: true
+        daemon_reload: true
+      when: breakglass_fake_hwclock_enabled | bool
+
+    - name: breakglass-node | fake-hwclock hourly save timer enabled
+      ansible.builtin.systemd:
+        name: fake-hwclock-save.timer
+        enabled: true
+        state: started
+      when: breakglass_fake_hwclock_enabled | bool
+
+    - name: breakglass-node | fake-hwclock seeded — but only from a sane clock
+      # Never persist a bad time. The year guard is the same one ntp-hygiene
+      # uses before `fake-hwclock save`.
+      ansible.builtin.command: fake-hwclock save
+      changed_when: false
+      when:
+        - breakglass_fake_hwclock_enabled | bool
+        - (ansible_date_time.year | int) >= breakglass_clock_min_year | int
+
+    - name: breakglass-node | clock-step script
+      ansible.builtin.template:
+        src: breakglass-clock-step.sh.j2
+        dest: /usr/local/sbin/breakglass-clock-step.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: breakglass-node | clock-step unit
+      ansible.builtin.template:
+        src: breakglass-clock-step.service.j2
+        dest: /etc/systemd/system/breakglass-clock-step.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: breakglass-node | clock-step retry timer
+      ansible.builtin.template:
+        src: breakglass-clock-step-retry.timer.j2
+        dest: /etc/systemd/system/breakglass-clock-step-retry.timer
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: breakglass-node | clock-step unit enabled (fires on next boot)
+      ansible.builtin.systemd:
+        name: breakglass-clock-step.service
+        enabled: true
+        daemon_reload: true
+
+    - name: breakglass-node | clock-step retry timer enabled + started
+      ansible.builtin.systemd:
+        name: breakglass-clock-step-retry.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # Prove the thing works now, rather than discovering on the bad day that it
+    # does not. The script is a no-op on a healthy clock, so this is cheap.
+    - name: breakglass-node | run the clock step once, so the converge exercises it
+      ansible.builtin.command: /usr/local/sbin/breakglass-clock-step.sh
+      register: bg_clock_step_run
+      changed_when: "'stepping' in bg_clock_step_run.stdout or 'stepping' in bg_clock_step_run.stderr"
+      failed_when: false
+
+    - name: breakglass-node | a node that cannot reach a time source is not converged
+      ansible.builtin.assert:
+        that: bg_clock_step_run.rc == 0
+        fail_msg: >-
+          breakglass-clock-step.sh could not reach any of
+          {{ breakglass_http_time_servers | join(', ') }} from this host, so
+          this node cannot fix its own clock and will fail TLS on both
+          transports after any power cut. Check egress to :443 for
+          those hosts before declaring this node break-glass.
+        success_msg: "clock step reachable; this node can recover its own clock"
+
+# ---- 3. resolver where port 53 egress is blocked ----------------------------
+- name: breakglass-node | DNS over TLS
+  when: breakglass_dns_over_tls_enabled | bool
+  block:
+    - name: breakglass-node | refuse an empty resolver list rather than break name resolution
+      ansible.builtin.fail:
+        msg: >-
+          breakglass_dns_over_tls_enabled is set but
+          breakglass_dns_over_tls_servers is empty. Writing that config would
+          leave the host with DNSOverTLS on and no server to reach.
+      when: breakglass_dns_over_tls_servers | length == 0
+
+    - name: breakglass-node | resolved drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: breakglass-node | DNS-over-TLS drop-in
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/10-dot.conf
+        mode: "0644"
+        content: |
+          # Managed by ops/ansible/roles/breakglass-node — DO NOT EDIT ON HOST.
+          # This site advertises public resolvers over DHCP and then blocks port
+          # 53 egress to them, so a DHCP client has nameservers it cannot reach.
+          # Port 853 is open; resolution goes over TLS instead.
+          [Resolve]
+          DNS={{ breakglass_dns_over_tls_servers | join(' ') }}
+          DNSOverTLS=yes
+          FallbackDNS=
+      notify: breakglass restart resolved
+
+# CVE-2026-98432 (IPv4 TCP request-socket use-after-free, CVSS 9.8). The
+# published exploit needs an MPTCP listener, and Go 1.24+ listeners request
+# MPTCP by default. Ubuntu 24.04 and 22.04 had no fixed kernel on 2026-11-02
+# (ubuntu.com/security/CVE-2026-98432: "in progress"). MPTCP stays off until
+# the fixed kernel is live on the host, then this task is removed. Tegra
+# kernels do not build MPTCP, so the key is absent there and the task skips.
+- name: CVE-2026-98432 mitigation — MPTCP off until the fixed kernel ships
+  ansible.posix.sysctl:
+    name: net.mptcp.enabled
+    value: "0"
+    sysctl_file: /etc/sysctl.d/98-goat-cve-2026-98432.conf
+    state: present
+    reload: true
+  when: ansible_kernel is not search('tegra')

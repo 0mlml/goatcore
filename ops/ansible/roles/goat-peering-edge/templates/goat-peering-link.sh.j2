@@ -1,0 +1,51 @@
+#!/bin/sh
+# {{ ansible_managed }}
+#
+# Create/destroy the xfrm interface that carries one cross-sovereign peering
+# link. Driven by goat-peering-link@<name>.service, which sources
+# /etc/goat-peering-edge/<name>.link.env.
+#
+# Deliberately not netplan/systemd-networkd: this has to behave the same on an
+# Ubuntu server using networkd and on an L4T host that may not be.
+
+set -eu
+
+: "${LINK_IFNAME:?LINK_IFNAME not set}"
+: "${LINK_IF_ID:?LINK_IF_ID not set}"
+: "${LINK_UNDERLAY_DEV:?LINK_UNDERLAY_DEV not set}"
+: "${LINK_ADDR:?LINK_ADDR not set}"
+: "${LINK_PREFIX_LEN:?LINK_PREFIX_LEN not set}"
+: "${LINK_MTU:?LINK_MTU not set}"
+
+case "${1:-up}" in
+  up)
+    if ! ip link show "$LINK_IFNAME" >/dev/null 2>&1; then
+      ip link add "$LINK_IFNAME" type xfrm dev "$LINK_UNDERLAY_DEV" if_id "$LINK_IF_ID"
+    fi
+    ip link set "$LINK_IFNAME" mtu "$LINK_MTU"
+    ip addr replace "${LINK_ADDR}/${LINK_PREFIX_LEN}" dev "$LINK_IFNAME"
+    ip link set "$LINK_IFNAME" up
+
+    if [ "${LINK_CLAMP_MSS:-0}" = "1" ]; then
+      nft list table inet goat_peering >/dev/null 2>&1 || nft add table inet goat_peering
+      nft list chain inet goat_peering clamp >/dev/null 2>&1 || \
+        nft add chain inet goat_peering clamp \
+          '{ type filter hook forward priority mangle ; policy accept ; }'
+      nft flush chain inet goat_peering clamp
+      nft add rule inet goat_peering clamp oifname "$LINK_IFNAME" \
+        tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+      nft add rule inet goat_peering clamp iifname "$LINK_IFNAME" \
+        tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+    fi
+    ;;
+  down)
+    if [ "${LINK_CLAMP_MSS:-0}" = "1" ]; then
+      nft delete table inet goat_peering >/dev/null 2>&1 || true
+    fi
+    ip link del "$LINK_IFNAME" >/dev/null 2>&1 || true
+    ;;
+  *)
+    echo "usage: $0 {up|down}" >&2
+    exit 2
+    ;;
+esac

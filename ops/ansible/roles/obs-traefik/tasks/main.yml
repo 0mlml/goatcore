@@ -1,0 +1,149 @@
+---
+# Block 21H.3 prereq — obs-traefik role.
+# ADR 0842. Public-facing TLS terminator on Orin-C for the operator
+# IdP + every obs/utility consumer.
+
+- name: Require site_id + site_dns_zone
+  ansible.builtin.assert:
+    that:
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+    fail_msg: |
+      site_id and site_dns_zone must be set in group_vars/<site>_obs_hosts/vars.yml.
+
+- name: Require at least one route
+  # If obs_traefik_routes is empty, Traefik comes up but serves
+  # nothing. That's a useless deploy; fail-fast.
+  ansible.builtin.assert:
+    that:
+      - obs_traefik_routes is defined
+      - obs_traefik_routes | length > 0
+    fail_msg: |
+      obs_traefik_routes is empty or undefined. Populate per-site in
+      group_vars/<site>_obs_hosts/vars.yml. At minimum, set the two
+      operator-IdP routes (auth.ops.<site> + oauth2.ops.<site>) when
+      operator_idp_enabled is true.
+
+- name: Require cert + key files exist on operator workstation
+  ansible.builtin.stat:
+    path: "{{ item.0 }}"
+  delegate_to: localhost
+  loop: >-
+    {{ obs_traefik_routes
+       | map(attribute='cert_src') | list
+       | zip(obs_traefik_routes | map(attribute='name') | list)
+       | list }}
+  loop_control:
+    label: "{{ item.1 }} ({{ item.0 }})"
+  register: cert_stat
+  failed_when: not cert_stat.stat.exists
+
+- name: Ensure compose project + dynamic-config + tls dirs exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ obs_traefik_compose_dir }}", mode: "0750" }
+    - { path: "{{ obs_traefik_data_root }}", mode: "0700" }
+    - { path: "{{ obs_traefik_dynamic_dir }}", mode: "0750" }
+    - { path: "{{ obs_traefik_tls_root }}", mode: "0750" }
+
+- name: Ensure per-route TLS subdirectories exist
+  ansible.builtin.file:
+    path: "{{ obs_traefik_tls_root }}/{{ item.name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop: "{{ obs_traefik_routes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Deliver cert PEM for each route
+  ansible.builtin.copy:
+    src: "{{ item.cert_src }}"
+    dest: "{{ obs_traefik_tls_root }}/{{ item.name }}/cert.pem"
+    owner: root
+    group: root
+    mode: "0640"
+  loop: "{{ obs_traefik_routes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: restart obs-traefik
+
+- name: Deliver key PEM for each route
+  ansible.builtin.copy:
+    src: "{{ item.key_src }}"
+    dest: "{{ obs_traefik_tls_root }}/{{ item.name }}/key.pem"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ obs_traefik_routes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  notify: restart obs-traefik
+
+- name: Render static traefik.yml
+  ansible.builtin.template:
+    src: traefik.yml.j2
+    dest: "{{ obs_traefik_compose_dir }}/traefik.yml"
+    mode: "0644"
+  notify: restart obs-traefik
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ obs_traefik_compose_dir }}/docker-compose.yml"
+    mode: "0640"
+
+- name: Render middleware catalog
+  ansible.builtin.template:
+    src: middlewares.yml.j2
+    dest: "{{ obs_traefik_dynamic_dir }}/00-middlewares.yml"
+    mode: "0644"
+
+- name: Render per-route dynamic config
+  ansible.builtin.template:
+    src: route.yml.j2
+    dest: "{{ obs_traefik_dynamic_dir }}/route-{{ item.name }}.yml"
+    mode: "0644"
+  loop: "{{ obs_traefik_routes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  vars:
+    route: "{{ item }}"
+
+- name: Pull obs-traefik image
+  ansible.builtin.command:
+    cmd: docker compose pull traefik
+    chdir: "{{ obs_traefik_compose_dir }}"
+  changed_when: true
+
+- name: Bring up obs-traefik
+  ansible.builtin.command:
+    cmd: docker compose up -d traefik
+    chdir: "{{ obs_traefik_compose_dir }}"
+  changed_when: true
+
+- name: Wait for Traefik admin /api/version (loopback)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ obs_traefik_admin_port }}/api/version"
+    status_code: 200
+  register: traefik_admin
+  retries: 30
+  delay: 2
+  until: traefik_admin.status == 200
+
+- name: Surface routes summary
+  ansible.builtin.debug:
+    msg: |
+      obs-traefik up. Configured routes:
+      {% for r in obs_traefik_routes %}
+        - {{ r.name }}: {{ r.hosts | join(', ') }} -> {{ r.backend }}
+      {% endfor %}
+      Public TLS at https://<orin-c-ip>:{{ obs_traefik_https_port }}
+      Admin (loopback only): http://127.0.0.1:{{ obs_traefik_admin_port }}/dashboard/

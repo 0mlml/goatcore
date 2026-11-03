@@ -1,0 +1,30 @@
+---
+# wireguard-kmod role defaults (ADR 1118).
+
+# present = install modules + cut netbird over to kernelspace.
+# absent  = remove modules + restart netbird back into userspace.
+wg_kmod_state: present
+
+# Local checkout of goat-wireguard-kmod on the control machine.
+# Artifacts are resolved per host as: <root>/artifacts/<ansible_kernel>/*.ko
+wg_kmod_artifact_root: "{{ lookup('env', 'WG_KMOD_ARTIFACT_ROOT') | default(lookup('env', 'HOME') ~ '/src/github.com/usareur-af/goatcore-wireguard-kmod', true) }}"
+
+wg_kmod_netbird_service: netbird
+
+# Seconds to wait for the host's mesh transport to return after the netbird
+# restart (the restart drops the deploy's own connection by design).
+wg_kmod_reconnect_timeout: 300
+
+# BBR/fq POLICY, distinct from availability. The artifact set always installs
+# tcp_bbr.ko + sch_fq.ko (so BBR is testable per-connection and the F-301
+# Starlink-reordering A/B measurement is finally possible), but switching the
+# host DEFAULT congestion control is a per-goatnet decision gated on that
+# measurement. true = persist net.ipv4.tcp_congestion_control=bbr +
+# net.core.default_qdisc=fq (sysctl.d + modules-load.d). false = remove the
+# persistence and revert the runtime values if this role had set them.
+wg_kmod_bbr_policy: false
+
+# The goat-wireguard-kmod checkout commit actually being deployed — recorded
+# in the per-host runtime ledger (ADR 1060 meta-dependency). Resolved from the
+# artifact checkout on the control machine; 'unknown' if it isn't a git repo.
+wg_kmod_artifact_ref: "{{ lookup('ansible.builtin.pipe', 'git -C ' ~ wg_kmod_artifact_root ~ ' rev-parse --short HEAD 2>/dev/null || echo unknown') }}"

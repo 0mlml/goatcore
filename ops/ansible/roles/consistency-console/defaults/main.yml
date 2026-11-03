@@ -1,0 +1,264 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the `consistency-console` role — the CF-6 consistency console
+# (docs/design/consistency-foundation.md §7, ADR 1110 D5).
+#
+# A STATELESS PROJECTION behind Traefik + the oauth2-proxy admin fence (the
+# microscope deployment shape) that also holds a Zenoh mTLS session (the
+# consistency-health shape): it subscribes ops/consistency/health/** +
+# ops/consistency/report/**, reads the goatnet's committed IntentV1 from a
+# read-only mount VERIFIED AT EVERY RENDER, and stores nothing. Kill the
+# container and nothing changes (§7.9).
+#
+# DEFAULT-OFF, repo-side. Nothing here contacts a host until a goatnet's
+# group_vars turns it on AND the PENDING image sentinel is replaced by a real
+# multi-arch INDEX digest — the fail-closed assert refuses both.
+#
+# Deploy-decision checklist (operator-side, NOT this role — see also the
+# pre-flight comments in tasks/main.yml):
+#   1. Pin consistency_console_image from the first main build of
+#      .github/workflows/consistency-console-image.yml, with a
+#      deploy-history.yml row in the same change.
+#   2. Mint the leaf cert via the offline-CA cert-sign ceremony
+#      (Subject CN=goat-consistency-console-trial-peer) and add a router ACL
+#      rule allowing that subject to SUBSCRIBE ops/consistency/** — the
+#      console publishes nothing and needs no write rule. Router restart
+#      required; a missing rule denies SILENTLY.
+#   3. Mint the Hydra OIDC client for the fence (client id/secret) — the
+#      same ceremony as oauth2-proxy-microscope.
+#   4. Add the isitup_services entry. The name is HALF A PAIR with the
+#      `consistency-aggregator` row in group_vars/all.yml — scope in the name,
+#      the other one's failure mode in the desc; copy both verbatim so a third
+#      goatnet does not reintroduce the two-services-same-name confusion.
+#        - id: consistency
+#          name: "Consistency — this goatnet"
+#          desc: >-
+#            Compares what this goatnet is declared to run against what its
+#            nodes report. Served from the mesh off local files: still answers
+#            when the WAN is down.
+#          fqdn: "consistency.{{ site_id }}.{{ site_dns_zone }}"
+#          container: consistency-console
+#          port: 9760
+#          health_path: /healthz
+#          kind: ui
+#          category: admin
+#      and regenerate ops/dns (generate-mesh-hosts.py) in the same change.
+#      The entry is deliberately NOT committed before the deploy decision: a
+#      declared-but-undeployed service publishes a dark DNS record and a red
+#      status row (the F-197 class, mirrored).
+
+consistency_console_enabled: false
+
+# Multi-arch INDEX digest from .github/workflows/consistency-console-image.yml.
+#   docker buildx imagetools inspect ghcr.io/{{ ghcr_org }}/goat-consistency-console:sha-<short> --format '{{.Manifest.Digest}}'
+# sha-7c9a662 = the first successful main build (#2108, CF-6 merge); digest
+# verified as the OCI image INDEX (amd64+arm64), never a per-arch leaf
+#, identical in both ghcr namespaces. For governed goatnets the
+# value of record renders from ops/pins/fleet-pins.yaml into the generated
+# group_vars pins.yml, which shadows this default; bump BOTH in lockstep.
+consistency_console_image: "ghcr.io/{{ ghcr_org }}/goat-consistency-console:sha-7c9a662@sha256:79d40ca11dcc108a5a516d40caf797690e96c8640221a1434c66cdaaa3f1da8f"
+
+consistency_console_hostname: "consistency.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }}"
+consistency_console_compose_dir: /opt/consistency-console
+
+# --- the console app ---
+# The <site> scope of ops/consistency/health/<site> this page is ABOUT. Its
+# absence renders as "nothing heard", never as healthy.
+consistency_console_site: "{{ site_id | mandatory }}"
+consistency_console_rollup_stale_after_ms: 900000
+consistency_console_rust_log: "goat_consistency_console=info,zenoh=warn"
+
+# --- Zenoh session (read-only subscriber; publishes nothing) ---
+consistency_console_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+consistency_console_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+# Router hosts join the router's compose network. Non-router nodes set this
+# false and point the endpoint at the router host's MESH IP.
+consistency_console_join_zenoh_network: true
+# Leaf cert minted via the offline-CA ceremony with Subject
+# CN=goat-consistency-console-trial-peer (subscribe-only ACL subject; see the
+# deploy-decision checklist above).
+consistency_console_cert_dir: /opt/consistency-console/certs
+consistency_console_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# --- the committed intent artifact (verify-at-read, CF-5) ---
+# Placed by this role from the deploying checkout, mounted read-only. The
+# console verifies signature + content hash on EVERY render regardless of how
+# the file arrived — the transport, this role included, is untrusted by
+# construction.
+consistency_console_intent_dir: /etc/consistency-console
+
+# --- Traefik (file provider, the microscope shape) ---
+consistency_console_traefik_network: mgmt
+consistency_console_traefik_dynamic_dir: /etc/traefik/dynamic
+consistency_console_traefik_dynamic_filename: consistency-console.yml
+consistency_console_traefik_router_name: consistency-console
+consistency_console_traefik_cert_resolver: le
+# Mesh-only middleware stays ON EVEN THOUGH the admin fence gates too —
+# defense in depth; this surface is never internet-reachable.
+consistency_console_traefik_mesh_only_middleware: ""
+
+# --- oauth2-proxy admin fence (mirrors microscope / relay-health, ADR 0860) --
+consistency_console_oauth2_proxy_enabled: true
+consistency_console_oauth2_proxy_image: "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d"
+consistency_console_oauth2_proxy_oidc_issuer_url: ""
+consistency_console_oauth2_proxy_client_id: "consistency-console"
+consistency_console_oauth2_proxy_client_secret: ""
+consistency_console_oauth2_proxy_cookie_secret: ""
+# On-container OIDC-discovery resolution for the issuer's mesh-DNS name
+#.
+consistency_console_oauth2_proxy_oidc_host_entry: "oauth2.{{ site_id | mandatory }}.{{ public_mgmt_fqdn | default(site_dns_zone | mandatory) }}:{{ mesh_ip_a | default('100.127.0.190') }}"
+# Ory groups admitted at the fence. Widened by operator decision
+# (bus msg p1522): the CF-6 IAM-ADMIN exclusion is superseded for these
+# read-only drift pages — PLATFORM-ADMIN + IAM-ADMIN both view. (No
+# network-admin group exists to add: ADR 1113 rejected a NETWORK-ADMIN role;
+# network admins hold PLATFORM-ADMIN or use the aggregator's roster door.)
+# Literal (not templated) — the ADR 1073 parity ratchet reads this value and
+# asserts it equals the matrix grant set exactly.
+consistency_console_oauth2_proxy_allowed_groups: "PLATFORM-ADMIN,IAM-ADMIN"
+
+# --- Block 94 sibling base URLs (§7.7; empty = link hidden, never dead) ---
+# Per-site convention is <surface>.<site_id>.<site_dns_zone> — NOT
+# <surface>.<site_dns_zone>, the panoscope role's documented Phase-B mistake.
+consistency_console_sibling_panoscope_url: "https://panoscope.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }}"
+consistency_console_sibling_stethoscope_url: "https://stethoscope.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }}"
+consistency_console_sibling_flashlight_url: ""
+consistency_console_sibling_portal_url: ""
+# The CROSS-ENV comparison page. A site console sees ONE goatnet, so "how does
+# this compare to the other environment" is the question it structurally cannot
+# answer — and previously an operator had to know a second URL by heart.
+# Empty = hidden, never dead. Set it per goatnet; there is no sensible default
+# because the aggregator is hosted per fleet, not per site.
+consistency_console_sibling_crossenv_url: ""
+
+# ===========================================================================
+# CF-7 AGGREGATOR MODE (consistency-foundation.md §7.8 as-built, hosted
+# variant) — the SAME binary/image with --aggregate, deployed BESIDE the
+# multi-env relay-health dashboard on a cloud relay-health host rather than
+# on a mgmt host. Invoked explicitly via
+#   include_role: {name: consistency-console, tasks_from: aggregate}
+# (ops/ansible/consistency-aggregator-deploy.yml) so the single-mode path
+# above is untouched. DEFAULT-OFF and PENDING-pinned: nothing deploys until
+# the operator's deploy phase flips the flag AND pins a post-merge image
+# build that contains the aggregate-v1 API.
+# ===========================================================================
+
+consistency_aggregator_enabled: false
+
+# MUST be a multi-arch INDEX digest of a main build that includes the
+# aggregate-v1 API + drift view (the aggregator-product change). The CF-6
+# console pin above predates that API — do NOT reuse it here.
+# sha-577146c = #2403's merge commit (drift-page grid layout — round 4:
+# fixed-column CSS grid with sticky env-column header, one-line cells with
+# truncation behind the expansion affordance, bound measure-capped
+# explanations inside the row block, status-once vocabulary dedup, density
+# tiers with declared rows one line by default, 1280px page measure, and
+# the production-shaped 3-column visual fixture — §7.8 "Grid layout
+# as-built"), run 31453694174. Digest verified DAEMONLESS via the
+# GHCR manifests API with Accept: application/vnd.oci.image.index.v1+json —
+# content-type came back as the OCI image INDEX (amd64+arm64), identical in
+# both ghcr namespaces, and matches the workflow's own merge-job imagetools
+# inspect verbatim.
+consistency_aggregator_image: "ghcr.io/{{ ghcr_org }}/goat-consistency-console:sha-577146c@sha256:fa9658928c381a6b7a1147530a6d8caccf730505b487ec447ab2c710c8cb9fe2"
+
+# Sibling of the hosting box's relay-health FQDN on the same host, same
+# zone, same Traefik — the fleet naming scheme <service>.<env>.<org>.<suffix>.
+# EMPTY here;
+# the hosting group_vars set the literal
+# (group_vars/zagros_prod_relay_health/consistency-aggregator.yml) and the
+# aggregate tasks assert it non-empty.
+consistency_aggregator_hostname: ""
+
+consistency_aggregator_compose_dir: /opt/consistency-aggregator
+# Per-goatnet committed artifacts land under <intent_dir>/<goatnet>/ plus one
+# shared public-keys/ dir; verify-at-read runs per goatnet independently.
+consistency_aggregator_intent_dir: /etc/consistency-aggregator/intent
+# Per-goatnet subscribe-only client leafs under <cert_dir>/<name>/
+# (leaf-cert.pem / leaf-key.pem / ca-root-cert.pem), operator-minted via the
+# offline-CA ceremony — same subject each goatnet already ACLs for its own
+# console (CN=goat-consistency-console-trial-peer). Never committed.
+consistency_aggregator_cert_dir: /opt/consistency-aggregator/certs
+consistency_aggregator_rollup_stale_after_ms: 900000
+consistency_aggregator_rust_log: "goat_consistency_console=info,zenoh=warn"
+
+# --- zagros-door: the env-doors Tier 2 lane client (ADR 1117, first as-built
+# instance; consistency-foundation.md §7.8 as-built). A TLS-wrap haproxy
+# sidecar that carries the console's ZAGROS zenoh session inside an outer mTLS
+# connection through the ZAGROS relay ingress (SNI-pinned, fail-closed to
+# offline-CA cert holders; the inner zenoh mTLS session unchanged). Default
+# OFF + empty;
+# the hosting group_vars set the literals. Requires an operator-staged
+# combined client cert+key at <cert_dir>/zagros-door/client.pem (haproxy `crt`
+# format) — never committed; the aggregate tasks fail closed without it. ---
+consistency_aggregator_zagros_door_enabled: false
+# Same haproxy pin as the mgmt-host federation-proxy (the proven
+# relay-tunneled TLS client) — multi-arch INDEX digest.
+consistency_aggregator_zagros_door_image: "haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f"
+consistency_aggregator_zagros_door_sni: ""
+consistency_aggregator_zagros_door_relays: []
+
+# The goatnets the aggregator LISTENS to — rendered into aggregator.yaml.
+# Per entry: name (display + anchor), site (ops/consistency/health/<site>
+# scope), endpoint (tls/... from THIS host's vantage), goatnet (the
+# ops/consistency/intent/<goatnet>/ artifact dir). An endpoint that cannot be
+# reached renders that goatnet indeterminate-with-age — never green, never
+# absent — which is the §7.8 contract, so declaring a goatnet before its
+# transport exists is safe and makes the gap visible (the
+# relay_health_goatnets precedent).
+consistency_aggregator_goatnets: []
+
+# The relay-health standalone public gate's compose network + Traefik
+# file-provider dir (ops/compose/relay-health-standalone/docker-compose.public.yml)
+# — the aggregator joins that network and drops a sibling dynamic file, so
+# one Traefik serves both surfaces and the LE certResolver mints the sibling
+# cert via the same DNS-01 token.
+consistency_aggregator_network: relay-health
+consistency_aggregator_traefik_dynamic_dir: /opt/relay-health/traefik-dynamic
+consistency_aggregator_traefik_cert_resolver: le
+
+# --- aggregator front door — TWO gate modes -------------------------------
+# hydra-groups (default): the per-goatnet console ceremony — oauth2-proxy ->
+#   the HOSTING env's Hydra, allowed_groups parity-ratcheted (ADR 1073).
+#   Admits admins only, and the OIDC round-trip needs the hosting env's mesh.
+# dex-allowlist: the relay-health public-door ceremony (ADR 1061 Phase 2) —
+#   oauth2-proxy -> the public Dex broker, gate = the SAME roster-synced
+#   authenticated-emails file the relay-health door uses (ADR 1093 auto-sync),
+#   bind-mounted read-only. Dex emits no groups claim, so the email allowlist
+#   IS the authorization. Off-mesh reachable by design; use where the
+#   audience is the roster, not the admin group (operator decision
+#   for the hosted aggregator).
+consistency_aggregator_gate: "hydra-groups"
+consistency_aggregator_oauth2_proxy_enabled: true
+consistency_aggregator_oauth2_proxy_image: "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d"
+consistency_aggregator_oauth2_proxy_oidc_issuer_url: ""
+consistency_aggregator_oauth2_proxy_client_id: "consistency-aggregator"
+consistency_aggregator_oauth2_proxy_client_secret: ""
+consistency_aggregator_oauth2_proxy_cookie_secret: ""
+# F-126: pin the issuer's name for on-container OIDC discovery. On a mesh-peer
+# cloud host this points at the hosting env's mgmt-host MESH IP.
+consistency_aggregator_oauth2_proxy_oidc_host_entry: ""
+# hydra-groups mode only (dormant while the deployed gate is dex-allowlist);
+# kept parity-ratcheted with the matrix so a gate-mode flip-back restores the
+# widened admin fence (decision), not a stale or open door.
+consistency_aggregator_oauth2_proxy_allowed_groups: "PLATFORM-ADMIN,IAM-ADMIN"
+
+# dex-allowlist mode inputs (used only when consistency_aggregator_gate is
+# dex-allowlist). Client = the SHARED public-Dex `oauth2-proxy` static client
+# (same as the relay-health public gate; the per-host redirect URI is what is
+# registered per surface in usareur-af-infra). The allowlist file is
+# the relay-health box's roster-synced authenticated-emails file. The issuer
+# default is empty by design (F-188: shared artifacts must not hardcode a
+# site's zone) — the hosting group_vars own the literal; the dex-allowlist
+# assert fails closed on an empty issuer.
+consistency_aggregator_dex_issuer_url: ""
+consistency_aggregator_dex_client_id: "oauth2-proxy"
+consistency_aggregator_dex_client_secret: ""
+consistency_aggregator_allowlist_file: "/opt/relay-health/authenticated-emails.txt"
+
+# Block 94 sibling base URLs — empty by default: this page is fleet-scoped
+# and the hosting host serves no panoscope/stethoscope; links stay hidden,
+# never dead.
+consistency_aggregator_sibling_panoscope_url: ""
+consistency_aggregator_sibling_stethoscope_url: ""
+consistency_aggregator_sibling_flashlight_url: ""
+consistency_aggregator_sibling_portal_url: ""

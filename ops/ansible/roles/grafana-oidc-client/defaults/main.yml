@@ -1,0 +1,57 @@
+---
+# Defaults for the `grafana-oidc-client` role.
+#
+# Block 21H.3a — provisions an OAuth2 client at the operator-IdP Hydra
+# for Grafana, mirroring the netbird-dashboard 21D.1.c idempotent
+# GET-then-POST-or-PUT pattern. Does NOT manage the Grafana container
+# itself (that's the obs-host role); only the Hydra-side client config
+# and the Grafana env file with OIDC settings.
+#
+# Required env vars:
+#   - operator_idp_grafana_client_secret  (32+ chars; FRESH per site)
+#   - operator_idp_hydra_admin_host_port  (defined by operator-idp-hydra)
+
+grafana_oidc_client_id: "grafana"
+grafana_oidc_client_name: "Grafana ({{ site_id }})"
+
+# Issuer + redirect URI built from operator-IdP base. Issuer is rendered
+# by Hydra at oauth2.ops.<site> (the obs-traefik route for Hydra). The
+# Grafana redirect URI is dashboard.obs.<site> -- the new mesh hostname
+# we add to obs_traefik_routes for Grafana itself.
+grafana_oidc_issuer_url: "https://oauth2.ops.{{ site_id }}.{{ site_dns_zone }}"
+grafana_oidc_redirect_uri: "https://grafana.{{ site_id }}.{{ site_dns_zone }}/login/generic_oauth"
+
+# Scopes Grafana requests during the auth-code flow. openid is
+# mandatory; profile + email surface display name + identifier;
+# groups carries the authorization claim. Hydra grants whatever scopes
+# the client requests, and Kratos's identity-schema groups[] field
+# rides through as the `groups` claim by default in Hydra v2.x.
+# `offline_access` requests a refresh_token; Grafana's generic_oauth
+# plugin uses it to roll the session at token expiry instead of
+# bouncing the user back to /login. Must match the Grafana-side
+# GF_AUTH_GENERIC_OAUTH_SCOPES in the nova-obs compose file.
+grafana_oidc_scopes:
+  - openid
+  - profile
+  - email
+  - groups
+  - offline_access
+
+# Grafana role mapping from JWT groups claim to Grafana built-in roles.
+# Grafana has three: Admin, Editor, Viewer. Mapping logic:
+#   - groups contains obs-admin OR grafana-admin -> Admin
+#   - groups contains obs-readonly OR grafana-readonly -> Viewer
+#   - otherwise (no matching group) -> no access (Grafana login fails)
+# NOTE: nothing renders this var today — both compose files that carry
+# GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH (ops/compose/goat-obs, the
+# obs-host role template) hard-code their own expression. Kept in step so
+# a future consumer inherits the right vocabulary, not the dead one.
+grafana_oidc_role_jmespath: >-
+  contains(groups, 'obs-admin') && 'Admin'
+  || contains(groups, 'grafana-admin') && 'Admin'
+  || contains(groups, 'obs-readonly') && 'Viewer'
+  || contains(groups, 'grafana-readonly') && 'Viewer'
+
+# Hydra admin endpoint for client provisioning. Loopback on Orin-C
+# (same host this role runs against).
+grafana_oidc_hydra_admin: "http://127.0.0.1:{{ operator_idp_hydra_admin_host_port | default(4447) }}"

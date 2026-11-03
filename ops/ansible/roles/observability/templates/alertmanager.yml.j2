@@ -1,0 +1,325 @@
+{# Alertmanager config — rendered by the observability role.
+   Receivers are wired in descending severity order:
+
+     critical → PagerDuty AND ntfy as PEERS, fan-out (both fire)
+                  - PagerDuty if pagerduty_integration_key is set
+                  - ntfy if ntfy_alertmanager_webhook_url is set
+                  - both if both set; one if only one; webhook-noop if neither
+     warning  → Slack + email + ntfy as peers, same fan-out pattern
+                  - Slack if slack_webhook_url is set
+                  - email if smtp_smarthost + email_digest_recipients set
+                  - ntfy if ntfy_alertmanager_webhook_url set
+                  - webhook-noop if none
+     info     → grouped + shown in Prom UI only; no delivery
+
+   Peer fan-out: a single receiver containing
+   pagerduty_configs + webhook_configs (or slack_configs +
+   email_configs + webhook_configs) fires all configured notifiers
+   concurrently. PagerDuty's feature richness (on-call rotation,
+   escalation policies, SMS/voice fallback, MTTR metrics) and ntfy's
+   sovereign IP-push are complementary — neither is fallback for the
+   other. Per-site self-hosted ntfy server + alertmanager-ntfy bridge.
+   See failure-isolation.md §9 (peer-pager pattern) and
+   multi-agent-team-management.md §6.5c (same ntfy substrate serves
+   agent escalations).
+
+   Swapping paging vendors is a group_vars edit, not a config edit.
+   Unset vendor vars fall back to `webhook-noop` which drops to
+   /dev/null — alerts still render in the UI but nobody wakes up.
+
+   See failure-isolation.md §9 (paging) and the group_vars for the
+   env-sourced credential pattern.
+#}
+{# Helper: critical-fanout fires whenever ANY of PagerDuty / ntfy is set.
+   warning-fanout fires whenever ANY of Slack / email / ntfy is set.
+   Both fall back to webhook-noop when nothing is configured. #}
+global:
+  resolve_timeout: 5m
+{% if smtp_smarthost | default('') | length > 0 %}
+  smtp_smarthost: "{{ smtp_smarthost }}"
+  smtp_from: "{{ smtp_from | default('person-13@example.org') }}"
+  smtp_auth_username: "{{ smtp_auth_username | default('') }}"
+  smtp_auth_password: "{{ smtp_auth_password | default('') }}"
+  smtp_require_tls: true
+{% endif %}
+
+{# critical_fanout_active is true if either PagerDuty or ntfy is configured. #}
+{% set critical_fanout_active = (pagerduty_integration_key | default('') | length > 0) or (ntfy_alertmanager_webhook_url | default('') | length > 0) %}
+{# warning_fanout_active is true if any of Slack / email / ntfy is configured. #}
+{% set warning_fanout_active = (slack_webhook_url | default('') | length > 0) or (smtp_smarthost | default('') | length > 0 and email_digest_recipients | default('') | length > 0) or (ntfy_alertmanager_webhook_url | default('') | length > 0) or (warning_to_pagerduty | default(false) | bool and pagerduty_integration_key | default('') | length > 0) %}
+{# warning_to_pagerduty routes the WARNING tier to PagerDuty as well, at
+   severity="warning" so the PD service's own urgency rules decide whether it
+   wakes anyone. Exists because a goatnet can easily have PagerDuty wired for
+   critical and NOTHING for warning — which is worse than it looks: the tier
+   still fires, still resolves, and is silently discarded, so disk-filling and
+   clock-skew read as "no news". Opt-in per goatnet; unset behaves as before. #}
+{# deadman_active: an external absence-detector receives the Watchdog heartbeat
+   (rules/deadman.yml). Same contract as the obs-host role's template. #}
+{% set deadman_active = (deadman_webhook_url | default('') | length > 0) %}
+
+route:
+  receiver: {% if critical_fanout_active %}critical-fanout{% else %}webhook-noop{% endif %}
+
+  group_by: ["alertname", "site", "component"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # deadman FIRST — before any severity matcher. Watchdog carries
+    # severity="none" so it matches no tier below; without this route it falls
+    # through to the top-level receiver and pages every repeat_interval.
+    - matchers:
+        - alertname = "Watchdog"
+      receiver: {% if deadman_active %}deadman{% else %}webhook-noop{% endif %}
+
+      group_wait: 0s
+      group_interval: {{ deadman_repeat_interval | default('1m') }}
+      repeat_interval: {{ deadman_repeat_interval | default('1m') }}
+      continue: false
+
+    # F-568: a transient can resolve during the normal group_wait, so deliver
+    # its first firing immediately. Separate routers cannot delay each other;
+    # later transitions are checked every 30s instead of the generic 5m.
+    - matchers:
+        - alertname = "ZenohRouterAdmissionSeizure"
+        - severity = "critical"
+      receiver: {% if critical_fanout_active %}critical-fanout{% else %}webhook-noop{% endif %}
+
+      group_by: ["alertname", "site", "component", "router"]
+      group_wait: 0s
+      group_interval: 30s
+      continue: false
+
+    # critical → PagerDuty + ntfy (peer fan-out; both fire when both configured)
+    - matchers:
+        - severity = "critical"
+      receiver: {% if critical_fanout_active %}critical-fanout{% else %}webhook-noop{% endif %}
+
+      continue: false
+
+    # warning tier. A COMMENT MUST NOT END IN A BLOCK TAG: ansible renders with
+    # trim_blocks=True, which eats the newline after `{% raw %}{% endif %}{% endraw %}` and pulls the
+    # NEXT line up into this comment — silently deleting the route below.
+    # Destination: {% if warning_fanout_active %}Slack + email + ntfy (peer fan-out; all configured fire){% else %}webhook-noop — NOT DELIVERED on this goatnet; only `critical` reaches a person{% endif %} .
+    - matchers:
+        - severity = "warning"
+      receiver: {% if warning_fanout_active %}warning-fanout{% else %}webhook-noop{% endif %}
+
+      continue: false
+
+    # info → grouped only; visible in Prom UI but no delivery
+    - matchers:
+        - severity = "info"
+      receiver: webhook-noop
+      continue: false
+
+inhibit_rules:
+  # PostgresDown suppresses all Spock noise on the same site.
+  - source_matchers:
+      - alertname = "PostgresDown"
+    target_matchers:
+      - component = "spock"
+    equal: ["site"]
+
+  # Slot invalidated suppresses lag alerts for the same subscription.
+  - source_matchers:
+      - alertname = "SpockSlotInvalidated"
+    target_matchers:
+      - alertname = "SpockSubscriptionLag"
+    equal: ["site", "subscription_name"]
+
+  # Block 52A.1 — invalidated slot is necessarily inactive; one alert
+  # is enough. SpockSlotInvalidated is the authoritative one because
+  # it triggers the rebuild runbook; SlotInactive is a softer-floor
+  # signal for "consumer dropped without invalidation."
+  - source_matchers:
+      - alertname = "SpockSlotInvalidated"
+    target_matchers:
+      - alertname = "SpockSlotInactive"
+    equal: ["site", "slot_name"]
+
+  # Block 52A.1 — when a subscription is in non-replicating state,
+  # lag is meaningless (the lag column reports 0 / NULL). Suppress
+  # SpockSubscriptionLag in favor of SpockSubscriptionNotReplicating
+  # which is the actionable alert.
+  - source_matchers:
+      - alertname = "SpockSubscriptionNotReplicating"
+    target_matchers:
+      - alertname = "SpockSubscriptionLag"
+    equal: ["site", "subscription_name"]
+
+  # SignalServerDown suppresses downstream signal-server alerts on the
+  # same instance.
+  - source_matchers:
+      - alertname = "SignalServerDown"
+    target_matchers:
+      - component = "signal-server"
+    equal: ["site", "instance"]
+
+receivers:
+  # Always-defined null receiver. Every other receiver falls back to
+  # this when its credentials aren't set. Dropping alerts here is
+  # intentional during shakedown — the Prom UI still shows them.
+  - name: webhook-noop
+    webhook_configs:
+      - url: "http://localhost:9999/noop"
+        send_resolved: false
+{% if deadman_active %}
+  - name: deadman
+    webhook_configs:
+      - url: "{{ deadman_webhook_url }}"
+        send_resolved: false
+        max_alerts: 0
+{% if deadman_webhook_token | default('') | length > 0 %}
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: "{{ deadman_webhook_token }}"
+{% endif %}
+{% endif %}
+
+{% if critical_fanout_active %}
+  - name: critical-fanout
+    # Peer fan-out: PagerDuty + ntfy fire concurrently when both
+    # configured. Either alone if only one is set. Backward-compatible
+    # with PagerDuty-only deployments. See failure-isolation.md §9
+    # (peer-pager pattern) and ADR 0010.
+{% if pagerduty_integration_key | default('') | length > 0 %}
+    # PagerDuty Events API v2 (routing_key = the 32-char Integration
+    # Key from the PagerDuty service's "Events API v2" integration —
+    # Service Directory → goat → Integrations → +Add → Events
+    # API v2 → copy Integration Key). Rotation: set
+    # PAGERDUTY_INTEGRATION_KEY in env, re-run observability role,
+    # alertmanager restart handler picks up the new key.
+    # NOTE: the Alertmanager `service_key` field selects the legacy
+    # Events API v1 endpoint; `routing_key` selects v2 (which PD has
+    # been the recommended path since 2018). Same Integration Key
+    # value works for both; the field name picks the endpoint.
+    pagerduty_configs:
+      # `url` pins the REGION. Unset, Alertmanager defaults to the US endpoint —
+      # so an EU-hosted account has every page accepted by the API and delivered
+      # to nobody. Same rule ops/monitoring/net-health/alert-eval.py follows.
+      - url: "{{ pagerduty_events_url | default('https://events.pagerduty.com/v2/enqueue') }}"
+        routing_key: "{{ pagerduty_integration_key }}"
+        send_resolved: true
+        # MAP the goat severity vocabulary onto PagerDuty's, never pass it
+        # through. PD Events API v2 accepts EXACTLY `critical|warning|error|
+        # info` and answers anything else with HTTP 400 `'payload.severity' is
+        # invalid` — a hard, non-retried failure, so the page is simply lost
+        # while Prometheus and Alertmanager both show the alert firing and
+        # routed.
+        #
+        # The rule set uses severities that are not PD words. Every `page` alert — the
+        # entire mesh-liveness group, i.e. every "a declared always-up peer is gone"
+        # alarm — would 400 without the mapping, so the one alert designed to say a peer
+        # is gone could not be delivered.
+        #
+        # `page` means wake someone ⇒ critical. `ticket` means record it, do
+        # not wake ⇒ warning. UNKNOWN MAPS TO critical, deliberately: an
+        # unmapped severity must fail LOUD. Defaulting it to `info`, or leaving
+        # unmapped severity must fail LOUD. Defaulting it to `info`, or leaving
+        # it to pass through, keeps the failure invisible.
+        # which the final else catches for the same reason.
+        # SINGLE-QUOTED, ON ONE LINE. YAML folds a `>-` block's
+        # trailing COMMENTS INTO THE VALUE: the rendered severity becomes
+        # `critical        # PD Events API v2 rejects empty summary with HTTP 400...`,
+        # which is not a PagerDuty word, so every page 400s while the config LOOKS
+        # correct and alertmanager reports the alerts routed. A folded scalar absorbs any more-indented line
+        # after it, comments included; keep this on one line and keep comments ABOVE.
+        severity: '{% raw %}{{ if eq .CommonLabels.severity "critical" }}critical{{ else if eq .CommonLabels.severity "page" }}critical{{ else if eq .CommonLabels.severity "warning" }}warning{{ else if eq .CommonLabels.severity "info" }}info{{ else if eq .CommonLabels.severity "error" }}error{{ else if eq .CommonLabels.severity "ticket" }}warning{{ else }}critical{{ end }}{% endraw %}'
+        # PD Events API v2 rejects empty summary with HTTP 400.
+        # Production prom rules set the `summary` annotation, but manual
+        # smoke tests (amtool alert add) and rules added without
+        # annotations would cause a 400 and a notify-retry-canceled
+        # error. Fall back through summary → alertname → "(no summary)".
+        description: "{{ '{{' }} or .CommonAnnotations.summary .CommonLabels.alertname \"(no summary)\" {{ '}}' }}"
+        details:
+          site: "{{ '{{' }} .CommonLabels.site {{ '}}' }}"
+          component: "{{ '{{' }} .CommonLabels.component {{ '}}' }}"
+          alertname: "{{ '{{' }} .CommonLabels.alertname {{ '}}' }}"
+          runbook: "{{ '{{' }} .CommonAnnotations.runbook_url {{ '}}' }}"
+          firing: "{{ '{{' }} .Alerts.Firing | len {{ '}}' }}"
+{% endif %}
+{% if ntfy_alertmanager_webhook_url | default('') | length > 0 %}
+    # ntfy via the alertmanager-ntfy bridge container running on the
+    # same per-site mgmt-host. The bridge translates alertmanager's
+    # webhook JSON into ntfy POSTs with proper Title / Priority / Tags.
+    # Topic per group_vars: ntfy_topic_critical (default
+    # "goat-sre-{{ '{{' }}site{{ '}}' }}-critical"). See
+    # failure-isolation.md §9 + group_vars/{env}_hosts/vars.yml.
+    webhook_configs:
+      - url: "{{ ntfy_alertmanager_webhook_url }}"
+        send_resolved: true
+        max_alerts: 0
+{% if ntfy_alertmanager_user | default('') | length > 0 %}
+        # ntfy is deny-all by default (ADR 1168); this is the write-only publisher.
+        http_config:
+          basic_auth:
+            username: "{{ ntfy_alertmanager_user }}"
+            password: "{{ ntfy_alertmanager_password }}"
+{% endif %}
+{% endif %}
+{% endif %}
+
+{% if warning_fanout_active %}
+  - name: warning-fanout
+{% if warning_to_pagerduty | default(false) | bool and pagerduty_integration_key | default('') | length > 0 %}
+    # Warning tier -> PagerDuty at severity "warning". Same Events API v2
+    # integration key as critical; PagerDuty maps severity to urgency, so a
+    # low-urgency policy keeps these off the phone at 3am while still recording
+    # them. Chosen over email for goatnets with no receiving mailbox.
+    pagerduty_configs:
+      # `url` pins the REGION. Unset, Alertmanager defaults to the US endpoint —
+      # so an EU-hosted account has every page accepted by the API and delivered
+      # to nobody. Same rule ops/monitoring/net-health/alert-eval.py follows.
+      - url: "{{ pagerduty_events_url | default('https://events.pagerduty.com/v2/enqueue') }}"
+        routing_key: "{{ pagerduty_integration_key }}"
+        send_resolved: true
+        severity: "warning"
+        description: "{{ '{{' }} or .CommonAnnotations.summary .CommonLabels.alertname \"(no summary)\" {{ '}}' }}"
+        details:
+          site: "{{ '{{' }} .CommonLabels.site {{ '}}' }}"
+          component: "{{ '{{' }} .CommonLabels.component {{ '}}' }}"
+          alertname: "{{ '{{' }} .CommonLabels.alertname {{ '}}' }}"
+          firing: "{{ '{{' }} .Alerts.Firing | len {{ '}}' }}"
+{% endif %}
+    # Peer fan-out for warning tier: Slack + email + ntfy fire
+    # concurrently when configured. Email digest is the historical
+    # warning-tier path; ntfy adds a sovereign mobile-push channel
+    # for warnings without paging anyone in the middle of the night.
+{% if slack_webhook_url | default('') | length > 0 %}
+    slack_configs:
+      - api_url: "{{ slack_webhook_url }}"
+        channel: "{{ slack_warnings_channel | default('#goat-alerts') }}"
+        send_resolved: true
+        title: "[{{ '{{' }} .Status | toUpper {{ '}}' }}] {{ '{{' }} .CommonLabels.alertname {{ '}}' }} @ {{ '{{' }} .CommonLabels.site {{ '}}' }}"
+        text: "{{ '{{' }} .CommonAnnotations.summary {{ '}}' }}"
+{% endif %}
+{% if smtp_smarthost | default('') | length > 0 and email_digest_recipients | default('') | length > 0 %}
+    email_configs:
+      - to: "{{ email_digest_recipients }}"
+        send_resolved: false
+        headers:
+          Subject: "[goat] {{ '{{' }} .CommonLabels.severity {{ '}}' }}: {{ '{{' }} .CommonLabels.alertname {{ '}}' }}"
+{% endif %}
+{% if ntfy_alertmanager_webhook_url | default('') | length > 0 %}
+    # ntfy bridge for warnings — uses a different topic than critical
+    # so subscribers can opt into critical-only push if desired.
+    # The alertmanager-ntfy bridge reads the alert severity label and
+    # routes to ntfy_topic_warning vs ntfy_topic_critical accordingly,
+    # so the alertmanager-side webhook URL is the same for both tiers.
+    webhook_configs:
+      # Warning tier goes to its own topic when one is declared, so a person can
+      # subscribe to critical alone; falls back to the single URL otherwise.
+      - url: "{{ ntfy_alertmanager_webhook_url_warning | default(ntfy_alertmanager_webhook_url) }}"
+        send_resolved: false
+        max_alerts: 0
+{% if ntfy_alertmanager_user | default('') | length > 0 %}
+        http_config:
+          basic_auth:
+            username: "{{ ntfy_alertmanager_user }}"
+            password: "{{ ntfy_alertmanager_password }}"
+{% endif %}
+{% endif %}
+{% endif %}

@@ -1,0 +1,45 @@
+#!/bin/sh
+# {{ ansible_managed }}
+#
+# Create or remove the WireGuard interface that carries one cross-sovereign peering.
+# Driven by goat-peering-wg@<interface>.service, which reads
+# {{ peering_wg_config_dir }}/<interface>.env. Before phase 11 that file names only
+# the interface and its key; the address, the peer and the firewall arrive with it.
+set -eu
+
+: "${WG_IFNAME:?WG_IFNAME not set}"
+
+case "${1:-up}" in
+  up)
+    : "${WG_KEY_FILE:?WG_KEY_FILE not set}"
+    : "${WG_LISTEN_PORT:?WG_LISTEN_PORT not set}"
+    ip link show "$WG_IFNAME" >/dev/null 2>&1 || ip link add "$WG_IFNAME" type wireguard
+    wg set "$WG_IFNAME" private-key "$WG_KEY_FILE" listen-port "$WG_LISTEN_PORT"
+    [ -z "${WG_MTU:-}" ] || ip link set "$WG_IFNAME" mtu "$WG_MTU"
+    [ -z "${WG_LINK_ADDR:-}" ] || ip addr replace "$WG_LINK_ADDR" dev "$WG_IFNAME"
+    if [ -n "${WG_PEER_KEY:-}" ]; then
+      # One peer, ever. A key left over from an earlier agreement is an open door.
+      for p in $(wg show "$WG_IFNAME" peers); do
+        [ "$p" = "$WG_PEER_KEY" ] || wg set "$WG_IFNAME" peer "$p" remove
+      done
+      if [ -n "${WG_PEER_ENDPOINT:-}" ]; then
+        wg set "$WG_IFNAME" peer "$WG_PEER_KEY" allowed-ips "$WG_PEER_ALLOWED" \
+          endpoint "$WG_PEER_ENDPOINT" persistent-keepalive "${WG_PEER_KEEPALIVE:-25}"
+      else
+        wg set "$WG_IFNAME" peer "$WG_PEER_KEY" allowed-ips "$WG_PEER_ALLOWED"
+      fi
+    fi
+    # `-f` replaces only the table the file declares; docker's own rules are untouched.
+    [ -z "${WG_NFT_FILE:-}" ] || nft -f "$WG_NFT_FILE"
+    ip link set "$WG_IFNAME" up
+    ;;
+  down)
+    table="goat_peering_$(printf '%s' "$WG_IFNAME" | tr -c 'a-zA-Z0-9_\n' '_')"
+    nft delete table inet "$table" >/dev/null 2>&1 || true
+    ip link del "$WG_IFNAME" >/dev/null 2>&1 || true
+    ;;
+  *)
+    echo "usage: $0 {up|down}" >&2
+    exit 2
+    ;;
+esac

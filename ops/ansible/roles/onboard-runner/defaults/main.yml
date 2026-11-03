@@ -1,0 +1,235 @@
+---
+# ops/ansible/roles/onboard-runner/defaults/main.yml
+#
+# The onboard-runner auto-executor (docs/design/operator-onboard-intake.md
+# §"Fast-follow"). Runs on the site's mgmt host as a CONTAINER with its OWN scoped
+# portal identity: it polls the portal for operator-approved proposals, claims
+# each atomically, and runs the native `goat admin onboard`. Source:
+# ops/onboard-runner/ (image ghcr.io/{{ ghcr_org }}/onboard-runner). Portal contract:
+# ops/goat-zenoh-portal.
+#
+# SAFETY: this is a mint-anything capability. It is DEFAULT-OFF — deploying the
+# role renders the compose + creds but does NOT bring the container up until
+# `onboard_runner_enabled: true` is set explicitly (a deliberate go-live gate).
+# When disabled the role brings the stack DOWN, so toggling off actually stops
+# the daemon.
+
+# --- container image (see ops/onboard-runner + the onboard-runner-image.yml
+#     workflow). Digest-pinned per ADR 0859 (recorded in deploy-history.yml).
+#     CI multi-arch index (linux/amd64 + linux/arm64), built on main. ---
+onboard_runner_image: "ghcr.io/{{ ghcr_org }}/onboard-runner:sha-afd11bd@sha256:35b4a4ede0d00685cdb6f0c46c4112dd4cd429d690e5dc1dea758f7ed7912fc9"
+onboard_runner_container_name: "onboard-runner"
+onboard_runner_dir: "/opt/onboard-runner"           # compose dir (host)
+
+# --- the shared Docker network the portal + Kratos live on (so the runner
+#     reaches both by container name — no host mesh DNS, the whole point of the
+#     container reshape). external: true. ---
+onboard_runner_network: "mgmt"
+
+# --- reachability by container name on onboard_runner_network ---
+onboard_runner_portal_internal_url: "http://goat-zenoh-portal:8090"
+# The onboarding-contract endpoint (approved queue / claim / result) — moved to
+# goat-id-console (docs/design/onboarding-extraction-plan.md). Distinct from the
+# cert-mint leg above (portal). Same mgmt docker network, by container name.
+onboard_runner_onboard_internal_url: "http://goat-id-console:8080"
+onboard_runner_kratos_admin_url: "http://mgmt-host-kratos-1:4434"
+
+# --- the site `goat` binary the runner shells out to (native onboard). It is
+#     bind-mounted from the host (role-managed, one version source), NOT baked
+#     into the image. MUST be >= 0.4.15 — the GOAT_ONBOARD_KRATOS_ADMIN_URL
+#     override (reaching a sibling Kratos container by name) landed in 0.4.15. ---
+onboard_runner_goat_bin_host: "/usr/local/bin/goat"
+# 0.4.41 for a SECOND reason, added . The first (0.4.15) was the
+# GOAT_ONBOARD_KRATOS_ADMIN_URL override the container needs. The new one is
+# that the minter's setup-key device allowance defaults to 1 before #2629
+# (goat-cli-v0.4.40 admin.rs: `nb.usage_limit.unwrap_or(1)`), so a manifest with
+# no netbird.usage_limit — which is EVERY manifest whose candidate left the
+# devices field at zero — produced a SINGLE-USE key. First enrolment consumed
+# it; a reinstall or a second device then failed with "couldn't add peer: setup
+# key is invalid", indistinguishable from a revoked key. 0.4.41+ defaults to 5.
+# Check the host's goat version before relying on the reuse this field allows.
+onboard_runner_min_goat_version: "0.4.41"
+
+# --- Keep the host goat binary in lockstep with what this goatnet's own
+#     download surface serves, so a CLI-release redeploy (bump goat_get_release_tag
+#     + redeploy goat-get) also refreshes the binary the runner bind-mounts —
+#     no second pin to remember. The runner emits Kratos identity traits via this
+#     binary; a stale host goat keeps emitting traits the schema has dropped and
+#     breaks onboarding after a schema migration.
+#
+#     Source = the on-disk files goat-get already wrote to its www dir on THIS
+#     host, NOT an HTTP fetch of get.<site>: the mgmt host that serves get.<site>
+#     may not resolve its own mesh hostname (NXDOMAIN — its resolver does
+#     not carry the mesh zone), so an HTTP pull silently no-ops on the very host
+#     that runs the runner. Reading the served file makes host-goat == served-goat
+#     literally the same bytes goat-get checksum-verified at deploy, with zero
+#     DNS/HTTP/token dependency. Co-located by construction on a mgmt host; if the
+#     dir is absent (goat-get not deployed here) auto-sync skips and the freshness
+#     assert below still fail-closes on a too-old / missing binary. ---
+onboard_runner_goat_autoupdate: true
+onboard_runner_goat_served_dir: "/opt/goat-get/www"
+# Where the version probe records the installed host goat as
+# {"version": X, "tag": "goat-cli-vX"}; the ledger reads it back (meta/main.yml).
+onboard_runner_goat_marker_dir: "/var/lib/goat/onboard-runner"
+
+# --- the tree the native mint reads/writes under --repo-root, bind-mounted rw
+#     into the container. Needs the manifest schema and enabled affiliation catalog (read), plus writable
+#     ops/operators/<env>/ + out/ dir. Owned by the container's non-root uid so
+#     the mint can write. NOT a full repo clone. ---
+onboard_runner_uid: 65532
+onboard_runner_repo_root_host: "/var/lib/onboard-runner/repo"
+onboard_runner_repo_root_container: "/repo"
+onboard_runner_schema_src: "{{ playbook_dir }}/../operators/schema/operator-manifest.schema.json"
+onboard_runner_catalog_dir_src: "{{ playbook_dir }}/../identity/orgs"
+
+# --- runner flags ---
+onboard_runner_only_env: "{{ site_id }}"            # process only this goatnet's proposals
+onboard_runner_runner_id: "onboard-runner-{{ site_id }}"
+onboard_runner_interval: "30s"
+onboard_runner_http_timeout: "25s"
+
+# --- go-live gate (default OFF) ---
+onboard_runner_enabled: false
+
+# --- SPIFFE mTLS on the mint-capable onboarding leg (runner → console) ---
+# Default OFF. When true, a spiffe-helper sidecar fetches the runner's SVID from
+# the SPIRE agent Workload API and writes it to the shared svid volume; the
+# runner dials the console over mTLS (onboard_runner_mtls_onboard_url) presenting
+# that SVID and verifying the console's SVID SPIFFE ID. Additive — the bearer is
+# still sent for per-handle attribution. SPIRE is opt-in per goatnet, so
+# this is too (docs/design/runner-console-mtls.md). Requires the
+# matching SPIRE registration entry (spire_registration_entries: onboard-runner).
+onboard_runner_mtls_enabled: false
+# The console's mTLS onboarding listener (its :9443, container-name reachable on
+# the shared network). Only used when onboard_runner_mtls_enabled.
+onboard_runner_mtls_onboard_url: "https://goat-id-console:9443"
+# SPIFFE ID the runner accepts as the console (server-identity check).
+onboard_runner_console_spiffe_id: "spiffe://{{ spire_trust_domain | default('') }}/goat-id-console"
+# spiffe-helper sidecar wiring (mirrors the fabric-health role). The helper runs
+# as the runner's UID so the 0600 SVID key it writes is readable by the runner.
+# The sidecar image is the digest-pinned fabric_health_spiffe_helper_image from
+# the goatnet's SPIRE group_vars (the compose template falls
+# back to it — no unpinned role-default image, ADR 0703 + the deploy-history CI
+# fence). An operator MAY override onboard_runner_spiffe_helper_image at deploy.
+onboard_runner_spire_socket_dir: "/run/spire/sockets"
+onboard_runner_svid_dir: "/var/lib/onboard-runner/svid"
+onboard_runner_spire_uid: 65532
+
+# --- the runner's OWN portal key — a MACHINE credential, NOT a human operator
+#     key. It lives on the mgmt host (persisted), NOT in a human's laptop direnv, so a
+#     portal redeploy from any laptop can never drop it (the fix for the
+#     runner-key fragility). The role generates it once (idempotent), persists it
+#     at onboard_runner_key_file, and registers it in the PORTAL's keystore dir
+#     (portal reads it via PORTAL_OPERATOR_API_KEYS_DIR). onboard_runner_portal_key
+#     is SET IN TASKS from that file (the value here is just a placeholder). ---
+onboard_runner_key_file: "/var/lib/onboard-runner/portal.key"
+# The portal's service-key store on the SAME host (must match the portal role's
+# portal_operator_keys_dir). The role writes onboard-runner.key here.
+onboard_runner_portal_keystore_dir: "/opt/goat-zenoh-portal/operator-keys.d"
+# The portal container to bounce once, only when a NEW service key is first
+# written, so the runner authenticates immediately (no separate portal redeploy).
+onboard_runner_portal_container_name: "goat-zenoh-portal"
+# Optional ONE-TIME seed: if set AND the key file doesn't exist yet, the existing
+# key value is reused (seamless migration off the direnv) instead of generating a
+# fresh one. After the first deploy the direnv var can be removed.
+onboard_runner_portal_key_seed: "{{ lookup('env', (site_id | upper) + '_ONBOARD_RUNNER_PORTAL_KEY') | default('', true) }}"
+onboard_runner_portal_key: ""   # set in tasks from onboard_runner_key_file
+# The site NetBird admin token — the native mesh-enrollment leg mints the setup
+# key with it (goat reads <SITE>_NB_API_TOKEN, e.g. ACME_NB_API_TOKEN). Inherent,
+# unchanged from the host-process shape.
+# `| replace('-', '_')` is load-bearing: a hyphenated site_id (acme-prod) otherwise
+# derives "ACME-PROD_NB_API_TOKEN", which cannot be an env var name, so the
+# lookup silently returns "" and the role fails its own precondition with a
+# message that points at the portal key instead.
+onboard_runner_nb_api_token: "{{ lookup('env', (site_id | upper | replace('-', '_')) + '_NB_API_TOKEN') }}"
+# --- operator-action audit encrypt roster. When the runner mints on an
+#     operator's behalf, goat emits one OperatorActionV1 age-encrypted to these
+#     recipients; unset ⇒ goat falls back to a local plaintext log (no roster
+#     encryption). Comma/newline-separated age recipients, resolved from the
+#     operator env (40-dev-ca-operators.envrc exports GOAT_OPERATOR_AGE_RECIPIENTS).
+#     Public keys, but never committed literally — the env.j2 only renders the
+#     line when this is non-empty. ---
+onboard_runner_operator_age_recipients: "{{ lookup('env', 'GOAT_OPERATOR_AGE_RECIPIENTS') | default('', true) }}"
+
+# --- collaboration-environment provisioning leg (docs/design/collab-onboarding-provisioner.md).
+#     DEFAULT OFF: only a goatnet with a collab identity plane (Dex+Kanidm)
+#     turns this on. When enabled, a manifest carrying
+#     collab.enabled gets a FLAT Kanidm account minted + a one-time setup link
+#     staged to ops/operators/out/<handle>-collab.md. Best-effort — a collab
+#     failure never fails the onboarding (nothing enforcing depends on it). ---
+onboard_runner_collab_enabled: false
+onboard_runner_collab_kanidm_url: ""   # REQUIRED per goatnet; a shared role must not default to one
+# Auth for the collab Kanidm, resolved from the operator env at deploy (never
+# committed). PREFER a scoped service-account token (least privilege: person-create
+# + credential-reset only). The idm_admin password is the fallback and puts a
+# full-admin credential on this host — set the token where possible. Either being
+# empty AND the flag on ⇒ the leg stays disabled (fail-safe).
+onboard_runner_collab_kanidm_api_token: "{{ lookup('env', 'COLLAB_KANIDM_API_TOKEN') | default('', true) }}"
+onboard_runner_collab_kanidm_admin_pw: "{{ lookup('env', 'COLLAB_KANIDM_IDM_ADMIN_PW') | default('', true) }}"
+
+# --- mint-on-collect (ONBOARD_DEFER_CREDENTIAL). DEFAULT OFF fleet-wide.
+#     When true the runner is passed --defer-credential: no fabric credential is
+#     minted at onboard time; the person mints theirs once, themselves, on the
+#     console's /fabric-credential page. This var exists so that choice lives in
+#     config: set by hand on the runner container, it is lost on the next routine
+#     redeploy, which silently flips the goatnet back to immediate-mint.
+#
+#     DO NOT set this true on a goatnet until the deferred-create fix (deferred
+#     create must erase pool-era cert stamps) is DEPLOYED there. Enabling it
+#     first re-breaks every collect on a slot carrying a pool-era stamp. ---
+onboard_runner_defer_credential: false
+
+# Where the goatnet's public mgmt FQDN should point INSIDE the runner container.
+# On the mgmt host that name resolves to 127.0.0.1 via /etc/hosts, which inside a
+# container means the container itself — so the runner could not reach the
+# NetBird management API and every mint failed at `GET /api/groups`.
+#
+# `host-gateway`: docker substitutes the bridge gateway, i.e. the host, where
+# traefik publishes :443 for that name on every mgmt host. Same idiom as the
+# netvis and management-a pins, and stable across container recreates.
+#
+# NEVER a docker bridge address. A literal bridge IP can land on whatever
+# container holds that address on the next host, and every mint then fails at
+# `GET /api/groups` until the pin is corrected. Bridge IPs are assigned per
+# container start and differ per host, so a literal one is right on at most one
+# goatnet, for a while. `onboard_runner_traefik_ip` remains as a per-goatnet
+# override for a host where :443 is not published on the host.
+onboard_runner_mgmt_fqdn_addr: "{{ onboard_runner_traefik_ip | default('host-gateway', true) }}"
+
+# Zenoh router endpoint written into the runner's materialized goat profile, so
+# `goat admin onboard`'s operator-action audit emit reaches the fabric instead of
+# falling back to a container-local log file. Empty = the entrypoint omits the
+# key and the warning states the true reason.
+onboard_runner_router_endpoint: "{{ portal_router_endpoint | default('', true) }}"
+
+# --- per-goatnet endpoints for the native onboard legs ---------------
+# These are the four facts a goatnet needs in order to onboard anyone. Carrying
+# them as hand-copied match arms in the CLI would hold a new goatnet back until a
+# CLI release shipped, so they render into the runner's goat
+# profile, where they override the built-in table.
+#
+# Each defaults from the group_var that is already this goatnet's source of
+# truth, so a correctly-configured goatnet needs no new declaration. An empty
+# value is written nowhere and leaves the table's entry standing.
+onboard_runner_netbird_mgmt_url: "https://{{ public_mgmt_fqdn }}"
+onboard_runner_netbird_token_env: "{{ (site_id | upper | replace('-', '_')) ~ '_NB_API_TOKEN' }}"
+onboard_runner_netbird_site_prefix: "{{ site_id | upper }}"
+# Absent/unparseable is NOT false — goat leaves the table's value alone rather
+# than turning an intra-mesh transport on or off by omission.
+onboard_runner_netbird_rosenpass: "{{ rosenpass_enabled | default('') }}"
+onboard_runner_ory_auth_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}"
+onboard_runner_ory_ssh_host: "{{ mesh_ip_a | default('', true) }}"
+onboard_runner_ory_ssh_user: "{{ ansible_user | default('', true) }}"
+
+# --- Phase D: mint the `aff` (affiliation) identity trait (ADR 1043). DEFAULT
+#     OFF fleet-wide. When true the container carries GOAT_ORY_AFF_TRAIT_ENABLED=1
+#     and the native onboard's build_identity_body puts {id, kind[, nation]}
+#     from the manifest's affiliation block on the Kratos identity as
+#     traits.aff; the patched consent UI (patch 0004) forwards it into the
+#     id_token as `aff`, the claim a relying party authorizes on (ADR 1043).
+#     Mirrors operator-onboard.yml's ory_site_affiliation_trait_enabled(_map),
+#     so the two mint paths agree per site. Turn it on ONLY where the deployed
+#     Kratos schema carries traits.aff (a schema without it rejects every mint
+#     with 400) AND the consent UI runs patch 0004. Host goat >= 0.4.15 reads the
+#     variable (#1403). ---
+onboard_runner_aff_trait_enabled: false

@@ -1,0 +1,91 @@
+---
+# e2e-canary: pull the pinned digest, run it under compose, and let the
+# rollback-ledger meta-dependency record the row. The shape is the fleet's
+# (refuse an unpinned image; compose up -d; the ledger as the proof) with
+# nothing a canary does not need.
+
+- name: e2e-canary | refuse an unpinned image
+  ansible.builtin.assert:
+    that:
+      - e2e_canary_image | length > 0
+      - "'@sha256:' in e2e_canary_image"
+    fail_msg: >-
+      e2e_canary_image must be a digest-pinned reference
+      (ghcr.io/<org>/e2e-canary:<tag>@sha256:...). Empty or tag-only is refused.
+
+- name: e2e-canary | the pull reference (registry prefix rewritten, digest kept)
+  ansible.builtin.set_fact:
+    _e2e_pull_ref: "{{ e2e_canary_registry }}/{{ e2e_canary_image | regex_replace('^ghcr\\.io/[^/]+/', '') }}"
+
+- name: e2e-canary | ensure the compose directory
+  ansible.builtin.file:
+    path: "{{ e2e_canary_dir }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: e2e-canary | ensure the served payload directory
+  ansible.builtin.file:
+    path: "{{ e2e_canary_dir }}/served"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: e2e-canary | write the served payload marker (the release this host serves)
+  ansible.builtin.copy:
+    dest: "{{ e2e_canary_dir }}/served/version.json"
+    content: "{{ {'tag': e2e_canary_payload_tag} | to_nice_json }}\n"
+    mode: "0644"
+  become: true
+
+- name: e2e-canary | render docker-compose.yml
+  ansible.builtin.copy:
+    dest: "{{ e2e_canary_dir }}/docker-compose.yml"
+    mode: "0644"
+    content: |
+      # Rendered by the e2e-canary role. The image is the pin's digest; the
+      # tag beside it is for a human reading `docker ps`. The service is named
+      # like its container because rollback.sh recreates `<container_name>`
+      # as a compose service; the project is per host so hosts sharing one
+      # Docker daemon (the hermetic tier) never see each other as orphans.
+      name: {{ e2e_canary_container }}
+      services:
+        {{ e2e_canary_container }}:
+          image: {{ _e2e_pull_ref }}
+          container_name: {{ e2e_canary_container }}
+          restart: unless-stopped
+  become: true
+  register: _e2e_compose
+
+- name: e2e-canary | pull the pinned digest
+  ansible.builtin.command:
+    cmd: docker pull {{ _e2e_pull_ref }}
+  register: _e2e_pull
+  changed_when: "'Downloaded newer image' in _e2e_pull.stdout or 'Pull complete' in _e2e_pull.stdout"
+  become: true
+
+- name: e2e-canary | docker compose up -d (recreate when the file changed)
+  ansible.builtin.command:
+    cmd: docker compose -f {{ e2e_canary_dir }}/docker-compose.yml up -d{{ ' --force-recreate' if _e2e_compose.changed else '' }}
+  register: _e2e_up
+  changed_when: _e2e_compose.changed or ('Created' in _e2e_up.stderr) or ('Started' in _e2e_up.stderr) or ('Recreate' in _e2e_up.stderr)
+  become: true
+
+# A container carries the image ID, not its digests; the image carries those.
+- name: e2e-canary | the running container carries the pinned digest
+  ansible.builtin.shell:
+    cmd: >-
+      docker image inspect
+      "$(docker inspect --format {% raw %}'{{ .Image }}'{% endraw %} {{ e2e_canary_container }})"
+      --format {% raw %}'{{ json .RepoDigests }}'{% endraw %}
+  register: _e2e_running
+  changed_when: false
+  become: true
+
+- name: e2e-canary | refuse a running container whose digest is not the pin's
+  ansible.builtin.assert:
+    that:
+      - (e2e_canary_image | regex_replace('^.*@', '')) in _e2e_running.stdout
+    fail_msg: >-
+      {{ e2e_canary_container }} runs {{ _e2e_running.stdout }}, not the pinned
+      {{ e2e_canary_image | regex_replace('^.*@', '') }}.

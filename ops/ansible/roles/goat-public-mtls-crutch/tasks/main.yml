@@ -1,0 +1,217 @@
+---
+# ops/ansible/roles/goat-public-mtls-crutch
+# Block 80 / ADR 0843 — Public mTLS-gated crutch tier.
+# Design: docs/design/public-mtls-crutch-tier.md
+# Runbook: docs/operations/block-80-crutch-activate.md
+
+- name: Block 80 — gate on crutch_tier_enabled
+  ansible.builtin.debug:
+    msg: |
+      goat-public-mtls-crutch role is gated by crutch_tier_enabled (currently {{ crutch_tier_enabled | bool }}).
+      Substrate-as-code only when false (default).
+  when: not (crutch_tier_enabled | bool)
+
+# Everything below this point runs only when the role is activated on this host.
+- name: Block 80 — assert required vars when activated
+  ansible.builtin.assert:
+    that:
+      - crutch_host_fqdn | length > 0
+      - crutch_offline_ca_root_path_local is defined
+      - crutch_server_cert_path | length > 0
+      - crutch_server_key_path | length > 0
+    fail_msg: >-
+      crutch_tier_enabled=true requires crutch_host_fqdn,
+      crutch_offline_ca_root_path_local, crutch_server_cert_path, and
+      crutch_server_key_path to be set (group_vars or -e).
+  when: crutch_tier_enabled | bool
+
+- name: Block 80 — data root + traefik subdir
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ crutch_data_root }}"
+    - "{{ crutch_data_root }}/traefik"
+    - "{{ crutch_data_root }}/traefik/log"
+  when:
+    - crutch_tier_enabled | bool
+    - not (crutch_test_mode | bool)
+
+- name: Block 80 — stage offline-CA root cert onto host
+  ansible.builtin.copy:
+    src: "{{ crutch_offline_ca_root_path_local }}"
+    dest: "{{ crutch_data_root }}/traefik/offline-ca-root.pem"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart goat-public-mtls-crutch
+  when:
+    - crutch_tier_enabled | bool
+    - not (crutch_test_mode | bool)
+
+- name: Block 80 — stage offline-CA intermediate cert onto host
+  ansible.builtin.copy:
+    src: "{{ crutch_offline_ca_intermediate_path_local }}"
+    dest: "{{ crutch_data_root }}/traefik/offline-ca-intermediate.pem"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart goat-public-mtls-crutch
+  when:
+    - crutch_tier_enabled | bool
+    - not (crutch_test_mode | bool)
+    - crutch_offline_ca_intermediate_path_local | default('', true) | length > 0
+
+- name: Block 80 — render Traefik static config
+  ansible.builtin.template:
+    src: traefik-static.yml.j2
+    dest: "{{ crutch_data_root }}/traefik/static.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart goat-public-mtls-crutch
+  when: crutch_tier_enabled | bool
+
+- name: Block 80 — render Traefik dynamic config (mTLS + per-route map)
+  ansible.builtin.template:
+    src: traefik-dynamic.yml.j2
+    dest: "{{ crutch_data_root }}/traefik/dynamic.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  # Traefik file-watcher picks up dynamic.yml without restart — no handler.
+  when: crutch_tier_enabled | bool
+
+- name: Block 80 — render docker-compose stanza
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ crutch_data_root }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart goat-public-mtls-crutch
+  when: crutch_tier_enabled | bool
+
+# CRL refresh substrate. The script is rendered + chmod-executable; the
+# systemd timer (5-min cadence per design §6) drives the refresh. CRL
+# endpoint left blank = noop (see crutch-crl-refresh.sh.j2).
+- name: Block 80 — render CRL refresh script
+  ansible.builtin.template:
+    src: crutch-crl-refresh.sh.j2
+    dest: "{{ crutch_data_root }}/crutch-crl-refresh.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  when: crutch_tier_enabled | bool
+
+- name: Block 80 — render CRL refresh systemd unit + timer
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: crutch-crl-refresh.service.j2, dest: crutch-crl-refresh.service }
+    - { src: crutch-crl-refresh.timer.j2, dest: crutch-crl-refresh.timer }
+  notify: reload systemd
+  when:
+    - crutch_tier_enabled | bool
+    - not (crutch_test_mode | bool)
+
+- name: Block 80 — ensure initial CRL placeholder exists (otherwise Traefik refuses to start)
+  ansible.builtin.copy:
+    content: |
+      -----BEGIN X509 CRL-----
+      placeholder
+      -----END X509 CRL-----
+    dest: "{{ crutch_data_root }}/traefik/crl.pem"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false  # do NOT overwrite a real CRL the refresh script has fetched
+  when:
+    - crutch_tier_enabled | bool
+    - not (crutch_test_mode | bool)
+
+- name: Block 80 — enable + start CRL refresh timer
+  ansible.builtin.systemd:
+    name: crutch-crl-refresh.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when:
+    - crutch_tier_enabled | bool
+    - not (crutch_test_mode | bool)
+
+- name: Block 80 — bring up Traefik via docker compose
+  community.docker.docker_compose_v2:
+    project_src: "{{ crutch_data_root }}"
+    state: present
+  when:
+    - crutch_tier_enabled | bool
+    - not (crutch_test_mode | bool)
+
+# Post-deploy strict-required gate self-test (design §5 + ADR 0843 risk row).
+# A no-client-cert handshake against TCP 443 MUST fail at the TLS layer —
+# any other response means the gate has drifted to VerifyClientCertIfGiven
+# or is missing entirely. The play fails-fast if so.
+- name: Block 80 — wait for Traefik to bind TCP 443
+  ansible.builtin.wait_for:
+    port: 443
+    host: 127.0.0.1
+    timeout: 60
+  when:
+    - crutch_tier_enabled | bool
+    - crutch_self_test_enabled | bool
+    - not (crutch_test_mode | bool)
+
+- name: Block 80 — self-test, no-client-cert handshake must fail at TLS layer
+  ansible.builtin.shell:
+    cmd: >-
+      timeout 5 openssl s_client
+      -connect 127.0.0.1:443
+      -servername {{ crutch_mgmt_host }}
+      -verify_quiet
+      </dev/null 2>&1 || true
+  register: crutch_no_cert_probe
+  changed_when: false
+  when:
+    - crutch_tier_enabled | bool
+    - crutch_self_test_enabled | bool
+    - not (crutch_test_mode | bool)
+
+- name: Block 80 — assert strict-required gate rejected the no-cert handshake
+  ansible.builtin.assert:
+    that:
+      # OpenSSL surfaces a TLS alert when the server demands a client cert and
+      # the client offers none. Accept any of the canonical signatures.
+      - >-
+        ('alert handshake failure' in (crutch_no_cert_probe.stdout | default('')))
+        or
+        ('certificate required' in (crutch_no_cert_probe.stdout | default('')))
+        or
+        ('tlsv13 alert certificate required' in (crutch_no_cert_probe.stdout | default('')))
+        or
+        ('peer did not return a certificate' in (crutch_no_cert_probe.stdout | default('')))
+    fail_msg: |
+      goat-public-mtls-crutch strict-required gate self-test FAILED.
+
+      Expected: a TLS alert indicating the server demands a client cert
+      (`alert handshake failure`, `certificate required`, or
+      `peer did not return a certificate`).
+
+      Got:
+      {{ crutch_no_cert_probe.stdout | default('') }}
+
+      The gate may have drifted from RequireAndVerifyClientCert. Check
+      /etc/traefik/dynamic.yml on the host and the role template.
+    success_msg: |
+      Block 80 strict-required gate confirmed: no-cert handshake rejected at TLS layer.
+  when:
+    - crutch_tier_enabled | bool
+    - crutch_self_test_enabled | bool
+    - not (crutch_test_mode | bool)

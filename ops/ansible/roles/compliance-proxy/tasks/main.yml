@@ -1,0 +1,192 @@
+---
+# TAGS, and why they exist.
+#
+# `-t route` renders ONLY the Traefik route. That task needs the hostname and
+# the mesh-only middleware and nothing else — not the OIDC secret, not the
+# cookie secret, not the AWS invoke credential — so it sits outside the assert
+# demanding all three: moving a route file must not need credentials the route
+# never reads.
+#
+#   ansible-playbook ... compliance-proxy-deploy.yml -e target=<env>_hosts -t route
+#     route only; no credentials required
+#   ansible-playbook ... compliance-proxy-deploy.yml -e target=<env>_hosts
+#     everything, credentials asserted as before — unchanged default behaviour
+#
+# The assert is tagged `sidecars` deliberately rather than `always`: a
+# route-only run must not demand inputs it will not use.
+# compliance-proxy — Stage-2 mesh front for the cloud compliance dashboard.
+# Mirrors oauth2-proxy-dashboard; upstream is the aws-sigv4-proxy sidecar
+# (-> AWS_IAM-locked Function URL) instead of a local container.
+#
+# Pre-reqs (operator-fired BEFORE this role):
+#   1. Site Hydra reachable; patched consent UI (ADR 0857) so JWT carries `groups`.
+#   2. Hydra OAuth2 client `oauth2-proxy-compliance` registered (companion
+#      oidc-client step, same shape as oauth2-proxy-dashboard-oidc-client).
+#   3. Compliance-dashboard infra env at STAGE 2: Function URL live (enable_function_url=true)
+#      and this proxy's invoke credential granted (function_url_invoke_principal_arns).
+#   4. Traefik dynamic config routes compliance.<site>.<zone> ->
+#      oauth2-proxy-compliance:4180 (mesh-only middleware), + CoreDNS entry.
+#   5. The dashboard Lambda trusts the forwarded X-Auth-Request-* identity
+#      (Stage-2 app change).
+
+- name: Require compliance-proxy inputs
+  ansible.builtin.assert:
+    that:
+      - compliance_proxy_enabled | default(false) | bool
+      - compliance_proxy_oidc_client_secret is defined and (compliance_proxy_oidc_client_secret | length) >= 32
+      - compliance_proxy_cookie_secret is defined and (compliance_proxy_cookie_secret | length) in [16, 24, 32]
+      - compliance_function_url_host is defined and (compliance_function_url_host | length) > 0
+      - compliance_function_url_region is defined and (compliance_function_url_region | length) > 0
+      - compliance_invoke_aws_access_key_id is defined and (compliance_invoke_aws_access_key_id | length) > 0
+      - compliance_invoke_aws_secret_access_key is defined and (compliance_invoke_aws_secret_access_key | length) > 0
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+    fail_msg: |
+      compliance-proxy requires (Stage-2 enable):
+        - compliance_proxy_enabled: true
+        - compliance_proxy_oidc_client_secret (32+ chars; env)
+        - compliance_proxy_cookie_secret (16/24/32 b64 bytes; env)
+        - compliance_function_url_host + _region (the live AWS_IAM Function URL)
+        - compliance_invoke_aws_access_key_id + _secret (scoped invoke cred; env)
+        - site_id, site_dns_zone
+  tags: [sidecars]
+
+- name: Render oauth2-proxy-compliance.env (mode 0600)
+  ansible.builtin.template:
+    src: oauth2-proxy-compliance.env.j2
+    dest: "{{ compliance_proxy_envfile }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload compliance-proxy compose
+  tags: [sidecars]
+
+- name: Lay down compose overlay
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/mgmt-host/docker-compose.compliance-proxy.yml"
+    dest: "{{ compliance_proxy_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload compliance-proxy compose
+
+# Traefik mesh route: compliance.<site>.<zone> -> oauth2-proxy-compliance:4180
+# (mesh-only-allowlist middleware, le cert). Traefik file-provider auto-reloads
+# the dynamic dir. The hostname must also be in the mesh-only cert SAN anchor
+# (mgmt-dynamic.yml.j2, gated by compliance_proxy_enabled) so the cert covers
+# it — re-render the traefik-acme playbook after enabling.
+  tags: [sidecars]
+
+- name: Render Traefik mesh route (compliance.yml)
+  ansible.builtin.template:
+    src: compliance.yml.j2
+    dest: "{{ compliance_proxy_traefik_dynamic_dir | default('/etc/traefik/dynamic') }}/compliance.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [route]
+
+# The route filename changed. Traefik's file provider reads the whole directory,
+# so an orphaned old file would declare a second router on the same Host() rule.
+#
+# The path below MUST name the OLD file. Pointing it at the new one renders
+# compliance.yml and then immediately deletes it — a deploy that reports
+# changed=2 and leaves the surface with no route at all.
+- name: Remove the pre-rename compliance route file
+  ansible.builtin.file:
+    path: "{{ compliance_proxy_traefik_dynamic_dir | default('/etc/traefik/dynamic') }}/nova-compliance.yml"
+    state: absent
+  become: true
+  tags: [route]
+
+- name: Set compliance-proxy compose-time env (images + OIDC host entry + Function URL)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^{{ item.k }}="
+    line: "{{ item.k }}={{ item.v }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  loop:
+    - { k: "OAUTH2_PROXY_COMPLIANCE_IMAGE", v: "{{ oauth2_proxy_compliance_image }}" }
+    - { k: "OAUTH2_PROXY_COMPLIANCE_OIDC_HOST_ENTRY", v: "{{ compliance_proxy_oidc_host_entry }}" }
+    - { k: "COMPLIANCE_FUNCTION_URL_HOST", v: "{{ compliance_function_url_host }}" }
+    - { k: "COMPLIANCE_FUNCTION_URL_REGION", v: "{{ compliance_function_url_region }}" }
+  loop_control:
+    label: "{{ item.k }}"
+  notify: reload compliance-proxy compose
+  tags: [sidecars]
+
+- name: Set compliance-proxy invoke credential in /opt/mgmt-host/.env (sensitive)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^{{ item.k }}="
+    line: "{{ item.k }}={{ item.v }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  loop:
+    - { k: "COMPLIANCE_INVOKE_AWS_ACCESS_KEY_ID", v: "{{ compliance_invoke_aws_access_key_id }}" }
+    - { k: "COMPLIANCE_INVOKE_AWS_SECRET_ACCESS_KEY", v: "{{ compliance_invoke_aws_secret_access_key }}" }
+  loop_control:
+    label: "{{ item.k }}"
+  no_log: true
+  notify: reload compliance-proxy compose
+  tags: [sidecars]
+
+- name: Flush handlers so the proxies are up before the smoke fires
+  ansible.builtin.meta: flush_handlers
+  tags: [sidecars]
+
+- name: Bring up compliance-proxy sidecars (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      -f /opt/mgmt-host/docker-compose.yml
+      -f {{ compliance_proxy_compose_file }}
+      up -d aws-sigv4-proxy-compliance oauth2-proxy-compliance
+    chdir: /opt/mgmt-host
+  register: compliance_proxy_up
+  changed_when: >-
+    'Started' in (compliance_proxy_up.stderr | default(''))
+    or 'Created' in (compliance_proxy_up.stderr | default(''))
+    or 'Recreated' in (compliance_proxy_up.stderr | default(''))
+  tags: [sidecars]
+
+- name: Wait for oauth2-proxy-compliance healthy on /ping
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ compliance_proxy_host_port | default(4182) }}/ping"
+    status_code: 200
+  retries: 10
+  delay: 2
+  register: compliance_proxy_ping
+  failed_when: false
+  tags: [sidecars]
+
+- name: Print deploy summary
+  ansible.builtin.debug:
+    msg: |
+      compliance-proxy deployed (Stage-2 mesh front):
+        URL:           https://{{ compliance_proxy_fqdn }}/ (mesh-only, OIDC-gated)
+        Allowed group: {{ compliance_proxy_allowed_groups }} (manage via `goat admin onboard`)
+        OIDC:          {{ compliance_proxy_oidc_issuer_url }} (client_id={{ compliance_proxy_oidc_client_id }})
+        Upstream:      aws-sigv4-proxy -> {{ compliance_function_url_host }} (AWS_IAM Function URL)
+      Next: apply the Traefik route (compliance.<zone> -> oauth2-proxy-compliance:4180,
+      mesh-only) + CoreDNS entry, verify a COMPLIANCE-group user renders the
+      dashboard, then retire the ALB on the usareur-af-infra side.
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.
+  tags: [sidecars]
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: compliance-proxy | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "compliance-proxy"
+    rollback_ref: "{{ oauth2_proxy_compliance_image }}"

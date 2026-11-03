@@ -1,0 +1,46 @@
+---
+# Defaults for the `consistency-console-oidc-client` role.
+#
+# Provisions the OAuth2 client the consistency console's oauth2-proxy fence
+# presents, at the site Hydra. Mirrors `microscope-oidc-client`; see that role
+# for the shape rationale. Does NOT manage the console or its fence — that is
+# the `consistency-console` role, which this one runs before.
+#
+# WHY THIS ROLE EXISTS. The console's fence presents
+# OAUTH2_PROXY_CLIENT_ID=consistency-console. A goatnet with no such client in
+# Hydra ends every load at Ory `invalid_client` while the container, DNS, Traefik
+# and TLS are green. A role the console's own play runs makes the registration
+# per-goatnet by construction. ops/ci/check-fence-client-registered.py refuses
+# the shape.
+#
+# Required at deploy time:
+#   - consistency_console_oauth2_proxy_client_secret  (32+ chars; per-goatnet,
+#     from the declared secrets posture, ADR 1204 — already in each goatnet's
+#     group_vars/<site>_hosts/consistency-console.yml)
+#   - site_id, site_dns_zone                          (per-site identity)
+
+# Not independently configurable: it must equal what the fence presents, so it
+# reads the consistency-console role's own variable (one home for the fact).
+consistency_console_oidc_client_id: "{{ consistency_console_oauth2_proxy_client_id | default('consistency-console') }}"
+consistency_console_oidc_client_name: "consistency-console ({{ site_id }})"
+
+# ONE value feeds both sides of the handshake — the client Hydra stores and
+# the secret the proxy presents.
+consistency_console_oidc_client_secret: "{{ consistency_console_oauth2_proxy_client_secret }}"
+
+# The redirect is the console's own hostname (roles/consistency-console
+# consistency_console_hostname), never a literal prefix.
+consistency_console_oidc_redirect_uri: "https://{{ consistency_console_hostname | default('consistency.' ~ site_id ~ '.' ~ site_dns_zone) }}/oauth2/callback"
+
+# Same scope baseline as the other fences; `groups` carries the admin gate
+# (consistency_console_oauth2_proxy_allowed_groups), `offline_access` lets the
+# proxy refresh silently.
+consistency_console_oidc_scopes:
+  - openid
+  - profile
+  - email
+  - groups
+  - offline_access
+
+# Hydra admin endpoint. Loopback — this role runs on the mgmt host that hosts Hydra.
+consistency_console_oidc_hydra_admin: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}"

@@ -1,0 +1,87 @@
+# {{ ansible_managed }}
+#
+# goat-node-net-health publisher for {{ node_net_health_node }}. Rendered by
+# ops/ansible/roles/node-net-health/ (node-net-health.md, ADR 1036 net domain).
+# One container, mTLS Zenoh client peer of the router: reads the classified
+# host-side connection snapshot (written by node-net-health-snapshot.timer,
+# mounted read-only) and publishes ops/net/health/{{ node_net_health_node }}.
+# Observation, not enforcement. No secrets, no .env.
+
+services:
+  node-net-health:
+    image: {{ node_net_health_image }}
+    container_name: node-net-health
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+{% if node_net_health_join_zenoh_network | bool %}
+    networks:
+      - zenoh
+{% endif %}
+    environment:
+      NNH_ENDPOINT: "{{ node_net_health_zenoh_endpoint }}"
+      NNH_NODE: "{{ node_net_health_node }}"
+      NNH_SNAPSHOT_FILE: "/state/snapshot.json"
+      NNH_INTERVAL_MS: "{{ node_net_health_interval_ms }}"
+      NNH_STALE_AFTER_MS: "{{ node_net_health_stale_after_ms }}"
+      RUST_LOG: "{{ node_net_health_rust_log }}"
+{% if node_net_health_zenoh_endpoint.startswith('tls/') %}
+      NNH_CERT: "/certs/node-net-health-cert.pem"
+      NNH_KEY_FILE: "/certs/node-net-health-key.pem"
+      NNH_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+    volumes:
+      - "{{ node_net_health_state_dir }}:/state:ro"
+{% if node_net_health_zenoh_endpoint.startswith('tls/') %}
+      - "{{ node_net_health_cert_dir }}:/certs:ro"
+      - "{{ node_net_health_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+
+{% if node_net_health_rollup_enabled | bool %}
+  # Passive fleet roll-up (this host only): subscribes ops/net/health/** and
+  # writes node-net-health.json for the node-list page served by the
+  # relay-health nginx. Same image + cert; reveal-only.
+  node-net-health-rollup:
+    image: {{ node_net_health_image }}
+    container_name: node-net-health-rollup
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+{% if node_net_health_join_zenoh_network | bool %}
+    networks:
+      - zenoh
+{% endif %}
+    environment:
+      NNH_MODE: "rollup"
+      NNH_ENDPOINT: "{{ node_net_health_zenoh_endpoint }}"
+      NNH_ROLLUP_OUT: "/www/node-net-health.json"
+      RUST_LOG: "{{ node_net_health_rust_log }}"
+{% if node_net_health_zenoh_endpoint.startswith('tls/') %}
+      NNH_CERT: "/certs/node-net-health-cert.pem"
+      NNH_KEY_FILE: "/certs/node-net-health-key.pem"
+      NNH_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+    volumes:
+      # /net subdir owned by the container uid (65532) — the rest of the
+      # relay-health www stays root-owned.
+      - "{{ node_net_health_rollup_www_dir }}/net:/www"
+{% if node_net_health_zenoh_endpoint.startswith('tls/') %}
+      - "{{ node_net_health_cert_dir }}:/certs:ro"
+      - "{{ node_net_health_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+{% endif %}
+
+{% if node_net_health_join_zenoh_network | bool %}
+networks:
+  zenoh:
+    name: {{ node_net_health_zenoh_network }}
+    external: true
+{% endif %}

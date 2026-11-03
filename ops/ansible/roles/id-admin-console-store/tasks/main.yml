@@ -1,0 +1,32 @@
+---
+# Run by id-admin-console before it renders anything (ADR 1165 step A).
+#
+# 1. The gate: image store label, declared store and host marker agree.
+# 2. Postgres databases: always on a host with no rows yet (a new goatnet
+#    starting on Postgres), otherwise whenever the deployer supplied the
+#    superuser password, which re-asserts the pg_hba line after a postgres-a
+#    recreate. A routine console deploy without it skips this step; the cutover
+#    playbook always runs it.
+# 3. On that new host, the marker that says its rows are in Postgres.
+
+- name: id-admin-console-store | gate
+  ansible.builtin.include_tasks: gate.yml
+
+- name: id-admin-console-store | provision the Postgres databases
+  ansible.builtin.include_tasks: postgres-db.yml
+  when:
+    - id_admin_console_store == 'postgres'
+    - (idac_host_store == '') or (postgres_superuser_password | default('') | length > 0)
+
+- name: id-admin-console-store | record that this new host's console store is Postgres
+  ansible.builtin.copy:
+    content: |
+      postgres
+      new host with no SQLite rows; started on Postgres by the id-admin-console role at {{ now(utc=true).isoformat() }}Z
+    dest: "{{ id_admin_console_store_marker }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - id_admin_console_store == 'postgres'
+    - idac_host_store == ''

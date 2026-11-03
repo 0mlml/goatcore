@@ -1,0 +1,490 @@
+---
+# spock-mesh-peering / per-database.yml — the full grants + repset +
+# node + subscription + verify pass for ONE database. Included from
+# main.yml in a loop over `spock_mesh_databases` (loop var `spock_db`).
+#
+# Block 64R (ADR 1084). Spock catalogs (spock.node, spock.subscription,
+# spock.replication_set) are per-database, so every step here runs
+# against `spock_db.name`; the same node name appearing in several
+# databases' catalogs is expected and correct.
+#
+# `spock_db` shape:
+#   name:              database name (required)
+#   replication_sets:  list the subscriptions pull (required)
+#   repset:            optional — {name, tables}; creates the named
+#                      repset locally and curates membership per-table
+#, always
+#                      synchronize_data := false (see defaults/main.yml
+#                      for the truncate-direction hazard rationale).
+
+- name: "spock-mesh | [{{ spock_db.name }}] grant spock-schema permissions to replicator"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        GRANT USAGE ON SCHEMA spock TO {{ spock_mesh_replicator_user }};
+        GRANT SELECT ON ALL TABLES IN SCHEMA spock TO {{ spock_mesh_replicator_user }};
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA spock TO {{ spock_mesh_replicator_user }};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA spock
+          GRANT SELECT ON TABLES TO {{ spock_mesh_replicator_user }};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA spock
+          GRANT EXECUTE ON FUNCTIONS TO {{ spock_mesh_replicator_user }};
+  changed_when: true
+
+# ----------------------------------------------------------------------
+# Local node + per-peer local subscription
+# ----------------------------------------------------------------------
+
+- name: "spock-mesh | [{{ spock_db.name }}] ensure local Spock node {{ spock_mesh_local_node_name }} exists"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM spock.node WHERE node_name = '{{ spock_mesh_local_node_name }}') THEN
+            PERFORM spock.node_create(
+              node_name := '{{ spock_mesh_local_node_name }}',
+              dsn       := 'host={{ spock_mesh_local_publisher_host }} port=5432 dbname={{ spock_db.name }} user={{ spock_mesh_replicator_user }} password={{ spock_mesh_replicator_password }}'
+            );
+          END IF;
+        END $$;
+  no_log: true
+  changed_when: true
+
+# node_create is IF NOT EXISTS, so a node first created BEFORE its mesh IP was
+# filled in (pass-3 bootstrap run while mesh_ip_a was still a `TBD_..._MESH_IP`
+# placeholder) keeps that stale interface host forever — and a later sub_create
+# dials the placeholder and dies with "could not translate host name".
+# Converge the LOCAL node's advertised host to the configured publisher on every
+# run. Rewrites only the host= token (regexp), so the stored password and other
+# DSN fields are preserved and no secret appears in this task.
+- name: "spock-mesh | [{{ spock_db.name }}] self-heal local node interface host if it drifted from {{ spock_mesh_local_publisher_host }}"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -tAc
+      - >-
+        UPDATE spock.node_interface i
+        SET if_dsn = regexp_replace(i.if_dsn, 'host=[^ ]+', 'host={{ spock_mesh_local_publisher_host }}')
+        FROM spock.node n
+        WHERE i.if_nodeid = n.node_id
+          AND n.node_name = '{{ spock_mesh_local_node_name }}'
+          AND i.if_dsn NOT LIKE 'host={{ spock_mesh_local_publisher_host }} %';
+  register: spock_mesh_dsn_heal
+  changed_when: "'UPDATE 0' not in (spock_mesh_dsn_heal.stdout | default('UPDATE 0'))"
+
+# ----------------------------------------------------------------------
+# Curated repset (64R) — AFTER node creation on each side: Spock refuses
+# repset_create until the database is configured as a spock node
+# ("current database is not configured as spock node"; caught by the
+# test harness). Local side curates membership; the peer-side
+# repset is created empty as a precondition for the local pull.
+# ----------------------------------------------------------------------
+
+- name: "spock-mesh | [{{ spock_db.name }}] ensure named repset {{ spock_db.repset.name | default('(none)') }} exists"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM spock.replication_set
+            WHERE set_name = '{{ spock_db.repset.name }}'
+          ) THEN
+            PERFORM spock.repset_create('{{ spock_db.repset.name }}');
+          END IF;
+        END $$;
+  changed_when: true
+  when: spock_db.repset is defined
+
+# Revocation guard (issue #1505, ADR 1193). Creates goat_revocations and the
+# capture/guard/re-apply triggers on the NetBird tables. Runs before the repset
+# is curated because goat_revocations is a repset member, and after NetBird has
+# created its tables (the same precondition as the repset step). Idempotent.
+- name: "spock-mesh | [{{ spock_db.name }}] install the revocation guard"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -q
+    stdin: "{{ lookup('ansible.builtin.file', spock_mesh_revocation_guard_sql[spock_db.name]) }}"
+  changed_when: true
+  when:
+    - spock_mesh_revocation_guard | bool
+    - spock_db.name in spock_mesh_revocation_guard_sql
+
+# Hub directives (ADR 1205). goat_hub_directives is a repset member, so it is
+# created before the repset is curated. Idempotent.
+- name: "spock-mesh | [{{ spock_db.name }}] install the hub directive ledger"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -q
+    stdin: "{{ lookup('ansible.builtin.file', spock_mesh_hub_authority_sql[spock_db.name]) }}"
+  changed_when: true
+  when:
+    - spock_mesh_hub_authority | bool
+    - spock_db.name in spock_mesh_hub_authority_sql
+
+- name: "spock-mesh | [{{ spock_db.name }}] curate repset membership per-table"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM spock.tables
+            WHERE set_name = '{{ spock_db.repset.name }}'
+              AND nspname = 'public'
+              AND relname = '{{ item }}'
+          ) THEN
+            PERFORM spock.repset_add_table(
+              set_name := '{{ spock_db.repset.name }}',
+              relation := 'public.{{ item }}'::regclass,
+              synchronize_data := false
+            );
+          END IF;
+        END $$;
+  changed_when: true
+  loop: "{{ spock_db.repset.tables | default([]) }}"
+  loop_control:
+    label: "{{ spock_db.repset.name | default('') }} += public.{{ item }}"
+  when: spock_db.repset is defined
+
+# Remote-side preconditions FIRST: sub_create validates the provider at
+# create time — it dials the provider DSN and resolves node + requested
+# replication sets, so the peer's node AND the named repset must exist
+# before the local subscription is created (caught by the harness
+# [default] always exists, a named 64R repset does not).
+- name: "spock-mesh | [{{ spock_db.name }}] remote-side: ensure spock-schema grants for replicator on each peer"
+  # Cold-start precondition, same class as the peer node/repset tasks:
+  # sub_create's provider-side spock.node_info() call runs as `replicator`
+  # on the PEER, which needs the spock-schema grants there. Established
+  # peers already have them from their own role pass (no-op).
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ hostvars[item.inventory_hostname].spock_mesh_postgres_container | default(spock_mesh_postgres_container) }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        GRANT USAGE ON SCHEMA spock TO {{ spock_mesh_replicator_user }};
+        GRANT SELECT ON ALL TABLES IN SCHEMA spock TO {{ spock_mesh_replicator_user }};
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA spock TO {{ spock_mesh_replicator_user }};
+  changed_when: true
+  delegate_to: "{{ item.inventory_hostname }}"
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "[{{ spock_db.name }}] grants on {{ item.inventory_hostname }}"
+
+- name: "spock-mesh | [{{ spock_db.name }}] remote-side: ensure peer node exists (idempotent precondition)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ hostvars[item.inventory_hostname].spock_mesh_postgres_container | default(spock_mesh_postgres_container) }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM spock.node WHERE node_name = '{{ item.node_name }}') THEN
+            PERFORM spock.node_create(
+              node_name := '{{ item.node_name }}',
+              dsn       := 'host={{ item.publisher_host }} port=5432 dbname={{ spock_db.name }} user={{ spock_mesh_replicator_user }} password={{ spock_mesh_replicator_password }}'
+            );
+          END IF;
+        END $$;
+  no_log: true
+  changed_when: true
+  delegate_to: "{{ item.inventory_hostname }}"
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "[{{ spock_db.name }}] {{ item.node_name }} on {{ item.inventory_hostname }}"
+
+
+- name: "spock-mesh | [{{ spock_db.name }}] remote-side: ensure named repset exists on each peer (precondition for local pull)"
+  # The local subscription below pulls the repset BY NAME from the peer's
+  # postgres — on first wiring the peer may not have run its own role pass
+  # yet, so the named repset wouldn't exist there. Create it empty
+  # (belt-and-suspenders, same pattern as the peer-node precondition);
+  # each site curates its own membership when its own role pass runs.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ hostvars[item.inventory_hostname].spock_mesh_postgres_container | default(spock_mesh_postgres_container) }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM spock.replication_set
+            WHERE set_name = '{{ spock_db.repset.name }}'
+          ) THEN
+            PERFORM spock.repset_create('{{ spock_db.repset.name }}');
+          END IF;
+        END $$;
+  changed_when: true
+  delegate_to: "{{ item.inventory_hostname }}"
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "[{{ spock_db.name }}] repset {{ spock_db.repset.name | default('') }} on {{ item.inventory_hostname }}"
+  when: spock_db.repset is defined
+
+
+- name: "spock-mesh | [{{ spock_db.name }}] local-side: ensure subscription pulling FROM each peer"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM spock.subscription
+            WHERE sub_name = 'sub_{{ item.node_name }}_to_{{ spock_mesh_local_node_name }}'
+          ) THEN
+            PERFORM spock.sub_create(
+              subscription_name := 'sub_{{ item.node_name }}_to_{{ spock_mesh_local_node_name }}',
+              provider_dsn      := 'host={{ item.publisher_host }} port=5432 dbname={{ spock_db.name }} user={{ spock_mesh_replicator_user }} password={{ spock_mesh_replicator_password }}',
+              replication_sets  := ARRAY['{{ spock_db.replication_sets | join("','") }}']::text[],
+              synchronize_data  := {{ spock_mesh_synchronize_data | string | lower }},
+              forward_origins   := {% if spock_mesh_forward_origins %}ARRAY['{{ spock_mesh_forward_origins | join("','") }}']::text[]{% else %}ARRAY[]::text[]{% endif %}
+            );
+          END IF;
+        END $$;
+  no_log: true
+  changed_when: true
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "[{{ spock_db.name }}] sub_{{ item.node_name }}_to_{{ spock_mesh_local_node_name }} (pull from {{ item.site_id }})"
+
+# ----------------------------------------------------------------------
+# Per-peer remote-side subscription (delegate_to peer)
+# ----------------------------------------------------------------------
+
+- name: "spock-mesh | [{{ spock_db.name }}] remote-side: ensure subscription pulling FROM local site"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ hostvars[item.inventory_hostname].spock_mesh_postgres_container | default(spock_mesh_postgres_container) }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM spock.subscription
+            WHERE sub_name = 'sub_{{ spock_mesh_local_node_name }}_to_{{ item.node_name }}'
+          ) THEN
+            PERFORM spock.sub_create(
+              subscription_name := 'sub_{{ spock_mesh_local_node_name }}_to_{{ item.node_name }}',
+              provider_dsn      := 'host={{ spock_mesh_local_publisher_host }} port=5432 dbname={{ spock_db.name }}
+                                  user={{ spock_mesh_replicator_user }} password={{ spock_mesh_replicator_password }}',
+              replication_sets  := ARRAY['{{ spock_db.replication_sets | join("','") }}']::text[],
+              synchronize_data  := {{ spock_mesh_synchronize_data | string | lower }},
+              forward_origins   := {% if spock_mesh_forward_origins %}ARRAY['{{ spock_mesh_forward_origins | join("','") }}']::text[]{% else %}ARRAY[]::text[]{% endif %}
+            );
+          END IF;
+        END $$;
+  no_log: true
+  changed_when: true
+  delegate_to: "{{ item.inventory_hostname }}"
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "[{{ spock_db.name }}] sub_{{ spock_mesh_local_node_name }}_to_{{ item.node_name }} on {{ item.inventory_hostname }}"
+
+# ----------------------------------------------------------------------
+# Verify — subscription status reaches `replicating` in budget
+# ----------------------------------------------------------------------
+
+- name: "spock-mesh | [{{ spock_db.name }}] wait for local subs to report `replicating`"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -tA
+      - -c
+      - "SELECT status FROM spock.sub_show_status() WHERE subscription_name='sub_{{ item.node_name }}_to_{{ spock_mesh_local_node_name }}';"
+  register: spock_mesh_local_status
+  retries: "{{ (spock_mesh_replicating_timeout_seconds | int) // (spock_mesh_replicating_poll_interval_seconds | int) }}"
+  delay: "{{ spock_mesh_replicating_poll_interval_seconds | int }}"
+  until: spock_mesh_local_status.stdout | trim == 'replicating'
+  changed_when: false
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "[{{ spock_db.name }}] sub_{{ item.node_name }}_to_{{ spock_mesh_local_node_name }}"
+
+- name: "spock-mesh | [{{ spock_db.name }}] wait for remote-side subs to report `replicating`"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ hostvars[item.inventory_hostname].spock_mesh_postgres_container | default(spock_mesh_postgres_container) }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ spock_db.name }}"
+      - -tA
+      - -c
+      - "SELECT status FROM spock.sub_show_status() WHERE subscription_name='sub_{{ spock_mesh_local_node_name }}_to_{{ item.node_name }}';"
+  register: spock_mesh_remote_status
+  retries: "{{ (spock_mesh_replicating_timeout_seconds | int) // (spock_mesh_replicating_poll_interval_seconds | int) }}"
+  delay: "{{ spock_mesh_replicating_poll_interval_seconds | int }}"
+  until: spock_mesh_remote_status.stdout | trim == 'replicating'
+  changed_when: false
+  delegate_to: "{{ item.inventory_hostname }}"
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "[{{ spock_db.name }}] sub_{{ spock_mesh_local_node_name }}_to_{{ item.node_name }} on {{ item.inventory_hostname }}"
+
+# Subscriptions carry events created from now on; bootstrap earlier history in
+# both directions. Missing peer guards or conflicting event IDs fail the role.
+- name: "spock-mesh | [{{ spock_db.name }}] reconcile append-only revocation history"
+  ansible.builtin.include_role:
+    name: revocation-ledger-bootstrap
+  vars:
+    revocation_database: "{{ spock_db.name }}"
+    revocation_local_container: "{{ spock_mesh_postgres_container }}"
+    revocation_peer_host: "{{ revocation_peer.inventory_hostname }}"
+    revocation_peer_container: "{{ hostvars[revocation_peer.inventory_hostname].spock_mesh_postgres_container | default(spock_mesh_postgres_container) }}"
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    loop_var: revocation_peer
+  when:
+    - spock_mesh_revocation_guard | bool
+    - spock_db.name in spock_mesh_revocation_guard_sql

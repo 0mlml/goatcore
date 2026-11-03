@@ -1,0 +1,393 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# goat-docs — pull the goat-docs.tar.gz release asset onto the host,
+# sha256-verify it, unpack the mdBook static site into the webroot, and
+# serve it mesh-internally at docs.<site>.<zone> via nginx + Traefik.
+# docs/design/goat-cli-hosted-docs.md.
+
+- name: goat-docs | create compose + www + stage dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ goat_docs_compose_dir }}"
+    - "{{ goat_docs_www_dir }}"
+    - "{{ goat_docs_stage_dir }}"
+  become: true
+
+# Mirror-first. A sovereign / partner site has no credential to the GitHub org
+# and must not need one, so the release assets are also published to the R2
+# download mirror (bucket `goat-downloads`, fronted by `goat_release_mirror_base`)
+# under `cli/<tag>/<asset>`. We probe the mirror first and only fall back to the
+# GitHub release API when the mirror does not carry this tag. Integrity is
+# unchanged either way: the .sha256 sidecar is fetched and enforced below, so
+# the mirror is a transport, not a trust anchor.
+# Probe the tarball AND its .sha256 sidecar: the role needs both, so a mirror
+# carrying only one of them must not win the leg. Checking a single object
+# cannot distinguish a complete mirror from a partial one.
+- name: goat-docs | probe the download mirror for the tarball and its sidecar
+  ansible.builtin.uri:
+    url: "{{ goat_docs_mirror_base }}/{{ goat_docs_mirror_prefix }}/{{ item }}"
+    method: HEAD
+    status_code: [200, 403, 404]
+  register: goat_docs_mirror_probe
+  failed_when: false
+  loop:
+    - "{{ goat_docs_asset }}"
+    - "{{ goat_docs_asset }}.sha256"
+  become: true
+
+- name: goat-docs | use the mirror when it carries the tag
+  ansible.builtin.set_fact:
+    # Built as one Jinja expression, not a YAML mapping with templated keys:
+    # set_fact does NOT evaluate Jinja in a dict KEY, so a literal
+    # `"{{ goat_docs_asset }}":` key stays the unrendered string and the
+    # lookup below misses silently.
+    goat_docs_asset_urls: >-
+      {{ {
+           goat_docs_asset:
+             goat_docs_mirror_base ~ '/' ~ goat_docs_mirror_prefix ~ '/' ~ goat_docs_asset,
+           goat_docs_asset ~ '.sha256':
+             goat_docs_mirror_base ~ '/' ~ goat_docs_mirror_prefix ~ '/' ~ goat_docs_asset ~ '.sha256'
+         } }}
+    goat_docs_dl_headers: {"Accept": "application/octet-stream"}
+    goat_docs_source: mirror
+  when: >-
+    goat_docs_mirror_probe.results | default([]) | length > 0
+    and goat_docs_mirror_probe.results
+        | map(attribute='status') | reject('equalto', 200) | list | length == 0
+
+- name: goat-docs | otherwise fall back to the GitHub release API
+  ansible.builtin.set_fact:
+    goat_docs_dl_headers:
+      Authorization: "Bearer {{ goat_docs_github_token }}"
+      Accept: "application/octet-stream"
+    goat_docs_source: github
+  when: goat_docs_source is not defined
+
+# Only the GitHub leg needs a credential. On the mirror leg this assert is
+# skipped, which is the whole point: a sovereign site with no GitHub identity
+# still deploys. Keep the message naming the mirror, so an operator who hits
+# this knows the mirror miss is the real cause and the token is the fallback.
+- name: goat-docs | preconditions — release token present (GitHub fallback only)
+  ansible.builtin.assert:
+    that:
+      - goat_docs_github_token | default('') | length > 0
+    fail_msg: >-
+      The download mirror ({{ goat_docs_mirror_base }}/{{ goat_docs_mirror_prefix }})
+      does not carry {{ goat_docs_asset }} for {{ goat_docs_release_tag }}, so this
+      falls back to the GitHub release API — and goat_docs_github_token is empty.
+      Either publish the tag to the mirror (preferred; a sovereign site has no
+      GitHub identity) or set GOAT_CLI_RELEASE_TOKEN / GH_TOKEN with contents:read
+      on {{ goat_docs_release_repo }}.
+  run_once: true
+  when: goat_docs_source == 'github'
+
+- name: goat-docs | resolve release by tag (asset id + url map)
+  ansible.builtin.uri:
+    url: "https://api.github.com/repos/{{ goat_docs_release_repo }}/releases/tags/{{ goat_docs_release_tag }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ goat_docs_github_token }}"
+      Accept: "application/vnd.github+json"
+      X-GitHub-Api-Version: "2022-11-28"
+    return_content: true
+  register: goat_docs_release
+  become: true
+  no_log: true
+  when: goat_docs_source == 'github'
+
+- name: goat-docs | build name->api-url map for the tarball + its sha256
+  ansible.builtin.set_fact:
+    goat_docs_asset_urls: >-
+      {{ goat_docs_release.json.assets
+         | selectattr('name', 'in', [goat_docs_asset, goat_docs_asset ~ '.sha256'])
+         | items2dict(key_name='name', value_name='url') }}
+  when: goat_docs_source == 'github'
+
+- name: goat-docs | the docs tarball + sha256 are present in the release
+  ansible.builtin.assert:
+    that:
+      - goat_docs_asset in goat_docs_asset_urls
+      - (goat_docs_asset ~ '.sha256') in goat_docs_asset_urls
+    fail_msg: >-
+      Release {{ goat_docs_release_tag }} is missing {{ goat_docs_asset }}
+      and/or its .sha256 sidecar. Re-run the goat-cli-release workflow on
+      this tag so the `docs` job attaches them
+      (.github/workflows/goat-cli-release.yml).
+
+- name: goat-docs | download the sha256 sidecar
+  ansible.builtin.get_url:
+    url: "{{ goat_docs_asset_urls[goat_docs_asset ~ '.sha256'] }}"
+    headers: "{{ goat_docs_dl_headers }}"
+    dest: "{{ goat_docs_stage_dir }}/{{ goat_docs_asset }}.sha256"
+    mode: "0644"
+    force: true
+  become: true
+  no_log: true
+
+- name: goat-docs | read the expected sha256
+  ansible.builtin.slurp:
+    src: "{{ goat_docs_stage_dir }}/{{ goat_docs_asset }}.sha256"
+  register: goat_docs_sha_file
+  become: true
+
+- name: goat-docs | extract the expected hash
+  ansible.builtin.set_fact:
+    goat_docs_expected_sha: "{{ (goat_docs_sha_file.content | b64decode).split()[0] }}"
+
+- name: goat-docs | download + verify the docs tarball
+  ansible.builtin.get_url:
+    url: "{{ goat_docs_asset_urls[goat_docs_asset] }}"
+    headers: "{{ goat_docs_dl_headers }}"
+    dest: "{{ goat_docs_stage_dir }}/{{ goat_docs_asset }}"
+    checksum: "sha256:{{ goat_docs_expected_sha }}"
+    mode: "0644"
+    force: true
+  become: true
+  no_log: true
+
+# Clean replace: wipe the webroot so pages removed in a newer docs build
+# don't linger, then unpack. Brief 404s during the swap are acceptable for
+# a docs redeploy.
+#
+# IMPORTANT: clear the webroot's CONTENTS in place — do NOT remove + recreate
+# the directory. The nginx container bind-mounts this exact directory
+# (/opt/goat-docs/www -> /usr/share/nginx/html); deleting the dir gives it a
+# new inode the running container can't see, so nginx serves an empty mount
+# (403 "directory index forbidden") until the container is recreated. Emptying
+# the contents keeps the inode stable, so the live site updates with no
+# container restart and no stale-mount failure.
+- name: goat-docs | clear the webroot contents (preserve the dir inode — bind mount)
+  ansible.builtin.shell:
+    cmd: 'find "{{ goat_docs_www_dir }}" -mindepth 1 -delete'
+  changed_when: true
+  become: true
+
+- name: goat-docs | unpack the mdBook site into the webroot
+  ansible.builtin.unarchive:
+    src: "{{ goat_docs_stage_dir }}/{{ goat_docs_asset }}"
+    dest: "{{ goat_docs_www_dir }}"
+    remote_src: true
+  become: true
+
+- name: goat-docs | sanity — index.html landed
+  ansible.builtin.stat:
+    path: "{{ goat_docs_www_dir }}/index.html"
+  register: goat_docs_index
+  become: true
+
+- name: goat-docs | the unpacked site has an index.html
+  ansible.builtin.assert:
+    that:
+      - goat_docs_index.stat.exists
+    fail_msg: "Unpacked {{ goat_docs_asset }} has no index.html — the mdBook build may be malformed."
+
+# ---------------------------------------------------------------------------
+# goatbuilder book — OPT-IN second book at docs.<site>/goatbuilder/. Runs
+# AFTER the webroot clear + the goat-cli book unpack above, so the clear does
+# not wipe it and it never overwrites the goat-cli book's pages.
+# docs/design/goatbuilder-distribution.md.
+# ---------------------------------------------------------------------------
+- name: goat-docs | goatbuilder | preconditions — a release tag is pinned
+  ansible.builtin.assert:
+    that:
+      - goat_docs_goatbuilder_release_tag | length > 0
+    fail_msg: >-
+      goat_docs_goatbuilder_enabled is true but goat_docs_goatbuilder_release_tag is
+      empty: no goatbuilder release is pinned. Cut the release, then set the tag in
+      the role defaults (the same value as goat_get_goatbuilder_release_tag).
+  run_once: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | resolve the goatbuilder release by tag (asset id + url map)
+  ansible.builtin.uri:
+    url: "https://api.github.com/repos/{{ goat_docs_goatbuilder_release_repo }}/releases/tags/{{ goat_docs_goatbuilder_release_tag }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ goat_docs_github_token }}"
+      Accept: "application/vnd.github+json"
+      X-GitHub-Api-Version: "2022-11-28"
+    status_code: [200, 401, 403, 404]
+    return_content: true
+  register: goat_docs_goatbuilder_release
+  become: true
+  no_log: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | the release is readable
+  ansible.builtin.assert:
+    that:
+      - goat_docs_goatbuilder_release.status == 200
+    fail_msg: >-
+      goat_docs_goatbuilder_enabled is true but GitHub returned
+      {{ goat_docs_goatbuilder_release.status }} for {{ goat_docs_goatbuilder_release_repo }}
+      {{ goat_docs_goatbuilder_release_tag }}: the token needs contents:read there,
+      or the tag is not cut (a repository admin tags main).
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | build name->api-url map for the tarball + its sha256
+  ansible.builtin.set_fact:
+    goat_docs_goatbuilder_asset_urls: >-
+      {{ goat_docs_goatbuilder_release.json.assets
+         | selectattr('name', 'in', [goat_docs_goatbuilder_asset, goat_docs_goatbuilder_asset ~ '.sha256'])
+         | items2dict(key_name='name', value_name='url') }}
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | the tarball + sha256 are present in the release
+  ansible.builtin.assert:
+    that:
+      - goat_docs_goatbuilder_asset in goat_docs_goatbuilder_asset_urls
+      - (goat_docs_goatbuilder_asset ~ '.sha256') in goat_docs_goatbuilder_asset_urls
+    fail_msg: >-
+      Release {{ goat_docs_goatbuilder_release_tag }} is missing {{ goat_docs_goatbuilder_asset }}
+      and/or its .sha256 sidecar. Re-run goatbuilder-release.yml on this tag so the
+      `docs` job attaches them.
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | download the sha256 sidecar
+  ansible.builtin.get_url:
+    url: "{{ goat_docs_goatbuilder_asset_urls[goat_docs_goatbuilder_asset ~ '.sha256'] }}"
+    headers:
+      Authorization: "Bearer {{ goat_docs_github_token }}"
+      Accept: "application/octet-stream"
+    dest: "{{ goat_docs_stage_dir }}/{{ goat_docs_goatbuilder_asset }}.sha256"
+    mode: "0644"
+    force: true
+  become: true
+  no_log: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | read the expected sha256
+  ansible.builtin.slurp:
+    src: "{{ goat_docs_stage_dir }}/{{ goat_docs_goatbuilder_asset }}.sha256"
+  register: goat_docs_goatbuilder_sha_file
+  become: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | download + verify the tarball
+  ansible.builtin.get_url:
+    url: "{{ goat_docs_goatbuilder_asset_urls[goat_docs_goatbuilder_asset] }}"
+    headers:
+      Authorization: "Bearer {{ goat_docs_github_token }}"
+      Accept: "application/octet-stream"
+    dest: "{{ goat_docs_stage_dir }}/{{ goat_docs_goatbuilder_asset }}"
+    checksum: "sha256:{{ (goat_docs_goatbuilder_sha_file.content | b64decode).split()[0] }}"
+    mode: "0644"
+    force: true
+  become: true
+  no_log: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | create the book's subdirectory in the webroot
+  ansible.builtin.file:
+    path: "{{ goat_docs_www_dir }}/{{ goat_docs_goatbuilder_www_subdir }}"
+    state: directory
+    mode: "0755"
+  become: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | unpack the book into docs.<site>/goatbuilder/
+  ansible.builtin.unarchive:
+    src: "{{ goat_docs_stage_dir }}/{{ goat_docs_goatbuilder_asset }}"
+    dest: "{{ goat_docs_www_dir }}/{{ goat_docs_goatbuilder_www_subdir }}"
+    remote_src: true
+  become: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | sanity — the book's index.html landed
+  ansible.builtin.stat:
+    path: "{{ goat_docs_www_dir }}/{{ goat_docs_goatbuilder_www_subdir }}/index.html"
+  register: goat_docs_goatbuilder_index
+  become: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+- name: goat-docs | goatbuilder | the unpacked book has an index.html
+  ansible.builtin.assert:
+    that:
+      - goat_docs_goatbuilder_index.stat.exists
+    fail_msg: "Unpacked {{ goat_docs_goatbuilder_asset }} has no index.html — the goatbuilder book build may be malformed."
+  when: goat_docs_goatbuilder_enabled | bool
+
+# The release this book is, read back into the ledger row (served payloads).
+- name: goat-docs | goatbuilder | write the book's version.json (served-payload marker)
+  ansible.builtin.copy:
+    content: "{{ {'tag': goat_docs_goatbuilder_release_tag} | to_nice_json }}\n"
+    dest: "{{ goat_docs_www_dir }}/{{ goat_docs_goatbuilder_www_subdir }}/version.json"
+    mode: "0644"
+  become: true
+  when: goat_docs_goatbuilder_enabled | bool
+
+# ---------------------------------------------------------------------------
+# Serve + route.
+# ---------------------------------------------------------------------------
+- name: goat-docs | render version.json (staleness marker) into the webroot
+  ansible.builtin.template:
+    src: version.json.j2
+    dest: "{{ goat_docs_www_dir }}/version.json"
+    mode: "0644"
+  become: true
+
+- name: goat-docs | render nginx server block (version badge + /version.json)
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: "{{ goat_docs_compose_dir }}/nginx.conf"
+    mode: "0644"
+  become: true
+  notify: goat-docs | recreate container
+
+- name: goat-docs | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ goat_docs_compose_dir }}/docker-compose.yml"
+    mode: "0644"
+  become: true
+  notify: goat-docs | recreate container
+
+- name: goat-docs | render Traefik dynamic config (file provider)
+  ansible.builtin.template:
+    src: traefik-goat-docs.yml.j2
+    dest: "{{ goat_docs_traefik_dynamic_dir }}/{{ goat_docs_traefik_dynamic_filename }}"
+    mode: "0644"
+  become: true
+  # Traefik picks up file-provider changes automatically — no SIGHUP.
+
+# The route filename changed. Traefik's file provider reads
+# the whole directory, so an orphaned old file is not inert: it declares a
+# second router on the same Host() rule. Guarded on the two names differing so
+# this is a no-op once the rename is old.
+- name: goat-docs | remove pre-rename Traefik route file
+  ansible.builtin.file:
+    path: "{{ goat_docs_traefik_dynamic_dir }}/{{ goat_docs_traefik_dynamic_filename_legacy }}"
+    state: absent
+  become: true
+  when:
+    - goat_docs_traefik_dynamic_filename_legacy | default('') | length > 0
+    - goat_docs_traefik_dynamic_filename_legacy != goat_docs_traefik_dynamic_filename
+
+- name: goat-docs | pull nginx image
+  community.docker.docker_image:
+    name: "{{ goat_docs_image }}"
+    source: pull
+  become: true
+
+- name: goat-docs | bring up via docker compose
+  community.docker.docker_compose_v2:
+    project_src: "{{ goat_docs_compose_dir }}"
+    state: present
+    pull: missing
+  become: true
+
+- name: goat-docs | wait for container to be Running
+  ansible.builtin.command:
+    cmd: "docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' {{ goat_docs_container_name }}"
+  register: goat_docs_running
+  retries: 30
+  delay: 2
+  until: goat_docs_running.stdout | trim == 'true'
+  changed_when: false
+  become: true
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.

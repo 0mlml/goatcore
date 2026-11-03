@@ -1,0 +1,153 @@
+---
+# postgres-streaming-replication role defaults.
+#
+# Wires intra-site Postgres streaming replication between Router-A
+# (primary) and Router-B (hot standby) per docs/design/ha-failover.md
+# Phase B. Distinct from Spock — Spock is inter-site multi-master only;
+# intra-site (within one LAN) is single-WAL streaming replication.
+#
+# Required group_vars:
+#   - postgres_primary_lan_ip   (e.g. 192.168.1.132)
+#   - postgres_primary_app_name (e.g. orin_a, used as standby_names match)
+#   - postgres_standby_lan_ip   (e.g. 192.168.1.128)
+#   - postgres_standby_app_name (e.g. orin_b, used as primary_conninfo
+#                                application_name on the standby)
+#
+# Required env (passed via -e at playbook invocation):
+#   - postgres_replicator_password (the `replicator` role password)
+
+# Postgres major version. The basebackup client image MUST match the
+# server major version — postgres:14-alpine cannot pg_basebackup against
+# a 16.x server (incompatible_protocol).
+postgres_major_version: 16
+
+# pg_basebackup client image. postgres:<major>-alpine is the cheapest
+# tool image — small, ephemeral, runs as UID 70 alpine. NOTE: the
+# pgdata-a host volume is owned by UID 26 (postgres-spock RHEL UID), so
+# this role chowns post-basebackup. Same image works against any
+# postgres-spock {major} server.
+postgres_basebackup_client_image: "postgres:{{ postgres_major_version }}-alpine"
+
+# UID:GID expected on pgdata-a by the postgres-spock runtime.
+# RHEL-family postgres user is UID 26.
+postgres_spock_uid: 26
+postgres_spock_gid: 26
+
+# Docker volume name for the postgres-a state. Matches docker-compose
+# project name + service-name convention.
+postgres_data_volume: "mgmt-host_pgdata-a"
+# Volume path derives from the active Docker data-root. Production
+# Orins set `docker_engine_data_root: /opt/docker-data/docker` (per
+# F-093 closure see docs/design/os-baseline-and-luks.md
+# §"Three-tier storage"); dev / single-disk envs leave it empty and
+# fall back to Docker's upstream default `/var/lib/docker`. Both
+# resolve to a working volume path. Without this `default()` filter,
+# the role's basebackup tasks (find -delete, docker run -v, chown,
+# postgresql.auto.conf write) would target `/var/lib/docker/...` on
+# Orins that have data-root on NVMe — empty path, role would either
+# silently no-op or wipe the wrong directory.
+postgres_data_volume_path: "{{ docker_engine_data_root | default('/var/lib/docker') }}/volumes/{{ postgres_data_volume }}/_data"
+
+# Compose project + service names for the mgmt stack on the standby.
+mgmt_compose_dir: "/opt/mgmt-host"
+mgmt_services_to_stop_for_basebackup:
+  - postgres-a
+  - management-a
+  - signal-a
+  - traefik
+
+# Watchdog systemd service that auto-restarts compose services on exit.
+# Must be stopped during the basebackup window or it will race with the
+# data-dir wipe. See ops/ansible/roles/mgmt-host-compose-watch/.
+mgmt_compose_watchdog_unit: "mgmt-host-compose-watch.service"
+
+# Force a full re-basebackup even if the standby looks healthy. Default
+# false — the role detects an existing healthy standby and skips the
+# destructive wipe + basebackup. Set to true via -e for forced rebuild.
+postgres_streaming_force_rebuild: false
+
+# Synchronous replication knob.
+#
+# DEFAULT FALSE (changed per F-059 architectural reframing):
+# Sync rep blocks the primary's writes when the standby is unreachable
+# or lagging — the primary waits indefinitely for the standby's WAL ack.
+# For example CREATE ROLE on the primary deadlocks on `wait_event=SyncRep`
+# when the standby is down for basebackup. This is documented postgres behavior (durability vs
+# availability tradeoff), not a bug, but the durability guarantee isn't
+# worth the availability cost for our workload:
+#   - mgmt-API writes are infrequent (peer enrollment, ACL changes,
+#     key rotation). Not a hot transactional workload.
+#   - Failover RTO is operator-fired (minutes-to-hours). The few seconds
+#     of in-flight writes lost on A-failure under async are buried in
+#     the noise.
+#   - We're on a single LAN with ~1ms ping. Async lag is milliseconds in
+#     steady state.
+#
+# Mitigations under async (operationally):
+#   - `postgres_wal_keep_size` (default 2GB below) so the standby can
+#     catch up after typical disconnects without re-basebackup.
+#   - pgbackrest archive on the primary as fallback path if the streaming
+#     gap exceeds wal_keep_size.
+#   - Daily consistency probe + Grafana lag dashboard (operator-fired
+#     observability, not in this role).
+#
+# Set true ONLY when:
+#   - Application requires zero in-flight commit loss on failover.
+#   - Standby is reliably reachable (single LAN, redundant network).
+#   - Operator has audited deploy + recovery flows for SyncRep blocking.
+postgres_streaming_synchronous: false
+postgres_synchronous_commit_mode: "remote_write"
+
+# WAL retention on the primary (PG 13+: wal_keep_size in bytes/MB/GB).
+# 2GB lets the standby catch up after typical disconnects (network
+# blip, container restart, B reboot) without re-basebackup. Tune up if
+# your write rate exceeds 2GB/disconnect-window.
+postgres_wal_keep_size: "2GB"
+
+# Per-replication-slot WAL retention cap (PG 13+: max_slot_wal_keep_size).
+# Closes the disk-fill class: Postgres default is `-1`
+# (unlimited), so any offline / slow subscriber's slot pins WAL on
+# disk indefinitely. With `max_slot_wal_keep_size = 6GB` and N slots
+# (Spock subscriptions to other sites), worst-case retained WAL is
+# `N × 6GB` — bounded; subscribers whose restart_lsn falls more than
+# 6GB behind the primary's current LSN get invalidated and must
+# re-snapshot on return.
+#
+# Per F-093 + docs/design/compute-spec-minimums.md, 6GB is sized for:
+#   - 18 hours of retention at an elevated write rate (~330 MB/hr,
+#     inflated by offline-subscriber back-pressure)
+#   - days-to-weeks at normal write rate (DB-write-driven only)
+#   - re-snapshot is cheap at our DB scale (sub-100 MB today, single-GB
+#     at Phase-3 envelope) — invalidating a slot costs minutes, not hours
+#
+# Tune up to 12-24 GB only if re-snapshot becomes expensive (DB > 10 GB)
+# or if subscriber outages frequently exceed the 18-hour threshold.
+postgres_max_slot_wal_keep_size: "6GB"
+
+# max_connections — cluster-wide, MUST match primary on every standby.
+# Postgres recovery rule: a standby's max_connections must be >=
+# the primary's value or the standby refuses to start (`hot standby
+# is not possible because max_connections = N is a lower setting
+# than on the primary server`). ALTER SYSTEM SET on the primary does
+# NOT replicate to the standby's postgresql.auto.conf — recovery
+# parameters are set per-instance, not via WAL stream.
+#
+# An out-of-band ALTER SYSTEM on the primary would otherwise leave the
+# standby's auto.conf on the postgres-spock image's default 100, and the
+# standby refuses to start because 100 < 300. This default + the standby
+# auto.conf include below codify both halves so ops never has to
+# remember.
+#
+# 300 is the operating point: 100 base + headroom for Hydra
+# (10) + Kratos (10) + management-a (10) + signal-a (5) + admit-audit
+# (3) + pgBackRest backups (~5) + ops queries (~10) + Spock workers
+# (4-12 depending on subscription count) + replication slots (~10) +
+# Spock apply workers (~10) + headroom for spike-class events. Tune
+# up if a future workload (e.g. zenoh-bridge-dds) brings 50+ extra
+# connections; tune down only after measuring `pg_stat_activity`
+# shows steady-state below half the current cap.
+postgres_max_connections: 300
+
+# Path inside postgres-a container (postgres-spock RHEL layout) for
+# data dir validation queries.
+postgres_container_data_path: "/var/lib/pgsql/16/data"

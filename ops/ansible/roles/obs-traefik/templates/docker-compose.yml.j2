@@ -1,0 +1,36 @@
+# Rendered by ops/ansible/roles/obs-traefik on {{ ansible_date_time.iso8601 }}
+# Anchor: ADR 0842 (operator IdP Traefik fronting on Orin-C).
+
+services:
+  traefik:
+    image: {{ obs_traefik_image }}
+    container_name: obs-traefik
+    restart: unless-stopped
+    deploy:
+      resources:
+        # 1G fleet-default (bumped 2026-05-27 after the mgmt-host
+        # Traefik OOM-killed at 256M under the live SAN+route load on
+        # nova-a). See ops/compose/mgmt-host/docker-compose.yml for the
+        # full RCA comment.
+        limits: { cpus: "1.0", memory: 1G }
+        reservations: { memory: 64M }
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+    volumes:
+      - {{ obs_traefik_compose_dir }}/traefik.yml:/etc/traefik/traefik.yml:ro
+      - {{ obs_traefik_dynamic_dir }}:/etc/goat/traefik-dynamic:ro
+      - {{ obs_traefik_tls_root }}:{{ obs_traefik_tls_root }}:ro
+    ports:
+      # :443 bound to all interfaces — the public-facing TLS
+      # terminator for ALL obs/utility consumers on Orin-C. wg-cp0
+      # mesh peers reach via 198.18.0.9:443; LAN peers via the LAN IP.
+      - "{{ obs_traefik_https_port }}:443"
+      # :8080 Traefik dashboard — LOOPBACK ONLY. Operator SSH-tunnels
+      # to inspect; never reachable from the mesh.
+      - "127.0.0.1:{{ obs_traefik_admin_port }}:8080"
+    extra_hosts:
+      # Backends (operator-IdP Kratos, Hydra, future Grafana, MinIO,
+      # OpenObserve, Forgejo, Ollama) all run on the host network or
+      # on other compose projects on the same Orin-C. host.docker.internal
+      # gives Traefik a stable name for them.
+      - "host.docker.internal:host-gateway"

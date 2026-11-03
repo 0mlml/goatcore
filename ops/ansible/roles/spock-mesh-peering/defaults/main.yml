@@ -1,0 +1,159 @@
+---
+# spock-mesh-peering — defaults.
+#
+# Block 64Q.2. Author an idempotent role that wires
+# inter-site Spock multi-master subscriptions across all participating
+# sites in the mgmt-host fleet, replacing the manual `spock.sub_create()`
+# ceremony that scaled linearly with new sites + quadratically with cluster
+# size.
+#
+# Design: docs/design/ha-multi-site.md §"Inter-site Spock auto-mesh".
+
+# Topology mode for the local site:
+#   none      → role short-circuits; safe default for sites that have not
+#               yet been migrated to the auto-mesh substrate.
+#   full_mesh → discover every host in `groups['mgmt_hosts']` whose
+#               `participates_in_spock` is true, take the distinct site_ids
+#               other than the local one, and wire two-way subscriptions.
+#   explicit  → use the operator-supplied `inter_site_spock_peers` list of
+#               site_ids. Useful for staged rollouts or for refusing
+#               federation with a specific site.
+#
+# Default `none` is intentional: the role MUST NOT touch the live 12-edge
+# Spock topology that landed via the manual ceremony. Operator opts in
+# per-site by flipping the local site's `inter_site_spock_topology` to
+# `full_mesh` AFTER the 64Q.4 replicator-DSN migration has retrofitted
+# the existing edges.
+spock_mesh_topology: "{{ inter_site_spock_topology | default('none') }}"
+
+# Explicit peer list (site_ids), used only when topology=='explicit'.
+spock_mesh_explicit_peers: "{{ inter_site_spock_peers | default([]) }}"
+
+# Database that carries the inter-site replication. Today: `netbird`.
+# Block 64Q does not change the repset membership decision (that is the
+# separate 64Q.5 / Block 64R track) — it just creates the subscription
+# wiring. Tables actually replicated continue to be controlled by Spock
+# replication-set membership, which `spock_test` is the only entry today.
+spock_mesh_database: netbird
+
+# Replication sets the subscription pulls. Today the live edges pull
+# `default` (which contains only `spock_test` per Block 64C.1's narrow-
+# scope test-table-only design). Future expansion (mgmt-layer tables) is
+# orthogonal to this role.
+spock_mesh_replication_sets:
+  - default
+
+# Subscription tunables passed to spock.sub_create().
+#   synchronize_data := false  →  no initial-data sync; existing rows on
+#     publisher are NOT copied. New tables added to the repset later will sync at
+#     repset_add_table time.
+#   forward_origins  := empty  →  prevent inadvertent re-replication
+#     loops in N-way meshes (site A's writes go directly to B and C
+#     but NOT via D → B → A).
+spock_mesh_synchronize_data: false
+spock_mesh_forward_origins: []
+
+# How long to wait for `spock.sub_show_status() = 'replicating'` after a
+# fresh sub_create. Per docs/operations/goat-ha-dev-validation.md
+# the catchup is typically <2 s on healthy WAN; 60 s leaves margin for
+# slot creation + initial walsender handshake.
+spock_mesh_replicating_timeout_seconds: 60
+spock_mesh_replicating_poll_interval_seconds: 2
+
+# Postgres container name. Shared convention across the project.
+spock_mesh_postgres_container: postgres-a
+
+# Replication user the subscription DSN uses. Cluster-shared password is
+# resolved at runtime from <SITE_UPPER>_REPLICATOR_PASS in operator env
+# (already required by site-preflight on full-profile sites). Each site's
+# value MUST equal the same password cluster-wide so any site's DSN
+# authenticates against any other site's `replicator` role.
+#
+# This role does NOT create the `replicator` role. On full-profile sites
+# the postgres-streaming-replication role (Phase 6A) creates it on Orin-A.
+# On postgres-spock-only sites we do create it as a pre-task, since
+# Phase 6A doesn't run there. See tasks/main.yml.
+spock_mesh_replicator_user: replicator
+
+# ----------------------------------------------------------------------
+# Block 64R (ADR 1084) — multi-database federation + curated repsets
+# ----------------------------------------------------------------------
+# Each entry runs the full node/subscription/verify pass for one
+# database, pulling the listed replication sets. The optional `repset`
+# key creates a named repset in that database and curates its table
+# membership — per-table, never repset_add_all_tables, and
+# always synchronize_data := false on membership (adding a table with
+# sync=true pushes the ADDER's data to every subscriber; on a fresh
+# empty joiner that direction truncates the established node — initial
+# data seed is an explicit bootstrap step, not a repset side effect).
+#
+# The default preserves the pre-64R behavior exactly: one database
+# (`spock_mesh_database`), pulling `spock_mesh_replication_sets`, no
+# repset membership management.
+spock_mesh_databases:
+  - name: "{{ spock_mesh_database }}"
+    replication_sets: "{{ spock_mesh_replication_sets }}"
+
+# ADR 1084 D1 — the curated netbird_mgmt INCLUDE list, audited against
+# the schema of a running management server (30 tables total; the 10 excluded and
+# why are recorded in the ADR + ha-multi-site.md §5.6). Referenced from
+# group_vars when a goatnet opts into mgmt-layer replication:
+#
+#   spock_mesh_databases:
+#     - name: netbird
+#       replication_sets: [netbird_mgmt]
+#       repset:
+#         name: netbird_mgmt
+#         tables: "{{ spock_mesh_netbird_mgmt_tables }}"
+#
+# NEVER add kratos/hydra entries: the ory-narrow-repset role
+# (ory_spock_enabled, Phase 7D) owns Ory federation end-to-end — nodes,
+# ory_narrow membership, AND its own ory_sub_* subscriptions. A second
+# subscription pulling ory_narrow from here would double-apply every
+# replicated Ory row (duplicate INSERT → PK conflict).
+#
+# A netbird upgrade that adds tables requires a deliberate membership
+# decision here — the drift check compares the live schema against
+# this list plus the ADR's exclusion list.
+spock_mesh_netbird_mgmt_tables:
+  - accounts
+  - account_onboardings
+  - group_peers
+  - groups
+  - jobs
+  - name_server_groups
+  - network_resources
+  - network_routers
+  - networks
+  - peers
+  - personal_access_tokens
+  - policies
+  - policy_rules
+  - posture_checks
+  - records
+  - routes
+  - setup_keys
+  - user_invites
+  - users
+  - zones
+  # Not a NetBird table: the revocation ledger installed by the guard below.
+  - goat_revocations
+  # Not a NetBird table: the hub's directives (ADR 1205), installed below.
+  - goat_hub_directives
+
+# Revocation guard (issue #1505, ADR 1193). Last-writer-wins lets an ordinary
+# write at one site undo a revocation made at another during a partition. The
+# guard records revocations in a replicated, insert-only ledger and stops any
+# later write from undoing them. SQL is shared with the CI partition test
+# (ops/postgres/spock/tests/partition-revoke). Keyed by database name.
+spock_mesh_revocation_guard: true
+spock_mesh_revocation_guard_sql:
+  netbird: "{{ role_path }}/../../../postgres/spock/revocation-guard/netbird.sql"
+
+# Hub directives (ADR 1205). The goatnet's highest-echelon site (goatnet_hub_site)
+# acts on other sites only through goat_hub_directives rows, which the
+# spock-hub-directives timer at each site carries out after checking that the
+# hub committed them. Shared with the partition harness. Keyed by database name.
+spock_mesh_hub_authority: true
+spock_mesh_hub_authority_sql:
+  netbird: "{{ role_path }}/../../../postgres/spock/hub-authority/netbird.sql"

@@ -1,0 +1,101 @@
+---
+# ops/ansible/roles/apt-cacher-ng/tasks/main.yml
+#
+# Apt-caching forward proxy on Orin-C. Speeds up fleet apt pulls and
+# keeps the cluster operable if upstream mirrors are unreachable.
+# Idempotent. Uses native apt package (no Docker image needed).
+
+- name: Pre-flight — NVMe at /opt/docker-data exists
+  ansible.builtin.stat:
+    path: /opt/docker-data
+  register: _acng_nvme_stat
+
+- name: Fail if /opt/docker-data missing (run mgmt-host-luks.yml first)
+  ansible.builtin.assert:
+    that:
+      - _acng_nvme_stat.stat.exists | default(false)
+      - _acng_nvme_stat.stat.isdir | default(false)
+    fail_msg: |
+      /opt/docker-data is missing. Per ADR 0826 the obs/utility Orin
+      gets a 1 TB NVMe mounted at /opt/docker-data. Run
+      ops/ansible/mgmt-host-luks.yml against this host before this role.
+
+- name: Install apt-cacher-ng
+  become: true
+  ansible.builtin.apt:
+    name: apt-cacher-ng
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure cache + log dirs exist (NVMe-backed)
+  become: true
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: apt-cacher-ng
+    group: apt-cacher-ng
+    mode: "0755"
+  loop:
+    - "{{ apt_cacher_ng_cache_dir }}"
+    - "{{ apt_cacher_ng_log_dir }}"
+
+- name: Render acng.conf
+  become: true
+  ansible.builtin.template:
+    src: acng.conf.j2
+    dest: /etc/apt-cacher-ng/acng.conf
+    owner: root
+    group: apt-cacher-ng
+    mode: "0640"
+  notify: restart apt-cacher-ng
+
+- name: Render per-distro remap files (one per upstream)
+  become: true
+  ansible.builtin.template:
+    src: remap-distro.j2
+    dest: "/etc/apt-cacher-ng/{{ item.name }}_mirrors"
+    owner: root
+    group: apt-cacher-ng
+    mode: "0640"
+  loop: "{{ apt_cacher_ng_remap }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: restart apt-cacher-ng
+
+- name: Enable + start apt-cacher-ng
+  become: true
+  ansible.builtin.systemd:
+    name: apt-cacher-ng
+    enabled: true
+    state: started
+
+# Node-exporter textfile collector for Prometheus visibility.
+- name: Render apt-cacher-ng metric collector
+  become: true
+  ansible.builtin.template:
+    src: emit-metrics.sh.j2
+    dest: /usr/local/bin/apt-cacher-ng-emit-metrics.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: apt_cacher_ng_emit_node_exporter_metrics
+
+- name: Schedule apt-cacher-ng metric emission (every 5 min)
+  become: true
+  ansible.builtin.cron:
+    name: apt-cacher-ng-metrics
+    user: root
+    minute: "*/5"
+    job: "/usr/local/bin/apt-cacher-ng-emit-metrics.sh"
+    state: "{{ 'present' if apt_cacher_ng_emit_node_exporter_metrics else 'absent' }}"
+
+# Self-test marker
+- name: Render self-test script
+  become: true
+  ansible.builtin.template:
+    src: self-test.sh.j2
+    dest: /usr/local/bin/apt-cacher-ng-self-test
+    owner: root
+    group: root
+    mode: "0755"

@@ -1,0 +1,396 @@
+---
+# ops/ansible/roles/admit-audit/tasks/deploy.yml (main.yml imports it; ADR 1206 guard)
+#
+# Deploys the admit-audit sidecar (C1 of mgmt-plane-threat-mitigations.md §2.1)
+# + IOC alert rules (C3) onto an mgmt-host:
+#   1. Creates a least-privilege read-only `admit_audit` PG role (idempotent).
+#   2. Copies the compose overlay + the admit-ioc.yml rules file.
+#   3. Adds an admit-audit scrape target to the Prometheus config (idempotent).
+#   4. Appends admit-audit-specific keys to /opt/mgmt-host/.env.
+#   5. docker compose pull + up -d with the overlay layered on the base +
+#      observability overlays.
+#   6. Reloads Prometheus so the new rules + scrape target go live without
+#      restarting the observability stack.
+#
+# Pre-requisites: the base mgmt-host stack (mgmt-host.yml) and the
+# observability MVP (vega-observability.yml / roles/observability) must
+# already be deployed on the host. This role extends the observability
+# overlay's Prometheus — it does NOT deploy a second Prometheus.
+#
+# Host variables consumed:
+#   site_name                   — e.g. vega-a (already set by inventory)
+#   postgres_superuser_password — to bootstrap the admit_audit role
+#   admit_audit_password        — password for the new PG role
+
+- name: Require site_name
+  ansible.builtin.assert:
+    that: site_name is defined and site_name | length > 0
+    fail_msg: "site_name must be set per-host in inventory (e.g. vega-a)."
+
+- name: Require postgres_superuser_password
+  ansible.builtin.assert:
+    that: postgres_superuser_password is defined and postgres_superuser_password | length > 0
+    fail_msg: "Pass -e postgres_superuser_password=... to bootstrap the admit_audit role."
+
+- name: Require admit_audit_password
+  ansible.builtin.assert:
+    that: admit_audit_password is defined and admit_audit_password | length > 0
+    fail_msg: >
+      Pass -e admit_audit_password=... — password for the least-privilege
+      'admit_audit' PG role used by the admit-audit sidecar. Rotate via re-run.
+
+# ---------------------------------------------------------------------------
+# 1. Least-privilege read-only role in postgres.
+# ---------------------------------------------------------------------------
+# Executed via `docker exec postgres-a psql` — no psycopg2 needed on the host,
+# no remote PG connection needed. Idempotent: CREATE ROLE uses a DO block;
+# ALTER ROLE resets the password on every run (so rotation is just re-run).
+# Role gets SELECT on public.peers ONLY — no setup_keys, no users, no spock.
+
+- name: Create 'admit_audit' PG role if missing
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - |
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ pg_admit_audit_role }}') THEN
+            CREATE ROLE {{ pg_admit_audit_role }} LOGIN;
+          END IF;
+        END
+        $$;
+  changed_when: false
+
+- name: Set 'admit_audit' role password (idempotent-on-rotate)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "ALTER ROLE {{ pg_admit_audit_role }} WITH PASSWORD '{{ admit_audit_password }}';"
+  changed_when: true
+  no_log: true
+
+- name: Ensure pg_hba.conf admits admit_audit from the docker compose network
+  # The admit-audit sidecar connects from inside the docker compose mgmt
+  # network; pg_hba must have an entry. grep-then-append avoids duplicate
+  # lines on re-run; pg_reload_conf picks up the change without restart.
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      if ! docker exec postgres-a grep -q 'host all admit_audit' /etc/postgresql/pg_hba.conf; then
+        docker exec -u 0 postgres-a sh -c \
+          "echo 'host all admit_audit 0.0.0.0/0 scram-sha-256' >> /etc/postgresql/pg_hba.conf"
+        docker exec -e PGPASSWORD='{{ postgres_superuser_password }}' postgres-a \
+          psql -U postgres -c 'SELECT pg_reload_conf();'
+      fi
+  changed_when: true
+  no_log: true
+
+- name: Grant CONNECT on target DB to 'admit_audit' role
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "GRANT CONNECT ON DATABASE {{ pg_admit_audit_db }} TO {{ pg_admit_audit_role }};"
+  changed_when: false
+
+# Grant SELECT on public.peers only. Wrapped in a DO block so the role
+# no-ops cleanly if Netbird hasn't migrated the schema yet (greenfield
+# ordering: this role can run before the first management-a start, and
+# the table materializes later).
+- name: Grant SELECT on public.peers to 'admit_audit' (best-effort)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ pg_admit_audit_db }}"
+      - -v
+      - ON_ERROR_STOP=0
+      - -c
+      - |
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'peers'
+          ) THEN
+            EXECUTE 'GRANT USAGE ON SCHEMA public TO {{ pg_admit_audit_role }}';
+            EXECUTE 'GRANT SELECT ON public.peers TO {{ pg_admit_audit_role }}';
+          END IF;
+        END
+        $$;
+  changed_when: false
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# 2. Copy the compose overlay + IOC rules file.
+# ---------------------------------------------------------------------------
+# The observability role has already ensured {{ compose_dir }}/monitoring/rules/
+# exists; we just drop in the admit-ioc.yml file alongside the other rule files.
+
+- name: Copy docker-compose.admit-audit.yml
+  ansible.builtin.copy:
+    src: "../compose/mgmt-host/docker-compose.admit-audit.yml"
+    dest: "{{ compose_dir }}/docker-compose.admit-audit.yml"
+    mode: "0644"
+
+- name: Ensure monitoring rules directory exists
+  ansible.builtin.file:
+    path: "{{ compose_dir }}/monitoring/rules"
+    state: directory
+    mode: "0755"
+
+- name: Copy admit-ioc.yml rule file
+  ansible.builtin.copy:
+    src: "../compose/mgmt-host/monitoring/rules/admit-ioc.yml"
+    dest: "{{ compose_dir }}/monitoring/rules/admit-ioc.yml"
+    mode: "0644"
+  register: admit_ioc_rule
+
+# ---------------------------------------------------------------------------
+# 3. Add an admit-audit scrape target to the observability Prometheus config.
+# ---------------------------------------------------------------------------
+# The observability role copied prometheus.yml verbatim. We append a
+# scrape_configs entry via blockinfile (idempotent). The target is the
+# container hostname on the shared `mgmt` network. If this block is
+# already present, blockinfile is a no-op.
+
+# Under the three-Orin topology (ADR 0826), Prometheus runs on Orin-C
+# (separate host group `<site>_obs_hosts`) and scrapes admit-audit
+# across the mesh. The prometheus.yml file does not exist on this
+# mgmt-host. The scrape target lives in the obs-host's prometheus.yml,
+# laid down by `vega-obs-bootstrap.yml`. We only touch the local
+# prometheus.yml when the legacy on-mgmt-host obs path is in use
+# (`legacy_obs_on_mgmt_host: true`).
+- name: Check whether legacy on-mgmt-host prometheus.yml is present
+  ansible.builtin.stat:
+    path: "{{ compose_dir }}/monitoring/prometheus.yml"
+  register: prom_yml_stat
+
+- name: Ensure admit-audit scrape target exists in prometheus.yml (legacy on-mgmt-host obs only)
+  ansible.builtin.blockinfile:
+    path: "{{ compose_dir }}/monitoring/prometheus.yml"
+    marker: "# {mark} ANSIBLE MANAGED: admit-audit scrape"
+    block: |2
+        # ------------------------------------------------------------------
+        # admit-audit — C1 sidecar. Polls local postgres for new peer rows,
+        # emits admit_audit_* metrics. Scraped via the shared mgmt network.
+        # ------------------------------------------------------------------
+        - job_name: admit-audit
+          static_configs:
+            - targets:
+                - "admit-audit:9124"
+              labels:
+                instance: admit-audit-local
+                role: local
+    insertafter: "^scrape_configs:$"
+    mode: "0644"
+  register: prom_scrape_cfg
+  when: prom_yml_stat.stat.exists
+
+# ---------------------------------------------------------------------------
+# 4. Append admit-audit env vars to /opt/mgmt-host/.env.
+# ---------------------------------------------------------------------------
+
+- name: Append admit-audit env vars to /opt/mgmt-host/.env
+  ansible.builtin.blockinfile:
+    path: "{{ compose_dir }}/.env"
+    marker: "# {mark} ANSIBLE MANAGED: admit-audit"
+    block: |
+      ADMIT_AUDIT_PASSWORD={{ admit_audit_password }}
+      ADMIT_AUDIT_IMAGE={{ admit_audit_image }}
+    mode: "0600"
+    create: false
+
+# ---------------------------------------------------------------------------
+# 5a. Build admit-audit image locally from committed source.
+# ---------------------------------------------------------------------------
+# The admit-audit image isn't published to GHCR yet (no CI workflow).
+# Build on the host from the source at ops/admit-audit/ — same pattern as
+# ops/wave3/soak-gen and signal-server/cmd/federation-probe. Source is
+# tiny (~500 LOC Go) so tarball+base64 push fits SSM's 100KB cap.
+#
+# Block 75E gate: when admit_audit_use_substrate is true, the image flows
+# from the OCI distribution substrate (T2 Orin-C Forgejo) instead of being
+# built locally. The compose stack pulls admit_audit_image from the
+# substrate URL set in group_vars/<site>_hosts/vars.yml, and Step 5a is
+# skipped entirely. See ADR 0838 + docs/design/oci-goat-substrate.md.
+
+- name: Build admit-audit locally (skipped on substrate)
+  when: not (admit_audit_use_substrate | default(false))
+  block:
+    - name: Package admit-audit source into base64 tarball
+      # Runs on the controller (my laptop), NOT the target. delegate_to +
+      # run_once because the output is identical for every target host.
+      ansible.builtin.shell:
+        cmd: |
+          cd {{ playbook_dir }}/../admit-audit
+          # otel.go added (Block 27C OTel producer wiring) — main.go
+          # references its symbols (initOTel, startPollSpan, recordPollSpan,
+          # recordAdmitEvent) so the build fails without it. AppleDouble
+          # exclusion (`._*`) keeps macOS resource-fork files out of the
+          # tarball (operator-controller is usually a Mac).
+          tar czf - --exclude='._*' --exclude='*_test.go' \
+              main.go otel.go go.mod go.sum Dockerfile | base64 | tr -d '\n'
+      register: admit_audit_src_b64
+      delegate_to: localhost
+      run_once: true
+      become: false
+      changed_when: false
+
+    - name: Push admit-audit source to the host
+      # Quick — pure file extraction.
+      ansible.builtin.shell:
+        cmd: |
+          sudo mkdir -p /opt/admit-audit/src
+          echo '{{ admit_audit_src_b64.stdout }}' | base64 -d | sudo tar xz -C /opt/admit-audit/src
+      changed_when: true
+
+    - name: Build admit-audit docker image (multi-stage Dockerfile handles everything)
+      # Dockerfile has FROM golang:1.25-alpine AS builder + distroless runtime.
+      # Single `docker build` does go mod download + go build + image assembly.
+      # async: 600 / poll: 60 means Ansible backgrounds the command then polls
+      # every 60s for up to 10 min — works around SSM's per-command 10-min
+      # execution cap because each poll is a fresh SSM call.
+      ansible.builtin.shell:
+        cmd: |
+          cd /opt/admit-audit/src && sudo docker build -t {{ admit_audit_image }} .
+      async: 600
+      poll: 30
+      changed_when: true
+
+- name: Pull admit-audit from OCI substrate (Block 75E)
+  when: admit_audit_use_substrate | default(false)
+  ansible.builtin.command:
+    cmd: docker pull {{ admit_audit_image }}
+  register: admit_audit_pull
+  changed_when: "'Downloaded newer image' in admit_audit_pull.stdout"
+
+# Three-Orin topology (ADR 0826) splits observability onto Orin-C, so
+# docker-compose.obs.yml is not present on the mgmt-host. Only include
+# the obs overlay when legacy on-mgmt-host obs is in use (the same
+# stat result from earlier in this role).
+# F-312 RECURRENCE: this task recreated traefik without its ACME
+# resolver on EVERY zagros refresh. Two independent faults, both fixed here:
+#   1. An explicit -f set OVERRIDES the COMPOSE_FILE pin in .env, so the acme
+#      overlay has to be named or it is dropped.
+#   2. The `up -d` carried NO SERVICE NAME, so it rebuilt the whole stack —
+#      including traefik — when this role owns exactly one service.
+# traefik-acme.yml's own note assumed every scoped call ends
+# `up -d <service>`. This one did not. Scoping it is the real fix; carrying
+# the overlay is the belt to that pair of braces.
+- name: Detect the ACME compose overlay (traefik-acme.yml)
+  ansible.builtin.stat:
+    path: "{{ compose_dir }}/docker-compose.acme.yml"
+  register: _admit_audit_acme_overlay
+
+- name: docker compose up -d admit-audit (overlay-aware, service-scoped)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      -f docker-compose.yml
+      {% if phase2 | bool %}-f docker-compose.phase2.yml{% endif %}
+      {% if prom_yml_stat.stat.exists %}-f docker-compose.obs.yml{% endif %}
+      {% if _admit_audit_acme_overlay.stat.exists %}-f docker-compose.acme.yml{% endif %}
+      -f docker-compose.admit-audit.yml
+      up -d admit-audit
+    chdir: "{{ compose_dir }}"
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# 6. Reload Prometheus if the rules or scrape config changed.
+# ---------------------------------------------------------------------------
+# Prometheus was started with --web.enable-lifecycle; POST /-/reload
+# picks up the new rule file and the added scrape_config without a
+# full restart.
+
+# Prometheus runs locally only when legacy on-mgmt-host obs is in
+# use. Under three-Orin topology Prometheus is on Orin-C and is
+# reloaded by `<site>-obs-bootstrap.yml`. Skip the local reload
+# when prometheus.yml isn't on this host.
+- name: Reload Prometheus (rules + scrape config — legacy on-mgmt-host obs only)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9092/-/reload"
+    method: POST
+    status_code: [200, 204]
+  when:
+    - prom_yml_stat.stat.exists
+    - (admit_ioc_rule.changed or (prom_scrape_cfg.changed | default(false)))
+
+# ---------------------------------------------------------------------------
+# 7. Smoke checks.
+# ---------------------------------------------------------------------------
+
+- name: Wait for admit-audit /metrics
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9124/metrics"
+    status_code: 200
+  register: admit_metrics
+  retries: 30
+  delay: 2
+  until: admit_metrics.status == 200
+
+# Prometheus targets check applies only to the legacy on-mgmt-host
+# obs path. Under three-Orin topology the assertion belongs in the
+# obs-host bootstrap (or `<site>-obs-bootstrap.yml` Phase 7 smoke).
+- name: Confirm admit-audit job is in Prometheus targets (legacy on-mgmt-host obs only)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:9092/api/v1/targets?state=active"
+    return_content: true
+  register: prom_targets
+  when: prom_yml_stat.stat.exists
+
+- name: Report admit-audit scrape status
+  ansible.builtin.debug:
+    msg: >-
+      {% if prom_yml_stat.stat.exists %}
+      admit-audit scrape:
+      {{ (prom_targets.json.data.activeTargets
+          | selectattr('scrapePool', 'equalto', 'admit-audit')
+          | list) }}
+      {% else %}
+      admit-audit /metrics is up on this host (port 9124).
+      Prometheus scrape lives on the obs host (Orin-C) — verify there
+      via `<site>-obs-bootstrap.yml` Phase 7 smoke.
+      {% endif %}

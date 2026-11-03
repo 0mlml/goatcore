@@ -1,0 +1,55 @@
+# {{ ansible_managed }}
+# Sovereign peering edge for partner "{{ goat_zenoh_edge_partner_id }}" (ADR 1157).
+#
+# ONE published port, facing the partner. Nothing else is exposed: no REST, no
+# adminspace write, no storage. The inward link to our core is an OUTBOUND dial
+# from this container, so our core never listens toward the partner side.
+services:
+  {{ goat_zenoh_edge_stack }}:
+    image: "{{ goat_zenoh_edge_image }}"
+    container_name: "{{ goat_zenoh_edge_stack }}"
+    restart: unless-stopped
+    command: ["-c", "/etc/zenoh/config.json5"]
+{% if goat_zenoh_edge_acl_trace | default(false) | bool %}
+    # Prefix observer (docs/operations/peering-denial-observability.md). Raises
+    # ONLY the ACL interceptor to trace, so a denied message prints
+    # "<zid> on <subject> is unauthorized to <action> (<flow>) on <key_expr>"
+    # -- naming the exact key a partner tried to use, and the flow it tried it
+    # in. Everything else stays at the default level. Costs a line per ACL
+    # decision, because allows log at the same level; that is also what makes
+    # "refused" separable from "never attempted".
+    environment:
+      RUST_LOG: "zenoh=info,zenoh::net::routing::interceptor::access_control=trace"
+{% endif %}
+{% if goat_zenoh_edge_network_mode == 'host' %}
+    # The host's network, so the partner link and the core link each carry their
+    # real interface and the ACL can tell them apart. The listener binds the
+    # link address alone (config.json5).
+    network_mode: host
+{% else %}
+    ports:
+      - "{{ goat_zenoh_edge_bind_address }}:{{ goat_zenoh_edge_listen_port }}:{{ goat_zenoh_edge_listen_port }}"
+{% endif %}
+    volumes:
+      - "/etc/{{ goat_zenoh_edge_stack }}/config.json5:/etc/zenoh/config.json5:ro"
+      - "{{ goat_zenoh_edge_partner_ca_path }}:{{ goat_zenoh_edge_partner_ca_path }}:ro"
+{% if goat_zenoh_edge_trust_mode == 'bundle' %}
+      # The trust bundle must be MOUNTED, not merely written. Every cert here is
+      # mounted by exact path, so a file the role writes outside this list is
+      # invisible to the process -- and zenoh does not report a CA it cannot
+      # read, it just never dials.
+      - "{{ goat_zenoh_edge_bundle_path }}:{{ goat_zenoh_edge_bundle_path }}:ro"
+{% elif goat_zenoh_edge_our_ca_path | length > 0 %}
+      # In `fragment` mode the per-endpoint override names OUR CA by path, and
+      # that path must be readable INSIDE the container. It was not mounted, so
+      # the fragment pointed at a file zenoh could not open, the endpoint was
+      # discarded, and the edge never dialled -- with the container Up, the
+      # partner session ESTABLISHED and nothing logged. Found by running the
+      # drill script against the fleet image; the syntax works there, so the
+      # missing mount was the whole of the remaining fault.
+      - "{{ goat_zenoh_edge_our_ca_path }}:{{ goat_zenoh_edge_our_ca_path }}:ro"
+{% endif %}
+      - "{{ goat_zenoh_edge_outward_cert }}:{{ goat_zenoh_edge_outward_cert }}:ro"
+      - "{{ goat_zenoh_edge_outward_key }}:{{ goat_zenoh_edge_outward_key }}:ro"
+      - "{{ goat_zenoh_edge_inward_cert }}:{{ goat_zenoh_edge_inward_cert }}:ro"
+      - "{{ goat_zenoh_edge_inward_key }}:{{ goat_zenoh_edge_inward_key }}:ro"

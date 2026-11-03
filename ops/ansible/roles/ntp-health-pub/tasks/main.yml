@@ -1,0 +1,107 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-ntp-health-pub attestation republisher on a mgmt-host
+# (ADR 1036/1037, F-184).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the same docker network
+#      (zenoh-deploy.yml; nova-a or `-e target=zagros_hosts` for ZAGROS).
+#   2. ntp-health-agent running on the host (the site-bootstrap ntp-health-agent
+#      role), serving the SIGNED verdict on :9753/health (i.e. deployed with the
+#      signing-capable binary; ntp_health_agent_attestation_enabled).
+#   3. Infra-class leaf cert + key minted via offline-CA cert-sign with
+#      Subject CN=ntp-health-pub-trial-peer, placed at
+#      {{ ntp_health_pub_cert_dir }}/ntp-health-pub-{cert,key}.pem. The zenoh ACL
+#      subject `infra-ntp-health-pub` matches cert_common_names (zenoh 1.9.0 has
+#      no URI-SAN matcher) and is granted ingress write on ops/time/attest/**
+#      (rule `infra-w-time-attest`); a wrong/empty CN means silent denial.
+#   4. CA root present at {{ ntp_health_pub_ca_root_src }} (same file the router
+#      uses; its absence means the router itself isn't deployed).
+#
+# Persists nothing — no S3/MinIO, no secrets, no .env. It only reads the local
+# agent's verdict and republishes it on the bus.
+
+- name: ntp-health-pub | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ ntp_health_pub_cert_dir }}/ntp-health-pub-cert.pem"
+  register: ntp_health_pub_cert_stat
+  when: ntp_health_pub_zenoh_endpoint is match('^tls/')
+
+- name: ntp-health-pub | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      ntp-health-pub: leaf cert missing at
+      {{ ntp_health_pub_cert_dir }}/ntp-health-pub-cert.pem. Mint one via the
+      offline-CA cert-sign ceremony (Subject CN=ntp-health-pub-trial-peer)
+      before re-running (see docs/operations/dev-ca-cert-sign.md).
+  when:
+    - ntp_health_pub_zenoh_endpoint is match('^tls/')
+    - ntp_health_pub_cert_stat is not skipped
+    - not (ntp_health_pub_cert_stat.stat.exists | default(false))
+
+- name: ntp-health-pub | pre-flight CA root exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ ntp_health_pub_ca_root_src }}"
+  register: ntp_health_pub_ca_root_stat
+  when: ntp_health_pub_zenoh_endpoint is match('^tls/')
+
+- name: ntp-health-pub | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      ntp-health-pub: CA root cert missing at {{ ntp_health_pub_ca_root_src }} —
+      same file zenoh-router uses, so its absence means the router itself isn't
+      deployed.
+  when:
+    - ntp_health_pub_zenoh_endpoint is match('^tls/')
+    - ntp_health_pub_ca_root_stat is not skipped
+    - not (ntp_health_pub_ca_root_stat.stat.exists | default(false))
+
+- name: ntp-health-pub | normalize cert dir ownership for non-root container uid 65532 (Chainguard default)
+  ansible.builtin.file:
+    path: "{{ ntp_health_pub_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: ntp_health_pub_zenoh_endpoint is match('^tls/')
+
+- name: ntp-health-pub | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ ntp_health_pub_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: ntp-health-pub | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ ntp_health_pub_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: ntp-health-pub | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ ntp_health_pub_compose_dir }}"
+  changed_when: true
+
+- name: ntp-health-pub | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ ntp_health_pub_compose_dir }}"
+  register: ntp_health_pub_up
+  changed_when:
+    - "'Started' in ntp_health_pub_up.stderr or 'Created' in ntp_health_pub_up.stderr or 'Recreated' in ntp_health_pub_up.stderr"
+
+- name: ntp-health-pub | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ ntp_health_pub_compose_dir }}"
+  register: ntp_health_pub_ps
+  changed_when: false
+
+- name: ntp-health-pub | show
+  ansible.builtin.debug:
+    msg: "{{ ntp_health_pub_ps.stdout_lines }}"

@@ -1,0 +1,227 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the external goat-audit-subscriber service on a mgmt-host.
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the same docker network
+#      (deployed via zenoh-deploy.yml).
+#   2. Per-instance leaf cert + key minted via offline-CA cert-sign,
+#      placed under {{ audit_subscriber_cert_dir }}/. URI-SAN format
+#      is an operator-defined "infra peer" prefix (not a vendor
+#      prefix; the audit-subscriber is not portal-registered).
+#   3. CA root cert present at {{ audit_subscriber_ca_root_src }}
+#      (the same file the zenoh-router uses).
+#   4. When `audit_subscriber_s3_endpoint` is non-empty: MinIO bucket
+#      named in `audit_subscriber_s3_bucket` exists with Object-Lock
+#      enabled (per ADR 0811 + Block 95). Bucket *creation* is
+#      operator-driven (`mc mb --with-lock ...`); bucket *lifecycle
+#      policy* (Expiration + NoncurrentVersionExpiration +
+#      AbortIncompleteMultipartUpload, per Block 95 + F-171) is now
+#      applied by this role on every apply when `audit_subscriber_apply_lifecycle: true`.
+#      Access + secret keys are set in the orchestrator host's env in
+#      the env-var names given by `audit_subscriber_s3_{access,secret}_key_envvar`.
+#
+# An empty `audit_subscriber_s3_endpoint` runs observe-only: events are
+# counted but not stored. The subscriber is the canonical audit path
+# (ADR 0858).
+
+- name: audit-subscriber | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ audit_subscriber_cert_dir }}/audit-subscriber-cert.pem"
+  register: audit_subscriber_cert_stat
+  when: audit_subscriber_zenoh_endpoint is match('^tls/')
+
+- name: audit-subscriber | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      audit-subscriber: leaf cert missing at
+      {{ audit_subscriber_cert_dir }}/audit-subscriber-cert.pem.
+      Mint one via the offline-CA cert-sign ceremony before re-running
+      this playbook (see docs/operations/dev-ca-cert-sign.md).
+  when:
+    - audit_subscriber_zenoh_endpoint is match('^tls/')
+    - audit_subscriber_cert_stat is not skipped
+    - not (audit_subscriber_cert_stat.stat.exists | default(false))
+
+- name: audit-subscriber | pre-flight CA root exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ audit_subscriber_ca_root_src }}"
+  register: audit_subscriber_ca_root_stat
+  when: audit_subscriber_zenoh_endpoint is match('^tls/')
+
+- name: audit-subscriber | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      audit-subscriber: CA root cert missing at
+      {{ audit_subscriber_ca_root_src }} — same file zenoh-router uses,
+      so its absence means the router itself isn't deployed.
+  when:
+    - audit_subscriber_zenoh_endpoint is match('^tls/')
+    - audit_subscriber_ca_root_stat is not skipped
+    - not (audit_subscriber_ca_root_stat.stat.exists | default(false))
+
+- name: audit-subscriber | normalize cert dir ownership for non-root container uid 65532 (Chainguard default)
+  ansible.builtin.file:
+    path: "{{ audit_subscriber_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: audit_subscriber_zenoh_endpoint is match('^tls/')
+
+# The local NDJSON tail (ADR 1078) is written by the non-root container (uid
+# 65532), so the host dir must be owned by it — a root-owned bind mount yields
+# "Permission denied" and the tail stays empty (the MinIO WORM path is
+# unaffected either way, by design).
+- name: audit-subscriber | ensure local-tail dir owned by container uid 65532
+  ansible.builtin.file:
+    path: "{{ audit_subscriber_local_ndjson_dir }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0750"
+  when: audit_subscriber_local_ndjson_dir | length > 0
+
+# Bound the spool. Swept by the host's existing systemd-tmpfiles-clean.timer;
+# `e` acts only on an existing directory and removes contents older than the
+# age. The WORM copy in MinIO is untouched by this — it is a different object
+# store with its own Object Lock window, and nothing here can reach it.
+- name: audit-subscriber | bound local-tail retention
+  ansible.builtin.copy:
+    content: |
+      # {{ ansible_managed }}
+      # audit-subscriber local tail: keep
+      # {{ audit_subscriber_local_ndjson_retain_days }} days. This is the
+      # goat-logship handoff spool, not the audit store — durability is the
+      # MinIO Object-Lock write. Without this the tree grows without bound.
+      #
+      # m: restricts the age test to mtime. tmpfiles' default age-by (abcmABM)
+      # includes atime, so one bulk read of the spool — and goat-logship reads
+      # this spool by design — resets the clock on every file and the rule
+      # quietly matches nothing.
+      e {{ audit_subscriber_local_ndjson_dir }} - - - m:{{ audit_subscriber_local_ndjson_retain_days }}d
+    dest: /etc/tmpfiles.d/audit-subscriber-tail.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: audit_subscriber_local_ndjson_dir | length > 0
+  register: _audit_tail_tmpfiles
+
+- name: audit-subscriber | remove local-tail retention rule when tail is off
+  ansible.builtin.file:
+    path: /etc/tmpfiles.d/audit-subscriber-tail.conf
+    state: absent
+  when: audit_subscriber_local_ndjson_dir | length == 0
+
+- name: audit-subscriber | apply local-tail retention now
+  ansible.builtin.command:
+    cmd: systemd-tmpfiles --clean /etc/tmpfiles.d/audit-subscriber-tail.conf
+  when: _audit_tail_tmpfiles is changed
+  changed_when: true
+
+- name: audit-subscriber | resolve S3 secrets when endpoint is set
+  ansible.builtin.set_fact:
+    audit_subscriber_s3_access_key_value: "{{ lookup('env', audit_subscriber_s3_access_key_envvar) }}"
+    audit_subscriber_s3_secret_key_value: "{{ lookup('env', audit_subscriber_s3_secret_key_envvar) }}"
+  when: audit_subscriber_s3_endpoint | length > 0
+  no_log: true
+
+- name: audit-subscriber | fail when S3 endpoint set but creds env vars empty
+  ansible.builtin.fail:
+    msg: >-
+      audit-subscriber: audit_subscriber_s3_endpoint is set but env vars
+      {{ audit_subscriber_s3_access_key_envvar }} +
+      {{ audit_subscriber_s3_secret_key_envvar }} are empty in the
+      orchestrator host's env. Source the appropriate
+      .envrc.local.d/30-site-services.envrc tier before re-running, OR
+      clear audit_subscriber_s3_endpoint to run in observe-only mode.
+  when:
+    - audit_subscriber_s3_endpoint | length > 0
+    - (audit_subscriber_s3_access_key_value | default('') | length) == 0
+       or (audit_subscriber_s3_secret_key_value | default('') | length) == 0
+
+- name: audit-subscriber | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ audit_subscriber_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: audit-subscriber | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ audit_subscriber_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: audit-subscriber | render .env (S3 creds; mode 0600)
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ audit_subscriber_compose_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: audit-subscriber | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ audit_subscriber_compose_dir }}"
+  changed_when: true
+
+- name: audit-subscriber | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ audit_subscriber_compose_dir }}"
+  register: audit_subscriber_up
+  changed_when:
+    - "'Started' in audit_subscriber_up.stderr or 'Created' in audit_subscriber_up.stderr or 'Recreated' in audit_subscriber_up.stderr"
+
+- name: audit-subscriber | print running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ audit_subscriber_compose_dir }}"
+  register: audit_subscriber_ps
+  changed_when: false
+
+- name: audit-subscriber | show
+  ansible.builtin.debug:
+    msg: "{{ audit_subscriber_ps.stdout_lines }}"
+
+# Apply the audit-integrity bucket lifecycle policy per Block 95
+# three-tier substrate (docs/design/audit-cold-storage-offload.md).
+#
+# The policy needs BOTH halves:
+# NoncurrentVersionExpiration bounds the noncurrent VERSIONS, and
+# ExpiredObjectDeleteMarker removes the delete markers that are left
+# stranded once those versions are gone. With only the first, the bucket
+# stops growing in bytes and keeps growing in keys — see lifecycle.yml
+# for the cost of that.
+#
+# Gated on `audit_subscriber_apply_lifecycle` for observe-only deploys
+# + first-time runs where the bucket isn't created yet.
+#
+# TAGGED so the lifecycle policy can be re-applied on its own. A policy
+# change should not require redeploying the container to land it — that
+# pulls an image, and a pull against the wrong GHCR org 403s midway and
+# leaves the host half-applied. `--tags lifecycle` touches only the rule.
+#
+# `apply:` is NOT redundant with the `tags:` below it. A bare tag on a
+# dynamic include tags only the INCLUDE — the tasks inside stay untagged,
+# so `--tags lifecycle` includes the file and then runs nothing from it.
+# The run reports ok=1 changed=0 and looks like a successful no-op. Both
+# are required: `tags:` so the include is selected, `apply:` so what it
+# includes is selected too.
+- name: audit-subscriber | apply audit-integrity lifecycle policy (Block 95)
+  ansible.builtin.include_tasks:
+    file: lifecycle.yml
+    apply:
+      tags:
+        - lifecycle
+  when: audit_subscriber_apply_lifecycle | bool
+  tags:
+    - lifecycle
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.

@@ -1,0 +1,95 @@
+---
+# Provisions the OAuth2 client the consistency console's fence presents
+# (`consistency-console`) at the site Hydra. Idempotent upsert by client_id.
+# Mirrors roles/microscope-oidc-client/tasks/main.yml. Every task is run_once:
+# Hydra runs on the first host of a mgmt pair only, and the client is one row
+# per goatnet.
+
+- name: Require consistency-console OIDC client secret
+  ansible.builtin.assert:
+    that:
+      - consistency_console_oidc_client_secret is defined
+      - (consistency_console_oidc_client_secret | length) >= 32
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+    fail_msg: |
+      Missing consistency_console_oauth2_proxy_client_secret (32+ chars) or
+      site_id/site_dns_zone. This is the SAME secret the consistency-console
+      role templates into oauth2-proxy-consistency-console.env — one value,
+      both sides of the handshake. Generate fresh: openssl rand -hex 32
+  run_once: true
+
+- name: Pre-flight Hydra admin reachability
+  ansible.builtin.uri:
+    url: "{{ consistency_console_oidc_hydra_admin }}/health/ready"
+    status_code: 200
+  register: consistency_console_hydra_ready
+  until: consistency_console_hydra_ready is succeeded
+  retries: 5
+  delay: 2
+  run_once: true
+
+- name: Check whether consistency-console OAuth2 client exists at Hydra
+  ansible.builtin.uri:
+    url: "{{ consistency_console_oidc_hydra_admin }}/admin/clients/{{ consistency_console_oidc_client_id }}"
+    status_code: [200, 404]
+    return_content: true
+  register: consistency_console_client_get
+  no_log: true
+  run_once: true
+
+- name: Construct desired consistency-console OAuth2 client config
+  ansible.builtin.set_fact:
+    consistency_console_client_config:
+      client_id: "{{ consistency_console_oidc_client_id }}"
+      client_name: "{{ consistency_console_oidc_client_name }}"
+      client_secret: "{{ consistency_console_oidc_client_secret }}"
+      grant_types: [authorization_code, refresh_token]
+      response_types: [code]
+      scope: "{{ consistency_console_oidc_scopes | join(' ') }}"
+      redirect_uris: ["{{ consistency_console_oidc_redirect_uri }}"]
+      token_endpoint_auth_method: client_secret_post
+      skip_consent: true
+      access_token_strategy: jwt
+      audience: ["{{ consistency_console_oidc_client_id }}"]
+  no_log: true
+  run_once: true
+
+- name: Create consistency-console OAuth2 client at Hydra (POST when not present)
+  ansible.builtin.uri:
+    url: "{{ consistency_console_oidc_hydra_admin }}/admin/clients"
+    method: POST
+    body_format: json
+    body: "{{ consistency_console_client_config }}"
+    status_code: 201
+  when: consistency_console_client_get.status == 404
+  no_log: true
+  run_once: true
+
+- name: Detect drift on existing consistency-console OAuth2 client at Hydra
+  # Hydra v2.x omits `client_secret` from GET responses, so the
+  # `| default('')` makes the comparison "missing == we don't know == treat
+  # as drifted", forcing the PUT to re-sync the secret. PUT is idempotent on
+  # server state and no_log keeps the secret out of logs.
+  ansible.builtin.set_fact:
+    consistency_console_client_drift: >-
+      {{ (consistency_console_client_get.json.client_secret | default('')) != consistency_console_oidc_client_secret
+         or (consistency_console_client_get.json.redirect_uris | sort) != ([consistency_console_oidc_redirect_uri] | sort)
+         or (consistency_console_client_get.json.skip_consent | default(false)) != true
+         or (consistency_console_client_get.json.access_token_strategy | default('')) != 'jwt' }}
+  when: consistency_console_client_get.status == 200
+  no_log: true
+  run_once: true
+
+- name: Update consistency-console OAuth2 client at Hydra (PUT on drift)
+  ansible.builtin.uri:
+    url: "{{ consistency_console_oidc_hydra_admin }}/admin/clients/{{ consistency_console_oidc_client_id }}"
+    method: PUT
+    body_format: json
+    body: "{{ consistency_console_client_config }}"
+    status_code: 200
+  when:
+    - consistency_console_client_get.status == 200
+    - consistency_console_client_drift | default(false) | bool
+  no_log: true
+  run_once: true

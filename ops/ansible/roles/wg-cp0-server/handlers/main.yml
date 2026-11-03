@@ -1,0 +1,43 @@
+---
+# Handler discipline (Block 22R.3 — closes F-114 substrate-side):
+#
+#   - reload wg-cp0 peers  — fired on allowlist-only deltas. Uses
+#       `wg syncconf` against `wg-quick strip` of the on-disk conf so
+#       existing peer sessions are preserved (no handshake reset).
+#       This is the right notification for any task that only adds /
+#       removes peers or rotates a peer's pubkey + allowed-ips.
+#
+#   - restart wg-cp0       — fired on listener-shape changes (privkey
+#       rotation, ListenPort change, Address change, MTU change). Drops
+#       every peer's session and forces re-handshake. Only use this
+#       handler when the [Interface] stanza changes.
+#
+# The role's tasks/main.yml renders the conf to a staging path, runs
+# files/wg-cp0-classify-conf-change.sh to pick which handler should fire,
+# then atomically promotes the staged file. See that file for the full
+# classification algorithm.
+#
+# Background: notifying `restart wg-cp0` on every render has a fleet-wide blast
+# radius. Cloud peers are undisturbed across the restart when their on-disk +
+# in-memory keys match the allowlist, but a host whose on-disk key has silently
+# rotated past the allowlist cannot re-handshake, so a forced re-handshake of
+# every peer is the wrong default for a peer-set change.
+
+- name: reload wg-cp0 peers
+  ansible.builtin.shell: |
+    set -euo pipefail
+    wg syncconf {{ wg_cp0_interface_name }} <(wg-quick strip {{ wg_cp0_interface_name }})
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: restart wg-cp0
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ wg_cp0_interface_name }}"
+    state: restarted
+    daemon_reload: true
+
+- name: reload nftables
+  ansible.builtin.systemd:
+    name: nftables
+    state: reloaded

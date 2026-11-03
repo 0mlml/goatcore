@@ -1,0 +1,204 @@
+---
+# The console's two Postgres databases on postgres-a (ADR 1165 step A).
+# Idempotent: re-running changes nothing on a provisioned host.
+#
+# Same mechanism as the spire and admit-audit roles: `docker exec postgres-a
+# psql` as the superuser (no psycopg2 on the host, no remote connection), the
+# login role's password from the deployer's environment (ADR 1186), and a
+# grep-then-append pg_hba line followed by pg_reload_conf(). The same pg_hba line
+# is baked into ops/postgres/spock/conf/pg_hba.conf so a rebuilt image carries
+# it; the runtime append covers the image every host runs today.
+#
+# Inputs: postgres_superuser_password (-e, as every other playbook that touches
+# postgres-a takes it), id_admin_console_db_password (role default, env).
+#
+# Not replicated: neither database may appear in spock_mesh_databases, and
+# neither may carry the spock extension. Both are asserted below, so a later
+# group_vars edit that names one of them fails here rather than wiring a repset.
+
+- name: id-admin-console-store | postgres — inputs present
+  ansible.builtin.assert:
+    that:
+      - postgres_superuser_password | default('') | length > 0
+      - id_admin_console_db_password | default('') | length > 0
+    fail_msg: >-
+      Provisioning the console databases needs postgres_superuser_password
+      (pass -e postgres_superuser_password=..., the <SITE>_PG_PASS value) and
+      {{ id_admin_console_db_password_env }} in the environment. Run through
+      ops/scripts/with-secrets so both resolve from the secret store (ADR 1186).
+    quiet: true
+
+- name: id-admin-console-store | postgres — the console databases are not federated (step A)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (spock_mesh_databases | default([]) | map(attribute='name') | list
+         | intersect([id_admin_console_onboard_db_name, id_admin_console_org_db_name]))
+        | length == 0
+    fail_msg: >-
+      spock_mesh_databases names {{ id_admin_console_onboard_db_name }} or
+      {{ id_admin_console_org_db_name }}. ADR 1165 step A keeps both out of every
+      Spock replication set; they join only at step 6 of
+      docs/project/island-mode-program.md, after the step B schema.
+    quiet: true
+
+- name: id-admin-console-store | postgres — postgres-a accepts connections
+  ansible.builtin.command:
+    argv: ["docker", "exec", "{{ id_admin_console_db_container }}", "pg_isready", "-U", "postgres"]
+  changed_when: false
+
+- name: id-admin-console-store | postgres — create the login role if missing
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ id_admin_console_db_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -tAc
+      - >-
+        DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ id_admin_console_db_user }}') THEN
+        CREATE ROLE {{ id_admin_console_db_user }} LOGIN; RAISE NOTICE 'created';
+        END IF; END $$;
+  register: idac_pg_role
+  changed_when: "'created' in idac_pg_role.stderr"
+  no_log: true
+
+# Re-asserted every run, as admit-audit does, so a rotation is a re-run with the
+# new value. The value is the same on an ordinary run, so it reports unchanged.
+- name: id-admin-console-store | postgres — set the login role's password
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ id_admin_console_db_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -tAc
+      - "ALTER ROLE {{ id_admin_console_db_user }} WITH LOGIN PASSWORD '{{ id_admin_console_db_password | replace(\"'\", \"''\") }}'"
+  changed_when: false
+  no_log: true
+
+- name: id-admin-console-store | postgres — read the current owner of each database
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ id_admin_console_db_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -tAc
+      - "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{{ item }}'"
+  loop:
+    - "{{ id_admin_console_onboard_db_name }}"
+    - "{{ id_admin_console_org_db_name }}"
+  register: idac_pg_owner
+  changed_when: false
+
+# A new host's init script (01-databases.sql) creates both databases owned by
+# postgres, before this role exists; ownership moves here. The console runs
+# CREATE TABLE at schema version 1, so it must own them.
+- name: id-admin-console-store | postgres — create each database, or hand it to the console role
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ id_admin_console_db_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - >-
+        {{ ('CREATE DATABASE ' ~ item.item ~ ' OWNER ' ~ id_admin_console_db_user)
+           if (item.stdout | trim | length == 0)
+           else ('ALTER DATABASE ' ~ item.item ~ ' OWNER TO ' ~ id_admin_console_db_user) }}
+  loop: "{{ idac_pg_owner.results }}"
+  loop_control:
+    label: "{{ item.item }} (owner now: {{ item.stdout | trim or 'absent' }})"
+  when: item.stdout | trim != id_admin_console_db_user
+  changed_when: true
+
+- name: id-admin-console-store | postgres — neither database carries the spock extension
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ id_admin_console_db_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ item }}"
+      - -tAc
+      - "SELECT count(*) FROM pg_extension WHERE extname = 'spock'"
+  loop:
+    - "{{ id_admin_console_onboard_db_name }}"
+    - "{{ id_admin_console_org_db_name }}"
+  register: idac_pg_spock
+  changed_when: false
+  failed_when: idac_pg_spock.rc != 0 or (idac_pg_spock.stdout | trim) != '0'
+
+# The rule names both databases and the one role, like the netbird lines in the
+# baked file. The address is open because postgres-a is reached over the docker
+# mgmt network, the same scoping as spire and admit-audit. The file is the one
+# the server actually reads (SHOW hba_file), not an assumed path.
+- name: id-admin-console-store | postgres — pg_hba admits the console role to its two databases
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      HBA=$(docker exec {{ id_admin_console_db_container }} psql -U postgres -tAc 'SHOW hba_file')
+      DBS='{{ id_admin_console_onboard_db_name }},{{ id_admin_console_org_db_name }}'
+      ROLE='{{ id_admin_console_db_user }}'
+      RULE="host $DBS $ROLE 0.0.0.0/0 scram-sha-256"
+      if ! docker exec {{ id_admin_console_db_container }} grep -qE "^host[[:space:]]+$DBS[[:space:]]+$ROLE[[:space:]]" "$HBA"; then
+        docker exec -u 0 {{ id_admin_console_db_container }} sh -c "echo '$RULE' >> '$HBA'"
+        docker exec {{ id_admin_console_db_container }} psql -U postgres -tAc 'SELECT pg_reload_conf();' >/dev/null
+        echo idac_hba_changed
+      fi
+  register: idac_pg_hba
+  changed_when: "'idac_hba_changed' in idac_pg_hba.stdout"
+
+- name: id-admin-console-store | postgres — the loaded pg_hba rules include the console line, without errors
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ id_admin_console_db_container }}"
+      - psql
+      - -U
+      - postgres
+      - -tAc
+      - >-
+        SELECT count(*) FROM pg_hba_file_rules
+        WHERE '{{ id_admin_console_db_user }}' = ANY(user_name) AND error IS NULL
+  register: idac_pg_hba_loaded
+  changed_when: false
+  failed_when: idac_pg_hba_loaded.rc != 0 or (idac_pg_hba_loaded.stdout | trim | int) < 1

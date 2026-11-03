@@ -1,0 +1,195 @@
+---
+# host-net-publish — install the publisher + timer on a site network host.
+# See defaults/main.yml for the contract.
+
+- name: host-net-publish | require inputs
+  ansible.builtin.assert:
+    that:
+      - host_net_publish_enabled | bool
+      - host_net_goatnet | length > 0
+      - host_net_ingest_urls | length > 0
+      - host_net_bearer_token | length >= 16
+    fail_msg: >-
+      host-net-publish requires host_net_publish_enabled, host_net_goatnet,
+      host_net_ingest_urls and a bearer token (>=16 chars).
+
+# A host that publishes to its OWN site's ingest needs the ingest's
+# mesh hostname to resolve locally — mesh names don't self-resolve on the
+# host (netbird DNS serves peers, not the host's own resolver), so the ingest
+# URL fails http=000 without this entry.
+- name: host-net-publish | self-resolve hosts entries for local ingest names
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ item.value }} {{ item.key }}  # host-net self-publish to local ingest (managed by host-net-publish role)"
+    regexp: "\\s{{ item.key | regex_escape }}(\\s|$)"
+  loop: "{{ host_net_selfhost_entries | default({}) | dict2items }}"
+
+- name: host-net-publish | dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ host_net_publish_dir }}"
+    - "{{ host_net_publish_state_dir }}"
+
+- name: host-net-publish | install publisher script
+  ansible.builtin.copy:
+    src: "{{ host_net_publish_src }}"
+    dest: "{{ host_net_publish_dir }}/host-net-publish.sh"
+    mode: "0755"
+  notify: restart host-net-publish timer
+
+- name: host-net-publish | install rate peak sampler script
+  ansible.builtin.copy:
+    src: "{{ host_net_ratesample_src }}"
+    dest: "{{ host_net_publish_dir }}/host-net-ratesample.sh"
+    mode: "0755"
+  notify: restart host-net-ratesample
+
+- name: host-net-publish | install capacity probe script
+  ansible.builtin.copy:
+    src: "{{ capacity_probe_src }}"
+    dest: "{{ host_net_publish_dir }}/capacity-probe.sh"
+    mode: "0755"
+
+- name: host-net-publish | env (mode 0600 — carries the bearer)
+  ansible.builtin.copy:
+    dest: "{{ host_net_publish_dir }}/host-net-publish.env"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      HOSTNET_NAME={{ host_net_name }}
+      HOSTNET_GOATNET={{ host_net_goatnet }}
+      HOSTNET_INGEST_URLS={{ host_net_ingest_urls }}
+      RELAY_METRICS_BEARER_TOKEN={{ host_net_bearer_token }}
+      HOSTNET_INTERVAL_S={{ host_net_publish_interval | regex_replace('[^0-9]','') }}
+      HOSTNET_PING_TARGET={{ host_net_ping_target }}
+      HOSTNET_PING_COUNT={{ host_net_ping_count }}
+      HOSTNET_SIGNAL_CONTAINER={{ host_net_signal_container }}
+      HOSTNET_MGMT_CONTAINER={{ host_net_mgmt_container }}
+      HOSTNET_FEDERATION_MODE={{ host_net_federation_mode }}
+      STATE_DIR={{ host_net_publish_state_dir }}
+      SAMPLE_INTERVAL_S={{ host_net_sample_interval_s }}
+      CAPACITY_TARGET_MESH={{ capacity_target_mesh }}
+      CAPACITY_TARGET_PUBLIC={{ capacity_target_public }}
+      CAPACITY_TARGET_NAME={{ capacity_target_name }}
+      CAPACITY_PORT={{ capacity_probe_port }}
+      CAPACITY_DURATION_S={{ capacity_probe_duration_s }}
+      CAPACITY_MIN_INTERVAL_S={{ capacity_probe_min_interval_s }}
+      CAPACITY_DIRECTION={{ capacity_probe_direction }}
+      CAPACITY_TARGET_CROSSNODE={{ capacity_target_crossnode }}
+      CAPACITY_CROSSNODE_NAME={{ capacity_crossnode_name }}
+  no_log: true
+  notify:
+    - restart host-net-publish timer
+    - restart host-net-ratesample
+
+- name: host-net-publish | systemd service + timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - host-net-publish.service
+    - host-net-publish.timer
+    - host-net-ratesample.service
+    - capacity-probe.service
+    - capacity-probe.timer
+  notify: restart host-net-publish timer
+
+- name: host-net-publish | enable + start timer
+  ansible.builtin.systemd:
+    name: host-net-publish.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: host-net-publish | enable + start rate peak sampler (always-on)
+  ansible.builtin.systemd:
+    name: host-net-ratesample.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: host-net-publish | enable capacity-probe timer (hourly; only when a target is set)
+  ansible.builtin.systemd:
+    name: capacity-probe.timer
+    enabled: "{{ capacity_probe_enabled | bool }}"
+    state: "{{ 'started' if capacity_probe_enabled | bool else 'stopped' }}"
+    daemon_reload: true
+
+- name: host-net-publish | seed one capacity measurement now (when enabled)
+  ansible.builtin.systemd:
+    name: capacity-probe.service
+    state: started
+  when: capacity_probe_enabled | bool
+  changed_when: false
+  failed_when: false
+
+- name: host-net-publish | fire one publish now (seed the dashboards)
+  ansible.builtin.systemd:
+    name: host-net-publish.service
+    state: started
+  changed_when: false
+  failed_when: false
+
+# --- cross-node iperf3 target ------
+- name: host-net-publish | require a bind IP when the iperf3 target is enabled
+  ansible.builtin.assert:
+    that:
+      - host_net_iperf3_bind | length > 0
+    fail_msg: "host_net_iperf3_target_enabled requires host_net_iperf3_bind (this host's mesh IP)."
+  when: host_net_iperf3_target_enabled | bool
+
+- name: host-net-publish | install iperf3 (cross-node capacity target)
+  ansible.builtin.apt:
+    name: iperf3
+    state: present
+  when: host_net_iperf3_target_enabled | bool
+
+# F-370. The Debian/Ubuntu iperf3 package ships its own iperf3.service and
+# ENABLES it on install. That unit runs `iperf3 --server` with no --bind, so it
+# wants 0.0.0.0:5201 — the port our mesh-bound target already holds. It loses
+# the race, exits 1, and its packaged unit is Restart=always RestartSec=15 with
+# SuccessExitStatus=1, so exit 1 counts as success, the start-limit burst never
+# trips, and it retries forever.
+#
+# That is one failed unit start every 15 seconds for the life of the host: pure
+# journal noise and systemd churn that makes every real failure harder to see.
+#
+# Masked, not merely disabled: `disabled` still lets a dependency or a
+# `systemctl start` pull it in, and the apt package re-enables its unit on
+# every upgrade. A mask is the only state that survives that.
+#
+# The reverse race is the reason this matters beyond noise: if the packaged
+# unit wins the port (it starts at boot before the mesh interface carries our
+# bind address), it listens on 0.0.0.0 — every interface, not just the mesh —
+# and OUR mesh-bound target is the one that fails. That is an unauthenticated
+# bandwidth-test server on whatever else the host is attached to.
+- name: host-net-publish | mask the packaged iperf3.service
+  ansible.builtin.systemd:
+    name: iperf3.service
+    enabled: false
+    state: stopped
+    masked: true
+    daemon_reload: true
+  when: host_net_iperf3_target_enabled | bool
+  failed_when: false
+
+- name: host-net-publish | cross-node iperf3 target unit (mesh-bound)
+  ansible.builtin.template:
+    src: host-net-iperf3-target.service.j2
+    dest: /etc/systemd/system/host-net-iperf3-target.service
+    mode: "0644"
+  when: host_net_iperf3_target_enabled | bool
+  notify: restart host-net iperf3 target
+
+- name: host-net-publish | enable + start cross-node iperf3 target
+  ansible.builtin.systemd:
+    name: host-net-iperf3-target.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: host_net_iperf3_target_enabled | bool

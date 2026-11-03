@@ -1,0 +1,98 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-time-health roll-up on a mgmt-host (ADR 1036/1037, F-184).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the same docker network.
+#   2. goat-ntp-health-pub deployed on the hosts (so ops/time/attest/** carries data).
+#   3. Infra leaf cert + key minted via offline-CA cert-sign with Subject
+#      CN=goat-time-health-trial-peer at {{ time_health_cert_dir }}/time-health-{cert,key}.pem
+#      (ACL subject `infra-time-health`, rule `infra-w-time-health` on ops/time/health/**;
+#       a wrong CN = silent denial, F-177).
+#   4. CA root present at {{ time_health_ca_root_src }}.
+#
+# Persists nothing — no S3/MinIO/.env.
+
+- name: time-health | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ time_health_cert_dir }}/time-health-cert.pem"
+  register: time_health_cert_stat
+  when: time_health_zenoh_endpoint is match('^tls/')
+
+- name: time-health | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      time-health: leaf cert missing at
+      {{ time_health_cert_dir }}/time-health-cert.pem. Mint one via the offline-CA
+      cert-sign ceremony (Subject CN=goat-time-health-trial-peer) before re-running
+      (see docs/operations/dev-ca-cert-sign.md).
+  when:
+    - time_health_zenoh_endpoint is match('^tls/')
+    - time_health_cert_stat is not skipped
+    - not (time_health_cert_stat.stat.exists | default(false))
+
+- name: time-health | pre-flight CA root exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ time_health_ca_root_src }}"
+  register: time_health_ca_root_stat
+  when: time_health_zenoh_endpoint is match('^tls/')
+
+- name: time-health | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      time-health: CA root cert missing at {{ time_health_ca_root_src }} — same
+      file zenoh-router uses, so its absence means the router itself isn't deployed.
+  when:
+    - time_health_zenoh_endpoint is match('^tls/')
+    - time_health_ca_root_stat is not skipped
+    - not (time_health_ca_root_stat.stat.exists | default(false))
+
+- name: time-health | normalize cert dir ownership for non-root container uid 65532 (Chainguard default)
+  ansible.builtin.file:
+    path: "{{ time_health_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: time_health_zenoh_endpoint is match('^tls/')
+
+- name: time-health | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ time_health_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: time-health | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ time_health_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: time-health | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ time_health_compose_dir }}"
+  changed_when: true
+
+- name: time-health | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ time_health_compose_dir }}"
+  register: time_health_up
+  changed_when:
+    - "'Started' in time_health_up.stderr or 'Created' in time_health_up.stderr or 'Recreated' in time_health_up.stderr"
+
+- name: time-health | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ time_health_compose_dir }}"
+  register: time_health_ps
+  changed_when: false
+
+- name: time-health | show
+  ansible.builtin.debug:
+    msg: "{{ time_health_ps.stdout_lines }}"

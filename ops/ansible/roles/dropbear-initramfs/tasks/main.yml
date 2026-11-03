@@ -1,0 +1,185 @@
+---
+- name: Pre-flight — assert authorized_keys is non-empty
+  ansible.builtin.fail:
+    msg: >-
+      dropbear_authorized_keys is empty. Without authorized keys, no remote
+      operator can unlock from initramfs and the role is dead weight.
+      Populate via group_vars or (post Block 65B.2) the offline-enrollment
+      bundle's dropbear_authorized_keys CBOR field.
+  when: (dropbear_authorized_keys | length) == 0
+
+- name: Pre-flight — assert IP config is set
+  ansible.builtin.fail:
+    msg: >-
+      dropbear_initramfs_ip_config is empty. The initramfs cannot bring up
+      networking without a static IP config; DHCP is intentionally rejected.
+      Set per-host (typically from underlay_lan_ip + underlay_gateway +
+      underlay_netmask in group_vars).
+  when: dropbear_initramfs_ip_config | length == 0
+
+- name: Pre-flight — assert no public-bind smell in DROPBEAR_OPTIONS
+  ansible.builtin.fail:
+    msg: >-
+      DROPBEAR_OPTIONS contains a public-bind hint ('-w' allows root login,
+      explicit binding to 0.0.0.0). Block 65B requires underlay-LAN-only
+      reachability. Reject configuration.
+  when: >-
+    ('-w' in dropbear_options) or
+    ('0.0.0.0' in dropbear_options) or
+    ('::' in dropbear_options)
+
+- name: Install dropbear-initramfs and supporting packages
+  ansible.builtin.apt:
+    name: "{{ dropbear_packages }}"
+    state: present
+    update_cache: true
+
+- name: Ensure dropbear-initramfs config dir exists
+  ansible.builtin.file:
+    path: /etc/dropbear/initramfs
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render dropbear-initramfs authorized_keys
+  ansible.builtin.copy:
+    dest: /etc/dropbear/initramfs/authorized_keys
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      # Block 65B — dropbear-initramfs authorized_keys per ADR 0612.
+      # Managed by the dropbear-initramfs Ansible role; manual edits will
+      # be overwritten on next run. Source is `dropbear_authorized_keys`.
+      {% for key in dropbear_authorized_keys %}
+      {{ key }}
+      {% endfor %}
+  notify: update initramfs
+
+- name: Render DROPBEAR_OPTIONS for initramfs
+  ansible.builtin.copy:
+    dest: /etc/dropbear/initramfs/dropbear.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Block 65B — dropbear-initramfs config per ADR 0612.
+      # Managed by Ansible; flags hardened per role README.
+      DROPBEAR_OPTIONS="{{ dropbear_options }}"
+  notify: update initramfs
+
+- name: Configure initramfs networking — static IP for boot-time NIC bring-up
+  ansible.builtin.lineinfile:
+    path: /etc/initramfs-tools/initramfs.conf
+    regexp: '^IP='
+    line: "IP={{ dropbear_initramfs_ip_config }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  notify: update initramfs
+
+- name: Include extra kernel modules in initramfs (e.g. Tegra NIC)
+  ansible.builtin.lineinfile:
+    path: /etc/initramfs-tools/modules
+    regexp: '^{{ item }}\b'
+    line: "{{ item }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ dropbear_initramfs_extra_kmods }}"
+  notify: update initramfs
+
+- name: Force flush pending initramfs rebuild
+  ansible.builtin.meta: flush_handlers
+
+# Per F-058: on JetPack 6.1 the rootfs ships both
+# `linux-image-5.15.148-tegra` (running) and `linux-image-5.15.0-1032-realtime`
+# (alternate). Debian's version-ordering algorithm considers the realtime
+# kernel "newer," so update-initramfs defaults to it AND flash-kernel's
+# post-update hook refuses to copy the Tegra-kernel initrd to /boot/initrd
+# because it makes the same comparison. End state on a fresh Orin: dropbear
+# is in /boot/initrd.img-<realtime>, but /boot/initrd (extlinux's target)
+# stays at flash-time content. Workaround: rebuild explicitly for the
+# running kernel, then copy the result to /boot/initrd ourselves on Tegra
+# hosts. Idempotent — re-runs are no-ops if files match.
+
+- name: Detect Tegra L4T host (presence of /etc/nv_tegra_release)
+  ansible.builtin.stat:
+    path: /etc/nv_tegra_release
+  register: nv_tegra_release_stat
+
+- name: Rebuild initramfs explicitly for the running kernel (Tegra workaround per F-058)
+  ansible.builtin.command:
+    cmd: update-initramfs -u -k {{ ansible_kernel }}
+  register: tegra_initramfs_rebuild
+  changed_when: tegra_initramfs_rebuild.rc == 0
+  when: nv_tegra_release_stat.stat.exists | default(false)
+
+- name: Backup /boot/initrd before overwrite (Tegra)
+  ansible.builtin.copy:
+    src: /boot/initrd
+    dest: "/boot/initrd.bak-pre-dropbear-{{ ansible_date_time.iso8601_basic_short | default(ansible_date_time.iso8601, true) }}"
+    remote_src: true
+    force: false
+    owner: root
+    group: root
+    mode: "0644"
+  when: nv_tegra_release_stat.stat.exists | default(false)
+
+- name: Copy Tegra-kernel initramfs to /boot/initrd (overrides flash-kernel hook)
+  ansible.builtin.copy:
+    src: "/boot/initrd.img-{{ ansible_kernel }}"
+    dest: /boot/initrd
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: nv_tegra_release_stat.stat.exists | default(false)
+
+- name: Verify dropbear binary is present in the rebuilt initramfs
+  # On vanilla Ubuntu the initramfs is /boot/initrd.img-$KVER; on Tegra L4T
+  # it is /boot/initrd (no version suffix; flash-kernel post-update.d hook
+  # copies the freshly-built initramfs there per Block 65B.0 finding). Probe
+  # both — whichever exists.
+  #
+  # F-073 fix: the previous form `lsinitramfs ... | grep -q PAT`
+  # under `set -o pipefail` produced a false-FAIL when dropbear's path
+  # appeared mid-stream rather than at the last line — `grep -q` closes its
+  # stdin on first match, the still-writing `lsinitramfs` gets SIGPIPE
+  # (exit 141), and pipefail propagates the 141 even though the match
+  # succeeded. Replaced with `grep -c` (which reads the full input) +
+  # numeric check. Also broadens the pattern to `(usr/)?sbin/dropbear$` to
+  # cover the modern Debian /usr-merge layout (Ubuntu 22.04 Tegra L4T
+  # R36.4.7 puts the binary at usr/sbin/dropbear).
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      if [ -f /boot/initrd ]; then
+          target=/boot/initrd
+      else
+          target=$(ls -t /boot/initrd.img-* 2>/dev/null | head -1)
+      fi
+      [ -n "$target" ] || { echo 'NO INITRAMFS FOUND'; exit 2; }
+      count=$(lsinitramfs "$target" | grep -cE '(^|/)usr/sbin/dropbear$|(^|/)sbin/dropbear$' || true)
+      if [ "$count" -ge 1 ]; then
+          echo "PRESENT in $target ($count match)"
+      else
+          echo "MISSING from $target"
+          exit 1
+      fi
+    executable: /bin/bash
+  register: dropbear_in_initramfs
+  changed_when: false
+
+- name: Notice — dropbear-initramfs ready
+  ansible.builtin.debug:
+    msg: |
+      dropbear-initramfs ready on {{ inventory_hostname }}.
+      Bind: {{ dropbear_initramfs_ip_config | regex_replace('^([^:]+).*', '\\1') }}:{{ dropbear_initramfs_ssh_port }}
+      Authorized keys: {{ dropbear_authorized_keys | length }}
+      Verify on next reboot — initramfs hangs at LUKS prompt; SSH from a
+      peer in the same site to type the passphrase. See
+      docs/operations/dropbear-remote-unlock.md (Block 65B.3).

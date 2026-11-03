@@ -1,0 +1,142 @@
+---
+# Block 21H.1a — operator-idp-postgres role.
+# ADR 0842. Single-instance Postgres on Orin-C backing the operator IdP.
+# Idempotent — re-runs are no-ops when state matches.
+#
+# Required vars (resolved at runtime from the operator's `.envrc.local.d/`):
+#   - operator_idp_pg_superuser_password
+#   - operator_idp_pg_app_password
+#   - operator_idp_pg_dump_age_recipient
+
+- name: Require secrets + age recipient
+  ansible.builtin.assert:
+    that:
+      - operator_idp_pg_superuser_password is defined and (operator_idp_pg_superuser_password | length) > 0
+      - operator_idp_pg_app_password is defined and (operator_idp_pg_app_password | length) > 0
+      - operator_idp_pg_dump_age_recipient is defined and (operator_idp_pg_dump_age_recipient | length) > 0
+    fail_msg: |
+      Missing operator-IdP Postgres secrets. Per ADR 0842, this DB is
+      independent of the postgres-spock cluster — secrets are NOT
+      cluster-shared and NOT in 1Password's site-Hydra entry. Generate
+      fresh values via `openssl rand -base64 32` and append to
+      .envrc.local.d/30-site-services.envrc as:
+        export <SITE>_C_OPERATOR_IDP_PG_SUPERUSER_PASSWORD=...
+        export <SITE>_C_OPERATOR_IDP_PG_APP_PASSWORD=...
+        export <SITE>_C_OPERATOR_IDP_PG_DUMP_AGE_RECIPIENT=age1...
+      The age recipient is a public key — generate a fresh age keypair
+      via `age-keygen -o ~/.config/age/operator-idp-<site>.key`; the
+      private key stays on the operator's laptop (or a YubiKey-PIV
+      X25519 hardware key per the ca-signing-host pattern).
+
+- name: Ensure compose project + data + dump directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ operator_idp_compose_dir }}", mode: "0750" }
+    - { path: "{{ operator_idp_compose_dir }}/init", mode: "0755" }
+    - { path: "{{ operator_idp_data_root }}", mode: "0700" }
+    - { path: "{{ operator_idp_pg_dump_dir }}", mode: "0700" }
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ operator_idp_compose_dir }}/docker-compose.yml"
+    mode: "0640"
+
+- name: Render init-databases.sh (mounted into entrypoint-initdb.d)
+  ansible.builtin.template:
+    src: init-databases.sh.j2
+    dest: "{{ operator_idp_compose_dir }}/init/01-create-app-user-and-dbs.sh"
+    # Executable; the postgres entrypoint requires +x for *.sh scripts.
+    mode: "0755"
+
+- name: Render .env (Postgres passwords for compose env_file)
+  # Mode 0600 — secret material. Only the docker daemon (root) reads
+  # it. Distinct from the operator's .envrc.local; this file is
+  # rendered fresh on every Ansible run from current env-resolved
+  # values, so rotation is just a re-run.
+  ansible.builtin.copy:
+    dest: "{{ operator_idp_compose_dir }}/.env"
+    mode: "0600"
+    content: |
+      POSTGRES_PASSWORD={{ operator_idp_pg_superuser_password }}
+      OPERATOR_IDP_PG_APP_PASSWORD={{ operator_idp_pg_app_password }}
+  no_log: true
+  notify: restart operator-idp-postgres
+
+- name: Render pg-dump-and-encrypt.sh
+  ansible.builtin.template:
+    src: pg-dump-and-encrypt.sh.j2
+    dest: "{{ operator_idp_compose_dir }}/pg-dump-and-encrypt.sh"
+    mode: "0750"
+
+- name: Pull operator-idp-postgres image
+  ansible.builtin.command:
+    cmd: docker compose pull postgres
+    chdir: "{{ operator_idp_compose_dir }}"
+  changed_when: true
+
+- name: Bring up operator-idp-postgres
+  ansible.builtin.command:
+    cmd: docker compose up -d postgres
+    chdir: "{{ operator_idp_compose_dir }}"
+  changed_when: true
+
+- name: Wait for operator-idp-postgres healthcheck = healthy
+  ansible.builtin.command:
+    cmd: docker inspect -f '{% raw %}{{.State.Health.Status}}{% endraw %}' {{ operator_idp_pg_container_name }}
+  register: pg_health
+  retries: 30
+  delay: 2
+  until: pg_health.stdout | trim == "healthy"
+  changed_when: false
+
+- name: Smoke — verify operator_idp app user can connect
+  # Catches the F-079-class silent-failure: if the init script didn't
+  # run (volume already populated from a prior run) and the password
+  # was rotated, this connection fails clearly. Operator runs
+  # `ALTER ROLE operator_idp WITH PASSWORD '<new>'` to reconcile.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ operator_idp_pg_app_password }}"
+      - "{{ operator_idp_pg_container_name }}"
+      - psql
+      - -U
+      - "{{ operator_idp_pg_app_user }}"
+      - -d
+      - kratos
+      - -tAc
+      - "SELECT 1;"
+  register: app_user_smoke
+  changed_when: false
+  failed_when:
+    - app_user_smoke.rc != 0
+    - "'password authentication failed' in (app_user_smoke.stderr | default(''))"
+
+- name: Install pg-dump cron entry
+  # System-wide cron (not per-user crontab) — survives operator
+  # account changes; runs as root which is what `docker exec` needs.
+  ansible.builtin.cron:
+    name: "operator-idp-postgres dump"
+    minute: "{{ operator_idp_pg_dump_cron_minute }}"
+    hour: "{{ operator_idp_pg_dump_cron_hour }}"
+    user: root
+    job: "{{ operator_idp_compose_dir }}/pg-dump-and-encrypt.sh >/dev/null 2>&1"
+    cron_file: operator-idp-postgres-dump
+
+- name: Surface dump command for operator awareness
+  ansible.builtin.debug:
+    msg: |
+      operator-idp-postgres up. To run an ad-hoc dump:
+        sudo {{ operator_idp_compose_dir }}/pg-dump-and-encrypt.sh
+      Daily cron fires at {{ operator_idp_pg_dump_cron_hour }}:{{ operator_idp_pg_dump_cron_minute }} UTC; encrypted output at:
+        {{ operator_idp_pg_dump_dir }}/operator-idp-<TS>.sql.age
+      Decrypt with:
+        age -d -i ~/.config/age/operator-idp-<site>.key <file>.sql.age

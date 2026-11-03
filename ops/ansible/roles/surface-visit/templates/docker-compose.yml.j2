@@ -1,0 +1,43 @@
+# Rendered by ops/ansible/roles/surface-visit/ — DO NOT EDIT ON HOST.
+#
+# One emitter per fenced door. Each joins the zenoh network to publish and
+# mounts the docker containers directory READ-ONLY to find its door's log.
+---
+services:
+{% for s in surface_visit_surfaces %}
+  surface-visit-{{ s.name }}:
+    image: "{{ surface_visit_image }}"
+    container_name: "surface-visit-{{ s.name }}"
+    restart: unless-stopped
+    platform: "{{ surface_visit_image_platform }}"
+    networks:
+      - "{{ surface_visit_zenoh_network }}"
+    environment:
+      SURFACE_VISIT_SURFACE: "{{ s.name }}"
+      SURFACE_VISIT_ENV: "{{ site_id }}"
+      SURFACE_VISIT_NODE: "{{ inventory_hostname }}"
+      # The door writes its request log here; this emitter reads that one file.
+      # NOT Docker's container-log directory, which is root:root 0710 and would
+      # mean running as root or reading every container's output on the host.
+      SURFACE_VISIT_LOG_PATH: "/doorlog/request.log"
+      SURFACE_VISIT_AGE_RECIPIENTS_FILE: "/etc/surface-visit/age-recipients.txt"
+      SURFACE_VISIT_ZENOH_ENDPOINT: "{{ surface_visit_zenoh_endpoint }}"
+      SURFACE_VISIT_ZENOH_CERT: "/certs/surface-visit-cert.pem"
+      SURFACE_VISIT_ZENOH_KEY: "/certs/surface-visit-key.pem"
+      SURFACE_VISIT_ZENOH_ROOT_CA: "/certs/ca-root-cert.pem"
+      SURFACE_VISIT_TAIL_ONLY: "{{ surface_visit_tail_only | lower }}"
+      SURFACE_VISIT_DRY_RUN: "{{ surface_visit_dry_run | lower }}"
+      RUST_LOG: "{{ surface_visit_rust_log }}"
+    volumes:
+      # This door's request log only — least privilege, read-only.
+      - "{{ surface_visit_door_log_dir }}/{{ s.name }}:/doorlog:ro"
+      - "{{ surface_visit_cert_dir }}:/certs:ro"
+      - "{{ surface_visit_age_recipients_file }}:/etc/surface-visit/age-recipients.txt:ro"
+    labels:
+      - "traefik.enable=false"
+{% endfor %}
+
+networks:
+  "{{ surface_visit_zenoh_network }}":
+    external: true
+    name: "{{ surface_visit_zenoh_network }}"

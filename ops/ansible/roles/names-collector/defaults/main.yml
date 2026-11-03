@@ -1,0 +1,32 @@
+---
+# names-collector role defaults (ADR 1082 Amendment 2 §7.3).
+#
+# The passive self-claims collector: subscribes ops/names/claim/** on the
+# fabric and maintains claims.json in the goat-get www dir so devices can
+# fetch verified peer self-claims alongside the signed snapshot. Reveal-only
+# (audit-subscriber pattern) — it never publishes; every consumer re-verifies
+# each claim's signature + snapshot binding at read, so the collector is
+# untrusted transport (it can drop a claim, never forge one).
+
+# Where the collector's context (cert/key/ca-root/profile.toml) lives.
+names_collector_ctx_dir: /etc/goat-collector
+
+# The zenoh router the collector subscribes through (mesh IP, tls/).
+# Defaults to the site's mesh_ip_a — the mgmt host runs the router.
+names_collector_router_endpoint: "tls/{{ mesh_ip_a }}:7447"
+
+# The goat binary the service runs. goat-get already stages the signed
+# per-arch release binaries in its www dir; reuse the matching one so the
+# collector rides the same pinned release the site downloads.
+names_collector_goat_src: "{{ goat_get_www_dir | default('/opt/goat-get/www') }}/goat-linux-{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+names_collector_goat_bin: /usr/local/bin/goat-collector
+
+# Output file — the get tier serves this next to name-snapshot.json.
+names_collector_out: "{{ goat_get_www_dir | default('/opt/goat-get/www') }}/claims.json"
+
+# Leaf cert + key (Subject CN=names-collector-trial-peer) minted via the
+# offline-CA cert-sign ceremony, and the CA root (same file the router uses).
+# Relative to ops/enrollment/ (playbook_dir/../enrollment).
+names_collector_cert_src: "{{ site_id }}/names-collector-cert.pem"
+names_collector_key_src: "{{ site_id }}/names-collector-key.pem"
+names_collector_ca_root_src: "ca/{{ site_id }}/root-cert.pem"   # REQUIRED per goatnet; a shared role must not default to one

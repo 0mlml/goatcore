@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# ADR 1081 Layer 3 — revert host-local egress shaping.
+# Restores the default (kernel-default) qdisc on the WAN iface and removes the
+# host-local DSCP-steering table. Idempotent; safe to run when nothing is set.
+# Runs as the unit's ExecStop and when the role is toggled off.
+set -uo pipefail
+
+NFT_TABLE="goat_egress_shaping"
+
+IFACE="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')"
+if [[ -n "${IFACE}" ]]; then
+  # Return the iface to the system default qdisc (pfifo_fast / fq per
+  # net.core.default_qdisc). `tc qdisc del root` reverts cleanly.
+  tc qdisc del dev "${IFACE}" root 2>/dev/null || true
+  echo "[goat-egress-shaping] reverted qdisc on ${IFACE}"
+fi
+
+nft "delete table inet ${NFT_TABLE}" 2>/dev/null || true
+echo "[goat-egress-shaping] removed nft table inet ${NFT_TABLE}"

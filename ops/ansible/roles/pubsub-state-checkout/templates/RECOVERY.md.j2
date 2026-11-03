@@ -1,0 +1,51 @@
+# pubsub-state recovery — {{ inventory_hostname }} (standby)
+
+This host keeps a **warm checkout** of the `{{ pubsub_state_checkout_org }}/{{ pubsub_state_checkout_repo }}`
+Forgejo repo and a **staged `pubsub-apply` binary**, refreshed every
+{{ pubsub_state_checkout_interval_sec }}s by `pubsub-state-pull.timer`. This is
+the recovery side of Block 86 (`docs/design/pubsub-state-as-code.md`).
+
+- Warm checkout : `{{ pubsub_state_checkout_dir }}/repo/`  (MANIFEST.yaml + vendors/ at its root)
+- Staged binary : `{{ pubsub_state_apply_binary_dest }}`
+- Last pull     : `journalctl -u pubsub-state-pull.service -n 5`
+
+## On failover (do NOT run routinely — pubsub-apply MUTATES the portal)
+
+After this node is promoted to active and its **own** `goat-zenoh-portal` is up,
+restore the fabric structure from the local checkout:
+
+```bash
+# 1. Resolve this node's portal (container-network only; not host-published):
+PIP=$(sudo docker inspect goat-zenoh-portal \
+  -f '{{ '{{' }} (index .NetworkSettings.Networks "mgmt").IPAddress {{ '}}' }}')
+
+# 2. Dry-run first — prints the plan, exits non-zero if anything would change:
+{{ pubsub_state_apply_binary_dest }} \
+  -from {{ pubsub_state_checkout_dir }}/repo \
+  -portal-url "http://$PIP:8090" \
+  -api-key "$ZAGROS_PROD_PUBSUB_MIRROR_PORTAL_KEY" \
+  -dry-run
+
+# 3. Execute (creates missing vendors → re-mints certs/bundles, topics,
+#    schemas, examples; retires/deletes what the repo no longer has):
+{{ pubsub_state_apply_binary_dest }} \
+  -from {{ pubsub_state_checkout_dir }}/repo \
+  -portal-url "http://$PIP:8090" \
+  -api-key "$ZAGROS_PROD_PUBSUB_MIRROR_PORTAL_KEY"
+```
+
+`$ZAGROS_PROD_PUBSUB_MIRROR_PORTAL_KEY` is the `pubsub-state-mirror` service
+operator key. If it is not in the failover shell's env, use any operator key
+present in this node's `/opt/goat-zenoh-portal/operator-keys.d/` (strip the
+`handle:` prefix — the `-api-key` value is the part after the colon).
+
+## If Forgejo (Orin-C) was also lost
+
+Fall back to the MinIO backup tier, then apply from the extracted tree:
+
+```bash
+mc cp local-zagros-prod/pubsub-state-snapshots/latest.tar.gz /tmp/
+mkdir -p /tmp/pubsub-restore && tar xzf /tmp/latest.tar.gz -C /tmp/pubsub-restore
+# the tarball's top dir is pubsub-state/ :
+{{ pubsub_state_apply_binary_dest }} -from /tmp/pubsub-restore/pubsub-state -portal-url "http://$PIP:8090" -api-key "$KEY" -dry-run
+```

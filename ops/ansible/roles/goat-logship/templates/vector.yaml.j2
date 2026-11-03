@@ -1,0 +1,662 @@
+# Rendered by ops/ansible/roles/goat-logship on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/goat-logship/templates/vector.yaml.j2
+# Anchor: ADR 1078 — cyber logging + ConMon export. OCSF-canonical.
+#
+# Contract: every remap transform below stamps `.metadata.dictionary_id`
+# with a cef_id defined in ops/logging/goat-logship/dictionary.yaml. The CI
+# fence ops/ci/check-logship-dictionary.sh fails closed on any unmapped id.
+#
+# Internal canonical schema = OCSF/JSON. The CEF/syslog rendering lives only
+# at the egress boundary (Sink 2), default-off.
+#
+# VRL note: journald/file sources type most fields as maybe-null, so we read
+# every field with exists()+to_string() (never `.field ?? default`, which VRL
+# rejects as E651 when the access itself is infallible). A `$` destined for a
+# VRL capture group is written `$$` so Vector's config env-interpolation leaves
+# it intact.
+
+data_dir: /var/lib/vector
+
+# ---------------------------------------------------------------------------
+# Sources — collect only; near-zero local retention (ADR 1078 §5).
+# ---------------------------------------------------------------------------
+sources:
+
+  # Host auth / ssh / sudo / PAM via systemd-journald.
+  journald:
+    type: journald
+    current_boot_only: false
+    include_units:
+{% for unit in logship_journald_units %}
+      - {{ unit }}
+{% endfor %}
+
+{% if logship_source_auditd %}
+  # auditd raw log — privilege use, setuid, USER_AUTH. Parsed in VRL below.
+  auditd:
+    type: file
+    include:
+      - {{ logship_auditd_log_path }}
+    read_from: end
+{% endif %}
+
+{% if logship_source_zenoh_audit %}
+  # The existing Zenoh-audit NDJSON (fabric write / denial). Path is
+  # per-goatnet — confirm the on-disk spool for this host at deploy
+  # (audit-subscriber ships to MinIO; the local NDJSON tap is host-specific).
+  zenoh_audit:
+    type: file
+    include:
+      - {{ logship_zenoh_audit_glob }}
+    read_from: end
+{% endif %}
+
+{% if logship_source_identity_enroll %}
+  # Peer enroll / de-enroll — the admit-audit container emits one JSON line per
+  # admission to stdout. Scoped to that container only (docker_logs otherwise
+  # captures every container).
+  admit_audit:
+    type: docker_logs
+    include_containers:
+      - {{ logship_admit_audit_container }}
+{% endif %}
+
+{% if logship_source_app_http %}
+  # Non-Zenoh application plane — the Traefik ingress access log (JSON on stdout)
+  # is the chokepoint every web/API request crosses. Unlike the brokerless
+  # fabric, this plane HAS a central tap.
+  traefik:
+    type: docker_logs
+    include_containers:
+      - {{ logship_traefik_container }}
+{% endif %}
+
+{% if logship_source_app_auth %}
+  # Web-surface auth plane — oauth2-proxy fronts every OIDC-gated surface and
+  # logs the authenticated identity + auth denials. Container-name PREFIX match
+  # (there is one oauth2-proxy per surface).
+  oauth2_proxy:
+    type: docker_logs
+    include_containers:
+      - {{ logship_oauth2_proxy_prefix }}
+{% endif %}
+
+{% if logship_source_egress %}
+  # nftables / egress-proxy access decisions.
+  egress:
+    type: file
+    include:
+      - {{ logship_egress_log_path }}
+    read_from: end
+{% endif %}
+
+{% if logship_source_falco %}
+  # Phase 3 — Falco runtime-security events (JSON lines). Off until falcod is
+  # deployed on the host (kernel driver = a maintenance-window change).
+  falco:
+    type: file
+    include:
+      - {{ logship_falco_events_path }}
+    read_from: end
+{% endif %}
+
+{% if logship_source_osquery %}
+  # Phase 3 — osquery scheduled-query results (JSON lines). Off until osqueryd
+  # is deployed on the host (host package = a maintenance-window change).
+  osquery:
+    type: file
+    include:
+      - {{ logship_osquery_results_path }}
+    read_from: end
+{% endif %}
+
+  # Collector self-telemetry — feeds the absence-alarm (§4, closes F-169).
+  internal_metrics:
+    type: internal_metrics
+
+# ---------------------------------------------------------------------------
+# Transforms — normalize to OCSF, stamp the dictionary id, redact at edge.
+# ---------------------------------------------------------------------------
+transforms:
+
+  journald_ocsf:
+    type: remap
+    inputs: [journald]
+    source: |
+      # Read both the systemd unit and syslog identifier: on Debian/Ubuntu the
+      # sshd unit is `ssh.service` while the identifier is `sshd`, so classify
+      # on either.
+      unit = ""
+      if exists(._SYSTEMD_UNIT) { unit = to_string(._SYSTEMD_UNIT) ?? "" }
+      ident = ""
+      if exists(.SYSLOG_IDENTIFIER) { ident = to_string(.SYSLOG_IDENTIFIER) ?? "" }
+
+      msg = ""
+      if exists(.message) { msg = to_string(.message) ?? "" }
+      msg = replace(msg, r'(?i)(pass(word)?|secret|token|api[_-]?key)\s*[=:]\s*\S+', "$$1=[REDACTED]")
+
+      dict = "auth:sudo"
+      au = ["AU-2", "AC-6"]
+      if contains(unit, "ssh") || contains(ident, "ssh") {
+        dict = "auth:ssh"
+        au = ["AU-2"]
+      }
+
+      . = {
+        "class_uid": 3002,
+        "class_name": "Authentication",
+        "time": to_unix_timestamp(now()),
+        "severity_id": 1,
+        "message": msg,
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": dict,
+          "au_controls": au,
+          "site": "{{ logship_site_id }}",
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+
+{% if logship_source_auditd %}
+  auditd_ocsf:
+    type: remap
+    inputs: [auditd]
+    source: |
+      # file-source .message is typed string — no null-coalescing needed.
+      line = string!(.message)
+
+      atype = "USER"
+      m = parse_regex(line, r'type=(?P<t>\w+)') ?? {}
+      if is_string(m.t) { atype = string!(m.t) }
+
+      class_uid = 3002
+      class_name = "Authentication"
+      dict = "auth:sudo"
+      au = ["AU-2", "AC-6"]
+      # A config-change watch fires as a SYSCALL record carrying our key — check
+      # it FIRST, before the generic SYSCALL->privesc branch, or it'd misclassify.
+      # This catches the out-of-band manual edit that git/ansible never records.
+      if contains(line, "{{ logship_config_change_key }}") || atype == "CONFIG_CHANGE" {
+        class_uid = 5002
+        class_name = "Config State"
+        dict = "config:change"
+        au = ["AU-2", "CM-3"]
+      } else if includes(["SYSCALL", "SECCOMP", "ANOM_ABEND"], atype) {
+        dict = "auth:privesc"
+        au = ["AU-2", "AU-6"]
+      }
+
+      . = {
+        "class_uid": class_uid,
+        "class_name": class_name,
+        "time": to_unix_timestamp(now()),
+        "severity_id": 2,
+        "message": line,
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": dict,
+          "au_controls": au,
+          "site": "{{ logship_site_id }}",
+          "audit_type": atype,
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_source_zenoh_audit %}
+  zenoh_audit_ocsf:
+    type: remap
+    inputs: [zenoh_audit]
+    source: |
+      parsed = parse_json(string!(.message)) ?? {}
+{% if not logship_zenoh_audit_include_payload %}
+      # The body is already retained twice (audit tail + Object-Locked bucket).
+      # Drop the third copy and keep payload_hash, which still ties this record
+      # to the retained body. See logship_zenoh_audit_include_payload.
+      parsed = remove!(parsed, ["payload_bytes_b64"])
+      parsed.payload_in_ocsf = false
+{% endif %}
+      . = {
+        "class_uid": 6002,
+        "class_name": "Application Activity",
+        "time": to_unix_timestamp(now()),
+        "severity_id": 1,
+        "message": encode_json(parsed),
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": "fabric:write",
+          "au_controls": ["AU-12"],
+          "site": "{{ logship_site_id }}",
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_source_identity_enroll %}
+  admit_audit_ocsf:
+    type: remap
+    inputs: [admit_audit]
+    source: |
+      # The admit-audit line is JSON: {event, peer_id, name, account_id, ts, ...}.
+      # Non-JSON container noise parses to {} and still emits a bounded record.
+      a = parse_json(string!(.message)) ?? {}
+      ev = "admit"
+      if is_string(a.event) { ev = string!(a.event) }
+      peer = ""
+      if is_string(a.peer_id) { peer = string!(a.peer_id) }
+      pname = ""
+      if is_string(a.name) { pname = string!(a.name) }
+      acct = ""
+      if is_string(a.account_id) { acct = string!(a.account_id) }
+
+      . = {
+        "class_uid": 3001,
+        "class_name": "Account Change",
+        "time": to_unix_timestamp(now()),
+        "severity_id": 1,
+        "message": "peer " + ev + ": " + pname + " (" + peer + ")",
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": "identity:enroll",
+          "au_controls": ["AU-2", "AC-2"],
+          "site": "{{ logship_site_id }}",
+          "event": ev,
+          "peer_id": peer,
+          "peer_name": pname,
+          "account_id": acct,
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_source_app_http %}
+  app_http_ocsf:
+    type: remap
+    inputs: [traefik]
+    source: |
+      # Traefik JSON access log: {ClientHost, RequestHost, RequestMethod,
+      # RequestPath, DownstreamStatus, ServiceName, ...}. The traefik container
+      # also emits non-access app logs — drop anything without RequestMethod.
+      r = parse_json(string!(.message)) ?? {}
+      if !exists(r.RequestMethod) { abort }
+      method = to_string(r.RequestMethod) ?? ""
+      rhost = to_string(r.RequestHost) ?? ""
+      rpath = to_string(r.RequestPath) ?? ""
+{% if logship_app_http_drop_path_regexes %}
+      # Evidence-free keepalive routes, dropped before the record is built.
+      # RequestPath is Traefik's RequestURI, so strip the query string first or
+      # a route with parameters slips past its own pattern.
+      dpath = string!(split(rpath, "?")[0])
+{% for drop_rx in logship_app_http_drop_path_regexes %}
+      if match(dpath, r'{{ drop_rx }}') { abort }
+{% endfor %}
+{% endif %}
+      status = to_int(r.DownstreamStatus) ?? 0
+      client = to_string(r.ClientHost) ?? ""
+      svc = to_string(r.ServiceName) ?? ""
+      # Sizes carried through for ADR 1128 bandwidth attribution AND for the
+      # OCSF record itself — response size is evidence in an exfil review, and
+      # dropping it here was throwing away a field Traefik already logs.
+      down_bytes = to_int(r.DownstreamContentSize) ?? 0
+      up_bytes = to_int(r.RequestContentSize) ?? 0
+      . = {
+        "class_uid": 4002,
+        "class_name": "HTTP Activity",
+        "time": to_unix_timestamp(now()),
+        "severity_id": 1,
+        "message": method + " " + rhost + rpath + " -> " + to_string(status),
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": "app:http",
+          "au_controls": ["AU-2", "AC-3"],
+          "site": "{{ logship_site_id }}",
+          "client": client,
+          "http_host": rhost,
+          "http_path": rpath,
+          "http_method": method,
+          "http_status": status,
+          "http_response_bytes": down_bytes,
+          "http_request_bytes": up_bytes,
+          "service": svc,
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_http_bandwidth_metrics %}
+  # -- ADR 1128 WORKLOAD plane, HTTP half --------------------------------------
+  #
+  # Traefik is the one central tap on this substrate (the fabric is brokerless
+  # and has none), and it already logs every byte it moves. Its PROMETHEUS
+  # output, though, has no size counter at all — only the access log carries
+  # DownstreamContentSize. So the bytes come from the log, not from /metrics.
+  #
+  # This complements the node-net-health socket counters rather than
+  # duplicating them: a short-lived HTTP connection that opens and closes
+  # between socket samples is invisible to `ss`, and is caught here.
+  #
+  # Category comes from the ordered rule list in group_vars
+  # (logship_http_category_rules), first match wins, closed grammar per
+  # ops/observability/bandwidth-categories.yaml.
+  http_bytes_prep:
+    type: remap
+    inputs: [traefik]
+    source: |
+      r = parse_json(string!(.message)) ?? {}
+      if !exists(r.RequestMethod) { abort }
+      rhost = to_string(r.RequestHost) ?? ""
+      # Traefik's RequestPath carries the QUERY STRING too (it is RequestURI).
+      # Strip it before matching or every cache-busted asset — /app.js?v=abc123,
+      # the normal shape for a versioned bundle — misses the `\.js$$` anchor and
+      # lands in surface-page. That would quietly move the single largest class
+      # of static bytes into the dynamic-page row.
+      rpath = string!(split(to_string(r.RequestPath) ?? "", "?")[0])
+      .bw_client = to_string(r.ClientHost) ?? "unknown"
+      .bw_service = to_string(r.ServiceName) ?? "unknown"
+      # Direction is from THIS HOST's point of view: what Traefik sends to the
+      # browser is the host's tx (its uplink), what it receives is rx.
+      .bw_tx = to_int(r.DownstreamContentSize) ?? 0
+      .bw_rx = to_int(r.RequestContentSize) ?? 0
+      .bw_category = null
+{% for rule in logship_http_category_rules %}
+      # {{ rule.why | default(rule.category) }}
+      if .bw_category == null && {% if rule.get('host_regex') %}match(rhost, r'{{ rule.host_regex }}'){% if rule.get('path_regex') %} && {% endif %}{% endif %}{% if rule.get('path_regex') %}match(rpath, r'{{ rule.path_regex }}'){% endif %}{% if not rule.get('host_regex') and not rule.get('path_regex') %}true{% endif %} {
+        .bw_category = "{{ rule.category }}"
+      }
+{% endfor %}
+      # Fallback is a REAL category, not a blank: an unmatched route is a
+      # dynamic page until the map says otherwise, and the map being incomplete
+      # must never make traffic disappear from the chart.
+      if .bw_category == null { .bw_category = "{{ logship_http_category_fallback }}" }
+
+  http_bytes_metrics:
+    type: log_to_metric
+    inputs: [http_bytes_prep]
+    metrics:
+      # Always on. Cardinality = categories x services x 2, bounded by the
+      # closed grammar and the service registry.
+      - type: counter
+        field: bw_tx
+        increment_by_value: true
+        name: goat_http_bytes_total
+        tags:
+          host: "{{ logship_host_id }}"
+          category: "{{ '{{' }}bw_category{{ '}}' }}"
+          service: "{{ '{{' }}bw_service{{ '}}' }}"
+          direction: tx
+      - type: counter
+        field: bw_rx
+        increment_by_value: true
+        name: goat_http_bytes_total
+        tags:
+          host: "{{ logship_host_id }}"
+          category: "{{ '{{' }}bw_category{{ '}}' }}"
+          service: "{{ '{{' }}bw_service{{ '}}' }}"
+          direction: rx
+{% if logship_http_peer_attribution %}
+      # The "which peer is eating this category" drill-down. DELIBERATELY drops
+      # `service` — carrying both would make the cardinality the product of
+      # peers AND services. See the budget in mesh-bandwidth-attribution.md §6.
+      - type: counter
+        field: bw_tx
+        increment_by_value: true
+        name: goat_http_peer_bytes_total
+        tags:
+          host: "{{ logship_host_id }}"
+          category: "{{ '{{' }}bw_category{{ '}}' }}"
+          client: "{{ '{{' }}bw_client{{ '}}' }}"
+          direction: tx
+      - type: counter
+        field: bw_rx
+        increment_by_value: true
+        name: goat_http_peer_bytes_total
+        tags:
+          host: "{{ logship_host_id }}"
+          category: "{{ '{{' }}bw_category{{ '}}' }}"
+          client: "{{ '{{' }}bw_client{{ '}}' }}"
+          direction: rx
+{% endif %}
+{% endif %}
+
+{% if logship_source_app_auth %}
+  app_auth_ocsf:
+    type: remap
+    inputs: [oauth2_proxy]
+    source: |
+      # oauth2-proxy request log:
+      #   <ip> - <sess> - <email|-> [<t>] <host> <method> <up> "<path>" <proto> "<ua>" <status> ...
+      # plus denial lines: "No valid authentication in request. Initiating login."
+      # Keep only identity-bearing accesses (email present) and denials; the rest
+      # is covered by app:http.
+      line = string!(.message)
+      m = parse_regex(line, r'^(?P<ip>\S+) - \S+ - (?P<email>\S+) \[[^\]]+\] (?P<host>\S+) (?P<method>\S+) \S+ "(?P<path>[^"]*)" \S+ "[^"]*" (?P<status>\d+)') ?? {}
+      denial = contains(line, "No valid authentication")
+      email = "-"
+      if is_string(m.email) { email = string!(m.email) }
+      authed = email != "-"
+      if !authed && !denial { abort }
+
+      host = ""
+      if is_string(m.host) { host = string!(m.host) }
+      path = ""
+      if is_string(m.path) { path = string!(m.path) }
+      client = ""
+      if is_string(m.ip) { client = string!(m.ip) }
+
+      act = "access"
+      sev = 1
+      msg = "auth ok: " + email + " -> " + host + path
+      if denial {
+        act = "denied"
+        sev = 2
+        msg = "auth denied (login required): " + client
+      }
+
+      . = {
+        "class_uid": 3002,
+        "class_name": "Authentication",
+        "time": to_unix_timestamp(now()),
+        "severity_id": sev,
+        "message": msg,
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": "app:auth",
+          "au_controls": ["AU-2", "AC-7"],
+          "site": "{{ logship_site_id }}",
+          "activity": act,
+          "email": email,
+          "client": client,
+          "http_host": host,
+          "http_path": path,
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_source_egress %}
+  egress_ocsf:
+    type: remap
+    inputs: [egress]
+    source: |
+      msg = string!(.message)
+      . = {
+        "class_uid": 4001,
+        "class_name": "Network Activity",
+        "time": to_unix_timestamp(now()),
+        "severity_id": 1,
+        "message": msg,
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": "network:egress",
+          "au_controls": ["AU-2", "AC-4", "SC-7"],
+          "site": "{{ logship_site_id }}",
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_source_falco %}
+  falco_ocsf:
+    type: remap
+    inputs: [falco]
+    source: |
+      # Falco JSON: {output, priority, rule, time, output_fields{...}}.
+      f = parse_json(string!(.message)) ?? {}
+      out = ""
+      if is_string(f.output) { out = string!(f.output) }
+      rule = ""
+      if is_string(f.rule) { rule = string!(f.rule) }
+      prio = ""
+      if is_string(f.priority) { prio = string!(f.priority) }
+      . = {
+        "class_uid": 2004,
+        "class_name": "Detection Finding",
+        "time": to_unix_timestamp(now()),
+        "severity_id": 3,
+        "message": rule + ": " + out,
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": "runtime:falco",
+          "au_controls": ["SI-3", "SI-4"],
+          "site": "{{ logship_site_id }}",
+          "rule": rule,
+          "priority": prio,
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_source_osquery %}
+  osquery_ocsf:
+    type: remap
+    inputs: [osquery]
+    source: |
+      # osquery result: {name, action, hostIdentifier, columns{...}}.
+      q = parse_json(string!(.message)) ?? {}
+      qname = ""
+      if is_string(q.name) { qname = string!(q.name) }
+      act = ""
+      if is_string(q.action) { act = string!(q.action) }
+      . = {
+        "class_uid": 2003,
+        "class_name": "Compliance Finding",
+        "time": to_unix_timestamp(now()),
+        "severity_id": 2,
+        "message": "osquery " + qname + " " + act,
+        "device": { "hostname": "{{ logship_host_id }}" },
+        "metadata": {
+          "dictionary_id": "host:drift",
+          "au_controls": ["CM-3", "SI-4"],
+          "site": "{{ logship_site_id }}",
+          "query": qname,
+          "action": act,
+          "product": "goat-logship",
+          "version": "1"
+        }
+      }
+{% endif %}
+
+{% if logship_sink_collector_enabled %}
+  # Render OCSF → CEF only at the egress boundary (ADR 1078 §2 "keep their
+  # format at the boundary"). Internal events are untouched.
+  cef_render:
+    type: remap
+    inputs: [{{ logship_normalized_inputs | join(', ') }}]
+    source: |
+      sev = to_int(.severity_id) ?? 1
+      cef = "CEF:0|goat|goat-logship|1|" + (to_string(.metadata.dictionary_id) ?? "") +
+            "|" + (to_string(.class_name) ?? "") + "|" + to_string(sev) +
+            "| dvchost=" + (to_string(.device.hostname) ?? "") +
+            " cs1Label=site cs1=" + (to_string(.metadata.site) ?? "") +
+            " msg=" + (to_string(.message) ?? "")
+      . = { "message": cef }
+{% endif %}
+
+# ---------------------------------------------------------------------------
+# Sinks — decouple collect/transport/store (property #8). Disk-buffered so a
+# transport outage backpressures rather than drops.
+# ---------------------------------------------------------------------------
+sinks:
+
+  # Sink 1 — the durable landing. Pluggable by logship_durable_sink_mode; the
+  # component is always `durable` so the absence-alarm is mode-agnostic.
+{% if logship_durable_sink_mode == 's3' %}
+  # s3 mode — off-box Object-Lock S3, partitioned date/host/class per §4.
+  # Bucket = the GovCloud (US) Object-Lock bucket (terraform-govcloud/cyber-logging-s3.tf).
+  durable:
+    type: aws_s3
+    inputs: [{{ logship_normalized_inputs | join(', ') }}]
+    bucket: {{ logship_s3_bucket }}
+    region: {{ logship_s3_region }}
+    key_prefix: "ocsf/date=%Y-%m-%d/host={{ '{{' }} .device.hostname {{ '}}' }}/class={{ '{{' }} .metadata.dictionary_id {{ '}}' }}/"
+    compression: gzip
+    encoding:
+      codec: json
+    buffer:
+      type: disk
+      max_size: {{ logship_buffer_max_bytes }}
+      when_full: block
+{% else %}
+  # mock mode (default) — a local newline-delimited OCSF/JSON tail. Stores
+  # nothing off-box; proves collect->normalize->ship end to end. Flip to s3 by
+  # setting logship_durable_sink_mode=s3 (no other change).
+  durable:
+    type: file
+    inputs: [{{ logship_normalized_inputs | join(', ') }}]
+    # Container path — data_dir /var/lib/vector is the host data-root mount, so
+    # this lands on the host at {{ logship_mock_sink_dir }}/ (the banner's path).
+    path: "/var/lib/vector/ocsf/ocsf-%Y-%m-%d.json"
+    encoding:
+      codec: json
+    buffer:
+      type: disk
+      max_size: {{ logship_buffer_max_bytes }}
+      when_full: block
+{% endif %}
+
+{% if logship_sink_collector_enabled %}
+  # Sink 2 — external-collector egress adapter (CEF over syslog-5424 TCP/TLS).
+  # DEFAULT-OFF: only rendered when logship_sink_collector_enabled is true and
+  # a named collector endpoint is confirmed (ADR 1078 §2, §10).
+  collector_syslog:
+    type: socket
+    inputs: [cef_render]
+    mode: tcp
+    address: "{{ logship_collector_endpoint }}"
+    encoding:
+      codec: text
+    tls:
+      enabled: true
+      verify_certificate: true
+{% if logship_collector_ca_file %}
+      ca_file: {{ logship_collector_ca_file }}
+{% endif %}
+    buffer:
+      type: disk
+      max_size: {{ logship_buffer_max_bytes }}
+      when_full: block
+{% endif %}
+
+  # Absence-alarm feed — Prometheus scrapes this for last-flush / buffer /
+  # events-in-out. Silence here fires the F-169 closer alert.
+  #
+  # ADR 1128's HTTP byte counters ride this SAME exporter: it is already bound,
+  # already scraped as job=goat_logship, and already alerted on. Adding an
+  # input costs no new port, no new scrape job and no new absence alarm —
+  # which is most of why the HTTP half of bandwidth attribution is cheap.
+  metrics:
+    type: prometheus_exporter
+    inputs:
+      - internal_metrics
+{% if logship_http_bandwidth_metrics %}
+      - http_bytes_metrics
+{% endif %}
+    address: "0.0.0.0:{{ logship_metrics_port }}"

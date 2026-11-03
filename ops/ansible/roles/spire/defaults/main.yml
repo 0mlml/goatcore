@@ -1,0 +1,278 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the `spire` role — Phase A workload-identity slice. Co-located
+# SPIRE server + agent on a single host; the agent attests docker workloads
+# and the agent Workload API socket is exposed on the host for spiffe-helper
+# sidecars (fabric-health is the first consumer).
+#
+# Invoked only with an explicit -e target=<site>_hosts.
+
+# Trust domain — LOCKED before first org onboard (rename is the expensive
+# retrofit). Derives from the goatnet identity, as
+# spiffe://<goatnet>.<site_dns_zone>.
+spire_trust_domain: "{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }}"
+
+# Image pins are intentionally NOT in role defaults — they live in
+# the goatnet's SPIRE group_vars (SHA-pin, ADR 0703). Kept out of defaults so
+# the deploy-history CI guard (which assumes one image per role) doesn't trip
+# on the server+agent pair. Confirm
+# SPIRE license + source before the real digest pin (ADR 0412). The role fails
+# loud if they arrive still TODO_PIN.
+
+# SVID / CA lifetimes. Workload SVID TTL starts at 1h to bound reconnect churn
+# on file-based zenoh client certs (zenohd does not hot-reload on rotation);
+# tighten toward 15m in Phase B once spiffe-helper + container signal is
+# proven clean.
+#
+# Two more were reshaped by a relocation drill:
+# - ca_ttl was 24h. SPIRE rotates its self-signed CA within each ca_ttl, but
+#   the router trust concat happened only at deploy time — so a 24h ca_ttl
+#   guarantees the router rejects every SVID (UnknownCA) within a day of the
+#   last deploy. 2160h (90d) slows the rotation clock; the spire-trust-sync
+#   timer below is the durable fix either way.
+# - agents had no agent_ttl, so the agent SVID lived default_x509_svid_ttl
+#   (1h): any power-off longer than that killed the agent permanently (the
+#   join token is single-use). 360h (15d) survives realistic
+#   relocation/storage windows; kept at ca_ttl/6 so SPIRE doesn't cap or
+#   warn. The trust-sync script's agent-rescue arm covers beyond-TTL gaps.
+spire_default_svid_ttl: "1h"          # server.conf duration-string form
+spire_default_svid_ttl_seconds: 3600  # `entry create -x509SVIDTTL` wants integer SECONDS (keep == spire_default_svid_ttl)
+spire_ca_ttl: "2160h"
+spire_agent_svid_ttl: "360h"          # server.conf agent_ttl — agent survives power-off up to this
+
+# --- spire-trust-sync -----------------------------------------
+# Systemd timer that keeps the zenoh router trusting SPIRE's *rotating* CA
+# (re-exports the bundle, appends any new CA cert to the router trust file,
+# bounces the router only on change) and rescues a join-token-dead agent
+# (power-off > agent_ttl → "join token does not exist or has already been
+# used" crash loop → mint fresh token + recreate agent). Both arms are
+# idempotent no-ops when healthy.
+spire_trust_sync_enabled: true
+spire_trust_sync_interval: "15min"            # OnUnitActiveSec
+# Site wires these in its SPIRE group_vars. Empty router file →
+# bundle-export + agent-rescue only.
+spire_trust_sync_router_trust_file: ""
+
+# One entry PER PEERING: the EDGE router trust file, and the ONE partner trust
+# domain whose bundle belongs in it.
+#
+#   spire_trust_sync_federated_edges:
+#     - trust_file: "/etc/goat-zenoh-edge-svn/tls/partner-ca.pem"
+#       trust_domain: "svn.partner.example"        # "spiffe://svn.partner.example" also accepted
+#
+# THIS IS THE MOST DANGEROUS VARIABLE IN THE FEDERATION WORK. A federated bundle
+# is a foreign certificate authority. Per F-424 the Zenoh ACL matches a peer's
+# Common Name and cannot see which CA issued it, so any CA in a router's trust
+# store can mint ANY name that router's ACL recognises.
+#
+# It therefore enforces TWO separations, and the map shape is what makes the
+# second one expressible at all:
+#
+#   CORE vs EDGE. Every trust_file here must be an EDGE router's, never a core's.
+#   A partner bundle on a CORE router is not "trusting a partner"; it is handing
+#   them every identity the core knows, CN=goat-zenoh-router included.
+#   spire_trust_sync_router_trust_file (the core) is written from the own-bundle
+#   export alone, by a code path federated content cannot reach.
+#   Guard: ops/ci/check-spire-federated-trust-files.sh
+#
+#   EDGE vs EDGE. Each edge file receives our own bundle plus EXACTLY ONE
+#   partner's, fetched by trust domain. The predecessor of this variable was a
+#   flat LIST of files, which could not say which partner belonged in which file
+#   — so every federated bundle was written into every edge file. That is
+#   invisible with one partner and wrong with two: the edge facing B also trusts
+#   A's authority, and since the ACL matches the CN, A could mint B's agreed
+#   peering CN and be admitted at B's edge.
+#   Guard: ops/ci/check-per-partner-trust-isolation.sh
+spire_trust_sync_federated_edges: []
+
+# RETIRED peerings — same shape, one entry per peering that has ENDED:
+#
+#   spire_trust_sync_federated_edges_retired:
+#     - trust_file: "/etc/goat-zenoh-edge-svn/tls/partner-ca.pem"
+#       trust_domain: "svn.partner.example"        # for the record + the log line
+#
+# Retiring a peering means MOVING its entry from spire_trust_sync_federated_edges
+# to here, not deleting it. Deleting it stops the partner's authority being
+# ADDED and leaves the copy already in the trust file, because nothing visits a
+# file no declaration names — the partner stays trusted on that edge until
+# somebody notices. An entry here converges its trust file on OUR OWN BUNDLE
+# ALONE on the next trust-sync tick, which removes the partner authority and
+# restarts the edge router.
+#
+# Keep the entry until the edge itself is decommissioned; then delete the entry
+# and the file together. ops/ci/check-federated-trust-retirement.sh refuses a
+# peering that leaves the active list without arriving here, and refuses a
+# retired trust_file that is also an active edge or the core router's.
+spire_trust_sync_federated_edges_retired: []
+
+# Reconciliation. TRUE (default) = each EDGE trust file converges on exactly the
+# declared set: our own bundle ⊕ that one partner's for an active peering, our
+# own bundle alone for a retired one. Anything else in the file is REMOVED.
+#
+# FALSE = the historical append-only behaviour, in which a certificate authority
+# is never removed from a trust file by any code path — so a retired peering's
+# partner stays trusted indefinitely and a host that ran the pre-isolation
+# all-partners fold never heals. Setting it false does not fail the deploy; the
+# trust-sync script logs a WARNING naming each retired edge it is therefore
+# leaving alone, every tick.
+#
+# Removal is bounded three ways: it applies ONLY to files named in the two
+# federated-edge lists (never spire_trust_sync_router_trust_file, which
+# legitimately carries CAs this role knows nothing about), it happens only when
+# the whole declared set was obtained this tick (a failed partner-bundle fetch
+# falls back to append-only, so a transient failure can never reduce trust), and
+# it refuses to write an empty set. `spire-trust-sync.sh --dry-run` reports every
+# certificate it would remove, and from which file, without removing any.
+#
+# A file named in either list is WHOLLY OWNED by trust-sync. Do not point one at
+# a trust file that also carries a hand-placed or separately-managed CA.
+spire_trust_sync_prune_enabled: true
+
+# DEPRECATED, and deliberately left non-functional. This was the flat list
+# described above; no group_vars ever set it. Nothing reads it any more — the
+# role ASSERTS it is empty rather than quietly honouring it, because silently
+# ignoring a variable an operator set to grant trust is the worse failure.
+# Delete it from any group_vars and declare spire_trust_sync_federated_edges.
+spire_trust_sync_federated_trust_files: []
+spire_trust_sync_restart_containers: []
+spire_agent_rescue_enabled: true
+
+# --- Federation (Phase C — recognition layer; docs/design/federated-trust-model.md)
+# Default OFF: no federation block rendered, trust-sync stays own-bundle-only —
+# a pure no-op for non-federating sites. Turn on + declare partners per goatnet
+# (group_vars) to recognize a partner pod's own SPIRE trust domain. This is
+# RECOGNITION only; per-partner authorization (Zenoh ACL/namespace/release-set)
+# is the separate authz layer and is NOT configured here.
+spire_federation_enabled: false
+# One entry per partner trust domain to federate with:
+#   - trust_domain: partner-a.pod
+#     bundle_endpoint_url: "https://<partner-a bundle endpoint host:port>"
+#     endpoint_spiffe_id: "spiffe://partner-a.pod/spire/server"
+#     bundle_b64: "<base64 of the partner's PUBLIC bundle>"   # one-time bootstrap (optional)
+spire_federates_with: []
+spire_federation_bundle_endpoint_address: "0.0.0.0"
+spire_federation_bundle_endpoint_port: 8443
+
+spire_log_level: "INFO"
+
+# Host paths.
+spire_config_dir: "/opt/spire/config"
+spire_data_dir: "/opt/spire/data"
+spire_socket_dir: "/run/spire/sockets"   # agent Workload API socket lives here
+spire_compose_dir: "/opt/mgmt-host"      # overlay rides the mgmt-host project (mgmt net + postgres-a)
+spire_bin_dir: "/opt/spire/bin"          # in-image binary path (for healthcheck + exec)
+spire_container_uid: 1000                # ghcr.io/spiffe/spire-* run as nonroot 1000:1000; data + socket dirs must be owned by it
+
+# Datastore — own logical DB on postgres-a (mirrors Ory's pattern).
+spire_db_name: "spire"
+spire_db_user: "spire"
+# Password resolved from env at deploy (no plaintext on disk); set
+# <SITE>_SPIRE_DB_PASS in the operator's secret references.
+spire_db_password: "{{ lookup('env', (site_id_upper | default('ZAGROS')) ~ '_SPIRE_DB_PASS') }}"
+
+# The node SPIFFE path the single Thor agent attests as (join_token attestor).
+spire_agent_node_path: "agent/{{ inventory_hostname }}"
+
+# Declarative registration entries reconciled into the server. Each entry is
+# created-if-missing (idempotent). The CRITICAL field is `dns_name` — SPIRE
+# sets the X509-SVID Subject CN to the FIRST dns_name, which is how the
+# CN-only Zenoh ACL admits an SVID (zenoh 1.9.0 has no URI-SAN matcher,
+# F-124 item 7 / F-145). selector matches the spiffe-helper sidecar that
+# fronts the workload.
+#
+# Phase A ships exactly one entry: fabric-health.
+# ADR 1098 stage 4 (Option B) — PLATFORM sub-workload entries, generated from the
+# portal's recorded workload declarations by ops/identity/gen-platform-spire-entries.py.
+# Default empty; a real deploy sets this (with each entry's deploy-time `selector`
+# filled). The role folds in only selector-filled entries and warns on the rest.
+spire_platform_workload_entries: []
+
+spire_registration_entries:
+  - spiffe_id: "fabric-health"          # -> spiffe://<trust_domain>/fabric-health
+    cn_dns_name: "fabric-health-trial-peer"   # -> SVID Subject CN (Zenoh ACL subject)
+    selector: "docker:label:com.docker.compose.service:fabric-health-spiffe-helper"
+    x509_svid_ttl_seconds: "{{ spire_default_svid_ttl_seconds }}"
+
+  # grant-keyd — E1 key-distribution daemon (data-access M2.1). The SVID is both
+  # its mTLS client identity to the router and its bundle signing key; CN
+  # grant-keyd-trial-peer admits its keys/** writes through the ACL carve
+  # (subject `infra-keyd`). Inert until a workload with the matching sidecar
+  # label appears, so safe fleet-wide.
+  # herd-connector — the gear console's egress half (ADR 1131). It authenticates
+  # to the console by SPIFFE mTLS with NO bearer fallback by design, so without
+  # this entry the connector cannot dial in at all. Selector-based and therefore
+  # INERT until a workload carrying the matching compose-service label appears,
+  # which is why it is safe to declare on every goatnet before either one runs
+  # the connector.
+  - spiffe_id: "herd-connector"         # -> spiffe://<trust_domain>/herd-connector
+    cn_dns_name: "herd-connector-trial-peer"
+    selector: "docker:label:com.docker.compose.service:herd-connector-spiffe-helper"
+    x509_svid_ttl_seconds: "{{ spire_default_svid_ttl_seconds }}"
+
+  - spiffe_id: "grant-keyd"             # -> spiffe://<trust_domain>/grant-keyd
+    cn_dns_name: "grant-keyd-trial-peer"  # -> SVID Subject CN (Zenoh ACL subject infra-keyd)
+    selector: "docker:label:com.docker.compose.service:grant-keyd-spiffe-helper"
+    x509_svid_ttl_seconds: "{{ spire_default_svid_ttl_seconds }}"
+
+  # --- mint-capable onboarding leg (runner → console) mTLS -----------------
+  # SPIFFE identities for the onboard-runner and goat-id-console so the runner's
+  # call to the console's mint API is mutually authenticated by SVID rather than
+  # by "same mgmt bridge + static bearer" (docs/design/runner-console-mtls.md).
+  # The SVID's URI-SAN (spiffe://<trust_domain>/<spiffe_id>) is what the Go
+  # services verify. cn_dns_name is set for completeness (Subject CN) but the
+  # runner↔console mTLS matches on the URI-SAN, not the CN. Entries are inert
+  # until a workload with the matching sidecar label appears — issuing an SVID
+  # to no one is harmless — so they are safe fleet-wide while the leg is gated.
+  - spiffe_id: "onboard-runner"
+    cn_dns_name: "onboard-runner"
+    selector: "docker:label:com.docker.compose.service:onboard-runner-spiffe-helper"
+    x509_svid_ttl_seconds: "{{ spire_default_svid_ttl_seconds }}"
+  - spiffe_id: "goat-id-console"
+    cn_dns_name: "goat-id-console"
+    selector: "docker:label:com.docker.compose.service:goat-id-console-spiffe-helper"
+    x509_svid_ttl_seconds: "{{ spire_default_svid_ttl_seconds }}"
+
+# Is THIS host the goatnet's SPIRE server? Default FALSE — the role refuses to
+# run unless a host_vars file says otherwise. A server mints a CA, so exactly one
+# member of a goatnet may hold this. See the entry guard in tasks/main.yml.
+spire_enabled: false
+
+# --- AGENT-ONLY MODE (ADR 0412 Phase B) -------------------------------------
+# A node that runs a SPIRE AGENT attesting to a REMOTE server, and no server of
+# its own. This is how a workload gets an SVID on a host that is not the CA
+# holder: the Workload API socket is LOCAL by construction, so a workload can
+# only be served by an agent on its own host.
+#
+# Mutually exclusive with spire_enabled. Both false = this role does nothing
+# here, which is the correct default for every node that is neither.
+spire_agent_only: false
+
+# Address the SERVER publishes its attestation port on. Loopback by default, so
+# a goatnet with no agent-only node exposes nothing beyond its own host. Set it
+# ONLY on the CA holder of a goatnet that has one, and set it to the internal
+# inter-node address the agent attests over — never a mesh address.
+spire_server_bind_address: "127.0.0.1"
+
+# Host-side port for the SPIRE server. The container always listens on 8081;
+# this is only where it lands on the host. Must move on any goatnet whose
+# management-a already holds 8081 — which is every goatnet running the NTP
+# admit-fail-safe sidecar, since that sidecar takes :8080 and pushes
+# management-a to :8081 (universal-ntp-hygiene.md §6). The collision reads
+# "Bind for 127.0.0.1:8081 failed: port is already allocated".
+spire_server_host_port: "8081"
+
+# Where the remote server listens, as seen FROM the agent. Deliberately NOT a
+# mesh address and NOT the Docker service name: on a three-Orin site the Orins
+# carry a dedicated internal substrate (192.168.243.0/24) that already carries
+# inter-node trust traffic for Tang LUKS unlock, and node attestation belongs on
+# the same wire rather than on the mesh where every peer can reach it.
+# Set per-host in host_vars; empty is a refusal, not a default.
+spire_agent_server_address: ""
+spire_agent_server_port: 8081
+
+# Phase B pins the bundle instead of trusting first contact. The co-located
+# sandbox path keeps insecure_bootstrap because server and agent share a host
+# and a private compose network; across hosts that same setting would let
+# anything answering on the address become the trust root.
+spire_agent_trust_bundle_path: "/opt/spire/data/agent/bootstrap-bundle.pem"

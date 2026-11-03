@@ -1,0 +1,279 @@
+---
+# Install (or fully remove) the hourly gear-provenance audit. Idempotent.
+# Contract: docs/design/live-state-guard-scheduling.md §4. Canon: ADR 1130.
+
+# ---------------------------------------------------------------------------
+# Teardown. Runs FIRST and unconditionally when disabled, so turning the gate
+# off removes the background process rather than declining to redeploy it. The
+# sibling role netbird-admin-reconcile only skips, and that is the defect this
+# clause exists to stop repeating.
+# ---------------------------------------------------------------------------
+- name: machine-provenance-guard | teardown when disabled
+  when: not (machine_provenance_guard_enabled | bool)
+  block:
+    - name: machine-provenance-guard | stop + disable timer and service
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - machine-provenance-guard.timer
+        - machine-provenance-guard.service
+      failed_when: false
+
+    - name: machine-provenance-guard | remove units, script, lib, env, allowlist and metric
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/machine-provenance-guard.timer
+        - /etc/systemd/system/machine-provenance-guard.service
+        - /usr/local/sbin/machine-provenance-guard.sh
+        - "{{ machine_provenance_guard_lib_dir }}"
+        - /etc/goat/machine-provenance-guard.env
+        - /etc/goat/provenance-reconcile-allowlist
+        # The stale metric goes too. A textfile the exporter keeps serving after
+        # the job is gone reads as a healthy audit that simply stopped changing —
+        # which is indistinguishable from a fleet that stopped drifting.
+        - "{{ machine_provenance_guard_textfile_dir }}/machine_provenance_guard.prom"
+
+    - name: machine-provenance-guard | remove alert rules
+      ansible.builtin.file:
+        path: "{{ machine_provenance_guard_rules_dir }}/machine-provenance-guard.yml"
+        state: absent
+      notify: reload prometheus for machine-provenance-guard
+
+    - name: machine-provenance-guard | reload systemd after removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: machine-provenance-guard | say what was removed
+      ansible.builtin.debug:
+        msg:
+          - "machine-provenance-guard is TORN DOWN on this host."
+          - "The report dir {{ machine_provenance_guard_report_dir }} is left deliberately —"
+          - "it is evidence, not state. Remove it by hand if you mean to."
+          - "The portal service key is NOT revoked by this teardown: delete its file from"
+          - "the portal's operator-key directory to cut it, which the portal hot-reloads."
+
+# ---------------------------------------------------------------------------
+# Install.
+# ---------------------------------------------------------------------------
+- name: machine-provenance-guard | install
+  when: machine_provenance_guard_enabled | bool
+  block:
+    # Refuse rather than install something that cannot work. A unit that fails
+    # every hour is noise people mute, and a muted guard is no guard — which is
+    # the exact failure ADR 1130 exists to fix, reintroduced by deployment.
+    - name: machine-provenance-guard | require the NetBird service identity (provenance-guard)
+      ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+      vars:
+        nsi_identity: provenance-guard
+        nsi_token: "{{ machine_provenance_guard_nb_token }}"
+
+    - name: machine-provenance-guard | refuse to install unconfigured
+      ansible.builtin.assert:
+        that:
+          - machine_provenance_guard_nb_api_url | length > 0
+          - machine_provenance_guard_portal_url | length > 0
+          - machine_provenance_guard_portal_key | length > 0
+        fail_msg: >-
+          This guard needs FOUR values, on TWO planes: nb_api_url + nb_token for the
+          mesh, portal_url + portal_key for the registry. It joins one to the other,
+          so a missing portal credential does not degrade it — it blinds it, and a
+          blind run must exit 2 rather than look clean. The mesh token is checked
+          by the service-identity task above; mint the portal key with
+          ops/scripts/create-provenance-guard-identity.sh. Do NOT reuse a per-person op_ key: an audit that stops
+          when somebody offboards is not an audit.
+        quiet: true
+
+    # The contract asks for a metrics surface, and F-335 is why this is a
+    # separate, louder assertion than the rest: an unset textfile dir is a
+    # supported posture (journal-only), but a WRONG one fails silently forever.
+    - name: machine-provenance-guard | warn when this host will publish no metric
+      ansible.builtin.debug:
+        msg: >-
+          machine_provenance_guard_textfile_dir is unset, so this guard is visible
+          only in the journal and NO alert rules will do anything. That is a valid
+          posture; it is not a good one. Find the real directory with
+          `ps -o args= -C node_exporter | tr ' ' '\n' | grep textfile.directory`
+          and confirm the series reaches Prometheus, not merely the disk.
+      when: machine_provenance_guard_textfile_dir | length == 0
+
+    - name: machine-provenance-guard | directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/goat, mode: "0755" }
+        - { path: "{{ machine_provenance_guard_lib_dir }}/ops/ci", mode: "0755" }
+        - { path: "{{ machine_provenance_guard_lib_dir }}/ops/ansible", mode: "0755" }
+        - { path: "{{ machine_provenance_guard_report_dir }}", mode: "0755" }
+
+    # LAYOUT IS LOad-BEARING. check-node-class-membership.sh computes its own
+    # REPO_ROOT as `dirname($0)/../..` and then reads
+    # ops/ansible/netbird_acl_taxonomy.yml beneath it. Installed flat, it would
+    # look for the taxonomy beside a copy of itself and fail — the same class of
+    # bug as a test that mutates a copied script which resolves paths relative to
+    # its own location. So the prefix mirrors the repo.
+    - name: machine-provenance-guard | install the check at a repo-shaped path
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../ci/check-node-class-membership.sh"
+        dest: "{{ machine_provenance_guard_lib_dir }}/ops/ci/check-node-class-membership.sh"
+        owner: root
+        group: root
+        mode: "0755"
+      notify: restart machine-provenance-guard timer
+
+    - name: machine-provenance-guard | install the taxonomy the check sources its scopes from
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/netbird_acl_taxonomy.yml"
+        dest: "{{ machine_provenance_guard_lib_dir }}/ops/ansible/netbird_acl_taxonomy.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart machine-provenance-guard timer
+
+    - name: machine-provenance-guard | install wrapper
+      ansible.builtin.copy:
+        src: machine-provenance-guard.sh
+        dest: /usr/local/sbin/machine-provenance-guard.sh
+        owner: root
+        group: root
+        mode: "0755"
+      notify: restart machine-provenance-guard timer
+
+    - name: machine-provenance-guard | render the break-glass allowlist
+      ansible.builtin.template:
+        src: provenance-reconcile-allowlist.j2
+        dest: /etc/goat/provenance-reconcile-allowlist
+        owner: root
+        group: root
+        mode: "0644"
+      when: machine_provenance_guard_reconcile_allowlist | length > 0
+      notify: restart machine-provenance-guard timer
+
+    - name: machine-provenance-guard | remove the allowlist when the goatnet declares none
+      ansible.builtin.file:
+        path: /etc/goat/provenance-reconcile-allowlist
+        state: absent
+      when: machine_provenance_guard_reconcile_allowlist | length == 0
+
+    - name: machine-provenance-guard | install env file
+      ansible.builtin.template:
+        src: machine-provenance-guard.env.j2
+        dest: /etc/goat/machine-provenance-guard.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: restart machine-provenance-guard timer
+
+    - name: machine-provenance-guard | install units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - machine-provenance-guard.service
+        - machine-provenance-guard.timer
+      notify: restart machine-provenance-guard timer
+
+    - name: machine-provenance-guard | does this goatnet have a rules dir?
+      ansible.builtin.stat:
+        path: "{{ machine_provenance_guard_rules_dir }}"
+      register: mpg_rules_dir
+
+    # `copy`, NOT `template`. Prometheus annotations use {{ $value }} and
+    # {{ $labels.x }}, which Jinja evaluates and dies on — the sibling role hit
+    # exactly that on its first run. Static also means what is in the repo is
+    # byte-for-byte what Prometheus loads.
+    - name: machine-provenance-guard | install alert rules
+      ansible.builtin.copy:
+        src: machine-provenance-guard.rules.yml
+        dest: "{{ machine_provenance_guard_rules_dir }}/machine-provenance-guard.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - mpg_rules_dir.stat.exists | default(false)
+        - machine_provenance_guard_textfile_dir | length > 0
+      notify: reload prometheus for machine-provenance-guard
+
+    - name: machine-provenance-guard | say so when there is nowhere to alert from
+      ansible.builtin.debug:
+        msg: >-
+          No alert rules installed ({{ 'no rules dir at ' ~ machine_provenance_guard_rules_dir
+          if not (mpg_rules_dir.stat.exists | default(false))
+          else 'no textfile dir, so the series would never arrive' }}).
+          The audit still runs and still writes its report, but a side-door enrolment
+          on this goatnet will page nobody — someone has to read the journal.
+      when: >-
+        not (mpg_rules_dir.stat.exists | default(false))
+        or machine_provenance_guard_textfile_dir | length == 0
+
+    - name: machine-provenance-guard | flush handlers so the timer starts from current unit files
+      ansible.builtin.meta: flush_handlers
+
+    - name: machine-provenance-guard | enable + start timer
+      ansible.builtin.systemd:
+        name: machine-provenance-guard.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # Prove it works now, with somebody watching, rather than discovering at :17
+    # unattended that a credential was wrong.
+    - name: machine-provenance-guard | run once now
+      ansible.builtin.command:
+        cmd: systemctl start --wait machine-provenance-guard.service
+      register: mpg_run
+      changed_when: false
+      failed_when: false
+      when: machine_provenance_guard_run_now | bool
+
+    - name: machine-provenance-guard | what did the unit exit with?
+      ansible.builtin.command:
+        cmd: systemctl show machine-provenance-guard.service -p ExecMainStatus --value
+      register: mpg_status
+      changed_when: false
+      failed_when: false
+      when: machine_provenance_guard_run_now | bool
+
+    - name: machine-provenance-guard | read back the report
+      ansible.builtin.slurp:
+        src: "{{ machine_provenance_guard_report_dir }}/last-run.txt"
+      register: mpg_report
+      failed_when: false
+      when: machine_provenance_guard_run_now | bool
+
+    - name: machine-provenance-guard | report
+      ansible.builtin.debug:
+        msg: "{{ (mpg_report.content | b64decode).split('\n') }}"
+      when:
+        - machine_provenance_guard_run_now | bool
+        - mpg_report.content is defined
+
+    # The contract: exit 2 means a source could not be read, and the deploy play
+    # FAILS on it. Not because the fleet is wrong — because the guard is blind,
+    # and a blind guard installed quietly is how this whole class of defect
+    # started. Exit 1 does NOT fail the deploy: that is the fleet's condition,
+    # reported, and it is the timer's job to keep saying so.
+    - name: machine-provenance-guard | fail the deploy when the guard could not read its sources
+      ansible.builtin.fail:
+        msg: >-
+          machine-provenance-guard exited 2 on its first run: a source could not be
+          read, so this deploy has installed a guard that sees nothing. Check the
+          report above — the usual causes are a portal URL this host cannot reach,
+          a portal key not registered in the portal's operator-key directory, or a
+          NetBird token without the scope to list peers. Fix it before walking away;
+          an installed-but-blind guard is worse than none, because every surface
+          now says this goatnet is audited.
+      when:
+        - machine_provenance_guard_run_now | bool
+        - (mpg_status.stdout | default('0') | trim) == '2'

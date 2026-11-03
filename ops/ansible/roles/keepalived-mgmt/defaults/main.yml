@@ -1,0 +1,101 @@
+---
+# keepalived-mgmt role defaults.
+#
+# Per-site VRRP active-passive between Router-A (MASTER, priority 110)
+# and Router-B (BACKUP, priority 100). Owns a single virtual IP on the
+# LAN interface that the mgmt-API endpoint resolves to from inside the
+# site. External access from peers happens via wg-cp0 (silent control
+# plane); the keepalived VIP is the LAN-internal indirection layer that
+# lets the mgmt stack failover A→B without operator intervention.
+#
+# Required group_vars per site:
+#   - keepalived_vip                  (LAN VIP; e.g. 192.168.1.10)
+#   - keepalived_lan_interface        (e.g. eno1)
+#   - keepalived_router_id            (per-site unique 1-255; e.g. 51)
+#   - router_role                     (per-host: 'A' or 'B')
+#   - keepalived_auth_pass            (shared between A+B; in .envrc.local)
+
+# Priority assignment by router role. A=MASTER (higher), B=BACKUP.
+# Failover delta of 10 ensures A always wins when both healthy.
+keepalived_priority_a: 110
+keepalived_priority_b: 100
+
+# Health-check script — owns the failover decision. The MASTER demotes
+# itself when this returns non-zero (keepalived enters FAULT state and
+# the BACKUP promotes). Failure modes the script catches:
+#   - postgres-a container down (so writes can't proceed)
+#   - traefik container down (so the mgmt-API is unreachable)
+#   - postgres-a unhealthy (so reads/writes are unreliable)
+#
+# Deliberately does NOT check `management-a` — it crash-loops on the
+# standby until that side is promoted, and using it as a check creates
+# split-brain risk during rebuilds.
+keepalived_health_check_script: "/usr/local/bin/keepalived-mgmt-check.sh"
+keepalived_health_check_interval: 5
+keepalived_health_check_timeout: 3
+keepalived_health_check_rise: 2
+keepalived_health_check_fall: 2
+
+# Notify scripts — fire on state transitions. notify_master runs when
+# this node BECOMES master (failover-promote-side); notify_backup runs
+# when this node BECOMES backup (demote-side); notify_fault runs on
+# health-check failure.
+keepalived_notify_master: "/usr/local/bin/keepalived-mgmt-notify-master.sh"
+keepalived_notify_backup: "/usr/local/bin/keepalived-mgmt-notify-backup.sh"
+keepalived_notify_fault: "/usr/local/bin/keepalived-mgmt-notify-fault.sh"
+
+# VRRP advertisement interval (seconds). 1s is the keepalived default
+# and gives ~3s failover time (3 missed adverts).
+keepalived_advert_int: 1
+
+# VRRP authentication. AH (auth header) with shared password. Reasonable
+# default for a single-LAN failure domain; AH is FIPS-compatible.
+keepalived_auth_type: "PASS"
+
+# Postgres standby promote knob.
+#
+# DEFAULT FALSE (changed per F-060 architectural reframing):
+# VRRP + auto-promote-via-notify_master is non-canonical for postgres
+# failover. VRRP was designed for stateless VIP failover; bolting
+# `pg_ctl promote` onto notify_master races on every deploy / recovery /
+# pause-and-resume window because VRRP elects on broadcast timeout, not
+# on actual primary health.
+#
+# The canonical patterns are:
+#   - Patroni / Stolon / repmgr — consensus-based election via
+#     etcd/consul/zookeeper; primary holds a renewable lease; failover
+#     only happens on lease expiry. NO race conditions because election
+#     is consensus-based, not broadcast-based. **Use this when you
+#     genuinely need seconds-RTO postgres failover.**
+#   - VRRP-VIP-only + operator-fired promote (this default) — VRRP
+#     fails over the VIP within 3-5s; postgres failover requires
+#     operator-fired `pg_ctl promote`. RTO trade: seconds → minutes-to-
+#     hours. **Zero false-promote risk.** Right default for a small
+#     team operating a small fleet.
+#
+# Set true ONLY when:
+#   - You've measured the RTO requirement and minutes is unacceptable.
+#   - You've audited the deploy + recovery flows for VRRP races.
+#   - You've accepted the operational burden of a brittle pattern.
+# Even then, prefer migrating to Patroni instead.
+keepalived_auto_promote_postgres: false
+
+# Both-or-neither deploy guard.
+# Lone-node deploy is the documented split-brain failure mode: a single
+# node with keepalived running and no peer advertising VRRP self-elects
+# MASTER after master_down_interval (3-4s) and the notify_master script
+# runs pg_ctl promote, producing two primaries.
+#
+# Default false → role's pre-task asserts BOTH A and B are in the play's
+# host list; refuses to start otherwise. Override only when the operator
+# is deliberately deploying a single node (e.g. reinstating a recovered
+# node into an existing pair where the other already has keepalived
+# running). NEVER set true in CI / orchestrator paths.
+keepalived_allow_lone_node: false
+
+# nopreempt — once a node is BACKUP, it does not preempt the current
+# MASTER even if its priority is higher. Combined with explicit initial
+# state on both nodes, prevents the corner case where a recovered A
+# auto-preempts B and produces a flap. Failback is operator-fired
+# (matches the no-auto-failback stance in the role README + ADR 0318).
+keepalived_nopreempt: true

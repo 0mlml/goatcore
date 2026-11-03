@@ -1,0 +1,278 @@
+---
+# wg-cp0-server — install + configure the silent control-plane WireGuard
+# listener on a relay (cloud or local-physical). Idempotent.
+#
+# Pre-requisites (per-host inventory):
+#   - wg_cp0_relay_address   (e.g. 198.18.0.2)
+#   - wg_cp0_allowed_peers   (list of {name, pubkey, allowed_ips})
+#
+# Convention:
+#   - Cloud relays    → wg_cp0_secret_storage = aws_secrets_manager
+#   - Local-physical  → wg_cp0_secret_storage = local_file
+
+- name: Assert required vars are set
+  ansible.builtin.assert:
+    that:
+      - wg_cp0_relay_address | length > 0
+      - wg_cp0_subnet | length > 0
+      - wg_cp0_listen_port | int > 0
+    fail_msg: "wg_cp0_relay_address + wg_cp0_subnet + wg_cp0_listen_port are required."
+
+- name: Install WireGuard + nftables tooling
+  ansible.builtin.apt:
+    name:
+      - wireguard
+      - wireguard-tools
+      - nftables
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# --- key custody ----------------------------------------------------------
+
+- name: Probe existing on-disk privkey
+  ansible.builtin.stat:
+    path: "{{ wg_cp0_local_secret_path }}"
+  register: wg_cp0_privkey_stat
+
+- name: Generate fresh wg-cp0 keypair (when no on-disk key exists)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    wg genkey | tee {{ wg_cp0_local_secret_path }} | wg pubkey
+  args:
+    creates: "{{ wg_cp0_local_secret_path }}"
+    # /bin/sh on Ubuntu is dash; 'set -o pipefail' is bash-only.
+    executable: /bin/bash
+  register: wg_cp0_keygen
+  no_log: true
+
+- name: Read on-disk privkey + derive pubkey
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cat {{ wg_cp0_local_secret_path }}
+  args:
+    executable: /bin/bash
+  register: wg_cp0_privkey_read
+  changed_when: false
+  no_log: true
+
+- name: Set wg-cp0 key facts (privkey + pubkey)
+  ansible.builtin.set_fact:
+    wg_cp0_privkey_b64: "{{ wg_cp0_privkey_read.stdout }}"
+    wg_cp0_pubkey_b64: "{{ (wg_cp0_keygen.stdout | default('')) if (wg_cp0_keygen is changed) else (lookup('pipe', 'echo ' + wg_cp0_privkey_read.stdout + ' | wg pubkey')) }}"
+  no_log: true
+
+- name: Show this relay's wg-cp0 PUBLIC key (record it for bundle generation)
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} wg-cp0 PUBLIC key: {{ wg_cp0_pubkey_b64 }}"
+
+- name: Lock down the privkey file
+  ansible.builtin.file:
+    path: "{{ wg_cp0_local_secret_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+# --- AWS Secrets Manager backup (cloud relays only) -----------------------
+#
+# Both calls run with delegate_to: localhost so the controller's already-
+# resolved AWS creds (aws-vault exec usareur-af env vars) make the API call.
+# Earlier shape ran 'aws secretsmanager ...' on the relay itself, but base
+# Ubuntu images don't ship awscli and the relay's IAM role lacks
+# secretsmanager:Put/CreateSecret permissions. Controller-side keeps the
+# relay-image footprint minimal and re-uses creds we already have.
+
+- name: Back up wg-cp0 privkey to AWS Secrets Manager (cloud relays)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.command:
+    cmd: >-
+      aws secretsmanager put-secret-value
+      --secret-id "{{ wg_cp0_secret_name_prefix }}-{{ inventory_hostname | replace('relay-', '') }}-wg-cp0-priv"
+      --secret-string "{{ wg_cp0_privkey_b64 }}"
+      --region {{ aws_region | default(ansible_aws_ssm_region) }}
+  when: wg_cp0_secret_storage == "aws_secrets_manager"
+  no_log: true
+  register: wg_cp0_secret_put
+  failed_when:
+    - wg_cp0_secret_put.rc != 0
+    - "'ResourceNotFoundException' not in wg_cp0_secret_put.stderr"
+
+- name: Create AWS Secrets Manager entry on first run (cloud relays)
+  delegate_to: localhost
+  become: false
+  ansible.builtin.command:
+    cmd: >-
+      aws secretsmanager create-secret
+      --name "{{ wg_cp0_secret_name_prefix }}-{{ inventory_hostname | replace('relay-', '') }}-wg-cp0-priv"
+      --secret-string "{{ wg_cp0_privkey_b64 }}"
+      --description "wg-cp0 server privkey for {{ inventory_hostname }}"
+      --region {{ aws_region | default(ansible_aws_ssm_region) }}
+  when:
+    - wg_cp0_secret_storage == "aws_secrets_manager"
+    - wg_cp0_secret_put is defined
+    - wg_cp0_secret_put.rc != 0
+    - "'ResourceNotFoundException' in (wg_cp0_secret_put.stderr | default(''))"
+  no_log: true
+
+# --- listener config + service --------------------------------------------
+#
+# Block 22R.3 change:
+#
+# Pre-22R.3 this was a single template task that always fired the
+# `restart wg-cp0` handler. That handler drops every peer's session and
+# forces re-handshake fleet-wide on EVERY allowlist push (the dominant
+# operational change shape). F-114's substrate-side mitigation is to
+# notify `reload wg-cp0 peers` (wg syncconf) on allowlist-only deltas and
+# keep `restart wg-cp0` only for listener-shape changes (privkey / port /
+# address / MTU).
+#
+# The classification is computed by diffing the live conf against the
+# freshly-rendered staged conf — see
+# files/wg-cp0-classify-conf-change.sh.
+
+- name: Stage wg-cp0 conf to a sibling path (classification compares live vs staged)
+  ansible.builtin.template:
+    src: wg-cp0.conf.j2
+    dest: "/etc/wireguard/{{ wg_cp0_interface_name }}.conf.staged"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  changed_when: false  # staging only; promotion below is the load-bearing change
+
+- name: Install classifier helper on the relay
+  ansible.builtin.copy:
+    src: wg-cp0-classify-conf-change.sh
+    dest: /usr/local/sbin/wg-cp0-classify-conf-change.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Classify wg-cp0 conf change (first_install / shape_change / peer_change / no_change)
+  ansible.builtin.command:
+    argv:
+      - /usr/local/sbin/wg-cp0-classify-conf-change.sh
+      - "/etc/wireguard/{{ wg_cp0_interface_name }}.conf"
+      - "/etc/wireguard/{{ wg_cp0_interface_name }}.conf.staged"
+  register: wg_cp0_change_class
+  changed_when: false
+
+- name: Show classified change shape
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} wg-cp0 conf change class: {{ wg_cp0_change_class.stdout }}"
+
+- name: Promote staged conf — peer-set delta (notifies reload wg-cp0 peers, preserves handshakes)
+  ansible.builtin.copy:
+    src: "/etc/wireguard/{{ wg_cp0_interface_name }}.conf.staged"
+    dest: "/etc/wireguard/{{ wg_cp0_interface_name }}.conf"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: wg_cp0_change_class.stdout == "peer_change"
+  notify: reload wg-cp0 peers
+
+- name: Promote staged conf — listener-shape change or first install (notifies restart wg-cp0)
+  ansible.builtin.copy:
+    src: "/etc/wireguard/{{ wg_cp0_interface_name }}.conf.staged"
+    dest: "/etc/wireguard/{{ wg_cp0_interface_name }}.conf"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: wg_cp0_change_class.stdout in ["first_install", "shape_change"]
+  notify: restart wg-cp0
+
+- name: Remove staging file
+  ansible.builtin.file:
+    path: "/etc/wireguard/{{ wg_cp0_interface_name }}.conf.staged"
+    state: absent
+  changed_when: false
+
+- name: Enable IPv4 forwarding (so relay can route between peers if needed later)
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    state: present
+    reload: true
+
+- name: Enable + start wg-quick@{{ wg_cp0_interface_name }}
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ wg_cp0_interface_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# --- nftables rate-limit (defense-in-depth) -------------------------------
+
+- name: Ensure /etc/nftables.d exists
+  # apt install nftables creates /etc/nftables.conf but not the .d/ include
+  # dir; copy module won't auto-create dest's parent. Make it explicit.
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: wg_cp0_enable_nftables_ratelimit | bool
+
+- name: Install nftables hashlimit rule for {{ wg_cp0_listen_port }}
+  ansible.builtin.copy:
+    dest: /etc/nftables.d/wg-cp0-ratelimit.nft
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Rate-limit incoming UDP {{ wg_cp0_listen_port }} per source IP.
+      # Bursts: {{ wg_cp0_rate_limit_burst }}; sustained: {{ wg_cp0_rate_limit_per_source }} pps.
+      # WireGuard already drops bad packets cheaply; this caps abusive sources at the kernel net layer.
+      table inet wg_cp0_filter {
+        set ratelimit_v4 {
+          type ipv4_addr
+          flags dynamic
+          timeout 60s
+          size 65536
+        }
+        chain prerouting {
+          type filter hook prerouting priority -100; policy accept;
+          udp dport {{ wg_cp0_listen_port }} \
+            add @ratelimit_v4 { ip saddr limit rate over {{ wg_cp0_rate_limit_per_source }}/second burst {{ wg_cp0_rate_limit_burst }} packets } \
+            drop
+        }
+      }
+  when: wg_cp0_enable_nftables_ratelimit | bool
+  notify: reload nftables
+
+- name: Ensure nftables.d included in main config
+  ansible.builtin.lineinfile:
+    path: /etc/nftables.conf
+    line: 'include "/etc/nftables.d/*.nft"'
+    state: present
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: wg_cp0_enable_nftables_ratelimit | bool
+
+- name: Enable + start nftables
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started
+  when: wg_cp0_enable_nftables_ratelimit | bool
+
+# --- post-condition smoke ---------------------------------------------------
+
+- name: Verify wg show {{ wg_cp0_interface_name }} reports the interface
+  ansible.builtin.command:
+    cmd: "wg show {{ wg_cp0_interface_name }}"
+  register: wg_cp0_show
+  changed_when: false
+
+- name: Print wg-cp0 status
+  ansible.builtin.debug:
+    msg: "{{ wg_cp0_show.stdout_lines }}"

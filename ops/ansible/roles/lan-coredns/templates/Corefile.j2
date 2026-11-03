@@ -1,0 +1,32 @@
+# nova-lan — closed-LAN authoritative DNS server (CoreDNS)
+# Rendered by ops/ansible/roles/lan-coredns. Per-site bind IP is the host's
+# LAN IP (NOT mesh IP, NOT wg-cp0). The closed-LAN posture INVERTS the
+# mesh-coredns invariant: here, the LAN itself is the trust boundary
+# (per docs/design/nova-lan-instance.md § Internal CA + DNS).
+#
+# NO `forward` directive — unknown queries return NXDOMAIN. The closed
+# network has nowhere to forward to. Structural defense against
+# accidental query leakage.
+
+.:{{ lan_coredns_port }} {
+    # Listen only on loopback + LAN interface. No mesh, no wg-cp0 — those
+    # are not in scope for a closed-LAN instance.
+    bind 127.0.0.1 {{ lan_coredns_bind_ip }}
+
+    # Authoritative — only the configured zone resolves. Anything else
+    # returns NXDOMAIN. The `template` plugin's REFUSED-by-default
+    # behavior is intentionally NOT used because some legacy resolvers
+    # treat REFUSED as a retry-with-fallback signal; NXDOMAIN is the
+    # cleaner "no, and don't ask again" response.
+    hosts /etc/zone/{{ lan_coredns_zone_name }}.hosts {{ lan_coredns_zone_name }} {
+        reload 5s
+        no_reverse
+        ttl 60
+    }
+
+    # NO forward directive. Unknown queries → NXDOMAIN. Closed network.
+
+    cache 1000
+    log
+    errors
+}

@@ -1,0 +1,44 @@
+---
+# Only used after both subscription directions report replicating. Historical
+# rows predate that boundary, so copy them explicitly without changing IDs.
+- name: Revocation history | read provider history (guard must already be installed)
+  ansible.builtin.command:
+    argv: [docker, exec, -u, postgres, "{{ revocation_peer_container }}", psql, -X,
+           -U, postgres, -d, "{{ revocation_database }}", -v, ON_ERROR_STOP=1, -tAXq,
+           -c, "SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY id),'[]'::jsonb) FROM public.goat_revocations r;"]
+  delegate_to: "{{ revocation_peer_host }}"
+  register: revocation_provider_history
+  changed_when: false
+  no_log: true
+
+- name: Revocation history | import provider events atomically and reject ID collisions
+  ansible.builtin.command:
+    argv: [docker, exec, -i, -u, postgres, "{{ revocation_local_container }}", psql, -X,
+           -U, postgres, -d, "{{ revocation_database }}", -v, ON_ERROR_STOP=1, -tAXq]
+    stdin: >-
+      SELECT goat_revocations_merge(convert_from(decode(
+      '{{ revocation_provider_history.stdout | trim | b64encode }}','base64'),'UTF8')::jsonb);
+  register: revocation_import
+  changed_when: revocation_import.stdout | trim | int > 0
+  no_log: true
+
+- name: Revocation history | read local union
+  ansible.builtin.command:
+    argv: [docker, exec, -u, postgres, "{{ revocation_local_container }}", psql, -X,
+           -U, postgres, -d, "{{ revocation_database }}", -v, ON_ERROR_STOP=1, -tAXq,
+           -c, "SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY id),'[]'::jsonb) FROM public.goat_revocations r;"]
+  register: revocation_local_history
+  changed_when: false
+  no_log: true
+
+- name: Revocation history | import union at provider with original IDs and timestamps
+  ansible.builtin.command:
+    argv: [docker, exec, -i, -u, postgres, "{{ revocation_peer_container }}", psql, -X,
+           -U, postgres, -d, "{{ revocation_database }}", -v, ON_ERROR_STOP=1, -tAXq]
+    stdin: >-
+      SELECT goat_revocations_merge(convert_from(decode(
+      '{{ revocation_local_history.stdout | trim | b64encode }}','base64'),'UTF8')::jsonb);
+  delegate_to: "{{ revocation_peer_host }}"
+  register: revocation_export
+  changed_when: revocation_export.stdout | trim | int > 0
+  no_log: true

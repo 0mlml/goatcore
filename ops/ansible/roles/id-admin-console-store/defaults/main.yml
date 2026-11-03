@@ -1,0 +1,74 @@
+---
+# Defaults for the `id-admin-console-store` role: which store the goat-id-console
+# runs on, and that store's Postgres side (ADR 1165 step A,
+# docs/design/island-mode-multi-writer.md §5).
+#
+# A role of its own, not part of id-admin-console's defaults, because the cutover
+# and rollback playbooks need these values without running id-admin-console's
+# rollback-ledger dependency: including a role, even for one task file, runs its
+# meta dependencies, and a preflight that refuses must not have written a deploy
+# ledger row first. id-admin-console includes this role (public) before it
+# renders anything, so its env template reads the same values.
+#
+# Expects in scope (id-admin-console defaults, or group_vars):
+# id_admin_console_image, id_admin_console_onboard_db_path,
+# id_admin_console_org_db_path, site_id.
+
+# --- Store engine: SQLite or Postgres (ADR 1165 step A) ----------------------
+# Which store this goatnet's console runs on. `sqlite` (the default) renders the
+# env exactly as before: ONBOARD_DB_PATH / ORG_DB_PATH from
+# id_admin_console_onboard_db_path / id_admin_console_org_db_path. `postgres` renders
+# ONBOARD_DB_DSN / ORG_DB_DSN instead and the server never sees the SQLite paths.
+#
+# A goatnet moves from sqlite to postgres ONLY through
+# ops/ansible/id-console-postgres-cutover.yml (runbook
+# docs/operations/id-console-postgres-cutover.md), and back through
+# id-console-postgres-rollback.yml. The gate (tasks/gate.yml) refuses:
+#   - an image whose store label differs from this value (a Postgres-era image
+#     on a sqlite goatnet would start on empty databases);
+#   - postgres on a host the cutover has not marked (its rows are still in
+#     SQLite), and sqlite on a host the cutover has marked postgres.
+id_admin_console_store: sqlite
+# The image label the gate reads; absent on every image built before the
+# Postgres server, which the gate reads as "sqlite".
+id_admin_console_store_label: "org.usareur-af.goat-id-console.store"
+# Host-side record of which store holds this console's rows. Written by the
+# cutover (postgres) and the rollback (sqlite); absent = never cut over.
+id_admin_console_store_marker: /var/lib/goat-id-console/STORE
+
+# Postgres side, used only when id_admin_console_store is postgres. Names follow
+# the cluster's existing per-service databases (netbird, netbird_idp,
+# netbird_events, kratos, hydra, spire): service prefix, one database per store
+# (ADR 1165 D1), one login role owning both. Created for new hosts by
+# ops/postgres/spock/init/01-databases.sql and for existing ones by
+# tasks/postgres-db.yml. Neither is in any Spock replication set in step A, and
+# neither carries the spock extension.
+id_admin_console_db_container: postgres-a
+id_admin_console_db_host: postgres-a
+id_admin_console_db_port: 5432
+id_admin_console_db_user: id_console
+id_admin_console_onboard_db_name: id_console_onboard
+id_admin_console_org_db_name: id_console_orgs
+# Same delivery as the spire role's database password: the deployer's
+# environment, resolved per command from the secret store (ADR 1186; the
+# .envrc.local.d reference file holds only an op:// reference). The name is
+# <SITE_ID upper, - to _>_ID_CONSOLE_DB_PASS: ZAGROS_DEV_ID_CONSOLE_DB_PASS,
+# ZAGROS_ID_CONSOLE_DB_PASS, ZAGROS_PROD_ID_CONSOLE_DB_PASS. Read only when the store
+# is postgres; tasks/store-gate.yml refuses an empty value then.
+id_admin_console_db_password_env: "{{ site_id | upper | replace('-', '_') }}_ID_CONSOLE_DB_PASS"
+id_admin_console_db_password: "{{ lookup('env', id_admin_console_db_password_env) }}"
+# Percent-encoded in full ('/' included, which urlencode leaves alone), so any
+# password survives the URL and the compose env file unchanged.
+id_admin_console_db_password_url: "{{ id_admin_console_db_password | urlencode | replace('/', '%2F') }}"
+id_admin_console_onboard_db_dsn: >-
+  postgres://{{ id_admin_console_db_user }}:{{ id_admin_console_db_password_url }}@{{ id_admin_console_db_host }}:{{ id_admin_console_db_port }}/{{ id_admin_console_onboard_db_name }}?sslmode=disable
+id_admin_console_org_db_dsn: >-
+  postgres://{{ id_admin_console_db_user }}:{{ id_admin_console_db_password_url }}@{{ id_admin_console_db_host }}:{{ id_admin_console_db_port }}/{{ id_admin_console_org_db_name }}?sslmode=disable
+
+# --- Cutover archive (docs/design/island-mode-multi-writer.md §5) -------------
+# Where the cutover keeps the read-only SQLite copies, one dated directory per
+# cutover, and how long the rollback playbook will use them. Both playbooks read
+# these; nothing deletes an archive automatically (step B5 of the design does,
+# after 28 days on every goatnet).
+id_admin_console_sqlite_archive_root: /var/lib/goat-id-console/sqlite-archive
+id_admin_console_sqlite_archive_days: 28

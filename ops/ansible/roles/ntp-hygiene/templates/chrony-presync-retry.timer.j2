@@ -1,0 +1,31 @@
+# Managed by ops/ansible/roles/ntp-hygiene — do not hand-edit.
+#
+# chrony-presync-retry.timer — re-fires chrony-presync.service
+# every {{ chrony_presync_retry_interval_sec }}s until it succeeds, so a
+# host powered on BEFORE its WAN/uplink was reachable (relocation, cold
+# travel-router boot, hotel/satellite link lag) self-heals the moment
+# the network becomes reachable — with zero operator action.
+#
+# The presync script writes /run/chrony-presync.done and stops this
+# timer on genuine success, so once the clock is sane this stops firing.
+# Monotonic (OnBootSec/OnUnitActiveSec) on purpose: a wall-clock
+# OnCalendar timer would be meaningless while the very clock it exists
+# to fix is sitting at 1970.
+
+[Unit]
+Description=Retry chrony clock bootstrap until the network is reachable
+Documentation=file:///usr/local/sbin/chrony-presync.sh
+# No point retrying once the clock is bootstrapped.
+ConditionPathExists=!/run/chrony-presync.done
+
+[Timer]
+# First retry one interval after boot; then one interval after each
+# activation of chrony-presync.service. Monotonic clocks are unaffected
+# by the clock step the presync performs.
+OnBootSec={{ chrony_presync_retry_interval_sec }}s
+OnUnitActiveSec={{ chrony_presync_retry_interval_sec }}s
+Unit=chrony-presync.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

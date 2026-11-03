@@ -1,0 +1,52 @@
+{# ops/ansible/roles/pgbackrest/templates/pgbackrest.conf.j2             #}
+{# Rendered by the pgbackrest Ansible role into /etc/pgbackrest/         #}
+{# pgbackrest.conf on the mgmt-host. Bind-mounted into the Postgres     #}
+{# container. Mirrors ops/pgbackrest/pgbackrest.conf (reference copy) — #}
+{# keep them in sync when the config surface changes.                    #}
+{#                                                                       #}
+{# Required template variables:                                          #}
+{#   site_name                         — e.g. vega-a, vega-b, wb-a        #}
+{#   pgbackrest_stanza                 — e.g. vega-a-netbird              #}
+{#   pgbackrest_repo1_cipher_pass      — from PGBACKREST_REPO1_CIPHER_PASS#}
+{#   pgbackrest_process_max            — int, CPU parallelism            #}
+{#   pgbackrest_pg1_path               — PGDATA inside postgres          #}
+{#                                       (default /var/lib/pgsql/16/data)#}
+{#                                                                       #}
+{# Single local repo per host. No cloud repo, no repo2. Cross-host      #}
+{# durability comes from the paired host running its OWN independent    #}
+{# stanza (see design §2). Cross-site durability comes from Spock        #}
+{# replication, not pgBackRest (see design §1, §7.3.2).                 #}
+[global]
+# --- repo1: local NVMe ---------------------------------------------------
+repo1-path=/var/lib/pgbackrest
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass={{ pgbackrest_repo1_cipher_pass }}
+
+repo1-retention-full={{ pgbackrest_repo1_retention_full }}
+repo1-retention-diff={{ pgbackrest_repo1_retention_diff }}
+repo1-retention-archive={{ pgbackrest_repo1_retention_archive }}
+repo1-retention-archive-type=full
+
+# --- Global backup tuning ------------------------------------------------
+process-max={{ pgbackrest_process_max }}
+compress-type=zst
+compress-level=3
+
+log-path=/var/log/pgbackrest
+log-level-console=info
+log-level-file=detail
+
+# Async WAL archive push — decouples postgres's archive_command latency
+# from repo write latency via the shared spool dir.
+archive-async=y
+spool-path=/var/spool/pgbackrest
+
+# --- Per-stanza ----------------------------------------------------------
+# LOCAL mode: pgbackrest runs INSIDE the Postgres container via docker
+# exec. Unix socket, PGDATA, repo, logs all local to the container. No
+# pg1-host (would trigger SSH mode), no pg1-password (socket auth).
+[{{ pgbackrest_stanza }}]
+pg1-path={{ pgbackrest_pg1_path }}
+pg1-socket-path=/var/run/postgresql
+pg1-port=5432
+pg1-user=postgres

@@ -1,0 +1,32 @@
+# {{ ansible_managed }}
+[Unit]
+Description=topic-budget tenant notifier (cardinality design 2c; one-time per owner x grant-generation x stage)
+After=network-online.target
+{% if budget_notify_metrics_out | length > 0 %}
+# A oneshot timer job that dies leaves no trace of itself; the failure unit
+# flips the same textfile metric the successful run writes, so a crashed run
+# is visible off-host instead of only in the journal.
+OnFailure=budget-notify-failure.service
+{% endif %}
+
+[Service]
+Type=oneshot
+EnvironmentFile={{ budget_notify_dir }}/smtp.env
+ExecStart=/usr/bin/python3 {{ budget_notify_dir }}/budget-notify.py \
+  --fabric {{ budget_notify_fabric_json }} \
+  --state {{ budget_notify_dir }}/state.json \
+{% if budget_notify_registry_store == 'postgres' %}
+  --registry-store postgres \
+  --pg-container {{ budget_notify_pg_container }} \
+  --pg-db {{ budget_notify_pg_db }} \
+  --pg-user {{ budget_notify_pg_user }} \
+{% else %}
+  --registry {{ budget_notify_registry_db }} \
+{% endif %}
+  --emails {{ budget_notify_dir }}/emails.json \
+  --site {{ budget_notify_site }} \
+  --best-practices-url {{ budget_notify_best_practices_url }} \
+  --warn-fraction {{ budget_notify_warn_fraction }} \
+  --max-sample-age {{ budget_notify_max_sample_age }}{% if budget_notify_metrics_out | length > 0 %} \
+  --metrics-out {{ budget_notify_metrics_out }}{% endif %}{% if budget_notify_kratos_admin_url | default('') | length > 0 %} \
+  --kratos-admin-url {{ budget_notify_kratos_admin_url }}{% endif %}

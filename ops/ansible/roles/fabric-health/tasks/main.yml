@@ -1,0 +1,130 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-fabric-health meter on a mgmt-host (ADR 1034).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the same docker network
+#      (zenoh-deploy.yml for nova-a).
+#   2. Per-instance leaf cert + key minted via offline-CA cert-sign, placed
+#      at {{ fabric_health_cert_dir }}/fabric-health-{cert,key}.pem. The leaf
+#      MUST carry Subject CN=fabric-health-trial-peer — the zenoh ACL
+#      (goat-zenoh config.json5.j2 subject `infra-fabric-health`) matches
+#      on cert_common_names, NOT URI-SAN (zenoh 1.9.0 has no URI-SAN matcher,
+#      per the F-124 addendum). That subject is granted ingress write on
+#      ops/fabric/** (rule `infra-w-fabric-health`); a wrong/empty CN means
+#      the meter's health/footprint publishes are silently denied.
+#   3. CA root present at {{ fabric_health_ca_root_src }} (same file the
+#      router uses).
+#
+# Persists nothing — no S3/MinIO, no secrets, no .env. The meter only
+# reads `**` and publishes the health/footprint topics back on-bus.
+
+- name: fabric-health | pre-flight leaf cert exists (static identity + tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ fabric_health_cert_dir }}/fabric-health-cert.pem"
+  register: fabric_health_cert_stat
+  when:
+    - fabric_health_zenoh_endpoint is match('^tls/')
+    - fabric_health_identity_source == 'static'
+
+- name: fabric-health | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      fabric-health: leaf cert missing at
+      {{ fabric_health_cert_dir }}/fabric-health-cert.pem.
+      Mint one via the offline-CA cert-sign ceremony before re-running
+      (see docs/operations/dev-ca-cert-sign.md).
+  when:
+    - fabric_health_zenoh_endpoint is match('^tls/')
+    - fabric_health_cert_stat is not skipped
+    - not (fabric_health_cert_stat.stat.exists | default(false))
+
+- name: fabric-health | pre-flight CA root exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ fabric_health_ca_root_src }}"
+  register: fabric_health_ca_root_stat
+  when: fabric_health_zenoh_endpoint is match('^tls/')
+
+- name: fabric-health | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      fabric-health: CA root cert missing at
+      {{ fabric_health_ca_root_src }} — same file zenoh-router uses, so its
+      absence means the router itself isn't deployed.
+  when:
+    - fabric_health_zenoh_endpoint is match('^tls/')
+    - fabric_health_ca_root_stat is not skipped
+    - not (fabric_health_ca_root_stat.stat.exists | default(false))
+
+- name: fabric-health | normalize cert dir ownership for non-root container uid 65532 (Chainguard default)
+  ansible.builtin.file:
+    path: "{{ fabric_health_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when:
+    - fabric_health_zenoh_endpoint is match('^tls/')
+    - fabric_health_identity_source == 'static'
+
+- name: fabric-health | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ fabric_health_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: fabric-health | svid bind dir owned by the meter UID (spire identity only)
+  # The spiffe-helper (run as this UID) writes the SVID here; the meter (same
+  # UID) reads it. Owning the dir by the meter UID is what lets the helper's
+  # 0600 key be read by the meter without a world-readable key.
+  ansible.builtin.file:
+    path: "{{ fabric_health_svid_dir }}"
+    state: directory
+    owner: "{{ fabric_health_spire_uid }}"
+    group: "{{ fabric_health_spire_uid }}"
+    mode: "0750"
+  when: fabric_health_identity_source == 'spire'
+
+- name: fabric-health | render spiffe-helper.conf (spire identity only)
+  ansible.builtin.template:
+    src: spiffe-helper.conf.j2
+    dest: "{{ fabric_health_compose_dir }}/spiffe-helper.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  when: fabric_health_identity_source == 'spire'
+
+- name: fabric-health | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ fabric_health_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: fabric-health | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ fabric_health_compose_dir }}"
+  changed_when: true
+
+- name: fabric-health | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ fabric_health_compose_dir }}"
+  register: fabric_health_up
+  changed_when:
+    - "'Started' in fabric_health_up.stderr or 'Created' in fabric_health_up.stderr or 'Recreated' in fabric_health_up.stderr"
+
+- name: fabric-health | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ fabric_health_compose_dir }}"
+  register: fabric_health_ps
+  changed_when: false
+
+- name: fabric-health | show
+  ansible.builtin.debug:
+    msg: "{{ fabric_health_ps.stdout_lines }}"

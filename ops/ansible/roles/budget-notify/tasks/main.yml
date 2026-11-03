@@ -1,0 +1,137 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# Deploy budget-notify (cardinality design §2c) — script + handle->email
+# projection + root-only SMTP env + systemd timer.
+
+# The band file is written by the fabric-crawler role ONLY when
+# fabric_crawler_json_out_host_path is set. Deploying the notifier against an
+# empty path renders `--fabric ` and the timer declines every run as stale.
+# `| mandatory` does not catch "" (only undefined), so check the length.
+- name: budget-notify | fail closed on an empty band-file path (nothing would ever be written to it)
+  ansible.builtin.fail:
+    msg: >-
+      fabric_crawler_json_out_host_path is empty for this host, so the fabric
+      crawler writes no band file and budget-notify would decline every run.
+      Set it (group_vars/<site>_hosts/fabric-crawler.yml, precedent
+      zagros_prod_hosts) and redeploy fabric-crawler first — the two are one
+      contract, F-509.
+  when: (fabric_crawler_json_out_host_path | default('')) | length == 0
+
+- name: budget-notify | ensure dir
+  ansible.builtin.file:
+    path: "{{ budget_notify_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: budget-notify | install reconciler
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../zenoh-trial-peers/budget-notify/budget-notify.py"
+    dest: "{{ budget_notify_dir }}/budget-notify.py"
+    owner: root
+    group: root
+    mode: "0755"
+
+# handle -> email projection from the committed operator manifests
+# (registry-projection interim; ADR 1075 fold-in supersedes).
+- name: budget-notify | read operator manifests (controller-side)
+  ansible.builtin.set_fact:
+    _bn_emails: >-
+      {{ (_bn_emails | default({})) | combine(
+           { (_m.identity.handle | default('')): (_m.identity.email | default('')) }
+         ) }}
+  vars:
+    _m: "{{ lookup('ansible.builtin.file', item) | from_yaml }}"
+  loop: "{{ lookup('ansible.builtin.fileglob', budget_notify_manifest_glob, wantlist=True) }}"
+  loop_control:
+    label: "{{ item | basename }}"
+
+# Fail closed on an empty projection. The manifests are gitignored
+# (ops/operators/.gitignore), so a controller tree that does not have them —
+# any fresh worktree — reads zero and silently overwrites a good emails.json
+# with `{}`. That is not a quiet no-op: with no address for any owner, every
+# owner becomes a genuine no-address case, and a genuine no-address case is
+# LEDGERED, so the one-time notice is consumed and never sent.
+- name: budget-notify | fail closed on an empty handle->email projection
+  ansible.builtin.fail:
+    msg: >-
+      Read 0 operator manifests from {{ budget_notify_manifest_glob }} — writing
+      emails.json now would blank the live projection and let one-time notices be
+      ledgered as no-address. The manifests are gitignored: rsync them into THIS
+      controller tree before deploying. Set budget_notify_allow_empty_emails=true
+      only for a goatnet that genuinely has no operators yet.
+  when:
+    - not (budget_notify_allow_empty_emails | default(false))
+    - (_bn_emails | default({})) | length == 0
+
+- name: budget-notify | write handle->email projection
+  ansible.builtin.copy:
+    content: "{{ _bn_emails | default({}) | to_nice_json }}\n"
+    dest: "{{ budget_notify_dir }}/emails.json"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: budget-notify | fail closed on empty SMTP credentials (before writing anything)
+  ansible.builtin.fail:
+    msg: "ZAGROS_SES_SMTP_USERNAME/PASSWORD empty in the deploy environment — source 30-site-services.envrc"
+  when: budget_notify_smtp_username | length == 0 or budget_notify_smtp_password | length == 0
+
+- name: budget-notify | fail closed on an empty sender
+  ansible.builtin.fail:
+    msg: >-
+      budget_notify_smtp_from is empty on this goatnet. Set id_admin_console_smtp_from
+      or budget_notify_smtp_from in its group_vars. Without a sender every run of the
+      unit fails and no tenant hears about their budget.
+  when: budget_notify_smtp_from | length == 0
+
+- name: budget-notify | write SMTP env (root-only; standing credentials flow)
+  ansible.builtin.copy:
+    content: |
+      SMTP_HOST={{ budget_notify_smtp_host }}
+      SMTP_PORT={{ budget_notify_smtp_port }}
+      SMTP_USERNAME={{ budget_notify_smtp_username }}
+      SMTP_PASSWORD={{ budget_notify_smtp_password }}
+      SMTP_FROM={{ budget_notify_smtp_from }}
+    dest: "{{ budget_notify_dir }}/smtp.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+# Run-outcome metrics + the OnFailure unit. Skipped wholesale when no
+# textfile dir is configured on this host, so the notifier still deploys.
+- name: budget-notify | metrics + failure visibility
+  when: budget_notify_metrics_out | length > 0
+  block:
+    - name: budget-notify | ensure node-exporter textfile dir
+      ansible.builtin.file:
+        path: "{{ budget_notify_textfile_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: budget-notify | systemd OnFailure unit (records a crashed run)
+      ansible.builtin.template:
+        src: budget-notify-failure.service.j2
+        dest: /etc/systemd/system/budget-notify-failure.service
+        mode: "0644"
+
+- name: budget-notify | systemd service
+  ansible.builtin.template:
+    src: budget-notify.service.j2
+    dest: /etc/systemd/system/budget-notify.service
+    mode: "0644"
+
+- name: budget-notify | systemd timer
+  ansible.builtin.template:
+    src: budget-notify.timer.j2
+    dest: /etc/systemd/system/budget-notify.timer
+    mode: "0644"
+
+- name: budget-notify | enable timer
+  ansible.builtin.systemd:
+    name: budget-notify.timer
+    enabled: true
+    state: started
+    daemon_reload: true

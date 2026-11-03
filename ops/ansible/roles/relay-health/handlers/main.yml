@@ -1,0 +1,67 @@
+---
+- name: reload relay-health compose
+  ansible.builtin.command:
+    cmd: >-
+      docker compose {{ relay_health_compose_args }}
+      up -d {{ relay_health_up_services }}
+      {{ 'relay-metrics-ingest' if (relay_metrics_ingest_enabled | default(true) | bool) else '' }}
+    chdir: "{{ relay_health_compose_chdir }}"
+  changed_when: true
+
+- name: restart relay-health probe timer
+  ansible.builtin.systemd:
+    name: relay-health-probe.timer
+    state: restarted
+    daemon_reload: true
+
+# The ingest script is bind-mounted into the container, so `docker compose up -d`
+# does NOT recreate it when only the .py changes — the container keeps running the
+# old code. An explicit restart is required for a bind-mounted-script change to
+# take effect (learned live: the peer-names route 404'd on the cloud
+# box until the container was restarted).
+- name: restart relay-metrics-ingest
+  ansible.builtin.command:
+    cmd: docker restart relay-metrics-ingest
+  changed_when: true
+  failed_when: false
+
+# The PUBLIC gate's allowlist is a BIND-MOUNTED FILE, so `docker compose up -d`
+# will not recreate the container when only its contents change — the same
+# bind-mount caveat the role already documents for relay-metrics-ingest.py.
+#
+# oauth2-proxy does log "watching <file> for updates" at boot, which makes this
+# look unnecessary. It is not: ansible's copy/template modules write atomically
+# by renaming a temp file over the target, which swaps the inode out from under
+# an fsnotify watch. The process keeps the old list and every login 403s AFTER a
+# successful IdP round-trip — indistinguishable from a broken gate unless you
+# read the proxy log and notice the container's uptime predates the change.
+# An explicit restart is deterministic
+# regardless of watcher semantics.
+- name: restart relay-health oauth2-proxy
+  ansible.builtin.command:
+    cmd: docker restart relay-health-oauth2-proxy
+  changed_when: true
+  failed_when: false   # absent on a mesh-only (non-public) deployment
+
+# The nginx view-selection conf is a single-file bind mount, so the same inode
+# caveat applies: template renames a new file over it, the running nginx keeps
+# the old one, and `compose up -d` sees no reason to recreate. Found
+# when the watched-fleet locations were added: the relay-health container had
+# been up five weeks through every conf change since. The new conf is validated
+# in a throwaway container from the same image first, so a bad render fails the
+# play instead of taking the dashboard down on restart.
+- name: restart relay-health nginx
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      {% raw %}
+      mounts="$(docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' relay-health 2>/dev/null || true)"
+      {% endraw %}
+      case "$mounts" in *"/etc/nginx/conf.d/default.conf"*) ;; *) echo "relay-health has no view conf mounted; nothing to restart"; exit 0 ;; esac
+      {% raw %}
+      img="$(docker inspect -f '{{.Config.Image}}' relay-health)"
+      {% endraw %}
+      docker run --rm -v "{{ relay_health_dir }}/nginx-relay-health.conf:/etc/nginx/conf.d/default.conf:ro" "$img" nginx -t
+      docker restart relay-health
+    executable: /bin/bash
+  changed_when: true

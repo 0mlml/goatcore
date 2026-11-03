@@ -1,0 +1,81 @@
+---
+# Install + run the continuous Kratos->netbird admin-role reconciler.
+# Idempotent; safe to re-run from any playbook.
+
+# The map reaches the script as NETBIRD_MGMT_ROLE_MAP=GROUP=role,GROUP=role.
+# Refuse a map the script would refuse anyway, at deploy time where someone is
+# watching, rather than as a unit that fails every five minutes.
+- name: netbird-admin-reconcile | the role map is well-formed
+  ansible.builtin.assert:
+    that:
+      - netbird_mgmt_role_map | length > 0
+      - netbird_mgmt_role_map | selectattr('group', 'undefined') | list | length == 0
+      - netbird_mgmt_role_map | map(attribute='group') | select('match', '^[A-Z0-9][A-Z0-9-]*$') | list | length == netbird_mgmt_role_map | length
+      - netbird_mgmt_role_map | map(attribute='role') | reject('in', ['user', 'auditor', 'admin']) | list | length == 0
+    fail_msg: >-
+      netbird_mgmt_role_map must be a non-empty list of {group, role} with
+      group an Ory group name and role one of user, auditor, admin. Got:
+      {{ netbird_mgmt_role_map }}
+    quiet: true
+  when: netbird_admin_reconcile_enabled | bool
+
+- name: netbird-admin-reconcile | install reconcile script
+  ansible.builtin.copy:
+    src: netbird-admin-reconcile.sh
+    dest: /usr/local/sbin/netbird-admin-reconcile.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: netbird_admin_reconcile_enabled | bool
+
+- name: netbird-admin-reconcile | install systemd service
+  ansible.builtin.template:
+    src: netbird-admin-reconcile.service.j2
+    dest: /etc/systemd/system/netbird-admin-reconcile.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: netbird_admin_reconcile_enabled | bool
+  notify: reload systemd for netbird-admin-reconcile
+
+- name: netbird-admin-reconcile | install systemd timer
+  ansible.builtin.template:
+    src: netbird-admin-reconcile.timer.j2
+    dest: /etc/systemd/system/netbird-admin-reconcile.timer
+    owner: root
+    group: root
+    mode: "0644"
+  when: netbird_admin_reconcile_enabled | bool
+  notify: reload systemd for netbird-admin-reconcile
+
+- name: netbird-admin-reconcile | flush handlers so the timer starts from current unit files
+  ansible.builtin.meta: flush_handlers
+
+- name: netbird-admin-reconcile | enable + start timer
+  ansible.builtin.systemd:
+    name: netbird-admin-reconcile.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: netbird_admin_reconcile_enabled | bool
+
+# Run once inline so a deploy converges immediately instead of waiting out the
+# first interval — and so the play's output names anyone still pending a first
+# login (the F-238 gap this role makes visible rather than silent).
+- name: netbird-admin-reconcile | run once now
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/netbird-admin-reconcile.sh
+  environment:
+    KRATOS_ADMIN_URL: "http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}"
+    NETBIRD_MGMT_ADMIN_GROUPS: "{{ netbird_mgmt_admin_groups | join(',') }}"
+    NETBIRD_MGMT_ROLE_MAP: "{{ netbird_mgmt_role_map_env }}"
+    TEXTFILE_DIR: "{{ netbird_admin_reconcile_textfile_dir }}"
+  register: netbird_admin_reconcile_run
+  changed_when: "'PROMOTED' in (netbird_admin_reconcile_run.stdout | default(''))"
+  failed_when: false
+  when: netbird_admin_reconcile_enabled | bool
+
+- name: netbird-admin-reconcile | report
+  ansible.builtin.debug:
+    msg: "{{ (netbird_admin_reconcile_run.stdout | default('(skipped)')).split('\n') }}"
+  when: netbird_admin_reconcile_enabled | bool

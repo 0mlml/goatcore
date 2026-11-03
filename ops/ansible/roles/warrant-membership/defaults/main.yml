@@ -1,0 +1,86 @@
+---
+# warrant-membership — the converger that makes live NetBird peer membership
+# match ops/warrant/membership/<scope>/, on a timer, on the goatnet's mgmt
+# host. docs/design/mesh-change-control.md §4.4, ADR 1189.
+#
+# The role installs `goat warrant apply --membership` as a systemd oneshot +
+# timer. What the run does (report vs enforce) is decided by the declaration's
+# _scope.yaml `converge:` field, which the CLI can lower but never raise; the role
+# carries no mode knob on purpose, so the switch lives in the reviewed file.
+
+# Master gate. OFF by default: only a goatnet whose scope has a membership
+# declaration is governed, and it turns this on in its own group_vars (the
+# service-identity check reads this flag to decide whether that goatnet needs
+# the svc-<site>-warrant identity). false = full teardown when the play runs
+# (stop, disable, remove units, env file, declaration and metrics), not "skip"
+# — a timer left running with nothing in the repo admitting it exists is the
+# shape mesh-membership-reconcile's defaults warn about.
+warrant_membership_enabled: false
+
+# The taxonomy scope this goatnet's declaration governs: the directory installed
+# is ops/warrant/membership/<scope>/ (docs/design/mesh-change-control.md §4.1).
+# No default — a wrong scope converges the wrong goatnet's declaration, so every
+# governed goatnet names its own.
+warrant_membership_scope: ""
+
+# Where the declaration comes from (this checkout) and where it lands. The unit
+# passes the host directory as --file.
+warrant_membership_src_dir: "{{ playbook_dir }}/../warrant/membership/{{ warrant_membership_scope }}"
+warrant_membership_dest_dir: "/etc/goat/warrant/membership/{{ warrant_membership_scope }}"
+
+# Env var on the operator's shell holding the svc-<site>-warrant PAT (the
+# warrant-membership identity in ops/netbird/service-identities.yaml). Mint:
+#   ops/scripts/netbird-service-identities.py <goatnet> --mint
+warrant_membership_token_env: ""
+
+# Management API for THIS goatnet. Defaults to the URL the membership audit
+# already uses on the same host; no working fallback beyond that.
+warrant_membership_api_url: "{{ mesh_membership_reconcile_api_url | default('') }}"
+
+# The operator handle the converger's OperatorActionV1 records carry.
+warrant_membership_operator_handle: "svc-{{ site_id }}-warrant"
+
+# --- operator-action audit (#1455, F-207). The converger emits one
+#     OperatorActionV1 per enforce run that changed something, age-encrypted to
+#     the operator roster and published to ops/audit/operator/<handle>. Same
+#     source as the onboard-runner on this host (onboard_runner_operator_age_recipients):
+#     the operator env's GOAT_OPERATOR_AGE_RECIPIENTS (40-dev-ca-operators.envrc),
+#     comma/newline-separated age recipients. Public keys, but never committed
+#     literally (identity-spillage CI guard); warrant.env.j2 renders the line
+#     only when non-empty. Empty = goat records to the local fallback log. ---
+warrant_membership_operator_age_recipients: "{{ lookup('env', 'GOAT_OPERATOR_AGE_RECIPIENTS') | default('', true) }}"
+
+# Zenoh router the audit emit publishes to, written into the unit's goat
+# profile (/var/lib/goat-warrant/profile/contexts/default/profile.toml) as
+# router_endpoint — the same value the onboard-runner's profile carries.
+# Empty = no profile.toml is written and the emit falls back as before.
+#
+# The emit ALSO needs an mTLS identity in that profile (mtls.cert.pem,
+# mtls.key.pem, ca-roots.pem) whose CN the router lets put on
+# ops/audit/operator/**. None exists for this unit yet; until one is minted the
+# emit fails at the mTLS check and the record lands in
+# /var/lib/goat-warrant/profile/audit/operator-actions.log (#1455).
+warrant_membership_router_endpoint: "{{ portal_router_endpoint | default('', true) }}"
+
+# node_exporter textfile dir the goat_warrant_membership_* gauges land in. Same
+# F-335 posture as mesh-membership-reconcile: no working default exists across
+# goatnets, so it defaults to whatever that role is told for this host and the
+# role refuses to install when it is empty.
+warrant_membership_textfile_dir: "{{ mesh_membership_reconcile_textfile_dir | default('') }}"
+
+# The goat CLI on the mgmt host. The binary is installed by the goat-cli
+# distribution path, not by this role.
+warrant_membership_goat_bin: /usr/local/bin/goat
+
+# Every 5 minutes with jitter; first run 2 minutes after boot.
+warrant_membership_interval: "5min"
+warrant_membership_jitter_sec: 60
+warrant_membership_boot_delay: "2min"
+
+# Hard ceiling on one run: a read of peers, groups, setup keys and events plus
+# at most --max-changes writes.
+warrant_membership_timeout_sec: 240
+
+# Run once at deploy time, with somebody watching, instead of the first
+# evidence being an unattended tick.
+warrant_membership_run_now: true

@@ -1,0 +1,109 @@
+---
+# docker-engine role defaults — install Docker CE + Compose plugin from
+# Docker's official apt repo. Idempotent. Works on amd64 and arm64.
+#
+# Used by mgmt-host-baseline.yml so any new mgmt-host site (vega on-prem,
+# region B hardware, future Karbon 801s) gets Docker as part of the
+# baseline turnkey chain — before mgmt-host-luks.yml and the per-site
+# bootstrap playbook run.
+#
+# Convention: Docker is the canonical container orchestrator today per
+# ADR 0207. Podman + Quadlet is the active successor track (Phase 2D
+# spike, gating on validation). When that lands, this role gets a
+# `docker_engine_use_podman` switch — until then, docker-ce is the only
+# supported path.
+
+docker_engine_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+docker_engine_apt_keyring: /etc/apt/keyrings/docker.gpg
+docker_engine_apt_sources_list: /etc/apt/sources.list.d/docker.list
+# arch translation table — kernel-style → Docker apt repo style
+docker_engine_apt_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}[ansible_architecture] | default(ansible_architecture) }}"
+
+# Docker daemon.json data-root. Empty string = leave Docker on its
+# default (/var/lib/docker); production mgmt-host group_vars MUST
+# override to the NVMe path. Without this, eMMC fills with
+# postgres-spock + Ory + image cache + WAL retention.
+#
+# Pre-bug: vega-A bootstrap mounted /opt/docker-data
+# (1 TB NVMe) per os-baseline-and-luks.md but never wired Docker's
+# data-root. 41 GB of postgres + Ory + signal state landed on the
+# 57 GB eMMC, postgres pg_wal grew unbounded against subscriber-slot
+# retention with no max_slot_wal_keep_size cap, eMMC filled in 5 days,
+# postgres restart-looped on `pg_wal: No space left on device`.
+# Migration runbook: docs/operations/docker-data-root-migration.md.
+#
+# vega + prov-{fra,jdn,conus} group_vars override this to
+# /opt/docker-data/docker. NETHOST dev / hadev / integdev stay empty
+# (single-disk envs).
+docker_engine_data_root: ""
+
+# containerd root path. Empty string = leave containerd on its default
+# (/var/lib/containerd); production mgmt-host group_vars MUST override
+# to the NVMe path. Separate concern from Docker's data-root: containerd
+# is the OCI runtime daemon Docker shells out to, and it stores image
+# layers + container snapshots under its OWN root directory. Without
+# this, even with data-root pointed at NVMe, containerd's image layer
+# cache lives on the eMMC and grows independently as new images are
+# pulled.
+#
+# Surfaced during F-093 cleanup: vega-A/B + prov-rla had
+# Docker on NVMe but containerd silently on eMMC (~3 GB each — small
+# today, but durably wrong). Orin-C migration was the first to fix
+# both at once.
+#
+# vega + prov-{fra,jdn,conus} group_vars override this to
+# /opt/docker-data/containerd. NETHOST dev / hadev / integdev stay empty
+# (single-disk envs).
+docker_engine_containerd_root: ""
+
+# Docker daemon log driver bounds. Caps stdout/stderr container log
+# file growth so containers don't fill the system disk via logs alone
+# (separate concern from data-root, both load-bearing).
+docker_engine_log_max_size: "100m"
+docker_engine_log_max_file: "3"
+
+# Docker group membership: OPT-IN, and root-equivalent. Empty by default,
+# so no new membership is granted unless explicitly configured. Accounts
+# without socket access use sudo. Existing membership is retained: clearing
+# this additive list does not revoke a prior grant. Listing an account grants it
+# PASSWORDLESS access to the daemon socket, which is root-equivalent on the
+# host (the daemon runs as root, so socket access can start a container that
+# mounts the host filesystem and returns a root shell). Names must already
+# exist on the host; the role refuses a missing name (see tasks/main.yml)
+# rather than creating a fresh account inside the group. This replaces the
+# previously manual, undocumented `usermod -aG docker` step with a visible,
+# off-by-default, gated setting. Interim posture; the sudo-gated
+# rearchitecture that removes the standing grant is tracked in #1527.
+docker_group_members: []
+
+# Probe target for the post-login credential check. Names a package that is
+# PRIVATE in the org we deploy from, so the check proves the token can actually
+# read one rather than proving `docker login` exited 0.
+#
+# EMPTY BY DEFAULT, DELIBERATELY. every pinned package in the
+# usareur-af org is public and pulls anonymously, so any probe target would
+# return 200 whatever the credential was — a check that cannot fail, which is
+# the exact defect F-582 was written about. Shipping it enabled would reproduce
+# that defect one layer up.
+#
+# Set this to a genuinely private package the moment one is reintroduced; the
+# check is otherwise skipped and says so. Tag-addressed on purpose when set:
+# it asks "can this token read a private package here", so it must not drift
+# every time a pin moves.
+ghcr_private_probe_image: ""
+
+# Kernel inotify ceilings for a container host. Ubuntu ships
+# fs.inotify.max_user_instances=128 and the limit is per UID: every
+# container that runs as root and watches a file (Traefik's file provider,
+# compose-watch, Prometheus, Grafana, Ory config watchers) shares ONE
+# budget of 128 on the host. zagros's Thor sat at 188 instances in use;
+# the next Traefik restart could not create its watcher, loaded zero
+# routes, and the whole 443 edge answered 404. Applied persistently via
+# /etc/sysctl.d so it survives reboot; only raised, never lowered.
+docker_engine_inotify_max_user_instances: 1024
+docker_engine_inotify_max_user_watches: 524288

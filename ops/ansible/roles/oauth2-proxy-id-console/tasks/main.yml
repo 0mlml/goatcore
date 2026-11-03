@@ -1,0 +1,123 @@
+---
+# Canonical oauth2-proxy-id-console deploy onto a mgmt-host stack (ADR 0860).
+# Sibling-of oauth2-proxy-dashboard with admin.auth.* FQDN + a separate
+# Hydra OIDC client.
+#
+# Pre-reqs (operator-fired BEFORE this role):
+#   1. Site Hydra reachable on loopback (ory-deploy.yml ran).
+#   2. goat-id-console container already up + reachable on `mgmt` network
+#      (id-admin-console role ran).
+#   3. Patched consent UI in place per ADR 0857 (the JWT `groups` claim
+#      is what the ADMINS gate reads).
+#   4. id_admin_console_oauth2_proxy_client_secret +
+#      id_admin_console_oauth2_proxy_cookie_secret env vars set.
+#   5. oauth2-proxy-id-console-oidc-client role has run (Hydra OAuth2 client
+#      `oauth2-proxy-id-console` exists).
+
+- name: Require oauth2-proxy-id-console inputs
+  ansible.builtin.assert:
+    that:
+      - id_admin_console_oauth2_proxy_enabled | default(false) | bool
+      - id_admin_console_oauth2_proxy_client_secret is defined and (id_admin_console_oauth2_proxy_client_secret | length) >= 32
+      - id_admin_console_oauth2_proxy_cookie_secret is defined and (id_admin_console_oauth2_proxy_cookie_secret | length) in [16, 24, 32]
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+    fail_msg: |
+      oauth2-proxy-id-console role requires:
+        - id_admin_console_oauth2_proxy_enabled: true
+        - id_admin_console_oauth2_proxy_client_secret (32+ chars; env-sourced)
+        - id_admin_console_oauth2_proxy_cookie_secret (16, 24, or 32 random bytes
+                                                        base64-encoded; env-sourced)
+        - site_id, site_dns_zone
+
+- name: Render oauth2-proxy-id-console.env (mode 0600)
+  ansible.builtin.template:
+    src: oauth2-proxy-id-console.env.j2
+    dest: "{{ id_admin_console_oauth2_proxy_envfile }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload oauth2-proxy-id-console compose
+
+- name: Lay down compose overlay
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/mgmt-host/docker-compose.oauth2-proxy-id-console.yml"
+    dest: "{{ id_admin_console_oauth2_proxy_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload oauth2-proxy-id-console compose
+
+- name: Set OAUTH2_PROXY_ID_CONSOLE_OIDC_HOST_ENTRY in /opt/mgmt-host/.env (compose-time substitution)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^OAUTH2_PROXY_ID_CONSOLE_OIDC_HOST_ENTRY="
+    line: "OAUTH2_PROXY_ID_CONSOLE_OIDC_HOST_ENTRY={{ id_admin_console_oauth2_proxy_oidc_host_entry }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  notify: reload oauth2-proxy-id-console compose
+
+- name: Set OAUTH2_PROXY_ID_CONSOLE_IMAGE in /opt/mgmt-host/.env (ADR 0859 — easy rollback)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^OAUTH2_PROXY_ID_CONSOLE_IMAGE="
+    line: "OAUTH2_PROXY_ID_CONSOLE_IMAGE={{ id_admin_console_oauth2_proxy_image }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  notify: reload oauth2-proxy-id-console compose
+
+- name: Flush handlers so oauth2-proxy-id-console is up before the smoke fires
+  ansible.builtin.meta: flush_handlers
+
+- name: Bring up oauth2-proxy-id-console (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      -f /opt/mgmt-host/docker-compose.yml
+      -f {{ id_admin_console_oauth2_proxy_compose_file }}
+      up -d oauth2-proxy-id-console
+    chdir: /opt/mgmt-host
+  register: id_console_proxy_compose_up
+  changed_when: >-
+    'Started' in (id_console_proxy_compose_up.stderr | default(''))
+    or 'Created' in (id_console_proxy_compose_up.stderr | default(''))
+    or 'Recreated' in (id_console_proxy_compose_up.stderr | default(''))
+
+- name: Wait for oauth2-proxy-id-console healthy on :4180/ping (loopback diag port)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ id_admin_console_oauth2_proxy_host_port | default(4182) }}/ping"
+    status_code: 200
+  retries: 10
+  delay: 2
+  register: id_console_proxy_ping
+  failed_when: false
+
+- name: Print deploy summary
+  ansible.builtin.debug:
+    msg: |
+      oauth2-proxy-id-console deployed:
+        URL:           https://{{ id_admin_console_oauth2_proxy_fqdn }}/ (gates via OIDC)
+        Allowed group: {{ id_admin_console_oauth2_proxy_allowed_groups }}
+        OIDC:          {{ id_admin_console_oauth2_proxy_oidc_issuer_url }} (client_id={{ id_admin_console_oauth2_proxy_oidc_client_id }})
+
+      Next:
+        1. Apply traefik-acme.yml so admin.auth.* router lands.
+        2. Drill the live-fire checklist in
+           docs/operations/id-admin-console-runbook.md.
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: oauth2-proxy-id-console | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "oauth2-proxy-id-console"
+    rollback_ref: "{{ id_admin_console_oauth2_proxy_image }}"

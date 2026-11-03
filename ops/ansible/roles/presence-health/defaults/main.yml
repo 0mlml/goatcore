@@ -1,0 +1,52 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the presence-health role — deploys the goat-presence-health meter
+# (the presence domain of the environment-health surface; ADR 1040 gap 3 /
+# ADR 1036). One containerized mTLS Zenoh client peer that declares a liveliness
+# subscriber on the fabric's presence-token keyexpr (`**/presence/**`,
+# history-replayed on connect), tracks each token's alive/dropped state with the
+# 5-state honesty colors, and publishes ops/presence/health/<site> as
+# EnvHealthV1{domain:"presence"}. Native push-based presence — no probes, no
+# snapshot, no host-side timer. Persists nothing.
+#
+# Out-of-the-box config targets the default host group; override with -e target=<site>_hosts.
+
+# Image — pinned per ADR 0859 (easy rollback). Built by
+# .github/workflows/presence-health-image.yml. PENDING first build: the
+# sha-<short>@sha256:<index-digest> pin lands after the first image build off
+# main. To pin: resolve the index digest with
+#   docker buildx imagetools inspect ghcr.io/{{ ghcr_org }}/goat-presence-health:sha-<short> --format '{{.Manifest.Digest}}'
+# and append a matching deploy-history row.
+presence_health_image: "ghcr.io/{{ ghcr_org }}/goat-presence-health:sha-3d59cd1@sha256:206c46edc223644ff1a7473bb746a8de77caf05a9760917b239f8a9031523dcc"
+
+# Site identifier — the `<site>` segment of ops/presence/health/<site>.
+presence_health_site: "nova-a"
+
+# Zenoh router endpoint + network (internal docker, container-name resolution),
+# derived from zenoh_stack.
+presence_health_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+presence_health_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# Publish interval (ms) — also the recent-drop window the honesty color and
+# dropped_recent count grade against.
+presence_health_interval_ms: 30000
+
+# Liveliness keyexpr to watch — the presence-token convention
+# `<write_root>/presence/<label>` (crates/panoscope-core/src/presence.rs).
+presence_health_watch_key: "**/presence/**"
+
+# Host-side cert directory. Infra-class leaf cert + key minted via offline-CA
+# cert-sign with Subject CN=goat-presence-health-trial-peer (zenoh ACL subject
+# `infra-presence-health`, granted ingress write on ops/presence/health/** plus
+# the liveliness query/subscribe on `**/presence/**`). A wrong/empty CN means
+# the meter's publishes are silently denied.
+#   {cert_dir}/presence-health-cert.pem
+#   {cert_dir}/presence-health-key.pem
+presence_health_cert_dir: "/opt/presence-health/certs"
+
+# CA root the client uses to verify the router (same file the router uses).
+presence_health_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+presence_health_compose_dir: "/opt/presence-health"
+presence_health_rust_log: "goat_presence_health=info,zenoh=warn"

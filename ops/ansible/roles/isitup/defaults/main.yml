@@ -1,0 +1,192 @@
+---
+# Defaults for the `isitup` role.
+#
+# Canonical isitup deploy onto a mgmt-host stack. Produces a mesh-internal
+# status page reachable at https://isitup.<site>.<site_dns_zone>/ behind
+# an Ory Hydra OIDC gate (via oauth2-proxy + Traefik forwardAuth).
+#
+# Inputs (set in group_vars/<site>_hosts/vars.yml):
+#   - isitup_enabled: true                       master gate
+#   - isitup_services: [...]                     per-site service list (below)
+#   - isitup_oidc_client_secret                  env-sourced, 32+ chars
+#   - site_id, site_dns_zone                     standard per-site identity
+#   - public_mgmt_fqdn (optional)                used for SAN audit
+#
+# Per-service entry shape (each becomes one row on the page):
+#   - id: demogame                           stable slug (id field in JSON)
+#     name: "Demo Game"                      rendered label
+#     fqdn: demogame.<site>.netbird.example.net
+#     container: demogame                    optional — for direct
+#                                                container-IP health probe
+#     port: 8095                                 container port for the probe
+#     health_path: /health                       default /
+#     kind: ui                                   ui (default) | api
+#     expect_codes: "2|3|401|403"                default "2|3"; APIs that
+#                                                respond 401/403 unauth'd
+#                                                count as up with this set
+#     access: public                             optional auth-posture
+#                                                badge — public | admins
+#                                                | api | offmesh. Drives a
+#                                                colored pill on the page so
+#                                                new users navigate without
+#                                                403 guessing. `offmesh` =
+#                                                the row signs in on a
+#                                                DIFFERENT plane (public
+#                                                Dex/Kanidm or the collab
+#                                                plane), not this goatnet's
+#                                                mesh login. Empty =
+#                                                no badge.
+#     category: learn                              optional page section —
+#                                                account | learn | tools |
+#                                                live | sandbox | platform |
+#                                                admin | external | api.
+#                                                Groups rows under a heading;
+#                                                render order is the GROUPS
+#                                                key order in index.html.
+#                                                The first five replaced the
+#                                                old single `browse` bucket
+#                                                — it held a
+#                                                login page, a slide deck, a
+#                                                CLI download, a live radar
+#                                                picture and a throwaway
+#                                                playground under one word.
+#                                                `browse`/`interactive` still
+#                                                render (back-compat) but no
+#                                                goatnet uses them now.
+#                                                Empty = `app` (single
+#                                                "Applications" section,
+#                                                legacy behavior).
+#     link_path: /goatnets.html                   optional path the ROW'S LINK
+#                                                points at (default /).
+#                                                Distinct from health_path,
+#                                                which is where the PROBE
+#                                                goes — a row can probe
+#                                                /ping and link to the page
+#                                                a human actually wants.
+#     icon: docs                                  optional per-row glyph — an
+#                                                ICONS key (see index.html) or
+#                                                a path/URL to a brand logo
+#                                                (/icons/zenoh.svg). Empty =
+#                                                glyph picked from category.
+#
+# What this role does:
+#   1. Mints /opt/mgmt-host/isitup/{index.html,nginx.conf,check.sh,services.env}.
+#   2. Renders /opt/mgmt-host/isitup.env with oauth2-proxy config + the
+#      Hydra OIDC client_id/secret (the isitup-oidc-client role provisioned
+#      the matching record at Hydra).
+#   3. Renders Traefik dynamic config at /etc/traefik/dynamic/isitup-<site>.yml:
+#      - one router for /oauth2/* paths → oauth2-proxy-isitup:4180
+#      - one router for everything else → isitup:80 (forwardAuth middleware).
+#   4. Brings up the compose overlay (docker-compose.isitup.yml).
+#   5. Installs the cron job that ticks check.sh every 5 minutes inside the
+#      `isitup` container.
+
+isitup_dir: /opt/mgmt-host/isitup
+isitup_compose_file: /opt/mgmt-host/docker-compose.isitup.yml
+isitup_envfile: /opt/mgmt-host/isitup.env
+
+# Image — digest-pinned per ADR 0859 (easy rollback). Compose-time
+# substitution via /opt/mgmt-host/.env (the role writes ISITUP_IMAGE
+# there alongside OAUTH2_PROXY_OIDC_HOST_ENTRY). Bumps require an
+# append to deploy-history.yml (CI checks via
+# .github/workflows/deploy-history-check.yml). Upstream nginx image.
+isitup_image: "nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
+
+# Public FQDN for this isitup instance. Override per-site if the convention
+# changes; the default tracks the per-site mesh-internal naming pattern.
+isitup_fqdn: "isitup.{{ site_id }}.{{ site_dns_zone }}"
+
+# Hydra issuer + client ID (must match the isitup-oidc-client role's view of
+# the client record). Issuer trailing slash NOT optional — Hydra emits the
+# trailing slash in the iss claim, oauth2-proxy compares string-exact.
+isitup_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}/"
+isitup_oidc_client_id: "isitup"
+
+# On-host DNS override for the OIDC issuer. Docker's embedded
+# resolver (127.0.0.11) only forwards to host /etc/resolv.conf on port 53;
+# mesh CoreDNS listens on :5353 so the container CANNOT reach it through
+# the standard resolver path. Static host entry maps the public OIDC
+# hostname to the mgmt-host's mesh IP so the OIDC discovery request lands
+# on Traefik (which then routes to hydra-public on the mgmt docker network).
+# Format: "<hostname>:<ip>" — fed into oauth2-proxy-isitup's extra_hosts
+# via compose-time substitution of OAUTH2_PROXY_OIDC_HOST_ENTRY in
+# /opt/mgmt-host/.env (rendered by tasks/main.yml).
+# Override per-site if the mgmt-plane IP isn't `mesh_ip_a` (e.g. multi-host
+# sites where VRRP floats a virtual IP).
+isitup_oidc_host_entry: "oauth2.{{ site_id }}.{{ site_dns_zone }}:{{ mesh_ip_a }}"
+
+# oauth2-proxy cookie + session. cookie_secret MUST be exactly 16, 24, or 32
+# random bytes base64-encoded; we render it from NOVA_ISITUP_COOKIE_SECRET (or
+# the per-site analog). Cookie domain locks to the isitup FQDN so a stolen
+# cookie can't be replayed against dashboard / kratos / hydra on sibling
+# subdomains.
+isitup_cookie_domain: "{{ isitup_fqdn }}"
+
+# Default empty — every site MUST populate isitup_services in group_vars.
+# The role asserts non-empty before rendering services.env.
+isitup_services: []
+
+# Off-mesh services — the "Off-Mesh Services" section on the page.
+#
+# Same per-service shape as isitup_services, appended to it at render time, but
+# a separate list because the FACT is a different kind: these rows are NOT this
+# site's services. They are public-internet addresses on their own sign-in
+# planes (the public Dex/Kanidm at auth.goat.example / idm.goat.example, and the collab
+# plane at *.collab.goat.example) that a mesh user still needs to find — the team
+# chat/docs/files, the cross-goatnet consistency view, this goatnet's own
+# relay-health dashboard and the overview above it, all deliberately off-mesh so
+# they work when the mesh does not (ADR 1066). Every entry therefore carries
+# `type: external`, `category: external`, `access: offmesh`.
+#
+# One home for the list: `isitup_external_services_catalog` in
+# group_vars/all.yml. A site opts in with one line —
+#
+#   isitup_external_services: "{{ isitup_external_services_catalog }}"
+#
+# — rather than copying rows per site (group_vars, not role defaults, because
+# dynamic include_role defaults don't export to play-level template tasks).
+#
+# Default [] and opt-in per site ON PURPOSE: the probe is an outbound HTTPS
+# request from the isitup container, so on a site with no internet egress
+# (island mode) every row would read "probe unavailable" and the page banner
+# would go from "All systems operational" to "N unknown" — honest, but noise a
+# disconnected site did not ask for. Rows that answer read 302/303 = up.
+#
+# Two of the catalog's rows are THIS goatnet's own — its relay-health fleet
+# dashboard and the cross-goatnet overview a level above it, which live on the
+# same off-mesh box. They resolve through `isitup_relay_health_public_fqdn`
+# (all.yml, empty by default), so a site that opts in must also name its box.
+# The role asserts every off-mesh row has a non-empty fqdn rather than
+# rendering a row whose link is `https:///` — fail-closed, per the
+# instance-variability model.
+isitup_external_services: []
+
+# Extra Docker networks the isitup container joins (in addition to `mgmt`),
+# so check.sh can reach container-probe targets that live on other compose
+# projects' networks. Default [] = mgmt-only. A goatnet whose Zenoh router has
+# its own compose project sets ["goat-zenoh_default"] so the router's
+# REST plugin (:8000) is reachable for health probing — F-165. Rendered into
+# the compose overlay template; baked in so it survives reboot + compose-watch
+# recreates (not a post-hoc `docker network connect`, which a recreate drops).
+isitup_extra_networks: []
+
+# Mesh-only Traefik middleware reference. Empty = off (Traefik accepts
+# all source IPs reaching :443). Sites that want to gate the isitup
+# surface behind their mesh CIDR set this to a middleware name (e.g.
+# "mesh-only-allowlist@file") defined elsewhere in that site's Traefik
+# dynamic config. A site that fronts through wg-cp0 instead does not need it:
+# wg-cp0 provides the same gate at a lower layer.
+isitup_traefik_mesh_only_middleware: ""
+# Per-source browsing rate ceiling (goat-ratelimit, 50 r/s / burst 100),
+# attached per router — surface-overload-protection.md §3.1.
+# Defined by mgmt-dynamic.yml.j2 (ACME path) and the traefik role alike, so
+# it resolves on every host class. Set to "" to disable.
+isitup_traefik_ratelimit_middleware: "goat-ratelimit@file"
+
+# Door policy, declared rather than implied. "" = any authenticated identity
+# may reach the surface; authorization lives INSIDE the app. Stated as a
+# variable so ops/ci/check-fence-parity.py can hold it against the canonical
+# matrix (ops/permissions/group-permissions.yml, ADR 1073). A knob that is
+# simply absent reads as "nobody decided", and a surface can then reach
+# production serving HTTP 200 to any caller.
+isitup_oauth2_proxy_allowed_groups: ""

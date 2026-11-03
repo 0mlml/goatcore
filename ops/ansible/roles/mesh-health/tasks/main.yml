@@ -1,0 +1,253 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-mesh-health meter on a mgmt-host (ADR 1042/1036).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the same docker network, with the
+#      infra-mesh-health subject + infra-w-mesh-health rule LIVE in its config
+#      (in the template since ADR 1042; live only after a router restart —
+#      F-156), else the ops/mesh/health/<site> writes are silently denied.
+#   2. netbird daemon enrolled + running on the host (the snapshot timer
+#      fast-fails when /var/run/netbird.sock is absent — F-098 analog — and the
+#      meter then publishes an honest `unmetered`).
+#   3. Infra leaf cert + key minted via offline-CA cert-sign with Subject
+#      CN=goat-mesh-health-trial-peer at {{ mesh_health_cert_dir }}/mesh-health-{cert,key}.pem.
+#   4. CA root present at {{ mesh_health_ca_root_src }}.
+#
+# Persists nothing — no S3/MinIO/.env.
+
+- name: mesh-health | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ mesh_health_cert_dir }}/mesh-health-cert.pem"
+  register: mesh_health_cert_stat
+  when: mesh_health_zenoh_endpoint is match('^tls/')
+
+- name: mesh-health | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      mesh-health: leaf cert missing at
+      {{ mesh_health_cert_dir }}/mesh-health-cert.pem. Mint one via the offline-CA
+      cert-sign ceremony (Subject CN=goat-mesh-health-trial-peer) before re-running
+      (see docs/operations/dev-ca-cert-sign.md).
+  when:
+    - mesh_health_zenoh_endpoint is match('^tls/')
+    - mesh_health_cert_stat is not skipped
+    - not (mesh_health_cert_stat.stat.exists | default(false))
+
+- name: mesh-health | pre-flight CA root exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ mesh_health_ca_root_src }}"
+  register: mesh_health_ca_root_stat
+  when: mesh_health_zenoh_endpoint is match('^tls/')
+
+- name: mesh-health | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      mesh-health: CA root cert missing at {{ mesh_health_ca_root_src }} — same
+      file zenoh-router uses, so its absence means the router itself isn't deployed.
+  when:
+    - mesh_health_zenoh_endpoint is match('^tls/')
+    - mesh_health_ca_root_stat is not skipped
+    - not (mesh_health_ca_root_stat.stat.exists | default(false))
+
+- name: mesh-health | normalize cert dir ownership for non-root container uid 65532 (Chainguard default)
+  ansible.builtin.file:
+    path: "{{ mesh_health_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: mesh_health_zenoh_endpoint is match('^tls/')
+
+- name: mesh-health | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ mesh_health_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: mesh-health | ensure state dir (snapshot target; container reads RO)
+  ansible.builtin.file:
+    path: "{{ mesh_health_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: mesh-health | refuse a peer-expectation map with keys the meter does not read
+  # F-533: a peer entry indented one level short becomes a sibling of `peers:`
+  # instead of a member of it. The meter reads `.peers` and `.patterns` only, so
+  # such an entry is dropped in silence and the peer goes ungraded while the file
+  # appears to declare it. A dropped declaration and a satisfied one look identical
+  # from here, so fail instead.
+  ansible.builtin.assert:
+    that: (mesh_health_peer_classes.keys() | list | difference(['peers', 'patterns'])) | length == 0
+    fail_msg: >-
+      mesh_health_peer_classes carries key(s)
+      {{ mesh_health_peer_classes.keys() | list | difference(['peers', 'patterns']) | join(', ') }}
+      which the meter never reads — almost always a peer entry indented one
+      level short, which silently declares nothing. Nest it under `peers:`.
+    success_msg: "peer-expectation map has only keys the meter reads"
+
+- name: mesh-health | render declared peer-expectation map
+  # The operator authors this as YAML in group_vars; it lands beside the netbird
+  # snapshot as JSON and is bind-mounted read-only. Absence only means something
+  # against a declared expectation (docs/design/peer-liveness-expectations.md) —
+  # an empty map is valid and simply means nothing alerts.
+  ansible.builtin.copy:
+    # lan_peers rides in the same rendered file (issue #240): one declared-
+    # expectations document per vantage, one bind-mount, one restart handler.
+    # default([], true) also catches an explicit YAML null: a rendered
+    # "lan_peers": null fails the meter's whole peer-class deserialization,
+    # which would take the liveness declarations down with it.
+    content: "{{ mesh_health_peer_classes | combine({'lan_peers': mesh_health_lan_peers | default([], true)}) | to_nice_json }}\n"
+    dest: "{{ mesh_health_state_dir }}/peer-classes.json"
+    owner: root
+    group: root
+    mode: "0644"
+  # The meter reads the map once at startup, so a re-render is inert until it
+  # restarts. `docker compose up` does not recreate on a bind-mounted file
+  # change, hence the explicit handler.
+  notify: mesh-health | restart meter
+
+- name: mesh-health | warn when no always-up peer is declared
+  # Not a failure: a site may legitimately declare nothing yet. But a silent
+  # empty map looks identical to a working alarm that never fires, which is the
+  # failure mode this surface exists to close — so say it out loud at deploy.
+  ansible.builtin.debug:
+    msg: >-
+      mesh-health: no always-up peers declared for {{ mesh_health_site }} —
+      absence will NOT alert. Populate mesh_health_peer_classes in group_vars.
+  when: >-
+    (mesh_health_peer_classes.peers | default({}) | dict2items
+      | selectattr('value', 'equalto', 'always-up') | list | length) == 0
+    and (mesh_health_peer_classes.patterns | default({}) | dict2items
+      | selectattr('value', 'equalto', 'always-up') | list | length) == 0
+
+- name: mesh-health | ensure node_exporter textfile dir (container writes one file here)
+  ansible.builtin.file:
+    path: "{{ mesh_health_textfile_dir }}"
+    state: directory
+    # Owned by the container's non-root uid, matching the cert-dir task above:
+    # the Chainguard base runs as 65532, so a root-owned dir gives
+    # "Permission denied" on every tick. node_exporter only READS this
+    # directory, so handing it to the writer costs nothing.
+    owner: "65532"
+    group: "65532"
+    mode: "0755"
+  when: mesh_health_textfile_dir | default('', true) | length > 0
+
+# Fail closed rather than deploying a fetch that silently 401s forever. The
+# registry file would simply never appear, the meter would carry on without it,
+# and the deploy would look successful — so the enabling flag would be a lie
+# nobody checked.
+- name: mesh-health | require the NetBird service identity (netbird-infra)
+  ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+  vars:
+    nsi_identity: netbird-infra
+    nsi_token: "{{ mesh_health_registry_token }}"
+    nsi_enabled: "{{ mesh_health_registry_enabled | default(false) | bool }}"
+
+- name: mesh-health | install peer-registry token env file (root-only, not committed)
+  ansible.builtin.copy:
+    content: "NB_API_TOKEN={{ mesh_health_registry_token }}\n"
+    dest: "{{ mesh_health_registry_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: mesh_health_registry_enabled | default(false) | bool
+
+- name: mesh-health | ensure peer-summary dir (identity console reads RO)
+  ansible.builtin.file:
+    path: "{{ mesh_health_peer_summary_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: mesh_health_peer_summary_enabled | bool
+
+- name: mesh-health | install netbird snapshot script
+  ansible.builtin.template:
+    src: mesh-health-snapshot.sh.j2
+    dest: /usr/local/bin/mesh-health-snapshot.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: mesh-health | install snapshot systemd service
+  ansible.builtin.template:
+    src: mesh-health-snapshot.service.j2
+    dest: /etc/systemd/system/mesh-health-snapshot.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: mesh-health | reload systemd
+
+- name: mesh-health | install snapshot systemd timer
+  ansible.builtin.template:
+    src: mesh-health-snapshot.timer.j2
+    dest: /etc/systemd/system/mesh-health-snapshot.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: mesh-health | reload systemd
+
+- name: mesh-health | flush handlers before enabling the timer
+  ansible.builtin.meta: flush_handlers
+
+- name: mesh-health | enable + start the snapshot timer
+  ansible.builtin.systemd:
+    name: mesh-health-snapshot.timer
+    enabled: true
+    state: started
+
+- name: mesh-health | run one snapshot now (so the meter's first tick is grounded)
+  ansible.builtin.systemd:
+    name: mesh-health-snapshot.service
+    state: started
+
+- name: mesh-health | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ mesh_health_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: mesh-health | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ mesh_health_compose_dir }}"
+  changed_when: true
+
+- name: mesh-health | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ mesh_health_compose_dir }}"
+  register: mesh_health_up
+  changed_when:
+    - "'Started' in mesh_health_up.stderr or 'Created' in mesh_health_up.stderr or 'Recreated' in mesh_health_up.stderr"
+
+- name: mesh-health | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ mesh_health_compose_dir }}"
+  register: mesh_health_ps
+  changed_when: false
+
+- name: mesh-health | show
+  ansible.builtin.debug:
+    msg: "{{ mesh_health_ps.stdout_lines }}"
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: mesh-health | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "mesh-health"
+    rollback_ref: "{{ mesh_health_image }}"

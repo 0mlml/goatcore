@@ -1,0 +1,79 @@
+{# Rendered by ops/ansible/roles/relay-health — DO NOT EDIT ON HOST.
+
+   oauth2-proxy custom error page for the PUBLIC door. Closes the second half of
+   F-334: the gate authorises an email STRING, a person can hold several, and the
+   stock refusal is a bare 403 that names neither the identity nor the rule — so
+   a door working exactly as configured is indistinguishable from a broken one.
+   The last time that happened the escalation was "that is a big problem", which
+   was the correct read on the information the page gave.
+
+   WHAT THIS PAGE CANNOT DO, stated so nobody assumes otherwise: oauth2-proxy
+   v7.6.0 renders error.html with {Title, Message, ProxyPrefix, StatusCode,
+   Redirect, RequestID, Footer, Version} and NOT the email it just refused.
+   Echoing the presented address — F-334's cheapest single fix — needs either an
+   upstream template-data change or a shim ahead of the proxy. So this page does
+   the two things it can: it names the RULE, and it prints the request id, which
+   turns an unattributable refusal into one an admin can resolve in the access
+   log in seconds.
+
+   The palette is fixed rather than theme-aware on purpose: this page is served
+   to someone already confused, from a host with no CSS pipeline, and a
+   half-loaded theme is one more thing to doubt. #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ '{{.Title}}' }}</title>
+<style>
+  body { margin:0; background:#12161c; color:#f2f5f8;
+         font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  main { max-width:44rem; margin:0 auto; padding:3rem 1.25rem; }
+  h1 { font-size:1.5rem; margin:0 0 1rem; color:#ffffff; }
+  p  { margin:0 0 1rem; }
+  ul { margin:0 0 1rem; padding-left:1.2rem; }
+  li { margin:0 0 .5rem; }
+  .rule { background:#1c2530; border-left:4px solid #6aa9ff; padding:1rem 1.25rem; margin:0 0 1.5rem; }
+  .ref { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.9rem;
+         color:#cfd8e3; background:#1c2530; padding:.75rem 1rem; border-radius:4px;
+         word-break:break-all; }
+  a { color:#8fc0ff; }
+  .muted { color:#b6c2d0; font-size:.9rem; }
+</style>
+</head>
+<body>
+<main>
+{{ '{{ if eq .StatusCode 403 }}' }}
+  <h1>You signed in, but this address is not on the access list</h1>
+
+  <div class="rule">
+    Access to these dashboards is granted <strong>one email address at a time</strong>.
+    Your sign-in worked — the address it carried is simply not one of the
+    addresses on the list for this site.
+  </div>
+
+  <p>The usual cause is having more than one address. If you were invited at a
+  work address and signed in with a personal account (or the reverse), the door
+  sees a different person.</p>
+
+  <ul>
+    <li><a href="{{ '{{.ProxyPrefix}}' }}/sign_out">Sign out</a>, then sign in again
+        choosing the account whose address you were invited at.</li>
+    <li>If you only have one address, or you are not sure which one was used,
+        reply to the email that invited you and quote the reference below.
+        Adding a second address to your access is something an administrator
+        can do.</li>
+  </ul>
+
+  <p class="muted">Reference for whoever helps you — it identifies this exact
+  request in the access log, including the address that was presented:</p>
+  <p class="ref">{{ '{{.RequestID}}' }}</p>
+{{ '{{ else }}' }}
+  <h1>{{ '{{.Title}}' }}</h1>
+  <p>{{ '{{.Message}}' }}</p>
+  <p><a href="{{ '{{.Redirect}}' }}">Try again</a></p>
+  <p class="muted">Reference: <span class="ref">{{ '{{.RequestID}}' }}</span></p>
+{{ '{{ end }}' }}
+</main>
+</body>
+</html>

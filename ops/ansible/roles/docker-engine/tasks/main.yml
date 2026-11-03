@@ -1,0 +1,384 @@
+---
+# docker-engine — install Docker CE + Compose plugin from Docker's apt repo.
+# Idempotent. Re-runs are no-ops on hosts that already have docker.
+# Multi-arch (amd64 + arm64) — derives apt arch from ansible_architecture.
+
+- name: Detect existing Docker install (skip work if present + healthy)
+  ansible.builtin.command: docker --version
+  register: docker_present_probe
+  changed_when: false
+  failed_when: false
+
+- name: Ensure Docker apt prerequisites are present
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: docker_present_probe.rc != 0
+
+- name: Ensure /etc/apt/keyrings exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: docker_present_probe.rc != 0
+
+- name: Add Docker apt signing key
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o {{ docker_engine_apt_keyring }}
+      chmod a+r {{ docker_engine_apt_keyring }}
+    creates: "{{ docker_engine_apt_keyring }}"
+    executable: /bin/bash
+  when: docker_present_probe.rc != 0
+
+- name: Add Docker apt source list
+  ansible.builtin.copy:
+    content: "deb [arch={{ docker_engine_apt_arch }} signed-by={{ docker_engine_apt_keyring }}] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable\n"
+    dest: "{{ docker_engine_apt_sources_list }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: docker_apt_source_added
+  when: docker_present_probe.rc != 0
+
+- name: Refresh apt cache after adding Docker source
+  ansible.builtin.apt:
+    update_cache: true
+  when:
+    - docker_present_probe.rc != 0
+    - docker_apt_source_added is defined and docker_apt_source_added.changed
+
+- name: Install Docker CE + Compose plugin
+  ansible.builtin.apt:
+    name: "{{ docker_engine_packages }}"
+    state: present
+  when: docker_present_probe.rc != 0
+
+- name: Render /etc/docker/daemon.json (data-root + log bounds)
+  # Closes the disk-fill class: production mgmt-host group_vars
+  # set `docker_engine_data_root: /opt/docker-data/docker` so Docker stores
+  # images + volumes on the NVMe instead of the eMMC default. Empty string
+  # leaves Docker on its default (single-disk hosts). Log driver bounds prevent
+  # stdout/stderr alone from filling
+  # disk independent of data-root.
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {
+      {%- if docker_engine_data_root | length > 0 %}
+        "data-root": "{{ docker_engine_data_root }}",
+      {%- endif %}
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "{{ docker_engine_log_max_size }}",
+          "max-file": "{{ docker_engine_log_max_file }}"
+        }
+      }
+  notify: restart docker
+
+- name: Pre-flight — fail loud if data-root is configured but doesn't match running daemon
+  # Catches recurrence: if an operator forgets to migrate the existing
+  # /var/lib/docker contents to the new data-root path, this assertion
+  # forces them to do it (or it'd silently reset all running containers).
+  # Skipped when --check or --start-at-task gates are in play.
+  ansible.builtin.command: docker info --format '{% raw %}{{.DockerRootDir}}{% endraw %}'
+  register: docker_root_dir_actual
+  changed_when: false
+  when: docker_engine_data_root | length > 0
+
+# Fresh-box self-heal: on a brand-new mgmt-host the data-root move is
+# non-destructive (nothing to migrate), so apply it automatically — restart
+# Docker to pick up the just-rendered daemon.json — instead of dead-ending the
+# operator on the manual migration ceremony below. The fresh-box gate (ZERO
+# containers AND a near-empty /var/lib/docker)
+# excludes any box with real data, which still falls through to the fail-loud
+# assert + runbook. Only fires when the running root actually differs.
+- name: F-093 self-heal | detect a fresh Docker install (safe to auto-migrate)
+  ansible.builtin.shell: |
+    set -o pipefail
+    n=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
+    kb=$(du -sk /var/lib/docker 2>/dev/null | awk '{print $1}'); kb=${kb:-0}
+    if [ "$n" -eq 0 ] && [ "$kb" -lt 51200 ]; then echo fresh; else echo dirty; fi
+  args:
+    executable: /bin/bash
+  register: docker_freshbox_probe
+  changed_when: false
+  when:
+    - docker_engine_data_root | length > 0
+    - (docker_root_dir_actual.stdout | default('') | trim) != docker_engine_data_root
+
+- name: F-093 self-heal | restart Docker + re-read root on a fresh box
+  when:
+    - docker_engine_data_root | length > 0
+    - (docker_root_dir_actual.stdout | default('') | trim) != docker_engine_data_root
+    - (docker_freshbox_probe.stdout | default('')) is search('fresh')
+  block:
+    - name: F-093 self-heal | restart docker (fresh box, data-root just configured)
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+    - name: F-093 self-heal | re-read Docker root after restart
+      # Registers a SEPARATE var: registering back onto docker_root_dir_actual
+      # would CLOBBER the good pre-flight read with a skip-dict (no stdout)
+      # whenever this block skips — i.e. on every already-healthy box — and
+      # the assert below then crashes rendering fail_msg.
+      ansible.builtin.command: docker info --format '{% raw %}{{.DockerRootDir}}{% endraw %}'
+      register: docker_root_dir_reread
+      changed_when: false
+
+# Re-read for the final assert with its OWN register: when the self-heal
+# block above is SKIPPED (root already matches — every re-run after the
+# first), its `register: docker_root_dir_actual` still fires and clobbers
+# the good first read with a skip-dict that has no `.stdout`, which would make
+# this assert explode on healthy re-runs.
+- name: Re-read running daemon data-root for the final assert
+  ansible.builtin.command: docker info --format '{% raw %}{{.DockerRootDir}}{% endraw %}'
+  register: docker_root_dir_final
+  changed_when: false
+  when: docker_engine_data_root | length > 0
+
+- name: Assert running daemon's data-root matches configured (or fail with migration runbook pointer)
+  ansible.builtin.assert:
+    that:
+      - docker_root_dir_final.stdout | trim == docker_engine_data_root
+    fail_msg: |
+      Docker daemon is running with data-root `{{ docker_root_dir_final.stdout | trim }}`
+      but `docker_engine_data_root` is configured to `{{ docker_engine_data_root }}`.
+      This is the pre-2026-05-09 class of bug — production deploys must move data-root to NVMe.
+      Run the migration ceremony FIRST: docs/operations/docker-data-root-migration.md
+      Then re-run this play. If the existing /var/lib/docker is empty / new install,
+      restart docker manually (`sudo systemctl restart docker`) to pick up the new daemon.json.
+  when: docker_engine_data_root | length > 0
+
+- name: Render /etc/containerd/config.toml (containerd root on NVMe)
+  # Closes the second half of the disk-fill class: containerd
+  # stores image layers + snapshots under its OWN root directory,
+  # separate from Docker's data-root. Without this override, containerd
+  # silently stays on /var/lib/containerd (eMMC) and grows independently
+  # as new images are pulled — a slow-burn fill that only surfaces once
+  # the eMMC is already nearly full.
+  #
+  # Production mgmt-host group_vars set
+  # `docker_engine_containerd_root: /opt/docker-data/containerd` so
+  # containerd's image cache lives on the same NVMe as Docker's
+  # data-root. Empty string leaves containerd on its default
+  # (single-disk hosts).
+  #
+  # We render the minimal config (root + state) so future containerd
+  # default changes still apply; ALL other settings stay at containerd's
+  # built-in defaults.
+  ansible.builtin.copy:
+    dest: /etc/containerd/config.toml
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by ops/ansible/roles/docker-engine — do not hand-edit.
+      # See defaults/main.yml `docker_engine_containerd_root` for the knob.
+      #
+      # Why no `disabled_plugins` line: containerd v2 requires the FULL
+      # plugin URI (e.g. "io.containerd.grpc.v1.cri") and rejects the
+      # shorthand "cri" that the upstream docker-ce package's shipped
+      # config.toml uses (verified failing on containerd v2.2.3 + Ubuntu
+      # 22.04 Tegra). The shipped config gets away with the
+      # shorthand because it omits `version =`, so containerd treats it
+      # as v1 syntax. Once we declare `version = 2` (required for any
+      # other settings to be parsed correctly), the shorthand stops
+      # working. Leaving CRI enabled is harmless for Docker — Docker
+      # talks to containerd via its native API, not CRI; CRI's gRPC
+      # listener sits idle. If a future deploy needs CRI off, switch
+      # the line to `disabled_plugins = ["io.containerd.grpc.v1.cri"]`.
+      version = 2
+      root = "{{ docker_engine_containerd_root }}"
+      state = "/run/containerd"
+  when: docker_engine_containerd_root | length > 0
+  notify: restart containerd
+
+- name: Pre-flight — fail loud if containerd root is configured but doesn't match running daemon
+  # Same pattern as the data-root assertion above. Catches recurrence
+  # of the "configured-but-not-migrated" class — if an operator forgets
+  # to migrate /var/lib/containerd to the new path, this fails before
+  # any Docker-touching phase runs (forces the migration ceremony).
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      ctr --address /run/containerd/containerd.sock version 2>/dev/null \
+        | awk '/^Server:/{found=1} found && /Root:/{print $2; exit}' \
+        || true
+      # If ctr isn't on PATH or socket isn't responding, fall back to
+      # parsing /proc to find containerd's --root flag (or default).
+    executable: /bin/bash
+  register: containerd_root_probe
+  changed_when: false
+  failed_when: false
+  when: docker_engine_containerd_root | length > 0
+
+- name: Read containerd root from config.toml (authoritative)
+  # ctr binary may not be on PATH on every Ubuntu Docker install
+  # (containerd ships ctr but apt's docker-ce may not). Grep the
+  # rendered config.toml as the authoritative source — what's in the
+  # file is what containerd will use after the handler restarts it.
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      awk -F '"' '/^root = /{print $2; exit}' /etc/containerd/config.toml
+    executable: /bin/bash
+  register: containerd_root_from_config
+  changed_when: false
+  when: docker_engine_containerd_root | length > 0
+
+- name: Assert containerd config root matches configured (or fail with migration runbook pointer)
+  ansible.builtin.assert:
+    that:
+      - containerd_root_from_config.stdout | trim == docker_engine_containerd_root
+    fail_msg: |
+      containerd config.toml has root `{{ containerd_root_from_config.stdout | trim }}`
+      but `docker_engine_containerd_root` is configured to `{{ docker_engine_containerd_root }}`.
+      Run the migration ceremony: docs/operations/docker-data-root-migration.md
+      §"containerd root migration" before re-running.
+  when: docker_engine_containerd_root | length > 0
+
+- name: Enable + start docker.service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+# Authenticate the host's Docker to ghcr.io so PRIVATE packages pull.
+# Most images are public packages and pull anonymously, but private ones fail
+# `docker compose pull` with `unauthorized` until the host is logged in. The
+# token is read from the CONTROLLER env (operator's GHCR_READ_TOKEN) and piped to
+# the login on the host. No-op when the token is unset (hosts with only public
+# images). Persists in the host's docker config.json across recreates.
+#
+# A successful login does not establish access to a particular private package:
+# package visibility and organization token policy still apply. Host
+# authentication follows GitHub's documented classic-PAT package-read workflow,
+# including applicable organization/SSO policy.
+- name: Authenticate Docker to ghcr.io for private image pulls (when GHCR_READ_TOKEN set)
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    printf '%s' '{{ lookup("env", "GHCR_READ_TOKEN") }}'
+    | docker login ghcr.io -u {{ ghcr_login_user | default("goat-deploy") }} --password-stdin
+  args:
+    executable: /bin/bash
+  when: (lookup('env', 'GHCR_READ_TOKEN') | default('')) | length > 0
+  no_log: true
+  changed_when: false
+  tags: [ghcr-login]
+
+# Inspect an explicitly configured, independently verified PRIVATE target.
+# Public targets can succeed anonymously, and a skipped probe establishes no
+# credential-access fact. A nonzero manifest result fails the play. See F-582.
+- name: Verify the ghcr credential can read a private package in {{ ghcr_org }}
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    docker manifest inspect
+    ghcr.io/{{ ghcr_org }}/{{ ghcr_private_probe_image }} >/dev/null
+  args:
+    executable: /bin/bash
+  register: ghcr_probe
+  failed_when: ghcr_probe.rc != 0
+  changed_when: false
+  when:
+    - (lookup('env', 'GHCR_READ_TOKEN') | default('')) | length > 0
+    - ghcr_private_probe_image | default('') | length > 0
+  tags: [ghcr-login]
+
+# Docker group membership (opt-in, root-equivalent). See the trade-off on
+# docker_group_members in defaults/main.yml. An empty default makes both
+# tasks a no-op; existing membership is retained. The docker group is created
+# by the docker-ce postinst earlier in this role; nothing here creates it.
+- name: Refuse docker-group opt-in for a name that does not exist on the host
+  # ansible.builtin.user defaults to state=present, so without this gate a
+  # typo'd name would CREATE a fresh account already inside the root-equivalent
+  # docker group. getent fails the play on a missing key (fail-closed), so a
+  # bad name aborts the run before any account is touched.
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ item }}"
+  loop: "{{ docker_group_members }}"
+
+- name: Add configured accounts to the docker group (opt-in, root-equivalent)
+  ansible.builtin.user:
+    name: "{{ item }}"
+    groups: docker
+    append: true
+  loop: "{{ docker_group_members }}"
+
+- name: Final verification — Docker daemon and CLI both respond
+  ansible.builtin.command: "{{ item }}"
+  register: docker_verify
+  changed_when: false
+  loop:
+    - docker --version
+    - docker compose version
+    - systemctl is-active docker
+
+- name: Report installed Docker versions
+  ansible.builtin.debug:
+    msg: "{{ item.cmd | join(' ') }} → {{ item.stdout }}"
+  loop: "{{ docker_verify.results }}"
+  loop_control:
+    label: "{{ item.cmd | join(' ') }}"
+
+# ---------------------------------------------------------------------------
+# Container-host inotify ceiling. The kernel default of 128 inotify
+# instances per UID is shared by every root-running container on the host.
+# Past ~100 containers a service that opens a file watcher at start (Traefik's
+# file provider is the one that matters: no watcher = no dynamic routes =
+# every 443 route 404s) fails to start it. Persist the raise in sysctl.d and
+# apply it live; idempotent, never lowers a value an operator raised further.
+- name: Persist container-host inotify ceilings
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-goat-inotify.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # goat container host: the per-UID inotify budget is shared by
+      # every root container. Ubuntu default 128 is exceeded past ~100
+      # containers and Traefik then starts with no file provider.
+      fs.inotify.max_user_instances = {{ docker_engine_inotify_max_user_instances }}
+      fs.inotify.max_user_watches = {{ docker_engine_inotify_max_user_watches }}
+
+- name: Apply container-host inotify ceilings live
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value | string }}"
+    sysctl_file: /etc/sysctl.d/99-goat-inotify.conf
+    state: present
+    reload: true
+  loop:
+    - { name: fs.inotify.max_user_instances, value: "{{ docker_engine_inotify_max_user_instances }}" }
+    - { name: fs.inotify.max_user_watches, value: "{{ docker_engine_inotify_max_user_watches }}" }
+  loop_control:
+    label: "{{ item.name }}={{ item.value }}"
+
+# CVE-2026-98432 (IPv4 TCP request-socket use-after-free, CVSS 9.8). The
+# published exploit needs an MPTCP listener, and Go 1.24+ listeners request
+# MPTCP by default. Ubuntu 24.04 and 22.04 had no fixed kernel on 2026-11-02
+# (ubuntu.com/security/CVE-2026-98432: "in progress"). MPTCP stays off until
+# the fixed kernel is live on the host, then this task is removed. Tegra
+# kernels do not build MPTCP, so the key is absent there and the task skips.
+- name: CVE-2026-98432 mitigation — MPTCP off until the fixed kernel ships
+  ansible.posix.sysctl:
+    name: net.mptcp.enabled
+    value: "0"
+    sysctl_file: /etc/sysctl.d/98-goat-cve-2026-98432.conf
+    state: present
+    reload: true
+  when: ansible_kernel is not search('tegra')

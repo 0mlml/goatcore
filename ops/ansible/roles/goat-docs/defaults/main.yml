@@ -1,0 +1,91 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the goat-docs role — a mesh-internal docs site that serves
+# the goat-cli field guide (the mdBook built from the same tagged binary
+# get.<site> serves) at `docs.<site>.<zone>`. A near-clone of the goat-get role:
+# nginx:alpine + Traefik file-provider + mesh-only gating. The difference
+# is the payload — a single `goat-docs.tar.gz` release asset, unpacked into
+# the webroot as static HTML, rather than raw binaries.
+#
+# Provenance: the tarball is pulled from the goat-cli GitHub release (tag
+# `goat_docs_release_tag`) onto the host at deploy time (host egress; no
+# multi-MB artifact crosses the mesh), sha256-verified, then unpacked.
+# docs/design/goat-cli-hosted-docs.md.
+
+# Public hostname for on-mesh access. `docs.<site>.<zone>` by convention,
+# sibling to get.<site>.
+goat_docs_hostname: "docs.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }}"
+
+# Which goat-cli release's docs to serve. Tracks the binary release tag
+# (goat_get_release_tag) so the docs match the binary get.<site> serves; bump
+# here + re-run the deploy when a newer goat-cli ships.
+#
+# Keep this coupled to goat_get_release_tag unless the "Currency lock"
+# section in docs/design/goat-cli-hosted-docs.md says otherwise.
+goat_docs_release_tag: "goat-cli-v0.4.19"
+# Self-referential — see goat-get/defaults/main.yml.
+goat_docs_release_repo: "{{ source_repo }}"
+goat_docs_asset: "goat-docs.tar.gz"
+
+# GitHub token to read the PRIVATE repo's release assets at download time
+# (contents:read). Sourced from the operator env; passed transiently to
+# the host download task (no_log), never persisted on the host. Mirrors
+# goat-get so a single GOAT_CLI_RELEASE_TOKEN drives both deploys.
+goat_docs_github_token: "{{ lookup('env', 'GOAT_CLI_RELEASE_TOKEN') | default(lookup('env', 'GH_TOKEN'), true) | default(lookup('env', 'GHCR_READ_TOKEN'), true) }}"
+
+# nginx static server. SHA-pin per ADR 0859 (easy rollback).
+goat_docs_image: "nginx:1.27-alpine"
+goat_docs_container_name: "goat-docs"
+goat_docs_internal_port: 80
+
+# On-host paths.
+goat_docs_compose_dir: "/opt/goat-docs"
+goat_docs_www_dir: "/opt/goat-docs/www"
+goat_docs_stage_dir: "/opt/goat-docs/stage"
+
+# Traefik wiring — same pattern as goat-get/brief: file-provider
+# config in /etc/traefik/dynamic/, container on the `mgmt` Docker network,
+# `le` cert resolver. Distinct filename + router name so a goat-docs
+# redeploy can't stomp the neighboring routes (incl. goat-get).
+goat_docs_traefik_network: "mgmt"
+goat_docs_traefik_dynamic_dir: "/etc/traefik/dynamic"
+goat_docs_traefik_dynamic_filename: "goat-docs.yml"
+
+# The pre-rename filename, removed from the host on deploy. Leaving it
+# behind would give Traefik two routers on the same Host() rule.
+goat_docs_traefik_dynamic_filename_legacy: "nova-goat-docs.yml"
+goat_docs_traefik_cert_resolver: "le"
+goat_docs_traefik_router_name: "goat-docs"
+
+# Mesh-only gating — docs.<site> is a mesh-internal surface, exactly like
+# get.<site>. The site carries no app-layer auth, so this middleware is the
+# whole auth surface.
+goat_docs_traefik_mesh_only_middleware: "mesh-only-allowlist@file"
+
+# Release-asset download mirror. A sovereign / partner site has no credential to
+# the GitHub org, so the same assets are published to R2 (`goat-downloads`,
+# fronted at a public download host) under `cli/<tag>/<asset>`. The role probes this first
+# and only reaches api.github.com when the mirror lacks the tag. The .sha256
+# sidecar is enforced either way, so this is a transport choice, not a trust one.
+# The provisioning tier is a deliberate cross-goatnet shared service — not config bleed.
+goat_docs_mirror_base: "{{ goat_release_mirror_base | default('https://get.goat.example') }}"
+goat_docs_mirror_prefix: "cli/{{ goat_docs_release_tag }}"
+
+# ---------------------------------------------------------------------------
+# goatbuilder book — OPT-IN second book at docs.<site>/goatbuilder/
+# (docs/design/goatbuilder-distribution.md §"Inside the goatnet"). The
+# `goatbuilder-docs.tar.gz` asset of the goatbuilder release — the mdBook
+# composed from that tag's canonical design docs and that binary's --help —
+# unpacked into a subdirectory of THIS site's webroot. Same host, same cert,
+# same mesh gate; no new DNS name. Keep the tag coupled to
+# goat_get_goatbuilder_release_tag so the book matches the binary get.<site>
+# serves. GitHub-API fetch with the same token as the goat-cli book.
+# The tag is EMPTY until the first release is cut (the asset-parity guard
+# refuses a pin naming a release that exists nowhere); then set it here, the
+# same value as goat_get_goatbuilder_release_tag, and re-run goat-docs-deploy.yml.
+goat_docs_goatbuilder_enabled: false
+goat_docs_goatbuilder_release_repo: "USAREUR-AF/goatcore"
+goat_docs_goatbuilder_release_tag: "goatbuilder/v0.4.1"
+goat_docs_goatbuilder_asset: "goatbuilder-docs.tar.gz"
+goat_docs_goatbuilder_www_subdir: "goatbuilder"

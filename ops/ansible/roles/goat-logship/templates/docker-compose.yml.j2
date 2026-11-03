@@ -1,0 +1,58 @@
+# Rendered by ops/ansible/roles/goat-logship on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/goat-logship/templates/docker-compose.yml.j2
+# Anchor: ADR 1078 — off-box OCSF cyber logging via Vector.
+
+services:
+  goat-logship:
+    image: {{ logship_vector_image }}
+    container_name: goat-logship
+    restart: unless-stopped
+    command:
+      - --config
+      - /etc/vector/vector.yaml
+    environment:
+{% if logship_durable_sink_mode == 's3' %}
+      AWS_ACCESS_KEY_ID: "${LOGSHIP_S3_ACCESS_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${LOGSHIP_S3_SECRET_ACCESS_KEY}"
+{% endif %}
+      VECTOR_LOG: info
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+        reservations: { memory: 128M }
+    volumes:
+      - {{ logship_compose_dir }}/vector.yaml:/etc/vector/vector.yaml:ro
+      - {{ logship_data_root }}:/var/lib/vector
+      # journald — journal files + machine-id (Vector's journald source).
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+{% if logship_source_auditd %}
+      - {{ logship_auditd_log_path }}:{{ logship_auditd_log_path }}:ro
+{% endif %}
+{% if logship_source_egress %}
+      - {{ logship_egress_log_path }}:{{ logship_egress_log_path }}:ro
+{% endif %}
+{% if logship_source_zenoh_audit %}
+      - {{ logship_zenoh_audit_glob | dirname }}:{{ logship_zenoh_audit_glob | dirname }}:ro
+{% endif %}
+{% if logship_source_identity_enroll or logship_source_app_http or logship_source_app_auth %}
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+{% endif %}
+{% if logship_source_falco %}
+      - {{ logship_falco_events_path | dirname }}:{{ logship_falco_events_path | dirname }}:ro
+{% endif %}
+{% if logship_source_osquery %}
+      - {{ logship_osquery_results_path | dirname }}:{{ logship_osquery_results_path | dirname }}:ro
+{% endif %}
+    ports:
+      # Self-metrics for Prometheus (absence-alarm). Bound to the mesh IP at
+      # the host level by the two-layer firewall pattern; container-side we
+      # expose only the metrics port — no ingest port is listened on.
+      - "{{ logship_metrics_port }}:{{ logship_metrics_port }}"
+    networks:
+      - goat-logship-net
+
+networks:
+  goat-logship-net:
+    name: goat-logship-net

@@ -1,0 +1,96 @@
+---
+# ops/ansible/roles/zenoh/tasks/main.yml
+#
+# Zenoh router deployment — Step 1 of the implementation tracker.
+# See docs/project/zenoh-implementation.md for the 8-step sequence and
+# docs/design/zenoh-data-fabric.md §"Phase 2 deployment scope" for
+# what ships.
+#
+# This role ONLY deploys the router + minimal config. Plugins, load
+# generator, gatewatch integration, storage configuration come in
+# subsequent iterations as their own tasks or roles.
+
+- name: Ensure zenoh dirs exist on host
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /etc/zenoh
+    - /opt/zenoh
+    - "{{ zenoh_plugin_dir }}"
+    - /var/lib/zenoh
+    - /var/lib/zenoh/rocksdb
+
+# RocksDB backend .so (not shipped in upstream eclipse/zenoh image) —
+# download the matching prebuilt artifact from the upstream
+# zenoh-backend-rocksdb release, verify SHA256, drop into the host
+# plugin dir. docker-compose.yml bind-mounts that dir into the
+# container at /opt/zenoh/plugins (read-only); config.json5's
+# storage_manager.backend_search_dirs picks it up. Same upstream
+# release tag as the image = ABI alignment by construction.
+- name: Resolve rocksdb backend artifact URL + SHA256 for this host's architecture
+  ansible.builtin.set_fact:
+    zenoh_rocksdb_backend_arch: "{{ zenoh_rocksdb_backend_arch_map[ansible_architecture] }}"
+    zenoh_rocksdb_backend_sha256: "{{ zenoh_rocksdb_backend_sha256_map[ansible_architecture] }}"
+  failed_when: ansible_architecture not in zenoh_rocksdb_backend_arch_map
+
+- name: Fetch + verify upstream rocksdb backend zip
+  ansible.builtin.get_url:
+    url: "{{ zenoh_rocksdb_backend_url_template | regex_replace('\\{version\\}', zenoh_rocksdb_backend_version) | regex_replace('\\{arch\\}', zenoh_rocksdb_backend_arch) }}"
+    dest: "/opt/zenoh/zenoh-backend-rocksdb-{{ zenoh_rocksdb_backend_version }}-{{ zenoh_rocksdb_backend_arch }}-musl.zip"
+    checksum: "sha256:{{ zenoh_rocksdb_backend_sha256 }}"
+    mode: "0644"
+  register: zenoh_rocksdb_zip
+  notify: Restart zenoh router
+
+- name: Install libzenoh_backend_rocksdb.so to host plugin dir
+  ansible.builtin.unarchive:
+    src: "{{ zenoh_rocksdb_zip.dest }}"
+    dest: "{{ zenoh_plugin_dir }}/"
+    remote_src: true
+    creates: "{{ zenoh_plugin_dir }}/libzenoh_backend_rocksdb.so"
+  notify: Restart zenoh router
+
+- name: Render zenoh config.json5 from template
+  ansible.builtin.template:
+    src: "config.json5.j2"
+    dest: "{{ zenoh_config_path }}"
+    mode: "0644"
+  notify: Restart zenoh router
+
+- name: Render zenoh docker-compose.yml from template
+  ansible.builtin.template:
+    src: "docker-compose.yml.j2"
+    dest: "{{ zenoh_compose_path }}"
+    mode: "0644"
+  notify: Restart zenoh router
+
+- name: Pull zenoh image
+  community.docker.docker_image:
+    name: "{{ zenoh_image }}"
+    source: pull
+  # Non-fatal if already cached; we just need it present
+  changed_when: false
+
+- name: Start zenoh router
+  ansible.builtin.command:
+    cmd: docker compose -f {{ zenoh_compose_path }} up -d
+  register: zenoh_up
+  # docker compose v2 writes per-container status to stderr:
+  # "Running" → already up, no-op (changed=false).
+  # "Started" / "Created" / "Recreated" → real state change.
+  # Earlier `changed_when: true` always reported changed, breaking
+  # the idempotence contract callers expect for ops automation.
+  # Config changes (template tasks above) notify the Restart handler
+  # via their own changed signal, so this task doesn't need notify:.
+  changed_when: "'Started' in zenoh_up.stderr or 'Created' in zenoh_up.stderr or 'Recreated' in zenoh_up.stderr"
+
+- name: Wait for zenoh router metrics endpoint
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8088/metrics"
+    status_code: 200
+  register: zenoh_health
+  retries: 20
+  delay: 3
+  until: zenoh_health.status == 200

@@ -1,0 +1,85 @@
+# Rendered by ops/ansible/roles/operator-idp-hydra on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/operator-idp-hydra/templates/hydra.yaml.j2
+# Anchor: ADR 0842 (dedicated operator IdP).
+#
+# SECRETS POLICY: HYDRA_SECRETS_SYSTEM + HYDRA_SECRETS_COOKIE are passed
+# as env vars from /opt/operator-idp-hydra/.env (mode 0600). They do
+# NOT appear in this rendered file.
+#
+# Greenfield issuer — no legacy clients, no F-080 dashboard quirks.
+# F-077 (consent default) is mitigated per-client at provisioning time
+# via skip_consent: true. F-078 (token strategy default) is mitigated
+# at the ISSUER level here by setting strategies.access_token=jwt as
+# the default; operator IdP consumers all JWKS-validate JWTs.
+
+serve:
+  public:
+    port: 4444
+    cors:
+      enabled: true
+      allowed_origins:
+        - "https://*.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}"
+      allowed_methods:
+        - POST
+        - GET
+        - PUT
+      allowed_headers:
+        - Authorization
+        - Content-Type
+      exposed_headers:
+        - Content-Type
+  admin:
+    port: 4445
+
+dsn: "{{ operator_idp_hydra_dsn }}"
+
+urls:
+  self:
+    issuer: "https://oauth2.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/"
+  # Login + consent UIs are served by the Kratos UI on the operator
+  # Kratos. Same host (Orin-C), separate compose project; reverse-
+  # proxied by Traefik at auth.ops.<site>.netbird-prod.goat.example.
+  login: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/login"
+  consent: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/consent"
+  logout: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/logout"
+  error: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/error"
+
+# Lifespan budgets. Smaller than site-Hydra's; operator IdP is not
+# subject to the Spock-replication race condition that drove
+# ADR 1010 D2.
+ttl:
+  access_token: 8h
+  refresh_token: 168h     # 7d (vs site Hydra's 30d — operators rotate sessions more often)
+  id_token: 1h
+  auth_code: 5m            # No replication-lag dependency, can be tighter
+  login_consent_request: 5m
+
+oauth2:
+  expose_internal_errors: false
+  pkce:
+    enforced_for_public_clients: true
+
+oidc:
+  subject_identifiers:
+    supported_types:
+      - public
+      - pairwise
+    pairwise:
+      # Per-site salt — derived deterministically from site_id so this
+      # value is reproducible across re-renders without out-of-band
+      # custody. Distinct from the site-Hydra salt (different formula
+      # input + different secret tier).
+      salt: "{{ ('operator-idp-pairwise-' + site_id) | hash('sha256') | truncate(32, True, '') }}"
+
+# F-078 mitigation at the issuer level: JWT access tokens by default.
+# Every operator-IdP consumer (Grafana, MinIO, OpenObserve, Forgejo)
+# JWKS-validates JWTs offline. Opaque tokens would force per-consumer
+# /oauth2/introspect calls back to Hydra, which is both slower and
+# couples consumer health to Hydra reachability.
+strategies:
+  access_token: "{{ operator_idp_hydra_access_token_strategy }}"
+
+log:
+  level: info
+  format: json
+  leak_sensitive_values: false

@@ -1,0 +1,77 @@
+---
+# onboard-intake-collector — deploy the public candidate-onboarding front desk
+# (ADR 1062 stage 1). Off unless onboard_intake_enabled; requires a public fqdn.
+
+- name: Onboard-intake — skip when disabled
+  ansible.builtin.debug:
+    msg: "onboard-intake-collector disabled (onboard_intake_enabled=false) — nothing to do"
+  when: not onboard_intake_enabled
+
+- name: Onboard-intake — require a public fqdn when enabled
+  ansible.builtin.assert:
+    that:
+      - onboard_intake_public_fqdn | length > 0
+    fail_msg: "onboard_intake_enabled is true but onboard_intake_public_fqdn is unset"
+  when: onboard_intake_enabled
+
+- name: Onboard-intake — deploy the collector
+  when: onboard_intake_enabled
+  block:
+    - name: Onboard-intake — collector dir
+      ansible.builtin.file:
+        path: "{{ onboard_intake_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Onboard-intake — render nginx allowlist config
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: "{{ onboard_intake_dir }}/nginx.conf"
+        mode: "0644"
+      register: _intake_nginx
+
+    - name: Onboard-intake — render compose
+      ansible.builtin.template:
+        src: docker-compose.yml.j2
+        dest: "{{ onboard_intake_dir }}/docker-compose.yml"
+        mode: "0644"
+
+    - name: Onboard-intake — render Traefik dynamic route (enrollment entrypoint)
+      ansible.builtin.template:
+        src: traefik-onboard-intake.yml.j2
+        dest: "{{ onboard_intake_traefik_dynamic_dir }}/{{ onboard_intake_traefik_dynamic_filename }}"
+        mode: "0644"
+      # Traefik file-provider watch picks it up automatically.
+
+    - name: Onboard-intake — pull image
+      community.docker.docker_compose_v2_pull:
+        project_src: "{{ onboard_intake_dir }}"
+      changed_when: false
+
+    - name: Onboard-intake — bring up the collector
+      community.docker.docker_compose_v2:
+        project_src: "{{ onboard_intake_dir }}"
+        state: present
+      register: _intake_up
+
+    # A bind-mounted FILE that ansible REPLACED (the template task writes a temp
+    # then renames → a NEW inode) is not seen by the running container: its mount
+    # still points at the old inode, so `docker exec ... nginx -s reload` re-reads
+    # the STALE config and the change silently doesn't take (the collector kept
+    # proxying to the old upstream through a whole cutover). RECREATE
+    # the container instead — that re-resolves the bind-mount to the new host file.
+    - name: Onboard-intake — recreate the collector on config change (re-resolve the replaced bind-mount)
+      community.docker.docker_compose_v2:
+        project_src: "{{ onboard_intake_dir }}"
+        state: present
+        recreate: always
+      when: _intake_nginx is changed and _intake_up is not changed
+
+    - name: Onboard-intake — wait for the collector to answer
+      ansible.builtin.command:
+        cmd: "docker exec {{ onboard_intake_container_name }} wget -qO- http://127.0.0.1/healthz"
+      register: _intake_health
+      retries: 10
+      delay: 2
+      until: _intake_health.rc == 0
+      changed_when: false

@@ -1,0 +1,39 @@
+# Managed by ops/ansible/roles/breakglass-node — do not hand-edit.
+#
+# breakglass-clock-step.service — the same shape as ntp-hygiene's
+# chrony-presync.service, for a node that cannot use NTP at all.
+# See /usr/local/sbin/breakglass-clock-step.sh for why a step, and not the
+# htpdate daemon's slew, is what recovers this class of node.
+
+[Unit]
+Description=Step the clock from HTTPS Date headers before the overlay transports
+Documentation=file:///usr/local/sbin/breakglass-clock-step.sh
+# network-online guarantees the local link is configured, NOT that the WAN is
+# reachable. Necessary but not sufficient — breakglass-clock-step-retry.timer
+# covers the cold-boot-before-the-uplink case.
+After=network-online.target
+Wants=network-online.target
+# Start BEFORE anything that authenticates against a certificate. Both overlay
+# transports do, and both failed closed for two days on echo-breakglass because
+# the clock was 49 days behind. Ordering only (no Requires=): if this cannot
+# reach a time source, the transports still start and a later retry fixes them.
+Before=tailscaled.service
+Before=netbird.service
+Before=htpdate.service
+ConditionPathExists=/usr/sbin/htpdate
+# Skip once the clock has been corrected this boot. The sentinel is written by
+# the SCRIPT on genuine success only, so a failed attempt leaves the condition
+# open for the retry timer.
+ConditionPathExists=!/run/breakglass-clock-step.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/breakglass-clock-step.sh
+RemainAfterExit=yes
+TimeoutStartSec={{ breakglass_clock_step_timeout_sec }}s
+# Only exit 0 counts. A non-zero exit (no time source yet) leaves the unit
+# failed so the retry timer re-fires it.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

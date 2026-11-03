@@ -1,0 +1,947 @@
+---
+# ops/ansible/roles/goat-zenoh/tasks/main.yml
+#
+# Nova-mode Zenoh router deployment. Forked from the canonical
+# zenoh role; the deviations (mTLS, access_control, per-vendor storages,
+# different file paths) were large enough that an `if nova_mode`
+# pile in the parent role would be net-negative on readability.
+#
+# Pre-flight gates the deploy on Track A's substrate being in place:
+#   - nova offline-CA root cert
+#   - Zenoh router leaf cert + key
+# If any are missing, the role fails fast with a clear error pointing
+# at docs/operations/nova-zenoh-trial-deploy.md §"Pre-flight gate".
+
+- name: Pre-flight | edge-queryable lockdown carries its re-grants
+  # Fail CLOSED. The lockdown narrows `trial-peer-r-all`, and every service
+  # policy includes that rule, so enabling it without re-grants strips
+  # `declare_queryable` from every subject on the fabric — not just from edge
+  # peers. A zenoh denial is silent, so the damage would show up as
+  # services mysteriously answering nothing, with no error anywhere and no
+  # obvious link back to this flag.
+  #
+  # Refusing here rather than warning is the point: the whole failure mode is
+  # that nobody finds out.
+  ansible.builtin.assert:
+    that:
+      - (zenoh_edge_queryable_lockdown_grants | default([])) | length > 0
+    fail_msg: >-
+      zenoh_edge_queryable_lockdown is ON but
+      zenoh_edge_queryable_lockdown_grants is empty. Flipping the flag alone
+      removes declare_queryable from EVERY subject (every service policy
+      carries trial-peer-r-all), and the denial is silent. Enumerate what
+      currently answers on this goatnet:
+        docker exec <router> sh -c 'wget -qO- "http://127.0.0.1:8000/@/*/router/**/queryable/**"'
+      Every entry with clients>0 is a remote queryable that needs a re-grant
+      (routers-only entries are the router's own storage and do not). On
+      zagros-prod that list was six: keys/**, ops/**, attest/schema/**,
+      ops/audit/operator/** and three tenant slot roots.
+    quiet: true
+  when: zenoh_edge_queryable_lockdown | default(false) | bool
+
+- name: Pre-flight | every fabric-wide read grant is a complete, reviewable line
+  # Fail CLOSED on a malformed entry. `**` is the grant that let one slow
+  # subscriber stall zagros fabric-wide, so every row that keeps it must say who
+  # owns it and why — a list of bare CNs is not a reviewable list. An entry with
+  # neither `cn` nor `slot_idx` would render an empty or garbage common name,
+  # which matches nothing and fails SILENTLY: the reader would look
+  # granted in git and read nothing on the fabric.
+  ansible.builtin.assert:
+    that:
+      - zenoh_fabric_wide_read | rejectattr('owner', 'defined') | list | length == 0
+      - zenoh_fabric_wide_read | rejectattr('reason', 'defined') | list | length == 0
+      - zenoh_fabric_wide_read | selectattr('cn', 'undefined') | selectattr('slot_idx', 'undefined') | list | length == 0
+    fail_msg: >-
+      Every zenoh_fabric_wide_read entry needs `owner`, `reason`, and exactly
+      one identity key — `cn:` (a certificate common name) or `slot_idx:` (a
+      pool slot, whose anchor CN the template derives). Offending entries:
+      {{ zenoh_fabric_wide_read
+         | rejectattr('owner', 'defined') | list
+         + zenoh_fabric_wide_read | rejectattr('reason', 'defined') | list }}
+    quiet: true
+  when: zenoh_peer_read_scoped | default(false) | bool
+
+- name: Pre-flight | no cross-tenant shape is the fabric-wide grant in disguise
+  # `zenoh_peer_cross_tenant_read` exists so a FILTER — one vendor or one topic
+  # across tenants — needs no named grant. Two entries would turn it back into
+  # the grant: `**` itself, and any expression made only of `*` chunks (`*/**`,
+  # `*/*/**`), which matches every key that has at least one chunk, i.e.
+  # everything anyone publishes. Refuse both rather than render a list that
+  # reads as a filter set and behaves as a fabric-wide allow.
+  ansible.builtin.assert:
+    that:
+      - zenoh_peer_cross_tenant_read | select('match', '^(\*\*|\*(/\*)*(/\*\*)?)$') | list | length == 0
+    fail_msg: >-
+      zenoh_peer_cross_tenant_read contains an entry that matches the whole
+      keyspace:
+      {{ zenoh_peer_cross_tenant_read | select('match', '^(\*\*|\*(/\*)*(/\*\*)?)$') | list }}.
+      A cross-tenant shape must name at least one real chunk (`**/basemap_vendor/**`,
+      `**/airtracks/v1/*`). Fabric-wide reach is zenoh_fabric_wide_read, which
+      is bound to named certificates.
+    quiet: true
+  when: zenoh_peer_read_scoped | default(false) | bool
+
+- name: Pre-flight | no partner anchor holds the fabric-wide read
+  # A partner is carved to its own anchor plus its release lanes. Naming that
+  # anchor here hands it `**` through a second subject, and across subjects the
+  # FIRST Allow wins — so the partition would be silently undone for exactly the
+  # identity it exists to restrict. Refuse rather than render it.
+  ansible.builtin.assert:
+    that:
+      - zenoh_fabric_wide_read
+        | selectattr('cn', 'defined')
+        | map(attribute='cn')
+        | select('in', zenoh_partner_read_lanes | default({}) | list)
+        | list | length == 0
+    fail_msg: >-
+      zenoh_fabric_wide_read names a PARTNER anchor. That grants the partner the
+      whole keyspace and silently undoes its B2.1 read partition. Remove the
+      line, or remove the anchor from zenoh_partner_read_lanes if it is no
+      longer a partner.
+    quiet: true
+  when:
+    - zenoh_peer_read_scoped | default(false) | bool
+    - zenoh_partner_read_partition | default(false) | bool
+
+- name: Pre-flight | flatten the pre-cut partner slot ranges (ADR 1138)
+  # The explicit lane map is only half the partner population: the pre-cut
+  # blocks carve whole ranges of slot indexes. A `slot_idx:` grant landing in
+  # one of those ranges is the same silent un-partitioning as naming the anchor.
+  ansible.builtin.set_fact:
+    goat_zenoh_partner_idxs: "{{ (goat_zenoh_partner_idxs | default([])) + range(item.from | int, (item.to | int) + 1) | list }}"
+  loop: "{{ zenoh_partner_slot_blocks | default([]) }}"
+  when:
+    - zenoh_peer_read_scoped | default(false) | bool
+    - zenoh_partner_read_partition | default(false) | bool
+
+- name: Pre-flight | no pre-cut partner slot holds the fabric-wide read
+  ansible.builtin.assert:
+    that:
+      - zenoh_fabric_wide_read
+        | selectattr('slot_idx', 'defined')
+        | map(attribute='slot_idx')
+        | select('in', goat_zenoh_partner_idxs | default([]))
+        | list | length == 0
+    fail_msg: >-
+      A zenoh_fabric_wide_read entry names a slot_idx inside a pre-cut PARTNER
+      block ({{ zenoh_partner_slot_blocks | default([]) }}). Granting it the
+      whole keyspace silently undoes that partner's read partition.
+    quiet: true
+  when:
+    - zenoh_peer_read_scoped | default(false) | bool
+    - zenoh_partner_read_partition | default(false) | bool
+
+- name: Pre-flight | the goatnet's CA root cert exists on controller
+  ansible.builtin.stat:
+    path: "{{ nova_ca_root_cert_path }}"
+  delegate_to: localhost
+  become: false
+  register: nova_ca_root_stat
+  changed_when: false
+
+- name: Pre-flight | the goatnet's router leaf cert exists on controller
+  ansible.builtin.stat:
+    path: "{{ nova_router_leaf_cert_path }}"
+  delegate_to: localhost
+  become: false
+  register: nova_router_cert_stat
+  changed_when: false
+
+- name: Pre-flight | the goatnet's router leaf key exists on controller
+  ansible.builtin.stat:
+    path: "{{ nova_router_leaf_key_path }}"
+  delegate_to: localhost
+  become: false
+  register: nova_router_key_stat
+  changed_when: false
+
+- name: Pre-flight | refuse to deploy without Track A substrate
+  ansible.builtin.assert:
+    that:
+      - nova_ca_root_stat.stat.exists
+      - nova_router_cert_stat.stat.exists
+      - nova_router_key_stat.stat.exists
+    fail_msg: >-
+      GB-071 goat-zenoh refuses to deploy: the CA root or the router leaf is
+      not on this controller. Looked for
+        - {{ nova_ca_root_cert_path }}
+        - {{ nova_router_leaf_cert_path }}
+        - {{ nova_router_leaf_key_path }}
+      The leaf is read from the site manifest's out_dir
+      (~/.goat/state/{{ goat_router_leaf_site }}-leaves), so any checkout
+      finds it. If it is missing there, mint it:
+      {{ 'router-cert.pem' | goat_leaf_mint(goat_router_leaf_site) }}
+
+# LAZY STORAGE, FAIL-CLOSED. A render writes zenoh_active_slot_anchors verbatim,
+# and that list is generated (ops/scripts/sync-slot-anchors.py) from the portal's
+# live slot registry. So a render from a STALE list does not merely lag — it
+# DELETES the store of every slot minted since the list was last generated,
+# returning each one to the F-428 state: writes permitted, nothing retained,
+# queries answering EMPTY. The portal live-adds a store at mint, but that store
+# exists only in the RUNNING config; this file is what survives a restart.
+#
+# So the render refuses rather than reverts. Regenerate, commit, deploy — in
+# that order, always. Advisory-only would be useless here: the whole failure is
+# that nobody notices.
+- name: Pre-flight | lazy storage — read the live slot set from the portal registry
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import sqlite3, subprocess, sys
+        q = ("SELECT slot_id FROM slots WHERE assigned_to IS NOT NULL "
+             "AND assigned_to != '' AND revoked_at IS NULL")
+        if "{{ zenoh_lazy_registry_store }}" == "postgres":
+            # portal_store: postgres (ADR 1165 step A): the same SELECT through
+            # the Postgres container's local socket, in a read-only session.
+            try:
+                out = subprocess.run(
+                    ["docker", "exec", "-i",
+                     "-e", "PGOPTIONS=-c default_transaction_read_only=on",
+                     "{{ zenoh_lazy_registry_pg_container }}", "psql", "-X", "-q", "-A", "-t",
+                     "-v", "ON_ERROR_STOP=1", "-U", "{{ zenoh_lazy_registry_pg_user }}",
+                     "-d", "{{ zenoh_lazy_registry_pg_db }}"],
+                    input=q + ";\n", capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print("UNREADABLE:%s" % exc, file=sys.stderr); sys.exit(2)
+            if out.returncode != 0:
+                print("UNREADABLE:%s" % out.stderr.strip(), file=sys.stderr); sys.exit(2)
+            ids = [l for l in out.stdout.splitlines() if l]
+        else:
+            try:
+                c = sqlite3.connect("file:{{ zenoh_lazy_registry_db }}?mode=ro", uri=True)
+                ids = [r[0] for r in c.execute(q).fetchall()]
+            except sqlite3.Error as exc:
+                print("UNREADABLE:%s" % exc, file=sys.stderr); sys.exit(2)
+        print("\n".join(sorted(ids)))
+  register: zenoh_live_slots
+  changed_when: false
+  failed_when: false
+  become: true
+  # MUST run under --check. A `command` is skipped in check mode by default,
+  # which left stdout empty and made the assert below report "0 live" and refuse
+  # a correct list — a guard that cries wolf on every dry run is a guard people
+  # learn to bypass. The query is a read-only SELECT against a ?mode=ro handle,
+  # so running it in check mode changes nothing.
+  check_mode: false
+  when:
+    - zenoh_identity_model == 'per-uuid-slot-pool'
+    - zenoh_lazy_slot_storage | default(false) | bool
+    # ONLY when an explicit list is committed. A goatnet with an empty list
+    # relies on the discovery step further down (dirs holding .sst), and there
+    # is no committed list to be stale — zagros_prod, zagros_cloud, zagros_b and
+    # zagros_prod_echo are all in that state today. Guarding them here would refuse
+    # every one of their deploys for a list they never had.
+    - (zenoh_active_slot_anchors | default([]) | length) > 0
+
+- name: Pre-flight | lazy storage — refuse to render an anchor list that is not the live one
+  ansible.builtin.assert:
+    that:
+      - zenoh_live_slots.rc == 0
+      - zenoh_live_slots.stdout_lines | default([]) | length > 0
+      - (zenoh_live_slots.stdout_lines | sort) == (zenoh_active_slot_anchors | default([]) | sort)
+    fail_msg: >-
+      REFUSING to render: zenoh_active_slot_anchors does not match the live slot
+      registry on this host
+      ({{ zenoh_active_slot_anchors | default([]) | length }} committed vs
+      {{ zenoh_live_slots.stdout_lines | default([]) | length }} live;
+      {{ (zenoh_live_slots.stdout_lines | default([]) | difference(zenoh_active_slot_anchors | default([]))) | length }}
+      live slots would LOSE their store, and
+      {{ ((zenoh_active_slot_anchors | default([])) | difference(zenoh_live_slots.stdout_lines | default([]))) | length }}
+      declared stores are for slots that are not live).
+      Rendering this would put every missing slot back into F-428 — writes
+      permitted, nothing retained, queries answering EMPTY. Regenerate and
+      commit first:
+        ops/scripts/sync-slot-anchors.py --env <goatnet> {{ '--registry-store postgres --pg-ssh <mgmt host>' if zenoh_lazy_registry_store == 'postgres' else '--db <registry.db>' }}
+      {{ "The registry could not be READ at all (rc=2) — that is not a drift verdict; fix access before deploying." if zenoh_live_slots.rc == 2 else "" }}
+      {{ "The registry returned ZERO live slots. On a goatnet with a live portal that is a wrong database or a real emptying, never a clean render — it is refused either way." if (zenoh_live_slots.stdout_lines | default([]) | length) == 0 else "" }}
+  when:
+    - zenoh_identity_model == 'per-uuid-slot-pool'
+    - zenoh_lazy_slot_storage | default(false) | bool
+    # ONLY when an explicit list is committed. A goatnet with an empty list
+    # relies on the discovery step further down (dirs holding .sst), and there
+    # is no committed list to be stale — zagros_prod, zagros_cloud, zagros_b and
+    # zagros_prod_echo are all in that state today. Guarding them here would refuse
+    # every one of their deploys for a list they never had.
+    - (zenoh_active_slot_anchors | default([]) | length) > 0
+
+- name: Pre-flight | slot-pool salt must be non-empty in per-uuid-slot-pool mode
+  ansible.builtin.assert:
+    that:
+      - zenoh_slot_pool_salt | length > 0
+    fail_msg: >-
+      zenoh_slot_pool_salt is EMPTY while zenoh_identity_model is
+      "per-uuid-slot-pool". group_vars source it from an env var (e.g.
+      HOBBY_SLOT_POOL_SALT) — an unsourced environment silently renders
+      the empty-salt pool sha256(":<k>"), which matches NOTHING the
+      portal (which baked its pool at first boot with the real salt)
+      ever assigns: every minted cert then writes nothing, silently
+      Source the site envrc and re-run.
+  when: zenoh_identity_model == "per-uuid-slot-pool"
+
+- name: Ensure goat-zenoh dirs exist on host (non-portal-writable)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /etc/{{ zenoh_stack }}/tls
+    - /opt/{{ zenoh_stack }}
+    - "{{ goat_zenoh_plugin_dir }}"
+    - "{{ goat_zenoh_storage_path }}"
+
+# /etc/{{ zenoh_stack }}/ must be group-writable by the goat-zenoh-portal
+# container's UID (65532 — chainguard nonroot) so the portal can
+# atomic-write per-vendor ACL marker stanzas + storage stanzas via the
+# tmpfile-then-rename pattern. Without group write, Phase 4 vendor mint
+# returns HTTP 200 with `note_to_share: "ACL render failed"` instead of
+# 201, the orchestrator halts, and the bundle never renders. See
+# 2026-05-20 incident: Patrick Dufour onboarding hit this regression
+# after a prior root-owned tmpfile blocked a chainguard-nonroot atomic
+# write. Owner stays root; group is the portal container's GID.
+- name: Ensure /etc/{{ zenoh_stack }}/ is portal-group-writable
+  ansible.builtin.file:
+    path: /etc/{{ zenoh_stack }}
+    state: directory
+    owner: root
+    group: "65532"
+    mode: "0775"
+
+# RocksDB backend .so (not shipped in upstream eclipse/zenoh image) —
+# download the matching prebuilt artifact from the upstream
+# zenoh-backend-rocksdb release, verify SHA256, drop into the host
+# plugin dir. docker-compose.yml bind-mounts that dir into the
+# container at /opt/zenoh/plugins (read-only); config.json5's
+# storage_manager.backend_search_dirs picks it up. Same upstream release
+# tag as the image = ABI alignment by construction (ADR 0858).
+- name: Resolve rocksdb backend artifact for this host's architecture
+  ansible.builtin.set_fact:
+    goat_zenoh_rocksdb_backend_arch: "{{ goat_zenoh_rocksdb_backend_arch_map[ansible_architecture] }}"
+    goat_zenoh_rocksdb_backend_sha256: "{{ goat_zenoh_rocksdb_backend_sha256_map[ansible_architecture] }}"
+  failed_when: ansible_architecture not in goat_zenoh_rocksdb_backend_arch_map
+  # FIPS variant bakes its matched-pair glibc backend into the image — the
+  # musl artifact can't load in a glibc zenohd and must not be delivered.
+  when: not goat_zenoh_fips_variant | bool
+
+- name: Ensure unzip is present (rocksdb backend ships as a zip; minimal server installs lack it)
+  ansible.builtin.apt:
+    name: unzip
+    state: present
+  when: not goat_zenoh_fips_variant | bool
+
+- name: Fetch + verify upstream rocksdb backend zip
+  ansible.builtin.get_url:
+    url: "{{ goat_zenoh_rocksdb_backend_url_template | regex_replace('\\{version\\}', goat_zenoh_rocksdb_backend_version) | regex_replace('\\{arch\\}', goat_zenoh_rocksdb_backend_arch) }}"
+    dest: "/opt/{{ zenoh_stack }}/zenoh-backend-rocksdb-{{ goat_zenoh_rocksdb_backend_version }}-{{ goat_zenoh_rocksdb_backend_arch }}-musl.zip"
+    checksum: "sha256:{{ goat_zenoh_rocksdb_backend_sha256 }}"
+    mode: "0644"
+  register: goat_zenoh_rocksdb_zip
+  notify: Restart nova zenoh router
+  when: not goat_zenoh_fips_variant | bool
+
+- name: Install libzenoh_backend_rocksdb.so to host plugin dir
+  ansible.builtin.unarchive:
+    src: "{{ goat_zenoh_rocksdb_zip.dest }}"
+    dest: "{{ goat_zenoh_plugin_dir }}/"
+    remote_src: true
+    creates: "{{ goat_zenoh_plugin_dir }}/libzenoh_backend_rocksdb.so"
+  notify: Restart nova zenoh router
+  when: not goat_zenoh_fips_variant | bool
+
+# Snapshot which issuers the router trusts RIGHT NOW, before the copy below
+# overwrites the bundle. Paired with the assertion after the append.
+#
+# WHY. The copy is destructive (it replaces ca-root-cert.pem with the offline
+# root alone) and the append rebuilds the rest from OTHER sources. If a source
+# has drifted -- most plausibly spire-trust-sync having appended a rotated SPIRE
+# CA that /opt/spire/data/server/spire-ca.pem no longer carries -- the rebuild
+# silently drops an issuer that live peers still chain to. ACL/TLS denial is
+# silent at both ends, so the loss would surface as peers "just not
+# working", not as an error. Checked on ZAGROS 2026-09-03: the bundle held two
+# SPIFFE CAs and the SPIRE source carried both, so nothing was lost -- but that
+# was luck confirmed by measurement, not a property anything enforced.
+- name: Snapshot currently-trusted issuers before rewriting the CA bundle
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -uo pipefail
+      f="{{ goat_zenoh_tls_dir }}/ca-root-cert.pem"
+      [ -f "$f" ] || { : > /tmp/.goat-trust-before; echo "no-prior-bundle"; exit 0; }
+      awk 'BEGIN{n=0} /BEGIN CERT/{n++} {print > ("/tmp/.gtb-" n ".pem")}' "$f"
+      for c in /tmp/.gtb-*.pem; do
+        [ -s "$c" ] && openssl x509 -in "$c" -noout -fingerprint -sha256 2>/dev/null
+      done | sed 's/.*=//' | sort -u > /tmp/.goat-trust-before
+      rm -f /tmp/.gtb-*.pem
+      wc -l < /tmp/.goat-trust-before
+  register: goat_trust_before
+  changed_when: false
+  tags: [trust-anchors]
+
+- name: Deliver the goatnet's CA root cert to host
+  ansible.builtin.copy:
+    src: "{{ nova_ca_root_cert_path }}"
+    dest: "{{ goat_zenoh_tls_dir }}/ca-root-cert.pem"
+    mode: "0644"
+  notify: Restart nova zenoh router
+  tags: [trust-anchors]
+
+# Deliver repo-side extra trust roots (e.g. ZAGROS's own offline-CA root during
+# the additive phase of a CA migration) BEFORE the append below, so the append
+# finds them on disk. Empty by default — nova-a renders byte-identical.
+- name: Deliver repo-side extra trust roots to host
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0644"
+  loop: "{{ goat_zenoh_extra_ca_deliver }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  when: goat_zenoh_extra_ca_deliver | length > 0
+  notify: Restart nova zenoh router
+  tags: [trust-anchors]
+
+# Fold extra trust roots (e.g. the SPIRE CA on ZAGROS) into the same root_ca
+# bundle so the router admits client certs chaining to them — without a second
+# root_ca field (zenoh accepts one). Idempotent: appends each extra only if not
+# already present. No-op when the list is empty (nova-a byte-identical).
+- name: Append extra trust roots to the router CA bundle (target-side)
+  ansible.builtin.shell:
+    # bash, not the default /bin/sh (dash) — `set -o pipefail` is a bashism and
+    # this task only runs when extra_ca_paths is non-empty (ZAGROS's SPIRE CA), so
+    # the dash failure never surfaced on nova-a (empty list → task skipped).
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      changed=0
+      for f in {{ goat_zenoh_extra_ca_paths | join(' ') }}; do
+        if [ -f "$f" ] && ! grep -qF "$(cat "$f")" "{{ goat_zenoh_tls_dir }}/ca-root-cert.pem"; then
+          cat "$f" >> "{{ goat_zenoh_tls_dir }}/ca-root-cert.pem"
+          changed=1
+        fi
+      done
+      echo "extra_ca_changed=${changed}"
+  register: nova_extra_ca
+  changed_when: "'extra_ca_changed=1' in nova_extra_ca.stdout"
+  when: goat_zenoh_extra_ca_paths | length > 0
+  notify: Restart nova zenoh router
+  tags: [trust-anchors]
+
+# Fail CLOSED if the rebuilt bundle lost an issuer it previously carried.
+# Failing here stops the play before the restart handler runs, so the router
+# keeps serving with its old in-memory trust while the operator investigates --
+# a wrong file on disk is recoverable, a router that has already reloaded a
+# short bundle is a live outage with no error message.
+- name: Assert the rebuilt CA bundle lost no previously-trusted issuer
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -uo pipefail
+      f="{{ goat_zenoh_tls_dir }}/ca-root-cert.pem"
+      awk 'BEGIN{n=0} /BEGIN CERT/{n++} {print > ("/tmp/.gta-" n ".pem")}' "$f"
+      for c in /tmp/.gta-*.pem; do
+        [ -s "$c" ] && openssl x509 -in "$c" -noout -fingerprint -sha256 2>/dev/null
+      done | sed 's/.*=//' | sort -u > /tmp/.goat-trust-after
+      rm -f /tmp/.gta-*.pem
+      missing="$(comm -23 /tmp/.goat-trust-before /tmp/.goat-trust-after)"
+      if [ -n "$missing" ]; then
+        echo "DROPPED_ISSUERS"
+        echo "$missing"
+        exit 1
+      fi
+      echo "ok: $(wc -l < /tmp/.goat-trust-before) before, $(wc -l < /tmp/.goat-trust-after) after"
+  register: goat_trust_after
+  changed_when: false
+  failed_when: goat_trust_after.rc != 0
+  when: goat_zenoh_extra_ca_paths | length > 0
+  tags: [trust-anchors]
+
+- name: Deliver the goatnet's router leaf cert to host
+  ansible.builtin.copy:
+    src: "{{ nova_router_leaf_cert_path }}"
+    dest: "{{ goat_zenoh_tls_dir }}/router-cert.pem"
+    mode: "0644"
+  notify: Restart nova zenoh router
+
+- name: Deliver the goatnet's router leaf key to host
+  ansible.builtin.copy:
+    src: "{{ nova_router_leaf_key_path }}"
+    dest: "{{ goat_zenoh_tls_dir }}/router-key.pem"
+    mode: "0600"
+  notify: Restart nova zenoh router
+
+# --- F-258 identity-model branch ------------------------------------------
+# per-vendor mode (nova-a / nova-lan / nova-twin): the portal appends per-vendor ACL
+# rules to the LIVE config at runtime, so a plain role re-render drops them. The
+# durable fix splits the ACL into a role-owned SEED (config.json5.j2 with the
+# per-vendor regions empty) + a portal-owned ORG FRAGMENT (every seed + runtime
+# vendor), reconciled by acl-assemble.py — a re-render regenerates only the seed
+# and re-splices the fragment, so runtime vendors can never be dropped.
+# slot-pool mode (ZAGROS / hobby): the ACL is template-rendered deterministically
+# (pre-cut slots, no add-vendor.sh) — the fragment split does not apply; keep the
+# direct-render + clobber-guard path unchanged. See docs/findings/F-258.
+- name: F-258 | resolve identity-model branch
+  ansible.builtin.set_fact:
+    jz_per_vendor: "{{ zenoh_identity_model != 'per-uuid-slot-pool' }}"
+
+# ===== SLOT-POOL MODE: direct render + clobber-guard (unchanged) ===========
+- name: Clobber-safety — count ACL rules in the live config (0 if fresh)
+  ansible.builtin.shell:
+    cmd: "if [ -f '{{ goat_zenoh_config_path }}' ]; then grep -c 'permission:' '{{ goat_zenoh_config_path }}'; else echo 0; fi"
+  register: jz_live_acl_rules
+  changed_when: false
+  check_mode: false
+  when: not jz_per_vendor
+
+- name: Clobber-safety — render the template to a scratch file for comparison
+  ansible.builtin.template:
+    src: "config.json5.j2"
+    dest: "/tmp/jz-acl-check-{{ zenoh_stack }}.json5"
+    mode: "0600"
+  changed_when: false
+  check_mode: false
+  when: not jz_per_vendor
+
+- name: Clobber-safety — count ACL rules the template would render
+  ansible.builtin.shell:
+    cmd: "grep -c 'permission:' '/tmp/jz-acl-check-{{ zenoh_stack }}.json5'"
+  register: jz_tmpl_acl_rules
+  changed_when: false
+  check_mode: false
+  when: not jz_per_vendor
+
+- name: Clobber-safety — refuse to drop runtime portal-added ACL rules
+  ansible.builtin.assert:
+    that:
+      - (jz_live_acl_rules.stdout | int) <= (jz_tmpl_acl_rules.stdout | int)
+        or (goat_zenoh_allow_acl_rerender | default(false) | bool)
+    quiet: true
+    fail_msg: >-
+      REFUSING to re-render {{ goat_zenoh_config_path }}: the LIVE config has
+      {{ jz_live_acl_rules.stdout }} ACL rules but this template renders only
+      {{ jz_tmpl_acl_rules.stdout }} — a re-render would DROP
+      {{ (jz_live_acl_rules.stdout | int) - (jz_tmpl_acl_rules.stdout | int) }}
+      runtime portal-added rules and cut those tenants off the fabric.
+      Deploy image/config-preserving changes with the surgical image swap
+      (compose image + force-recreate; ops/scripts/rollback.sh shape). Only after
+      capturing the live rules back into the seed, re-run with
+      -e goat_zenoh_allow_acl_rerender=true.
+    success_msg: "ACL clobber-safety OK (live {{ jz_live_acl_rules.stdout }} <= template {{ jz_tmpl_acl_rules.stdout }})."
+  when: not jz_per_vendor
+
+- name: Clobber-safety — remove the scratch comparison file
+  ansible.builtin.file:
+    path: "/tmp/jz-acl-check-{{ zenoh_stack }}.json5"
+    state: absent
+  changed_when: false
+  check_mode: false
+  when: not jz_per_vendor
+
+# Lazy slot-pool storage (zenoh-storage-taxonomy-sharding.md): when enabled and no
+# explicit anchor list is provided, discover the LIVE slot anchors from disk — the
+# 32-hex anchor dirs that already hold rocksdb data (.sst). These are the stores
+# the render declares; empty pool slots get no store. Explicitly setting
+# zenoh_active_slot_anchors (e.g. registry-derived) overrides discovery.
+- name: Lazy storage | discover active slot anchors (dirs holding rocksdb data)
+  ansible.builtin.shell: |
+    set -o pipefail
+    shopt -s nullglob
+    for d in "{{ goat_zenoh_storage_path }}"/*/; do
+      b="$(basename "$d")"
+      if [[ "$b" =~ ^[0-9a-f]{32}$ ]] && compgen -G "$d"/*.sst >/dev/null 2>&1; then
+        echo "$b"
+      fi
+    done
+  args:
+    executable: /bin/bash
+  register: _lazy_active_anchors
+  changed_when: false
+  check_mode: false
+  when:
+    - not jz_per_vendor
+    - zenoh_lazy_slot_storage | default(false) | bool
+    - (zenoh_active_slot_anchors | default([]) | length) == 0
+
+- name: Lazy storage | set zenoh_active_slot_anchors from discovery
+  ansible.builtin.set_fact:
+    zenoh_active_slot_anchors: "{{ _lazy_active_anchors.stdout_lines | default([]) }}"
+  when:
+    - not jz_per_vendor
+    - zenoh_lazy_slot_storage | default(false) | bool
+    - (zenoh_active_slot_anchors | default([]) | length) == 0
+    - _lazy_active_anchors is defined
+
+- name: Render zenoh config.json5 directly (slot-pool mode)
+  ansible.builtin.template:
+    src: "config.json5.j2"
+    dest: "{{ goat_zenoh_config_path }}"
+    mode: "0644"
+  notify: Restart nova zenoh router
+  when: not jz_per_vendor
+
+# F-447 — a render that STOPS declaring a storage does not remove what that
+# storage wrote. The directory and its samples stay on disk, and the
+# fabric-crawler keeps opening them, because the crawler enumerates store
+# DIRECTORIES (rocksdb_census, read_dir over the storage base) rather than the
+# router's configured storages. Two consequences: samples from a temporary
+# enable outlive the enable with no retention rule attached, because retention
+# is expressed per CONFIGURED storage; and "nothing was ever published here"
+# cannot be answered from the render alone. That second one is not theoretical
+# — it is the question the ADR 1105 `multipub/` rename was gated on, and the
+# render said no while the disk said yes.
+#
+# So compare the two, on every deploy, at the moment a revert would create an
+# orphan. The RENDERED CONFIG IS THE DECLARATION: parse the `dir:` values out
+# of the file that was just written rather than re-deriving the template's own
+# logic, so this can never drift from what the router will actually serve.
+#
+# Reports; never deletes. Deleting a store because the current render omits it
+# would be a data-loss primitive one typo away from firing on the whole pool
+# (an unset zenoh_active_slot_anchors renders no slot stores at all). Disposal
+# stays an operator act. `zenoh_orphan_stores_fail` lets a goatnet that has
+# been cleaned ratchet this to hard-fail later.
+- name: Orphaned stores | list store dirs the current render does not declare
+  ansible.builtin.shell:
+    executable: /bin/bash
+    # `cmd:` rather than the free-form string form ON PURPOSE: free-form makes
+    # ansible split the command looking for key=value args, and this body's
+    # nested quoting ("..." around '...' around "...") defeats that splitter
+    # with "unbalanced jinja2 block or quotes". Same shape as the F-258 probe
+    # below.
+    cmd: |
+      set -o pipefail
+      store_base='{{ goat_zenoh_storage_path }}'
+      cfg='{{ goat_zenoh_config_path }}'
+      [ -d "$store_base" ] || exit 0
+      [ -f "$cfg" ] || exit 0
+      declared=$(grep -oE 'dir:[[:space:]]*"[^"]+"' "$cfg" \
+                 | sed -E 's/.*"(.*)"/\1/' \
+                 | grep -E "^${store_base}/" \
+                 | sed -E "s#^${store_base}/##" \
+                 | sed -E 's#/+$##' \
+                 | sort -u)
+      ondisk=$(find "$store_base" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -u)
+      comm -13 <(printf '%s\n' "$declared") <(printf '%s\n' "$ondisk")
+  register: _zenoh_orphan_stores
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Orphaned stores | record the list on the host for later disposal
+  ansible.builtin.copy:
+    content: |
+      # Store directories present under {{ goat_zenoh_storage_path }} that the
+      # CURRENT rendered config ({{ goat_zenoh_config_path }}) does not declare.
+      # Written by the goat-zenoh role on every deploy. F-447.
+      #
+      # A name here is data the router is NO LONGER SERVING but has NOT deleted.
+      # It is still counted and opened by the fabric-crawler every cycle, and no
+      # retention rule applies to it. Disposal is an operator act: confirm the
+      # store is genuinely dead, back it up, then remove the directory.
+      #
+      # Rendered at: {{ ansible_date_time.iso8601 | default('unknown') }}
+      {% for _d in (_zenoh_orphan_stores.stdout_lines | default([])) %}
+      {{ _d }}
+      {% endfor %}
+    dest: "{{ goat_zenoh_storage_path }}/.undeclared-stores"
+    mode: "0644"
+  when: _zenoh_orphan_stores is defined
+
+- name: Orphaned stores | report
+  ansible.builtin.debug:
+    msg: >-
+      F-447: {{ _zenoh_orphan_stores.stdout_lines | default([]) | length }}
+      store directory/ies under {{ goat_zenoh_storage_path }} are NOT declared by
+      the current render and are therefore unserved, unretained, and still
+      crawled: {{ _zenoh_orphan_stores.stdout_lines | default([]) | join(', ') }}.
+      Listed in {{ goat_zenoh_storage_path }}/.undeclared-stores. Disposal is an
+      operator act — this task never deletes.
+  when: (_zenoh_orphan_stores.stdout_lines | default([]) | length) > 0
+
+- name: Orphaned stores | fail if this goatnet has ratcheted to zero
+  ansible.builtin.fail:
+    msg: >-
+      F-447: zenoh_orphan_stores_fail is set for this goatnet, and
+      {{ _zenoh_orphan_stores.stdout_lines | default([]) | length }} undeclared
+      store directory/ies remain:
+      {{ _zenoh_orphan_stores.stdout_lines | default([]) | join(', ') }}.
+      Dispose of them (or clear the flag) before deploying.
+  when:
+    - zenoh_orphan_stores_fail | default(false) | bool
+    - (_zenoh_orphan_stores.stdout_lines | default([]) | length) > 0
+
+# ===== PER-VENDOR MODE: F-258 seed + org fragment reconciliation ===========
+- name: F-258 | install acl-assemble.py reconciler on host
+  ansible.builtin.copy:
+    src: "acl-assemble.py"
+    dest: "{{ goat_zenoh_acl_assemble_path }}"
+    mode: "0755"
+  when: jz_per_vendor
+
+- name: F-258 | render the role-owned SEED (per-vendor regions empty)
+  ansible.builtin.template:
+    src: "config.json5.j2"
+    dest: "{{ goat_zenoh_acl_seed_path }}"
+    mode: "0644"
+  when: jz_per_vendor
+
+- name: F-258 | probe org-fragment + live + seed rule counts
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      frag='{{ goat_zenoh_acl_org_path }}'; live='{{ goat_zenoh_config_path }}'; seed='{{ goat_zenoh_acl_seed_path }}'
+      echo "frag_exists=$([ -f "$frag" ] && echo 1 || echo 0)"
+      echo "live_rules=$([ -f "$live" ] && grep -c 'permission:' "$live" || echo 0)"
+      echo "seed_rules=$(grep -c 'permission:' "$seed")"
+  register: jz_frag_probe
+  changed_when: false
+  check_mode: false
+  when: jz_per_vendor
+
+- name: F-258 | parse fragment/live/seed state
+  ansible.builtin.set_fact:
+    jz_frag_exists: "{{ jz_frag_probe.stdout | regex_search('frag_exists=(\\d+)', '\\1') | first | int }}"
+    jz_live_rules: "{{ jz_frag_probe.stdout | regex_search('live_rules=(\\d+)', '\\1') | first | int }}"
+    jz_seed_rules: "{{ jz_frag_probe.stdout | regex_search('seed_rules=(\\d+)', '\\1') | first | int }}"
+  when: jz_per_vendor
+
+- name: F-258 | refuse an un-migrated router (live runtime vendors, no fragment)
+  ansible.builtin.assert:
+    that:
+      - (jz_frag_exists | int) == 1
+        or (jz_live_rules | int) <= (jz_seed_rules | int)
+        or (goat_zenoh_allow_acl_rerender | default(false) | bool)
+    quiet: true
+    fail_msg: >-
+      REFUSING to deploy: {{ goat_zenoh_config_path }} has {{ jz_live_rules }}
+      ACL rules but there is no org fragment at {{ goat_zenoh_acl_org_path }}
+      and the seed renders only {{ jz_seed_rules }} — this router has runtime
+      portal-added vendors not yet captured into the fragment. Run the one-time
+      migration (ops/ansible/goat-zenoh-acl-migrate.yml: extract → byte-verify
+      → install fragment; non-disruptive) before deploying. See docs/findings/F-258.
+    success_msg: "F-258 fragment state OK (frag={{ jz_frag_exists }}, live={{ jz_live_rules }}, seed={{ jz_seed_rules }})."
+  when: jz_per_vendor
+
+- name: F-258 | bootstrap org fragment for a FRESH standup (no fragment yet)
+  ansible.builtin.template:
+    src: "acl-org-fragment.json5.j2"
+    dest: "{{ goat_zenoh_acl_org_path }}"
+    mode: "0644"
+  when:
+    - jz_per_vendor
+    - (jz_frag_exists | int) == 0
+
+- name: F-258 | assemble live config from seed + org fragment (to scratch)
+  ansible.builtin.command:
+    cmd: >-
+      python3 {{ goat_zenoh_acl_assemble_path }} assemble
+      --seed {{ goat_zenoh_acl_seed_path }}
+      --org {{ goat_zenoh_acl_org_path }}
+      --out /tmp/jz-assembled-{{ zenoh_stack }}.json5
+  changed_when: false
+  check_mode: false
+  when: jz_per_vendor
+
+- name: F-258 | publish assembled live config (idempotent; notifies restart on change)
+  ansible.builtin.copy:
+    src: "/tmp/jz-assembled-{{ zenoh_stack }}.json5"
+    dest: "{{ goat_zenoh_config_path }}"
+    remote_src: true
+    mode: "0644"
+  notify: Restart nova zenoh router
+  when: jz_per_vendor
+
+- name: F-258 | remove assemble scratch file
+  ansible.builtin.file:
+    path: "/tmp/jz-assembled-{{ zenoh_stack }}.json5"
+    state: absent
+  changed_when: false
+  check_mode: false
+  when: jz_per_vendor
+
+# ===== F-364 | universal-read coverage assert ==============================
+# Runs AFTER the config is rendered and BEFORE the restart handler flushes, so
+# a failure aborts the play with the previous (working) ACL still in force —
+# F-156 means the router only picks up an ACL on restart, which is exactly the
+# window this uses.
+#
+# Why it is a host-side assert and not a CI check: zenoh_universal_read_cns is
+# a list of reader cert CNs, and reader CNs are minted PER GOATNET. A repo-side
+# check can only compare the list against another list. The truth lives in the
+# certs mounted on this host, so the check has to run here. zagros-prod shipped
+# zagros's four CNs, none of which exist on zagros-prod, and nothing anywhere could
+# have noticed until three inspection surfaces went silently dark.
+- name: F-287 | install the ACL evaluator
+  # Not a gate — a tool. It answers "which live subscriptions would this ACL
+  # refuse?" from the router's own census, which is the pre-flight for turning
+  # zenoh_peer_read_scoped on and the post-mortem when a reader goes quiet:
+  #   curl -s "http://127.0.0.1:8000/@/*/router/subscriber/**" > /tmp/subs.json
+  #   {{ goat_zenoh_acl_evaluate_path }} impact {{ goat_zenoh_config_path }} trial-peer-read /tmp/subs.json
+  ansible.builtin.copy:
+    src: "acl-evaluate.py"
+    dest: "{{ goat_zenoh_acl_evaluate_path }}"
+    mode: "0755"
+
+- name: F-364 | install universal-read coverage checker
+  ansible.builtin.copy:
+    src: "assert-universal-read-coverage.py"
+    dest: "{{ goat_zenoh_read_coverage_check_path }}"
+    mode: "0755"
+
+# Skipped under --check: check mode renders no config and copies no checker, so
+# there would be nothing to assert against. The assert belongs to a real run,
+# which is the only run that can reach a restart.
+- name: F-364 | assert narrowing the universal read blinds no live reader
+  ansible.builtin.command:
+    cmd: "{{ goat_zenoh_read_coverage_check_path }} {{ goat_zenoh_config_path }}"
+  register: goat_zenoh_read_coverage
+  changed_when: false
+  failed_when: goat_zenoh_read_coverage.rc != 0
+  when: not ansible_check_mode
+
+- name: F-364 | show universal-read coverage verdict
+  ansible.builtin.debug:
+    var: goat_zenoh_read_coverage.stdout_lines
+  when: not ansible_check_mode
+
+# ---- Helpers (per-vendor only; slot-pool onboarding is pure cert-mint) -----
+- name: Install add-vendor helper script (per-vendor)
+  ansible.builtin.copy:
+    src: "add-vendor.sh"
+    dest: "{{ goat_zenoh_helper_path }}"
+    mode: "0755"
+  when: jz_per_vendor
+
+- name: Install delete-vendor helper script (per-vendor)
+  ansible.builtin.copy:
+    src: "delete-vendor.sh"
+    dest: "{{ goat_zenoh_delete_helper_path }}"
+    mode: "0755"
+  when: jz_per_vendor
+
+- name: Render zenoh docker-compose.yml
+  ansible.builtin.template:
+    src: "docker-compose.yml.j2"
+    dest: "{{ goat_zenoh_compose_path }}"
+    mode: "0644"
+  notify: Restart nova zenoh router
+
+# ---- Boot-race healer ---------------------------------------------
+# The router's host-port publish is pinned to the netbird mesh IP, which
+# doesn't exist on wt0 until netbird finishes enrolling — AFTER the docker
+# daemon's boot-time `unless-stopped` start attempt. That attempt dies with
+# exit 255 and takes every mTLS client down with it. This oneshot waits for
+# the mesh IP at boot, then converges the router. See mesh-boot.sh.j2.
+- name: Install goat-zenoh mesh-boot healer script
+  ansible.builtin.template:
+    src: "mesh-boot.sh.j2"
+    dest: /usr/local/sbin/{{ zenoh_stack }}-mesh-boot.sh
+    mode: "0755"
+    owner: root
+    group: root
+
+- name: Install goat-zenoh mesh-boot systemd unit
+  ansible.builtin.template:
+    # src is the FIXED template filename (not zenoh_stack-derived — there is
+    # one template); only the rendered unit name (dest) is per-stack. nova-a
+    # worked by coincidence (its zenoh_stack == 'goat-zenoh' matched the
+    # filename); ZAGROS surfaced the bug.
+    src: "goat-zenoh-mesh-boot.service.j2"
+    dest: /etc/systemd/system/{{ zenoh_stack }}-mesh-boot.service
+    mode: "0644"
+    owner: root
+    group: root
+  register: goat_zenoh_mesh_boot_unit
+
+- name: Enable goat-zenoh mesh-boot unit (start at boot, after mesh IP)
+  ansible.builtin.systemd:
+    name: "{{ zenoh_stack }}-mesh-boot.service"
+    enabled: true
+    daemon_reload: "{{ goat_zenoh_mesh_boot_unit.changed }}"
+
+- name: Pull zenoh image
+  # `docker pull` rather than community.docker.docker_image — keeps the
+  # role's collection dep set to just the ones the syntax-check CI
+  # already installs (ansible.posix + community.general). The follow-on
+  # `docker compose up -d` would pull on first run anyway; this is just
+  # an explicit-pull step for operator visibility.
+  ansible.builtin.command:
+    cmd: "docker pull {{ nova_zenoh_image }}"
+  register: goat_zenoh_pull
+  changed_when: "'Downloaded newer image' in goat_zenoh_pull.stdout or 'Pull complete' in goat_zenoh_pull.stdout"
+
+- name: Start zenoh router
+  ansible.builtin.command:
+    cmd: docker compose -f {{ goat_zenoh_compose_path }} up -d
+  register: goat_zenoh_up
+  changed_when: "'Started' in goat_zenoh_up.stderr or 'Created' in goat_zenoh_up.stderr or 'Recreated' in goat_zenoh_up.stderr"
+
+- name: Wait for zenoh REST endpoint
+  # REST plugin returns 400 on `GET /` by design — probe an admin
+  # endpoint that returns 200 instead. Endpoint discovered at first
+  # successful deploy 2026-05-15. Bind is on the host-side mesh IP
+  # (goat_zenoh_rest_host); the host's 127.0.0.1:8000 has no
+  # listener because the docker-compose port-map narrows to the mesh IP.
+  ansible.builtin.uri:
+    url: "http://{{ goat_zenoh_rest_host }}:{{ goat_zenoh_rest_port }}/@/local/router/config"
+    status_code: [200]
+  register: goat_zenoh_health
+  retries: 20
+  delay: 3
+  until: goat_zenoh_health.status == 200
+
+# FIPS variant fail-closed post-check: the patched zenohd asserts
+# try_fips_mode() at startup and prints this marker before serving; a router
+# that booted without the module in FIPS mode must fail the play, not run
+# silently classical (ADR 1079 / zenoh-pqc-tls.md §5).
+- name: Assert FIPS boot marker (goat FIPS module active)
+  ansible.builtin.shell:
+    cmd: >-
+      docker logs {{ zenoh_stack }}-router 2>&1
+      | grep -q 'goat FIPS: AWS-LC FIPS module active'
+  changed_when: false
+  when: goat_zenoh_fips_variant | bool
+
+# Host-side FIPS attestation file — the evidence source the crypto-posture
+# publisher reads (ADR 1079). Written ONLY after the boot marker asserts
+# above, so `fips_marker: true` means the deploy actually saw the module
+# enter FIPS mode on this image digest. The publisher freshness-grades it;
+# a stale or absent file degrades the rendered posture to grey, never green.
+# Removed on a non-FIPS deploy so the evidence can't go stale-positive.
+- name: Write FIPS attestation for crypto-posture (fips variant)
+  ansible.builtin.copy:
+    dest: "/etc/{{ zenoh_stack }}/fips-attest.json"
+    mode: "0644"
+    content: |
+      {
+        "fips_marker": true,
+        "image_digest": "{{ nova_zenoh_image | regex_replace('^.*@', '') }}",
+        "attested_at_ms": {{ (ansible_date_time.epoch | int) * 1000 }},
+        "module": "AWS-LC FIPS 3.1.0 (CMVP #5298/#5314)"
+      }
+  when: goat_zenoh_fips_variant | bool
+
+- name: Remove stale FIPS attestation (non-fips variant)
+  ansible.builtin.file:
+    path: "/etc/{{ zenoh_stack }}/fips-attest.json"
+    state: absent
+  when: not goat_zenoh_fips_variant | bool
+
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.
+
+# ---- CF-4: record the config render manifest --------------------------------
+# AFTER every render above, deliberately: the ledger row (role entry) records
+# what the run INTENDED; this hashes what the converge actually produced. The
+# watch-set is DECLARED DATA — `consistency_render_watch` in the generated
+# pins.yml, from fleet-pins.yaml `render_watch:` — so this role carries no
+# path list of its own. Default-off (consistency_render_manifest_enabled) and
+# declared-off (empty watch-set): a goatnet that declares nothing records
+# nothing, and the include below is then a no-op.
+# Canon: docs/design/consistency-foundation.md §5.2a.
+- name: Record the config render manifest (CF-4)
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: render-manifest
+  vars:
+    render_component: nova-zenoh

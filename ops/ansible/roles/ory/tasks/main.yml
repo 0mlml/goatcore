@@ -1,0 +1,706 @@
+---
+# Block 21C — deploy per-site Ory Kratos + Hydra to a mgmt-host pair.
+# ADR 0411 (Accepted post-spike). Idempotent: re-runs are
+# safe; admin import skips existing identities.
+#
+# Required vars:
+#   site_id                    short site identifier (e.g. "acme")
+#   site_dns_zone              full mesh DNS zone (default in defaults/main.yml)
+#   postgres_superuser_password  shared with mgmt-host role
+#   kratos_cookie_secret       64 hex chars  — CLUSTER-SHARED (see below)
+#   kratos_cipher_secret       32 hex chars  — CLUSTER-SHARED
+#   hydra_secrets_system       64 hex chars  — CLUSTER-SHARED
+#   hydra_secrets_cookie       64 hex chars  — CLUSTER-SHARED
+# Optional:
+#   site_admins                list of {email, name, password_hash, groups[]}
+#   ory_kratos_image           override for spike pin
+#   ory_hydra_image            override for spike pin
+#
+# Cluster-shared secret discipline: the four Ory secrets above MUST be
+# byte-identical across every site that joins the Spock-replicated kratos.*
+# / hydra.* schemas. The role NEVER auto-generates them — it
+# only asserts presence and reads from the operator's .envrc.local. Genesis
+# is one-time, operator-fired via ops/scripts/cluster-secrets-init.sh on
+# the FIRST cluster site; every subsequent site mirrors the same values via
+# `<SITE>_KRATOS_*` / `<SITE>_HYDRA_*` env-var aliases. site-preflight.yml
+# refuses to PASS without them per ops/ansible/vars/site-required-env-vars.yml.
+
+- name: Require site_id + site_dns_zone
+  ansible.builtin.assert:
+    that:
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+    fail_msg: |
+      site_id and site_dns_zone must be set per-instance in
+      group_vars/<site>_hosts/vars.yml. site_id is the per-group identifier
+      (e.g. "vega", "integdev"). site_dns_zone is the instance mesh DNS zone
+      (e.g. netbird.nova.example, netbird-prod.goat.example) — it has NO
+      role default (fail-closed per docs/design/instance-variability-model.md),
+      so a forgotten override fails here instead of silently rendering
+      legacy URLs into this instance's identity plane.
+
+- name: Require secrets
+  ansible.builtin.assert:
+    that:
+      - kratos_cookie_secret is defined and (kratos_cookie_secret | length) >= 32
+      - kratos_cipher_secret is defined and (kratos_cipher_secret | length) == 32
+      - hydra_secrets_system is defined and (hydra_secrets_system | length) >= 32
+      - hydra_secrets_cookie is defined and (hydra_secrets_cookie | length) >= 32
+      # Block 21D.1.b — selfservice-ui (login/registration HTML renderer)
+      # requires cookie + CSRF secrets to bind. Without these the container
+      # crash-loops on startup and OIDC login flows return 502 from Traefik.
+      - ui_cookie_secret is defined and (ui_cookie_secret | length) >= 32
+      - ui_csrf_secret is defined and (ui_csrf_secret | length) >= 32
+    fail_msg: |
+      Missing or undersized Ory secrets — these are CLUSTER-SHARED, do NOT
+      generate fresh values for this site (per F-005, KRATOS_CIPHER must be
+      byte-identical cluster-wide; cookie + hydra secrets aligned for
+      simplicity). UI_COOKIE / UI_CSRF can be per-site (no F-005 invariant
+      — selfservice-ui state isn't cluster-replicated).
+
+      Recovery paths, in order of preference:
+
+        (a) FIRST cluster site (no prior Ory deploy anywhere):
+              ops/scripts/cluster-secrets-init.sh
+            → generates the 4 secrets, appends labeled block to .envrc.local,
+              prompts operator to persist to 1Password, prints next steps.
+
+        (b) Subsequent site (Ory already deployed elsewhere — usual case):
+              1. Pull from 1Password (preferred), OR
+              2. Recover from a deployed peer:
+                   ssh ... <vega-A> 'sudo grep -E "^(KRATOS|HYDRA)_SECRETS" \
+                     /opt/mgmt-host/.env'
+              3. Drop into .envrc.local under the cluster-shared block, mirror
+                 to <SITE>_* aliases byte-for-byte. direnv allow.
+
+      Do not run `openssl rand` for these values on a non-first site — it
+      will silently break Spock-replicated kratos.* / hydra.* row decryption.
+      See docs/operations/ory-deploy-handoff.md §"Cluster secrets" for the
+      full discipline.
+
+# Asserted up here with the other preconditions — BEFORE kratos.yaml is
+# rendered — so an incomplete courier config fails the deploy outright rather
+# than leaving a half-applied state (config naming a sender the .env has no
+# credentials for).
+# The other half of the same defect: a site with recovery ON and no courier is
+# not merely "reset-by-operator-link", it is actively publishing a
+# "Forgot password?" page that accepts the click and delivers nothing. Kratos
+# cannot split the admin recovery endpoint from the self-service page — one
+# flag governs both — so this cannot be asserted away, only surfaced. Print it
+# on every run so the state stays visible rather than settling into background.
+- name: Surface recovery-enabled-without-courier as a user-visible defect
+  ansible.builtin.debug:
+    msg: |
+      NOTE {{ inventory_hostname }}: ory_recovery_enabled is true but
+      ory_courier_smtp_enabled is false. The goat-id-console mint-link button
+      works. The self-service "Forgot password?" page renders, accepts the
+      click and delivers NOTHING — it cannot be hidden
+      without a selfservice-ui patch. Declared, not accidental.
+  when:
+    - ory_recovery_enabled | default(false) | bool
+    - not (ory_courier_smtp_enabled | default(false) | bool)
+
+- name: Require complete courier SMTP config when the courier is enabled
+  ansible.builtin.assert:
+    that:
+      - (ory_courier_smtp_host | default('') | length) > 0
+      - (ory_courier_smtp_username | default('') | length) > 0
+      - (ory_courier_smtp_password | default('') | length) > 0
+      - (ory_courier_from_address | default('') | length) > 0
+    fail_msg: |
+      ory_courier_smtp_enabled is true but the courier config is incomplete.
+
+      Every field is per-goatnet Class-A config with NO role default, so a
+      forgotten override fails here instead of inheriting another goatnet's
+      sender identity. Set in group_vars/<site>_hosts/vars.yml:
+
+        ory_courier_smtp_host / _username / _password / ory_courier_from_address
+
+      Credentials come from the operator environment (30-site-services.envrc)
+      — an empty username/password almost always means the envrc was not
+      sourced, not that the value is missing upstream. `direnv allow` and
+      re-run. The sender address must be one the relay holds a verified
+      identity for (SES 554-rejects everything else).
+  when: ory_courier_smtp_enabled | default(false) | bool
+
+- name: Ensure Ory config directory exists
+  ansible.builtin.file:
+    path: "{{ ory_compose_dir }}/{{ ory_config_subdir }}"
+    state: directory
+    mode: "0750"
+
+- name: Render Kratos config
+  ansible.builtin.template:
+    src: ory/kratos.yaml.j2
+    dest: "{{ ory_compose_dir }}/{{ ory_config_subdir }}/kratos.yaml"
+    # 0644 — no secrets in this file (secrets injected via env vars from
+    # /opt/mgmt-host/.env). Kratos container runs as non-root user and
+    # needs world-readable config to start; 0640 fails with "open
+    # /etc/config/kratos.yaml: permission denied" from kratos-migrate.
+    mode: "0644"
+  notify: restart kratos
+
+- name: Render Hydra config
+  ansible.builtin.template:
+    src: ory/hydra.yaml.j2
+    dest: "{{ ory_compose_dir }}/{{ ory_config_subdir }}/hydra.yaml"
+    # See note on Kratos config above — same non-root container runtime
+    # constraint.
+    mode: "0644"
+  notify: restart hydra
+
+# F-572 / ADR 1188: the flag-on schema renders only over a READY backfill.
+# Kratos admin answers here only on a site that already runs Kratos; a first
+# stand-up is gated after Kratos starts instead (see below).
+- name: authz-backfill-gate | Probe Kratos admin before the flag-on schema render
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}/admin/health/ready"
+    status_code: 200
+  register: ory_authz_kratos_probe
+  failed_when: false
+  check_mode: false
+  when: ory_authz_in_metadata | default(false) | bool
+
+- name: authz-backfill-gate | Gate before the schema render (Kratos already running)
+  ansible.builtin.include_tasks: authz-backfill-gate.yml
+  vars:
+    ory_authz_gate_stage: before the schema render
+  when:
+    - ory_authz_in_metadata | default(false) | bool
+    - ory_authz_kratos_probe.status | default(-1) == 200
+
+- name: Render identity schema
+  ansible.builtin.template:
+    src: ory/identity-schema.json.j2
+    dest: "{{ ory_compose_dir }}/{{ ory_config_subdir }}/identity-schema.json"
+    mode: "0644"
+  notify: restart kratos
+
+# External ICAM federation — the CAC-ingress toggle switch (default-off).
+# docs/design/external-icam-federation.md. The dir is created ALWAYS so the compose
+# bind-mount (docker-compose.ory.yml) is a zero-behavior empty mount when off; the
+# claim-maps + client-secret env vars only materialize when icam_federation.enabled.
+- name: Ensure claim-maps dir exists (external ICAM federation)
+  ansible.builtin.file:
+    path: "{{ ory_compose_dir }}/{{ ory_config_subdir }}/claim-maps"
+    state: directory
+    mode: "0755"
+
+- name: Sync referenced ICAM claim-maps into the config dir
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../identity/claim-maps/{{ item.claim_map | default(item.id) }}.jsonnet"
+    dest: "{{ ory_compose_dir }}/{{ ory_config_subdir }}/claim-maps/{{ item.claim_map | default(item.id) }}.jsonnet"
+    mode: "0644"
+  loop: "{{ icam_federation.providers | default([]) }}"
+  loop_control:
+    label: "{{ item.claim_map | default(item.id) }}.jsonnet"
+  when: icam_federation.enabled | default(false) | bool
+  notify: restart kratos
+
+# Per-provider OIDC client secret via Kratos env-override — kept out of the 0644
+# kratos.yaml (secrets policy), resolved from the operator env at deploy time.
+# Index matches the provider order rendered in kratos.yaml (providers[<idx>]).
+- name: Write the external ICAM client secrets env file the kratos service loads (0600)
+  # One SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_<n>_CLIENT_SECRET line per provider,
+  # from the operator environment (ICAM_OIDC_<ID>_CLIENT_SECRET); a comment only when
+  # federation is off. Always written: docker-compose.ory.yml names it as the kratos
+  # env_file. Compose recreates kratos when it changes (the `up -d` below).
+  ansible.builtin.copy:
+    dest: "{{ ory_compose_dir }}/{{ ory_config_subdir }}/kratos-icam.env"
+    content: |
+      # External ICAM federation client secrets — written by roles/ory; do not edit on host.
+      {% if icam_federation.enabled | default(false) | bool %}
+      {% for p in icam_federation.providers | default([]) %}
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_{{ loop.index0 }}_CLIENT_SECRET={{ lookup('env', 'ICAM_OIDC_' ~ (p.id | upper | replace('-', '_')) ~ '_CLIENT_SECRET') }}
+      {% endfor %}
+      {% endif %}
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart kratos
+
+- name: Refuse an enabled ICAM provider whose client secret is not in the deploy environment
+  ansible.builtin.assert:
+    that: (lookup('env', 'ICAM_OIDC_' ~ (item.id | upper | replace('-', '_')) ~ '_CLIENT_SECRET') | length) >= 16
+    fail_msg: >-
+      ICAM_OIDC_{{ item.id | upper | replace('-', '_') }}_CLIENT_SECRET is unset or shorter than 16
+      characters; Kratos would register provider {{ item.id }} with an empty secret.
+  loop: "{{ icam_federation.providers | default([]) }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when: icam_federation.enabled | default(false) | bool
+  no_log: true
+
+- name: At most one local card front-end per goatnet (one extra_hosts slot in the kratos service)
+  vars:
+    _icam_local: "{{ (icam_federation.providers | default([])) | selectattr('mode', 'defined') | selectattr('mode', 'in', ['mtls_proxy', 'keycloak_frontend']) | list }}"
+  ansible.builtin.assert:
+    that: (_icam_local | length) <= 1
+    fail_msg: "icam_federation names {{ _icam_local | length }} local providers; docker-compose.ory.yml carries one KRATOS_ICAM_LOCAL_HOST_ENTRY slot."
+  when: icam_federation.enabled | default(false) | bool
+
+- name: Point the local card front-end's mesh name at the Docker host gateway for Kratos
+  # Kratos's outgoing-HTTP client refuses the mesh range (100.64.0.0/10) in every mode;
+  # via the host gateway (172.17.0.1, allowed) Traefik serves the same name and cert.
+  vars:
+    _icam_local: "{{ (icam_federation.providers | default([])) | selectattr('mode', 'defined') | selectattr('mode', 'in', ['mtls_proxy', 'keycloak_frontend']) | list if (icam_federation.enabled | default(false) | bool) else [] }}"
+    # Computed here so it is safe when the list is empty. Ansible finalizes
+    # every argument before it reads state, so `(_icam_local | first)` inline
+    # in `line:` failed the task on a goatnet that federates with nobody --
+    # "No first item, sequence was empty" -- although state was already absent
+    # and the task had nothing to write. A goatlite's list is always empty.
+    _icam_local_host: "{{ ((_icam_local | first).issuer_url | regex_replace('^https?://([^/:]+).*$', '\\1')) if (_icam_local | length) > 0 else '' }}"
+  ansible.builtin.lineinfile:
+    path: "{{ ory_compose_dir }}/.env"
+    regexp: "^KRATOS_ICAM_LOCAL_HOST_ENTRY="
+    line: "KRATOS_ICAM_LOCAL_HOST_ENTRY={{ _icam_local_host }}:host-gateway"
+    state: "{{ 'present' if _icam_local_host | length > 0 else 'absent' }}"
+    create: true
+    mode: "0600"
+
+- name: Remove provider client secrets from /opt/mgmt-host/.env (they moved to ory/kratos-icam.env)
+  ansible.builtin.lineinfile:
+    path: "{{ ory_compose_dir }}/.env"
+    regexp: "^SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_[0-9]+_CLIENT_SECRET="
+    state: absent
+  no_log: true
+
+- name: Inject Kratos courier SMTP URI into .env (0600, env-override)
+  vars:
+    _courier_user: "{{ ory_courier_smtp_username | urlencode | replace('/', '%2F') }}"
+    _courier_pass: "{{ ory_courier_smtp_password | urlencode | replace('/', '%2F') }}"
+  ansible.builtin.lineinfile:
+    path: "{{ ory_compose_dir }}/.env"
+    regexp: "^KRATOS_COURIER_SMTP_URI="
+    line: "KRATOS_COURIER_SMTP_URI={{ ory_courier_smtp_scheme }}://{{ _courier_user }}:{{ _courier_pass }}@{{ ory_courier_smtp_host }}:{{ ory_courier_smtp_port }}/"
+    state: present
+    create: true
+    mode: "0600"
+  when: ory_courier_smtp_enabled | default(false) | bool
+  no_log: true
+  notify: restart kratos
+
+# Turning the courier off has to REMOVE the line, not just stop writing it.
+# Compose resolves ${KRATOS_COURIER_SMTP_URI:-<sink>}, and `:-` only falls back
+# when the var is unset or empty — a leftover line from a previous deploy would
+# keep the courier live and make disabling it a no-op. This is the rollback
+# path, so it has to actually roll back. (lineinfile state=absent exits cleanly
+# when .env does not exist yet, e.g. on a first deploy.)
+- name: Remove Kratos courier SMTP URI from .env when the courier is disabled
+  ansible.builtin.lineinfile:
+    path: "{{ ory_compose_dir }}/.env"
+    regexp: "^KRATOS_COURIER_SMTP_URI="
+    state: absent
+  when: not (ory_courier_smtp_enabled | default(false) | bool)
+  notify: restart kratos
+
+- name: Append Ory secrets + image pins to /opt/mgmt-host/.env (idempotent — replaces existing entries)
+  ansible.builtin.lineinfile:
+    path: "{{ ory_compose_dir }}/.env"
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    create: true
+    mode: "0600"
+  loop:
+    - { key: "ORY_KRATOS_IMAGE", value: "{{ ory_kratos_image }}" }
+    - { key: "ORY_HYDRA_IMAGE", value: "{{ ory_hydra_image }}" }
+    # Patched consent UI per ADR 0857 (groups-forwarding + audience-
+    # fallback + scope-fallback). Source-of-truth at ops/ory-consent/;
+    # operator bumps the pin in group_vars per-site to a digest-pinned
+    # form (`<tag>@sha256:<digest>`). This entry keeps the selfservice-ui
+    # with the canonical pattern for ORY_KRATOS_IMAGE / ORY_HYDRA_IMAGE
+    # in this loop, so a patch never needs a hand-edit of /opt/mgmt-host/.env.
+    - { key: "KRATOS_SELFSERVICE_UI_IMAGE", value: "{{ kratos_selfservice_ui_image }}" }
+    - { key: "HYDRA_SECRETS_SYSTEM", value: "{{ hydra_secrets_system }}" }
+    - { key: "HYDRA_SECRETS_COOKIE", value: "{{ hydra_secrets_cookie }}" }
+    # Kratos secrets injected via env (NOT inlined in kratos.yaml at
+    # mode 0644). The Kratos binary's env-override pattern reads
+    # KRATOS_SECRETS_COOKIE / KRATOS_SECRETS_CIPHER as comma-separated
+    # arrays at parse time, before config validation runs. Per F-005:
+    # KRATOS_SECRETS_CIPHER MUST be identical across the HA pair
+    # (Orin-A + Orin-B) — operator provisions the same value on both.
+    - { key: "KRATOS_SECRETS_COOKIE", value: "{{ kratos_cookie_secret }}" }
+    - { key: "KRATOS_SECRETS_CIPHER", value: "{{ kratos_cipher_secret }}" }
+    # Block 21D.1.b — selfservice-ui (login/registration/recovery HTML pages)
+    # picks these up from /opt/mgmt-host/.env via docker compose env interp.
+    # SITE_FQDN_FOR_AUTH is the public URL Kratos's browser flows return to
+    # (e.g. https://auth.<site>.<site_dns_zone>). UI_*_SECRET
+    # values come from per-site group_vars (env-var lookups, 1Password-backed).
+    - { key: "SITE_FQDN_FOR_AUTH", value: "https://auth.{{ site_id }}.{{ site_dns_zone }}" }
+    - { key: "UI_COOKIE_SECRET", value: "{{ ui_cookie_secret }}" }
+    - { key: "UI_CSRF_SECRET", value: "{{ ui_csrf_secret }}" }
+  no_log: true
+  # Note: image-pin changes here (ORY_KRATOS_IMAGE / ORY_HYDRA_IMAGE /
+  # KRATOS_SELFSERVICE_UI_IMAGE) are picked up by the existing
+  # `docker compose up -d` below — compose recreates any container whose
+  # image differs from the running one. No explicit handler needed for
+  # image bumps. The config-rendering tasks above use the kratos/hydra
+  # restart handlers separately to pick up kratos.yaml / hydra.yaml
+  # changes without a full recreate.
+
+- name: Create kratos + hydra logical databases (idempotent)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -tAc
+      - "SELECT 1 FROM pg_database WHERE datname='{{ item }}'"
+  register: db_check
+  changed_when: false
+  loop:
+    - kratos
+    - hydra
+
+- name: Create databases that don't exist
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - postgres
+      - -c
+      - "CREATE DATABASE {{ item.item }};"
+  loop: "{{ db_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stdout | trim != "1"
+  changed_when: true
+
+- name: docker compose pull (Ory overlay images)
+  ansible.builtin.command:
+    cmd: docker compose -f docker-compose.yml -f docker-compose.ory.yml pull
+    chdir: "{{ ory_compose_dir }}"
+  changed_when: true
+
+- name: Run Kratos migrations (one-shot)
+  ansible.builtin.command:
+    cmd: docker compose -f docker-compose.yml -f docker-compose.ory.yml run --rm kratos-migrate
+    chdir: "{{ ory_compose_dir }}"
+  changed_when: true
+
+- name: Run Hydra migrations (one-shot)
+  ansible.builtin.command:
+    cmd: docker compose -f docker-compose.yml -f docker-compose.ory.yml run --rm hydra-migrate
+    chdir: "{{ ory_compose_dir }}"
+  changed_when: true
+
+# F-002 + ADR 1010 D7: pre-seed the shared `networks` row in both
+# Kratos and Hydra databases BEFORE either service starts. Hydra's
+# Determine() picks earliest created_at; without this pre-seed (with a
+# pre-2013 timestamp) every site's Hydra picks its own random
+# migration-baked nid → cross-site federation breaks. T5 probe on
+# confirmed this fix.
+- name: Pre-seed shared network nid in kratos + hydra databases
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ item }}"
+      - -c
+      - "INSERT INTO networks (id, created_at, updated_at) VALUES ('{{ ory_shared_nid }}', '{{ ory_shared_preseed_ts }}', '{{ ory_shared_preseed_ts }}') ON CONFLICT (id) DO NOTHING;"
+  loop:
+    - kratos
+    - hydra
+  changed_when: true
+
+- name: Bring up Kratos + Hydra + selfservice-ui long-running services
+  ansible.builtin.command:
+    cmd: docker compose -f docker-compose.yml -f docker-compose.ory.yml up -d kratos hydra selfservice-ui
+    chdir: "{{ ory_compose_dir }}"
+  changed_when: true
+
+- name: Wait for Kratos admin /health/ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}/admin/health/ready"
+    status_code: 200
+  register: kratos_ready
+  retries: 30
+  delay: 2
+  until: kratos_ready.status == 200
+
+- name: authz-backfill-gate | Gate after Kratos starts (it was not running before the render)
+  ansible.builtin.include_tasks: authz-backfill-gate.yml
+  vars:
+    ory_authz_gate_stage: after Kratos started
+  when:
+    - ory_authz_in_metadata | default(false) | bool
+    - ory_authz_kratos_probe.status | default(-1) != 200
+
+- name: Wait for Hydra admin /health/ready
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}/health/ready"
+    status_code: 200
+  register: hydra_ready
+  retries: 30
+  delay: 2
+  until: hydra_ready.status == 200
+
+# ===========================================================================
+# First-admin auto-provisioning (Block 21D.1.c — added)
+#
+# Without this a deploy is left in an unusable state, with the first identity
+# minted by hand through the Kratos admin API. Pattern:
+#
+#   - Per-site `site_admins:` list in group_vars carries ONLY {email, name}.
+#     No password_hash in repo, no secrets in committed YAML.
+#   - First ory-deploy run: for each admin whose identity does NOT yet
+#     exist in Kratos, generate a 16-char random password, bcrypt-hash
+#     it, import via kratos admin API, persist plaintext to
+#     /opt/mgmt-host/.bootstrap-passwords/<email>.txt (mode 0600 root:root).
+#   - Subsequent ory-deploy runs: identity-exists check returns true,
+#     skip. Passwords set by operator via the dashboard's account-settings
+#     UI on first login survive forever; the auto-gen password only
+#     applies on first creation.
+#   - Operator workflow: SSH to mgmt-host, `sudo cat
+#     /opt/mgmt-host/.bootstrap-passwords/<email>.txt`, log in via the
+#     dashboard, change password via account settings, `sudo rm` the
+#     bootstrap file. The role's summary task prints these instructions
+#     at end of run.
+#
+# Backward compat: if a site_admins entry includes `password_hash:`, the
+# role respects it (skip auto-gen path entirely + use admins.yaml import
+# path below). Existing sites that pre-date this pattern keep working.
+# ===========================================================================
+
+- name: bootstrap-admin | Ensure password-output dir exists (mode 0700, root)
+  ansible.builtin.file:
+    path: "{{ ory_compose_dir }}/.bootstrap-passwords"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: site_admins | length > 0
+
+- name: bootstrap-admin | Check whether each admin identity already exists in Kratos
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}/admin/identities?credentials_identifier={{ item.email | urlencode }}"
+    status_code: 200
+    return_content: true
+  register: admin_lookups
+  loop: "{{ site_admins }}"
+  loop_control:
+    label: "{{ item.email }}"
+  when: site_admins | length > 0
+
+- name: bootstrap-admin | Build per-admin provisioning spec (autogen-vs-skip decided per-entry)
+  ansible.builtin.set_fact:
+    bootstrap_admin_specs: "{{ bootstrap_admin_specs | default([]) + [ admin_spec ] }}"
+  vars:
+    # `admin_lookups.results[idx].json` is a list of matching identities.
+    # Empty list = identity does not exist yet → needs auto-provisioning.
+    existing: "{{ (admin_lookups.results[idx].json | default([])) | length > 0 }}"
+    operator_provided: "{{ item.password_hash is defined and (item.password_hash | length) > 0 }}"
+    needs_autogen: "{{ not existing and not operator_provided }}"
+    # 16-char URL-safe random password — plaintext stored only on the target
+    # host at /opt/mgmt-host/.bootstrap-passwords/<email>.txt (mode 0600).
+    # `lookup('password', '/dev/null ...')` re-randomizes on every run, but
+    # gated by `existed_pre_deploy` below — re-runs skip the import step
+    # entirely for existing identities, so the regenerated value never
+    # touches Kratos / never overwrites the bootstrap file.
+    autogen_password: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+    # F-128 — pick the first-login surface from the user's `groups` against
+    # `bootstrap_first_login_url_by_group`. First matching group wins; if
+    # none match, fall through to `_default` (typically isitup). Per-user
+    # `first_login_url` override on the site_admins entry beats the map.
+    matched_group_prefix: >-
+      {{
+        item.first_login_url
+        | default(
+            (item.groups | default([]))
+              | map('extract', bootstrap_first_login_url_by_group)
+              | reject('undefined') | reject('none')
+              | first
+              | default(bootstrap_first_login_url_by_group._default | default('isitup'))
+          )
+      }}
+    admin_spec:
+      email: "{{ item.email }}"
+      name: "{{ item.name }}"
+      groups: "{{ item.groups | default([]) }}"
+      existed_pre_deploy: "{{ existing }}"
+      operator_provided_hash: "{{ operator_provided }}"
+      plaintext_for_kratos: "{{ autogen_password if needs_autogen else '' }}"
+      password_hash: "{{ item.password_hash | default('') }}"
+      first_login_url: "https://{{ matched_group_prefix }}.{{ site_id }}.{{ site_dns_zone }}/"
+  loop: "{{ site_admins }}"
+  loop_control:
+    label: "{{ item.email }}"
+    index_var: idx
+  when:
+    - site_admins | length > 0
+  no_log: true
+
+- name: bootstrap-admin | Create new identities via Kratos admin API (plaintext password — Kratos hashes internally)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}/admin/identities"
+    method: POST
+    body_format: json
+    body:
+      schema_id: default
+      state: active
+      traits:
+        email: "{{ item.email }}"
+        name: "{{ item.name }}"
+      # Login groups go to admin-managed metadata_public, never self-editable
+      # traits: the settings flow cannot write it, so a
+      # bootstrap admin's grant cannot be self-edited, and the create stays
+      # valid once a site sets ory_authz_in_metadata. Always emitted (empty
+      # when none) so a metadata-first reader never falls back to traits.
+      metadata_public:
+        groups: "{{ item.groups | default([]) | list }}"
+      credentials:
+        password:
+          config:
+            password: "{{ item.plaintext_for_kratos if (item.plaintext_for_kratos | length > 0) else omit }}"
+            hashed_password: "{{ item.password_hash if (item.password_hash | length > 0) else omit }}"
+      verifiable_addresses:
+        - value: "{{ item.email }}"
+          verified: true
+          via: email
+          status: completed
+    status_code: [201]
+  loop: "{{ bootstrap_admin_specs | default([]) }}"
+  loop_control:
+    label: "{{ item.email }}"
+  when:
+    - bootstrap_admin_specs is defined
+    - not item.existed_pre_deploy
+  no_log: true
+  register: admin_create_results
+
+- name: bootstrap-admin | Persist plaintext password for each auto-generated admin
+  ansible.builtin.copy:
+    dest: "{{ ory_compose_dir }}/.bootstrap-passwords/{{ item.email }}.txt"
+    content: |
+      Email:    {{ item.email }}
+      Name:     {{ item.name }}
+      Password: {{ item.plaintext_for_kratos }}
+
+      Log in at: {{ item.first_login_url }}
+
+      First action: change password via the account-settings UI (top-right menu after login).
+      Then (operator step): sudo rm {{ ory_compose_dir }}/.bootstrap-passwords/{{ item.email }}.txt
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ bootstrap_admin_specs | default([]) }}"
+  loop_control:
+    label: "{{ item.email }}"
+  when:
+    - bootstrap_admin_specs is defined
+    - item.plaintext_for_kratos | length > 0
+    - not item.existed_pre_deploy
+  no_log: true
+
+- name: bootstrap-admin | Summarize what got provisioned + operator action items
+  ansible.builtin.debug:
+    msg: |
+      {% set fresh = bootstrap_admin_specs | default([]) | rejectattr('existed_pre_deploy') | selectattr('plaintext_for_kratos') | list %}
+      {% if fresh | length > 0 %}
+      ============================================================
+      FIRST-LOGIN PASSWORDS — read once + change via account-settings:
+      ============================================================
+      {% for a in fresh %}
+        - {{ a.email }} ({{ a.groups | join(',') | default('no-groups', true) }})
+          password file: sudo cat {{ ory_compose_dir }}/.bootstrap-passwords/{{ a.email }}.txt
+          first-login URL: {{ a.first_login_url }}
+      {% endfor %}
+
+      Per-user workflow:
+        1. SSH to {{ inventory_hostname }} and read the password file above.
+        2. Deliver {email, password, first-login URL} to the user out-of-band.
+        3. User opens the URL, logs in, changes password via account-settings.
+        4. sudo rm {{ ory_compose_dir }}/.bootstrap-passwords/<email>.txt
+      ============================================================
+      {% else %}
+      No new admins to provision (all site_admins identities already exist in Kratos).
+      {% endif %}
+  when: site_admins | length > 0
+
+- name: Smoke-check — Kratos public OIDC discovery (proxied test)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ hydra_public_host_port | default(4444) }}/.well-known/openid-configuration"
+    status_code: 200
+    return_content: true
+  register: oidc_discovery
+  # Hydra's public listener (4444) sometimes lags the admin listener (4445)
+  # by a few seconds at first start. Retries here cover that startup flake;
+  # without them the role false-fails on a healthy deploy: admin /health/ready can
+  # return 200 immediately while public OIDC discovery closes the connection for
+  # ~30s before serving.
+  retries: 20
+  delay: 3
+  until: oidc_discovery.status == 200
+
+- name: Surface OIDC issuer (sanity)
+  ansible.builtin.debug:
+    msg: "Hydra issuer reports: {{ (oidc_discovery.content | from_json).issuer }}"
+  when: oidc_discovery.content is defined
+
+# ===========================================================================
+# F-161 fallout — flush stale consent sessions after image-pin changes.
+#
+# Hydra persists OAuth2 consent decisions in Postgres and short-circuits
+# on subsequent logins ("is this subject already consented for this
+# client?"). After a kratos_selfservice_ui_image bump that changes how
+# session data is written (e.g. the F-161 scope-fallback patch), users
+# whose first login wrote a stored session under the OLD code keep
+# hitting the same failure mode even after the new image is live —
+# their session row was persisted with broken contents and Hydra reuses
+# it verbatim.
+#
+# The operator names affected users in `ory_consent_revoke_subjects`
+# (default empty list). Each {subject, client} pair DELETEs that
+# user's stored consent session for that client via Hydra admin
+# loopback. Idempotent: Hydra returns 204 whether the session existed
+# or not, so leaving entries here is harmless once the affected user
+# has re-logged-in once.
+#
+# Companion to the standalone helper at ops/scripts/revoke-stale-consent.sh
+# — both hit the same Hydra admin endpoint. This task folds the helper
+# behavior into the canonical deploy path so the post-bump flush is
+# operator-declarative + replayable.
+# ===========================================================================
+
+- name: consent-revoke | Revoke stored consent sessions for listed subjects
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}/admin/oauth2/auth/sessions/consent?subject={{ item.subject | urlencode }}&client={{ item.client | urlencode }}&all=true"
+    method: DELETE
+    status_code: [204, 404]
+  loop: "{{ ory_consent_revoke_subjects }}"
+  loop_control:
+    label: "{{ item.subject }} → {{ item.client }}"
+  when: ory_consent_revoke_subjects | length > 0
+  register: consent_revoke_result
+
+- name: consent-revoke | Surface revoke summary
+  ansible.builtin.debug:
+    msg: |
+      Revoked {{ ory_consent_revoke_subjects | length }} consent session(s).
+      Affected users' next login through the consent UI will write a fresh
+      stored session under the current kratos_selfservice_ui_image. Leaving
+      these entries in group_vars on subsequent runs is harmless (DELETE
+      against a non-existent session returns 404, treated as success).
+  when: ory_consent_revoke_subjects | length > 0

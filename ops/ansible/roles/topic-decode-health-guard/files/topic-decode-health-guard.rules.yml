@@ -1,0 +1,90 @@
+# Managed by ansible (roles/topic-decode-health-guard). Do not edit on the host.
+#
+# Ships from the ROLE, not the shared ops/compose/goat-obs tree, so the absent()
+# alert below exists only on goatnets that actually deployed the timer. In the
+# shared tree it would fire forever everywhere that has not.
+#
+# NOTE the ordering of concerns: the first two alerts are about the GUARD, and
+# only the third is about the fabric. That is deliberate. A guard that stopped
+# running, or that is running blind, is a worse condition than a bad topic it
+# reports — because the bad topic is at least visible.
+#
+# NOT INSTALLED where the obs stack runs on a different host:
+# /opt/<site>-obs/prometheus/rules does not exist there and the role says so at
+# deploy time. On such a goatnet the systemd unit is the only alarm.
+groups:
+  - name: topic-decode-health-guard
+    rules:
+      # The failure mode this role exists to fix, now alertable: the audit
+      # stopped and nobody noticed. absent() covers "never arrived" — which is
+      # what F-335 found three publishers doing into a directory nothing reads.
+      - alert: TopicDecodeHealthGuardNotReporting
+        expr: absent(topic_decode_health_guard_last_run_timestamp_seconds)
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The topic decode-health audit has published no metric at all"
+          description: >-
+            topic_decode_health_guard_last_run_timestamp_seconds is absent from
+            Prometheus. Either the timer is not running, or it is writing its
+            textfile into a directory this host's node_exporter does not read
+            Check
+            `systemctl list-timers topic-decode-health-guard.timer` first, then
+            `ps -o args= -C node_exporter | grep textfile.directory`.
+            A guard nobody runs is indistinguishable from no guard.
+
+      # A stale timestamp is the OTHER half: the file is there, the series
+      # exists, and it stopped advancing. The wrapper deliberately does not
+      # stamp on exit 2, so a blind guard shows up here rather than as a
+      # cheerfully fresh timestamp over a run that saw nothing.
+      - alert: TopicDecodeHealthGuardStale
+        expr: time() - topic_decode_health_guard_last_run_timestamp_seconds > 10800
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The topic decode-health audit has not completed a full read for 3h"
+          description: >-
+            Last successful read was {{ $value | humanizeDuration }} ago against an
+            hourly schedule. The guard only stamps this after reading BOTH the
+            portal and the router, so the usual cause is one of them being
+            unreachable — exit 2, which says nothing about decode health and must
+            not be read as clean. See
+            /var/lib/goat/topic-decode-health-guard/last-run.txt.
+
+      # The fabric condition. This is the F-177-shaped bug itself: bytes that do
+      # not match their declared format, which every other surface reports as
+      # green because zenoh `put` is fire-and-forget.
+      #
+      # Deliberately NOT alerting on NO-SAMPLE or STALE. A powered-off sensor is
+      # operational state, not a regression, and paging on it is how this alert
+      # gets muted — at which point the DOUBLE-ENCODED case it exists for goes
+      # unseen too. The contract says never fail on a backlog; the same applies
+      # to paging.
+      - alert: TopicBytesDoNotMatchDeclaredFormat
+        # BASELINED TOPICS ARE SUBTRACTED. Without this the alert fires forever
+        # on debt the operator has already declared, with a reason and a date —
+        # which pages nobody usefully and gets silenced, taking the NEW-topic
+        # case down with it. Fixing the unit's exit code and leaving the alert
+        # permanently firing would just move the muted-guard problem one surface
+        # across. The raw count stays available as
+        # topic_decode_health_guard_topics for dashboards, so the debt is still
+        # visible; it simply stops being an alarm.
+        expr: >-
+          sum(topic_decode_health_guard_topics{grade=~"UNDECODABLE|DOUBLE-ENCODED"})
+          - sum(topic_decode_health_guard_baselined) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} UNDECLARED topic(s) carry bytes that do not match their declared format"
+          description: >-
+            A registered topic whose payload does not decode as the format the
+            registry declares. DOUBLE-ENCODED specifically means the payload
+            decodes only after stripping a base64 layer — that names both the bug
+            and the fix, and is what GATEWAY_ONE SVN-001 did on three topics for weeks
+            while every surface reported green. Read
+            /var/lib/goat/topic-decode-health-guard/last-run.txt: it names the key,
+            the declared format and the detail. Fix the PUBLISHER; correcting the
+            registry to match bad bytes makes the fabric consistently wrong.

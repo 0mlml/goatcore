@@ -1,0 +1,213 @@
+---
+# Install (or fully remove) the daily membership audit timer. Idempotent.
+
+# ---------------------------------------------------------------------------
+# Teardown branch. Runs FIRST and unconditionally when disabled, so turning the
+# gate off actually removes the background process instead of merely declining
+# to redeploy it. A role whose `enabled: false` only skips its install tasks
+# leaves a timer running on a host with nothing in the repo admitting it exists
+# — which is the shape of an incident nobody can trace.
+# ---------------------------------------------------------------------------
+- name: mesh-membership-reconcile | teardown when disabled
+  when: not (mesh_membership_reconcile_enabled | bool)
+  block:
+    - name: mesh-membership-reconcile | stop + disable timer and service
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - mesh-membership-reconcile.timer
+        - mesh-membership-reconcile.service
+      failed_when: false
+
+    - name: mesh-membership-reconcile | remove unit files, script, env and metrics
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/mesh-membership-reconcile.timer
+        - /etc/systemd/system/mesh-membership-reconcile.service
+        - /usr/local/sbin/mesh-membership-reconcile.sh
+        - /usr/local/lib/goat/check-membership-reconcile.py
+        - /usr/local/lib/goat/membership-declared-deviations.yaml
+        - /etc/goat/mesh-membership-reconcile.env
+        # The stale metric goes too. A textfile the exporter keeps serving after
+        # the job is gone reads as a healthy audit that simply stopped changing.
+        - "{{ mesh_membership_reconcile_textfile_dir }}/mesh_membership_reconcile.prom"
+
+    # The rules go with the job. mesh-membership-reconcile.yml's absent() alert
+    # exists only where the timer does, so left behind it pages forever.
+    - name: mesh-membership-reconcile | remove alert rules
+      ansible.builtin.file:
+        path: "{{ mesh_membership_reconcile_rules_dir }}/mesh-membership-reconcile.yml"
+        state: absent
+      notify: reload prometheus for mesh-membership-reconcile
+
+    - name: mesh-membership-reconcile | reload systemd after removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: mesh-membership-reconcile | say what was removed
+      ansible.builtin.debug:
+        msg:
+          - "mesh-membership-reconcile is TORN DOWN on this host."
+          - "The report directory {{ mesh_membership_reconcile_report_dir }} is left in place"
+          - "deliberately — it is evidence, not state. Remove it by hand if you mean to."
+
+# ---------------------------------------------------------------------------
+# Install branch.
+# ---------------------------------------------------------------------------
+- name: mesh-membership-reconcile | install
+  when: mesh_membership_reconcile_enabled | bool
+  block:
+    # Refuse rather than install something that cannot work. A unit that fails
+    # every night is noise people mute, and a muted guard is no guard.
+    - name: mesh-membership-reconcile | require the NetBird service identity (membership-reconcile)
+      ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+      vars:
+        nsi_identity: membership-reconcile
+        nsi_token: "{{ mesh_membership_reconcile_token }}"
+
+    - name: mesh-membership-reconcile | refuse to install unconfigured
+      ansible.builtin.assert:
+        that:
+          - mesh_membership_reconcile_api_url | length > 0
+        fail_msg: >-
+          mesh_membership_reconcile_api_url must be set for this goatnet. Its
+          token is the dedicated membership-reconcile service identity, checked
+          by the task above — never the shared infra token, so this role stays
+          revocable on its own.
+        quiet: true
+
+    - name: mesh-membership-reconcile | directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /usr/local/lib/goat, mode: "0755" }
+        - { path: /etc/goat, mode: "0755" }
+        - { path: "{{ mesh_membership_reconcile_report_dir }}", mode: "0755" }
+
+    - name: mesh-membership-reconcile | install the check and its declarations
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - src: "{{ playbook_dir }}/../ci/check-membership-reconcile.py"
+          dest: /usr/local/lib/goat/check-membership-reconcile.py
+        - src: "{{ playbook_dir }}/../ci/membership-declared-deviations.yaml"
+          dest: /usr/local/lib/goat/membership-declared-deviations.yaml
+      notify: restart mesh-membership-reconcile timer
+
+    - name: mesh-membership-reconcile | install wrapper
+      ansible.builtin.copy:
+        src: mesh-membership-reconcile.sh
+        dest: /usr/local/sbin/mesh-membership-reconcile.sh
+        owner: root
+        group: root
+        mode: "0755"
+      notify: restart mesh-membership-reconcile timer
+
+    - name: mesh-membership-reconcile | install env file
+      ansible.builtin.template:
+        src: mesh-membership-reconcile.env.j2
+        dest: /etc/goat/mesh-membership-reconcile.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: restart mesh-membership-reconcile timer
+
+    - name: mesh-membership-reconcile | install units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - mesh-membership-reconcile.service
+        - mesh-membership-reconcile.timer
+      notify: restart mesh-membership-reconcile timer
+
+    # Alert rules, only where there is a Prometheus to load them.
+    - name: mesh-membership-reconcile | does this goatnet have a rules dir?
+      ansible.builtin.stat:
+        path: "{{ mesh_membership_reconcile_rules_dir }}"
+      register: mesh_mr_rules_dir
+
+    # `copy`, NOT `template`. Prometheus annotations use {{ $value }} and
+    # {{ $labels.x }}, which Jinja tries to evaluate and dies on. The file has no ansible variables in
+    # it, so there is nothing to template; keeping it static also means what is
+    # in the repo is byte-for-byte what Prometheus loads.
+    - name: mesh-membership-reconcile | install alert rules
+      ansible.builtin.copy:
+        src: mesh-membership-reconcile.rules.yml
+        dest: "{{ mesh_membership_reconcile_rules_dir }}/mesh-membership-reconcile.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      when: mesh_mr_rules_dir.stat.exists | default(false)
+      notify: reload prometheus for mesh-membership-reconcile
+
+    - name: mesh-membership-reconcile | say so when there is nowhere to alert from
+      ansible.builtin.debug:
+        msg: >-
+          {{ mesh_membership_reconcile_rules_dir }} does not exist, so NO alert rules were
+          installed. The audit still runs and still writes its report, but a reverted
+          removal on this goatnet will page nobody — someone has to read the journal.
+      when: not (mesh_mr_rules_dir.stat.exists | default(false))
+
+    - name: mesh-membership-reconcile | flush handlers so the timer starts from current unit files
+      ansible.builtin.meta: flush_handlers
+
+    - name: mesh-membership-reconcile | enable + start timer
+      ansible.builtin.systemd:
+        name: mesh-membership-reconcile.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # Prove it works now, with somebody watching, rather than discovering at
+    # 06:41 unattended that the token was wrong.
+    - name: mesh-membership-reconcile | run once now
+      ansible.builtin.command:
+        cmd: systemctl start --wait mesh-membership-reconcile.service
+      register: mesh_mr_run
+      changed_when: false
+      failed_when: false
+      when: mesh_membership_reconcile_run_now | bool
+
+    - name: mesh-membership-reconcile | read back the report
+      ansible.builtin.slurp:
+        src: "{{ mesh_membership_reconcile_report_dir }}/last-run.txt"
+      register: mesh_mr_report
+      failed_when: false
+      when: mesh_membership_reconcile_run_now | bool
+
+    - name: mesh-membership-reconcile | report
+      ansible.builtin.debug:
+        msg: "{{ (mesh_mr_report.content | b64decode).split('\n') }}"
+      when:
+        - mesh_membership_reconcile_run_now | bool
+        - mesh_mr_report.content is defined
+
+    # An exit 2 means the mesh was never read. That must stop the play — it is
+    # indistinguishable from success in every surface except this one.
+    - name: mesh-membership-reconcile | fail the play if the mesh could not be read
+      ansible.builtin.fail:
+        msg: >-
+          mesh-membership-reconcile could not read {{ mesh_membership_reconcile_api_url }}.
+          The timer is installed but reports nothing usable. Check the token and URL:
+          journalctl -u mesh-membership-reconcile.service -n 30
+      when:
+        - mesh_membership_reconcile_run_now | bool
+        - mesh_mr_report.content is defined
+        - "'# exit:     2' in (mesh_mr_report.content | b64decode)"

@@ -1,0 +1,53 @@
+---
+# Defaults for the `oauth2-proxy-dashboard-oidc-client` role.
+#
+# Provisions the OAuth2 client at site Hydra used by the oauth2-proxy
+# sidecar that gates the netbird admin dashboard with --allowed-group=ADMINS
+# (Block 83C.2-L7, closes the L7 portion of F-132). Mirrors the
+# isitup-oidc-client role shape. Does NOT manage the proxy container itself
+# — that's the `oauth2-proxy-dashboard` role.
+#
+# Note: this is a SEPARATE Hydra client from the existing `dashboard` client
+# the netbird-dashboard SPA uses for its own PKCE flow against netbird-mgmt.
+# After the gate lands, two clients exist at this site's Hydra:
+#   - dashboard                  — SPA → mgmt-API access tokens (existing)
+#   - oauth2-proxy-dashboard     — sidecar gate → ADMINS group check (new)
+# The user only sees one Kratos login (the second flow is silent because
+# the Kratos session cookie from the first is still valid).
+#
+# Required at deploy time:
+#   - oauth2_proxy_dashboard_oidc_client_secret  (32+ chars; fresh per site)
+#   - site_id, site_dns_zone                     (per-site identity)
+
+oauth2_proxy_dashboard_oidc_client_id: "oauth2-proxy-dashboard"
+oauth2_proxy_dashboard_oidc_client_name: "oauth2-proxy-dashboard ({{ site_id }})"
+
+# Issuer + redirect URI built from the site Hydra. Redirect path is the
+# canonical oauth2-proxy callback at the dashboard FQDN.
+oauth2_proxy_dashboard_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}"
+oauth2_proxy_dashboard_oidc_redirect_uri: "https://dashboard.{{ site_id }}.{{ site_dns_zone }}/oauth2/callback"
+
+# Scopes oauth2-proxy requests during the auth-code flow.
+#  - `groups` carries the ADMINS check — without it, oauth2-proxy can't
+#    enforce OAUTH2_PROXY_ALLOWED_GROUPS=ADMINS regardless of the patched
+#    consent UI (the JWT would carry the claim but the proxy wouldn't ask).
+#  - `offline_access` makes Hydra issue a refresh_token alongside the
+#    access_token. oauth2-proxy's cookie carries `refresh:after 1h` (env
+#    template). Without offline_access, the access_token expires (Hydra
+#    default ~1h) and oauth2-proxy has no refresh_token to silently roll
+#    the session forward, so it kills the cookie session and bounces the
+#    user through the full Hydra/Kratos consent flow ~hourly. That's the
+#    "loading fails / auth fails / rough navigation" experience users hit
+#    on dashboard.<site>.<zone> after the first hour of a session.
+#    grant_types already includes refresh_token in tasks/main.yml; the
+#    scope-request was the missing half of the round trip.
+oauth2_proxy_dashboard_oidc_scopes:
+  - openid
+  - profile
+  - email
+  - groups
+  - offline_access
+
+# Hydra admin endpoint for client provisioning. Loopback on the mgmt-host
+# (this role runs against the same Orin/Thor that hosts Hydra).
+oauth2_proxy_dashboard_oidc_hydra_admin: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}"

@@ -1,0 +1,86 @@
+# ops/ansible/roles/spock-drift-watch/tasks/main.yml
+#
+# Block 52A.3 — install the interim L2a drift-watch cron + alert
+# textfile pipeline. Idempotent.
+
+- name: Ensure psql client + jq are present
+  ansible.builtin.apt:
+    name:
+      # `postgresql-client` is the distro-default version (Ubuntu 22.04 →
+      # pg14, Ubuntu 24.04 → pg16). The Postgres wire protocol is
+      # backward-compatible, so a pg14 client talking to a pg16 server
+      # is fine for the drift-watch script's read-only queries. Avoids
+      # adding the PGDG apt repo just to pull a version-matched client.
+      - postgresql-client
+      - jq
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+
+- name: Ensure node_exporter textfile directory exists
+  ansible.builtin.file:
+    path: "{{ spock_drift_watch_textfile_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Install spock-drift-watch.sh
+  ansible.builtin.copy:
+    src: spock-drift-watch.sh
+    dest: "{{ spock_drift_watch_install_dir }}/spock-drift-watch.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Render env file (peer list + credentials)
+  ansible.builtin.template:
+    src: spock-drift-watch.env.j2
+    dest: "{{ spock_drift_watch_env_file }}"
+    owner: root
+    group: root
+    mode: "0640"
+  become: true
+  no_log: true
+
+- name: Install systemd service unit
+  ansible.builtin.copy:
+    src: spock-drift-watch.service
+    dest: /etc/systemd/system/spock-drift-watch.service
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: reload systemd
+
+- name: Render systemd timer unit
+  ansible.builtin.template:
+    src: spock-drift-watch.timer.j2
+    dest: /etc/systemd/system/spock-drift-watch.timer
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: reload systemd
+
+- name: Flush systemd reload before enable
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable spock-drift-watch timer
+  ansible.builtin.systemd:
+    name: spock-drift-watch.timer
+    enabled: "{{ spock_drift_watch_enabled }}"
+    state: "{{ 'started' if spock_drift_watch_enabled else 'stopped' }}"
+  become: true
+
+- name: One-shot run on first install (so dashboard isn't empty until first hourly tick)
+  ansible.builtin.systemd:
+    name: spock-drift-watch.service
+    state: started
+  become: true
+  when: spock_drift_watch_enabled
+  changed_when: false
+  failed_when: false

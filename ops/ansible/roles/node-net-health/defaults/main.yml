@@ -1,0 +1,93 @@
+---
+# Defaults for the `node-net-health` role — the `net` domain of the
+# environment-health surface (docs/design/node-net-health.md, ADR 1036).
+#
+# Shape (mirrors the mesh-health role): a host systemd timer runs the
+# classifying collector (ops/node-net-health/nnh-snapshot.py — hourly +
+# on-demand) which writes ONE atomic snapshot JSON; a single container
+# (goat-node-net-health, a normal mTLS Zenoh client peer) grades it and
+# publishes ops/net/health/<node>. Observation, not enforcement.
+#
+# Inputs (group_vars/<site>_hosts/vars.yml):
+#   node_net_health_enabled: true
+#   node_net_health_node_class + node_net_health_baseline_rules  (the
+#     node-class egress contract — every rule carries name + why)
+
+node_net_health_enabled: false
+
+# Multi-arch INDEX digest from .github/workflows/node-net-health-image.yml.
+#   docker buildx imagetools inspect ghcr.io/{{ ghcr_org }}/goat-node-net-health:sha-<short> --format '{{.Manifest.Digest}}'
+node_net_health_image: "ghcr.io/{{ ghcr_org }}/goat-node-net-health:sha-31be3af@sha256:e26b46b9233e7258661abd617b8b02b9bba314a4f4d698c87cdffe28d8283983"
+
+# --- on-host layout ---
+node_net_health_compose_dir: /opt/node-net-health
+node_net_health_state_dir: /var/lib/node-net-health
+node_net_health_etc_dir: /etc/node-net-health
+
+# --- collector timer ---
+node_net_health_snapshot_interval_s: 3600      # hourly; run-now via systemctl start
+node_net_health_snapshot_boot_delay_s: 120
+
+# --- bandwidth attribution (ADR 1128, the --fast pass) ---
+# A SECOND, lighter timer beside the hourly one. Bandwidth needs a minute
+# cadence to be useful for capacity work; the security inventory needs an hour.
+# Coupling them would force a choice between an hourly bandwidth chart and 60x
+# the inventory cost, so they are separate units with separate delta baselines.
+#
+# Gated on the node-exporter role being present on the host: the metrics land
+# in ITS textfile collector directory rather than opening another port. Where
+# node-exporter is absent the collector says so on stderr and carries on — the
+# Zenoh envelope does not depend on it.
+node_net_health_attribution_enabled: false
+node_net_health_attribution_interval_s: 60
+node_net_health_attribution_boot_delay_s: 90
+node_net_health_textfile_path: "/var/lib/node_exporter/textfile/goat_net_attribution.prom"
+# Per-peer series: peers x categories x directions. ~3.4k series at a 90-peer
+# goatnet (fine); NOT fine at the ADR 1122 10k-peer envelope — turn off there.
+node_net_health_peer_attribution: true
+# Gap between the deploy's two priming samples. One sample only establishes a
+# baseline and emits zeros, which reads exactly like "no traffic"; two spaced
+# samples leave a real first reading behind.
+node_net_health_attribution_verify_gap_s: 15
+
+# --- classifier knobs (nnh-snapshot.py env) ---
+node_net_health_mesh_cidrs: "100.64.0.0/10"
+node_net_health_internal_cidrs: "172.16.0.0/12"
+node_net_health_fabric_ports: "7447"
+node_net_health_fabric_comms: "zenohd"
+# stale = handshake age > 3x the WireGuard rekey window (120 s); see
+# docs/design/node-net-health.md "Stale definition".
+node_net_health_stale_handshake_s: 360
+
+# --- the node-class egress contract (baseline registry) ---
+# Rendered to {{ node_net_health_etc_dir }}/baseline.json. Fail-closed: a
+# socket matching no rule (and neither the mesh nor fabric plane) is
+# UNDECLARED — amber + risk list + OCSF. Every rule needs name + why.
+node_net_health_node_class: "unknown"
+node_net_health_baseline_rules: []
+
+# --- publisher (container) ---
+# <node> segment of ops/net/health/<node>; default = the inventory hostname.
+node_net_health_node: "{{ inventory_hostname_short | default(inventory_hostname) }}"
+node_net_health_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+node_net_health_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+# Router hosts join the router's compose network (resolve the router by
+# container name). Non-router fleet nodes set this false and point the
+# endpoint at the router host's MESH IP (tls/<mesh-ip>:7447) instead.
+node_net_health_join_zenoh_network: true
+node_net_health_interval_ms: 30000             # beat cadence (matches sibling meters; snapshot stays hourly)
+node_net_health_stale_after_ms: 7800000        # ~2 snapshot intervals + slack -> unmetered
+node_net_health_rust_log: "goat_node_net_health=info,zenoh=warn"
+
+# Leaf cert minted via the offline-CA ceremony with Subject
+# CN=goat-node-net-health-trial-peer (zenoh ACL subject infra-node-net-health).
+node_net_health_cert_dir: /opt/node-net-health/certs
+node_net_health_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# --- rollup reader (one host per goatnet — the Thor) ---
+# Same image, --mode rollup: a passive subscriber of ops/net/health/** that
+# writes node-net-health.json for the node-list page (served by the
+# relay-health nginx, so the page lives beside the relay dashboard under the
+# same admin gate). Reveal-only; no central poller — nodes self-publish.
+node_net_health_rollup_enabled: false
+node_net_health_rollup_www_dir: /opt/relay-health/www

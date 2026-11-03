@@ -1,0 +1,69 @@
+---
+# ops/ansible/roles/oci-substrate-t2-sync/defaults/main.yml
+#
+# Per-site Orin-C cron that syncs the canonical-set from T1 (R2 + ECR)
+# to T2 (Orin-C Forgejo) on a 48h interval. Pull-through cache (Block 71's
+# docker-registry-mirror) covers urgent cache-misses between cron runs;
+# this cron is the drift-safety-net per ADR 0838 §"Sync model".
+#
+# Status: the T1 endpoints ARE now wired, in the shared home
+# ops/ansible/group_vars/all.yml (the provisioning tier is one
+# cross-goatnet service — see that file for why it is not per-goatnet).
+# The role defaults below stay EMPTY on purpose: an empty default plus a
+# fail-closed assert means a host that somehow reads role defaults
+# without the group_vars refuses rather than syncing from nowhere.
+#
+# What is still NOT done, and why oci_t2_sync_enabled remains false:
+# no R2 credential has been minted, no rclone seed has run, and the
+# `crane copy` registry semantics the sync script assumes have never
+# been proven against the R2 bucket. Checklist:
+# docs/design/rapid-site-bringup.md §5 "What the light-up still needs".
+# Flipping the switch is a deploy decision, not a merge decision.
+
+# Master switch. Per-goatnet decision; carries a parity-capabilities row.
+oci_t2_sync_enabled: false
+
+# Forgejo endpoint on this Orin-C; consumed by sync script.
+oci_t2_forgejo_endpoint: "localhost:3030"
+
+# T1 mirror endpoints — real values live in group_vars/all.yml; these
+# empty defaults are the fail-closed floor (see the assert in tasks).
+oci_t1_r2_endpoint: ""
+oci_t1_ecr_endpoint: ""
+
+# R2 S3-API credential, account-scoped. Real values come from
+# group_vars/all.yml via lookup('env', 'R2_ACCESS_KEY_ID' /
+# 'R2_SECRET_ACCESS_KEY'). Never rendered to disk — see the assert and
+# the delivery gap noted in tasks/main.yml.
+oci_t1_r2_access_key_id: ""
+oci_t1_r2_secret_access_key: ""
+
+# Cron interval. Per ADR 0838 + design doc §6.2: 48h default,
+# operator-tunable per site to as long as 7d if bandwidth-constrained
+# or as short as 24h if freshness-sensitive. Image bumps that land via
+# the PR-merged trigger hit T1 immediately; T2 freshness for
+# not-yet-requested canonical-set images is the drift-safety-net the
+# cron covers, not the urgent path — urgent pulls are served by the
+# pull-through cache.
+oci_t2_sync_interval_hours: 48
+
+# Stagger offset across sites (in hours). Computed from sha256(site_id)
+# at the operator workstation; default empty means use the first 8 bits
+# of sha256(inventory_hostname) mod oci_t2_sync_interval_hours.
+oci_t2_sync_offset_hours: ""
+
+# Path to canonical-set.yaml on the Orin-C. Synced from operator
+# workstation via the role's "deploy canonical-set" task on every run.
+oci_canonical_set_path: /etc/oci-goat/canonical-set.yaml
+
+# Where the sync script lives (operator-fired manual + cron-fired auto).
+oci_sync_script_path: /usr/local/bin/oci-goat-sync.sh
+
+# Where the sync script writes per-run JSONL evidence.
+oci_sync_log_path: /var/log/oci-goat-sync.jsonl
+
+# Cron user. Per CLAUDE.md the Orin-C utility-host runs operator-fired
+# scripts as root; the sync script does not need privileged actions
+# (just docker socket access via group membership), but root keeps the
+# log file ownership clean.
+oci_sync_cron_user: root

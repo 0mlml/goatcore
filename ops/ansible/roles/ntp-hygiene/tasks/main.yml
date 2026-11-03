@@ -1,0 +1,426 @@
+---
+# ops/ansible/roles/ntp-hygiene/tasks/main.yml
+#
+# NTP hygiene MVP (v1) for mgmt-hosts.
+#
+# Policy: docs/design/universal-ntp-hygiene.md  (cross-plane)
+# Scope:  docs/design/mgmt-plane-threat-mitigations.md §1.1 (N1-N5)
+# Debt:   docs/design/ha-multi-site-validation.md items #18, #22
+#
+# Pipeline:
+#   1. Install chrony (apt) and write /etc/chrony/chrony.conf from
+#      template (NTS sources only).
+#   2. Install SuperQ/chrony_exporter as a systemd unit, bound to
+#      127.0.0.1:9123 and reading chronyd's Unix control socket.
+#   3. Preflight assertion — fails if chrony has no selected source OR
+#      last-offset > chrony_preflight_offset_ms. Reusable from
+#      ops/ansible/tasks/ntp-preflight.yml for future playbooks
+#      (e.g. coordinated-upgrade.yml).
+#   4. Smoke-test assertion — offset_seconds < chrony_smoketest_offset_s
+#      and at least one chrony source reported.
+#
+# Not in v1 (documented gaps — see README.md):
+#   * GNSS hardware integration.
+#   * `ntp-health-agent` daemon (Unix socket / signed HTTPS / Zenoh).
+#   * Cross-site peer attestation.
+#   * Enrollment-time NTP health check.
+#   * Auto-demote on sustained NTP degradation.
+
+- name: Install chrony (Ubuntu 22.04 ships 4.2 — NTS-capable)
+  ansible.builtin.apt:
+    name: chrony
+    state: present
+    update_cache: true
+  notify: restart chrony
+
+- name: Ensure chrony log dir exists
+  ansible.builtin.file:
+    path: "{{ chrony_logdir }}"
+    state: directory
+    owner: _chrony
+    group: _chrony
+    mode: "0750"
+
+# --------------------------------------------------------------------------
+# Block 12G — NTS server tier (per ADR 0834)
+# Pre-flight: when chrony_serve_nts is true, the offline-CA-signed cert
+# + key MUST exist BEFORE chrony.conf is rendered, or the daemon
+# refuses to load with a confusing FailedToOpen log line. Verify
+# presence + tighten perms here. Skipped cleanly when the flag is off.
+# --------------------------------------------------------------------------
+
+- name: "[NTS server] Verify cert exists at configured path"
+  ansible.builtin.stat:
+    path: "{{ chrony_serve_nts_cert_path }}"
+  register: _nts_cert_stat
+  when: chrony_serve_nts | default(false) | bool
+
+- name: "[NTS server] Verify key exists at configured path"
+  ansible.builtin.stat:
+    path: "{{ chrony_serve_nts_key_path }}"
+  register: _nts_key_stat
+  when: chrony_serve_nts | default(false) | bool
+
+- name: "[NTS server] Fail loudly if cert + key are missing"
+  ansible.builtin.assert:
+    that:
+      - _nts_cert_stat.stat.exists | default(false)
+      - _nts_key_stat.stat.exists | default(false)
+    fail_msg: |
+      chrony_serve_nts is true but the cert/key are missing:
+        cert: {{ chrony_serve_nts_cert_path }}  (exists: {{ _nts_cert_stat.stat.exists | default(false) }})
+        key:  {{ chrony_serve_nts_key_path }}   (exists: {{ _nts_key_stat.stat.exists | default(false) }})
+      Operator must issue these via `cert-sign --eku serverAuth` BEFORE
+      flipping the flag. See docs/operations/orin-c-utility-host.md
+      §"NTS server" or ADR 0834 for the cert-sign invocation.
+  when: chrony_serve_nts | default(false) | bool
+
+- name: "[NTS server] Tighten cert + key file ownership"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: "{{ chrony_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ chrony_serve_nts_cert_path }}", mode: "0644" }
+    - { path: "{{ chrony_serve_nts_key_path }}",  mode: "0640" }
+  loop_control:
+    label: "{{ item.path }}"
+  when: chrony_serve_nts | default(false) | bool
+  notify: restart chrony
+
+- name: "[NTS server] Ensure dump dir exists (key cache for restart resilience)"
+  ansible.builtin.file:
+    path: "{{ chrony_serve_nts_dump_dir }}"
+    state: directory
+    owner: "{{ chrony_group }}"
+    group: "{{ chrony_group }}"
+    mode: "0750"
+  when: chrony_serve_nts | default(false) | bool
+
+# --------------------------------------------------------------------------
+# Pre-sync — install the one-shot non-NTS bootstrap
+# service that runs BEFORE chrony.service + docker.service when the
+# host clock is implausibly old (Tegra Orin RTC-loss class). No-op on
+# healthy clocks; fires only on first-boot-after-power-loss.
+# --------------------------------------------------------------------------
+
+- name: "[chrony-presync] Render /usr/local/sbin/chrony-presync.sh"
+  ansible.builtin.template:
+    src: chrony-presync.sh.j2
+    dest: /usr/local/sbin/chrony-presync.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: chrony_presync_enabled | bool
+
+- name: "[chrony-presync] Render systemd unit"
+  ansible.builtin.template:
+    src: chrony-presync.service.j2
+    dest: /etc/systemd/system/chrony-presync.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: chrony_presync_enabled | bool
+  notify: reload systemd
+
+- name: "[chrony-presync] Enable systemd unit (will fire on next boot)"
+  ansible.builtin.systemd:
+    name: chrony-presync.service
+    enabled: true
+    daemon_reload: true
+  when: chrony_presync_enabled | bool
+
+# F-165 relocation/late-WAN self-heal — a monotonic timer re-fires
+# chrony-presync.service until it succeeds, so a host powered on before
+# its uplink is reachable converges on correct time with no operator
+# action. The presync script stops this timer on success.
+- name: "[chrony-presync] Render retry timer (relocation/late-WAN self-heal)"
+  ansible.builtin.template:
+    src: chrony-presync-retry.timer.j2
+    dest: /etc/systemd/system/chrony-presync-retry.timer
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - chrony_presync_enabled | bool
+    - chrony_presync_retry_timer_enabled | bool
+  notify: reload systemd
+
+- name: "[chrony-presync] Enable + start retry timer"
+  ansible.builtin.systemd:
+    name: chrony-presync-retry.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when:
+    - chrony_presync_enabled | bool
+    - chrony_presync_retry_timer_enabled | bool
+
+- name: "[chrony-presync] Remove the stamp so the role-run is testable on a healthy host"
+  # /run/chrony-presync.done is the "already-ran-this-boot" stamp. We
+  # don't remove it during normal role runs — it'll be regenerated on
+  # next boot. But during testing / first install we want the unit to
+  # be ready to fire on next reboot regardless of any stale stamp.
+  ansible.builtin.file:
+    path: /run/chrony-presync.done
+    state: absent
+  when:
+    - chrony_presync_enabled | bool
+    - chrony_presync_force_clear_stamp | default(false) | bool
+
+# --------------------------------------------------------------------------
+# fake-hwclock — the OFFLINE cold-boot companion to chrony-presync.
+# The Tegra AGX Orin has no battery-backed RTC, so it cold-boots at
+# 1970-01-01 (kernel: "nvvrs-pseq-rtc: setting system clock to 1970").
+# chrony-presync corrects this — but only AFTER it reaches a network time
+# source. On a denied-edge / late-WAN / offline cold boot there is no source,
+# so the box sits at 1970 and EVERY mTLS handshake fails cert validation
+# ("certificate is not yet valid") — netbird, zenoh, management, registry
+# pulls all break, and the site cannot rejoin its own fabric offline (a
+# direct hit on the ADR-1037 "run itself at the denied edge" thesis).
+# fake-hwclock saves the wall clock to disk (hourly + on shutdown) and
+# restores it at boot BEFORE the network, so a cold boot starts at
+# "last-known-good" instead of 1970; chrony-presync/chrony then refine it.
+# Safe fleet-wide: `fake-hwclock load` only advances the clock, never regresses
+# it, so on an RTC-equipped host (already-correct clock) it is a no-op.
+- name: "[fake-hwclock] Install (RTC-less cold-boot clock persistence)"
+  ansible.builtin.apt:
+    name: fake-hwclock
+    state: present
+  when: ntp_fake_hwclock_enabled | bool
+
+# The custom unit has to ship with the role: a fresh host otherwise hits
+# "Could not find the requested service fake-hwclock-load.service".
+- name: "[fake-hwclock] Install load-at-boot unit (role owns the unit file)"
+  ansible.builtin.copy:
+    src: fake-hwclock-load.service
+    dest: /etc/systemd/system/fake-hwclock-load.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: ntp_fake_hwclock_enabled | bool
+
+- name: "[fake-hwclock] Ensure load-at-boot service is enabled"
+  ansible.builtin.systemd:
+    name: fake-hwclock-load.service
+    enabled: true
+    daemon_reload: true
+  when: ntp_fake_hwclock_enabled | bool
+
+- name: "[fake-hwclock] Seed the saved clock — but ONLY when the clock is sane"
+  # Never persist a bad time. The role runs after chrony has settled with a
+  # selected source (the wait-for-settle task above), so the clock is correct
+  # here; the year guard is belt-and-suspenders against seeding a 1970 value.
+  ansible.builtin.command: fake-hwclock save
+  changed_when: false
+  when:
+    - ntp_fake_hwclock_enabled | bool
+    - (ansible_date_time.year | int) >= 2020
+
+- name: Render /etc/chrony/chrony.conf (NTS sources + optional server tier)
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart chrony
+
+- name: Enable + start chrony
+  ansible.builtin.systemd:
+    name: chrony
+    state: started
+    enabled: true
+
+# Flush the chrony restart so the preflight that follows sees the
+# newly-configured sources, not whatever was running before this role.
+- name: Apply chrony restart before preflight
+  ansible.builtin.meta: flush_handlers
+
+# Give chrony a moment to complete its first NTS-KE handshake(s). The
+# preflight below will fail fast if the settle doesn't produce a source.
+#
+# This waits for an actual SELECTED source (^* or ^+) — not just for
+# chronyd to be alive. Without that, a freshly-restarted chrony returns
+# rc=0 from `chronyc tracking` immediately but no source is selected
+# yet (NTS-KE + clock measurement take 5-30s) and the preflight that
+# follows fails. become required so the chrony cmdsocket is reachable.
+- name: Wait for chrony to settle with at least one selected source (up to 60s)
+  become: true
+  ansible.builtin.shell: |
+    set -o pipefail
+    chronyc -c sources | awk -F, '$2 ~ /^[*+]$/ { n++ } END { print (n+0) }'
+  args:
+    executable: /bin/bash
+  register: chrony_settle
+  retries: 30
+  delay: 2
+  until: (chrony_settle.stdout | default('0') | int) >= 1
+  changed_when: false
+
+# A fresh box can boot a few hundred milliseconds out. `makestep 1.0 3` steps
+# only a full second or more, so anything under that is slewed at chrony's
+# default rate, about half an hour per second, while site-bootstrap's preflight
+# refuses above chrony_preflight_offset_ms. chrony-presync does not catch it
+# either: it checks that the year is plausible, nothing finer (F-604, measured
+# 2026-11-02 on a fresh VM: 882 ms, refused at 200 ms). So the one place a
+# step is both safe and needed is here, at baseline, before anything that
+# keeps time runs. A host with containers running is left to slew: a step
+# under a live Postgres is the wrong trade, and the preflight will say what
+# the clock is.
+- name: Read the system clock's offset from NTP time after settling (seconds, signed)
+  become: true
+  ansible.builtin.shell: |
+    set -o pipefail
+    chronyc -c tracking | awk -F, '{ print $4 }'
+  args:
+    executable: /bin/bash
+  register: chrony_system_offset
+  changed_when: false
+
+- name: Count running containers (a step is for a box that keeps no time yet)
+  become: true
+  ansible.builtin.shell: docker ps -q 2>/dev/null | wc -l
+  register: chrony_running_containers
+  changed_when: false
+  failed_when: false
+
+- name: Step the clock once when the offset exceeds the preflight ceiling and nothing runs yet
+  become: true
+  ansible.builtin.command: chronyc makestep
+  when:
+    - ((chrony_system_offset.stdout | default('0') | trim | float) | abs) * 1000 >= (chrony_preflight_offset_ms | int)
+    - (chrony_running_containers.stdout | default('0') | trim | int) == 0
+
+# --------------------------------------------------------------------------
+# 2. chrony_exporter
+# --------------------------------------------------------------------------
+
+- name: Confirm chrony daemon user exists (will run the exporter too)
+  # chronyd's unix-socket RPC authorization checks caller's effective
+  # UID against an allow-list that by default includes only root and
+  # chronyd's own UID. Group membership is NOT enough. Simplest +
+  # canonical approach is to run the exporter AS the chrony user —
+  # that's also what SuperQ/chrony_exporter's own packaging does.
+  # No dedicated exporter user needed.
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ chrony_exporter_user }}"
+
+- name: Remove stale dedicated chrony_exporter user if present
+  # From earlier role revisions that created its own user. Idempotent.
+  ansible.builtin.user:
+    name: chrony_exporter
+    state: absent
+  when: chrony_exporter_user != "chrony_exporter"
+
+- name: Detect host architecture for chrony_exporter download
+  ansible.builtin.set_fact:
+    chrony_exporter_arch: >-
+      {{ 'amd64' if ansible_architecture == 'x86_64'
+         else 'arm64' if ansible_architecture in ['aarch64', 'arm64']
+         else ansible_architecture }}
+
+# Tarball name per SuperQ/chrony_exporter release layout:
+#   chrony_exporter-<version>.linux-<arch>.tar.gz
+- name: Set chrony_exporter download URL
+  ansible.builtin.set_fact:
+    chrony_exporter_url: >-
+      https://github.com/SuperQ/chrony_exporter/releases/download/v{{ chrony_exporter_version }}/chrony_exporter-{{ chrony_exporter_version }}.linux-{{ chrony_exporter_arch }}.tar.gz
+    chrony_exporter_tar: "/tmp/chrony_exporter-{{ chrony_exporter_version }}.linux-{{ chrony_exporter_arch }}.tar.gz"
+
+- name: Check whether chrony_exporter binary already present at pinned version
+  ansible.builtin.command:
+    cmd: "{{ chrony_exporter_install_dir }}/chrony_exporter --version"
+  register: chrony_exporter_installed
+  failed_when: false
+  changed_when: false
+
+- name: Download chrony_exporter tarball
+  ansible.builtin.get_url:
+    url: "{{ chrony_exporter_url }}"
+    dest: "{{ chrony_exporter_tar }}"
+    mode: "0644"
+  when: >-
+    chrony_exporter_installed.rc != 0
+    or chrony_exporter_version not in (chrony_exporter_installed.stderr | default(''))
+       and chrony_exporter_version not in (chrony_exporter_installed.stdout | default(''))
+
+- name: Extract chrony_exporter binary
+  ansible.builtin.unarchive:
+    src: "{{ chrony_exporter_tar }}"
+    dest: /tmp/
+    remote_src: true
+    extra_opts:
+      - "--strip-components=1"
+      - "--no-same-owner"
+    creates: "/tmp/chrony_exporter-{{ chrony_exporter_version }}-extracted"
+  when: >-
+    chrony_exporter_installed.rc != 0
+    or chrony_exporter_version not in (chrony_exporter_installed.stderr | default(''))
+       and chrony_exporter_version not in (chrony_exporter_installed.stdout | default(''))
+
+- name: Install chrony_exporter binary
+  ansible.builtin.copy:
+    src: /tmp/chrony_exporter
+    dest: "{{ chrony_exporter_install_dir }}/chrony_exporter"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart chrony_exporter
+  # Skip when Download + Extract were skipped (binary already at pinned
+  # version). Same gate as Download/Extract above.
+  when: >-
+    chrony_exporter_installed.rc != 0
+    or chrony_exporter_version not in (chrony_exporter_installed.stderr | default(''))
+       and chrony_exporter_version not in (chrony_exporter_installed.stdout | default(''))
+
+- name: Render chrony_exporter systemd unit
+  ansible.builtin.template:
+    src: chrony_exporter.service.j2
+    dest: /etc/systemd/system/chrony_exporter.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart chrony_exporter
+
+- name: Enable + start chrony_exporter
+  ansible.builtin.systemd:
+    name: chrony_exporter
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Apply chrony_exporter restart if unit changed
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for chrony_exporter /metrics to respond
+  ansible.builtin.uri:
+    url: "http://{{ chrony_exporter_listen_addr }}/metrics"
+    status_code: 200
+    return_content: false
+  register: chrony_exporter_ready
+  retries: 15
+  delay: 2
+  until: chrony_exporter_ready.status == 200
+
+# --------------------------------------------------------------------------
+# 3. Preflight assertion — reusable from other playbooks via
+#    ops/ansible/tasks/ntp-preflight.yml (which delegates to
+#    roles/ntp-hygiene/tasks/preflight.yml under the hood).
+# --------------------------------------------------------------------------
+
+- name: Run NTP preflight assertion
+  ansible.builtin.include_tasks: preflight.yml
+
+# --------------------------------------------------------------------------
+# 4. Smoke-test — all targeted hosts must see their local chrony_exporter
+#    return offset_seconds < chrony_smoketest_offset_s and >= 1 source.
+# --------------------------------------------------------------------------
+
+- name: Run NTP smoke-test
+  ansible.builtin.include_tasks: smoketest.yml

@@ -1,0 +1,336 @@
+# Kratos config — rendered by the `ory` role per-site.
+#
+# SECRETS POLICY (CLAUDE.md "No plaintext secrets in generated files
+# on disk"): this file is rendered at mode 0644 because the Kratos
+# container runs as non-root and needs world-readable config (0640 fails
+# with "open /etc/config/kratos.yaml: permission denied"). Therefore secrets MUST
+# come from env vars in /opt/mgmt-host/.env (mode 0600), NOT inlined
+# here. The empty arrays below are populated at runtime by Kratos's
+# env-var override — the CONTAINER vars are SECRETS_COOKIE / SECRETS_CIPHER
+# (config path uppercased, no `KRATOS_` prefix, no `_0` index); compose maps
+# them from KRATOS_SECRETS_{COOKIE,CIPHER} in the host .env.
+#
+# Failover: single-active per ADR 1010 D1 (operator-fired per
+# the postgres failover runbook, same model as netbird-mgmt). Lifespan
+# budgets in this file (10m flow, 15m settings) cover both inter-site
+# Spock replication lag AND the operator-fired intra-site failover
+# window with comfortable margin per ADR 1010 D2.
+#
+# F-005 (Kratos cipher per-instance encryption): the cipher secret must
+# be IDENTICAL across the HA pair (Orin-A + Orin-B). With single-active
+# deployment + operator-fired failover, B's kratos doesn't run until
+# operator promotes — but when it does start, it must use the same
+# cipher secret as A's kratos was using, otherwise encrypted-at-rest
+# data is unreadable. Operator MUST set KRATOS_SECRETS_CIPHER on both
+# Orins to the same 32-char value (1Password-backed, gitignored).
+version: v1.3.1
+
+serve:
+  public:
+    base_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/"
+    cors:
+      enabled: true
+      allowed_origins:
+        - "https://*.{{ site_id }}.{{ site_dns_zone }}"
+      allowed_methods:
+        - POST
+        - GET
+        - PUT
+        - DELETE
+      allowed_headers:
+        - Authorization
+        - Cookie
+        - Content-Type
+      exposed_headers:
+        - Content-Type
+        - Set-Cookie
+  admin:
+    base_url: http://kratos:4434/
+
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/config/identity-schema.json
+
+# Block 21D.1.b — Kratos's OAuth2-provider integration with Hydra. Without
+# this block, Hydra-initiated OIDC flows hit Kratos's selfservice-ui-node
+# /login with `?login_challenge=...` and Kratos returns:
+#   "refusing to parse login_challenge query parameter because
+#    oauth2_provider.url is invalid or unset"
+# Hydra admin port (4445) is loopback-only inside the compose network;
+# Kratos reaches it via Docker DNS `hydra:4445`.
+oauth2_provider:
+  url: http://hydra:4445
+
+selfservice:
+  default_browser_return_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/"
+
+  # Without this, any return_to URL outside of `default_browser_return_url`'s
+  # exact value is rejected by Kratos with `self_service_flow_return_to_forbidden`
+  # ("Requested return_to URL ... is not allowed"). The patched selfservice-ui-node
+  # routes humans through /welcome on auth.<site>.<zone> after a successful direct
+  # login (any path entered by hand without an OIDC-initiated `?return_to=`); that
+  # destination must be in the allowlist or the user lands on the Kratos /error page.
+  # Kratos prefix-matches each entry, so listing the auth-domain root covers
+  # /welcome plus any future selfservice-ui-node routes on the same origin.
+  allowed_return_urls:
+    - "https://auth.{{ site_id }}.{{ site_dns_zone }}/"
+    # goat-id-console step-up return legs (goat#247 defect 5). The console's
+    # verify flow (login?aal=aal2) and enrol flow (settings) both send
+    # return_to=https://admin.auth.<site>/step-up/return — a DIFFERENT origin,
+    # so the auth-root entry above does not prefix-match it and Kratos refuses
+    # the whole flow ("Requested return_to URL ... is not allowed"). Never hit
+    # live before only because earlier defects kept anyone from reaching the
+    # Verify button.
+    #
+    # The origin is id_admin_console_fqdn — the SAME fact that feeds the
+    # console's STEP_UP_RETURN_TO_BASE (id-admin-console role, defaults
+    # main.yml). A per-goatnet override of that fact belongs in group_vars,
+    # where BOTH roles see it and this entry follows automatically; the
+    # default below only mirrors the id-admin-console role default for plays
+    # that run the ory role alone. If the two ever diverge, both step-up
+    # return legs die with self_service_flow_return_to_forbidden.
+    - "https://{{ id_admin_console_fqdn | default('admin.auth.' ~ site_id ~ '.' ~ site_dns_zone) }}/"
+
+  flows:
+    # ADR 1010 D2 lifespan budgets — must exceed worst-case inter-site
+    # Spock replication lag + operator-fired intra-site failover window.
+    settings:
+      ui_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/settings"
+      privileged_session_max_age: {{ ory_privileged_session_max_age | default('24h') }}
+    login:
+      ui_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/login"
+      # 60m, not the Ory default 10m. A LOGIN FLOW lifespan is how long a
+      # rendered sign-in form stays submittable — it is not the session
+      # (24h) and shortening it buys no session security, because an
+      # unsubmitted form grants nothing.
+      #
+      # What 10m costs: an operator with
+      # several mesh surfaces open loses any form they opened while reading
+      # something else. Kratos handles that correctly ("the login flow
+      # expired N minutes ago, please try again"), so the cost is
+      # interruption, NOT an error page.
+      #
+      # This environment fans one IdP out across five+ fenced surfaces, so
+      # "opened a tab, came back to it" is the NORMAL path, not an edge
+      # case. An expired flow should re-render the form, not show a security error.
+      lifespan: {{ ory_login_flow_lifespan | default('60m') }}
+      # NO `required_aal` HERE — Kratos has no such key on a login flow, and
+      # adding one does not degrade gracefully: it fails the config schema and
+      # Kratos REFUSES TO BOOT.
+      #
+      #   I[#/selfservice/flows/login] S[…/login/additionalProperties]
+      #   additionalProperties "required_aal" not allowed
+      #
+      # The `ory_admin_mfa_required` knob must never render this key: any goatnet that
+      # set it true would take its whole identity plane down on the next `ory` role run. v1.3.1's schema
+      # accepts `required_aal` in exactly two places — `selfservice.flows.settings`
+      # and `session.whoami` (see the whoami block below) — and neither is a
+      # login-door MFA requirement. Mandatory MFA at the door is not expressible
+      # on this Kratos; step-up is enforced per-ACTION by goat-id-console
+      # (ADR 0860), which reads the session's own authentication_methods ledger.
+    registration:
+      ui_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/register"
+      # Same reasoning as login above, and it matters more here: a person
+      # part-way through onboarding loses their work to a security page.
+      lifespan: {{ ory_registration_flow_lifespan | default('60m') }}
+      # Disabled by default for the mgmt-plane IdP — admins are
+      # provisioned via `kratos identity import` from admins.<site>.yaml.
+      # Per-consumer Block 21D wiring may flip this on for service-account
+      # self-service registration.
+      enabled: false
+    recovery:
+      # Gated on ory_recovery_enabled (default false). When off, Kratos treats
+      # the flow as disabled and every recovery attempt 400s
+      # ("Recovery is not allowed because it was disabled"), which also breaks
+      # the goat-id-console admin recovery-link button. See role defaults.
+      enabled: {{ ory_recovery_enabled | default(false) | bool | lower }}
+{% if ory_recovery_enabled | default(false) | bool %}
+      use: code
+{% endif %}
+      ui_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/recovery"
+      lifespan: {{ ory_recovery_lifespan | default('24h') }}
+    verification:
+      ui_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/verification"
+      lifespan: 1h
+    error:
+      ui_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/error"
+    logout:
+      after:
+        default_browser_return_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}/"
+
+  methods:
+    password:
+      enabled: true
+      config:
+        haveibeenpwned_enabled: false
+        max_breaches: 0
+        ignore_network_errors: true
+        min_password_length: 12
+        identifier_similarity_check_enabled: true
+    # WebAuthn / passkey support (A10 in idp-decision-review.md;
+    # browser-test verification deferred to Block 21D when the first
+    # consumer service brings a UI online).
+    #
+    # passwordless: false.
+    # Setting `passwordless: true` is a speculative posture for
+    # "passkey-as-first-factor", and it causes
+    # Kratos to auto-deactivate fresh password-only identities created
+    # via the operator-onboard.yml flow within 1-5 minutes of creation:
+    # Kratos auto-initializes a webauthn placeholder credential whenever
+    # an identity is minted with a webauthn-identifier trait (email), a
+    # lifecycle reaper observes the placeholder-without-enrolled-key
+    # state, and flips state → inactive. No consumer service relies
+    # on webauthn-as-first-factor (every operator
+    # manifest example ships passkey: false; the dashboard / grafana /
+    # portal flows authenticate via password through the OIDC handshake).
+    # With passwordless: false, webauthn is available only as a
+    # second-factor (after a primary password login), and the reaper
+    # never sees the deactivation-trigger state.
+    #
+    # The goat-id-console Reactivate button (sibling to ADR 0860) stays
+    # in place as belt-and-suspenders for any future Kratos lifecycle
+    # surprise — but routine identity provisioning should no longer
+    # need it.
+    webauthn:
+      enabled: true
+      config:
+        passwordless: false
+        rp:
+          display_name: "goat {{ site_id | upper }}"
+          id: "auth.{{ site_id }}.{{ site_dns_zone }}"
+          origins:
+            - "https://auth.{{ site_id }}.{{ site_dns_zone }}"
+    totp:
+      enabled: true
+      config:
+        issuer: "goat {{ site_id | upper }}"
+{% if icam_federation.enabled | default(false) and (icam_federation.providers | default([]) | length > 0) %}
+    # ---- External ICAM federation — the CAC-ingress broker (default-off) --------
+    # docs/design/external-icam-federation.md · role default icam_federation (off).
+    # Every toggle mode (upstream_oidc / mtls_proxy / keycloak_frontend) presents
+    # HERE as one upstream OIDC provider — this block is mode-UNIFORM; the mode only
+    # decides what backs issuer_url (external IdP / local mTLS proxy / local Keycloak).
+    # SITE IdP only — the operator IdP (operator-idp-kratos) stays native (break-glass).
+    # Secrets policy: client_secret is left empty here (0644 world-readable file) and
+    # injected at runtime via Kratos env-override from ory/kratos-icam.env (0600, the
+    # compose env_file of the kratos service):
+    #   SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_<n>_CLIENT_SECRET=$ICAM_OIDC_<ID>_CLIENT_SECRET
+    # Claims map to grammar traits via the per-provider jsonnet (ops/identity/claim-maps/).
+    oidc:
+      enabled: true
+      config:
+        providers:
+{% for p in icam_federation.providers %}
+          # provider {{ loop.index0 }}: {{ p.id }} — mode={{ p.mode | default('upstream_oidc') }} scheme={{ p.scheme | default('native') }} authority={{ p.authority | default('industry') }}{% if p.boundary_il is defined %} boundary_il={{ p.boundary_il }}{% endif %}
+
+          - id: "{{ p.id }}"
+            provider: generic
+            label: "{{ p.label | default(p.id) }}"
+            client_id: "{{ p.client_id }}"
+            client_secret: ""   # -> env SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_{{ loop.index0 }}_CLIENT_SECRET
+            issuer_url: "{{ p.issuer_url }}"
+            mapper_url: "file:///etc/config/claim-maps/{{ p.claim_map | default(p.id) }}.jsonnet"
+            scope:
+{% for s in p.scopes | default(['openid', 'profile', 'email']) %}
+              - {{ s }}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% if ory_recovery_enabled | default(false) | bool %}
+    # Recovery (and verification) code strategy. Enabled only when
+    # ory_recovery_enabled is true so the recovery flow above has a method.
+    # Admin-minted links (goat-id-console) return the code/link in the API
+    # response — no courier delivery needed.
+    code:
+      enabled: true
+      config:
+        lifespan: {{ ory_recovery_lifespan | default('24h') }}
+{% endif %}
+
+session:
+  lifespan: 24h
+  cookie:
+    domain: "auth.{{ site_id }}.{{ site_dns_zone }}"
+    same_site: Lax
+    persistent: true
+  whoami:
+    # MFA AT THE DOOR. This is the only AAL knob Kratos v1.3.1 has — there is no
+    # login-flow equivalent (see the login block above, F-341). `highest_available`
+    # demands the strongest factor an identity actually HOLDS, so it cannot lock
+    # out a password-only user; `aal1` turns the second factor off at sign-in and
+    # leaves it to goat-id-console's per-action step-up gate.
+    #
+    # MUST be set explicitly either way — Kratos's own default is
+    # `highest_available`, so OMITTING this key does not mean "off", it means
+    # strictest. Set it so operators know which posture they are running.
+    #
+    # KNOWN WART, recorded rather than hidden. The selfservice-ui's
+    # `maybeInitiate2FA` (lib/pkg/middleware.js) builds its OWN step-up URL:
+    #
+    #   res.redirect(getUrlForFlow(apiBaseUrl, "login",
+    #     new URLSearchParams({ aal: "aal2", return_to: return_to })))
+    #
+    # It never copies `login_challenge`. So any page behind requireAuth/setSession
+    # — `/welcome` and `/sessions` — that a browser loads WHILE an OIDC login is
+    # in flight will push that browser into a fresh, challenge-less aal2 flow.
+    # A second tab on /welcome gets pushed into a flow carrying no challenge.
+    #
+    # It is a wart and not a blocker: every scripted path recovers, because the
+    # Hydra challenge stays PENDING and the flow resumes once the session reaches
+    # aal2. Four harness variants — kratos-direct, through-ui, double-submit and
+    # two-tab — all reach the app under `highest_available`
+    # (ops/identity/aal2-oidc-repro/repro.sh). A real login can land on the Ory
+    # welcome page instead; retrying the original URL works.
+    #
+    # THE CAUSE, reproduced deterministically: the login
+    # form is SUBMITTED TWICE. Both POSTs carry the same referer, same flow
+    # and same content-length, milliseconds apart — a double-click. Kratos answers the
+    # second on a consumed flow with a 303 to default_browser_return_url, which
+    # navigates the browser off the challenge-bearing step-up URL the first one
+    # correctly returned. maybeInitiate2FA is the LAST link, not the first, and
+    # patching it is impossible anyway (no challenge in scope on /welcome).
+    # Fixed by ops/ory-consent/patches/0005-*, a double-submit guard.
+    required_aal: {{ 'highest_available' if ory_admin_mfa_required | default(true) | bool else 'aal1' }}
+
+secrets:
+  # Populated at runtime via the container env vars SECRETS_COOKIE +
+  # SECRETS_CIPHER (Kratos takes the config path uppercased, with NO `KRATOS_`
+  # prefix and no `_0` index — an earlier version of this comment named
+  # KRATOS_SECRETS_*_0, which sets nothing). docker-compose.ory.yml maps them
+  # from KRATOS_SECRETS_{COOKIE,CIPHER} in /opt/mgmt-host/.env (mode 0600).
+  # The empty arrays here let Kratos start; the env vars override at
+  # parse time per Kratos's documented env-override behavior.
+  cookie: []
+  cipher: []
+
+hashers:
+  algorithm: bcrypt
+  bcrypt:
+    cost: 12
+
+courier:
+  smtp:
+    # Default no-op courier — Kratos requires this block to exist; pointing at
+    # a local sink that won't actually deliver is the safe default for a site
+    # with no mail transport.
+    #
+    # When ory_courier_smtp_enabled, the REAL connection_uri is injected at
+    # runtime via the Kratos env-override COURIER_SMTP_CONNECTION_URI (from
+    # /opt/mgmt-host/.env, mode 0600) and takes precedence over this line. It
+    # is deliberately absent here: this file is mode 0644 (the non-root Kratos
+    # container must read it) and the URI embeds the SMTP user:pass. Same
+    # secrets policy as the ICAM client_secret and KRATOS_SECRETS_* above.
+    connection_uri: "smtps://localhost:1025/?disable_starttls=true"
+{% if ory_courier_smtp_enabled | default(false) | bool %}
+    # Sender identity is NOT a secret, so it stays in the config file where it
+    # is reviewable. Must be an address the relay has a verified identity for.
+    from_address: "{{ ory_courier_from_address }}"
+    from_name: "{{ ory_courier_from_name }}"
+{% endif %}
+
+log:
+  level: info
+  format: json
+  leak_sensitive_values: false

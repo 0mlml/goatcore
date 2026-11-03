@@ -1,0 +1,111 @@
+---
+# Block 21H.1c — operator-idp-hydra role.
+# ADR 0842. Per-site Ory Hydra serving OAuth2 / OIDC for the operator
+# IdP. Connects to operator-idp-postgres + uses operator-idp-kratos as
+# login UI host (all three on the same Orin-C).
+#
+# Sequencing: this role must run AFTER operator-idp-postgres (DB)
+# AND operator-idp-kratos (login UI surface). 21H.1d orchestrator
+# enforces order.
+
+- name: Require operator-IdP Hydra secrets
+  ansible.builtin.assert:
+    that:
+      - operator_idp_hydra_secrets_system is defined and (operator_idp_hydra_secrets_system | length) >= 32
+      - operator_idp_hydra_secrets_cookie is defined and (operator_idp_hydra_secrets_cookie | length) >= 32
+      - operator_idp_pg_app_password is defined and (operator_idp_pg_app_password | length) > 0
+      - site_id is defined and (site_id | length) > 0
+    fail_msg: |
+      Missing operator-IdP Hydra secrets or DB password. These are
+      FRESH per site (NOT cluster-shared per ADR 0842). Generate:
+        OP_HYDRA_SYSTEM=$(openssl rand -hex 32)
+        OP_HYDRA_COOKIE=$(openssl rand -hex 32)
+      Then append to .envrc.local.d/30-site-services.envrc:
+        export <SITE>_C_OPERATOR_IDP_HYDRA_SECRETS_SYSTEM=...
+        export <SITE>_C_OPERATOR_IDP_HYDRA_SECRETS_COOKIE=...
+
+- name: Ensure compose project + config dir exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ operator_idp_hydra_compose_dir }}", mode: "0750" }
+    - { path: "{{ operator_idp_hydra_compose_dir }}/{{ operator_idp_hydra_config_subdir }}", mode: "0750" }
+
+- name: Render hydra.yaml
+  ansible.builtin.template:
+    src: hydra.yaml.j2
+    dest: "{{ operator_idp_hydra_compose_dir }}/{{ operator_idp_hydra_config_subdir }}/hydra.yaml"
+    mode: "0644"
+  notify: restart operator-idp-hydra
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ operator_idp_hydra_compose_dir }}/docker-compose.yml"
+    mode: "0640"
+
+- name: Render .env (operator-IdP Hydra secrets)
+  ansible.builtin.copy:
+    dest: "{{ operator_idp_hydra_compose_dir }}/.env"
+    mode: "0600"
+    content: |
+      HYDRA_SECRETS_SYSTEM={{ operator_idp_hydra_secrets_system }}
+      HYDRA_SECRETS_COOKIE={{ operator_idp_hydra_secrets_cookie }}
+  no_log: true
+  notify: restart operator-idp-hydra
+
+- name: Pull operator-idp-hydra image
+  ansible.builtin.command:
+    cmd: docker compose pull hydra
+    chdir: "{{ operator_idp_hydra_compose_dir }}"
+  changed_when: true
+
+- name: Run Hydra migrations (one-shot, idempotent)
+  ansible.builtin.command:
+    cmd: docker compose run --rm hydra-migrate
+    chdir: "{{ operator_idp_hydra_compose_dir }}"
+  changed_when: true
+
+- name: Bring up operator-idp-hydra
+  ansible.builtin.command:
+    cmd: docker compose up -d hydra
+    chdir: "{{ operator_idp_hydra_compose_dir }}"
+  changed_when: true
+
+- name: Wait for Hydra /health/ready (loopback admin port)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ operator_idp_hydra_admin_host_port }}/health/ready"
+    status_code: 200
+  register: hydra_admin_ready
+  retries: 30
+  delay: 2
+  until: hydra_admin_ready.status == 200
+
+- name: Wait for Hydra public OIDC discovery doc (loopback public port)
+  # Hydra's public listener (4444) sometimes lags admin (4445) by a
+  # few seconds at first start. Same flake the site-Hydra role saw
+  # at vega-A first deploy; same retry budget.
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ operator_idp_hydra_public_host_port }}/.well-known/openid-configuration"
+    status_code: 200
+    return_content: true
+  register: oidc_discovery
+  retries: 20
+  delay: 3
+  until: oidc_discovery.status == 200
+
+- name: Surface OIDC issuer (sanity)
+  ansible.builtin.debug:
+    msg: |
+      operator-idp-hydra up. OIDC issuer reports:
+        {{ (oidc_discovery.content | from_json).issuer }}
+      Loopback ports:
+        public  http://127.0.0.1:{{ operator_idp_hydra_public_host_port }}
+        admin   http://127.0.0.1:{{ operator_idp_hydra_admin_host_port }}
+      Public listener will be reverse-proxied by Traefik on Orin-C as:
+        https://oauth2.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}
+      Default access-token strategy: {{ operator_idp_hydra_access_token_strategy }}.

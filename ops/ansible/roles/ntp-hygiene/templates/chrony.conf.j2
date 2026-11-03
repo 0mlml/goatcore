@@ -1,0 +1,126 @@
+{# ops/ansible/roles/ntp-hygiene/templates/chrony.conf.j2
+   Rendered by ops/ansible/roles/ntp-hygiene.
+   Policy: NTS sources only — no plain NTP. See
+   docs/design/universal-ntp-hygiene.md §7 (fail-closed) and
+   §2 (publisher dimension).                                              #}
+# /etc/chrony/chrony.conf — MANAGED BY ANSIBLE (ntp-hygiene role).
+# Do not edit by hand. Override in group_vars or the role defaults.
+
+# -- Sources: NTS only ------------------------------------------------------
+# Each `server <host> iburst nts` line requires a successful NTS-KE
+# handshake before chrony uses the source. If key-exchange fails chrony
+# refuses to sync against it and the error lands in the log below.
+{% for src in chrony_nts_sources %}
+server {{ src }} iburst nts
+{% endfor %}
+{% if (chrony_plain_ntp_sources | default([])) | length > 0 %}
+
+# -- Plain NTP (DECLARED DEVIATION from NTS-only) ---------------------------
+# Only for a site whose network blocks NTS-KE / public NTP so no NTS source is
+# reachable, leaving unauthenticated NTP the ONLY available time. Empty on
+# every normal host — set per-site in group_vars with a doc reference.
+# Typical case: the LAN blocks NTS + public :123 and the ISP resolver also serves
+# plain NTP, which makes it the only reachable source.
+{% for src in chrony_plain_ntp_sources %}
+server {{ src }} iburst
+{% endfor %}
+{% endif %}
+
+# -- Drift / logging / runtime ---------------------------------------------
+driftfile {{ chrony_driftfile }}
+
+# Record measurements / statistics / tracking for post-hoc analysis and
+# for the `measurements` / `tracking` metrics surfaced by chrony_exporter.
+logdir {{ chrony_logdir }}
+log measurements statistics tracking
+
+# Step the clock on first measurement if it's off by > 1s, but only
+# during the first 3 updates (prevents mid-life clock steps — if we
+# ever drift past 1s in steady state we WANT that to fail visibly).
+makestep 1.0 3
+
+# Let chrony discipline the kernel RTC (hardware clock) so a reboot
+# doesn't leave us with a wildly-wrong wall clock before chrony resyncs.
+rtcsync
+
+# Leap-second handling: smear over 1000s rather than stepping at the
+# moment — avoids a one-second jump in wall clock that would otherwise
+# trip the clock-offset alert.
+leapsectz right/UTC
+maxslewrate 1000
+
+# -- Control socket / command port (read by chrony_exporter) ---------------
+{% if (chrony_exporter_cmdport | default(0) | int) > 0 %}
+# cmdport mode: the exporter reads chronyd over a LOCALHOST UDP command port
+# instead of the Unix control socket. Needed where the Unix-socket client
+# path fails — e.g. the STIG'd Jetson core, whose AppArmor-confined chronyd
+# cannot reply to the exporter's temp client socket, so /metrics hangs (the
+# F-194 class). Bound to loopback only; the exporter uses 127.0.0.1:<port>.
+cmdport {{ chrony_exporter_cmdport | int }}
+bindcmdaddress 127.0.0.1
+bindcmdaddress ::1
+{% else %}
+# The exporter connects over this Unix socket, not UDP. Default path on
+# Ubuntu 22.04 is /run/chrony/chronyd.sock; group-read so the
+# chrony_exporter user (added to the chrony group) can read it.
+# These are the Ubuntu-package defaults; listed explicitly for clarity.
+cmdport 0
+{% endif %}
+
+{% if chrony_serve_nts | default(false) | bool %}
+# -- Server tier (Block 12G / ADR 0834) ------------------------------------
+# Serve NTS to goat-net peers. Reachability is gated at the network layer
+# (allow-list below + host firewall + canonical-LAN/wg-cp0 segmentation);
+# chrony's allow-list is defense-in-depth, not the primary enforcement.
+#
+# Cert chain: the server cert + key are issued by the offline-CA via
+# `cert-sign --eku serverAuth` per ADR 0407. Clients trust the offline-CA
+# root via the offline-enrollment bundle's tls_trust_anchor field.
+ntsserverkey  {{ chrony_serve_nts_key_path }}
+ntsservercert {{ chrony_serve_nts_cert_path }}
+ntsdumpdir    {{ chrony_serve_nts_dump_dir }}
+ntsport       {{ chrony_serve_nts_port }}
+
+# NTP server port. 123 is the IANA-assigned port; clients dial it
+# directly after NTS-KE on ntsport above.
+port 123
+
+# Allow-list: only these CIDRs may sync against this server. Same-site
+# canonical LAN is primary (sub-ms RTT, low precision loss); wg-cp0 is
+# cross-site fallback (sloppy precision, but better than each peer
+# falling through to public NTS over its own egress).
+{% for cidr in (chrony_serve_nts_allow_cidrs | default([])) %}
+allow {{ cidr }}
+{% endfor %}
+
+# Orphan-mode last-resort anchor — a single-host site with no reachable
+# upstream still serves time, marked stratum 10 so clients know it's a
+# last-resort reference.
+local stratum 10
+
+{% elif chrony_serve_plain_ntp | default(false) | bool %}
+# -- Plain-NTP server tier (Block 82 trial fabrics) ------------------------
+# Serve unauthenticated NTP on port 123 to the configured LAN CIDRs.
+# Trial-scope only: visiting laptops arrive with arbitrary clocks; they
+# need a local reference so TLS validation against the leaf cert passes
+# (notBefore / notAfter checks).
+#
+# This is the lighter sibling of the NTS server tier above. Production
+# uses chrony_serve_nts: true (Block 12G); trial use here trades NTS
+# setup overhead for ergonomics. Not for production deploys.
+port 123
+{% for cidr in (chrony_serve_plain_ntp_allow_cidrs | default([])) %}
+allow {{ cidr }}
+{% endfor %}
+# Orphan-mode last-resort anchor — same shape as the NTS branch.
+local stratum 10
+
+{% else %}
+# -- Hardening -------------------------------------------------------------
+# Do not serve time to the outside world — this host is a mgmt-plane
+# publisher, not a time server. Flip `chrony_serve_nts: true` per
+# ADR 0834 + Block 12G to add the server tier, or
+# `chrony_serve_plain_ntp: true` for the trial-scope plain-NTP server
+# tier (Block 82).
+port 0
+{% endif %}

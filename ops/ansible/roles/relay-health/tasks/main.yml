@@ -1,0 +1,1207 @@
+---
+# relay-health role — mesh-internal, Ory-admin-gated relay-fleet health
+# dashboard. Static nginx + host prober timer + oauth2-proxy admin gate
+# (mirror oauth2-proxy-id-console / ADR 0860). F-213.
+#
+# Pre-reqs (operator-fired BEFORE this role):
+#   1. Site Hydra reachable on loopback (ory-deploy.yml ran).
+#   2. Patched consent UI in place (ADR 0857 — the JWT `groups` claim).
+#   3. relay_health_oauth2_proxy_client_secret + _cookie_secret env vars set.
+#   4. traefik-acme.yml re-rendered with relay_health_enabled: true so the
+#      router + the mesh-only cert SAN land (run AFTER this role).
+
+# ---------------------------------------------------------------------------
+# 0. Sunset path — relay_health_enabled: false.
+#    This role historically ASSERTS relay_health_enabled (the three "require
+#    inputs" tasks below) rather than skipping, so a bare `false` used to ERROR
+#    the deploy. When the flag is false we now tear the served dashboard down
+#    cleanly and end the play for THIS host before the asserts. Used to retire
+#    the mesh-only (private) dashboard on a Thor while the off-mesh cloud
+#    dashboard (a separate host, relay_health_enabled: true) is untouched —
+#    a mesh-only health surface is unreachable exactly when the mesh is broken.
+#    docs/design/relay-health-dashboard.md §"Mesh-dashboard sunset".
+#
+#    DELIBERATELY NOT torn down: the Thor-side cloud FEEDERS — the peer-id→name
+#    resolver (relay-peer-names.timer, ADR 1055), the fail-closed gate-allowlist
+#    auto-sync (relay-health-allowlist-publish.timer, ADR 1093), AND the zenoh
+#    router-health probe (zenoh-health-probe.timer, F-248/F-253). All three POST
+#    to the SURVIVING cloud dashboard (peer-name map + gate allowlist + the
+#    router-health / new-session-OPEN seizure band), not the private surface, so
+#    retiring the private dash keeps every band on the survivor. They keep
+#    running under systemd from the last enabled deploy; end_host means this role
+#    no longer re-renders them — extract them into a standalone role if long-term
+#    maintenance is wanted (the follow-up noted in the design doc). The probe's
+#    ingest URL was already narrowed to cloud-only in group_vars, so its POST to
+#    the retired Thor ingest just best-effort-fails; the cloud band is unaffected.
+# The registry WAL gauge (§2c / sunset §0) needs somewhere to write. Checked
+# up front, on BOTH paths, because the failure mode of an unset dir is silent:
+# dirname('') is '', the .prom lands at /registry-wal.prom where nothing
+# scrapes it, and rules/registry-wal.yml sits unfed — the F-449 shape.
+- name: relay-health | require a textfile destination for the registry WAL gauge
+  ansible.builtin.assert:
+    that:
+      - (registry_wal_prom_out | default('') | length > 0) or (relay_health_textfile_out | default('') | length > 0)
+    fail_msg: >-
+      registry_wal_signals_enabled is true but neither registry_wal_prom_out
+      nor relay_health_textfile_out is set, so there is no node-exporter
+      textfile dir to write goat_registry_* into and the registry-wal alerts
+      cannot fire. Set one in group_vars, or disable the gauge.
+  when: registry_wal_signals_enabled | default(false) | bool
+
+- name: relay-health | sunset — tear down the served dashboard when disabled
+  when: not (relay_health_enabled | default(false) | bool)
+  block:
+    - name: relay-health | sunset — stop + disable the served-dashboard timers
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: false
+        state: stopped
+        daemon_reload: true
+      failed_when: false          # a unit may never have been installed here
+      loop:
+        - relay-health-probe.timer        # the relay-FLEET prober (fed the private page only)
+        - zenoh-fabric-sampler.timer      # superseded by fabric-crawler (already disabled)
+        - iperf3-target.service           # standalone/cloud only; no-op on a Thor
+        # NOT here: zenoh-health-probe.timer — a cloud feeder, left running (above).
+
+    - name: relay-health | sunset — remove the served-dashboard containers
+      ansible.builtin.command:
+        cmd: "docker rm -f {{ item }}"
+      register: relay_health_sunset_rm
+      changed_when: relay_health_sunset_rm.rc == 0
+      failed_when: false          # a container may not exist on this host
+      loop:
+        - relay-health                    # Thor overlay: static nginx
+        - oauth2-proxy-relay-health       # Thor overlay: the admin gate
+        - relay-metrics-ingest            # Thor overlay: the private ingest
+        - relay-health-traefik            # standalone public gate (if ever here)
+        - relay-health-oauth2-proxy       # standalone public gate (if ever here)
+
+    # Cloud feeders stay MAINTAINED, not merely tolerated: re-render the
+    # gate-allowlist auto-sync publisher (script + env + units) before ending
+    # the play, so a publisher change (e.g. a new extra target) reaches a
+    # sunset Thor. The peer-name resolver and the zenoh probe are re-rendered
+    # below for the same reason.
+    - name: relay-health | sunset — keep the cloud-feeder allowlist publisher current
+      ansible.builtin.include_tasks: allowlist-publisher.yml
+
+    # The peer-name resolver must re-render here: riding from the last enabled deploy
+    # means a URL corrected in group_vars never reaches it.
+    - name: relay-health | sunset — keep the cloud-feeder peer-name resolver current
+      ansible.builtin.include_tasks: peer-names.yml
+
+    # zenoh-health-probe needs the same treatment. Riding from the last enabled
+    # deploy means the unit can never pick up a corrected variable: a narrowed
+    # zenoh_health_ingest_urls never reaches the deployed unit, which keeps POSTing
+    # to a retired ingest (http=404, every minute, forever). Worse, its
+    # ExecStartPost keeps rendering the local Prometheus band from that retired
+    # ingest's frozen JSON. Re-render it here so both follow the flag.
+    # The scripts themselves too, not just the units: the probe measures the
+    # delivery-stall signals and writes its own goat_zenoh_*
+    # textfile, and a sunset host never reaches the main script-install loop
+    # below (end_host).
+    - name: relay-health | sunset — keep the zenoh cloud feeder scripts current
+      when: zenoh_health_probe_enabled | default(false) | bool
+      ansible.builtin.copy:
+        src: "{{ relay_health_src_dir }}/{{ item }}"
+        dest: "{{ relay_health_dir }}/{{ item }}"
+        mode: "0755"
+      loop:
+        - zenoh-health-probe.sh
+        - zenoh-router-signals.py
+
+    - name: relay-health | sunset — re-render the zenoh cloud feeder against current vars
+      when: zenoh_health_probe_enabled | default(false) | bool
+      ansible.builtin.template:
+        src: "{{ item.s }}"
+        dest: "{{ item.d }}"
+        mode: "{{ item.m }}"
+      loop:
+        - { s: zenoh-health-probe.env.j2, d: "{{ relay_health_dir }}/zenoh-health-probe.env", m: "0600" }
+        - { s: zenoh-health-probe.service.j2, d: /etc/systemd/system/zenoh-health-probe.service, m: "0644" }
+        - { s: zenoh-health-probe.timer.j2, d: /etc/systemd/system/zenoh-health-probe.timer, m: "0644" }
+      no_log: true      # env carries the bearer token
+
+    - name: relay-health | sunset — pick up the re-rendered feeder unit
+      when: zenoh_health_probe_enabled | default(false) | bool
+      ansible.builtin.systemd:
+        name: zenoh-health-probe.timer
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    # The registry WAL gauge is not a dashboard feeder at all — it writes a
+    # LOCAL textfile band for the goatnet's own Prometheus — but it lives in
+    # this role, and a sunset host never reaches the main install path
+    # (end_host below). A host with the portal is often a sunset host
+    # (relay_health_enabled: false), so without this re-render the
+    # collector would deploy nowhere and rules/registry-wal.yml would be a
+    # rule with no producer, silently green through a large WAL. Same treatment as the zenoh feeder above.
+    - name: relay-health | sunset — keep the registry WAL gauge script current
+      when: registry_wal_signals_enabled | default(false) | bool
+      ansible.builtin.copy:
+        src: "{{ relay_health_src_dir }}/registry-wal-signals.py"
+        dest: "{{ relay_health_dir }}/registry-wal-signals.py"
+        mode: "0755"
+
+    - name: relay-health | sunset — re-render the registry WAL gauge against current vars
+      when: registry_wal_signals_enabled | default(false) | bool
+      ansible.builtin.template:
+        src: "{{ item.s }}"
+        dest: "{{ item.d }}"
+        mode: "{{ item.m }}"
+      loop:
+        - { s: registry-wal-signals.env.j2, d: "{{ relay_health_dir }}/registry-wal-signals.env", m: "0644" }
+        - { s: registry-wal-signals.service.j2, d: /etc/systemd/system/registry-wal-signals.service, m: "0644" }
+        - { s: registry-wal-signals.timer.j2, d: /etc/systemd/system/registry-wal-signals.timer, m: "0644" }
+
+    - name: relay-health | sunset — pick up the re-rendered registry WAL timer
+      when: registry_wal_signals_enabled | default(false) | bool
+      ansible.builtin.systemd:
+        name: registry-wal-signals.timer
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    # A stopped producer does not retract what it already published. node-exporter
+    # keeps serving any .prom left in the textfile directory, with no notion that
+    # the thing that wrote it is gone — so a retired band goes on asserting its
+    # last value indefinitely. relay-health.prom was still reporting
+    # goat_relay_up{relay="pdx"} 1 fifteen days after its prober was disabled by
+    # this very block. Tearing down a producer therefore has to include its output.
+    - name: relay-health | sunset — remove textfile bands orphaned by this teardown
+      when: (relay_health_textfile_out | default('') | length) > 0
+      ansible.builtin.file:
+        path: "{{ relay_health_textfile_out | dirname }}/{{ item }}"
+        state: absent
+      loop:
+        - relay-health.prom       # written by the now-disabled fleet prober
+        - zenoh-health.prom       # the ingest bridge's band; the probe writes zenoh-router-probe.prom instead
+
+    - name: relay-health | sunset — done, end the play for this host
+      ansible.builtin.meta: end_host
+
+# The oauth2-proxy/Ory gate inputs are required only in Thor mode. Standalone
+# (ADR 1061 cloud host) has no gate in PHASE 1 — it is mesh-only behind an
+# egress-only SG — so it requires only site_id + the gate is the PHASE 2 flip.
+- name: relay-health | require inputs (Thor mode — oauth2 gate)
+  ansible.builtin.assert:
+    that:
+      - relay_health_enabled | default(false) | bool
+      - relay_health_oauth2_proxy_client_secret is defined and (relay_health_oauth2_proxy_client_secret | length) >= 32
+      # oauth2-proxy requires EXACTLY 16/24/32 bytes (a 44-char base64 string
+      # crash-loops it: "cookie_secret must be 16, 24, or 32 bytes"). Use
+      # `openssl rand -hex 16` (32 chars), not `rand -base64 32` (44).
+      - relay_health_oauth2_proxy_cookie_secret is defined and ((relay_health_oauth2_proxy_cookie_secret | length) in [16, 24, 32])
+      - site_id is defined and (site_id | length) > 0
+      - public_mgmt_fqdn is defined and (public_mgmt_fqdn | length) > 0
+      - mesh_ip_a is defined and (mesh_ip_a | length) > 0
+    fail_msg: |
+      relay-health role requires relay_health_enabled, the oauth2-proxy
+      client_secret (32+) + cookie_secret (16/24/32 b64), site_id,
+      public_mgmt_fqdn, mesh_ip_a.
+  when: not (relay_health_standalone | bool)
+
+- name: relay-health | require inputs (standalone — PHASE 1, no gate)
+  ansible.builtin.assert:
+    that:
+      - relay_health_enabled | default(false) | bool
+      - site_id is defined and (site_id | length) > 0
+    fail_msg: |
+      relay-health standalone (ADR 1061 cloud host) requires
+      relay_health_enabled + site_id. No oauth2-proxy gate in PHASE 1.
+  when: relay_health_standalone | bool
+
+- name: relay-health | require inputs (standalone PUBLIC — PHASE 2 Dex gate)
+  ansible.builtin.assert:
+    that:
+      - relay_health_fqdn is defined and (relay_health_fqdn | length) > 0
+      - relay_health_public_oidc_client_secret is defined and (relay_health_public_oidc_client_secret | length) > 0
+      - relay_health_public_cookie_secret is defined and ((relay_health_public_cookie_secret | length) in [16, 24, 32])
+      - relay_health_public_cloudflare_dns_api_token is defined and (relay_health_public_cloudflare_dns_api_token | length) > 0
+      - relay_health_public_allowed_emails is defined and (relay_health_public_allowed_emails | length) > 0
+    fail_msg: |
+      relay-health PUBLIC (PHASE 2) requires relay_health_fqdn, the dedicated Dex
+      client secret (relay_health_public_oidc_client_secret), an oauth2-proxy
+      cookie secret of EXACTLY 16/24/32 bytes (use `openssl rand -hex 16`), the
+      zagros.example Cloudflare DNS-01 token
+      (relay_health_public_cloudflare_dns_api_token), and a NON-EMPTY
+      relay_health_public_allowed_emails allowlist. The public gate is
+      fail-closed: it will not deploy a public surface that admits any
+      authenticated user. Set relay_health_public_allowed_emails in group_vars
+      to the intended viewers (operators/admins) — relay topology is
+      recon-sensitive (ADR 1066); do NOT list the whole mesh roster.
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+
+# ---------------------------------------------------------------------------
+# 1. Artifacts + www dir.  The prober/conf/html are committed at
+#    ops/relay/health (PR #1203); copy them onto the host.
+# ---------------------------------------------------------------------------
+- name: relay-health | create dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ relay_health_dir }}"
+    - "{{ relay_health_www_dir }}"
+    - "{{ relay_health_www_dir }}/ingest"   # ADR 1058 — relay self-published metrics land here
+
+- name: relay-health | install prober + conf + ingest server
+  ansible.builtin.copy:
+    src: "{{ relay_health_src_dir }}/{{ item.f }}"
+    dest: "{{ relay_health_dir }}/{{ item.f }}"
+    mode: "{{ item.m }}"
+  loop:
+    - { f: relay-health-probe.sh, m: "0755" }
+    - { f: redact-relay-health.py, m: "0755" }   # ADR 1066 reduced-detail view
+    - { f: relay-health-to-prom.py, m: "0755" }
+    - { f: relay-status-record.py, m: "0755" }     # persists the top-of-page status-history timeline
+    - { f: relay-peer-names.py, m: "0755" }        # ADR 1055 — Thor-side peer-id -> name resolver (host, not a container)
+    - { f: zenoh-health-probe.sh, m: "0755" }      # F-248/F-253 — Thor-side router service-health probe (timer gated below)
+    - { f: zenoh-router-signals.py, m: "0755" }    # F-287 — delivery-stall counters from the router log + session census
+    - { f: registry-wal-signals.py, m: "0755" }    # portal registry WAL gauges (91.4 GB WAL the runway alert averaged away) — timer gated in §2c
+    - { f: zenoh-health-to-prom.py, m: "0755" }    # zenoh band -> Prometheus (goat_zenoh_*) for the wedge alerts
+    - { f: zenoh-fabric-sampler.sh, m: "0755" }    # wedge instrument — cardinality/load leading indicators (zenoh-wedge-instrumentation.md)
+    - { f: zenoh-wedge-verdict.py, m: "0755" }     # offline: symcap captures -> per-wedge hypothesis verdicts
+  notify: reload relay-health compose
+
+- name: relay-health | install the shared peer→person client
+  # ops/identity/peerowner.py — the Python client for the portal's peer→person
+  # resolver, shared with peerview rather than re-inlined here (the four-state
+  # attribution is the part worth not re-deriving per consumer). Dropped beside
+  # the resolver because that script runs from this directory, not as a package.
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../identity/peerowner.py"
+    dest: "{{ relay_health_dir }}/peerowner.py"
+    mode: "0644"
+  notify: reload relay-health compose
+
+# The relay fleet this vantage probes. Copied SEPARATELY from the loop above
+# because the source filename is per-goatnet while the destination is fixed:
+# relay short names collide across fleets, so each goatnet gets its own conf.
+# Destination stays `relays.conf` so the
+# prober command line and every on-host reference are goatnet-independent.
+# Without this selector a new goatnet's dashboard silently probes another
+# goatnet's fleet and labels the results with its own vantage.
+- name: relay-health | install the relay fleet conf for this goatnet
+  ansible.builtin.copy:
+    src: "{{ relay_health_src_dir }}/{{ relay_health_relays_conf }}"
+    dest: "{{ relay_health_dir }}/relays.conf"
+    mode: "0644"
+  notify: reload relay-health compose
+
+# relay-metrics-ingest.py is bind-mounted into the ingest container; a change to it
+# needs an explicit container restart (compose up -d won't recreate on a bind-mount
+# change alone), so it copies separately and notifies the restart handler.
+- name: relay-health | install relay-metrics ingest server (bind-mounted)
+  ansible.builtin.copy:
+    src: "{{ relay_health_src_dir }}/relay-metrics-ingest.py"
+    dest: "{{ relay_health_dir }}/relay-metrics-ingest.py"
+    mode: "0644"
+  notify:
+    - reload relay-health compose
+    - restart relay-metrics-ingest
+
+# Allowlist auto-sync publisher (ADR 1093 Phase 1) — shared task file because
+# the sunset path also re-renders it (a retired private dash keeps feeding the
+# surviving cloud dashboard's door).
+- name: relay-health | allowlist auto-sync publisher (Thor)
+  ansible.builtin.include_tasks: allowlist-publisher.yml
+
+# Publish half of the cross-goatnet overview. Gated on targets: a box with no
+# siblings installs nothing rather than a timer that posts into the void.
+- name: relay-health | cross-goatnet summary publisher (script + units)
+  when: (relay_health_summary_targets | default('') | length) > 0
+  block:
+    - name: relay-health | install goatnet-summary-publish.sh
+      ansible.builtin.copy:
+        src: "{{ relay_health_src_dir }}/goatnet-summary-publish.sh"
+        dest: "{{ relay_health_dir }}/goatnet-summary-publish.sh"
+        mode: "0755"
+
+    - name: relay-health | render goatnet-summary-publish env (mode 0600 — carries the token)
+      ansible.builtin.template:
+        src: goatnet-summary-publish.env.j2
+        dest: "{{ relay_health_dir }}/goatnet-summary-publish.env"
+        mode: "0600"
+      no_log: true
+
+    - name: relay-health | install goatnet-summary-publish service + timer
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - goatnet-summary-publish.service
+        - goatnet-summary-publish.timer
+
+    - name: relay-health | enable + start the cross-goatnet publish timer
+      ansible.builtin.systemd:
+        name: goatnet-summary-publish.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+# Watched fleets were removed: every goatnet with a relay tier has its
+# own relay-health box (ops/goatnets/cross-env.yaml). Remove what they installed
+# on a box that ran one.
+- name: relay-health | remove watched-fleet leftovers
+  ansible.builtin.shell: |
+    set -u
+    found=0
+    for t in $(systemctl list-units --all 'relay-health-fleet@*.timer' --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+      systemctl disable --now "$t" >/dev/null 2>&1 || true; found=1
+    done
+    for f in /etc/systemd/system/relay-health-fleet@.service /etc/systemd/system/relay-health-fleet@.timer \
+             "{{ relay_health_dir }}/fleets" "{{ relay_health_www_dir }}/fleets"; do
+      [ -e "$f" ] && { rm -rf "$f"; found=1; }
+    done
+    [ "$found" = 1 ] && { systemctl daemon-reload; echo removed; } || true
+  register: relay_health_fleet_cleanup
+  changed_when: "'removed' in relay_health_fleet_cleanup.stdout"
+
+# Reduced-detail view (ADR 1066). nginx picks the document from the viewer's
+# group; without this conf the default image serves the full one to everyone.
+- name: relay-health | render the nginx view-selection conf
+  ansible.builtin.template:
+    src: relay-health-nginx.conf.j2
+    dest: "{{ relay_health_dir }}/nginx-relay-health.conf"
+    mode: "0644"
+  notify:
+    - reload relay-health compose
+    - restart relay-health nginx
+
+- name: relay-health | install the cross-goatnet overview page
+  ansible.builtin.copy:
+    src: "{{ relay_health_src_dir }}/goatnets.html"
+    dest: "{{ relay_health_www_dir }}/goatnets.html"
+    mode: "0644"
+
+# Rendered rather than copied: the goatnet list is per-deployment. Written even
+# when empty so the page can tell "no siblings declared" apart from "config
+# missing" — two different failures that would otherwise look identical.
+# `source` is the controller's commit, shown in the page footer: the registry is
+# only as current as the last deploy of this box, and the footer is where a
+# reader sees how old that is.
+- name: relay-health | render the goatnet registry for the overview page
+  vars:
+    _src: "{{ lookup('ansible.builtin.pipe', 'git -C ' ~ (playbook_dir | quote) ~ ' log -1 --format=%h%x20%cs 2>/dev/null || true') | split(' ') }}"
+  ansible.builtin.copy:
+    content: "{{ {'goatnets': relay_health_goatnets, 'source': {'ref': _src[0] | default(''), 'date': _src[1] | default('')}} | to_nice_json }}\n"
+    dest: "{{ relay_health_www_dir }}/goatnets.json"
+    mode: "0644"
+
+# A goatnet leaves the registry when it is retired. Its last summary would
+# otherwise sit in the ingest dir indefinitely, so summaries for ids no longer
+# registered go too.
+- name: relay-health | find stored goatnet summaries
+  ansible.builtin.find:
+    paths: "{{ relay_health_www_dir }}/ingest"
+    patterns: "goatnet-*.json"
+  register: relay_health_stored_summaries
+  failed_when: false
+
+- name: relay-health | remove summaries for goatnets no longer in the registry
+  vars:
+    _id: "{{ item.path | basename | regex_replace('^goatnet-(.*)\\.json$', '\\1') }}"
+  when: _id not in (relay_health_goatnets | map(attribute='id') | list)
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ relay_health_stored_summaries.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: relay-health | install dashboard as index.html (served at /)
+  ansible.builtin.copy:
+    src: "{{ relay_health_src_dir }}/relay-health.html"
+    dest: "{{ relay_health_www_dir }}/index.html"
+    mode: "0644"
+
+# --- iperf3 capacity-probe target (cloud box only; mesh-bound) ---
+- name: relay-health | install iperf3 (capacity-probe target)
+  ansible.builtin.apt:
+    name: iperf3
+    state: present
+    update_cache: true
+  when: relay_health_iperf3_target_enabled | bool
+
+# F-370 — same collision as host-net-publish, same fix. The iperf3 package
+# enables its own iperf3.service on 0.0.0.0:5201, which fights our mesh-bound
+# unit forever (Restart=always + SuccessExitStatus=1 means the retry loop never
+# gives up). Masked because disable does not survive a package upgrade.
+#
+# Sharper here than on a mgmt host: these are cloud boxes with a public
+# interface, so an unbound iperf3 winning the port is a bandwidth-test server
+# on the internet, not just a noisy journal.
+- name: relay-health | mask the packaged iperf3.service
+  ansible.builtin.systemd:
+    name: iperf3.service
+    enabled: false
+    state: stopped
+    masked: true
+    daemon_reload: true
+  when: relay_health_iperf3_target_enabled | bool
+  failed_when: false
+
+- name: relay-health | iperf3 target unit (bound to the mesh IP only)
+  ansible.builtin.template:
+    src: iperf3-target.service.j2
+    dest: /etc/systemd/system/iperf3-target.service
+    mode: "0644"
+  when: relay_health_iperf3_target_enabled | bool
+
+- name: relay-health | enable + start iperf3 target
+  ansible.builtin.systemd:
+    name: iperf3-target.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: relay_health_iperf3_target_enabled | bool
+
+# ---------------------------------------------------------------------------
+# 2. Host prober timer (fast probes, credential-free).
+# ---------------------------------------------------------------------------
+- name: relay-health | install prober systemd service + timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - relay-health-probe.service
+    - relay-health-probe.timer
+  notify: restart relay-health probe timer
+
+- name: relay-health | seed an initial probe so the page has data on first load
+  ansible.builtin.command:
+    cmd: "{{ relay_health_dir }}/relay-health-probe.sh --conf {{ relay_health_dir }}/relays.conf --out {{ relay_health_www_dir }}/relay-health.json {% if relay_health_tunnel_endpoint | default(true) | bool %}--tunnel-endpoint {% endif %}{% if relay_metrics_ingest_enabled | default(true) | bool %}--ingest-dir {{ relay_health_www_dir }}/ingest {% endif %}--vantage {{ relay_health_vantage | default(site_id ~ '-thor') }}"
+  changed_when: false
+  failed_when: false
+
+- name: relay-health | seed the Grafana bridge .prom (when textfile_out set)
+  ansible.builtin.command:
+    cmd: "{{ relay_health_dir }}/relay-health-to-prom.py --in {{ relay_health_www_dir }}/relay-health.json --out {{ relay_health_textfile_out }}"
+  changed_when: false
+  failed_when: false
+  when: relay_health_textfile_out | default('') | length > 0
+
+- name: relay-health | enable + start prober timer
+  ansible.builtin.systemd:
+    name: relay-health-probe.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# 2b. Zenoh router service-health probe — Thor-only (runs where
+#     the router lives), POSTs to BOTH ingests so both dashboards get the band.
+#     Needs root for docker inspect / nsenter into the router netns / /proc.
+# ---------------------------------------------------------------------------
+- name: relay-health | zenoh router-health probe env + timer (Thor)
+  when: zenoh_health_probe_enabled | default(false) | bool
+  block:
+    - name: relay-health | render zenoh-health probe env + units
+      ansible.builtin.template:
+        src: "{{ item.s }}"
+        dest: "{{ item.d }}"
+        mode: "{{ item.m }}"
+      loop:
+        - { s: zenoh-health-probe.env.j2, d: "{{ relay_health_dir }}/zenoh-health-probe.env", m: "0600" }
+        - { s: zenoh-health-probe.service.j2, d: /etc/systemd/system/zenoh-health-probe.service, m: "0644" }
+        - { s: zenoh-health-probe.timer.j2, d: /etc/systemd/system/zenoh-health-probe.timer, m: "0644" }
+        - { s: zenoh-fabric-sampler.service.j2, d: /etc/systemd/system/zenoh-fabric-sampler.service, m: "0644" }
+        - { s: zenoh-fabric-sampler.timer.j2, d: /etc/systemd/system/zenoh-fabric-sampler.timer, m: "0644" }
+      no_log: true      # env carries the bearer token
+
+    - name: relay-health | seed an initial router-health probe (best-effort)
+      ansible.builtin.shell:
+        cmd: "set -a; . {{ relay_health_dir }}/zenoh-health-probe.env; set +a; {{ relay_health_dir }}/zenoh-health-probe.sh"
+      changed_when: false
+      failed_when: false
+
+    - name: relay-health | enable + start zenoh-health probe timer
+      ansible.builtin.systemd:
+        name: zenoh-health-probe.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # The shell sampler's full `**` walk is the heaviest read in the fleet —
+    # exactly the crawl the single lazy crawler replaces
+    # (zenoh-cardinality-budget-and-lazy-crawler.md §4). When the fabric-crawler
+    # role writes zenoh-fabric.json instead (fabric_crawler_json_out_host_path),
+    # set relay_health_fabric_sampler_enabled: false in the SAME group_vars
+    # change so exactly ONE walker runs. Default true = status quo.
+    - name: relay-health | enable + start zenoh-fabric-sampler timer (wedge precursors)
+      ansible.builtin.systemd:
+        name: zenoh-fabric-sampler.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: relay_health_fabric_sampler_enabled | default(true)
+
+    - name: relay-health | disable zenoh-fabric-sampler timer (superseded by fabric-crawler)
+      ansible.builtin.systemd:
+        name: zenoh-fabric-sampler.timer
+        enabled: false
+        state: stopped
+        daemon_reload: true
+      failed_when: false   # timer may not exist yet on a fresh host
+      when: not (relay_health_fabric_sampler_enabled | default(true))
+
+# ---------------------------------------------------------------------------
+# 2c. Portal registry WAL gauges — the 91.4 GB the runway alert averaged away.
+#     ThorDiskRunwayShort (added later) derives runway from the 24h
+#     AVERAGE burn; the registry WAL leak recurred in ~200 GB/day bursts that
+#     averaged to a ~19-day runway, above the 14-day threshold the whole time.
+#     This timer gauges the FILE (goat_registry_* → node-exporter textfile,
+#     registry-wal-signals.py) so rules/registry-wal.yml catches the class in
+#     minutes. Gated per-goatnet by registry_wal_signals_enabled (group_vars),
+#     set where the portal's registry.db lives — the same shape as the zenoh
+#     probe gate above. The sunset path (§0) re-renders the same three files:
+#     on a sunset host this block is never reached (end_host).
+#
+#     SQLite era only (ADR 1165 step A). A goatnet whose portal registry is on
+#     Postgres (portal_store: postgres in group_vars, the goat-zenoh-portal-store
+#     role's variable) has no WAL to gauge: the file left behind is the
+#     read-only cutover archive. There the timer is stopped and its files are
+#     removed, including the .prom, so no frozen gauge outlives the store.
+# ---------------------------------------------------------------------------
+- name: relay-health | portal registry WAL gauges env + timer
+  when:
+    - registry_wal_signals_enabled | default(false) | bool
+    - portal_store | default('sqlite') != 'postgres'
+  block:
+    - name: relay-health | render registry-wal-signals env + units
+      ansible.builtin.template:
+        src: "{{ item.s }}"
+        dest: "{{ item.d }}"
+        mode: "{{ item.m }}"
+      loop:
+        - { s: registry-wal-signals.env.j2, d: "{{ relay_health_dir }}/registry-wal-signals.env", m: "0644" }
+        - { s: registry-wal-signals.service.j2, d: /etc/systemd/system/registry-wal-signals.service, m: "0644" }
+        - { s: registry-wal-signals.timer.j2, d: /etc/systemd/system/registry-wal-signals.timer, m: "0644" }
+
+    - name: relay-health | seed an initial registry WAL reading (best-effort)
+      ansible.builtin.shell:
+        cmd: "set -a; . {{ relay_health_dir }}/registry-wal-signals.env; set +a; {{ relay_health_dir }}/registry-wal-signals.py --registry \"$REGISTRY_DB\" --out \"$REGISTRY_PROM_OUT\""
+      changed_when: false
+      failed_when: false
+
+    - name: relay-health | enable + start registry-wal-signals timer
+      ansible.builtin.systemd:
+        name: registry-wal-signals.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+- name: relay-health | retire the registry WAL gauges (portal registry on Postgres)
+  when: portal_store | default('sqlite') == 'postgres'
+  block:
+    - name: relay-health | stop + disable registry-wal-signals timer
+      ansible.builtin.systemd:
+        name: registry-wal-signals.timer
+        enabled: false
+        state: stopped
+      failed_when: false   # never installed on this host is the same end state
+
+    - name: relay-health | remove registry-wal-signals units, env and gauges
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      # The .prom path only when a textfile dir is configured: with
+      # relay_health_textfile_out empty the default would be /registry-wal.prom.
+      loop: >-
+        {{ ['/etc/systemd/system/registry-wal-signals.timer',
+            '/etc/systemd/system/registry-wal-signals.service',
+            relay_health_dir ~ '/registry-wal-signals.env']
+           + ([gzrh_prom] if gzrh_prom != '/registry-wal.prom' else []) }}
+      vars:
+        gzrh_prom: "{{ registry_wal_prom_out | default((relay_health_textfile_out | dirname) ~ '/registry-wal.prom') }}"
+      register: relay_health_registry_wal_removed
+
+    - name: relay-health | reload systemd after removing the registry WAL units
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: relay_health_registry_wal_removed is changed
+
+# ---------------------------------------------------------------------------
+# 3. Hydra OIDC client (idempotent upsert by client_id; mirror id-console).
+#    Thor mode only — standalone (PHASE 1) has no Ory/Hydra and no gate.
+# ---------------------------------------------------------------------------
+- name: relay-health | Hydra admin reachable
+  ansible.builtin.uri:
+    url: "{{ relay_health_oidc_hydra_admin }}/health/ready"
+    status_code: 200
+  retries: 5
+  delay: 2
+  when: not (relay_health_standalone | bool)
+
+- name: relay-health | check OIDC client at Hydra
+  ansible.builtin.uri:
+    url: "{{ relay_health_oidc_hydra_admin }}/admin/clients/{{ relay_health_oauth2_proxy_oidc_client_id }}"
+    status_code: [200, 404]
+    return_content: true
+  register: relay_health_client_get
+  when: not (relay_health_standalone | bool)
+
+- name: relay-health | desired OIDC client config
+  when: not (relay_health_standalone | bool)
+  ansible.builtin.set_fact:
+    relay_health_client_config:
+      client_id: "{{ relay_health_oauth2_proxy_oidc_client_id }}"
+      client_name: "oauth2-proxy-relay-health ({{ site_id }})"
+      client_secret: "{{ relay_health_oauth2_proxy_client_secret }}"
+      grant_types: [authorization_code, refresh_token]
+      response_types: [code]
+      scope: "{{ relay_health_oidc_scopes | join(' ') }}"
+      redirect_uris: ["{{ relay_health_oidc_redirect_uri }}"]
+      token_endpoint_auth_method: client_secret_post
+      skip_consent: true
+      access_token_strategy: jwt
+      audience: ["{{ relay_health_oauth2_proxy_oidc_client_id }}"]
+
+- name: relay-health | create OIDC client (POST when absent)
+  ansible.builtin.uri:
+    url: "{{ relay_health_oidc_hydra_admin }}/admin/clients"
+    method: POST
+    body_format: json
+    body: "{{ relay_health_client_config }}"
+    status_code: 201
+  when:
+    - not (relay_health_standalone | bool)
+    - relay_health_client_get.status == 404
+  no_log: true
+
+- name: relay-health | update OIDC client (PUT — re-sync secret/redirect)
+  ansible.builtin.uri:
+    url: "{{ relay_health_oidc_hydra_admin }}/admin/clients/{{ relay_health_oauth2_proxy_oidc_client_id }}"
+    method: PUT
+    body_format: json
+    body: "{{ relay_health_client_config }}"
+    status_code: 200
+  when:
+    - not (relay_health_standalone | bool)
+    - relay_health_client_get.status == 200
+  no_log: true
+
+# ---------------------------------------------------------------------------
+# 4. compose + .env compose-time vars.
+#    Thor mode: oauth2-proxy env + the mgmt-host overlay.
+#    Standalone (ADR 1061): a self-contained compose, no oauth2-proxy.
+# ---------------------------------------------------------------------------
+- name: relay-health | render oauth2-proxy env (mode 0600)
+  ansible.builtin.template:
+    src: oauth2-proxy-relay-health.env.j2
+    dest: "{{ relay_health_oauth2_proxy_envfile }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not (relay_health_standalone | bool)
+  notify: reload relay-health compose
+
+- name: relay-health | lay down compose overlay (Thor)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/mgmt-host/docker-compose.relay-health.yml"
+    dest: "{{ relay_health_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: not (relay_health_standalone | bool)
+  notify: reload relay-health compose
+
+- name: relay-health | lay down standalone compose (ADR 1061 cloud host, PHASE 1 mesh-only)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/relay-health-standalone/docker-compose.yml"
+    dest: "{{ relay_health_standalone_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - relay_health_standalone | bool
+    - not (relay_health_public_enabled | bool)
+  notify: reload relay-health compose
+
+# --- PHASE 2 public break-glass gate (ADR 1061): Traefik + oauth2-proxy → Dex ---
+- name: relay-health | letsencrypt + traefik-dynamic dirs
+  ansible.builtin.file:
+    path: "{{ item.p }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.m }}"
+  loop:
+    - { p: "{{ relay_health_le_dir }}", m: "0700" }
+    - { p: "{{ relay_health_traefik_dynamic_dir }}", m: "0755" }
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+
+- name: relay-health | render Traefik dynamic config (file provider router)
+  ansible.builtin.template:
+    src: relay-health-traefik-dynamic.yml.j2
+    dest: "{{ relay_health_traefik_dynamic_dir }}/relay-health.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+  notify: reload relay-health compose
+
+- name: relay-health | SEED PUBLIC oauth2-proxy authenticated-emails allowlist (create only)
+  ansible.builtin.copy:
+    # One lowercased email per line — the explicit access grant for the public
+    # gate (oauth2-proxy AUTHENTICATED_EMAILS_FILE). Rendered BEFORE the compose
+    # lay-down so the file exists at the volume mount (a missing mount source
+    # would have docker create a directory in its place).
+    content: |
+      {% for e in (relay_health_public_allowed_emails | map('trim') | map('lower') | unique) %}
+      {{ e }}
+      {% endfor %}
+    dest: "{{ relay_health_public_authenticated_emails_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    # ---------------------------------------------------------------------
+    # force: false — THIS IS A SEED, NOT A DECLARATION. F-352.
+    #
+    # Two independent reasons, and the second one is a silent failure.
+    #
+    # 1. OWNERSHIP. Since ADR 1093 Phase 1 this file is owned by the roster
+    #    auto-sync (relay-health-allowlist-publish on the Thor), which is what
+    #    makes "active member ⇒ access, revoked ⇒ removed" structural instead
+    #    of a redeploy. group_vars is the bootstrap value for a box that has
+    #    never been published to. Re-rendering it on every converge overwrites
+    #    live authorization with a stale env var.
+    #
+    # 2. INODE DIVORCE. `copy` writes atomically: temp file, then rename over
+    #    the destination — which allocates a NEW INODE. Both the ingest and
+    #    oauth2-proxy bind-mount this path as a FILE, and a file bind-mount
+    #    follows the inode, not the path. After the rename the containers hold
+    #    the OLD inode and the host path is a different file: the host file
+    #    and the container file can hold different lists at the same path.
+    #
+    #    The publisher POSTs on schedule and gets HTTP 200 every time, writing
+    #    addresses into an inode nothing reads, while the gate enforces whatever
+    #    ansible left. Every surface says healthy.
+    #
+    # Consequence of force: false — changing the seed list on a box that has
+    # already been published to does nothing, deliberately. Change membership
+    # in Kratos, which is the authority. To re-seed by hand, delete the file
+    # and re-run; then RESTART the ingest and every oauth2-proxy that mounts
+    # it, or you have re-created the divorce.
+    # ---------------------------------------------------------------------
+    force: false
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+  notify:
+    - reload relay-health compose
+    # MUST also restart the proxy: this file is bind-mounted, so compose leaves
+    # the container running, and oauth2-proxy reads the list into memory. See
+    # the handler for why its own file-watcher does not save us.
+    - restart relay-health oauth2-proxy
+
+- name: relay-health | custom oauth2-proxy template dir (PUBLIC door)
+  ansible.builtin.file:
+    path: "{{ relay_health_dir }}/oauth2-proxy-templates"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+
+- name: relay-health | render PUBLIC oauth2-proxy refusal page
+  # The stock 403 names neither the identity nor the rule, so a correctly
+  # configured door reads as a broken one. Mounted read-only into the proxy;
+  # OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR points at it. Only error.html is
+  # overridden — sign_in.html keeps the built-in.
+  ansible.builtin.template:
+    src: oauth2-proxy-error.html.j2
+    dest: "{{ relay_health_dir }}/oauth2-proxy-templates/error.html"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+  notify:
+    - reload relay-health compose
+    # Bind-mounted and read at startup, so compose leaving the container running
+    # would serve the old page indefinitely — same reason the allowlist file
+    # carries this second handler.
+    - restart relay-health oauth2-proxy
+
+- name: relay-health | render PUBLIC oauth2-proxy env → Dex (mode 0600)
+  ansible.builtin.template:
+    src: oauth2-proxy-relay-health-public.env.j2
+    dest: "{{ relay_health_dir }}/oauth2-proxy.env"
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+  no_log: true
+  notify: reload relay-health compose
+
+# -- ntfy pager (ADR 1168) ------------------------------------------------------
+- name: ntfy | pre-flight — fqdn + both passwords present when enabled
+  ansible.builtin.assert:
+    that:
+      - ntfy_fqdn | length > 0
+      - ntfy_admin_password | length >= 24
+      - ntfy_alertmanager_password | length >= 24
+    fail_msg: >-
+      ntfy_enabled is true but ntfy_fqdn / ZAGROS_NTFY_ADMIN_PASSWORD /
+      ZAGROS_NTFY_ALERTMANAGER_PASSWORD are not all set (24+ chars). See
+      group_vars/<env>_relay_health/vars.yml.
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+    - ntfy_enabled | default(false) | bool
+
+- name: ntfy | dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ ntfy_dir }}"
+    - "{{ ntfy_dir }}/cache"
+    - "{{ ntfy_dir }}/data"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+    - ntfy_enabled | default(false) | bool
+
+- name: ntfy | render server.yml
+  ansible.builtin.template:
+    src: ntfy-server.yml.j2
+    dest: "{{ ntfy_dir }}/server.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+    - ntfy_enabled | default(false) | bool
+  notify: reload relay-health compose
+
+- name: relay-health | lay down PUBLIC compose (Traefik + oauth2-proxy + nginx)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/relay-health-standalone/docker-compose.public.yml"
+    dest: "{{ relay_health_public_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+  notify: reload relay-health compose
+
+- name: relay-health | compose-time .env entries (Thor — oauth2)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^{{ item.k }}="
+    line: "{{ item.k }}={{ item.v }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  loop:
+    - { k: "OAUTH2_PROXY_RELAY_HEALTH_OIDC_HOST_ENTRY", v: "{{ relay_health_oauth2_proxy_oidc_host_entry }}" }
+    - { k: "OAUTH2_PROXY_RELAY_HEALTH_IMAGE", v: "{{ relay_health_oauth2_proxy_image }}" }
+    - { k: "RELAY_HEALTH_OAUTH2_PROXY_HOST_PORT", v: "{{ relay_health_oauth2_proxy_host_port }}" }
+  when: not (relay_health_standalone | bool)
+  notify: reload relay-health compose
+
+- name: relay-health | compose-time .env entries (standalone)
+  ansible.builtin.lineinfile:
+    path: "{{ relay_health_dir }}/.env"
+    regexp: "^{{ item.k }}="
+    line: "{{ item.k }}={{ item.v }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  loop:
+    - { k: "SITE_ID", v: "{{ site_id }}" }
+    - { k: "RELAY_HEALTH_LISTEN_PORT", v: "{{ relay_health_listen_port }}" }
+  when: relay_health_standalone | bool
+  notify: reload relay-health compose
+
+# PHASE 2 public compose-time vars (the FQDN + ACME email + the Cloudflare
+# DNS-01 token Traefik needs). no_log: the token is secret.
+- name: relay-health | compose-time .env entries (PUBLIC — Traefik/ACME)
+  ansible.builtin.lineinfile:
+    path: "{{ relay_health_dir }}/.env"
+    regexp: "^{{ item.k }}="
+    line: "{{ item.k }}={{ item.v }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  loop:
+    - { k: "RELAY_HEALTH_FQDN", v: "{{ relay_health_fqdn }}" }
+    - { k: "ACME_EMAIL", v: "{{ relay_health_acme_email }}" }
+    - { k: "CLOUDFLARE_DNS_API_TOKEN", v: "{{ relay_health_public_cloudflare_dns_api_token }}" }
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+  no_log: true
+  notify: reload relay-health compose
+
+# ADR 1058 — relay-metrics ingest .env (token + the known relay-name allowlist).
+# no_log: the bearer token. Gated; the compose service uses `:?` required vars.
+# Path is mode-aware: Thor base .env vs the standalone project .env.
+- name: relay-health | relay-metrics ingest .env entries (ADR 1058)
+  ansible.builtin.lineinfile:
+    path: "{{ (relay_health_dir ~ '/.env') if (relay_health_standalone | bool) else '/opt/mgmt-host/.env' }}"
+    regexp: "^{{ item.k }}="
+    line: "{{ item.k }}={{ item.v }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  loop:
+    # Image pin comes from the compose overlay default (RELAY_METRICS_INGEST_IMAGE),
+    # not here — mirrors the nginx pin so the deploy-history ledger is unaffected.
+    - { k: "RELAY_METRICS_BEARER_TOKEN", v: "{{ relay_metrics_bearer_token }}" }
+    - { k: "RELAY_METRICS_ALLOWED_NAMES", v: "{{ relay_metrics_allowed_names }}" }
+    # Host-net health (RCA): site hosts allowed to POST host-net
+    # reports. Empty (the default) keeps the /host-net-ingest route dark.
+    - { k: "HOST_NET_ALLOWED_NAMES", v: "{{ host_net_allowed_names | default('') }}" }
+    # Allowlist auto-sync (ADR 1093 Phase 1): publisher names allowed to POST the
+    # active roster (empty = route dark) + the fail-closed floor below which the
+    # box refuses the list and keeps the last-good gate file.
+    - { k: "ALLOWLIST_PUBLISHERS", v: "{{ relay_health_allowlist_publishers | default('') }}" }
+    - { k: "ALLOWLIST_MIN", v: "{{ relay_health_allowlist_min | default(20) }}" }
+    # Zenoh router service health: routers allowed to POST their
+    # health. Empty (the default) keeps the /zenoh-health-ingest route dark. Set
+    # on BOTH the Thor and the cloud box so both dashboards store the band's
+    # history — the probe (Thor-side) POSTs to both ingests.
+    - { k: "ZENOH_HEALTH_ALLOWED_NAMES", v: "{{ zenoh_health_allowed_names | default('') }}" }
+    # Cross-goatnet rollup ingest. Its own token, deliberately: a sibling
+    # goatnet never holds this box's full ingest credential. Both empty ⇒ the
+    # route 404s and the feature is off.
+    - { k: "CROSS_FLEET_TOKEN", v: "{{ relay_health_cross_fleet_token | default('') }}" }
+    - { k: "CROSS_FLEET_ALLOWED_NAMES", v: "{{ relay_health_cross_fleet_allowed | default('') }}" }
+  when: relay_metrics_ingest_enabled | default(true) | bool
+  no_log: true
+  notify: reload relay-health compose
+
+# ADR 1055 — peer-name resolver. Shared task file: the sunset path renders it too,
+# so a Thor with no dashboard keeps its feeder pointed at the current box.
+- name: relay-health | peer-names resolver (ADR 1055)
+  ansible.builtin.include_tasks: peer-names.yml
+
+- name: relay-health | flush handlers (bring containers up before the smoke)
+  ansible.builtin.meta: flush_handlers
+
+- name: relay-health | bring up containers (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose {{ relay_health_compose_args }} up -d {{ relay_health_up_services }}
+      {{ 'relay-metrics-ingest' if (relay_metrics_ingest_enabled | default(true) | bool) else '' }}
+    chdir: "{{ relay_health_compose_chdir }}"
+  register: relay_health_up
+  changed_when: >-
+    'Started' in (relay_health_up.stderr | default(''))
+    or 'Created' in (relay_health_up.stderr | default(''))
+    or 'Recreated' in (relay_health_up.stderr | default(''))
+
+- name: relay-health | wait for oauth2-proxy on its loopback diag port
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ relay_health_oauth2_proxy_host_port }}/ping"
+    status_code: 200
+  retries: 10
+  delay: 2
+  failed_when: false
+  when: not (relay_health_standalone | bool)
+
+- name: relay-health | wait for the standalone dashboard on its host port
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ relay_health_listen_port }}/"
+    status_code: 200
+  retries: 10
+  delay: 2
+  failed_when: false
+  when:
+    - relay_health_standalone | bool
+    - not (relay_health_public_enabled | bool)
+
+# PHASE 2: :443 is not reachable until the SG opens (terraform public_enabled) +
+# the LE cert mints via DNS-01 (can take a minute), so don't HTTP-probe here —
+# assert the gate containers are running. The browser login is verified post-flip.
+- name: relay-health | PUBLIC gate containers running (traefik + oauth2-proxy)
+  ansible.builtin.command:
+    cmd: docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' relay-health-traefik relay-health-oauth2-proxy relay-health
+  register: relay_health_public_ps
+  changed_when: false
+  failed_when: false
+  retries: 6
+  delay: 5
+  until: "relay_health_public_ps.stdout_lines | select('equalto', 'true') | list | length == 3"
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+
+- name: ntfy | container running
+  ansible.builtin.command:
+    cmd: docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' relay-health-ntfy
+  register: ntfy_ps
+  changed_when: false
+  failed_when: false
+  retries: 6
+  delay: 5
+  until: ntfy_ps.stdout | default('') == 'true'
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+    - ntfy_enabled | default(false) | bool
+
+# Users are created or re-keyed idempotently from the controller-held secrets,
+# so a rotated env entry lands on the next run. `ntfy user add` refuses an
+# existing user, hence the list-then-branch. Passwords ride NTFY_PASSWORD in
+# the exec env, never argv (they would show in `ps`).
+- name: ntfy | ensure admin + alertmanager users (create or re-key)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      # Read the list whole before matching. `list | grep -q` under pipefail
+      # fails when grep exits on the first match and ntfy takes SIGPIPE, which
+      # would send an existing admin down the `user add` branch.
+      users="$(docker exec relay-health-ntfy ntfy user list 2>&1)"
+      if grep -qE "^user {{ item.u }} " <<<"$users"; then
+        docker exec -e NTFY_PASSWORD relay-health-ntfy ntfy user change-pass {{ item.u }} >/dev/null
+        echo "rekeyed {{ item.u }}"
+      else
+        docker exec -e NTFY_PASSWORD relay-health-ntfy ntfy user add --role={{ item.r }} {{ item.u }} >/dev/null
+        echo "created {{ item.u }}"
+      fi
+    executable: /bin/bash
+  environment:
+    NTFY_PASSWORD: "{{ item.p }}"
+  loop:
+    - { u: "{{ ntfy_admin_user }}", r: "admin", p: "{{ ntfy_admin_password }}" }
+    - { u: "{{ ntfy_alertmanager_user }}", r: "user", p: "{{ ntfy_alertmanager_password }}" }
+  loop_control:
+    label: "{{ item.u }}"
+  register: ntfy_users
+  changed_when: "'created' in ntfy_users.stdout"
+  no_log: true
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+    - ntfy_enabled | default(false) | bool
+
+- name: ntfy | alertmanager is write-only on this goatnet's paging topics
+  ansible.builtin.command:
+    cmd: docker exec relay-health-ntfy ntfy access {{ ntfy_alertmanager_user }} "goat-{{ ntfy_goatnet }}-{{ item }}" write-only
+  loop: "{{ ntfy_topics }}"
+  changed_when: false
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+    - ntfy_enabled | default(false) | bool
+
+- name: ntfy | reachable on its public hostname with a valid certificate
+  ansible.builtin.uri:
+    url: "https://{{ ntfy_fqdn }}/v1/health"
+    status_code: 200
+    return_content: true
+  register: ntfy_health
+  retries: 12
+  delay: 10
+  until: ntfy_health.status | default(0) == 200
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+    - ntfy_enabled | default(false) | bool
+
+- name: relay-health | PUBLIC gate — acme.json cert-minting note
+  ansible.builtin.command:
+    cmd: "grep -c certificate {{ relay_health_le_dir }}/acme.json"
+  register: relay_health_acme_check
+  changed_when: false
+  failed_when: false
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+
+- name: relay-health | summary (Thor)
+  ansible.builtin.debug:
+    msg: |
+      relay-health deployed (Thor, Ory-gated):
+        URL:           https://{{ relay_health_fqdn }}/  (Ory-gated)
+        Door:          {{ relay_health_oauth2_proxy_allowed_groups | default('', true) | ternary(relay_health_oauth2_proxy_allowed_groups, 'any authenticated identity') }}
+        Full detail:   {{ relay_health_full_view_groups }} (everyone else gets the reduced document)
+        Probe timer:   relay-health-probe.timer every {{ relay_health_probe_interval }} (fast, no creds)
+      Next: apply traefik-acme.yml with relay_health_enabled: true so the
+      router + mesh-only cert SAN land, then verify 302→login (unauth) / 200 (admin).
+  when: not (relay_health_standalone | bool)
+
+- name: relay-health | summary (standalone — ADR 1061 cloud host, PHASE 1)
+  ansible.builtin.debug:
+    msg: |
+      relay-health deployed (standalone cloud host, PHASE 1 — no public, no gate):
+        Dashboard:     http://{{ mesh_ip_a | default('<mesh-ip>') }}:{{ relay_health_listen_port }}/  (mesh-only; egress-only SG blocks the public internet)
+        Vantage:       {{ relay_health_vantage }}  (external — :443/STUN/QUIC are health-driving, F-213 fixed)
+        Probe timer:   relay-health-probe.timer every {{ relay_health_probe_interval }} (fast, no creds)
+      Next (PHASE 2, gated): attach the EIP + open :443 in terraform-zagros
+      (public_enabled=true), add the oauth2-proxy/Dex gate + Cloudflare A-record.
+  when:
+    - relay_health_standalone | bool
+    - not (relay_health_public_enabled | bool)
+
+- name: relay-health | summary (standalone — ADR 1061 cloud host, PHASE 2 PUBLIC)
+  ansible.builtin.debug:
+    msg: |
+      relay-health deployed (standalone cloud host, PHASE 2 — PUBLIC break-glass gate):
+        Public URL:    https://{{ relay_health_fqdn }}/  (Dex login at {{ relay_health_public_oidc_issuer }})
+        Mesh URL:      http://{{ mesh_ip_a | default('<mesh-ip>') }}:{{ relay_health_listen_port }}/  (mesh-only, unauthenticated — SG blocks this port from the public internet)
+        Gate (public): authenticated Dex/Kanidm user (no group claim yet — matches compliance)
+        TLS:           Let's Encrypt via Cloudflare DNS-01
+        acme.json:     {{ 'cert present' if (relay_health_acme_check.stdout | default('0') | int > 0) else 'still minting (check again shortly)' }}
+        Vantage:       {{ relay_health_vantage }}  (external — honest peer-eye view)
+      Public reachable off-mesh after: terraform public_enabled=true (EIP + :443) +
+      the Cloudflare A-record {{ relay_health_fqdn }} → EIP + the Dex redirect URI.
+  when:
+    - relay_health_standalone | bool
+    - relay_health_public_enabled | bool
+
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: relay-health | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "relay-health"
+    rollback_ref: "{{ relay_health_oauth2_proxy_image }}"
+
+# CVE-2026-98432 (IPv4 TCP request-socket use-after-free, CVSS 9.8). The
+# published exploit needs an MPTCP listener, and Go 1.24+ listeners request
+# MPTCP by default. Ubuntu had no fixed kernel on 2026-11-02; MPTCP stays off
+# until the fixed kernel is live on the host, then this task is removed.
+- name: CVE-2026-98432 mitigation — MPTCP off until the fixed kernel ships
+  ansible.posix.sysctl:
+    name: net.mptcp.enabled
+    value: "0"
+    sysctl_file: /etc/sysctl.d/98-goat-cve-2026-98432.conf
+    state: present
+    reload: true
+  when: ansible_kernel is not search('tegra')

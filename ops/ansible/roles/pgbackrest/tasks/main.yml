@@ -1,0 +1,595 @@
+---
+# ops/ansible/roles/pgbackrest/tasks/main.yml
+#
+# Phase 2 MVP pgBackRest deployment onto an mgmt-host.
+#
+# Steps:
+#   1. Preconditions — required vars present.
+#   2. Host dirs — /etc/pgbackrest, /opt/docker-data/pgbackrest,
+#      /var/log/pgbackrest, /var/spool/pgbackrest.
+#   3. Render pgbackrest.conf from the Jinja template.
+#   4. Copy docker-compose.pgbackrest.yml into the compose dir.
+#   5. Append pgbackrest env vars to /opt/mgmt-host/.env.
+#   6. Install pgbackrest binary inside {{ postgres_container_name }} (idempotent),
+#      and confirm the container's postgres user can read pgbackrest.conf.
+#   7. Apply WAL archiving settings via ALTER SYSTEM + pg_reload_conf.
+#   8. docker compose up the pgbackrest-runner sidecar.
+#   9. One-shot stanza-create + first full backup (verification).
+#  10. Schedule host cron jobs for full / diff / incr.
+#  11. Restart {{ postgres_container_name }} if archive_mode wasn't already 'on'
+#      (archive_mode requires restart to take effect).
+#
+# Assumes the base mgmt-host stack is already up ({{ postgres_container_name }} healthy) —
+# run ops/ansible/mgmt-host.yml first on a greenfield host.
+
+# ---------------------------------------------------------------------------
+# 1. Preconditions.
+# ---------------------------------------------------------------------------
+
+- name: Require site_name
+  ansible.builtin.assert:
+    that: site_name is defined and site_name | length > 0
+    fail_msg: "site_name must be set per-host in inventory (e.g. vega-a)."
+
+- name: Require config paths matching the base Compose read-only mount
+  ansible.builtin.assert:
+    that:
+      - pgbackrest_conf_dir == '/etc/pgbackrest'
+      - pgbackrest_conf_path == '/etc/pgbackrest/pgbackrest.conf'
+    fail_msg: >-
+      The base Compose mounts /etc/pgbackrest. Custom configuration paths
+      require a matching reviewed Compose definition before running this role.
+
+- name: Require pgbackrest_repo1_cipher_pass
+  ansible.builtin.assert:
+    that: pgbackrest_repo1_cipher_pass is defined and pgbackrest_repo1_cipher_pass | length >= 32
+    fail_msg: >
+      Pass -e pgbackrest_repo1_cipher_pass="$PGBACKREST_REPO1_CIPHER_PASS"
+      (sourced from 1Password item "goat - pgBackRest {{ site_name }} repo1").
+      Must be >= 32 chars. Generate once per site with `openssl rand -hex 32`
+      and store in 1Password BEFORE first run.
+
+- name: Require pgbackrest_archive_mode
+  ansible.builtin.assert:
+    that:
+      - pgbackrest_archive_mode is defined
+      - pgbackrest_archive_mode == "on"
+    fail_msg: >
+      pgbackrest_archive_mode must be "on". pgBackRest rejects
+      "always" with error [067] (confirmed in Wave 1.8 smoke test
+      2026-04-22). For streaming-replica topologies, keep
+      archive_mode=on on both sides and use --backup-standby on the
+      backup command to offload I/O. See docs/design/pgbackrest.md §4.1.
+
+# ---------------------------------------------------------------------------
+# 2. Host dirs.
+# ---------------------------------------------------------------------------
+
+- name: Ensure /etc/pgbackrest exists
+  ansible.builtin.file:
+    path: "{{ pgbackrest_conf_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure repo1 (local backup) directory exists + owned by postgres uid 26
+  ansible.builtin.file:
+    path: "{{ pgbackrest_repo1_dir }}"
+    state: directory
+    # pgbackrest runs inside {{ postgres_container_name }} as the postgres user (uid 26
+    # on the pgedge image, based on Rocky Linux 9). Bind-mounts from
+    # the host preserve numeric UID through the kernel. Host-side
+    # root-owned 0750 means uid-26 cannot read — stanza-create fails
+    # with rc=41 "Permission denied" on archive.info. Chown to
+    # 26:26 so the container-side postgres user sees its own files.
+    owner: "26"
+    group: "26"
+    mode: "0750"
+
+- name: Ensure log directory exists + owned by postgres uid 26
+  ansible.builtin.file:
+    path: "{{ pgbackrest_log_dir }}"
+    state: directory
+    owner: "26"
+    group: "26"
+    mode: "0755"
+
+- name: Ensure spool directory exists + owned by postgres uid 26
+  ansible.builtin.file:
+    path: "{{ pgbackrest_spool_dir }}"
+    state: directory
+    owner: "26"
+    group: "26"
+    mode: "0755"
+
+# ---------------------------------------------------------------------------
+# 3. Render pgbackrest.conf.
+# ---------------------------------------------------------------------------
+
+- name: Render /etc/pgbackrest/pgbackrest.conf
+  ansible.builtin.template:
+    src: pgbackrest.conf.j2
+    dest: "{{ pgbackrest_conf_path }}"
+    # The base compose bind-mounts /etc/pgbackrest read-only into the
+    # Postgres container (a literal path: keep pgbackrest_conf_dir at its
+    # default, or the readability check in step 6 fails). pgbackrest runs
+    # there as the postgres user, uid 26, the uid that owns the repo, log
+    # and spool dirs above, so owning the file by uid 26 lets it read it.
+    # The group stays root: the container user's primary gid (1000) can map
+    # to a human account on the host, and the file holds the cipher pass.
+    owner: "26"
+    group: root
+    mode: "0640"
+  no_log: true
+
+# ---------------------------------------------------------------------------
+# 4. Copy compose overlay.
+# ---------------------------------------------------------------------------
+
+- name: Copy docker-compose.pgbackrest.yml
+  ansible.builtin.copy:
+    src: "../compose/mgmt-host/docker-compose.pgbackrest.yml"
+    dest: "{{ compose_dir }}/docker-compose.pgbackrest.yml"
+    mode: "0644"
+
+# ---------------------------------------------------------------------------
+# 5. Append pgbackrest env to /opt/mgmt-host/.env.
+# ---------------------------------------------------------------------------
+# The base mgmt-host.yml writes a fresh .env each run. Use blockinfile to
+# add the pgbackrest-specific keys idempotently.
+
+- name: Append pgbackrest env vars to /opt/mgmt-host/.env
+  ansible.builtin.blockinfile:
+    path: "{{ compose_dir }}/.env"
+    marker: "# {mark} ANSIBLE MANAGED: pgbackrest"
+    block: |
+      PGBACKREST_IMAGE={{ pgbackrest_image }}
+    mode: "0600"
+    create: false
+
+# ---------------------------------------------------------------------------
+# 6. Install pgbackrest binary inside {{ postgres_container_name }}.
+# ---------------------------------------------------------------------------
+# WHY in-container: archive_command runs as the postgres process, inside
+# the {{ postgres_container_name }} container. It needs a `pgbackrest` binary on PATH.
+#
+# Base image: pgedge/pgedge-postgres:16-spock5-minimal is Rocky Linux 9.
+# Has `dnf` (not microdnf). pgbackrest is NOT in EPEL 9; comes from the
+# PGDG repo. We install the PGDG repo rpm first, then pgbackrest from it.
+#
+# Idempotent: check first with `which pgbackrest`; skip install if present.
+
+- name: Check if pgbackrest is already installed in {{ postgres_container_name }}
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ postgres_container_name }}"
+      - sh
+      - -c
+      - "command -v pgbackrest || true"
+  register: pgbackrest_in_container
+  changed_when: false
+
+- name: Install PGDG repo inside {{ postgres_container_name }} (prereq for pgbackrest on RHEL 9)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - "0"
+      - "{{ postgres_container_name }}"
+      - dnf
+      - install
+      - -y
+      - "https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+  when: pgbackrest_in_container.stdout | length == 0
+  changed_when: true
+
+- name: Install pgbackrest inside {{ postgres_container_name }} (dnf from PGDG)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - "0"
+      - "{{ postgres_container_name }}"
+      - dnf
+      - install
+      - -y
+      - "{{ pgbackrest_rpm_spec }}"
+  when: pgbackrest_in_container.stdout | length == 0
+  changed_when: true
+
+# Also needs the log + spool dirs visible inside {{ postgres_container_name }}. The compose
+# overlay only mounts them into the sidecar, but archive_command runs in
+# {{ postgres_container_name }}. We have two choices:
+#   (a) add bind mounts to the BASE compose — violates ground rule.
+#   (b) docker exec mkdir inside the container so archive-push has
+#       somewhere to write, understanding the dirs are container-local
+#       and WAL segments spool ephemerally until the sidecar drains them
+#       — BUT that defeats async mode, which relies on a persistent spool.
+#
+# Workaround: set archive-async=n in {{ postgres_container_name }}'s view of the config.
+# BUT that re-adds the archive_command latency problem. Acceptable at
+# Phase 2 scale (region A PoC, WAL generation is single-digit MB/s max).
+#
+# Documented limitation — revisit in Phase 3 when Orin ships:
+#   TODO(phase3): add /var/spool/pgbackrest + /var/log/pgbackrest mounts
+#   to the base {{ postgres_container_name }} service so async archive-push works. Requires
+#   a coordinated compose change + restart.
+
+- name: Ensure /var/log/pgbackrest exists inside {{ postgres_container_name }} (ephemeral)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - "0"
+      - "{{ postgres_container_name }}"
+      - mkdir
+      - -p
+      - /var/log/pgbackrest
+  changed_when: false
+
+- name: Ensure /var/spool/pgbackrest exists inside {{ postgres_container_name }} (ephemeral)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - "0"
+      - "{{ postgres_container_name }}"
+      - mkdir
+      - -p
+      - /var/spool/pgbackrest
+  changed_when: false
+
+- name: chown log + spool dirs inside {{ postgres_container_name }} to the postgres user
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - "0"
+      - "{{ postgres_container_name }}"
+      - chown
+      - -R
+      - "postgres:postgres"
+      - /var/log/pgbackrest
+      - /var/spool/pgbackrest
+  changed_when: false
+
+# pgbackrest.conf reaches {{ postgres_container_name }} through the base
+# compose's read-only bind mount of /etc/pgbackrest, so it survives every
+# recreate. A container created before that mount existed does not have it:
+# copy the file in as before so archiving works now. The next recreate from
+# the current compose replaces the copy with the mount.
+
+- name: Check whether /etc/pgbackrest is bind-mounted into {{ postgres_container_name }}
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ postgres_container_name }}"
+      - sh
+      - -c
+      - "if grep -q ' /etc/pgbackrest ' /proc/self/mountinfo; then echo mounted; else echo copy; fi"
+  register: pgbackrest_conf_delivery
+  changed_when: false
+
+- name: Ensure /etc/pgbackrest exists (no mount yet) inside {{ postgres_container_name }}
+  # docker cp to a nonexistent parent dir fails, so create it first.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - "0"
+      - "{{ postgres_container_name }}"
+      - mkdir
+      - -p
+      - /etc/pgbackrest
+  when: pgbackrest_conf_delivery.stdout == "copy"
+  changed_when: false
+
+- name: Copy pgbackrest.conf (no mount yet) into {{ postgres_container_name }}
+  # The copy lives only as long as this container. Re-copied on every run so
+  # secret rotations propagate until the container is recreated with the
+  # mount.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - cp
+      - "{{ pgbackrest_conf_path }}"
+      - "{{ postgres_container_name }}:/etc/pgbackrest/pgbackrest.conf"
+  when: pgbackrest_conf_delivery.stdout == "copy"
+  changed_when: true
+
+- name: Fix pgbackrest.conf ownership + mode (no mount yet) inside {{ postgres_container_name }}
+  # docker cp preserves the host-side owner and mode; pgbackrest runs as the
+  # container's postgres user and gets [Errno 13] Permission denied.
+  # Chown to postgres + 0640 — readable by the daemon without making it
+  # world-readable (the file contains repo cipher passes).
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - "0"
+      - "{{ postgres_container_name }}"
+      - sh
+      - -c
+      - "chown postgres:postgres /etc/pgbackrest/pgbackrest.conf && chmod 0640 /etc/pgbackrest/pgbackrest.conf"
+  when: pgbackrest_conf_delivery.stdout == "copy"
+  changed_when: true
+
+- name: Warn about a copied pgbackrest.conf in {{ postgres_container_name }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ postgres_container_name }} was created before the base compose
+      bind-mounted /etc/pgbackrest, so pgbackrest.conf was copied into this
+      container only. Recreating it from the current compose switches it to
+      the mount. A recreate from an older compose drops the copy, and WAL
+      archiving then fails on every segment.
+  when: pgbackrest_conf_delivery.stdout == "copy"
+
+- name: Confirm the postgres user can read pgbackrest.conf in {{ postgres_container_name }}
+  # archive_command and the cron backups run as postgres. Fail here rather
+  # than leave archiving failing silently while Postgres keeps every segment.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ postgres_container_name }}"
+      - test
+      - -r
+      - /etc/pgbackrest/pgbackrest.conf
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# 7. Apply WAL archiving settings.
+# ---------------------------------------------------------------------------
+# ALTER SYSTEM SET + pg_reload_conf(). archive_mode needs container restart
+# to take effect — handled at the end of the role.
+
+- name: Check current archive_mode
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ postgres_container_name }}"
+      - psql
+      - -U
+      - postgres
+      - -tAc
+      - "SHOW archive_mode;"
+  register: current_archive_mode
+  changed_when: false
+
+- name: ALTER SYSTEM SET archive_mode
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ postgres_container_name }}"
+      - psql
+      - -U
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "ALTER SYSTEM SET archive_mode = '{{ pgbackrest_archive_mode }}';"
+  changed_when: current_archive_mode.stdout | trim != pgbackrest_archive_mode
+
+- name: ALTER SYSTEM SET archive_command
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ postgres_container_name }}"
+      - psql
+      - -U
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "ALTER SYSTEM SET archive_command = 'pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza={{ pgbackrest_stanza }} archive-push %p';"
+  changed_when: true
+
+- name: ALTER SYSTEM SET archive_timeout = '60s'
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ postgres_container_name }}"
+      - psql
+      - -U
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "ALTER SYSTEM SET archive_timeout = '60s';"
+  changed_when: true
+
+- name: Reload postgres config (picks up archive_command + archive_timeout)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "PGPASSWORD={{ postgres_superuser_password }}"
+      - "{{ postgres_container_name }}"
+      - psql
+      - -U
+      - postgres
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "SELECT pg_reload_conf();"
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# 8. Skip sidecar — run pgbackrest inside {{ postgres_container_name }} via docker exec.
+# ---------------------------------------------------------------------------
+# The sidecar-based approach in docker-compose.pgbackrest.yml is preserved
+# for future architectural exploration (socket-sharing via named volume,
+# SSH trampoline, pgbackrest-tls server mode). For vega PoC we use the
+# local-mode pattern: pgbackrest installed INSIDE {{ postgres_container_name }} (step 6) +
+# repo/log/spool paths bind-mounted from host via the base compose. All
+# pgbackrest commands invoked via `docker exec {{ postgres_container_name }} pgbackrest ...`.
+# Unix socket, PGDATA, repo, logs all local to {{ postgres_container_name }}.
+
+# ---------------------------------------------------------------------------
+# 9. Restart {{ postgres_container_name }} if archive_mode was not already on.
+# ---------------------------------------------------------------------------
+# MUST happen BEFORE stanza-create — pgbackrest stanza-create verifies
+# archiving is working.
+
+- name: Restart {{ postgres_container_name }} to activate archive_mode (only if it was not already at target)
+  # Use `docker restart` directly (not `docker compose restart`) so the
+  # task works regardless of which compose overlays are active. Compose-
+  # based restart needs every -f that defines the target service; on the
+  # phase2 single-host topology postgres-b only exists in
+  # docker-compose.phase2.yml, which would require a second compose-file
+  # list here. `docker restart <container>` sidesteps the whole dance.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - restart
+      - "{{ postgres_container_name }}"
+  when: current_archive_mode.stdout | trim != pgbackrest_archive_mode
+  changed_when: true
+
+- name: Wait for {{ postgres_container_name }} ready again
+  ansible.builtin.command:
+    cmd: docker exec {{ postgres_container_name }} pg_isready -U postgres
+  register: pg_ready
+  retries: 30
+  delay: 2
+  until: pg_ready.rc == 0
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# 10. stanza-create + first full backup (verification).
+# ---------------------------------------------------------------------------
+# stanza-create is idempotent as long as the stanza config hasn't changed.
+# The first full backup doubles as deployment verification — if S3 creds
+# are wrong or the spool dir perms are broken, we find out here, not on
+# Sunday at 02:00 UTC.
+
+- name: pgbackrest stanza-create (idempotent)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ postgres_container_name }}"
+      - pgbackrest
+      - --stanza={{ pgbackrest_stanza }}
+      - stanza-create
+  register: stanza_create
+  changed_when: "'already exists' not in stanza_create.stderr"
+  failed_when:
+    - stanza_create.rc != 0
+    - "'already exists' not in stanza_create.stderr"
+
+- name: pgbackrest check (stanza sanity check)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ postgres_container_name }}"
+      - pgbackrest
+      - --stanza={{ pgbackrest_stanza }}
+      - check
+  changed_when: false
+
+- name: pgbackrest first full backup (verification)
+  # Synchronous — at Phase 2 scale (single-digit GB) this completes in
+  # seconds. If it ever runs long enough to hit Ansible's default
+  # connection timeout we can revisit with async/poll (SSM supports it).
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ postgres_container_name }}"
+      - pgbackrest
+      - --stanza={{ pgbackrest_stanza }}
+      - --type=full
+      - backup
+  register: first_backup
+  changed_when: true
+
+- name: Show pgbackrest info after first backup
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ postgres_container_name }}"
+      - pgbackrest
+      - --stanza={{ pgbackrest_stanza }}
+      - info
+  register: pgbackrest_info
+  changed_when: false
+
+- name: Surface pgbackrest info to the operator
+  ansible.builtin.debug:
+    msg: "{{ pgbackrest_info.stdout_lines }}"
+
+# ---------------------------------------------------------------------------
+# 11. Schedule cron jobs.
+# ---------------------------------------------------------------------------
+# Host cron invokes `docker exec pgbackrest-runner pgbackrest ...`. Using
+# host cron (not an in-container cron) keeps the scheduler visible in
+# /etc/cron.d where operators expect to find it, and sidecar restarts
+# don't lose the schedule.
+
+- name: Cron job — weekly full backup
+  ansible.builtin.cron:
+    name: "pgbackrest {{ pgbackrest_stanza }} full"
+    minute: "{{ pgbackrest_cron_full_minute }}"
+    hour: "{{ pgbackrest_cron_full_hour }}"
+    weekday: "{{ pgbackrest_cron_full_weekday }}"
+    user: root
+    job: >-
+      /usr/bin/docker exec {{ postgres_container_name }} pgbackrest
+      --stanza={{ pgbackrest_stanza }}
+      --type=full backup
+      >> /var/log/pgbackrest/cron.log 2>&1
+
+- name: Cron job — daily differential backup
+  ansible.builtin.cron:
+    name: "pgbackrest {{ pgbackrest_stanza }} diff"
+    minute: "{{ pgbackrest_cron_diff_minute }}"
+    hour: "{{ pgbackrest_cron_diff_hour }}"
+    weekday: "{{ pgbackrest_cron_diff_weekday }}"
+    user: root
+    job: >-
+      /usr/bin/docker exec {{ postgres_container_name }} pgbackrest
+      --stanza={{ pgbackrest_stanza }}
+      --type=diff backup
+      >> /var/log/pgbackrest/cron.log 2>&1
+
+- name: Cron job — 6-hourly incremental backup
+  ansible.builtin.cron:
+    name: "pgbackrest {{ pgbackrest_stanza }} incr"
+    minute: "{{ pgbackrest_cron_incr_minute }}"
+    hour: "{{ pgbackrest_cron_incr_hour }}"
+    weekday: "{{ pgbackrest_cron_incr_weekday }}"
+    user: root
+    job: >-
+      /usr/bin/docker exec {{ postgres_container_name }} pgbackrest
+      --stanza={{ pgbackrest_stanza }}
+      --type=incr backup
+      >> /var/log/pgbackrest/cron.log 2>&1

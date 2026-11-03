@@ -1,0 +1,281 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the audit-subscriber role — deploys the external
+# goat-audit-subscriber service per
+# docs/design/zenoh-audit-external-subscriber.md + ADR 0858.
+#
+# Out-of-the-box configuration targets a single-host trial fabric.
+# Override `audit_subscriber_*` group vars for other deployments.
+
+# Image — SHA-pinned per ADR 0859 (easy rollback). Bumps to this value
+# require an append to deploy-history.yml (CI checks via
+# .github/workflows/deploy-history-check.yml). Built by
+# .github/workflows/audit-subscriber-image.yml.
+audit_subscriber_image: "ghcr.io/{{ ghcr_org }}/goat-audit-subscriber:sha-81c7e54@sha256:46b91630a9440b10d6bb49855ef4ad01eadf56273c46efd357541cb48c3aee8d"
+
+# Stable identifier for this subscriber's writes. Becomes a path
+# component in MinIO object keys + a label on the emitted Prometheus
+# metrics. The default suits a single-host trial fabric; a real site
+# should use its site short code.
+audit_subscriber_id: "nova-a"
+
+# Zenoh router endpoint. Internal docker network — container-name
+# resolution. The router listens mTLS-only on 7447, so the default is
+# `tls/...`. The binary auto-detects from the endpoint scheme. The
+# `<zenoh_stack>-router` container name derives from the one deployment
+# param.
+audit_subscriber_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+
+# Docker network the zenoh-router container actually lives on. Matches
+# the synth-vendor role: the zenoh compose project's external network is
+# `<zenoh_stack>_default`.
+audit_subscriber_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# Identity model of the audited goatnet (ADR 1025). `per-vendor` (the first
+# key segment is a human vendor prefix) or `per-uuid-slot-pool` (the first
+# segment is an opaque slot anchor uuid). Stamped on every audit event as
+# `identity_model` so a downstream reader knows whether the `anchor`/`vendor`
+# field is a human name or a uuid to join against the slot registry's assigned
+# handle. A slot-pool goatnet sets `per-uuid-slot-pool` in group_vars.
+audit_subscriber_identity_model: "per-vendor"
+
+# Key-expression to subscribe to. `**` captures every sample the router
+# routes to this client; narrow per-prefix when the trial fabric ACL
+# tightens around the subscriber identity.
+audit_subscriber_subscribe_key: "**"
+
+# Comma-separated key-expressions EXCLUDED from the audit / persistence
+# path (ADR 1032). The subscriber keeps its `**` subscription but drops
+# matching samples before hashing + upload, counting them in
+# `goat_audit_excluded_total{exclude_pattern}`. Default `volatile/**` —
+# the non-persisted class (high-throughput telemetry + bounded large-file
+# transfer) must never reach the locked audit-integrity bucket and fill
+# disk. Set to "" to capture everything (legacy behaviour).
+#
+# DEPLOYMENT ORDERING (ADR 1032): this exclude must be live on the running
+# subscriber BEFORE any peer is granted volatile/<peer>/** write in the
+# router ACL. Granting the write first would route the firehose into the
+# Object-Locked bucket — hard to reclaim. The router-side grant and this
+# exclude land together.
+audit_subscriber_exclude_keys: "volatile/**"
+
+# Host-side cert directory. Leaf cert + key minted via offline-CA
+# cert-sign (same workflow as panoscope + synth-vendor leaves, but
+# under an infra-peer URI-SAN rather than a vendor-prefix one).
+# Operator pre-stages files at:
+#   {cert_dir}/audit-subscriber-cert.pem
+#   {cert_dir}/audit-subscriber-key.pem
+#   {cert_dir}/ca-root.pem
+audit_subscriber_cert_dir: "/opt/audit-subscriber/certs"
+
+# Source path on the host for the fabric's CA root certificate. Read-only
+# bind-mounted as /ca/ca-root.pem inside the container so the client
+# verifies the router's server cert. Lives under the zenoh role's per-stack
+# /etc/<zenoh_stack>/tls dir.
+audit_subscriber_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# Host-side compose project dir.
+audit_subscriber_compose_dir: "/opt/audit-subscriber"
+
+# Logging filter.
+audit_subscriber_rust_log: "goat_audit_subscriber=info,zenoh=warn"
+
+# Prometheus /metrics bind. Published to the host on the same port so
+# the Block 82B observability stack can scrape it directly.
+audit_subscriber_metrics_port: 9303
+
+# MinIO endpoint (S3-compatible). When empty the subscriber runs in
+# observe-only mode — events are counted in metrics but not written to
+# durable storage. Useful for the first-deploy dual-run validation
+# step (see Block 82S.2).
+audit_subscriber_s3_endpoint: ""
+
+# MinIO bucket. Per ADR 0811 the production target is a bucket with
+# Object-Lock COMPLIANCE; bucket *creation* (mc mb --with-lock) is an
+# operator-driven step before first non-observe-only deploy, but the
+# *lifecycle policy* (retention horizon + noncurrent-version cleanup
+# per F-171) is now applied by this role on every apply — see
+# `apply_lifecycle` below + ops/ansible/roles/audit-subscriber/tasks/lifecycle.yml.
+audit_subscriber_s3_bucket: "audit-integrity"
+
+# ----------------------------------------------------------------------
+# Bucket-level retention + lifecycle knobs.
+#
+# Block 95 canonical shape (docs/design/audit-cold-storage-offload.md):
+#
+#   middle tier  = MinIO audit-integrity, 30d Object Lock + 30d
+#                  lifecycle Expiration + 1d NoncurrentVersionExpiration
+#   long term    = operator-fired cold-storage offload at deployment
+#                  milestones (ops/scripts/offload-to-cold.sh).
+#
+# Defaults below are the canonical fleet-wide values. A site overrides per
+# group_vars/<env>/ to adjust retention or to keep audit-integrity in the
+# legacy 1y posture until the operator migrates to the three-tier shape.
+# ----------------------------------------------------------------------
+
+# Apply the lifecycle policy to the audit-integrity bucket on this
+# role apply. Set false to leave the bucket untouched (useful for
+# observe-only deploys + first-time runs where the bucket isn't
+# created yet).
+audit_subscriber_apply_lifecycle: true
+
+# How long Object Lock COMPLIANCE retention is set on newly-PUT objects.
+# Note: the audit-subscriber binary writes objects with per-object
+# retention via PutObjectRetention; this knob is the *bucket default*
+# applied by the lifecycle policy as a floor for any object PUT
+# without an explicit retention. Per-object retention is the audit-
+# subscriber's responsibility; this is a substrate safety net.
+audit_subscriber_minio_retention_days: 30
+
+# Lifecycle Expiration — current versions are expired (delete-marker
+# created) at this age. Matches retention so objects can actually be
+# expired once their Object Lock window passes.
+audit_subscriber_minio_expiration_days: 30
+
+# Lifecycle NoncurrentVersionExpiration — once a current version is
+# expired (replaced by a delete marker), the noncurrent version is
+# hard-deleted after this many additional days. Without this clause
+# (default state before F-171's fix), noncurrent versions accumulate
+# forever and the bucket grows past its documented retention horizon.
+audit_subscriber_minio_noncurrent_days: 1
+
+# Lifecycle AbortIncompleteMultipartUpload — orphaned partial uploads
+# from past audit-subscriber crashes get aborted after this many days.
+# Hygiene clause.
+audit_subscriber_minio_multipart_abort_days: 1
+
+# Expire "zombie" delete markers — a delete marker left as the only thing at a
+# key once the versions beneath it have been pruned.
+#
+# WHY THIS IS SEPARATE FROM NoncurrentVersionExpiration, which is already set
+# above and already works: that clause removes noncurrent VERSIONS. On a
+# versioned bucket the current-version Expiration does not hard-delete either,
+# it writes a delete marker. So the two clauses together empty the bucket of
+# data and leave the markers behind forever.
+#
+# A bucket with both existing clauses deployed fills with delete markers, up
+# to half of all versions. MinIO's scanner walks every one of them continuously,
+# so disk reads dwarf client traffic.
+#
+# ExpiredObjectDeleteMarker is mutually exclusive with Expiration.Days in the
+# same S3 rule, so this renders a SECOND rule rather than extending the first.
+# MinIO's own term for the condition is "zombie delete markers"
+# (mc ilm rule add --expire-delete-marker).
+#
+# Set false only to reproduce the pre-fix state; there is no case where keeping
+# them is useful — a delete marker with nothing under it records nothing.
+audit_subscriber_minio_expire_delete_markers: true
+
+# Container running mc + minio admin commands.
+audit_subscriber_minio_container: "minio"
+
+# Name of the mc alias the lifecycle task MINTS for itself, per run, via
+# MC_HOST_<alias>. It is not looked up in the container's mc config and does
+# not need to pre-exist.
+#
+# The alias is minted rather than assumed because an alias a human may or may
+# not have typed into a container is a per-host accident. Where it carries an
+# empty access key, every lifecycle run hits Access Denied, and a bucket check
+# that reads that as "bucket does not exist" skips the whole task while the
+# deploy reports clean. The name below is just a label.
+audit_subscriber_minio_alias: "goatilm"
+
+# Where MinIO listens from INSIDE its own container. Plain http on purpose —
+# this never leaves the container's loopback.
+audit_subscriber_minio_admin_endpoint: "127.0.0.1:9000"
+
+# Root credentials for lifecycle administration. Lifecycle is an admin-plane
+# operation; the audit-subscriber's own S3 user is deliberately not
+# privileged enough for it.
+#
+# These default to the same env-var NAMES the minio role uses for this host,
+# which are set per-goatnet in group_vars/<env>/minio.yml — so a host that
+# runs MinIO needs no extra configuration here. Only the names live in
+# variables; the values are read from the environment at run time and never
+# written to a committed file.
+audit_subscriber_minio_root_user_envvar: "{{ minio_root_user_envvar | default('') }}"
+audit_subscriber_minio_root_password_envvar: "{{ minio_root_password_envvar | default('') }}"
+
+# Where the 0600 MC_HOST env file is staged. `docker exec --env-file` reads
+# it, so the credential never appears on a command line and never reaches
+# `ps` or the ansible log. Removed in the task's `always` block.
+audit_subscriber_lifecycle_mc_env_path: "/root/.audit-lifecycle-mc.env"
+
+# MinIO region (ignored by MinIO but required by the AWS SDK).
+audit_subscriber_s3_region: "us-east-1"
+
+# Environment variable NAMES in the orchestrator host's env that hold
+# the MinIO access + secret keys. Resolved by the role into a
+# compose-side .env file (mode 0600) — secrets never live in
+# committed templates and never appear in compose command lines.
+# Operator sets these in the .envrc.local.d/30-site-services.envrc
+# tier per docs/operations/local-secrets-pattern.md.
+audit_subscriber_s3_access_key_envvar: "NOVA_AUDIT_SUBSCRIBER_S3_ACCESS_KEY"
+audit_subscriber_s3_secret_key_envvar: "NOVA_AUDIT_SUBSCRIBER_S3_SECRET_KEY"
+
+# Cap on inline payload bytes captured per event. Publishes larger than
+# this carry hash + length only.
+audit_subscriber_max_inline_payload: 16384
+
+# Writer batching knobs. THESE TWO SET MINIO'S SCAN COST — read before tuning.
+#
+# The writer flushes on WHICHEVER COMES FIRST: `batch_events` accumulated, or
+# `batch_interval_ms` elapsed. One flush = exactly one S3 object. So the pair
+# decides how many objects the bucket holds, and MinIO's background scanner
+# reads one `xl.meta` per object on every pass — scan cost is per-OBJECT, not
+# per-byte.
+#
+# WHAT 256/5000 COSTS. At ~47 events/s the TIME cap binds first, so the writer
+# emits an object every 5 s:
+#
+#   17,000+ objects/day  ->  ~590,000 objects at the 30-day horizon
+#   MinIO stores each as a directory tree (obj dir + xl.meta + version dir +
+#   part) = ~4 inodes, so millions of inodes on the host filesystem
+#   Reads far exceed writes on an append-only archive, which is the scanner
+#   walking metadata, not clients
+#
+# 60 s / 10000 holds the SAME bytes with ~92% fewer objects (1,440/day,
+# ~43,000 at 30 days, ~1.8 MiB each). MinIO handles megabyte objects far
+# better than it handles hundreds of thousands of small ones.
+#
+# WHY BOTH MOVE. Raising only the interval changes nothing: at ~47 events/s a
+# 60 s window accumulates ~2,820 events, so a 256 cap would still bind and
+# still emit ~11 objects/minute. `batch_events` must sit well above rate x
+# interval for the time cap to be the one that fires; 10000 gives ~3.5x headroom
+# at that rate and acts as a burst valve, not the norm. It also bounds writer
+# memory: 10,000 x ~650 B is ~6.5 MB held.
+#
+# THE COST, STATED PLAINLY. Between flushes the batch lives in the writer's
+# in-memory Vec and NOWHERE ELSE — the local NDJSON tail is appended inside
+# the same flush as the MinIO upload, not continuously. So `batch_interval_ms`
+# is the window of audit events LOST OUTRIGHT if audit-subscriber dies, not
+# merely un-WORMed: they came off the Zenoh bus and a restarted subscriber
+# receives live data, not history. This moves that window 5 s -> 60 s.
+#
+# Keep that trade explicit. If a goatnet needs a tighter audit guarantee,
+# shorten the INTERVAL and drop batch_events to match (keeping it above
+# rate x interval), and accept the object count that comes with it.
+audit_subscriber_batch_events: 10000
+audit_subscriber_batch_interval_ms: 60000
+# Bound on the subscriber->writer channel. Unrelated to batch size (the writer
+# drains this continuously into its Vec regardless of when it flushes), but
+# `goat_audit_drop_total` going non-zero means the writer cannot keep up and
+# this is the knob, not the batch pair.
+audit_subscriber_channel_depth: 4096
+
+# Optional HOST directory the subscriber ALSO appends each NDJSON batch to (a
+# best-effort tail; the MinIO WORM write is unaffected on failure). Off-box
+# cyber-logging (goat-logship, ADR 1078) tails this to surface fabric writes as
+# OCSF fabric:write. Empty = off. When set, mounted into the container at /tail.
+audit_subscriber_local_ndjson_dir: ""
+
+# Days of dated tail files to keep. The tail is a transport handoff to
+# goat-logship, not a store — the durable copy is the MinIO WORM write above,
+# Object-Locked for audit_subscriber_minio_retention_days. Without pruning the
+# tail grows by gigabytes per day.
+#
+# 7 rather than 3 buys a week of goat-logship outage before the reader loses
+# data it never consumed; the WORM copy is unaffected either way. Only consulted
+# when audit_subscriber_local_ndjson_dir is set.
+audit_subscriber_local_ndjson_retain_days: 7

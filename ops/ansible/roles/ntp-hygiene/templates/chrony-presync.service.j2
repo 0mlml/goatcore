@@ -1,0 +1,46 @@
+# Managed by ops/ansible/roles/ntp-hygiene — do not hand-edit.
+#
+# chrony-presync.service — see /usr/local/sbin/chrony-presync.sh for
+# rationale. Runs early in boot, BEFORE chrony.service + docker.service
+# + containerd.service, and only when the clock is implausibly old.
+# Closes the F-096 chicken-and-egg; F-165 adds relocation/late-WAN
+# self-heal via chrony-presync-retry.timer (which re-fires this unit
+# until it succeeds).
+
+[Unit]
+Description=Bootstrap clock via plain NTP before NTS-secured chrony starts
+Documentation=file:///usr/local/sbin/chrony-presync.sh
+DefaultDependencies=no
+# network-online only guarantees the LOCAL link is configured — NOT that
+# the upstream WAN is reachable (a travel router's satellite/uplink can
+# lag minutes behind link-up). So this gate is necessary but not
+# sufficient; chrony-presync-retry.timer covers the late-WAN case.
+After=network-online.target
+Wants=network-online.target
+# Start BEFORE every service that depends on a sane clock. chrony itself
+# uses NTS so it strictly requires this. docker + containerd start
+# time-bound containers (registry-mirror TLS, the zenoh router's
+# tls/:7447 listener, netbird Signal TLS) that validate certs against
+# the host clock.
+Before=chrony.service
+Before=docker.service
+Before=containerd.service
+# Skip once the clock has been bootstrapped this boot. The sentinel is
+# written by the SCRIPT on genuine success ONLY (not unconditionally),
+# so a failed attempt leaves the condition open for the retry timer.
+ConditionPathExists=!/run/chrony-presync.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/chrony-presync.sh
+RemainAfterExit=yes
+TimeoutStartSec={{ chrony_presync_timeout_sec }}s
+# Only exit 0 counts as success. A non-zero exit (network not up yet)
+# leaves the unit failed so chrony-presync-retry.timer re-fires it.
+# chrony.service is NOT blocked by our failure (Before= orders only, no
+# Requires=) — it starts at a bad clock and gets corrected on a later
+# retry pass once the WAN is reachable.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

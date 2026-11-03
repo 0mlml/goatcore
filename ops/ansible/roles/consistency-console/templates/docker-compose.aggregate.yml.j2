@@ -1,0 +1,115 @@
+# {{ ansible_managed }}
+#
+# goat-consistency-console in CF-7 AGGREGATOR MODE, hosted beside the
+# multi-env relay-health dashboard (consistency-foundation.md §7.8 as-built).
+# Fence chain: relay-health Traefik (file-provider sibling router,
+# consistency-aggregator.yml) -> oauth2-proxy-consistency-aggregator:4180
+# (PLATFORM-ADMIN gate against the hosting goatnet's Hydra) ->
+# consistency-aggregator:9760. The console is a read-only Zenoh mTLS client
+# of each configured goatnet's router; it publishes nothing, stores nothing,
+# executes nothing — killing it changes nothing on any goatnet (§7.9).
+#
+# No host port is published: the ONLY paths in are the Traefik chain and the
+# compose network.
+
+services:
+  consistency-aggregator:
+    image: "{{ consistency_aggregator_image }}"
+    container_name: consistency-aggregator
+    restart: unless-stopped
+    networks:
+      - relay-health
+    expose:
+      - "9760"
+    environment:
+      GCC_AGGREGATE_CONFIG: /config/aggregator.yaml
+      GCC_LISTEN: "0.0.0.0:9760"
+      GCC_ROLLUP_STALE_AFTER_MS: "{{ consistency_aggregator_rollup_stale_after_ms }}"
+      # The fleet-scoped ladder document (release-graduation.md §8) — one file at the
+      # intent root, not per goatnet: the ladder spans the rungs.
+      GCC_RELEASE_FILE: "/intent/release-readiness.json"
+      RUST_LOG: "{{ consistency_aggregator_rust_log }}"
+{% if consistency_aggregator_sibling_panoscope_url | length > 0 %}
+      CONSISTENCY_SIBLING_PANOSCOPE_URL: "{{ consistency_aggregator_sibling_panoscope_url }}"
+{% endif %}
+{% if consistency_aggregator_sibling_stethoscope_url | length > 0 %}
+      CONSISTENCY_SIBLING_STETHOSCOPE_URL: "{{ consistency_aggregator_sibling_stethoscope_url }}"
+{% endif %}
+{% if consistency_aggregator_sibling_flashlight_url | length > 0 %}
+      CONSISTENCY_SIBLING_FLASHLIGHT_URL: "{{ consistency_aggregator_sibling_flashlight_url }}"
+{% endif %}
+{% if consistency_aggregator_sibling_portal_url | length > 0 %}
+      CONSISTENCY_SIBLING_PORTAL_URL: "{{ consistency_aggregator_sibling_portal_url }}"
+{% endif %}
+    volumes:
+      # Read-only, all of them: the console owns no state (§7.3).
+      - "{{ consistency_aggregator_compose_dir }}/aggregator.yaml:/config/aggregator.yaml:ro"
+      - "{{ consistency_aggregator_intent_dir }}:/intent:ro"
+      - "{{ consistency_aggregator_cert_dir }}:/certs:ro"
+    labels:
+      - "traefik.enable=false"
+
+{% if consistency_aggregator_zagros_door_enabled | bool %}
+  # zagros-door — the env-doors Tier 2 lane CLIENT (ADR 1117; env-doors.md
+  # §"Tier 2"; consistency-foundation.md §7.8 as-built). A TLS-wrap haproxy
+  # (the federation-proxy pattern): accepts the console's zenoh TLS stream on
+  # :17447 and carries it inside an OUTER mTLS connection (offline-dev-CA
+  # client cert, SNI {{ consistency_aggregator_zagros_door_sni }}) to the ZAGROS
+  # relay fleet :443 → relay haproxy SNI pin → rathole → zagros-a Traefik
+  # (RequireAndVerifyClientCert) → the Thor's zenoh tls/:7447. The INNER
+  # zenoh mTLS session is unchanged end-to-end; this hop only opens the
+  # road. Lane down ⇒ the console renders ZAGROS indeterminate-with-age.
+  zagros-door:
+    image: "{{ consistency_aggregator_zagros_door_image }}"
+    container_name: zagros-door
+    restart: unless-stopped
+    # Match the cert dir's ownership (the role chowns it to 65532 for the
+    # non-root console container); haproxy must read the client cert+key.
+    user: "65532:65532"
+    networks:
+      - relay-health
+    expose:
+      - "17447"
+    volumes:
+      - "{{ consistency_aggregator_compose_dir }}/zagros-door-haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"
+      # Combined client cert + key (haproxy `crt` format), operator-minted
+      # via the offline-CA ceremony — never committed.
+      - "{{ consistency_aggregator_cert_dir }}/zagros-door/client.pem:/certs/zagros-door/client.pem:ro"
+    labels:
+      - "traefik.enable=false"
+{% endif %}
+
+{% if consistency_aggregator_oauth2_proxy_enabled | bool %}
+  oauth2-proxy-consistency-aggregator:
+    image: "{{ consistency_aggregator_oauth2_proxy_image }}"
+    container_name: oauth2-proxy-consistency-aggregator
+    restart: unless-stopped
+    networks:
+      - relay-health
+    expose:
+      - "4180"
+{% if consistency_aggregator_gate | default('hydra-groups') == 'dex-allowlist' %}
+    volumes:
+      # The relay-health door's roster-synced allowlist (ADR 1093 auto-sync
+      # writes it IN-PLACE, so this mount tracks membership live). Read-only:
+      # this fence consumes the door list, it never owns it.
+      - "{{ consistency_aggregator_allowlist_file }}:/etc/oauth2-proxy/authenticated-emails.txt:ro"
+{% elif consistency_aggregator_oauth2_proxy_oidc_host_entry | length > 0 %}
+    # OIDC discovery hits the issuer's name — pin it. On this mesh-peer
+    # cloud host the pin points at the hosting env's mgmt-host MESH IP.
+    # (hydra-groups mode only — the public Dex issuer needs no pin.)
+    extra_hosts:
+      - "{{ consistency_aggregator_oauth2_proxy_oidc_host_entry }}"
+{% endif %}
+    env_file:
+      - oauth2-proxy-consistency-aggregator.env
+    labels:
+      - "traefik.enable=false"
+{% endif %}
+
+networks:
+  # The relay-health standalone public gate's network — joining it is what
+  # lets the relay-health Traefik resolve the fence by service name.
+  relay-health:
+    external: true
+    name: "{{ consistency_aggregator_network }}"

@@ -1,0 +1,114 @@
+---
+# Block 21H.1b — operator-idp-kratos role.
+# ADR 0842. Per-site Ory Kratos for the operator IdP. Connects to
+# operator-idp-postgres on the same Orin-C. Idempotent: re-runs are
+# safe; container restarts on config or .env drift only.
+#
+# Sequencing: this role must run AFTER operator-idp-postgres (DB must
+# exist + the kratos schema must be reachable). The orchestrator
+# (vega-obs-bootstrap.yml Phase 8) enforces order via play sequence.
+
+- name: Require operator-IdP Kratos secrets
+  ansible.builtin.assert:
+    that:
+      - operator_idp_kratos_cookie_secret is defined and (operator_idp_kratos_cookie_secret | length) >= 32
+      - operator_idp_kratos_cipher_secret is defined and (operator_idp_kratos_cipher_secret | length) == 32
+      - operator_idp_pg_app_password is defined and (operator_idp_pg_app_password | length) > 0
+      - site_id is defined and (site_id | length) > 0
+    fail_msg: |
+      Missing operator-IdP Kratos secrets or DB password. These are
+      FRESH per site (NOT cluster-shared per ADR 0842). Generate via:
+        OP_KRATOS_COOKIE=$(openssl rand -hex 32)
+        OP_KRATOS_CIPHER=$(openssl rand -hex 16)   # 32 hex chars = 16 bytes
+      Then append to .envrc.local.d/30-site-services.envrc:
+        export <SITE>_C_OPERATOR_IDP_KRATOS_COOKIE_SECRET=...
+        export <SITE>_C_OPERATOR_IDP_KRATOS_CIPHER_SECRET=...
+      operator_idp_pg_app_password is shared with the postgres role
+      (same DB, same user) and must already be set per the
+      operator-idp-postgres role's pre-flight check.
+
+- name: Ensure compose project + config dir exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ operator_idp_kratos_compose_dir }}", mode: "0750" }
+    - { path: "{{ operator_idp_kratos_compose_dir }}/{{ operator_idp_kratos_config_subdir }}", mode: "0750" }
+
+- name: Render kratos.yaml
+  ansible.builtin.template:
+    src: kratos.yaml.j2
+    dest: "{{ operator_idp_kratos_compose_dir }}/{{ operator_idp_kratos_config_subdir }}/kratos.yaml"
+    # 0644 — non-root container needs world-readable config to start.
+    # No secrets in this file (env-overridden at parse time per the
+    # KRATOS_SECRETS_* pattern in templates/docker-compose.yml.j2).
+    mode: "0644"
+  notify: restart operator-idp-kratos
+
+- name: Render identity schema
+  ansible.builtin.template:
+    src: identity-schema.json.j2
+    dest: "{{ operator_idp_kratos_compose_dir }}/{{ operator_idp_kratos_config_subdir }}/identity-schema.json"
+    mode: "0644"
+  notify: restart operator-idp-kratos
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ operator_idp_kratos_compose_dir }}/docker-compose.yml"
+    mode: "0640"
+
+- name: Render .env (operator-IdP Kratos secrets)
+  # Mode 0600 — secret material; only docker daemon (root) reads.
+  # Distinct .env per role-compose-project; do not share with
+  # operator-idp-postgres .env (different secrets, different blast
+  # radius).
+  ansible.builtin.copy:
+    dest: "{{ operator_idp_kratos_compose_dir }}/.env"
+    mode: "0600"
+    content: |
+      KRATOS_SECRETS_COOKIE={{ operator_idp_kratos_cookie_secret }}
+      KRATOS_SECRETS_CIPHER={{ operator_idp_kratos_cipher_secret }}
+  no_log: true
+  notify: restart operator-idp-kratos
+
+- name: Pull operator-idp-kratos image
+  ansible.builtin.command:
+    cmd: docker compose pull kratos
+    chdir: "{{ operator_idp_kratos_compose_dir }}"
+  changed_when: true
+
+- name: Run Kratos migrations (one-shot, idempotent — Kratos handles re-run)
+  ansible.builtin.command:
+    cmd: docker compose run --rm kratos-migrate
+    chdir: "{{ operator_idp_kratos_compose_dir }}"
+  changed_when: true
+
+- name: Bring up operator-idp-kratos
+  ansible.builtin.command:
+    cmd: docker compose up -d kratos
+    chdir: "{{ operator_idp_kratos_compose_dir }}"
+  changed_when: true
+
+- name: Wait for Kratos /admin/health/ready (loopback)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ operator_idp_kratos_admin_host_port }}/admin/health/ready"
+    status_code: 200
+  register: kratos_ready
+  retries: 30
+  delay: 2
+  until: kratos_ready.status == 200
+
+- name: Surface readiness evidence
+  ansible.builtin.debug:
+    msg: |
+      operator-idp-kratos up at:
+        public  http://127.0.0.1:{{ operator_idp_kratos_public_host_port }}
+        admin   http://127.0.0.1:{{ operator_idp_kratos_admin_host_port }}
+      Public listener will be reverse-proxied by Traefik on Orin-C as:
+        https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}
+      Initial operator enrollment lives in 21H.2 (separate role +
+      runbook).

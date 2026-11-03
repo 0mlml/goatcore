@@ -1,0 +1,221 @@
+# {{ ansible_managed }}
+# onboard-runner — the pull-model onboarding auto-executor as a CONTAINER with
+# its own scoped portal identity (docs/design/operator-onboard-intake.md
+# §"Fast-follow"). Joins the shared {{ onboard_runner_network }} network so it
+# reaches the portal + Kratos by container name (no host mesh DNS). The minimal
+# goat profile (portal endpoint + the runner's own token) is materialized at
+# startup by the image entrypoint from the .env below.
+services:
+  {{ onboard_runner_container_name }}:
+    image: "{{ onboard_runner_image }}"
+    container_name: "{{ onboard_runner_container_name }}"
+    restart: unless-stopped
+    # The native onboard reaches this goatnet's NetBird management API at its
+    # PUBLIC FQDN, which on a mgmt host resolves through /etc/hosts to 127.0.0.1
+    # (traefik on the host). Inside a container 127.0.0.1 is the container
+    # itself, so the name is pointed at the host instead: `host-gateway`, the
+    # docker bridge gateway, where traefik publishes :443. Without this the
+    # mint dies at
+    #   error: NetBird GET /api/groups failed: network or parse error
+    # which is the fourth wall a new goatnet hits and says nothing about DNS
+    #. Same class as the F-198 issuer/extra_hosts gotcha.
+    #
+    # Never a literal bridge IP here (see onboard_runner_mgmt_fqdn_addr in
+    # defaults/main.yml): the address is per host and per container start, and
+    # the same error line above is what a wrong pin produces.
+    extra_hosts:
+      - "{{ onboard_runner_netbird_mgmt_url | urlsplit('hostname') }}:{{ onboard_runner_mgmt_fqdn_addr }}"
+    env_file: [.env]
+    environment:
+      HOME: /home/runner
+      # The Go runner's portal contract endpoint AND the goat profile's
+      # portal_endpoint (materialized by the entrypoint) — one value.
+      PORTAL_URL: "{{ onboard_runner_portal_internal_url }}"
+      # F-433. The runner's own Go process already talks to the console via
+      # `--onboard=` below, but a native onboard SHELLS OUT to `goat admin
+      # onboard`, and that subprocess builds its own client from the profile —
+      # which knows only PORTAL_URL. Left unset, its POST /api/onboard/register goes to
+      # the PORTAL, which does not have that route, and every CLI mint prints a warning
+      # that the person is invisible to the dormancy sweep, archive pass and usage
+      # check. `goat-cli` honours this override precisely so a runner
+      # can re-point without re-issuing a bundle.
+      #
+      # PLAINTEXT on purpose, even where onboard_runner_mtls_enabled is true
+      # and the runner's own `--onboard=` below switches to :9443. Do
+      # not "fix" this to match that line. The console's mTLS listener is
+      # ADDITIVE — same routes, separate addr, plaintext :8080 still served
+      # (cmd/console/main.go) — and goat-cli has no client-SVID support, so
+      # pointing this at :9443 would break the CLI leg rather than
+      # harden it. The subprocess authenticates with the same bearer it
+      # already carries; the SVID leg belongs to the runner's own client.
+      GOAT_ONBOARD_ENDPOINT: "{{ onboard_runner_onboard_internal_url }}"
+      # The native onboard's Ory leg runs `sh -c 'curl …'` IN-container against
+      # the sibling Kratos admin API (no SSH), reaching it by container name.
+      GOAT_ONBOARD_KRATOS_LOCAL: "1"
+      GOAT_ONBOARD_KRATOS_ADMIN_URL: "{{ onboard_runner_kratos_admin_url }}"
+      # Stamped into the mint's audit event (runner-executed / operator-approved).
+      GOAT_OPERATOR_HANDLE: "{{ onboard_runner_runner_id }}"
+{% if onboard_runner_defer_credential %}
+      # Mint-on-collect: the runner passes --defer-credential, so the fabric
+      # credential is NOT minted at onboard time — the person mints it once,
+      # themselves, on the console's /fabric-credential page.
+      #
+      # It lives here rather than being hand-set on a container because a value set
+      # by hand is lost on the next redeploy, which flips the goatnet back to
+      # immediate-mint with nothing in the config to show the change.
+      #
+      # Do NOT enable on a goatnet until the deferred-create fix (deferred
+      # create must erase pool-era cert stamps) is DEPLOYED there. Enabling
+      # first re-breaks every collect on a pre-stamped pool slot.
+      ONBOARD_DEFER_CREDENTIAL: "1"
+{% endif %}
+{% if onboard_runner_aff_trait_enabled | bool %}
+      # Phase D (ADR 1043): the native onboard emits traits.aff {id, kind[, nation]}
+      # from the manifest's affiliation block; the consent UI forwards it as the
+      # id_token `aff` claim. Config, not a hand-set container env, for the same
+      # reason as ONBOARD_DEFER_CREDENTIAL above.
+      GOAT_ORY_AFF_TRAIT_ENABLED: "1"
+{% endif %}
+{% if onboard_runner_mtls_enabled %}
+      # SPIFFE mTLS on the onboarding-contract leg (runner → console). The runner
+      # presents the SVID the spiffe-helper sidecar writes to /svid and verifies
+      # the console's SVID SPIFFE ID. Bearer still sent for F-207 attribution.
+      ONBOARD_MTLS_ENABLED: "true"
+      ONBOARD_MTLS_CERT_FILE: "/svid/onboard-runner-cert.pem"
+      ONBOARD_MTLS_KEY_FILE: "/svid/onboard-runner-key.pem"
+      ONBOARD_MTLS_BUNDLE_FILE: "/svid/spire-bundle.pem"
+      ONBOARD_MTLS_SERVER_ID: "{{ onboard_runner_console_spiffe_id }}"
+{% endif %}
+    command:
+      - "--portal={{ onboard_runner_portal_internal_url }}"
+      # The onboarding contract (approved queue / claim / result) moved to
+      # goat-id-console; --portal stays the cert-mint leg (POST /api/orgs).
+      - "--onboard={{ onboard_runner_mtls_onboard_url if onboard_runner_mtls_enabled else onboard_runner_onboard_internal_url }}"
+      - "--only-env={{ onboard_runner_only_env }}"
+      - "--runner-id={{ onboard_runner_runner_id }}"
+      - "--repo-root={{ onboard_runner_repo_root_container }}"
+      - "--goat-bin=/usr/local/bin/goat"
+      - "--interval={{ onboard_runner_interval }}"
+      - "--http-timeout={{ onboard_runner_http_timeout }}"
+    volumes:
+      # The site `goat` binary, bind-mounted from the host (role-managed, one
+      # version source). glibc parity: wolfi-base runs the host's gnu binary.
+      - "{{ onboard_runner_goat_bin_host }}:/usr/local/bin/goat:ro"
+      # The manifest schema (read) + writable ops/operators/<env>/ + out/ tree.
+      - "{{ onboard_runner_repo_root_host }}:{{ onboard_runner_repo_root_container }}:rw"
+{% if peerview_enabled | default(false) %}
+      # lifecycle-sweep owns the lock and atomic hold-record rewrite.
+      - {{ peerview_state_dir | default('/var/lib/peerview') }}:/var/lib/peerview:rw
+{% endif %}
+{% if warrant_membership_enabled | default(false) %}
+      # The engine re-checks authority immediately before mutation.
+      - /etc/goat/warrant/membership:/etc/goat/warrant/membership:ro
+{% endif %}
+{% if onboard_runner_mtls_enabled %}
+      # SVID cert+key+bundle written by the sidecar below (SPIRE Phase A).
+      - "{{ onboard_runner_svid_dir }}:/svid:ro"
+{% endif %}
+{% if onboard_runner_healthcheck_enabled | default(false) %}
+    # Container healthcheck.
+    #
+    # Unlike the portal / crawler / grant-keyd containers, this image CAN run a
+    # probe: it is cgr.dev/chainguard/wolfi-base with curl + a shell
+    # (ops/onboard-runner/Dockerfile), added for the native onboard's local
+    # Kratos leg. So the check below is real, not aspirational.
+    #
+    # What it checks, honestly: (1) that the runner's SVID material is present
+    # and still gets it through a TLS handshake with goat-id-console — the
+    # failure mode nothing else sees, the spiffe-helper sidecar dying and the
+    # SVID going stale, after which the runner silently claims no work; and
+    # (2) that this goatnet's NetBird management API answers from inside the
+    # container at the address extra_hosts maps it to (200/401/403 = reached).
+    # With (2), a wrong address reads unhealthy within three minutes and
+    # IdentityPlaneServiceUnhealthy fires, instead of the container reading
+    # `healthy` while it cannot mint. It does
+    # NOT prove the runner's poll loop is alive: docker runs this in a new
+    # process, so a hung PID 1 still passes. Hence the runner sits in the
+    # WARNING tier (IdentityPlaneServiceUnhealthy), not the paging tier.
+    #
+    # DEFAULT-OFF until verified once on the target host — an unrunnable or
+    # mis-pathed probe pins the container `Up (unhealthy)` forever.
+    # Verify, then set onboard_runner_healthcheck_enabled: true in group_vars:
+{% if onboard_runner_mtls_enabled %}
+    #   docker exec {{ onboard_runner_container_name }} curl -fsS --max-time 5 \
+    #     --cert /svid/onboard-runner-cert.pem --key /svid/onboard-runner-key.pem \
+    #     --cacert /svid/spire-bundle.pem {{ onboard_runner_mtls_onboard_url }}/healthz
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS --max-time 5
+          --cert /svid/onboard-runner-cert.pem --key /svid/onboard-runner-key.pem
+          --cacert /svid/spire-bundle.pem {{ onboard_runner_mtls_onboard_url }}/healthz >/dev/null
+          && case "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://{{ public_mgmt_fqdn }}/api/groups)" in
+          200|401|403) exit 0 ;; *) echo "mgmt API unreachable at https://{{ public_mgmt_fqdn }}" >&2; exit 1 ;; esac
+{% else %}
+    #   docker exec {{ onboard_runner_container_name }} curl -fsS --max-time 5 {{ onboard_runner_onboard_internal_url }}/healthz
+    #
+    # Without mTLS there is no runner-scoped credential to exercise, so this
+    # degrades to a plain reachability probe of the onboarding contract — it
+    # reports the CONSOLE's health on the runner's row. Read it that way.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS --max-time 5 {{ onboard_runner_onboard_internal_url }}/healthz >/dev/null
+          && case "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://{{ public_mgmt_fqdn }}/api/groups)" in
+          200|401|403) exit 0 ;; *) echo "mgmt API unreachable at https://{{ public_mgmt_fqdn }}" >&2; exit 1 ;; esac
+{% endif %}
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+{% endif %}
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - "{{ onboard_runner_network }}"
+    labels:
+      - "traefik.enable=false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+{% if onboard_runner_mtls_enabled %}
+
+  # SPIRE Phase A: fetch + rotate the runner's X509-SVID from the SPIRE agent
+  # Workload API and write cert+key+bundle into the shared svid volume the runner
+  # reads as /svid. The SPIRE registration entry's selector matches this
+  # service's compose label (docker:label:com.docker.compose.service:onboard-runner-spiffe-helper).
+  # Runs as the runner's UID so the 0600 key it writes is readable by the runner.
+  onboard-runner-spiffe-helper:
+    image: "{{ onboard_runner_spiffe_helper_image | default(fabric_health_spiffe_helper_image) }}"
+    container_name: onboard-runner-spiffe-helper
+    restart: unless-stopped
+    user: "{{ onboard_runner_spire_uid }}:{{ onboard_runner_spire_uid }}"
+    command: ["-config", "/etc/spiffe-helper/helper.conf"]
+    volumes:
+      - "{{ onboard_runner_spire_socket_dir }}:/run/spire/sockets:ro"
+      - "{{ onboard_runner_dir }}/spiffe-helper.conf:/etc/spiffe-helper/helper.conf:ro"
+      - "{{ onboard_runner_svid_dir }}:/svid"
+    # No healthcheck: the spiffe-helper image is distroless (see this role's
+    # spiffe-helper.conf.j2 — it is why the helper cannot run a chmod hook), so
+    # no shell, no curl, no self-probe. `NONE` is explicit so nobody adds an
+    # unrunnable wget probe and pins it `Up (unhealthy)` forever. This
+    # sidecar's failure mode — a stale SVID — is what the runner's own
+    # healthcheck above exercises via the mTLS handshake.
+    healthcheck:
+      test: ["NONE"]
+    networks:
+      - "{{ onboard_runner_network }}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+{% endif %}
+
+networks:
+  {{ onboard_runner_network }}:
+    external: true

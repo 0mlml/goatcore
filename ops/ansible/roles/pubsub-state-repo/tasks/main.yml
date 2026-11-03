@@ -1,0 +1,132 @@
+---
+# ops/ansible/roles/pubsub-state-repo/tasks/main.yml
+#
+# Provisions the per-site Forgejo repo that holds the pub/sub
+# state-of-record (Block 86), drops the mirror script + systemd timer,
+# and seeds the first commit from the live portal.
+
+- name: Pre-flight — credentials present
+  ansible.builtin.assert:
+    that:
+      - pubsub_state_forgejo_token | length > 0
+      - pubsub_state_portal_api_key | length > 0
+    fail_msg: |
+      FORGEJO_PUBSUB_TOKEN and PORTAL_OPERATOR_API_KEY must be set in
+      the environment before applying this role. See
+      docs/design/pubsub-state-as-code.md §"State-of-record hierarchy."
+
+- name: Pre-flight — Forgejo reachable
+  ansible.builtin.uri:
+    url: "{{ pubsub_state_forgejo_url }}/api/v1/version"
+    return_content: true
+    status_code: [200]
+  register: _forgejo_version
+  changed_when: false
+
+# Portal-by-container resolve (opt-in) — the effective portal URL for the
+# preflight must match what the mirror script resolves at runtime. When the
+# portal's 8090 is not host-published (three-Orin topology), resolve the
+# container's IP on its docker network; else use pubsub_state_portal_url as-is.
+- name: Resolve portal container IP (container mode)
+  ansible.builtin.command:
+    cmd: >-
+      docker inspect {{ pubsub_state_portal_container }}
+      -f '{% raw %}{{ (index .NetworkSettings.Networks "{% endraw %}{{ pubsub_state_portal_network }}{% raw %}").IPAddress }}{% endraw %}'
+  register: _portal_ip_res
+  changed_when: false
+  when: pubsub_state_portal_container | length > 0
+
+- name: Set effective portal URL
+  ansible.builtin.set_fact:
+    _effective_portal_url: >-
+      {{ ('http://' + (_portal_ip_res.stdout | trim) + ':' + (pubsub_state_portal_port | string))
+         if (pubsub_state_portal_container | length > 0)
+         else pubsub_state_portal_url }}
+
+- name: Pre-flight — portal reachable
+  ansible.builtin.uri:
+    url: "{{ _effective_portal_url }}/api/health"
+    return_content: true
+    status_code: [200]
+  changed_when: false
+
+- name: Ensure Forgejo org exists
+  ansible.builtin.uri:
+    url: "{{ pubsub_state_forgejo_url }}/api/v1/orgs"
+    method: POST
+    headers:
+      Authorization: "token {{ pubsub_state_forgejo_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      username: "{{ pubsub_state_org }}"
+      description: "Pub/sub state-of-record (Block 86) — per-site mirrors of goat-zenoh-portal registries"
+      visibility: private
+    status_code: [201, 422]   # 422 = already exists, treat as OK
+  register: _org_create
+  changed_when: _org_create.status == 201
+
+- name: Ensure Forgejo repo exists
+  ansible.builtin.uri:
+    url: "{{ pubsub_state_forgejo_url }}/api/v1/orgs/{{ pubsub_state_org }}/repos"
+    method: POST
+    headers:
+      Authorization: "token {{ pubsub_state_forgejo_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ pubsub_state_repo }}"
+      description: "Pub/sub state-of-record for site {{ pubsub_state_repo }}"
+      private: true
+      auto_init: true
+      default_branch: main
+    status_code: [201, 409]   # 409 = already exists
+  register: _repo_create
+  changed_when: _repo_create.status == 201
+
+- name: Ensure working dir exists
+  become: true
+  ansible.builtin.file:
+    path: "{{ pubsub_state_workdir }}"
+    state: directory
+    mode: "0750"
+
+- name: Drop mirror script
+  become: true
+  ansible.builtin.template:
+    src: pubsub-state-mirror.sh.j2
+    dest: /usr/local/bin/pubsub-state-mirror.sh
+    mode: "0750"
+
+- name: Drop systemd unit
+  become: true
+  ansible.builtin.template:
+    src: pubsub-state-mirror.service.j2
+    dest: /etc/systemd/system/pubsub-state-mirror.service
+    mode: "0644"
+  notify: reload systemd
+
+- name: Drop systemd timer
+  become: true
+  ansible.builtin.template:
+    src: pubsub-state-mirror.timer.j2
+    dest: /etc/systemd/system/pubsub-state-mirror.timer
+    mode: "0644"
+  notify: reload systemd
+
+- name: Flush handlers (pick up unit + timer changes)
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable + start timer
+  become: true
+  ansible.builtin.systemd:
+    name: pubsub-state-mirror.timer
+    enabled: true
+    state: started
+
+- name: First-run mirror — populate the repo before the timer fires
+  become: true
+  ansible.builtin.command: /usr/local/bin/pubsub-state-mirror.sh
+  register: _first_mirror
+  changed_when: "'committed' in _first_mirror.stdout"
+  failed_when: _first_mirror.rc not in [0]

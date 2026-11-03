@@ -1,0 +1,264 @@
+---
+# Defaults for the `ory` role. Per-site overrides via group_vars or -e.
+ory_kratos_image: "oryd/kratos:v1.3.1"
+ory_hydra_image: "oryd/hydra:v2.3.0"
+# Patched consent UI per ADR 0857 — overlay-only image that forwards
+# Kratos `traits.groups` into the OIDC JWT (patch 1), falls back to
+# `body.client.audience` when Hydra delivers empty
+# `requested_access_token_audience` (patch 2, F-144), and falls back
+# to `body.client.scope.split(' ')` when grantScope is empty (patch 3,
+# F-161). Source: `ops/ory-consent/`. Digest-pinned per ADR 0859 —
+# bumps require an append to `deploy-history.yml` alongside the value
+# here (CI check enforces). Sites override per-site in group_vars only
+# if a site needs a DIFFERENT pin than the fleet default.
+kratos_selfservice_ui_image: "ghcr.io/{{ ghcr_org }}/kratos-selfservice-ui-node-patched:sha-1a8cbfc@sha256:953ec27fbd8cadc9f43f54e20fb7871a3db63c9a90ce894dcae226a964e95644"
+ory_compose_dir: /opt/mgmt-host
+ory_config_subdir: ory
+
+# Operator-driven one-shot list of {subject, client} pairs whose
+# stored Hydra consent sessions should be revoked at the end of the
+# role run. Empty by default. Use case: after a new
+# `kratos_selfservice_ui_image` digest lands (e.g. patch 3 fix for
+# F-161), users whose first login wrote a stored consent session
+# under the OLD code don't auto-re-run through the consent UI on
+# subsequent logins — Hydra short-circuits at the
+# "already-consented?" check. Revoking the stored session forces the
+# next login through the new code. Revoke is idempotent on Hydra's
+# side (returns 204 whether the session existed or not), so leaving
+# stale entries here is harmless after the affected users have
+# re-logged-in once.
+#
+# Shape:
+#   ory_consent_revoke_subjects:
+#     - { subject: "cdc21793-93e1-430e-a76e-93da38586adb", client: "grafana" }
+#     - { subject: "<kratos-id-2>", client: "netbird-dashboard" }
+ory_consent_revoke_subjects: []
+# site_dns_zone — the instance's full mesh DNS zone (e.g.
+# netbird.example.net).
+# Instance-specific, Class A per docs/design/instance-variability-model.md:
+# intentionally NO default. A forgotten per-instance override must fail loud
+# (the "Require site_id + site_dns_zone" assert in tasks/main.yml), NOT silently
+# render another instance's URLs into this instance's identity plane (OIDC issuer,
+# schema $id). Set it in group_vars/<site>_hosts/vars.yml. (every real site does)
+# Default admin set is empty — pass site_admins per-site to seed real admins.
+site_admins: []
+
+# F-128 — group → first-login URL map. The bootstrap-password file emitted
+# for each new identity uses this map to pick which surface to direct the
+# user to. First match against the user's `groups` wins; unmatched users
+# fall through to `_default`. Sites can extend the map in group_vars
+# (e.g. `VENDOR: portal`) without touching this role.
+#
+# Values are subdomain prefixes — rendered as `https://<prefix>.<site_id>.<site_dns_zone>/`.
+# `_default` is the catchall for users whose `groups` does not match any
+# other entry; `isitup` is the safe v1 choice because every Hydra OIDC
+# client surface (dashboard / panoscope / portal / demogame) shares
+# the same Kratos session — landing on isitup never blocks a downstream
+# admin who needed the dashboard, just adds one extra click.
+bootstrap_first_login_url_by_group:
+  PLATFORM-ADMIN: dashboard
+  _default: isitup
+
+# ADR 1052 Phase 4 — vendor->org identity-trait migration compat window.
+# The going-forward org affiliation lives in traits.org (rendered as "Org
+# affiliation" in the settings UI). While identities minted before the trait
+# migration still carry the legacy traits.vendor, the schema must ALSO accept
+# vendor or their next self-service settings save fails validation
+# (additionalProperties:false). true = keep the deprecated legacy vendor block
+# in the schema (renders extra org-worded legacy fields, but no "vendor"
+# wording). Flip to false ONLY after the backfill
+# (ops/identity/backfill-vendor-to-org-trait.py) reports zero identities with
+# traits.vendor — that drop removes the legacy fields from the settings UI.
+ory_site_vendor_trait_compat: true
+
+# F-572 / ADR 1188 — authorization fields (groups, org, aff) in admin-managed
+# metadata_public instead of self-editable traits. true drops them from the
+# traits schema, so a self-service settings save can no longer carry them.
+# Per-site order: (1) deploy the metadata-first readers and writers with this
+# false, (2) run ops/identity/backfill-authz-traits-to-metadata.py --apply on
+# the mgmt host until --verify prints READY, (3) set true and redeploy this
+# role. tasks/authz-backfill-gate.yml refuses (3) while --verify is not READY.
+ory_authz_in_metadata: false
+
+# Canonical shared network ID for both Kratos and Hydra multi-tenancy.
+# Every site uses the SAME UUID so cross-site federation works (one
+# OAuth client created at site A is visible to Hydra at site B; one
+# identity created at site A is visible to Kratos at site B). The
+# pre-seed timestamp must be EARLIER than 2013-10-07 because Hydra's
+# migration inserts a default `networks` row at that hardcoded date,
+# and `networkx.Manager.Determine()` adopts the row with the EARLIEST
+# `created_at`. Pre-1970 (Unix epoch start) is comfortably earlier.
+# See ADR 1010 §D7 + F-002 (Hydra-specific gap).
+ory_shared_nid: "fcbfb51d-3774-4d02-8b49-4b6d496a703a"
+
+# Account recovery flow. Default OFF — Kratos's documented default, and the
+# posture every site shipped historically (the recovery flow had only a
+# ui_url, never `enabled: true`, so any recovery attempt returned HTTP 400
+# "Recovery is not allowed because it was disabled"). That dead path also
+# broke the goat-id-console "mint recovery link" button (it POSTs to the
+# admin /recovery/link/code/admin endpoint, which requires the flow enabled).
+#
+# When true, the template enables the recovery flow with the `code` strategy
+# and the `code` method. The operator path (admin-minted recovery link via
+# goat-id-console / operator-idp-enroll.sh) then returns a working link in the
+# API response body — NO SMTP courier required. The self-service "forgot
+# password" page emails a code via the courier, which is a no-op sink unless
+# ory_courier_smtp_enabled is also set (see below); with recovery on but no
+# courier, operator-minted links remain the only working reset path.
+# Set true per-site in group_vars/<site>_hosts/vars.yml.
+ory_recovery_enabled: false
+
+# Lifespan of the recovery flow AND the recovery `code` method (both rendered
+# into kratos.yaml) — i.e. how long an admin-minted set-password/reset link
+# stays usable. Invitees routinely open the welcome email hours after mint, so
+# 1h strands them; codes are single-use and the recovery UI only resolves on
+# the mesh, which bounds the exposure of the longer window. The goat-id-console
+# welcome email states this window — keep welcome.go in sync if changed.
+ory_recovery_lifespan: "24h"
+
+# --- Courier (SMTP) --------------------------------------------------------
+# The transport for self-service account recovery: the "forgot password" page
+# emails a one-time code, and without a working courier that page succeeds
+# silently while the mail is swallowed (F-241 — "connection refused x6 then
+# 'message abandoned' for every recovery email ever attempted"). Enabling it is
+# what turns self-service reset from a dead end into a working flow; the
+# admin-minted path (goat-id-console) never needed it and is unaffected.
+#
+# Default OFF, and every field below is EMPTY by default rather than carrying a
+# plausible-looking value: the sender identity and credentials are per-goatnet
+# Class-A config (docs/design/instance-variability-model.md), so a site that
+# forgets to set them must fail the deploy, not inherit another goatnet's
+# sender. The role asserts completeness before writing anything.
+#
+# SECRETS: the Kratos courier takes ONE connection_uri that embeds the SMTP
+# user:pass. kratos.yaml is mode 0644 (non-root container must read it), so the
+# URI is NEVER rendered there — the role composes it from the fields below and
+# injects it via the Kratos env-override COURIER_SMTP_CONNECTION_URI out of
+# /opt/mgmt-host/.env (0600), the same pattern the ICAM client secrets and
+# KRATOS_SECRETS_* already use. Only the non-secret from_address/from_name are
+# templated into kratos.yaml.
+#
+# Scope note: the recovery UI resolves on the mesh only, so this serves someone
+# who still has mesh access and lost their password — it is deliberately not a
+# public, internet-reachable "forgot password". See docs/design/id-admin-console.md.
+ory_courier_smtp_enabled: false
+ory_courier_smtp_host: ""
+# 587 = STARTTLS (the `smtp` scheme below); use 465 with scheme `smtps` for
+# implicit TLS. Kratos enforces STARTTLS on `smtp://` unless explicitly
+# disabled, which this role never does.
+ory_courier_smtp_port: "587"
+ory_courier_smtp_scheme: "smtp"
+ory_courier_smtp_username: ""
+ory_courier_smtp_password: ""
+# Envelope sender. Must be an address SES (or whatever relay is in use) has a
+# verified identity for, else every send is 554-rejected.
+ory_courier_from_address: ""
+ory_courier_from_name: ""
+
+ory_shared_preseed_ts: "1970-01-01 00:00:00"
+
+# ---------------------------------------------------------------------------------
+# External ICAM federation — the CAC-ingress TOGGLE SWITCH.
+# docs/design/external-icam-federation.md · ADR to follow.
+#
+# One selector, three interchangeable backends, ONE converged downstream contract:
+# every mode ends up presenting to Kratos as an upstream OIDC provider, so the
+# Kratos `oidc` broker block (kratos.yaml.j2) is mode-UNIFORM — the mode only
+# decides what auxiliary component stands up and where issuer_url points.
+#
+#   mode: upstream_oidc     (PATH #1 — the default, zero smartcard code)
+#     issuer_url points at an EXTERNAL enterprise IdP that already validates CAC
+#     (EAMS-A / Azure Gov / login.gov). Nothing else deploys. Enterprise-reachability
+#     dependency — treat as OPPORTUNISTIC so island-mode survives.
+#
+#   mode: mtls_proxy        (PATH #2 — sovereign CAC, in the pocket)
+#     issuer_url points at a LOCAL icam-mtls-proxy (default-off role) that terminates
+#     x509 client-cert mTLS, validates to DoD roots + CRL/OCSP, extracts EDIPI from
+#     the SAN otherName UPN, and bridges to Kratos. The only CAC path with no
+#     reachable enterprise IdP.
+#
+#   mode: keycloak_frontend (PATH #3 — Platform One's x509 flows, in the pocket)
+#     issuer_url points at a LOCAL icam-keycloak-cac (default-off role) running
+#     Keycloak's native X.509 authenticator as the CAC front-end; Kratos federates
+#     to it over OIDC. Buys battle-tested flows without hand-building path #2.
+#
+# Default OFF + empty providers => the oidc block does not render and nothing
+# changes (additive, reversible). Sites turn it on in group_vars/<site>_hosts/vars.yml.
+# Per-provider client secrets are injected via env-override into .env (0600), NEVER
+# inlined into the 0644 kratos.yaml (secrets policy). See the group_vars example at
+# ops/ansible/group_vars/_examples/icam-federation.example.yml.
+icam_federation:
+  enabled: false
+  providers: []
+  # Shape of each provider (documented; empty by default):
+  #   - id: eams-a                 # slug -> Kratos provider id + ICAM_OIDC_<ID>_CLIENT_SECRET
+  #     mode: upstream_oidc        # upstream_oidc | mtls_proxy | keycloak_frontend
+  #     scheme: dod-piv            # identity.source_scheme grammar enum (grammar.yaml)
+  #     authority: doctrinal       # doctrinal (EDIPI) | industry (login.gov/entra)
+  #     label: "CAC / EAMS-A"      # login-UI button label
+  #     issuer_url: "https://login.example.mil/"   # OIDC issuer (external #1 / local #2,#3)
+  #     client_id: "goat-example"
+  #     scopes: ["openid", "profile", "email"]
+  #     claim_map: eams-a          # -> ops/identity/claim-maps/<claim_map>.jsonnet
+  #     asserts_min: { ial: ial2, aal: aal2, fal: fal2 }   # fail-closed downstream gate
+  #     boundary_il: 5             # authorization boundary / impact level tag
+
+# Kratos self-service settings: how recently the user must have logged in to
+# change privileged fields (password, etc.). At 15m, users routinely hit
+# "The login session is too old ... Please re-authenticate." on a password
+# change and — if their re-auth fails — the change silently doesn't persist.
+# 24h matches the session lifespan, so any
+# live session can manage its own account without a mid-flow re-auth wall.
+ory_privileged_session_max_age: 24h
+
+# site_name — used ONLY to derive the Hydra pairwise-subject salt. Without a
+# default, `ory-deploy.yml` dies with "'site_name' is undefined" at the "Render
+# Hydra config" task on any goatnet that does not pass it with -e, and a role
+# that cannot complete leaves a goatnet's deployed kratos.yaml stale.
+#
+# SALT CAVEAT, stated rather than discovered later: the salt is
+# sha256("hydra-pairwise-" + site_name), so changing site_name changes it, and
+# a changed salt changes the `sub` claim for any client registered with
+# subject_type=pairwise. A goatnet whose clients are all subject_type=public has
+# nothing at risk. Before running this role on a goatnet you have not checked, run:
+#   curl -sS http://127.0.0.1:4445/admin/clients?page_size=100 \
+#     | python3 -c 'import sys,json;print([c["client_id"] for c in json.load(sys.stdin) if c.get("subject_type")=="pairwise"])'
+# and pin site_name in that goatnet's group_vars if the list is non-empty.
+site_name: "{{ site_id }}"
+
+# Mandatory MFA at the sign-in door. Default ON.
+#
+# true  -> session.whoami.required_aal: highest_available — Kratos demands the
+#          strongest factor an identity actually HOLDS. It cannot demand one an
+#          identity does not have, so this never locks out a password-only user.
+# false -> session.whoami.required_aal: aal1 — no second factor at sign-in; the
+#          factor is demanded per-ACTION by goat-id-console's step-up gate only.
+#
+# This is the ONLY AAL knob Kratos v1.3.1 exposes for login. An earlier version
+# of this variable rendered `selfservice.flows.login.required_aal`, which is not
+# a Kratos key at all — the config fails schema validation and Kratos REFUSES TO
+# BOOT, so never add it.
+#
+# Default is ON because that is the posture every goatnet was already running:
+# Kratos's own default for this key is `highest_available`, so the goatnets that
+# omitted it entirely were enforcing MFA without anyone having chosen to.
+# Setting it explicitly makes the posture legible; it does not change it.
+#
+# Known wart under `true`, recorded in the template beside the key: the
+# selfservice-ui's maybeInitiate2FA builds its own step-up URL without copying
+# login_challenge, so a page loaded mid-OIDC-login can push the browser into a
+# fresh challenge-less flow. Every scripted path recovers (the Hydra challenge
+# stays pending); a real login can land on the welcome page and need a retry. Reproduce
+# with ops/identity/aal2-oidc-repro/repro.sh before changing anything here.
+#
+# THE CAUSE: the login form is submitted TWICE (same referer,
+# same flow, same content-length, milliseconds apart). Kratos answers the second on a
+# consumed flow by redirecting to default_browser_return_url, navigating the
+# browser off the in-flight OAuth2 login. Prevented by a double-submit guard in
+# ops/ory-consent/patches/0005-*. Do NOT reach for "patch maybeInitiate2FA" —
+# it is the last link and there is no challenge in scope when it fires.
+ory_admin_mfa_required: true
+
+# Any change to this knob must be validated by
+# ops/ci/check-kratos-config-renders.sh, which renders the template per goatnet
+# and boots Kratos against the result.

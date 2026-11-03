@@ -1,0 +1,77 @@
+---
+# Defaults for the `goat-zenoh-portal-store` role: which store the portal's
+# registry runs on, and that store's Postgres side (ADR 1165 step A,
+# docs/design/island-mode-multi-writer.md §5).
+#
+# A role of its own, not part of goat-zenoh-portal's defaults, because the
+# cutover and rollback playbooks need these values without running
+# goat-zenoh-portal's rollback-ledger dependency: including a role, even for one
+# task file, runs its meta dependencies, and a preflight that refuses must not
+# have written a deploy ledger row first. goat-zenoh-portal includes this role
+# (public) before it renders anything, so its templates read the same values.
+#
+# Expects in scope (goat-zenoh-portal defaults, or group_vars):
+# portal_image, portal_db_path, site_id.
+
+# --- Store engine: SQLite or Postgres (ADR 1165 step A) ----------------------
+# Which store this goatnet's portal registry runs on. `sqlite` (the default)
+# renders the compose file and env exactly as before: `--db=<portal_db_path>`.
+# `postgres` renders PORTAL_DB_DSN instead and the server never sees the SQLite
+# path.
+#
+# Set it in group_vars, not inventory: the relay-health role (registry WAL
+# gauges) and ops/ansible/obs.yml (registry-wal alert rules) on the same goatnet
+# read the same variable to retire the SQLite-only monitoring.
+#
+# A goatnet moves from sqlite to postgres ONLY through
+# ops/ansible/portal-postgres-cutover.yml (runbook
+# docs/operations/portal-postgres-cutover.md), and back through
+# portal-postgres-rollback.yml. The gate (tasks/gate.yml) refuses:
+#   - an image whose store label differs from this value (a Postgres-era image
+#     on a sqlite goatnet would start on an empty database);
+#   - postgres on a host the cutover has not marked (its rows are still in
+#     SQLite), and sqlite on a host the cutover has marked postgres.
+portal_store: sqlite
+# The image label the gate reads; absent on every image built before the
+# Postgres server, which the gate reads as "sqlite".
+portal_store_label: "org.usareur-af.goat-zenoh-portal.store"
+# Host-side record of which store holds the registry's rows. Written by the
+# cutover (postgres) and the rollback (sqlite); absent = never cut over.
+portal_store_marker: /var/lib/goat-zenoh-portal/STORE
+
+# Postgres side, used only when portal_store is postgres. Names follow the
+# cluster's existing per-service databases (netbird, kratos, hydra, spire,
+# id_console_*): one database for the registry (ADR 1165 D1), one login role
+# owning it. Created for new hosts by ops/postgres/spock/init/01-databases.sql
+# and for existing ones by tasks/postgres-db.yml. Not in any Spock replication
+# set in step A, and it does not carry the spock extension.
+#
+# postgres-a is reached over the docker `mgmt` network, which the portal
+# container already joins (portal_traefik_network); tasks/postgres-db.yml
+# asserts both are on it.
+portal_db_container: postgres-a
+portal_db_host: postgres-a
+portal_db_port: 5432
+portal_db_user: portal
+portal_db_name: portal_registry
+# Same delivery as the spire and id console database passwords: the deployer's
+# environment, resolved per command from the secret store (ADR 1186; the
+# .envrc.local.d reference file holds only an op:// reference). The name is
+# <SITE_ID upper, - to _>_PORTAL_DB_PASS: ZAGROS_DEV_PORTAL_DB_PASS,
+# ZAGROS_PORTAL_DB_PASS, ZAGROS_PROD_PORTAL_DB_PASS. Read only when the store is
+# postgres; tasks/gate.yml refuses an empty value then.
+portal_db_password_env: "{{ site_id | upper | replace('-', '_') }}_PORTAL_DB_PASS"
+portal_db_password: "{{ lookup('env', portal_db_password_env) }}"
+# Percent-encoded in full ('/' included, which urlencode leaves alone), so any
+# password survives the URL and the compose env file unchanged.
+portal_db_password_url: "{{ portal_db_password | urlencode | replace('/', '%2F') }}"
+portal_db_dsn: >-
+  postgres://{{ portal_db_user }}:{{ portal_db_password_url }}@{{ portal_db_host }}:{{ portal_db_port }}/{{ portal_db_name }}?sslmode=disable
+
+# --- Cutover archive (docs/design/island-mode-multi-writer.md §5) -------------
+# Where the cutover keeps the read-only SQLite copy, one dated directory per
+# cutover, and how long the rollback playbook will use it. Both playbooks read
+# these; nothing deletes an archive automatically (step B5 of the design does,
+# after 28 days on every goatnet).
+portal_sqlite_archive_root: /var/lib/goat-zenoh-portal/sqlite-archive
+portal_sqlite_archive_days: 28

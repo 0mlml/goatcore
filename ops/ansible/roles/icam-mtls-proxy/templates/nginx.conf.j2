@@ -1,0 +1,45 @@
+# icam-mtls-proxy nginx — card sign-in from any sovereign PKI (ADR 1209).
+# Profiles enabled here: {{ icam_sovereign_pkis | map(attribute='id') | join(', ') }}
+# (ops/identity/sovereign-pkis.yaml via icam_mtls_proxy_pkis). The map blocks are the
+# registry's rendering (ops/identity/sovereign_pkis.py nginx_maps); pki.js reads SAN
+# fields out of the verified client certificate.
+load_module modules/ngx_http_js_module.so;
+events {}
+http {
+    js_import pki from /etc/nginx/pki.js;
+{% if (icam_sovereign_pkis | sovereign_pki_nginx_profiles_js) | length > 0 %}
+    js_import profiles from /etc/nginx/pki-profiles.js;
+{% endif %}
+    {{ icam_sovereign_pkis | sovereign_pki_nginx_js_set | indent(4) }}
+
+    {{ icam_sovereign_pkis | sovereign_pki_nginx_maps | indent(4) }}
+    server {
+        listen 8443 ssl;
+        server_name {{ icam_mtls_proxy_issuer_url | regex_replace('^https?://([^/:]+).*$', '\\1') }};
+        ssl_certificate     /certs/proxy.crt;
+        ssl_certificate_key /certs/proxy.key;
+        # mTLS validated against the enabled profiles' CA bundles; a card is required
+        # only on the human-facing auth paths, enforced per-location (the RP
+        # back-channel has no certificate).
+        ssl_client_certificate /certs/ca.crt;
+        ssl_verify_client optional;
+        ssl_verify_depth {{ icam_mtls_proxy_verify_depth }};
+
+        location ~ ^/(auth|callback) {
+            if ($ssl_client_verify != SUCCESS) { return 403 "a certificate from an enabled PKI is required\n"; }
+            if ($pki_id = "") { return 403 "certificate issuer is not an enabled PKI profile\n"; }
+            if ($pki_remote_user = "") { return 403 "certificate carries no identifier for its PKI profile\n"; }
+            proxy_pass http://dex:5556;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Remote-User  $pki_remote_user;
+            proxy_set_header X-Remote-Pki   $pki_id;
+            proxy_set_header X-Remote-Email $pki_san_email;
+            proxy_set_header X-Forwarded-Proto https;
+        }
+        location / {
+            proxy_pass http://dex:5556;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Forwarded-Proto https;
+        }
+    }
+}

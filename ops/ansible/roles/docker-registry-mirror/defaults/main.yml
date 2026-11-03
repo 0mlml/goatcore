@@ -1,0 +1,70 @@
+---
+# ops/ansible/roles/docker-registry-mirror/defaults/main.yml
+#
+# Pull-through cache for Docker / OCI container images. One registry:2
+# instance per upstream registry (docker.io, ghcr.io, quay.io). Each
+# binds a different host port; clients route via /etc/docker/daemon.json
+# (registry-mirrors for docker.io) or containerd's hosts.toml
+# (per-registry mirrors for ghcr.io, quay.io, etc.).
+
+# Image pin. registry:2 is the canonical Distribution project image,
+# Apache 2.0. Pin to a specific tag for reproducibility.
+docker_registry_mirror_image: "registry:2.8.3"
+
+# Docker network the mirrors share. Each mirror is on its own port; the
+# network exists so future co-located services can reach mirrors by
+# container name.
+docker_registry_mirror_network: registry-mirror-net
+
+# Storage root. Per-upstream subdirs under this. NVMe-backed per ADR
+# 0826. Container images can be 1+ GB (NVIDIA L4T base layers); / would
+# fill quickly.
+docker_registry_mirror_storage_root: /opt/docker-data/docker-registry-mirror
+
+# Compose project dir on host.
+docker_registry_mirror_compose_dir: /opt/docker-registry-mirror
+
+# Per-upstream mirrors. Each entry:
+#   - name        : short label (used in container_name + path)
+#   - upstream    : full URL (proxy.remoteurl)
+#   - host_port   : port on Orin-C clients dial
+#   - bind        : "0.0.0.0" (default) or specific listen IP
+#
+# docker.io has special-case handling in /etc/docker/daemon.json
+# (registry-mirrors). Other registries (ghcr.io, quay.io) need
+# containerd hosts.toml on the client; not Docker-engine's
+# registry-mirrors. The mirror works regardless — the routing is the
+# client-side detail.
+docker_registry_mirror_upstreams:
+  - name: dockerhub
+    upstream: "https://registry-1.docker.io"
+    host_port: 5000
+    bind: "0.0.0.0"
+  - name: ghcr
+    upstream: "https://ghcr.io"
+    host_port: 5001
+    bind: "0.0.0.0"
+  - name: quay
+    upstream: "https://quay.io"
+    host_port: 5002
+    bind: "0.0.0.0"
+
+# Read-only mode. Pull-through caches should never accept pushes from
+# clients; setting the storage backend read-only at startup prevents an
+# operator from accidentally pushing a custom image into the cache
+# (which would then fail pulls because the cache treats unknown blobs
+# as proof of upstream).
+docker_registry_mirror_storage_read_only: false
+
+# How long to keep an image blob in the cache after last access.
+# 0 = forever (default, simplest). Set to e.g. 720h to GC.
+docker_registry_mirror_blob_ttl: "0s"
+
+# Garbage-collection cadence. registry:2 ships a `garbage-collect`
+# subcommand; we run it weekly via a cron job in the role.
+# Empty string = disable.
+docker_registry_mirror_gc_schedule: "0 4 * * 0"
+
+# Emit a Prometheus textfile-collector metric so Prometheus on the
+# obs-host substrate can graph cache size + container health.
+docker_registry_mirror_emit_node_exporter_metrics: true

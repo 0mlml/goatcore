@@ -1,0 +1,151 @@
+---
+# Defaults for the `netbird-dashboard` role (Block 21D.1).
+#
+# First 21D Ory OIDC consumer. Mirrors `ops/ansible/roles/ory/` shape
+# (per-site config rendered from group_vars; idempotent re-runs;
+# operator-fired via dashboard-deploy.yml, not part of site-bootstrap.yml).
+
+# -- Image pin --------------------------------------------------------------
+# Pin by digest per Block 13C supply-chain hardening + ADR 0703 +
+# CI compose-lint pin-compat guard (which fails the build on tag-only
+# defaults). Digest is the multi-arch index digest captured from
+# docker.io/netbirdio/dashboard:latest ; bump along with
+# the tag when intentionally upgrading dashboard versions.
+netbird_dashboard_image: "netbirdio/dashboard:latest@sha256:e3ee15351a46345d338a5f9d20cf49bcc3d3594d6d61bc4e5d6f640dda2cbdb0"
+
+# -- Compose target ---------------------------------------------------------
+# Shared with the ory + mgmt-host roles (single mgmt-host compose dir).
+ory_compose_dir: /opt/mgmt-host
+
+# -- F-129 — Kratos groups → netbird-mgmt admin role reconciler -------------
+# List of Kratos group strings that grant netbird-mgmt admin role. The
+# reconciler in dashboard-deploy.yml post_tasks queries Kratos for every
+# active identity whose `traits.groups` intersects this list and SQL-
+# promotes the matching netbird-mgmt user-rows to role='admin'. Idempotent
+# and one-directional (never demotes — symmetric revoke is Block 83F).
+# Sites can extend in group_vars without touching the play.
+netbird_mgmt_admin_groups:
+  - PLATFORM-ADMIN
+
+# -- OIDC client identity ---------------------------------------------------
+# `client_id` value Hydra registers + dashboard sends in OAuth2 redirects.
+# Stable per-site (one client per site, per Block 21D.1). Same client_id
+# OK across sites because each site has its own Hydra issuer + nid.
+netbird_dashboard_oidc_client_id: "netbird-dashboard"
+netbird_dashboard_oidc_scopes:
+  - openid
+  - profile
+  - email
+  - offline_access
+
+# Token-endpoint auth method. `client_secret_post` is what the
+# netbirdio/dashboard SPA actually sends (form body, not Basic auth) —
+# `client_secret_basic` causes Hydra to reject token exchange with a
+# 400 "client authentication failed" because the dashboard's @axa-fr/
+# oidc-client builds a POST body with client_secret in the form.
+netbird_dashboard_oidc_token_endpoint_auth_method: "client_secret_post"
+
+# Response types + grant types. authorization_code + refresh_token covers
+# normal browser login; refresh_token enables long-lived sessions without
+# re-prompting Kratos every hour.
+netbird_dashboard_oidc_response_types:
+  - code
+netbird_dashboard_oidc_grant_types:
+  - authorization_code
+  - refresh_token
+
+# F-077: Hydra's selfservice-ui-node consent UI defaults to scope
+# checkboxes UNCHECKED. Operator clicks Allow without ticking → Hydra
+# grants no scopes → no id_token issued → @axa-fr/oidc-client hangs in
+# loading state. `skip_consent: true` makes Hydra grant all requested
+# scopes automatically. Appropriate for first-party clients (the
+# dashboard IS the application Hydra protects, not a third-party).
+netbird_dashboard_oidc_skip_consent: true
+
+# F-078: Ory Hydra defaults to opaque `ory_at_*` access tokens.
+# netbird-mgmt validates JWTs against Hydra's JWKS — opaque tokens are
+# rejected as "token invalid". `jwt` makes Hydra mint RS256-signed JWT
+# access tokens. Per-client setting in Hydra v2.x.
+netbird_dashboard_oidc_access_token_strategy: "jwt"
+
+# Redirect URIs registered with Hydra. Three required entries:
+# - `/peers` — actual landing page after OAuth callback (current
+#   AUTH_REDIRECT_URI default; the @axa-fr/oidc-client treats whatever
+#   AUTH_REDIRECT_URI is as the OAuth callback handler).
+# - `/access-control` — destination after the / nginx redirect, used as
+#   `callbackPath` by the OIDC library when login is initiated from /.
+#   Without this entry Hydra rejects the redirect at re-auth.
+# - `/silent-auth` — service-worker-driven silent token renewal target
+#   (404 in our static export today, but the OIDC library prepares the
+#   URL pre-emptively at every page load and Hydra validates the URL
+#   against the registered list).
+# F-080: `/auth` (the netbirdio docker-compose template's default) is
+# 404 in our static export and breaks OAuth callback. Do NOT include.
+netbird_dashboard_oidc_redirect_uris:
+  - "{{ netbird_dashboard_self_url }}/peers"
+  - "{{ netbird_dashboard_self_url }}/access-control"
+  - "{{ netbird_dashboard_self_url }}/silent-auth"
+
+# -- Hydra admin API endpoint (loopback on mgmt-host) -----------------------
+# docker-compose.ory.yml binds Hydra admin at 127.0.0.1:4445 by default.
+# Same port assumption as ory role's first-admin import task.
+netbird_dashboard_hydra_admin_url: "http://127.0.0.1:4445"
+
+# -- Mesh change control: two dashboard addresses ---------------------------
+# docs/design/mesh-change-control.md §2 (ADR 1189). Off by default; a goatnet
+# opts in from its own group_vars. When true:
+#   - the everyday `dashboard` container talks to mgmt-read.<site>, a Traefik
+#     route that forwards only GET/HEAD/OPTIONS on /api (mgmt-dynamic.yml.j2),
+#     so nothing done from dashboard.<site> can write;
+#   - a second container, `dashboard-admin` (same pinned image), talks to the
+#     full API on mgmt.<site> (mgmt-admin.<site>, which refuses group writes,
+#     when warrant_membership_enabled) and is served at admin-dashboard.<site> behind
+#     its own oauth2-proxy (dashboard-fence-deploy.yml, NETBIRD-ADMIN only);
+#   - the `netbird-dashboard` Hydra client also registers the admin address's
+#     redirect URIs.
+# Turning it back off and re-running dashboard-deploy.yml removes the admin
+# container and points the everyday dashboard at mgmt.<site> again.
+netbird_dashboard_split_enabled: false
+
+# -- mgmt-API endpoint the dashboard talks to -------------------------------
+# The netbird-mgmt API (proxied through Traefik at mgmt.<site>...:443).
+# Resolved at template-render time from site_id + site_dns_zone.
+netbird_dashboard_mgmt_full_url: "https://mgmt.{{ site_id }}.{{ site_dns_zone }}"
+netbird_dashboard_mgmt_read_url: "https://mgmt-read.{{ site_id }}.{{ site_dns_zone }}"
+netbird_dashboard_mgmt_api_endpoint: "{{ netbird_dashboard_mgmt_read_url if (netbird_dashboard_split_enabled | bool) else netbird_dashboard_mgmt_full_url }}"
+# The admin dashboard's API endpoint. On a goatnet where warrant also owns
+# peer membership (warrant_membership_enabled, the warrant-membership role's
+# switch, set in the goatnet's group_vars) it is mgmt-admin.<site>: the full
+# API except group writes, which Traefik answers 403 because the converger
+# would revert them on its next pass (mgmt-dynamic.yml.j2, ADR 1189).
+# Otherwise the full API on mgmt.<site>.
+netbird_dashboard_mgmt_admin_url: "https://mgmt-admin.{{ site_id }}.{{ site_dns_zone }}"
+netbird_dashboard_admin_mgmt_api_endpoint: "{{ netbird_dashboard_mgmt_admin_url if ((netbird_dashboard_split_enabled | bool) and (warrant_membership_enabled | default(false) | bool)) else netbird_dashboard_mgmt_full_url }}"
+# gRPC endpoint. Always the full management host: the read-only route carries
+# /api only, and the dashboard's gRPC use is not a write path this gates.
+netbird_dashboard_mgmt_grpc_api_endpoint: "{{ netbird_dashboard_mgmt_full_url }}"
+
+# -- Dashboard self-URL -----------------------------------------------------
+# What the dashboard advertises as its own callback URI. Must match the
+# Hydra client's registered redirect_uris exactly.
+netbird_dashboard_self_url: "https://dashboard.{{ site_id }}.{{ site_dns_zone }}"
+
+# -- Admin dashboard (only when netbird_dashboard_split_enabled) -------------
+netbird_dashboard_admin_self_url: "https://admin-dashboard.{{ site_id }}.{{ site_dns_zone }}"
+# Loopback diagnostic port for the admin container (3000 = dashboard,
+# 3001 = selfservice-ui).
+netbird_dashboard_admin_host_port: 3002
+netbird_dashboard_admin_oidc_redirect_uris:
+  - "{{ netbird_dashboard_admin_self_url }}/peers"
+  - "{{ netbird_dashboard_admin_self_url }}/access-control"
+  - "{{ netbird_dashboard_admin_self_url }}/silent-auth"
+
+# -- Token source -----------------------------------------------------------
+# `accessToken` is what Hydra produces by default; netbirdio/dashboard
+# accepts either. accessToken is the safer choice (idToken is pre-userinfo).
+netbird_dashboard_token_source: "accessToken"
+
+# -- Use Auth0 quirk --------------------------------------------------------
+# Upstream dashboard has a hardcoded "use Auth0" path that hits Auth0-only
+# extension claims. We don't run Auth0; keep this false.
+netbird_dashboard_use_auth0: "false"

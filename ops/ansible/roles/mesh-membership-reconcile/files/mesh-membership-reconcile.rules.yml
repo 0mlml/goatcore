@@ -1,0 +1,104 @@
+# Managed by ansible (roles/mesh-membership-reconcile). Do not edit on the host.
+#
+# Alerts for the daily NetBird membership audit.
+#
+# SHIPPED BY THE ROLE, NOT FROM ops/compose/goat-obs/prometheus/rules/. That is
+# deliberate: the absent() rule below must exist only where the timer exists. A
+# shared rules dir is synced to every goatnet, so an absent() guard living there
+# would fire immediately and permanently on every goatnet that has not deployed
+# this timer — and false alerts are how alerting gets switched off. Same reason
+# the obs-host role installs an explicit list rather than globbing.
+groups:
+  - name: mesh-membership-reconcile
+    rules:
+      # THE REGRESSION. A group somebody deliberately removed from a peer is
+      # present again. Empty by construction — every entry in the `absent:` axis
+      # of membership-declared-deviations.yaml is a decision that was written
+      # down — so a non-zero value is always either an undone decision or a
+      # declaration that should have changed. Critical: this is the exact
+      # condition that went unnoticed for three days and produced F-332.
+      - alert: MeshMembershipReverted
+        expr: mesh_membership_reverted_total > 0
+        for: 10m
+        labels:
+          severity: critical
+          component: identity
+        annotations:
+          summary: "{{ $value }} deliberately-removed mesh group(s) are back on {{ $labels.api }}"
+          description: >-
+            A NetBird group declared `absent:` in ops/ci/membership-declared-deviations.yaml
+            is present again on {{ $labels.api }}. Somebody either undid a documented
+            decision without recording it, or the decision was wrong and the declaration
+            should change — both are edits, neither is silence. Named peers and groups:
+            `cat /var/lib/goat/membership-reconcile/last-run.txt` on the mgmt host, or
+            `journalctl -u mesh-membership-reconcile`. F-332.
+
+      # AN INVITATION NOBODY ANSWERED. Warning, not critical, and a long `for:`
+      # on purpose: this is a backlog that a human works through, not a
+      # regression that pages. The check already applies a days threshold before
+      # counting a key at all, so anything here has been unanswered for at least
+      # that long; this rule adds a second, larger one so a normal slow start
+      # never reaches an alert. Non-zero is the NORMAL state on a goatnet that
+      # is onboarding — the number mattering is the point, not the alert firing.
+      - alert: MeshMembershipUnusedKeysAgeing
+        expr: mesh_membership_unused_key_max_age_days > 14
+        for: 6h
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "an invitation on {{ $labels.api }} has gone {{ $value }} days unanswered"
+          description: >-
+            A setup key has been valid and never presented for {{ $value }} days. An
+            unused key produces no failed enrollment and no peer, so nothing else on any
+            surface reports it — a partner sat in exactly this state for fourteen days
+            while believing he was connected, and was found only because he sent an
+            email. Either the person needs chasing or the key should be revoked;
+            both close it. Names and issue dates:
+            `cat /var/lib/goat/membership-reconcile/last-run.txt` on the mgmt host.
+
+      # THE AUDIT DIED. Daily timer, so 36h means two consecutive runs missed.
+      # CRITICAL rather than warning on purpose: a dead membership audit means
+      # the mesh is unwatched, which is the state F-332 measures the cost of.
+      # It is also the state that looks identical to "everything is fine" on
+      # every other surface, which is why it has to page rather than inform.
+      - alert: MeshMembershipAuditStale
+        expr: time() - mesh_membership_reconcile_last_run_timestamp_seconds > 129600
+        for: 30m
+        labels:
+          severity: critical
+          component: identity
+        annotations:
+          summary: "membership audit on {{ $labels.api }} has not completed for >36h"
+          description: >-
+            mesh-membership-reconcile last completed a full read
+            {{ $value | humanizeDuration }} ago. The timestamp is stamped only after all
+            four management-API reads succeed, so this covers a dead timer, an expired
+            service-user token and an unreachable mgmt API alike — check which:
+            `systemctl status mesh-membership-reconcile.service` and
+            `journalctl -u mesh-membership-reconcile -n 50`. An exit code of 2 means the
+            mesh was never read, which says nothing about membership and must not be
+            read as clean.
+
+      # THE METRIC NEVER ARRIVED. Distinct from staleness: staleness needs the
+      # series to exist to go stale. This catches the F-335 shape — the audit
+      # runs, writes its .prom file, and the file lands in a directory
+      # node_exporter is not reading, so every surface says it is publishing and
+      # nothing ever arrives. Long `for:` because a first deploy legitimately
+      # has no series until the first run plus a scrape.
+      - alert: MeshMembershipAuditMissing
+        expr: absent(mesh_membership_reconcile_last_run_timestamp_seconds)
+        for: 2h
+        labels:
+          severity: critical
+          component: identity
+        annotations:
+          summary: "membership audit is deployed here but has never published a metric"
+          description: >-
+            This goatnet installs the mesh-membership-reconcile timer (this rule ships
+            with that role and nowhere else), but Prometheus has no
+            mesh_membership_reconcile_last_run_timestamp_seconds series at all. Most
+            likely the textfile directory is not the one this host's node_exporter
+            reads — confirm with
+            `ps -o args= -C node_exporter | tr ' ' '\n' | grep textfile.directory`
+            and compare against mesh_membership_reconcile_textfile_dir. F-335.

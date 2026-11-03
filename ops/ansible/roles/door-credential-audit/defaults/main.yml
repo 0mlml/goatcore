@@ -1,0 +1,80 @@
+---
+# door-credential-audit — daily census of people who were invited through a
+# Kanidm door and never completed credential setup.
+#
+# Why this is a BACKGROUND PROCESS and not a command somebody remembers to run:
+# issuing a credential-setup code is fire-and-forget. Nothing in the system
+# records that the person ever finished. The state "invited, cannot get in" is
+# therefore invisible from every surface until the person emails somebody.
+#
+# Everything below that looks like over-specification is there for the same
+# reason it is in mesh-membership-reconcile: a guard nobody can see the age of
+# is a future incident with no evidence in it.
+#
+#   * it publishes a last-run timestamp to the node_exporter textfile collector,
+#     so a timer that silently died is a number that stopped moving rather than
+#     nothing at all;
+#   * it is READ-ONLY against the door (two GETs) — it can never be the cause of
+#     a change you are investigating;
+#   * `enabled: false` TEARS DOWN. It does not merely skip the install tasks,
+#     which would leave a timer running on a host with nothing in the repo
+#     admitting it exists.
+
+# Master gate. false = full teardown, not "skip".
+door_credential_audit_enabled: false
+
+# Which door. `public` = idm.<zone> (the off-mesh dashboard door);
+# `collab`  = idm.collab.<zone>. One timer per plane; deploy the role twice
+# with different values if a host should watch both.
+door_credential_audit_plane: public
+
+# Credential for the read. Prefer a READ-SCOPED service-account bearer, minted
+# with ops/scripts/create-door-audit-identity.sh — this host then holds a
+# credential that can list persons and nothing else.
+#
+# The idm_admin password fallback exists because the scoped account may not be
+# minted yet on a given door; it places a FULL-ADMIN credential for the identity
+# plane on this host, which is a materially worse blast radius. Stated plainly
+# so nobody deploys the fallback thinking it is equivalent.
+door_credential_audit_token: ""
+door_credential_audit_admin_password: ""
+
+# Daily. This audits a slow-moving fact — a person's setup state changes once,
+# ever. A tighter interval would add wakeups and door load without shortening
+# any detection window that matters.
+door_credential_audit_oncalendar: "*-*-* 07:23:00"
+
+# Spread across ten minutes: this host already runs several timers, and landing
+# on the same second as one of them is how unrelated jobs end up in each other's
+# incident timelines.
+door_credential_audit_jitter_sec: 600
+
+# Hard ceiling on one run. Two HTTPS GETs against a cloud door; past three
+# minutes something is wrong, and a hung unit holding a systemd job slot is
+# worse than a failed one.
+door_credential_audit_timeout_sec: 180
+
+# node_exporter textfile-collector drop directory. EMPTY BY DEFAULT AND THAT IS
+# DELIBERATE — set it per goatnet to the directory this host's node_exporter is
+# actually reading. The obvious-looking /var/lib/node_exporter/textfile can
+# exist, be writable, and be read by nothing. A wrong
+# path fails silently forever; an unset one fails once, loudly, at deploy time.
+#   ps -o args= -C node_exporter | tr ' ' '\n' | grep textfile.directory
+door_credential_audit_textfile_dir: ""
+
+# Where the human-readable report of the last run lands. `last-run.txt` is
+# overwritten each run; `history/` keeps the last N and prunes itself inside the
+# unit rather than via a logrotate drop-in (there is no logrotate on mgmt hosts,
+# so a rotation config would be inert and the directory would grow forever).
+door_credential_audit_report_dir: /var/lib/goat/door-credential-audit
+door_credential_audit_history_keep: 30
+
+# Prometheus rules directory for this goatnet's obs stack. Rules are dropped IF
+# the directory exists and skipped quietly if not — a goatnet without a local
+# Prometheus still gets the audit and the journal. Rules ship from the ROLE, not
+# the shared tree, so the absent() alert exists only where the timer does.
+door_credential_audit_rules_dir: "/opt/{{ site_id }}-obs/prometheus/rules"
+
+# Run once inline at deploy time, so the unit is proven while an operator is
+# watching instead of first firing unattended at 07:23.
+door_credential_audit_run_now: true

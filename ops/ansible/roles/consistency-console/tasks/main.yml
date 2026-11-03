@@ -1,0 +1,254 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the CF-6 consistency console on a mgmt host — Traefik + oauth2-proxy
+# admin fence (microscope shape) in front, a read-only Zenoh mTLS subscriber
+# behind (consistency-health shape). Canon: consistency-foundation.md §7,
+# ADR 1110 D5. Idempotent.
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. The zenoh router must carry a subject for the console's leaf cert
+#      (CN=goat-consistency-console-trial-peer) allowed to SUBSCRIBE
+#      ops/consistency/** — subscribe only; the console publishes nothing. A
+#      router restart is required after the template change (F-156: zenohd
+#      1.9.0 SIGHUP is a no-op), and until then the subscription is SILENTLY
+#      denied — the page then honestly renders "nothing heard".
+#   2. Leaf cert + key minted via the offline-CA cert-sign ceremony
+#      (docs/operations/dev-ca-cert-sign.md).
+#   3. Hydra OIDC client minted for the fence (same ceremony as
+#      oauth2-proxy-microscope).
+#   4. Mesh-DNS + isitup registration per the defaults header checklist.
+#
+# VERIFY THE PAGE, not the logs: browse https://{{ consistency_console_hostname }}/
+# — an empty grid saying "nothing heard" after a deploy means the router ACL
+# rule is missing or the rollup meter is not running.
+
+- name: consistency-console | require enablement + a PINNED image (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - consistency_console_enabled | bool
+      - "'@sha256:' in consistency_console_image"
+      - "'PENDING' not in consistency_console_image"
+    fail_msg: >-
+      consistency-console requires consistency_console_enabled and a
+      digest-pinned consistency_console_image (no PENDING sentinel). The image
+      builds on main via .github/workflows/consistency-console-image.yml; pin
+      the multi-arch INDEX digest, never a per-arch manifest leaf.
+
+- name: consistency-console | the console must know which site it is about
+  ansible.builtin.assert:
+    that:
+      - consistency_console_site | length > 0
+      - consistency_goatnet | default('') | length > 0
+    fail_msg: >-
+      consistency_console_site (the ops/consistency/health/<site> scope this
+      page is about) and consistency_goatnet (whose committed intent artifact
+      to place) are both required. consistency_goatnet is rendered into
+      pins.yml by generate-pins.py for every governed member.
+
+- name: consistency-console | refuse fence-on without its secrets
+  ansible.builtin.assert:
+    that:
+      - consistency_console_oauth2_proxy_oidc_issuer_url | length > 0
+      - consistency_console_oauth2_proxy_client_secret | length > 0
+      # oauth2-proxy measures the cookie secret in CHARACTERS and refuses
+      # anything but 16/24/32, so `openssl rand -base64 32` (44 chars)
+      # crash-loops it at boot with an otherwise-green play recap.
+      # An exact-set check is the only one that catches it; a floor does not.
+      - consistency_console_oauth2_proxy_cookie_secret is defined and ((consistency_console_oauth2_proxy_cookie_secret | length) in [16, 24, 32])
+    fail_msg: >-
+      consistency_console_oauth2_proxy_enabled=true but issuer/client_secret/
+      cookie_secret are unset — the fence would deploy broken-open.
+  when: consistency_console_oauth2_proxy_enabled | bool
+
+- name: consistency-console | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ consistency_console_cert_dir }}/consistency-console-cert.pem"
+  register: gcc_cert_stat
+  when: consistency_console_zenoh_endpoint is match('^tls/')
+
+- name: consistency-console | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      consistency-console: leaf cert missing at
+      {{ consistency_console_cert_dir }}/consistency-console-cert.pem. Mint one
+      via the offline-CA cert-sign ceremony (Subject
+      CN=goat-consistency-console-trial-peer) before re-running (see
+      docs/operations/dev-ca-cert-sign.md).
+  when:
+    - consistency_console_zenoh_endpoint is match('^tls/')
+    - gcc_cert_stat is not skipped
+    - not (gcc_cert_stat.stat.exists | default(false))
+
+- name: consistency-console | normalize cert dir ownership for non-root container uid 65532
+  ansible.builtin.file:
+    path: "{{ consistency_console_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: consistency_console_zenoh_endpoint is match('^tls/')
+
+- name: consistency-console | dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ consistency_console_compose_dir }}"
+    - "{{ consistency_console_intent_dir }}"
+
+# The console verifies signature + content hash at EVERY render regardless of
+# how the file arrived — the transport, this role included, is untrusted by
+# construction (the consistency-health rollup's distribution story, reused).
+- name: consistency-console | place the goatnet's committed intent artifact + signature
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../consistency/intent/{{ consistency_goatnet }}/{{ item }}"
+    dest: "{{ consistency_console_intent_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - intent.json
+    - intent.json.sig
+  notify: consistency-console | recreate container
+
+- name: consistency-console | place the offline-CA public keys (the CF-5 trust root)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../enrollment/public-keys/"
+    dest: "{{ consistency_console_intent_dir }}/public-keys/"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: consistency-console | recreate container
+
+# --- the release-readiness document (/release, release-graduation.md §8) ---------------
+# DERIVED, never committed: it stamps the generating checkout's HEAD and a
+# generation time, so a committed copy would drift on every merge and a CI
+# regenerate-diff gate could never pass. Generated here from the deploying
+# tree, which makes its age the age of THIS deploy — the fact the console
+# renders on the page rather than hiding.
+- name: consistency-console | a controller-side seat for the rendered readiness document
+  ansible.builtin.tempfile:
+    state: file
+    suffix: .release-readiness.json
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  register: gcc_readiness_tmp
+
+- name: consistency-console | render the release-readiness document from this checkout
+  ansible.builtin.command:
+    cmd: >-
+      {{ ansible_playbook_python }} {{ playbook_dir }}/../release/graduate.py readiness
+      --out {{ gcc_readiness_tmp.path }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+
+- name: consistency-console | place the release-readiness document
+  ansible.builtin.copy:
+    src: "{{ gcc_readiness_tmp.path }}"
+    dest: "{{ consistency_console_intent_dir }}/release-readiness.json"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: consistency-console | recreate container
+
+- name: consistency-console | drop the controller-side seat
+  ansible.builtin.file:
+    path: "{{ gcc_readiness_tmp.path }}"
+    state: absent
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+
+- name: consistency-console | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ consistency_console_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: consistency-console | recreate container
+
+- name: consistency-console | render oauth2-proxy env
+  ansible.builtin.template:
+    src: oauth2-proxy-consistency-console.env.j2
+    dest: "{{ consistency_console_compose_dir }}/oauth2-proxy-consistency-console.env"
+    owner: root
+    group: root
+    mode: "0600"
+  when: consistency_console_oauth2_proxy_enabled | bool
+  notify: consistency-console | recreate container
+
+- name: consistency-console | render Traefik dynamic config
+  ansible.builtin.template:
+    src: traefik-consistency-console.yml.j2
+    dest: "{{ consistency_console_traefik_dynamic_dir }}/{{ consistency_console_traefik_dynamic_filename }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: consistency-console | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ consistency_console_compose_dir }}"
+  changed_when: true
+
+# Handlers run BEFORE this task, not after it, so a change that notified the
+# recreate handler has already been applied by the time compose runs here —
+# and this task then finds nothing to do. Without the flush the ordering is
+# the other way round: `up -d` recreates the app on a new image pin, the play
+# continues, and the handler recreates BOTH containers again at the end.
+#
+# That double recreate is not cosmetic. the console was
+# recreated at 07:26:24Z and its oauth2-proxy not until 07:26:38Z; an operator
+# who loaded the page at 07:26:29Z got a 502 from a proxy whose upstream was
+# mid-restart. Fourteen seconds, entirely self-inflicted — the app was
+# restarted twice for one pin bump. The same shape is visible in the journal
+# for the deploy (14:52:56 -> 14:53:15, nineteen seconds).
+#
+# CONSTRAINT THAT MAKES THIS SAFE: flush_handlers is PLAY-scoped, not
+# role-scoped — it fires every pending handler in the play, not just this
+# role's. That is acceptable only because this role is the sole role in its
+# play (consistency-console-deploy.yml), and aggregate mode enters through
+# tasks_from: aggregate and never reaches this file. If this role is ever
+# added to a multi-role play, this task restarts that play's other services
+# early and must be reconsidered.
+- name: consistency-console | apply pending recreates before bringing the project up
+  ansible.builtin.meta: flush_handlers
+
+- name: consistency-console | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ consistency_console_compose_dir }}"
+  register: gcc_up
+  changed_when:
+    - "'Started' in gcc_up.stderr or 'Created' in gcc_up.stderr or 'Recreated' in gcc_up.stderr"
+
+- name: consistency-console | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ consistency_console_compose_dir }}"
+  register: gcc_ps
+  changed_when: false
+
+- name: consistency-console | show
+  ansible.builtin.debug:
+    msg: "{{ gcc_ps.stdout_lines }}"
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: consistency-console | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "consistency-console"
+    rollback_ref: "{{ consistency_console_image }}"

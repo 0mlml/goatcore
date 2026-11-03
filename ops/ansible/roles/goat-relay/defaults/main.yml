@@ -1,0 +1,189 @@
+---
+# ops/ansible/roles/goat-relay/defaults/main.yml
+#
+# Defaults for the goat-relay role. Override per-play or per-host as
+# needed. See `roles/goat-relay/README.md` for the operational-
+# invariant pair this role encodes.
+
+# Container image — pinned to a vetted, immutable digest per ADR 0859
+# (rollback ledger: roles/goat-relay/deploy-history.yml). Floating :latest
+# is deliberately NOT the default: an un-vetted relay image can fill the relays'
+# disks fleet-wide. Bump this + prepend a deploy-history row together.
+# The stats work is load-bearing for this role's OWN defaults:
+# `goat_relay_stats_addr` is set by default, and an image without it rejects
+# `--stats-addr` and crash-loops printing usage. Pin = multi-arch index digest.
+# Override via `-e goat_relay_image=ghcr.io/{{ ghcr_org }}/goat-relay:<tag>`.
+goat_relay_image: ghcr.io/{{ ghcr_org }}/goat-relay:sha-d5f492e@sha256:08602535f642153b43466d0be07de476e468ea16d6c15f6e14c044dd7d984f42
+
+# Listener bind address. The relay runs in the host network namespace
+#, so this is the host-facing bind. Production: 0.0.0.0:33073.
+goat_relay_bind_addr: "0.0.0.0:33073"
+
+# Address peers reach the relay at — returned in `AuthResponse` (spec
+# §3.3). For cloud-fronted hosts behind EIP/NAT/LB this differs from
+# `goat_relay_bind_addr`. Per F-032: if the relay
+# advertises `0.0.0.0` peers can't dial the other peer's relay-mediated
+# address. Production deploys MUST set this to the public IP / DNS
+# name peers connect to. Defaults to bind addr (matches the binary's
+# own default — preserves single-host non-cloud-fronted semantics).
+goat_relay_advertised_addr: "{{ goat_relay_bind_addr }}"
+
+# Number of shards (Block 33C.1 lever L8). Each shard is a pinned OS
+# thread + current_thread tokio runtime, with the listener bound via
+# SO_REUSEPORT. Default: empty string → binary picks `cores.len()`.
+# Override to a specific integer if you want fewer than all cores.
+goat_relay_shards: ""
+
+# Block 33C.1 lever L8.b — opt-in SO_REUSEPORT_CBPF source-IP affinity
+# steering. When true, the binary attaches a 3-instruction classic-BPF
+# program that returns `src_ip % shards` for IPv4 incoming connections,
+# pinning each peer to a single shard. Group-wide effect handled
+# internally — only shard 0 attaches; other shards skip. Linux-only;
+# silently ignored on macOS dev builds. Default off.
+goat_relay_cbpf_affinity: false
+
+# F-041 mitigation — server-side QUIC-preference bias in milliseconds.
+# Set to a positive value (recommended: 100) to make the WS accept handler
+# sleep this many ms after `tcp_accept` and BEFORE the TLS handshake,
+# delaying the WS dialer's return so the netbird daemon's race-dialer
+# (a true first-to-finish race with no QUIC preference) picks QUIC.
+# Default 0 = off; production / bench envs that want deterministic QUIC
+# selection set this to 100. Cost paid once per peer per daemon process
+# lifetime.
+goat_relay_prefer_quic_bias_ms: 0
+
+# ADR 1055 §2b white-box stats endpoint — the relay serves a read-only JSON
+# snapshot of its drop + per-peer-forwarded-byte counters here. The container
+# runs host-networked (above), so 127.0.0.1 binds the HOST loopback: reachable
+# by the on-host self-publisher (relay-metrics-publish reads RELAY_STATS_URL and
+# folds the per-peer rows into the deep block) but NOT publicly (the relay is
+# not a mesh peer). Default on at localhost (safe, read-only, non-fatal on bind
+# failure); set to "" to disable. The binary itself stays default-off for
+# standalone use — this role is the opt-in.
+goat_relay_stats_addr: "127.0.0.1:9098"
+
+# TLS cert + key paths on the HOST. Production: real CA-signed certs
+# delivered out-of-band; tier-4a-style first-light: self-signed via
+# openssl req -x509.
+goat_relay_cert_host_path: /etc/goat-relay/cert.pem
+goat_relay_key_host_path: /etc/goat-relay/key.pem
+
+# Cert mode (consumed by goat-relay-deploy.yml's cert phase). Defaults here —
+# NOT as a play var — so a per-env inventory/group_var override actually wins
+# (a play var shadows [relay_servers:vars], which silently leaves a relay
+# self-signed or with no cert).
+#   goat_relay_self_signed_cert: openssl self-signed for first-light/bench.
+#     REJECTED by real netbird relay clients (they validate rels:// against the
+#     system trust store — shared/relay/tls/client_prod.go), so it is ONLY valid
+#     where no real peer dials.
+#   goat_relay_le_dns01: obtain a publicly-trusted Let's Encrypt cert via
+#     Cloudflare DNS-01 (needs cloudflare_api_token + relay_dns_name). Set true
+#     for any peer-facing tier on a public zone (generate-relays.sh flips it on
+#   for environments that need it). Mutually exclusive with self-signed in practice — when
+#     LE is on, the LE cert is staged before the self-signed step's `creates:`
+#     guard, and generate-relays.sh also sets self_signed=false.
+goat_relay_self_signed_cert: true
+goat_relay_le_dns01: false
+
+# kTLS hand-off attempt threshold env var override (ADR 0709 D8).
+# Mirrors upstream's NB_RELAY_HC_ATTEMPT_THRESHOLD (default 1).
+goat_relay_hc_attempt_threshold: 1
+
+# Relay-client auth shared secret (timed-HMAC v2, wire-compatible with
+# the netbird relay client + the legacy relay tier). Defaults to the
+# per-site `relay_secret` (env-sourced in group_vars, e.g.
+# `relay_secret: "{{ lookup('env', '<SITE>_RELAY_SECRET') }}"`), so a
+# site that already defines `relay_secret` for its legacy tier needs no
+# extra var. The role asserts this is non-empty (fail-closed) and the
+# binary refuses to start without it. NEVER hard-code a secret here.
+goat_relay_auth_secret: "{{ relay_secret | default('') }}"
+
+# ADR 1021 Phase C — require peer-ID-bound (algo-2) relay tokens, rejecting
+# unbound (algo-1) ones. Default false = dual-accept migration window (the
+# relay takes both). Flip to true fleet-wide ONLY after the management
+# server issues peer-bound tokens, or every peer locks out. Phase A (the
+# relay-side dual-accept) ships with this false.
+goat_relay_require_peer_bound: false
+
+# Container name. One relay per host in the current shape.
+goat_relay_container_name: goat-relay
+
+# Container restart policy.
+goat_relay_restart_policy: unless-stopped
+
+# Docker log rotation. The relay logs to stdout via the
+# json-file driver, which is UNBOUNDED by default — a chatty/looping binary
+# (the pre-fix F-220 per-frame eprintln flood) filled a 16 GB log on a 19 GB
+# relay disk fleet-wide, killing SSM + degrading the relay. Cap + rotate so
+# an unbounded writer can never fill the disk again. 5 × 50m = 250 MB ceiling
+# per relay, well under the small root volume.
+goat_relay_log_driver: json-file
+goat_relay_log_max_size: "50m"
+goat_relay_log_max_file: "5"
+
+# File-descriptor ceiling for the relay container (F-229 second failure
+# mode — EMFILE "too many open files" under connection accumulation, the
+# default 1024 soft limit). 1,048,576 leaves ample headroom for the
+# admission-control cap (default 4096 conns/shard) across all shards.
+goat_relay_nofile_limit: 1048576
+
+# Block 33C.1 lever L5 (ADR 0711) — io_uring data plane opt-in.
+# When true, the container is started with `GOAT_RELAY_USE_URING=1` so
+# the goat-relay binary picks the io_uring serve path on Linux. M-019
+# bench measures the lift against the M-018 baseline. Userspace TLS
+# only on the uring path; kTLS deferred (kTLS+io_uring integration is
+# a follow-up). Linux-only; ignored on other platforms.
+goat_relay_use_uring: false
+
+# Private-registry pull auth (Block 75 image-distribution tier). The goat-relay
+# image lives in a private GHCR package (ghcr.io/{{ ghcr_org }}/goat-relay, published by
+# .github/workflows/goat-relay-image.yml). Set `goat_relay_pull_auth_enabled: true`
+# and provide `goat_relay_pull_password` (typically sourced from GHCR_READ_TOKEN
+# in .envrc.local.d/) to log the target host's docker daemon in to GHCR before
+# the image-pull step. Credential persists in /root/.docker/config.json on the
+# target host after first login. Mirrors the brief/dataflows role pattern.
+goat_relay_pull_auth_enabled: false
+goat_relay_pull_registry: "ghcr.io"
+goat_relay_pull_username: "goat-maintainer"
+goat_relay_pull_password: ""
+
+# --- relay-metrics self-publish (ADR 1058) — OPT-IN ---
+# The relay reads its own host metrics locally and POSTs them to the mgmt host's
+# token-gated ingest over its rathole :443 path, so the relay-health dashboard
+# throughput auto-populates without SSM. Enable per-env in group_vars.
+relay_metrics_publish_enabled: false
+relay_metrics_dir: /opt/relay-metrics
+relay_metrics_publish_interval: "15s"
+# This relay's short name — MUST equal its name in relay-health's relays.conf
+# (the ingest allowlist + POST-path key). The inventory emits hosts as
+# `relay-<name>` (generate-relays.sh), so strip the `relay-` prefix to recover
+# the relays.conf name (relay-pdx -> pdx). Override per-host if a tier differs.
+relay_metrics_name: "{{ inventory_hostname_short | regex_replace('^relay-', '') }}"
+# Mgmt-host ingest, reached via THIS relay's rathole :443 tunnel. Host = the public
+# enrollment FQDN (its cert covers the route); the script --resolve-pins it to
+# 127.0.0.1 so it traverses this relay's own tunnel deterministically.
+relay_metrics_ingest_host: "{{ site_enrollment_dns | default(public_mgmt_fqdn) }}"
+relay_metrics_ingest_url: "https://{{ relay_metrics_ingest_host }}/relay-metrics-ingest"
+relay_metrics_bearer_token: ""   # REQUIRED in group_vars (env-sourced) when enabled
+
+# Publisher implementation (Phase 3 deploy-swap, F-235). `bash` = the legacy
+# metrics-publish.sh (current live path). `binary` = the typed Go relay-probe
+# (`ops/relay-probe`, `relay-probe publish`) — the vehicle for the ADR 1055
+# per-peer stats (reads RELAY_STATS_URL, folds the per-peer distribution into
+# the deep block). Flip to `binary` to light up per-peer end-to-end; the bash
+# stays installed so rollback is just flipping this back. The controller
+# cross-compiles the stdlib-only binary for the host arch (no release asset /
+# token, cf. F-232) — it needs a Go toolchain on the ansible controller.
+relay_metrics_publisher: bash
+# GOARCH for the relay host (x86_64 relays -> amd64; Graviton -> arm64).
+relay_probe_go_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+# Controller-side build output (per-arch), copied to the relay when publisher=binary.
+relay_probe_build_out: "/tmp/relay-probe-build/relay-probe-linux-{{ relay_probe_go_arch }}"
+
+# Per-peer counting runtime knob. The counting runs on the dispatch hot
+# path (~tens of ns/frame, measured), so it's default-coupled to the stats
+# endpoint in the binary (on iff --stats-addr). Set to "0"/"off" to force it OFF
+# even with the endpoint served (pay zero per-frame cost), or "1"/"on" to force
+# on. Empty = binary default (coupled to --stats-addr). Wired as env
+# GOAT_RELAY_PEER_STATS.
+goat_relay_peer_stats: ""

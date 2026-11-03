@@ -1,0 +1,106 @@
+---
+# ops/ansible/roles/goat-relay-host-tuning/defaults/main.yml
+#
+# Host-tuning levers for goat-relay hosts. ALL of these touch the host
+# kernel / cmdline / sysctl / cpufreq state — the role is intentionally
+# OPT-IN per Block 33C.1's host-tuning factor list (H1-H4).
+#
+# Each lever has its own enable flag, defaulting to FALSE. Operators
+# turn them on per-host (group_vars or inventory) explicitly. The role
+# is idempotent and produces evidence trails for each change applied.
+#
+# Cross-refs:
+#   - ADR 0709 D3 amendment (systemd-native deploy is the
+#     prerequisite for H2's single-tenant risk envelope)
+#   - ADR 0823 (H2 mitigations=off risk acceptance)
+#   - ADR 0218 (substrate strategy — H2 only tenable on bare-metal /
+#     single-tenant VM; risky on shared-tenant)
+#   - docs/project/implementation-plan.md Block 33C.1 H1-H4 row
+
+# ─── Tier-1 — sustained-Gbps sysctl baseline ──────────────────────
+# The qdisc + congestion-control + socket-buffer + backlog combo that
+# turned single-flow goat-relay throughput from 364 → 761 Mbps in M-018
+# (commit 4cd5812). Applied via /etc/sysctl.d so the values persist
+# across reboots (the previous inline-`sysctl -w` shape vanished on
+# reboot — the F-035/F-036/F-037-class persistence-not-applied trap;
+# see docs/operations/bench-test-as-a-service.md). H2 reboot is the
+# specific trigger that exposed the gap.
+#
+# Default OFF — opt-in per the role's host-tuning posture. Set
+# `goat_relay_tier1_sysctl_enable: true` in group_vars or via -e for
+# bench / production hosts.
+goat_relay_tier1_sysctl_enable: false
+# BBR congestion control; fq qdisc (BBR's recommended pacing qdisc).
+goat_relay_tier1_tcp_congestion_control: bbr
+goat_relay_tier1_default_qdisc: fq
+# Socket buffer ceilings; values in M-018: 128 MiB max + 32 MiB defaults.
+goat_relay_tier1_rmem_max: 134217728  # 128 MiB
+goat_relay_tier1_wmem_max: 134217728  # 128 MiB
+# tcp_rmem/wmem are 3-tuples: min, default, max. Values in M-018.
+goat_relay_tier1_tcp_rmem: "4096 33554432 134217728"
+goat_relay_tier1_tcp_wmem: "4096 33554432 134217728"
+# NIC rx backlog + listen backlog + SYN backlog; values from M-018.
+goat_relay_tier1_netdev_max_backlog: 250000
+goat_relay_tier1_somaxconn: 8192
+goat_relay_tier1_tcp_max_syn_backlog: 8192
+# Skip the per-route TCP metrics cache so a slow-start tail from an
+# earlier flow doesn't penalize subsequent flows on the same path.
+goat_relay_tier1_tcp_no_metrics_save: 1
+
+# ─── H1 — CPU frequency governor ────────────────────────────────────
+# `cpupower frequency-set -g performance` pins the CPU frequency to
+# the maximum supported by the hardware. Default Linux is `schedutil`
+# or `ondemand` which scales down under low load — fine for general
+# servers, fine for bursty workloads, but goat-relay is throughput-
+# bound and benefits from "always max." ~5-15% on bursty / latency-
+# sensitive paths. Cheap, reversible, no risk envelope concerns.
+goat_relay_h1_cpu_governor_enable: false
+goat_relay_h1_cpu_governor: performance
+
+# ─── H2 — mitigations=off (Spectre/Meltdown/MDS/etc.) ─────────────
+# Disables CPU hardware-bug mitigations on the kernel cmdline.
+# REQUIRES ADR 0823 risk-acceptance review per host BEFORE setting
+# this to true. Single-tenant + no-untrusted-code-path host only.
+# The role does NOT auto-reboot — operator-fired reboot per host
+# with explicit pre-/post-verification.
+goat_relay_h2_mitigations_off_enable: false
+
+# ─── H3 — Hugepages for buffer pools ──────────────────────────────
+# Reserve 2 MB hugepages at boot. Reduces TLB pressure on the
+# Bytes-slab + (post-L5) io_uring SQ/CQ rings. Marginal at 100 Mbps;
+# meaningful at multi-Gbps. Tied to L4 (bounded MPSC) + L5
+# (io_uring) actually using the hugepage allocator — no benefit
+# until the binary is built to use it. Safe to enable early
+# (kernel just reserves the pages; unused pages are wasted RAM
+# but no correctness impact).
+goat_relay_h3_hugepages_enable: false
+# Number of 2 MB hugepages to reserve. 512 = 1 GB. Sized for a relay
+# host serving thousands of connections each with ~256-frame queues
+# (per WRITER_QUEUE_CAPACITY). Adjust per-host RAM budget.
+goat_relay_h3_hugepages_count: 512
+
+# ─── H4 — PGO + BOLT compile (build-time, not runtime) ────────────
+# Profile-guided optimization is a build-time concern, NOT a host-
+# tuning concern. The Ansible role does not apply H4. The H4 lever
+# is captured in goat-relay/Cargo.toml + CI build steps — see
+# the implementation-plan.md Block 33C.1 H4 row + ADR 0707
+# (Rust toolchain pinning).
+#
+# This var is here purely as a documentation marker so operators
+# reading the role know where H4 lives. Do not set it to true —
+# nothing in this role consumes it.
+goat_relay_h4_pgo_bolt_marker: false
+
+# ─── Container-log bounds ──────────────────
+# UNLIKE the H1-H3 perf levers above, this defaults to TRUE — it is a
+# safety net, not a tuning knob. The relays install Docker outside the
+# docker-engine role, so they shipped with an UNBOUNDED json-file driver;
+# the pre-fix relay binary's per-frame log flood then filled the 19 GB
+# disk fleet-wide. Render a log-bounded /etc/docker/daemon.json so
+# NO container on a relay host can fill the disk via stdout. The render
+# restarts docker (a brief blip) only when the file actually changes, so
+# it is a one-time cost on first apply. Mirrors the docker-engine role's
+# 100m × 3 bound. Set to false only if a host manages daemon.json elsewhere.
+goat_relay_docker_log_bounds_enable: true
+goat_relay_docker_log_max_size: "100m"
+goat_relay_docker_log_max_file: "3"

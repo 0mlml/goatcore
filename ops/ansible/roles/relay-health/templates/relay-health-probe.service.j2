@@ -1,0 +1,36 @@
+# Rendered by ops/ansible/roles/relay-health/ — DO NOT EDIT ON HOST.
+# Fast (credential-free) relay-fleet probe → writes the JSON the dashboard
+# nginx serves. --deep is deliberately NOT used here (it needs aws-vault and
+# would spam keychain prompts; it stays the laptop-operator tool).
+[Unit]
+Description=relay-health fleet probe (fast, credential-free)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --tunnel-endpoint: this prober runs ON the Thor (the rathole tunnel endpoint),
+# where a probe to relay:443 hairpins back through the relay's own tunnel to
+# this host. The dashboard treats :443/STUN as informational there and bases
+# health on :2333 control reachability. --vantage labels it on the page.
+# --alert-sink (default-OFF): when relay_health_alert_sink is set, push
+# Alertmanager-v2 alerts for the F-229 relay-disk gap off the self-published
+# (--ingest-dir) deep blocks. Pages only once the receiver is un-nooped (ADR 1059).
+ExecStart={{ relay_health_dir }}/relay-health-probe.sh --conf {{ relay_health_dir }}/relays.conf --out {{ relay_health_www_dir }}/relay-health.json {% if relay_health_tunnel_endpoint | default(true) | bool %}--tunnel-endpoint {% endif %}{% if relay_metrics_ingest_enabled | default(true) | bool %}--ingest-dir {{ relay_health_www_dir }}/ingest {% endif %}{% if relay_health_alert_sink | default('') | length > 0 %}--alert-sink {{ relay_health_alert_sink }} --site {{ site_id }} {% endif %}--vantage {{ relay_health_vantage | default(site_id ~ '-thor') }}
+# Persist the overall network status each cycle for the dashboard's top-of-page
+# history timeline (5-level, day-bucketed with an hourly drill-down). Reads the
+# relay JSON just written + the canary quorum; writes status-history.json (served)
+# and status.db (NOT served — kept in the install dir).
+# Reduced-detail variant (ADR 1066), regenerated from the fresh probe so the two
+# documents can never disagree about relay STATE — they differ only in detail.
+# Runs before the other post-steps: nginx may serve it at any moment.
+ExecStartPost={{ relay_health_dir }}/redact-relay-health.py {{ relay_health_www_dir }}/relay-health.json {{ relay_health_www_dir }}/relay-health-reduced.json
+ExecStartPost={{ relay_health_dir }}/relay-status-record.py --relay-health {{ relay_health_www_dir }}/relay-health.json --peers {{ relay_health_www_dir }}/ingest/peers.json --db {{ relay_health_dir }}/status.db --out {{ relay_health_www_dir }}/status-history.json
+{% if relay_health_textfile_out | default('') | length > 0 %}
+# Grafana bridge: convert the JSON the prober just wrote into goat_relay_*
+# Prometheus metrics in a node-exporter textfile dir, so the relay-fleet-health
+# Grafana dashboard renders the SAME signals (incl. STUN / enroll ok-ratio that
+# blackbox can't do). See docs/design/grafana-dashboard-suite.md. Absent when
+# the co-resident obs node-exporter textfile dir isn't set (relay_health_textfile_out="").
+ExecStartPost={{ relay_health_dir }}/relay-health-to-prom.py --in {{ relay_health_www_dir }}/relay-health.json --out {{ relay_health_textfile_out }}
+{% endif %}

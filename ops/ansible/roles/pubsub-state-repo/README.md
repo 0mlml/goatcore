@@ -1,0 +1,63 @@
+# role: pubsub-state-repo
+
+Provisions the per-site Forgejo repo that holds the pub/sub
+state-of-record (Block 86), drops the mirror script + systemd timer,
+and seeds the first commit from the live portal.
+
+**Design:** `docs/design/pubsub-state-as-code.md`.
+
+**Apply playbook:** `ops/ansible/nova-pubsub-state-repo-bootstrap.yml`.
+
+## Required env vars
+
+| Var                       | Purpose                                    |
+| ------------------------- | ------------------------------------------ |
+| `FORGEJO_PUBSUB_TOKEN`    | Forgejo PAT scoped to write:repository     |
+| `PORTAL_OPERATOR_API_KEY` | Portal operator key (Bearer auth)          |
+
+## Portal-by-container resolve mode (opt-in)
+
+Default off: the mirror reaches the portal at `pubsub_state_portal_url`
+(`127.0.0.1:8090`), which assumes the portal's 8090 is host-published (nova-a).
+
+On the three-Orin topology the portal's 8090 is reachable only by container name
+on a docker network (no host publish, no Traefik front), and its container IP
+moves on redeploy. Set `pubsub_state_portal_container` (+ `_network`, default
+`mgmt`; `_port`, default 8090) and the mirror script re-resolves that
+container's IP on the named network at the top of **every** cycle, so a portal
+redeploy does not strand the mirror. Requires the mirror to run with docker
+access (the systemd unit runs as root — it does).
+
+## What it leaves on the host
+
+- `/usr/local/bin/pubsub-state-mirror.sh` — mirror cycle script
+- `/etc/systemd/system/pubsub-state-mirror.service` — oneshot unit
+- `/etc/systemd/system/pubsub-state-mirror.timer` — every `pubsub_state_mirror_interval_sec` (default 300s)
+- `/var/lib/pubsub-state-mirror/repo/` — local working clone of the Forgejo repo
+
+## What it pushes to Forgejo
+
+A repo under org `goat-pubsub-state` with the canonical layout
+described in the design doc. Every mirror cycle replaces the tree in
+full, so the repo is always "current state" — no history beyond
+mirror-commit messages.
+
+## What it pushes to MinIO
+
+When `pubsub_state_minio_bucket` + `pubsub_state_minio_alias` are set
+(both default values are populated for nova-a), every cycle also drops
+`pubsub-state-snapshots/snapshot-<ts>.tar.gz` and overwrites
+`pubsub-state-snapshots/latest.tar.gz`. The MinIO push is best-effort —
+a failure logs to stderr but does not abort the mirror cycle.
+
+## Restoring a site from this repo
+
+See the operator runbook `docs/operations/pubsub-state-rebuild.md`.
+
+## Operator one-shot
+
+```
+$ FORGEJO_PUBSUB_TOKEN=... PORTAL_OPERATOR_API_KEY=... \
+    OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
+    ansible-playbook -i inventory/nova-a.ini nova-pubsub-state-repo-bootstrap.yml
+```

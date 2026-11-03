@@ -1,0 +1,48 @@
+---
+# onboard-intake-collector — the public candidate-onboarding "front desk"
+# (ADR 1062 stage 1, decision #1). A thin nginx allowlist reverse proxy on the
+# public enrollment ingress that serves ONLY the candidate form + the two
+# token-gated candidate endpoints, forwarding them to the mesh-only onboarding
+# engine. Everything else 404s, so the engine's operator surfaces are never
+# publicly reachable — the upstream itself stays mesh-only.
+#
+# The onboarding engine moved from the data-fabric portal to goat-id-console
+# (docs/design/onboarding-extraction-plan.md), so the upstream is now the console
+# and the allowlisted candidate paths proxy to its public routes
+# (/public/onboard.html, /public/onboard/preview|submit). The candidate-facing
+# URLs (/onboard.html, /api/onboard/preview|submit) are UNCHANGED — nginx rewrites
+# them to the console's /public paths so the enrollment link a sponsor already
+# handed out keeps working.
+#
+# Off by default; opt in per goatnet (ZAGROS) via group_vars.
+onboard_intake_enabled: false
+
+# Public hostname the candidate reaches (DNS → relays → rathole → Thor
+# enrollment entrypoint → this collector). Set per env in group_vars.
+onboard_intake_public_fqdn: ""
+
+# The mesh-only onboarding-engine upstream (container:port on the shared mgmt
+# network). Now goat-id-console:8080 — proxied DIRECTLY to the container, which
+# bypasses oauth2-proxy, so the console's un-gated /public routes are reachable
+# while its admin surface stays behind the ADMINS gate.
+onboard_intake_portal_upstream_host: "goat-id-console"
+onboard_intake_portal_upstream_port: 8080
+
+# Collector container.
+onboard_intake_container_name: "onboard-intake-collector"
+# Pinned nginx — multi-arch INDEX digest (public-internet surface; verified
+# against docker.io). Recorded in deploy-history.yml (ADR 0859).
+onboard_intake_image: "nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
+
+# The external Traefik network the portal + Traefik share (so the collector can
+# reach the portal AND be routed to by Traefik).
+onboard_intake_traefik_network: "mgmt"
+
+# Traefik enrollment entrypoint + ACME resolver (matches the mgmt-host Traefik).
+onboard_intake_entrypoint: "enrollment"
+onboard_intake_cert_resolver: "le"
+
+# Where Traefik watches dynamic config + where the collector compose lives.
+onboard_intake_traefik_dynamic_dir: "/etc/traefik/dynamic"
+onboard_intake_traefik_dynamic_filename: "onboard-intake.yml"
+onboard_intake_dir: "/opt/onboard-intake"

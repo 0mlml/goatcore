@@ -1,0 +1,43 @@
+# {{ ansible_managed }}
+#
+# goat-ntp-health-pub republisher on {{ ntp_health_pub_host_id }}. Rendered by
+# ops/ansible/roles/ntp-health-pub/ (ADR 1036/1037, F-184). One container, mTLS
+# Zenoh client peer of the router: reads the local ntp-health-agent's signed
+# verdict (:9753/health) and republishes it verbatim on
+# ops/time/attest/{{ ntp_health_pub_host_id }}. Persists nothing — no secrets,
+# so no sibling .env.
+
+services:
+  ntp-health-pub:
+    image: {{ ntp_health_pub_image }}
+    container_name: ntp-health-pub
+    restart: unless-stopped
+    networks:
+      # Reaches the router over the zenoh compose network.
+      - zenoh
+    extra_hosts:
+      # The ntp-health-agent is a HOST systemd binary on :9753 — reach it via
+      # the docker host-gateway (host.docker.internal), since this container is
+      # on the zenoh network, not host networking.
+      - "host.docker.internal:host-gateway"
+    environment:
+      NTP_HEALTH_PUB_ENDPOINT: "{{ ntp_health_pub_zenoh_endpoint }}"
+      NTP_HEALTH_PUB_HOST_ID: "{{ ntp_health_pub_host_id }}"
+      NTP_HEALTH_AGENT_URL: "{{ ntp_health_pub_agent_url }}"
+      NTP_HEALTH_PUB_INTERVAL_MS: "{{ ntp_health_pub_interval_ms }}"
+      RUST_LOG: "{{ ntp_health_pub_rust_log }}"
+{% if ntp_health_pub_zenoh_endpoint.startswith('tls/') %}
+      NTP_HEALTH_PUB_CERT: "/certs/ntp-health-pub-cert.pem"
+      NTP_HEALTH_PUB_KEY_FILE: "/certs/ntp-health-pub-key.pem"
+      NTP_HEALTH_PUB_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+{% if ntp_health_pub_zenoh_endpoint.startswith('tls/') %}
+    volumes:
+      - "{{ ntp_health_pub_cert_dir }}:/certs:ro"
+      - "{{ ntp_health_pub_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+
+networks:
+  zenoh:
+    name: {{ ntp_health_pub_zenoh_network }}
+    external: true

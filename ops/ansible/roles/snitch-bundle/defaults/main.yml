@@ -1,0 +1,89 @@
+---
+# snitch-bundle role defaults
+#
+# Bundle-driven snitch probe install (Block 61, ADR 0223 / offline-enrollment §11.6a).
+# Use on wg-cp0-onboarded peers where the snitch binary arrives via
+# the bootstrap bundle and the probe API key arrives via the per-device
+# offline-enrollment bundle. NOT for ad-hoc dev-workstation onboarding —
+# that path stays on the legacy `curl /install` flow in install-probe.sh.
+
+# Path on the peer where the bootstrap bundle was unpacked. The
+# snitch binary lives at <unpacked>/binaries/snitch on Block 61's
+# bundle layout.
+snitch_bundle_unpack_dir: /opt/goat/bootstrap
+
+# Path on the peer where the per-device offline-enrollment bundle was
+# placed at provisioning. The role reads `snitch_probe_key` (32 bytes,
+# base64-or-hex) from this CBOR file via a tiny pre-installed
+# `bundle-extract` helper (assumed present on bundle-onboarded hosts;
+# alternative: pass via inventory `snitch_probe_key` directly for
+# inventory-managed hosts where the Ansible operator already has the key
+# in 1Password / Vault).
+snitch_enrollment_bundle_path: /etc/goat/enrollment/enrollment.cbor
+
+# Snitch collector reachable via wg-cp0; default expects mgmt VIP. For
+# legacy mesh-IP peers, override to the legacy mesh IP (100.127.1.32).
+snitch_collector_url: "http://snitch.netbird.legacy.example:8080"
+
+# Probe interval base (seconds). Actual sleep jitters [base-5, base+5].
+snitch_probe_interval: 60
+
+# Soft per-cycle wall-clock budget. Sub-steps that would start past
+# this are skipped + counted in the report (see Block 61).
+snitch_probe_cycle_budget: 5s
+
+# Comma-separated list of relay URLs the probe asserts transport against
+# every cycle. Source: same per-relay table the wg-cp0 bundle carries
+# (cp-relay endpoints translated to data-plane rels:// URLs); typically
+# rendered into snitch_relay_urls at provisioning time. Empty = skip
+# the per-relay probe.
+snitch_relay_urls: ""
+
+# Override to skip the per-device key extraction step (use a key from
+# inventory instead). Useful for ad-hoc test envs.
+snitch_probe_key_inventory: ""
+
+# Local kill switch (Block 61). Set to any non-empty string to force
+# this peer's probe into PolicyOff regardless of the collector's policy.
+# Use case: you need to silence ONE peer fast (operational disruption,
+# debugging, mission window) without touching the fleet-wide policy.
+# Empty = collector's policy applies normally.
+snitch_probe_disabled: ""
+
+# F-074 fallback: operator-laptop-staged binary for the snitch probe when
+# the on-host bundle layout isn't laid down. Block 68 rapid-bringup was
+# supposed to lay down /opt/goat/bootstrap/binaries/snitch but
+# doesn't yet; the Linux task list copies from a controller-side
+# pre-staged path when the on-host path is empty. The repo is PRIVATE
+# (Block 30 sanitization gate), so direct unauthenticated GitHub release
+# download returns 404 — operator must `gh release download` the asset
+# on the laptop first; the role then `copy`s from controller (delegate_to
+# localhost stat, then ansible.builtin.copy with src on controller).
+#
+# When the repo is public-facing (post-Block 30), switch back to the
+# get_url+URL pattern for unauthenticated CDN downloads.
+snitch_release_local_path: "{{ lookup('env', 'HOME') }}/.goat/state/snitch-binaries"
+# Self-referential — the repo the operator is told to `gh release download`
+# from should be the one they are deploying from, not a hardcoded side.
+# Declaring it here (rather than inline in the task message) is also what
+# makes it visible to ops/ci/check-release-asset-parity.sh, which pairs
+# `<prefix>_release_repo` with `<prefix>_release_tag`.
+snitch_release_repo: "{{ source_repo }}"
+snitch_release_tag: "snitch-v0.1.0"
+# Where the staging run records which release the probe binary came from; the
+# deploy-rollback ledger reads it back (tasks/Linux.yml). Same dir as the ledger.
+snitch_bundle_marker_dir: "/var/lib/goat/snitch-bundle"
+
+# Re-stage the probe binary even when one is already present.
+#
+# WHY THIS EXISTS. The release-download fallback below is gated on the staged
+# binary being ABSENT, so once /opt/goat/bootstrap/binaries/snitch exists
+# it is reused forever — however old. A rebuilt binary therefore never reaches
+# the hosts: the copy compares against the stale source, reports changed=0, and
+# the deploy looks successful while the probes keep running the previous build.
+# The collector can serve a new binary for hours while hosts run the old one and
+# every play is green.
+#
+# Set true when you have rebuilt snitch and want the fleet on it:
+#   ansible-playbook ... -e snitch_bundle_force_refresh=true
+snitch_bundle_force_refresh: false

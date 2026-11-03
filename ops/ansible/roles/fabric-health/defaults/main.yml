@@ -1,0 +1,82 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the fabric-health role — deploys the goat-fabric-health meter
+# (the participant-visible "Reveal" pillar of the QoS design) per
+# docs/design/fabric-health-surface.md + ADR 1034.
+#
+# Out-of-the-box configuration targets a single-host trial fabric.
+# Override `fabric_health_*` group vars for other deployments. The meter is a
+# normal mTLS Zenoh client peer that subscribes `**`, rolls traffic up by
+# class + producer, and publishes ops/fabric/health/<site> +
+# ops/fabric/footprint/<peer>. It PERSISTS NOTHING — no S3, no MinIO, no
+# durable store (contrast the audit-subscriber role).
+
+# Image — SHA-pinned per ADR 0859 (easy rollback). Bumps to this value
+# require an append to deploy-history.yml (CI checks via
+# .github/workflows/deploy-history-check.yml). Built by
+# .github/workflows/fabric-health-image.yml.
+fabric_health_image: "ghcr.io/{{ ghcr_org }}/goat-fabric-health:sha-d4ebcc3@sha256:7c7eb8233f63dbfda171f2eadb4f621d570532f350ca3291bf2ffb4a5ff6386c"
+
+# Site identifier — the `<site>` segment of ops/fabric/health/<site>.
+fabric_health_site: "nova-a"
+
+# Zenoh router endpoint. Internal docker network — container-name
+# resolution. The router listens mTLS-only on 7447; `<zenoh_stack>-router`
+# derives from the one deployment param.
+fabric_health_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+
+# Docker network the zenoh-router container lives on (the zenoh compose
+# project's external network, `<zenoh_stack>_default`).
+fabric_health_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# Publish interval (ms). The rolling window equals this interval — rates
+# are computed over the interval just elapsed (ADR 1034 §3).
+fabric_health_interval_ms: 5000
+
+# Per-class capacity targets — the "knee" against which live load is
+# compared (ADR 1012). Comma-separated C0,C1,C2,C3. SEED VALUES ONLY —
+# replace with measured ceilings from the load-test apparatus per site. A class with no target reads
+# `unmetered` (honest — not green); see ADR 1034 measurement-trust.
+fabric_health_target_msgs: "5000,20000,50000,200000"
+fabric_health_target_bytes: "1000000,20000000,100000000,500000000"
+
+# Host-side cert directory. Leaf cert + key minted via offline-CA cert-sign
+# under an infra-peer URI-SAN (same shape as the audit-subscriber leaf, not
+# a vendor-prefix one). Operator pre-stages files at:
+#   {cert_dir}/fabric-health-cert.pem
+#   {cert_dir}/fabric-health-key.pem
+fabric_health_cert_dir: "/opt/fabric-health/certs"
+
+# Source path on the host for the trial fabric's CA root certificate.
+# Read-only bind-mounted as /ca/ca-root.pem so the client verifies the
+# router's server cert. Same file the zenoh-router + audit-subscriber use.
+fabric_health_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# Host-side compose project dir.
+fabric_health_compose_dir: "/opt/fabric-health"
+
+# Logging filter.
+fabric_health_rust_log: "goat_fabric_health=info,zenoh=warn"
+
+# --- Identity source: static (offline-CA mint) | spire (SPIRE SVID) --------
+# Default `static`: the operator pre-stages the leaf at
+# {{ fabric_health_cert_dir }}. `spire` (set in group_vars/<site>_hosts/spire.yml)
+# draws the client identity from a co-located SPIRE agent via a spiffe-helper
+# sidecar. In `spire` mode the client cert+key come from the SVID; the CA root
+# (router verification) is still the offline-CA file, unchanged.
+fabric_health_identity_source: "static"
+
+# spiffe-helper sidecar image (spire mode only) lives in
+# group_vars/<site>_hosts/spire.yml — kept out of role defaults so the
+# deploy-history CI guard doesn't read it as a fabric-health image-pin bump.
+
+# Host dir where the SPIRE agent exposes its Workload API socket (spire mode).
+fabric_health_spire_socket_dir: "/run/spire/sockets"
+
+# Host bind dir for the SVID the spiffe-helper writes + the meter reads (spire
+# mode). A host dir (not a named volume) chowned to the meter UID so the helper
+# — run as the same UID — writes a key the meter can read. The meter's image
+# (Chainguard goat-fabric-health) runs as nonroot 65532.
+fabric_health_svid_dir: "/opt/fabric-health/svid"
+fabric_health_spire_uid: 65532

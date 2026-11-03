@@ -1,0 +1,109 @@
+---
+# keepalived-mgmt role — installs + configures keepalived for VRRP
+# active-passive between Router-A (MASTER) and Router-B (BACKUP).
+# Idempotent — safe to re-run; config is templated, scripts come from
+# files/, restart fires only on change.
+
+# F-055 guard: lone-node deploy is the documented split-brain failure
+# mode. A single node with keepalived and no peer advertising VRRP
+# self-elects MASTER after master_down_interval and runs pg_ctl
+# promote, producing two primaries. Refuse to proceed unless the
+# play's host list includes both A and B (or operator explicitly
+# overrides via keepalived_allow_lone_node=true).
+- name: "keepalived | F-055 guard — both nodes must be in play (or explicit override)"
+  ansible.builtin.assert:
+    that:
+      - keepalived_allow_lone_node | default(false) | bool
+        or (ansible_play_hosts_all | length >= 2)
+      - keepalived_allow_lone_node | default(false) | bool
+        or (
+          ansible_play_hosts_all
+          | map('extract', hostvars, 'router_role')
+          | map('upper')
+          | unique
+          | sort
+          | list
+        ) == ['A', 'B']
+    fail_msg: |
+      keepalived-mgmt role refuses to deploy because the current play's
+      host list does not contain BOTH router_role=A and router_role=B.
+
+      This is the F-055 split-brain guard. A lone keepalived node
+      self-elects MASTER within ~3-4 seconds and runs pg_ctl promote,
+      breaking streaming replication. See
+      docs/findings/F-055-keepalived-lone-node-self-elects-master-causing-split-brain.md.
+
+      Hosts in play: {{ ansible_play_hosts_all }}
+      router_roles seen: {{ ansible_play_hosts_all | map('extract', hostvars, 'router_role') | list }}
+
+      Resolutions:
+        1. Run against both A and B (drop --limit, or use --limit
+           <site>_hosts which includes both).
+        2. If you are deliberately re-applying to a single node in an
+           established pair where the other already has keepalived
+           running and advertising, set
+           -e keepalived_allow_lone_node=true.
+           NEVER set this in CI / orchestrator paths.
+    success_msg: "Both A and B in play; safe to proceed."
+  tags: [keepalived, f-055-guard]
+
+- name: "keepalived | install package"
+  ansible.builtin.apt:
+    name: keepalived
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  tags: [keepalived]
+
+- name: "keepalived | install health-check + notify scripts"
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: "0755"
+    owner: root
+    group: root
+  loop:
+    - keepalived-mgmt-check.sh
+    - keepalived-mgmt-notify-backup.sh
+    - keepalived-mgmt-notify-fault.sh
+  tags: [keepalived]
+
+- name: "keepalived | render notify-master script with auto_promote knob"
+  ansible.builtin.template:
+    src: keepalived-mgmt-notify-master.sh.j2
+    dest: "/usr/local/bin/keepalived-mgmt-notify-master.sh"
+    mode: "0755"
+    owner: root
+    group: root
+  tags: [keepalived]
+
+- name: "keepalived | render keepalived.conf"
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: "0640"
+    owner: root
+    group: root
+  notify: restart keepalived
+  tags: [keepalived]
+
+- name: "keepalived | enable + start service"
+  ansible.builtin.systemd:
+    name: keepalived
+    state: started
+    enabled: true
+    daemon_reload: true
+  tags: [keepalived]
+
+- name: "keepalived | verify VIP visibility on the LAN interface (MASTER only)"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.shell: |
+    set -e
+    for i in $(seq 1 30); do
+      ip -4 addr show {{ keepalived_lan_interface }} | grep -q "{{ keepalived_vip }}" && exit 0
+      sleep 1
+    done
+    echo "VIP {{ keepalived_vip }} not bound to {{ keepalived_lan_interface }} after 30s"
+    exit 1
+  changed_when: false
+  tags: [keepalived, verify]

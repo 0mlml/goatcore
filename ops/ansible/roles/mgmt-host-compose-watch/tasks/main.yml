@@ -1,0 +1,118 @@
+---
+# mgmt-host-compose-watch — F-013 mitigation, roadmap 9L.
+#
+# Installs a small bash watcher + systemd unit that revives any docker-compose
+# service in /opt/mgmt-host whose container has exited. Bridges the gap until
+# Docker's native restart-policy auto-recovery is reliable on this host.
+#
+# Designed to retire when the Phase 2D Podman+Quadlet migration lands per
+# docs/design/container-orchestration.md — Quadlet supervises containers
+# natively via systemd, making this role obsolete.
+#
+# Idempotent. Safe to re-run on every mgmt-host.yml apply.
+
+# The watcher script does `cd /opt/mgmt-host` at startup. If the dir doesn't
+# exist (fresh host, before mgmt-host.yml tasks: block creates it), the script
+# exits 1, systemd Restart=always re-spawns, and the unit stays in 'activating'
+# forever. Pre-create the dir here so the role is robust to fresh-host ordering.
+- name: Ensure compose directory exists (so the watcher can cd into it on first start)
+  ansible.builtin.file:
+    path: /opt/mgmt-host
+    state: directory
+    mode: "0755"
+
+# Block 78E — node_exporter textfile-collector dir.
+# The watcher writes compose_service_running.prom every cycle; node_exporter
+# scrapes it; alerts in monitoring/rules/compose-orphans.yml fire on any
+# compose-defined service that's been not-running for >5m, including one the
+# allowlist does not revive.
+#
+# node_exporter's textfile directory differs per host, so this path is driven by
+# mgmt_host_compose_watch_metrics_dir, whose default is the common case. A wrong
+# path means compose-orphans.yml alerts on a series that never exists.
+- name: "[Block 78E] Ensure node_exporter textfile-collector dir exists"
+  ansible.builtin.file:
+    path: "{{ mgmt_host_compose_watch_metrics_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "[Block 78E] Ensure jq is installed (required by watcher's metric-emit step)"
+  ansible.builtin.apt:
+    name: jq
+    state: present
+    update_cache: false
+  when: ansible_os_family == 'Debian'
+
+- name: Install mgmt-host-compose-watch.sh script
+  ansible.builtin.copy:
+    src: mgmt-host-compose-watch.sh
+    dest: /usr/local/sbin/mgmt-host-compose-watch.sh
+    owner: root
+    group: root
+    mode: '0755'
+  notify: restart mgmt-host-compose-watch
+  register: copy_sh
+  retries: 3
+  delay: 5
+  until: copy_sh is succeeded
+
+# SSM file-transfer has a known transient flake on .service files
+# (`Source ... .source.service not found`). Retry-until-succeeded absorbs the
+# flake without burning an entire fresh-env cycle.
+- name: Install mgmt-host-compose-watch.service systemd unit
+  ansible.builtin.template:
+    src: mgmt-host-compose-watch.service.j2
+    dest: /etc/systemd/system/mgmt-host-compose-watch.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload systemd and restart mgmt-host-compose-watch
+  register: copy_service
+  retries: 3
+  delay: 5
+  until: copy_service is succeeded
+
+- name: Ensure systemd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/mgmt-host-compose-watch.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+# Drop-in carries the optional MGMT_HOST_COMPOSE_WATCH_SERVICES allowlist
+# (defaults to empty = revive all exited services, prior behavior).
+# Per-site group_vars populates the allowlist when migration-style
+# services are in the compose stack — e.g. once Ory lands kratos-migrate
+# + hydra-migrate, those exit 0 by design and a watcher with no allowlist
+# revives them every poll cycle (verified destabilizing during ory-gate
+# v7 soak: 130 revivals in 11 minutes hammered postgres). The watcher
+# script already supports the env var (commit 08e22d4); this drop-in
+# plumbs the Ansible-managed value through the systemd unit.
+- name: Render mgmt-host-compose-watch env drop-in
+  ansible.builtin.template:
+    src: env.conf.j2
+    dest: /etc/systemd/system/mgmt-host-compose-watch.service.d/env.conf
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload systemd and restart mgmt-host-compose-watch
+
+- name: Enable and start mgmt-host-compose-watch.service
+  ansible.builtin.systemd:
+    name: mgmt-host-compose-watch.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Verify watcher is active
+  ansible.builtin.command:
+    cmd: systemctl is-active mgmt-host-compose-watch.service
+  register: watch_status
+  changed_when: false
+  failed_when: watch_status.stdout not in ["active", "activating"]
+  retries: 10
+  delay: 2
+  until: watch_status.stdout == "active"

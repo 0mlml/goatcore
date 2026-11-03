@@ -1,0 +1,137 @@
+---
+# Per (database, peer_site) subscription task. Called once for each
+# entry in ory_spock_databases × ory_spock_peer_sites.
+#
+# Loop variable: ory_spock_db_peer = [database, peer_site_id]
+#
+# Steps:
+#   1. Look up the peer Orin's primary host (router_role=A or single-Orin).
+#   2. Derive peer Spock node name (matches per_db.yml convention).
+#   3. Create subscription IF NOT EXISTS in spock.subscription catalog.
+#   4. Poll spock.sub_show_status() until 'replicating' or timeout.
+#
+# Mirrors spock-mesh-peering/tasks/main.yml's subscription block;
+# scoped to ory_narrow + per-Ory-DB.
+
+- name: "ory-narrow-repset[sub] | unpack loop tuple"
+  ansible.builtin.set_fact:
+    ory_spock_sub_db: "{{ ory_spock_db_peer[0] }}"
+    ory_spock_sub_peer_site: "{{ ory_spock_db_peer[1] }}"
+
+- name: "ory-narrow-repset[sub:{{ ory_spock_sub_db }}/{{ ory_spock_sub_peer_site }}] | find peer primary host"
+  ansible.builtin.set_fact:
+    ory_spock_sub_peer_host: >-
+      {{ (groups['mgmt_hosts']
+          | map('extract', hostvars)
+          | selectattr('site_id', 'defined')
+          | selectattr('site_id', 'eq', ory_spock_sub_peer_site)
+          | selectattr('participates_in_spock', 'defined')
+          | selectattr('participates_in_spock', 'eq', true)
+          | selectattr('router_role', 'defined')
+          | selectattr('router_role', 'in', ['A'])
+          | map(attribute='inventory_hostname')
+          | list)[0]
+          | default(
+            (groups['mgmt_hosts']
+             | map('extract', hostvars)
+             | selectattr('site_id', 'defined')
+             | selectattr('site_id', 'eq', ory_spock_sub_peer_site)
+             | selectattr('participates_in_spock', 'defined')
+             | selectattr('participates_in_spock', 'eq', true)
+             | map(attribute='inventory_hostname')
+             | list)[0]
+            ) }}
+
+- name: "ory-narrow-repset[sub:{{ ory_spock_sub_db }}/{{ ory_spock_sub_peer_site }}] | derive peer Spock node name"
+  ansible.builtin.set_fact:
+    ory_spock_sub_peer_node: >-
+      {{ ory_spock_sub_peer_site | replace('-', '_') }}{% if hostvars[ory_spock_sub_peer_host].intra_site_pair | default(false) | bool %}_a{% endif %}_{{ ory_spock_sub_db }}
+    ory_spock_sub_peer_pg_host: "{{ hostvars[ory_spock_sub_peer_host].mesh_ip_a | default(hostvars[ory_spock_sub_peer_host].ansible_host) }}"
+
+- name: "ory-narrow-repset[sub:{{ ory_spock_sub_db }}/{{ ory_spock_sub_peer_site }}] | derive local Spock node name"
+  ansible.builtin.set_fact:
+    ory_spock_sub_local_node: >-
+      {{ site_id | replace('-', '_') }}{% if intra_site_pair | default(false) | bool %}_a{% endif %}_{{ ory_spock_sub_db }}
+
+- name: "ory-narrow-repset[sub:{{ ory_spock_sub_db }}/{{ ory_spock_sub_peer_site }}] | derive subscription name"
+  ansible.builtin.set_fact:
+    ory_spock_sub_name: "ory_sub_{{ ory_spock_sub_peer_node }}_to_{{ ory_spock_sub_local_node }}"
+
+- name: "ory-narrow-repset[sub:{{ ory_spock_sub_db }}/{{ ory_spock_sub_peer_site }}] | refuse an unresolved mesh-IP placeholder in the provider host"
+  # Mirrors spock-mesh-peering's F-542 guard on the netbird leg. A peer host
+  # still reading `TBD_..._MESH_IP` means the peer site's mesh_ip_a group_var was
+  # not filled after enrolment; without this, sub_create dials the placeholder
+  # and dies "could not translate host name" DEEP inside the next task, which is
+  # no_log — so the operator sees a censored failure, not the cause. Fail closed
+  # here, at wiring time, with the fix named.
+  ansible.builtin.assert:
+    that:
+      - "'TBD' not in ory_spock_sub_peer_pg_host"
+    fail_msg: >-
+      Unresolved mesh-IP placeholder in the Ory Spock provider host for peer
+      {{ ory_spock_sub_peer_site }} ({{ ory_spock_sub_peer_pg_host }}). Fill
+      mesh_ip_a in group_vars/{{ ory_spock_sub_peer_site | replace('-', '_') }}_hosts/vars.yml
+      before wiring Phase 7D.
+
+- name: "ory-narrow-repset[sub:{{ ory_spock_sub_db }}/{{ ory_spock_sub_peer_site }}] | create subscription if missing"
+  ansible.builtin.shell:
+    cmd: |
+      docker exec -i -u postgres {{ ory_spock_postgres_container }} \
+        psql -U postgres -d {{ ory_spock_sub_db }} -v ON_ERROR_STOP=1 -tA <<'SQL'
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM spock.subscription WHERE sub_name = '{{ ory_spock_sub_name }}') THEN
+          PERFORM spock.sub_create(
+            subscription_name := '{{ ory_spock_sub_name }}',
+            provider_dsn := 'host={{ ory_spock_sub_peer_pg_host }} port=5432 dbname={{ ory_spock_sub_db }} user={{ ory_spock_replicator_user }} password={{ ory_spock_replicator_password }}',
+            replication_sets := ARRAY['{{ ory_spock_repset_name }}'],
+            synchronize_data := {{ ory_spock_synchronize_data | string | lower }},
+            forward_origins := ARRAY[]::text[]
+          );
+        END IF;
+      END $$;
+      SQL
+  no_log: true
+  register: ory_spock_sub_create
+  changed_when: false
+  when: not (ory_spock_reconcile_only | default(false) | bool)
+
+- name: "ory-narrow-repset[sub:{{ ory_spock_sub_db }}/{{ ory_spock_sub_peer_site }}] | poll sub_show_status for 'replicating'"
+  ansible.builtin.shell:
+    cmd: |
+      docker exec -i -u postgres {{ ory_spock_postgres_container }} \
+        psql -U postgres -d {{ ory_spock_sub_db }} -v ON_ERROR_STOP=1 -tA -c \
+        "SELECT status FROM spock.sub_show_status('{{ ory_spock_sub_name }}');"
+  register: ory_spock_sub_status
+  retries: "{{ (ory_spock_replicating_timeout_seconds / ory_spock_replicating_poll_interval_seconds) | int }}"
+  delay: "{{ ory_spock_replicating_poll_interval_seconds }}"
+  until: "'replicating' in ory_spock_sub_status.stdout"
+  changed_when: false
+  when: not (ory_spock_reconcile_only | default(false) | bool)
+
+- name: "ory-narrow-repset | verify reverse subscription before history reconciliation"
+  ansible.builtin.command:
+    argv: [docker, exec, -u, postgres, "{{ hostvars[ory_spock_sub_peer_host].ory_spock_postgres_container | default(ory_spock_postgres_container) }}",
+           psql, -X, -U, postgres, -d, "{{ ory_spock_sub_db }}", -v, ON_ERROR_STOP=1, -tAXq,
+           -c, "SELECT status FROM spock.sub_show_status('ory_sub_{{ ory_spock_sub_local_node }}_to_{{ ory_spock_sub_peer_node }}');"]
+  delegate_to: "{{ ory_spock_sub_peer_host }}"
+  register: ory_spock_reverse_status
+  changed_when: false
+  failed_when: ory_spock_reverse_status.rc != 0 or ory_spock_reverse_status.stdout | trim != 'replicating'
+  when:
+    - ory_spock_reconcile_only | default(false) | bool
+    - ory_spock_revocation_guard | bool
+    - ory_spock_sub_db in ory_spock_revocation_guard_sql
+
+- name: "ory-narrow-repset | reconcile append-only revocation history"
+  ansible.builtin.include_role:
+    name: revocation-ledger-bootstrap
+  vars:
+    revocation_database: "{{ ory_spock_sub_db }}"
+    revocation_local_container: "{{ ory_spock_postgres_container }}"
+    revocation_peer_host: "{{ ory_spock_sub_peer_host }}"
+    revocation_peer_container: "{{ hostvars[ory_spock_sub_peer_host].ory_spock_postgres_container | default(ory_spock_postgres_container) }}"
+  when:
+    - ory_spock_reconcile_only | default(false) | bool
+    - ory_spock_revocation_guard | bool
+    - ory_spock_sub_db in ory_spock_revocation_guard_sql

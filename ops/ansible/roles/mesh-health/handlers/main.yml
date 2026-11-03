@@ -1,0 +1,27 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+- name: mesh-health | reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: mesh-health | restart meter
+  # Runs at end-of-play, after `docker compose up`, so this restarts a container
+  # that already exists rather than racing its creation.
+  #
+  # F-398: that comment holds only on a host that has run this role BEFORE. The
+  # role flushes handlers mid-play (to enable the snapshot timer) and that flush
+  # lands BEFORE the compose file is rendered, so on a FRESH host this fires with
+  # no docker-compose.yml present and `docker compose restart` exits 1 with
+  # "no configuration file provided: not found" — failing the whole play. The
+  # `docker compose up` later in the same play creates the container regardless,
+  # so nothing is lost by doing nothing here. Guarded rather than reordered
+  # because the timer genuinely needs its unit file flushed before it is enabled.
+  ansible.builtin.shell:
+    cmd: |
+      if [ -f docker-compose.yml ]; then
+        docker compose restart mesh-health
+      else
+        echo "mesh-health: no compose file yet (first run on this host); the compose up later in this play starts it"
+      fi
+    chdir: "{{ mesh_health_compose_dir }}"
+  changed_when: true

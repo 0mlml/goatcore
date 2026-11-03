@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Managed by the luks-unlock Ansible role. Do not edit on the host.
+#
+# POST-BOOT LUKS auto-unlock. Deliberately NOT part of the boot
+# transaction: the volume stays `noauto` in crypttab, so a failure here can
+# never hang boot, reorder NVIDIA's unit graph, or drop the host to emergency
+# mode. Worst case: the host is UP and REACHABLE with the volume still locked —
+# which is the property that keeps a failed unlock recoverable at all.
+#
+# Why not in-transaction (both measured on a real Orin):
+#   - `headless` in crypttab disables the systemd password QUERY, and answering
+#     that query is exactly how clevis-luks-askpass delivers its key.
+#   - Removing `headless` and adding `_netdev` makes it work, but drags
+#     local-fs.target into network-online.target ordering; on Jetson systemd
+#     then deleted SEVEN jobs to break cycles (dbus, sockets.target, nvpmodel,
+#     nv, and the mount itself) and boot took ~20 minutes.
+set -uo pipefail
+
+DEV="{{ vol.device }}"
+NAME="{{ vol.name }}"
+MNT="{{ vol.mount_point }}"
+ATTEMPTS="{{ luks_postboot_unlock_attempts }}"
+INTERVAL="{{ luks_postboot_unlock_interval }}"
+
+log() { echo "[goat-unlock] $*"; }
+
+if [ -e "/dev/mapper/$NAME" ] && mountpoint -q "$MNT"; then
+  log "$MNT already unlocked + mounted; nothing to do"; exit 0
+fi
+
+for i in $(seq 1 "$ATTEMPTS"); do
+  [ -e "/dev/mapper/$NAME" ] && break
+  if clevis luks unlock -d "$DEV" -n "$NAME" >/dev/null 2>&1; then
+    log "unlocked via clevis on attempt $i"; break
+  fi
+  log "attempt $i/$ATTEMPTS: no peer answered yet; retrying in ${INTERVAL}s"
+  sleep "$INTERVAL"
+done
+
+if [ ! -e "/dev/mapper/$NAME" ]; then
+  # Exit 0 on purpose: an unlock failure must not mark the unit failed and
+  # invite a restart storm. The host is up; an operator can unlock by hand.
+  log "FAILED to unlock $NAME after $ATTEMPTS attempts — host is UP and reachable"
+  exit 0
+fi
+
+mountpoint -q "$MNT" || mount "$MNT" || { log "mount of $MNT failed"; exit 0; }
+log "mounted $MNT"
+
+{% for svc in vol.systemd_requires | default([]) %}
+systemctl start {{ svc }} && log "started {{ svc }}"
+{% endfor %}

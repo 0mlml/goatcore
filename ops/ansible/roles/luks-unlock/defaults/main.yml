@@ -1,0 +1,176 @@
+---
+luks_volumes: []
+
+# When `format_if_unformatted: true` is set on a per-volume entry, the role
+# will idempotently:
+#   1. cryptsetup luksFormat --type luks2 (only if `cryptsetup isLuks` says no)
+#   2. cryptsetup luksOpen                (only if /dev/mapper/<name> absent)
+#   3. mkfs.<filesystem>                  (only if blkid says no FS)
+#   4. mount the volume now               (so the play can verify end-to-end)
+# The passphrase comes from `vol.passphrase` (resolve from env / vault). When
+# the device is already LUKS-formatted, all four steps are no-ops and the
+# existing passphrase is left alone.
+luks_format_if_unformatted_default: false
+
+luks_tpm2_device: auto
+luks_tpm2_pcrs: [0, 2, 4, 7, 11]
+
+luks_fido2_device: auto
+
+# FIDO2 enrollment user-presence + PIN posture. The defaults preserve the
+# pre-Block-65 behavior (tap-required, PIN-as-token-default) for non-Orin
+# hosts. Orin group_vars flip both to false to activate the
+# presence-via-removal doctrine per ADR 0612 + Block 65D — YubiKey is not
+# stored in the Orin during steady-state, insertion at the boot ceremony IS
+# the operator's asynchronous consent.
+#
+# CAVEAT: YubiKey 5 FIPS series MAY force user-presence regardless of this
+# flag when running in FIPS mode. The 65D.3 enrollment step on prov-rla is
+# the empirical check; if the post-enrollment cold-boot still requires a
+# tap, the YubiKey is enforcing presence at the authenticator level and the
+# doctrine reverts to "tap-required" until a different FIDO2 device class
+# is procured.
+luks_fido2_user_presence: true
+luks_fido2_with_pin: true
+
+# Block 65D.3 — when set to true, the role wipes any existing FIDO2 keyslot
+# on each volume before enrolling the new one. Use to flip
+# luks_fido2_user_presence / luks_fido2_with_pin without manual cryptenroll.
+# Idempotent on second run: if the existing slot already matches the
+# requested flags, no wipe is performed.
+luks_fido2_force_reenroll: false
+
+# Per-volume `unlock_modes_disabled` is an opt-in list of modes that should
+# be ACTIVELY WIPED from the LUKS header (not merely absent from unlock_modes).
+# Used when a security-review or operational-rotation pass decides a
+# previously-enrolled mode should no longer be available. Idempotent: tasks
+# only fire when the mode's keyslot is currently present.
+#
+# Pattern (per-volume in luks_volumes_mgmt_host):
+#   - name: docker-data
+#     unlock_modes: [passphrase, tpm2]
+#     unlock_modes_disabled: [fido2, tang_client]   # actively wipe
+#
+# Safety: tasks pre-flight that at least one OTHER unlock path remains
+# (passphrase slot is the always-available recovery path; the role refuses
+# to wipe ALL modes simultaneously). See role README §"Disabling a mode
+# for a security review" for the full pattern + rollback path.
+luks_unlock_modes_disabled_default: []
+
+luks_usb_keyfile_uuid: ""
+
+luks_sss_threshold: 2
+luks_sss_pins: {}
+
+# Tang client config — Block 65C. List of {name, url} dicts; the role
+# Clevis-binds an additional LUKS keyslot per entry. URLs MUST resolve to a
+# wg-cp0-internal address (198.18.0.0/24); a public URL is rejected by
+# pre-flight assertion.
+luks_tang_servers: []
+
+luks_packages_base:
+  - cryptsetup
+  - cryptsetup-bin
+
+luks_packages_tpm2:
+  - clevis
+  - clevis-luks
+  - clevis-tpm2
+  - clevis-systemd
+
+luks_packages_fido2:
+  - libfido2-1
+  - fido2-tools
+
+luks_packages_sss:
+  - clevis-luks
+
+luks_packages_tang_client:
+  - clevis
+  - clevis-luks
+  - clevis-systemd
+
+# -- Host-site node-class paths ---------------------------------------------
+# See docs/design/host-site-node-disk-encryption.md. Both lists default to []
+# so a caller that only sets luks_volumes is completely unaffected.
+
+# `luks_installer_partitions` — enroll an unattended-unlock mode onto a LUKS
+# partition the OS INSTALLER already created (full-disk encryption). NEVER
+# formats. Per-entry shape:
+#   - name: cryptroot                # informational label
+#     device: /dev/nvme0n1p3         # the crypto_LUKS partition
+#     expected_vg: ubuntu-vg         # fail-closed shape assertion (LVM-on-LUKS)
+#     unlock_class: tpm2             # tpm2 | tang_initramfs
+#     passphrase: "{{ lookup('env','<HOST>_LUKS_PASS') }}"   # existing slot-0 pass
+#     # tang_initramfs only:
+#     tang_servers:                  # {name,url,class} — same shape as luks_tang_servers
+#       - {name: karbon-a, url: "http://192.168.1.10:7500", class: lan}
+#     initramfs_ip: "192.168.1.20::192.168.1.1:255.255.255.0::eth0:off"  # kernel ip= string
+#     initramfs_kmods: [macb]        # NIC driver(s) to seed into the initrd
+luks_installer_partitions: []
+
+# Packages for the headless in-initramfs Clevis+Tang unlock class. NOTE:
+# `clevis-initramfs` + `cryptsetup-initramfs` are what put clevis-luks-askpass
+# and networking INTO the initrd — the post-boot tang_client path does not use
+# them. This class has no prior use in this repo (see the design doc).
+luks_packages_tang_initramfs:
+  - clevis
+  - clevis-luks
+  - clevis-initramfs
+  - cryptsetup-initramfs
+
+# Packages for the installer-LUKS `tpm2` unlock class (x86 with a TPM). Clevis
+# (not systemd-cryptenroll) binds the TPM keyslot, and `clevis-initramfs` puts
+# clevis-luks-askpass into the initrd so the classic Ubuntu cryptroot boot
+# script unlocks it before pivot. `clevis-tpm2` pulls tpm2-tools. See
+# installer-luks.yml for why systemd-cryptenroll does not work here.
+luks_packages_tpm2_initramfs:
+  - clevis
+  - clevis-luks
+  - clevis-tpm2
+  - clevis-initramfs
+  - cryptsetup-initramfs
+
+# PCR policy for the installer-LUKS `tpm2` class. PCR 7 (Secure Boot policy
+# state) is STABLE across kernel/initramfs updates; binding kernel/firmware
+# PCRs (0, 4, 11) re-seals against a value that changes on every OS update and
+# breaks unattended unlock on a headless field box. Widen only where boot-chain
+# integrity is worth a re-bind after each update. Proven on the Karbon 801s
+# (Secure Boot disabled — PCR 7 is a stable anchor regardless).
+luks_clevis_tpm2_pcr_ids: "7"
+luks_clevis_tpm2_pcr_bank: "sha256"
+
+# `luks_encrypted_lvs` — carve a data LV out of the free space in an EXISTING
+# encrypted volume group and mount it. Encryption inherited from
+# the PV on the installer LUKS; no new LUKS header. Per-entry shape:
+#   - name: docker-data
+#     vg: ubuntu-vg
+#     size_percent_free: "90"        # -l 90%FREE  (OR use `size: 1500G` for -L)
+#     filesystem: ext4
+#     mount_point: /opt/docker-data
+#     data_root_subdirs: [/opt/docker-data/docker, /opt/docker-data/containerd]
+luks_encrypted_lvs: []
+
+# -- Post-boot auto-unlock -------------------------------------------
+# Clevis-delivered modes (tang_client / sss) unlock AFTER boot via
+# goat-unlock-<vol>.service, never inside the boot transaction.
+# See templates/goat-unlock-data-volume.sh.j2 for the two measured reasons.
+# attempts x interval bounds how long a host will keep trying for a peer that
+# may itself still be booting — 30 x 10s = 5 minutes, which covers a whole-site
+# power restore where every node comes up at once.
+luks_postboot_unlock_attempts: 30
+luks_postboot_unlock_interval: 10
+
+# -- Unattended-boot health -------------------------------------------
+# goat-unlock-health.timer reads, every luks_health_interval, whether each
+# clevis volume is open, how many of its bound Tang servers answer, and whether
+# the unit graph has an ordering cycle; writes them as node_exporter textfile
+# metrics (paged by goat-obs rules/luks-unlock.yml); and restarts the unlock unit
+# for a volume it finds locked.
+#
+# luks_tang_min_reachable is also a BIND-TIME floor: a tang_client volume with
+# fewer declared Tang servers than this is refused, because one server is a
+# single point of failure for an unattended boot.
+luks_tang_min_reachable: 2
+luks_health_interval: 2min
+luks_health_textfile_dir: /var/lib/node_exporter/textfile

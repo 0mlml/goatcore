@@ -1,0 +1,79 @@
+---
+# host-net-publish role — a site network host (mgmt-host) self-publishes
+# its HOST NETWORK HEALTH (uplink loss/rtt, iface rates, rathole tunnel flap
+# counts, signal/mgmt control-plane rates, own mesh view) to the relay-health
+# ingest(s). Counterpart
+# of the ingest side: relay-health role's host_net_allowed_names.
+
+host_net_publish_enabled: false     # opt-in per host group
+
+host_net_publish_dir: /opt/host-net-publish
+host_net_publish_state_dir: /var/lib/host-net-publish
+# Script source (committed): ops/relay/health/host-net-publish.sh
+host_net_publish_src: "{{ playbook_dir }}/../relay/health/host-net-publish.sh"
+# Continuous peak-hold rate sampler (committed): the 60s publish averages bursts
+# away, so this always-on loop samples the iface every host_net_sample_interval_s
+# and feeds iface.rx/tx_bps_peak. See docs/design/node-net-health.md.
+host_net_ratesample_src: "{{ playbook_dir }}/../relay/health/host-net-ratesample.sh"
+host_net_sample_interval_s: 2
+
+# Capacity probe (measures what the link CAN do — a speed test — via a short
+# iperf3 to a stable target; distinct from the usage rate). Runs hourly + on
+# demand (rate-limited). Off unless a target is set. See capacity-probe.sh.
+capacity_probe_src: "{{ playbook_dir }}/../relay/health/capacity-probe.sh"
+capacity_probe_enabled: "{{ (capacity_target_mesh | default('')) | length > 0 }}"
+capacity_target_mesh: ""             # target mesh IP (e.g. the cloud relay-health box)
+capacity_target_public: ""           # optional public IP (needs SG:5201 open)
+capacity_target_name: cloud
+capacity_probe_port: 5201
+capacity_probe_duration_s: 4
+capacity_probe_min_interval_s: 60
+capacity_probe_direction: down       # down | up | both
+capacity_probe_interval: "1h"        # periodic cadence
+# Cross-node federation-primary leg: peer mgmt-node mesh
+# IP. On a multi-node goatnet, set this to the OTHER node's mesh IP so the
+# hourly probe also records the node<->node mesh path (the primary signal-
+# federation transport). Empty on single-node goatnets. Needs an iperf3-target
+# running on the peer node (relay-health role's iperf3-target, or standalone).
+capacity_target_crossnode: ""
+capacity_crossnode_name: "peer-node"
+
+# Federation MODE the relay-health federation band grades against (ADR 1107).
+# active-active (default, back-compat): split-across-nodes is the health ideal,
+# single-homing is amber. single: one signal node by design — a lone node is
+# healthy, not "peer dark". loose-site: each site homes its own peers, single-
+# homing is the design (not degradation) and a cross-site cut is island-mode,
+# not a severed fabric.
+host_net_federation_mode: "active-active"
+
+# Cross-node iperf3 TARGET (the peer node speed-tests to this). Enable on each
+# node of a multi-node goatnet so the pair can measure the federation-primary
+# mesh leg in both directions. Mesh-bound only (WireGuard-authenticated peers).
+host_net_iperf3_target_enabled: false
+host_net_iperf3_bind: ""              # this host's mesh IP (required when enabled)
+host_net_iperf3_port: 5201
+
+# This host's report name — MUST appear in the ingest's host_net_allowed_names.
+host_net_name: "{{ inventory_hostname }}"
+host_net_goatnet: ""   # REQUIRED, the goatnet name
+
+# Comma-separated ingest bases. The CLOUD ingest first (reachable when the
+# site/mesh is down — the point); a local ingest optionally after.
+host_net_ingest_urls: ""   # REQUIRED, e.g. https://relay-health.<zone>/host-net-ingest
+
+# Shared bearer (same trust domain as relay metrics / peer-names).
+host_net_bearer_token: "{{ relay_metrics_bearer_token | default('') }}"
+
+host_net_publish_interval: "60s"    # timer cadence; also declared in the payload
+host_net_ping_target: "1.1.1.1"
+host_net_ping_count: 10
+# Containers to read control-plane state from; set "" on hosts that don't run
+# the netbird mgmt plane (the publisher then reports them as null — honest).
+host_net_signal_container: "signal-a"
+host_net_mgmt_container: "management-a"
+
+# Mesh hostnames that must resolve to a fixed IP ON THIS HOST for the
+# publisher to reach a local (same-site) ingest URL — mesh names don't
+# self-resolve on the host's own resolver. Dict of name -> ip; rendered into
+# /etc/hosts (idempotent lineinfile). Empty = no entries managed.
+host_net_selfhost_entries: {}

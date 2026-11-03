@@ -1,0 +1,42 @@
+---
+# nic-offload-guard — persist the F-300 USO mitigation on Jetson Orin hosts.
+#
+# The Orin nvethernet NIC's hardware UDP segmentation offload emits malformed
+# segments under UDP GSO (docs/findings/F-300-*.md). The mitigation is
+# tx-udp-segmentation off, persisted as disable-uso.service. This role makes
+# the hand-applied RCA fix reimage-proof; it changes nothing on a host that
+# already carries the current unit.
+#
+# Kernel WireGuard is unaffected; the guard protects the userspace
+# wireguard-go fallback path (post-kernel-bump). Do not remove without
+# retiring that fallback mode.
+
+- name: install disable-uso.service
+  ansible.builtin.copy:
+    src: disable-uso.service
+    dest: /etc/systemd/system/disable-uso.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: nic_offload_guard_unit
+
+- name: enable and start disable-uso.service
+  ansible.builtin.systemd:
+    name: disable-uso.service
+    enabled: true
+    state: started
+    daemon_reload: "{{ nic_offload_guard_unit is changed }}"
+
+- name: re-run the guard if the unit changed (oneshot with RemainAfterExit)
+  ansible.builtin.systemd:
+    name: disable-uso.service
+    state: restarted
+  when: nic_offload_guard_unit is changed
+
+- name: verify USO is off on the default-route interface
+  ansible.builtin.shell: |
+    N=$(ip route show default | grep -oE "dev [a-z0-9]+" | head -1 | cut -d" " -f2)
+    ethtool -k "$N" | grep -E '^tx-udp-segmentation:'
+  register: nic_offload_guard_state
+  changed_when: false
+  failed_when: "'tx-udp-segmentation: off' not in nic_offload_guard_state.stdout"

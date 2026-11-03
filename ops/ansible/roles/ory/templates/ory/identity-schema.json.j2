@@ -1,0 +1,102 @@
+{
+  "$id": "https://schemas.{{ site_dns_zone }}/identity/operator.v1.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "goat operator identity ({{ site_id }})",
+  "type": "object",
+  "properties": {
+    "traits": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "title": "Email address",
+          "ory.sh/kratos": {
+            "credentials": {
+              "password": {
+                "identifier": true
+              },
+              "webauthn": {
+                "identifier": true
+              },
+              "totp": {
+                "account_name": true
+              }
+            },
+            "verification": {
+              "via": "email"
+            },
+            "recovery": {
+              "via": "email"
+            }
+          }
+        },
+        "name": {
+          "type": "string",
+          "title": "Display name",
+          "minLength": 1,
+          "maxLength": 80
+        }
+{% if not ory_authz_in_metadata | default(false) %}
+        ,
+        "groups": {
+          "type": "array",
+          "title": "Group memberships",
+          "items": {
+            "type": "string",
+            "pattern": "^([A-Z][A-Z0-9-]{0,40}|data\\.(view\\.(all|notional|org:[a-z0-9][a-z0-9-]{0,63}|producer:[a-z0-9][a-z0-9-]{0,63})|write\\.producer:[a-z0-9][a-z0-9-]{0,63}|govern\\.org:[a-z0-9][a-z0-9-]{0,63}))$"
+          },
+          "default": [],
+          "uniqueItems": true
+        },
+        "org": {
+          "type": "object",
+          "title": "Org affiliation",
+          "additionalProperties": false,
+          "description": "Org (company / unit / system / partner) attributes — the org-neutral successor to the legacy 'vendor' trait block (ADR 1052 Phase 4). Populated at mint: short_tag from the manifest affiliation.id (org.short_tag only when the manifest has no affiliation), display_name from org.display_name; backfilled from the legacy vendor block for identities minted before the trait migration.",
+          "properties": {
+            "short_tag": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]{1,64}$",
+              "title": "Org short tag",
+              "description": "Kebab-case org id the identity is from: the manifest affiliation.id, which the org registry allows up to 64 characters. Same pattern as aff.id below, held in lockstep by ops/ci/check-affiliation-id-trait-sync.sh. Surfaced on the id-admin-console identity-detail view."
+            },
+            "display_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "title": "Org display name",
+              "description": "Org display name (e.g. 'Acme Corporation', '3rd Infantry Division') — what the identity-detail view shows alongside short_tag."
+            }
+          }
+        },
+        "aff": {
+          "type": "object",
+          "title": "Affiliation (identity-only dimension; ADR 1043)",
+          "additionalProperties": false,
+          "properties": {
+            "id":     { "type": "string", "pattern": "^[a-z0-9-]{1,64}$", "title": "Affiliation id (the unit)" },
+            "kind":   { "type": "string", "enum": ["vendor", "organic", "partner", "civil"], "title": "Affiliation kind" },
+            "nation": { "type": "string", "maxLength": 64, "title": "Nation (optional)" }
+          }
+        }
+{% endif %}
+{% if ory_site_vendor_trait_compat | default(true) %}
+        ,
+        "vendor": {
+          "_comment": "DEPRECATED (ADR 1052 Phase 4). Since F-572 / ADR 1188 the authorization fields (groups, org, aff) live in admin-managed metadata_public, NOT in self-editable traits, so the settings flow cannot self-grant them. This legacy block is retained ONLY so an identity still carrying a legacy traits.vendor validates on a settings save until the backfill (ops/identity/backfill-authz-traits-to-metadata.py) moves it to metadata_public. Flip group_var ory_site_vendor_trait_compat=false once that backfill reports zero identities carrying traits.vendor.",
+          "type": "object",
+          "title": "Org affiliation (legacy)",
+          "additionalProperties": false,
+          "properties": {
+            "short_tag": { "type": "string", "pattern": "^[a-z0-9-]{1,32}$", "title": "Org short tag (legacy)" },
+            "display_name": { "type": "string", "minLength": 1, "maxLength": 256, "title": "Org display name (legacy)" }
+          }
+        }
+{% endif %}
+      },
+      "required": ["email", "name"],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,94 @@
+---
+# ops/ansible/roles/ntp-hygiene/tasks/preflight.yml
+#
+# "NTP must be healthy before proceeding" gate.
+#
+# Called from:
+#   - roles/ntp-hygiene/tasks/main.yml (after chrony starts, before
+#     handing off to the smoketest).
+#   - ops/ansible/tasks/ntp-preflight.yml (the thin re-usable wrapper
+#     any other playbook — e.g. coordinated-upgrade.yml, vega-bootstrap.yml
+#     step 1 — imports).
+#
+# Two checks:
+#   (a) chrony has at least `chrony_preflight_min_sources` source(s) in
+#       a selected state ("^*" or "^+" in chronyc sources output, per
+#       chrony-project.org/doc/manual.html#sources-command).
+#   (b) absolute value of last offset < `chrony_preflight_offset_ms`.
+#
+# Fails the play with a clear message on either failure. Threshold is
+# tighter than the alerting threshold so we never kick off an upgrade
+# from a host that's only barely healthy.
+
+- name: Preflight — collect chronyc tracking
+  # become required: chronyc reads /run/chrony/chronyd.sock which is
+  # owned by _chrony group; the ansible_user (goat) is not in
+  # that group, so an unprivileged chronyc returns "506 Cannot talk to
+  # daemon" even when chronyd is healthy.
+  become: true
+  ansible.builtin.command: chronyc -c tracking
+  register: _preflight_tracking
+  changed_when: false
+
+- name: Preflight — parse last offset (seconds, signed)
+  ansible.builtin.set_fact:
+    # CSV order from chronyc -c tracking (chrony 4.x):
+    #   0: Reference ID
+    #   1: Stratum
+    #   2: Ref time (UTC)
+    #   3: System time (offset from NTP time, signed seconds)
+    #   4: Last offset (signed seconds)  <-- this is what we care about
+    #   5: RMS offset
+    #   6: Frequency
+    #   7: Residual freq
+    #   8: Skew
+    #   9: Root delay
+    #  10: Root dispersion
+    #  11: Update interval
+    #  12: Leap status
+    _preflight_last_offset_s: >-
+      {{ (_preflight_tracking.stdout.split(',')[4] | float) }}
+    _preflight_stratum: >-
+      {{ (_preflight_tracking.stdout.split(',')[1] | int) }}
+    _preflight_leap: >-
+      {{ _preflight_tracking.stdout.split(',')[12] }}
+
+- name: Preflight — collect chronyc sources (count selected)
+  become: true
+  ansible.builtin.shell: |
+    set -o pipefail
+    chronyc -c sources | awk -F, '$2 ~ /^[*+]$/ { n++ } END { print (n+0) }'
+  args:
+    executable: /bin/bash
+  register: _preflight_selected_count
+  changed_when: false
+
+- name: Preflight — fail if NO selected source
+  ansible.builtin.assert:
+    that:
+      - (_preflight_selected_count.stdout | int) >= chrony_preflight_min_sources
+    fail_msg: >-
+      NTP preflight FAILED on {{ inventory_hostname }}: chronyc reports
+      {{ _preflight_selected_count.stdout | int }} selected source(s),
+      need at least {{ chrony_preflight_min_sources }}. Either the NTS
+      key-exchange failed for all configured sources, or the host
+      cannot reach any time.cloudflare.com / nts.ntp.rnl.se /
+      ptbtime1.ptb.de / ohio.time.system76.com endpoint. Investigate
+      before running anything that depends on LWW correctness.
+    success_msg: >-
+      NTP preflight OK on {{ inventory_hostname }}: {{ _preflight_selected_count.stdout | int }}
+      selected source(s); stratum={{ _preflight_stratum }}, leap={{ _preflight_leap }}.
+
+- name: Preflight — fail if offset exceeds chrony_preflight_offset_ms
+  ansible.builtin.assert:
+    that:
+      - ((_preflight_last_offset_s | float) | abs) * 1000 < (chrony_preflight_offset_ms | int)
+    fail_msg: >-
+      NTP preflight FAILED on {{ inventory_hostname }}: last offset
+      {{ (_preflight_last_offset_s | float) * 1000 }} ms exceeds the
+      preflight ceiling of {{ chrony_preflight_offset_ms }} ms.
+      Refusing to proceed — LWW correctness is not safe at this skew.
+    success_msg: >-
+      NTP preflight OK on {{ inventory_hostname }}: last offset
+      {{ (_preflight_last_offset_s | float) * 1000 }} ms within
+      {{ chrony_preflight_offset_ms }} ms ceiling.

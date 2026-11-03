@@ -1,0 +1,133 @@
+# {{ ansible_managed }}
+#
+# goat-fabric-crawler for {{ fabric_crawler_site }}. Rendered by
+# ops/ansible/roles/fabric-crawler/ (zenoh-cardinality-budget-and-lazy-crawler.md
+# §4). One container, mTLS Zenoh client peer of the router: sequential bounded
+# per-owner crawl, publishes ops/fabric/cardinality/{{ fabric_crawler_site }} +
+# ops/fabric/census/{{ fabric_crawler_site }}. Persists nothing but the optional
+# band JSON — no secrets, no .env.
+
+services:
+  fabric-crawler:
+    image: {{ fabric_crawler_image }}
+    container_name: fabric-crawler
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 3968M
+    restart: unless-stopped
+    networks:
+      # Reaches the router over the zenoh compose network.
+      - zenoh
+    environment:
+      FABRIC_CRAWLER_ENDPOINT: "{{ fabric_crawler_zenoh_endpoint }}"
+      FABRIC_CRAWLER_SITE: "{{ fabric_crawler_site }}"
+      FABRIC_CRAWLER_INTERVAL_MS: "{{ fabric_crawler_interval_ms }}"
+      FABRIC_CRAWLER_LAZY_THRESHOLD: "{{ fabric_crawler_lazy_threshold }}"
+      FABRIC_CRAWLER_CRAWL_BUDGET_MS: "{{ fabric_crawler_crawl_budget_ms }}"
+      FABRIC_CRAWLER_OWNER_PAUSE_MS: "{{ fabric_crawler_owner_pause_ms }}"
+      FABRIC_CRAWLER_SELF_TIER: "{{ fabric_crawler_self_tier }}"
+      FABRIC_CRAWLER_REQUEST_TIER: "{{ fabric_crawler_request_tier }}"
+      RUST_LOG: "{{ fabric_crawler_rust_log }}"
+{% if fabric_crawler_json_out_host_path | length > 0 %}
+      FABRIC_CRAWLER_JSON_OUT: "/out/zenoh-fabric.json"
+{% endif %}
+{% if fabric_crawler_rocksdb_dir | default('') | length > 0 %}
+      FABRIC_CRAWLER_ROCKSDB_DIR: "/stores"
+      FABRIC_CRAWLER_ROCKSDB_SECONDARY_DIR: "/secondary"
+{% endif %}
+{% if zenoh_topic_budget_source | default('file') == 'registry' %}
+      # Topic-budget source = the portal registry resolver (ADR 1075 grant
+      # store; /api/budget-projection). Re-fetched every cycle; a fetch
+      # failure degrades to the crawler's honest stale/unavailable states.
+      FABRIC_CRAWLER_BUDGET_SOURCE: "{{ fabric_crawler_budget_projection_url }}"
+      FABRIC_CRAWLER_BUDGET_TOKEN: "{{ fabric_crawler_budget_token }}"
+{% elif zenoh_topic_budget_grants is defined %}
+      # Topic-budget allowance projection (layer 2b) — re-read every cycle;
+      # the DIR is mounted so an ansible re-render is visible in-container.
+      FABRIC_CRAWLER_BUDGET_SOURCE: "/budgets/topic-budgets.json"
+{% endif %}
+{% if fabric_crawler_zenoh_endpoint.startswith('tls/') %}
+      FABRIC_CRAWLER_CERT: "/certs/{{ fabric_crawler_cert_file }}"
+      FABRIC_CRAWLER_KEY_FILE: "/certs/{{ fabric_crawler_key_file }}"
+      FABRIC_CRAWLER_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+{% if fabric_crawler_healthcheck_enabled | default(false) %}
+    # Container healthcheck.
+    #
+    # DEFAULT-OFF ON PURPOSE. The runtime image is
+    # cgr.dev/chainguard/glibc-dynamic (ops/zenoh-trial-peers/fabric-crawler/
+    # Dockerfile) — no shell, no curl/wget — AND the crawler exposes no HTTP
+    # endpoint at all, so there is nothing in the image that can probe it. An
+    # unrunnable probe would pin the container `Up (unhealthy)` forever.
+    #
+    # Contract: `--healthcheck` (no value, no short form), exit 0 healthy /
+    # 1 unhealthy, one structured line printed either way so `docker inspect`
+    # shows the reason. Keep it gated off for any image without the flag: an
+    # unrunnable probe pins the container `Up (unhealthy)` forever.
+    #
+    # It is a LIVENESS probe, not a router probe: a crawler measuring from
+    # rocksdb with the zenoh session down exits 0, healthy, on purpose. Router
+    # state belongs on the data surface — goat_zenoh_crawler_session_live and
+    # ZenohCrawlerSessionDegraded — because routing it through docker health
+    # would re-couple the crawler to the router that the process was just
+    # decoupled from.
+    #
+    # No staleness threshold is duplicated here: the daemon stamps its own
+    # freshness window into a heartbeat file (interval_ms * 3 + crawl_budget_ms,
+    # ~4 min at the defaults) and the probe compares against that, so changing
+    # FABRIC_CRAWLER_INTERVAL_MS re-tunes the probe automatically.
+    #
+    # Heartbeat path resolves from container env, no extra mount:
+    # FABRIC_CRAWLER_HEARTBEAT_FILE, else a sibling of FABRIC_CRAWLER_JSON_OUT
+    # (the /out bind above, already writable), else /tmp. On a goatnet where
+    # json_out is EMPTY this falls through to /tmp, whose writability under the
+    # chainguard nonroot uid is the one unverified assumption — set
+    # FABRIC_CRAWLER_HEARTBEAT_FILE explicitly there, and check the container
+    # log first either way (the daemon WARNs loudly if the write fails).
+    #
+    # To turn on: confirm with
+    #   docker exec fabric-crawler /usr/local/bin/goat-fabric-crawler --healthcheck
+    # then set fabric_crawler_healthcheck_enabled: true in group_vars.
+    # Until then the crawler's liveness is inferred from its published
+    # freshness — ZenohFabricSamplerStale (frozen) + ZenohFabricSamplerAbsent
+    # (deleted), rules/zenoh-wedge.yml.
+    #
+    # start_period covers a slow first crawl: the heartbeat is written once at
+    # startup so a fresh container is healthy immediately, but a first pass over
+    # a large keyspace is bounded by fabric_crawler_crawl_budget_ms per owner,
+    # not by seconds.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/goat-fabric-crawler", "--healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+{% endif %}
+{% if fabric_crawler_zenoh_endpoint.startswith('tls/') or fabric_crawler_json_out_host_path | length > 0 or fabric_crawler_rocksdb_dir | default('') | length > 0 or zenoh_topic_budget_grants is defined %}
+    volumes:
+{% if fabric_crawler_zenoh_endpoint.startswith('tls/') %}
+      - "{{ fabric_crawler_cert_dir }}:/certs:ro"
+      - "{{ fabric_crawler_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+{% if fabric_crawler_json_out_host_path | length > 0 %}
+      - "{{ fabric_crawler_json_out_host_path | dirname }}:/out"
+{% endif %}
+{% if fabric_crawler_rocksdb_dir | default('') | length > 0 %}
+      # READ-ONLY: secondary-mode rocksdb opens never write the primary; the
+      # secondaries' catch-up logs live on the host scratch dir (chowned to
+      # the container uid by the role).
+      - "{{ fabric_crawler_rocksdb_dir }}:/stores:ro"
+      - "{{ fabric_crawler_compose_dir }}/secondary:/secondary"
+{% endif %}
+{% if zenoh_topic_budget_grants is defined %}
+      - "{{ fabric_crawler_compose_dir }}/budgets:/budgets:ro"
+{% endif %}
+{% endif %}
+
+networks:
+  zenoh:
+    name: {{ fabric_crawler_zenoh_network }}
+    external: true

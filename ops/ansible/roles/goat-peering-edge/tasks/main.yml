@@ -1,0 +1,465 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# goat-peering-edge — stand up one strongSwan IPsec peering edge for a
+# cross-sovereign federation link.
+#
+# Design: docs/design/cross-sovereign-peering-transport.md
+# Names:  docs/design/federation-package-spec.md §3.1
+# FIPS:   docs/design/fips-pqc-path.md §"What the boundary node runs"
+#
+# Pre-flight (operator-side, NOT this role) — see README "Before you apply
+# this to a host":
+#   1. Bootstrap steps 0 and 1 complete: both sides have exchanged endpoints,
+#      the link subnet and the MTU out of band. Step 1 carries no trust
+#      material, so a failure here costs only time.
+#   2. The leaf certificate + key exist at peering_edge_cert_path /
+#      peering_edge_key_path with Subject CN = peering_edge_local_id, minted by
+#      the offline-CA ceremony. This role NEVER writes secret material.
+#   3. The partner CA for THIS peering is at peering_edge_remote_ca_path. It is
+#      never installed anywhere a core router can reach.
+#
+# The role is idempotent and re-runnable.
+
+- name: peering-edge | require enablement and a declaration (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - peering_edge_enabled | bool
+      - peering_edge_name | length > 0
+      - peering_edge_name | length <= 11
+      - peering_edge_name is match('^[a-z0-9-]+$')
+      - peering_edge_our_sovereign_id | length > 0
+      - peering_edge_their_sovereign_id | length > 0
+      - peering_edge_local_id | length > 0
+      - peering_edge_remote_id | length > 0
+      - peering_edge_local_addr | length > 0
+      - peering_edge_remote_addr | length > 0
+      - peering_edge_local_link_ip | length > 0
+      - peering_edge_remote_link_ip | length > 0
+    fail_msg: >-
+      goat-peering-edge needs peering_edge_enabled plus a complete peering
+      declaration (name <= 11 chars, both sovereign ids, both peering
+      identities, both endpoints, both link addresses). Nothing here is
+      guessed: a guessed endpoint or identity is refused in silence at the far
+      end and reads as a broken link.
+
+# The peering names are DERIVED from the two sovereign ids (spec §3.1). They
+# are written in the declaration so the file reads on its own, and checked here
+# so the two sides cannot disagree about them. A mistyped name matches no rule
+# and is refused silently at both ends.
+- name: peering-edge | check the peering identities match their derivation
+  ansible.builtin.assert:
+    that:
+      - peering_edge_local_id is match(_pe_local_pattern)
+      - peering_edge_remote_id is match(_pe_remote_pattern)
+      - peering_edge_local_id | length <= 40
+      - peering_edge_remote_id | length <= 40
+    fail_msg: >-
+      Peering identities must be fed.<issuer>.<counterparty>.<ordinal> with a
+      zero-padded two-digit ordinal (spec §3.1). Expected
+      fed.{{ peering_edge_our_sovereign_id }}.{{ peering_edge_their_sovereign_id }}.NN
+      and fed.{{ peering_edge_their_sovereign_id }}.{{ peering_edge_our_sovereign_id }}.NN;
+      got {{ peering_edge_local_id }} and {{ peering_edge_remote_id }}.
+  vars:
+    _pe_local_pattern: >-
+      ^fed\.{{ peering_edge_our_sovereign_id | regex_escape }}\.{{ peering_edge_their_sovereign_id | regex_escape }}\.[0-9]{2}$
+    _pe_remote_pattern: >-
+      ^fed\.{{ peering_edge_their_sovereign_id | regex_escape }}\.{{ peering_edge_our_sovereign_id | regex_escape }}\.[0-9]{2}$
+
+- name: peering-edge | install strongSwan (swanctl era)
+  ansible.builtin.apt:
+    name: "{{ peering_edge_packages }}"
+    state: present
+    update_cache: true
+
+# Two charon instances on one host race for the same SPIs and the loser fails
+# in a way that reads as a partner problem. The swanctl daemon is the one this
+# role configures; the legacy starter is stopped if the distro pulled it in.
+- name: peering-edge | disable the legacy strongswan-starter daemon
+  ansible.builtin.systemd:
+    name: strongswan-starter.service
+    state: stopped
+    enabled: false
+  failed_when: false
+
+# --------------------------------------------------------------------------
+# Observe what this host actually provides. No inference from package names.
+# --------------------------------------------------------------------------
+- name: peering-edge | read /proc/sys/crypto/fips_enabled
+  ansible.builtin.slurp:
+    src: /proc/sys/crypto/fips_enabled
+  register: _pe_kernel_fips_raw
+  failed_when: false
+
+- name: peering-edge | list OpenSSL providers
+  ansible.builtin.command: openssl list -providers
+  register: _pe_openssl_providers
+  changed_when: false
+  failed_when: false
+
+- name: peering-edge | read the strongSwan version
+  ansible.builtin.command: swanctl --version
+  register: _pe_swanctl_version
+  changed_when: false
+  failed_when: false
+
+- name: peering-edge | read Ubuntu Pro attach state
+  ansible.builtin.command: pro status --format=json
+  register: _pe_pro_raw
+  changed_when: false
+  failed_when: false
+
+- name: peering-edge | reduce the observations
+  ansible.builtin.set_fact:
+    # The kernel's own claim. Necessary, never sufficient.
+    peering_edge_kernel_fips_enabled: >-
+      {{ (_pe_kernel_fips_raw.content | default('MA==') | b64decode | trim) == '1' }}
+    peering_edge_openssl_fips_provider: >-
+      {{ 'fips' in (_pe_openssl_providers.stdout | default('') | lower) }}
+    peering_edge_openssl_providers: >-
+      {{ _pe_openssl_providers.stdout_lines | default([]) | map('trim')
+         | select('match', '^[a-z0-9_-]+$') | list }}
+    peering_edge_strongswan_version: >-
+      {{ (_pe_swanctl_version.stdout | default('') | trim) or 'unknown' }}
+    # `default('{}')` fires only on UNDEFINED, not on an empty string, and
+    # `pro status --format=json` prints nothing at all on some hosts while still
+    # exiting 0 -- so the rc guard alone does not protect from_json. Require the
+    # output to actually look like an object before parsing it. An unreadable
+    # probe is an unknown, and an unknown is not attached.
+    peering_edge_pro_attached: >-
+      {{ ((_pe_pro_raw.stdout | default('') | trim) | from_json).attached | default(false)
+         if (_pe_pro_raw.rc | default(1) == 0
+             and (_pe_pro_raw.stdout | default('') | trim).startswith('{'))
+         else false }}
+    peering_edge_platform: >-
+      {%- if ansible_architecture == 'x86_64' -%}x86_64
+      {%- elif ansible_architecture in ['aarch64', 'arm64'] and ('tegra' in ansible_kernel) -%}l4t-arm64
+      {%- elif ansible_architecture in ['aarch64', 'arm64'] -%}stock-arm64
+      {%- else -%}unknown
+      {%- endif -%}
+
+# --------------------------------------------------------------------------
+# The FIPS decision. Three inputs, four outcomes, no silent path.
+# --------------------------------------------------------------------------
+#   observed = the host is running validated crypto (kernel AND OpenSSL agree)
+#   claimed  = observed AND an operator has recorded the CMVP certificate
+#              number read off the public database. fips-pqc-path.md is
+#              explicit: verify the certificate, do not trust a kernel to
+#              report itself enabled. So an empty certificate means the claim
+#              is NOT made even on a host that says fips_enabled=1.
+- name: peering-edge | decide the FIPS posture
+  ansible.builtin.set_fact:
+    peering_edge_fips_observed: >-
+      {{ (peering_edge_kernel_fips_enabled | bool)
+         and (peering_edge_openssl_fips_provider | bool) }}
+    peering_edge_fips_claimed: >-
+      {{ (peering_edge_kernel_fips_enabled | bool)
+         and (peering_edge_openssl_fips_provider | bool)
+         and (peering_edge_cmvp_certificate | length > 0) }}
+
+- name: peering-edge | classify the decision
+  ansible.builtin.set_fact:
+    peering_edge_decision: >-
+      {%- if not (peering_edge_fips_required | bool) -%}proceed-no-claim
+      {%- elif peering_edge_fips_claimed | bool -%}proceed-claimed
+      {%- elif peering_edge_fips_waived_reason | length > 0 -%}proceed-waived
+      {%- else -%}refuse
+      {%- endif -%}
+
+- name: peering-edge | compose the state record
+  ansible.builtin.set_fact:
+    peering_edge_state:
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+      hostname: "{{ ansible_hostname }}"
+      peering: "{{ peering_edge_name }}"
+      platform: "{{ peering_edge_platform }}"
+      kernel: "{{ ansible_kernel }}"
+      decision: "{{ peering_edge_decision }}"
+      identity:
+        local_id: "{{ peering_edge_local_id }}"
+        remote_id: "{{ peering_edge_remote_id }}"
+        our_sovereign_id: "{{ peering_edge_our_sovereign_id }}"
+        their_sovereign_id: "{{ peering_edge_their_sovereign_id }}"
+      transport:
+        local_addr: "{{ peering_edge_local_addr }}"
+        remote_addr: "{{ peering_edge_remote_addr }}"
+        link_ifname: "{{ peering_edge_link_ifname }}"
+        link_subnet: "{{ peering_edge_local_link_ip }}/{{ peering_edge_link_prefix_len }}"
+        mtu: "{{ peering_edge_mtu }}"
+        fabric_port: "{{ peering_edge_fabric_port }}"
+      negotiated_suite:
+        ike_proposals: "{{ peering_edge_ike_proposals }}"
+        esp_proposals: "{{ peering_edge_esp_proposals }}"
+        # Recorded so the absence is a fact, not an oversight: the tunnel is
+        # deliberately classical. The post-quantum hybrid is the Zenoh TLS
+        # session inside it (transport design §2.1).
+        post_quantum_kex: false
+      observed:
+        kernel_fips_enabled: "{{ peering_edge_kernel_fips_enabled | bool }}"
+        openssl_fips_provider: "{{ peering_edge_openssl_fips_provider | bool }}"
+        openssl_providers: "{{ peering_edge_openssl_providers }}"
+        strongswan_version: "{{ peering_edge_strongswan_version }}"
+        ubuntu_pro_attached: "{{ peering_edge_pro_attached | bool }}"
+      fips:
+        required: "{{ peering_edge_fips_required | bool }}"
+        observed: "{{ peering_edge_fips_observed | bool }}"
+        # false whenever cmvp_certificate is empty, however the kernel reports
+        # itself. An empty certificate is not a weaker claim; it is no claim.
+        claimed: "{{ peering_edge_fips_claimed | bool }}"
+        cmvp_certificate: "{{ peering_edge_cmvp_certificate }}"
+        waived_reason: "{{ peering_edge_fips_waived_reason }}"
+
+- name: peering-edge | state directory
+  ansible.builtin.file:
+    path: "{{ peering_edge_state_path | dirname }}"
+    state: directory
+    mode: "0755"
+
+# Written BEFORE the gate, so a refusal leaves the evidence of why on the host
+# rather than only in a play that has already exited.
+- name: peering-edge | write the state file
+  ansible.builtin.template:
+    src: state.json.j2
+    dest: "{{ peering_edge_state_path }}"
+    mode: "0644"
+
+- name: peering-edge | read the xfrm interface ids already on this host
+  # A second peering that lands on an id another peering already holds fails as
+  # `RTNETLINK answers: File exists` when the interface is created, which names
+  # neither the id nor the peering that holds it. Catching it here costs one
+  # command and turns a confusing systemd failure into a sentence.
+  ansible.builtin.command:
+    cmd: ip -d -o link show type xfrm
+  register: _pe_xfrm_existing
+  changed_when: false
+  failed_when: false
+
+- name: peering-edge | refuse an xfrm if_id already held by a different peering
+  ansible.builtin.fail:
+    msg: >-
+      goat-peering-edge refuses: xfrm if_id {{ peering_edge_xfrm_if_id }} is already
+      held on this host by an interface that is not {{ peering_edge_link_ifname }}.
+      The id must be unique per peering on a host. It is derived from
+      peering_edge_name, so two peerings collide only if their names hash together
+      -- set peering_edge_xfrm_if_id explicitly for this peering to break the tie.
+      Existing: {{ _pe_xfrm_existing.stdout_lines | select('search', 'if_id') | list }}
+  when:
+    - _pe_xfrm_existing.rc | default(1) == 0
+    - _pe_xfrm_existing.stdout_lines | default([])
+      | select('search', 'if_id 0x%x' % (peering_edge_xfrm_if_id | int))
+      | reject('search', peering_edge_link_ifname + '@')
+      | list | length > 0
+
+- name: peering-edge | refuse an unvalidated host with no recorded reason
+  ansible.builtin.fail:
+    msg: >-
+      goat-peering-edge refuses: peering_edge_fips_required is true and this
+      host cannot make the FIPS claim.
+      kernel fips_enabled={{ peering_edge_kernel_fips_enabled }},
+      openssl fips provider={{ peering_edge_openssl_fips_provider }},
+      cmvp_certificate={{ '(empty)' if peering_edge_cmvp_certificate | length == 0
+                          else peering_edge_cmvp_certificate }}.
+      {% if peering_edge_fips_observed | bool %}
+      The host IS running validated crypto but no certificate number has been
+      recorded. Read it off csrc.nist.gov for the module this host runs and set
+      peering_edge_cmvp_certificate; do not infer it from the kernel.
+      {% else %}
+      This platform ({{ peering_edge_platform }}, {{ ansible_kernel }}) is not
+      running a FIPS kernel with a FIPS OpenSSL provider. On L4T the Canonical
+      FIPS kernel and NVIDIA's tegra kernel are mutually exclusive, so this is
+      expected and is not fixable on this host.
+      {% endif %}
+      Either set peering_edge_fips_waived_reason to the reason this link
+      proceeds anyway, or set peering_edge_fips_required=false to state that
+      this edge is outside the claim. Observations are recorded at
+      {{ peering_edge_state_path }}.
+  when: peering_edge_decision == 'refuse'
+
+- name: peering-edge | RECORDED DEVIATION — proceeding without validated crypto
+  ansible.builtin.debug:
+    msg:
+      - "================ FIPS DEVIATION ================"
+      - "host:      {{ ansible_hostname }} ({{ peering_edge_platform }}, {{ ansible_kernel }})"
+      - "peering:   {{ peering_edge_name }} ({{ peering_edge_local_id }})"
+      - "required:  true"
+      - "claimed:   false  (cmvp_certificate={{ '(empty)' if peering_edge_cmvp_certificate | length == 0 else peering_edge_cmvp_certificate }})"
+      - "reason:    {{ peering_edge_fips_waived_reason }}"
+      - "recorded:  {{ peering_edge_state_path }}"
+      - "The tunnel below is configured identically to a validated host. What"
+      - "differs is that no FIPS claim is made for it. The Zenoh TLS session"
+      - "inside the tunnel carries its own claim and is unaffected."
+      - "================================================"
+  when: peering_edge_decision == 'proceed-waived'
+
+- name: peering-edge | note that no FIPS claim is being made
+  ansible.builtin.debug:
+    msg: >-
+      peering_edge_fips_required is false: this edge is deliberately outside
+      the FIPS claim. Recorded at {{ peering_edge_state_path }}.
+  when: peering_edge_decision == 'proceed-no-claim'
+
+# --------------------------------------------------------------------------
+# Certificate material. Asserted, never written.
+# --------------------------------------------------------------------------
+- name: peering-edge | stat the certificate material
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: _pe_cert_stat
+  loop:
+    - "{{ peering_edge_cert_path }}"
+    - "{{ peering_edge_key_path }}"
+    - "{{ peering_edge_remote_ca_path }}"
+
+- name: peering-edge | refuse without certificate material in place
+  ansible.builtin.assert:
+    that:
+      - _pe_cert_stat.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      Missing certificate material:
+      {{ _pe_cert_stat.results | rejectattr('stat.exists') | map(attribute='item') | list | join(', ') }}.
+      This role writes no secret to disk. Mint the leaf with Subject
+      CN={{ peering_edge_local_id }} via the offline-CA ceremony
+      (docs/operations/dev-ca-cert-sign.md) and place the partner CA delivered
+      for THIS peering at {{ peering_edge_remote_ca_path }} — never in a core
+      router's trust store.
+
+- name: peering-edge | tighten the private key mode without rewriting it
+  ansible.builtin.file:
+    path: "{{ peering_edge_key_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+- name: peering-edge | config directory for the link interface
+  ansible.builtin.file:
+    path: /etc/goat-peering-edge
+    state: directory
+    mode: "0755"
+
+- name: peering-edge | link interface parameters
+  ansible.builtin.template:
+    src: link.env.j2
+    dest: "/etc/goat-peering-edge/{{ peering_edge_name }}.link.env"
+    mode: "0644"
+  notify: Restart peering link interface
+
+- name: peering-edge | link interface helper
+  ansible.builtin.template:
+    src: goat-peering-link.sh.j2
+    dest: /usr/local/sbin/goat-peering-link
+    mode: "0755"
+  notify: Restart peering link interface
+
+- name: peering-edge | link interface unit
+  ansible.builtin.template:
+    src: goat-peering-link@.service.j2
+    dest: /etc/systemd/system/goat-peering-link@.service
+    mode: "0644"
+  notify: Restart peering link interface
+
+- name: peering-edge | enable the link interface
+  ansible.builtin.systemd:
+    name: "{{ peering_edge_link_service }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: peering-edge | make the validated module provide the crypto
+  # Disable the two AES plugins so openssl provides AES_GCM. Do NOT instead raise
+  # openssl's priority: `load = 100` evicts the whole software crypto set and
+  # kills charon on a FIPS host with "failed to load 2 critical plugin features".
+  # Verified on a real FIPS host and a non-FIPS one.
+  ansible.builtin.lineinfile:
+    path: "{{ peering_edge_strongswan_plugin_conf_dir }}/{{ item }}.conf"
+    regexp: '^\s*load\s*='
+    line: "    load = no"
+  loop: "{{ peering_edge_fips_crypto_plugins_disabled }}"
+  notify: Restart strongswan
+
+- name: peering-edge | flush handlers so list-algs reflects the plugin change
+  ansible.builtin.meta: flush_handlers
+
+- name: peering-edge | read which plugin actually provides the suite
+  ansible.builtin.command:
+    cmd: swanctl --list-algs
+  register: _pe_algs
+  changed_when: false
+  failed_when: false
+
+- name: peering-edge | refuse a FIPS claim the crypto does not support
+  # The check that F-466 existed for: a host can be Pro-attached and FIPS-enabled
+  # and STILL encrypt outside the validated module. Asserting on the provider is
+  # the only reading that catches it -- kernel fips_enabled and the openssl
+  # provider list both say yes while AES_GCM_16 comes from aesni.
+  ansible.builtin.fail:
+    msg: >-
+      goat-peering-edge refuses: peering_edge_fips_required is true, but
+      `swanctl --list-algs` does not report AES_GCM_16 from [openssl] -- so the
+      tunnel's bulk encryption is NOT coming from the validated module. This is
+      F-466: Pro attachment alone does not achieve it -- the aesni/aes plugins
+      beat openssl to AES_GCM unless disabled. What list-algs reports:
+      {{ _pe_algs.stdout_lines | default([]) | select('search', 'AES_GCM_16') | list }}
+  when:
+    - peering_edge_fips_required | bool
+    - not (peering_edge_fips_waived_reason | default('') | trim | length > 0)
+    - _pe_algs.rc | default(1) == 0
+    - not (_pe_algs.stdout | default('') is search('AES_GCM_16\[openssl\]'))
+
+- name: peering-edge | strongswan.d drop-in
+  ansible.builtin.template:
+    src: goat-peering-edge.strongswan.conf.j2
+    dest: /etc/strongswan.d/goat-peering-edge.conf
+    mode: "0644"
+  notify: Restart strongswan
+
+# The distro swanctl.conf ships `include conf.d/*.conf`, but a host that has
+# been hand-edited may not have it — and a connection in a file nothing
+# includes loads nothing, silently, which looks exactly like a partner problem.
+- name: peering-edge | swanctl conf.d directory
+  ansible.builtin.file:
+    path: "{{ peering_edge_swanctl_dir }}/conf.d"
+    state: directory
+    mode: "0750"
+
+- name: peering-edge | ensure swanctl.conf includes conf.d
+  ansible.builtin.lineinfile:
+    path: "{{ peering_edge_swanctl_dir }}/swanctl.conf"
+    line: "include conf.d/*.conf"
+    regexp: '^\s*include\s+conf\.d/\*\.conf\s*$'
+    create: true
+    mode: "0640"
+  notify: Reload swanctl configuration
+
+- name: peering-edge | swanctl connection
+  ansible.builtin.template:
+    src: swanctl.conf.j2
+    dest: "{{ peering_edge_swanctl_dir }}/conf.d/{{ peering_edge_name }}.conf"
+    mode: "0640"
+  notify: Reload swanctl configuration
+
+- name: peering-edge | enable strongswan
+  ansible.builtin.systemd:
+    name: "{{ peering_edge_service }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: peering-edge | flush handlers so the SA reflects this run
+  ansible.builtin.meta: flush_handlers
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: goat-peering-edge | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "goat-peering-edge"
+    rollback_ref: >-
+      {{ peering_edge_name }} {{ peering_edge_local_id }}->{{ peering_edge_remote_id }}
+      suite={{ peering_edge_ike_proposals }}/{{ peering_edge_esp_proposals }}
+      mtu={{ peering_edge_mtu }}

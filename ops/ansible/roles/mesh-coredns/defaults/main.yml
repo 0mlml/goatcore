@@ -1,0 +1,72 @@
+---
+# mesh-coredns role — deploy CoreDNS as the per-site mesh-internal DNS server
+# for *.netbird.legacy.example + *.netbird-prod.goat.example. Generic across
+# every mgmt-host site; the wrapper play sets per-site bind IP + paths.
+#
+# Replaces the previous NETHOST-only inline play (ops/ansible/nethost-dns.yml).
+# Block 13A supply chain hardening: CoreDNS replaces jpillora/dnsmasq.
+#
+# Block 79: added optional wg-cp0 bind so operator laptops
+# on the silent control plane can resolve mesh-internal hostnames
+# pre-netbird-enrollment. Without this, the chicken-and-egg problem is:
+# Mac is on wg-cp0 → can dial 198.18.0.1 → but cannot resolve
+# mgmt.vega.netbird-prod.goat.example → forced to use IP-literal URLs
+# which trip F-104 in stock netbird's gRPC dialer. Binding CoreDNS on
+# the wg-cp0 address is the structural answer.
+
+# Required (must be set per-host or in wrapper play vars):
+#   mesh_coredns_bind_ip          — host's MESH IP (e.g. 100.X.Y.Z) for
+#                                   netbird-mesh peers post-enrollment.
+#                                   Empty string when the host isn't on
+#                                   the netbird data-plane mesh (vega
+#                                   Orins are NOT netbird peers; they
+#                                   reach mgmt-API over wg-cp0 only).
+# Optional:
+#   mesh_coredns_wg_cp0_bind_ip   — host's wg-cp0 IP (e.g. 198.18.0.1).
+#                                   When set, CoreDNS additionally binds
+#                                   on this address so wg-cp0-only peers
+#                                   (operator laptops in the bootstrap
+#                                   window) can query before netbird-mesh
+#                                   enrollment. Empty = no extra bind.
+
+# Defaults (override per-site only when needed):
+mesh_coredns_dir: /opt/goat/dns
+mesh_coredns_image: coredns/coredns:1.15.0
+mesh_coredns_port: 5353
+# Optional second bind for the wg-cp0 silent-control-plane interface.
+# Empty = no extra bind. Set to e.g. "198.18.0.1" to allow operator
+# laptops on wg-cp0 to resolve mesh-DNS records pre-netbird-enrollment.
+# Block 79 / docs/operations/operator-laptop-onboarding.md.
+mesh_coredns_wg_cp0_bind_ip: ""
+mesh_coredns_zone_dir: "{{ playbook_dir }}/../dns"
+# Match docker-compose volume mounts; used by docker-compose.yml.j2
+mesh_coredns_corefile_path: "{{ mesh_coredns_dir }}/Corefile"
+mesh_coredns_zone_path: "{{ mesh_coredns_dir }}/mesh-hosts"
+mesh_coredns_compose_path: "{{ mesh_coredns_dir }}/docker-compose.yml"
+mesh_coredns_owner: "{{ ansible_user }}"
+mesh_coredns_group: "{{ ansible_user }}"
+# Smoke-test target — a known mesh-internal DNS name expected to resolve.
+# Derives from the per-instance identity (the silent-control-plane mgmt VIP,
+# which mesh CoreDNS always serves: mgmt.<site_id>.<site_dns_zone>), so a new
+# env smoke-tests its OWN record instead of a legacy one. Previously hard-
+# coded to NETHOST's `legacy.examplebird.legacy.example`, which only resolved on
+# legacy — every other consumer (e.g. mgmt-host-dns.yml) silently tested a
+# foreign record. Override per-site if a different known record is preferred.
+mesh_coredns_smoke_test_name: "mgmt.{{ site_id }}.{{ site_dns_zone }}"
+
+# --- F-282: host-local mesh-zone resolver route -----------------------------
+# netbird's management (by design — peerIsNameserver in the network-map
+# assembly) never sends the mesh-zone nameserver group to a peer whose own IP
+# is one of the group's nameservers. The DNS-hosting node therefore cannot
+# resolve its own zone via netbird, ever. This route sends the zone to the
+# LOCAL CoreDNS listener (127.0.0.1:{{ mesh_coredns_port }}) via a
+# systemd-resolved drop-in — the nameserver group stays untouched (it must:
+# ADR 1056 island resilience needs the on-site server in the group, and
+# netbird groups allow exactly 1 or 3 servers).
+# Default-off (fail-closed, instance-variability model §1 C.1); enable
+# per-goatnet in group_vars. Rollback: flip false + re-run — the drop-in is
+# removed and systemd-resolved restarted. Containers are NOT covered by this
+# route (docker embedded DNS bypasses resolved routing — F-127); they keep
+# the established per-service extra_hosts idiom.
+mesh_coredns_host_zone_route_enabled: false
+mesh_coredns_host_zone_route_zone: "{{ site_dns_zone | mandatory }}"

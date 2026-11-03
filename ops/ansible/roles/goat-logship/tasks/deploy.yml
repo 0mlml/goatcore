@@ -1,0 +1,240 @@
+---
+# ops/ansible/roles/goat-logship
+#
+# Anchor: ADR 1078 + design/cyber-logging-and-conmon-export.md.
+# Deploys the Vector collector that normalizes host/OS + fabric security
+# events to OCSF and ships them off-box to Object-Lock S3, absence-alarmed.
+#
+# Additive + removable by pin-revert with no effect on the existing audit or
+# metrics planes (ADR 1078 §10).
+
+# 1. Pre-flight
+
+- name: Pre-flight — durable sink mode is valid
+  ansible.builtin.assert:
+    that:
+      - logship_durable_sink_mode in ['mock', 's3']
+    fail_msg: "logship_durable_sink_mode must be 'mock' or 's3' (got '{{ logship_durable_sink_mode }}')."
+
+- name: Pre-flight — S3 sink bucket is named (s3 mode)
+  ansible.builtin.assert:
+    that:
+      - logship_s3_bucket | length > 0
+      - logship_s3_region | length > 0
+    fail_msg: >
+      logship_s3_bucket / logship_s3_region must be set in s3 mode — the
+      off-box durable sink is the point of this collector (ADR 1078 §5).
+  when: logship_durable_sink_mode == 's3'
+
+- name: Pre-flight — external-collector egress requires a named endpoint when enabled
+  ansible.builtin.assert:
+    that:
+      - logship_collector_endpoint | length > 0
+    fail_msg: >
+      logship_sink_collector_enabled is true but logship_collector_endpoint is
+      empty. The egress adapter is default-off and only enabled against a
+      named, confirmed collector (ADR 1078 §10).
+  when: logship_sink_collector_enabled | bool
+
+- name: Pre-flight — S3 ingest credentials present (s3 mode)
+  ansible.builtin.assert:
+    that:
+      - logship_s3_access_key_id | length > 0
+      - logship_s3_secret_access_key | length > 0
+    fail_msg: >
+      LOGSHIP_S3_ACCESS_KEY_ID / LOGSHIP_S3_SECRET_ACCESS_KEY must be exported
+      (ingest-only key for the Object-Lock bucket). Never committed.
+  vars:
+    logship_s3_access_key_id: "{{ lookup('env', 'LOGSHIP_S3_ACCESS_KEY_ID') | default('', true) }}"
+    logship_s3_secret_access_key: "{{ lookup('env', 'LOGSHIP_S3_SECRET_ACCESS_KEY') | default('', true) }}"
+  when: logship_durable_sink_mode == 's3'
+
+# 2. Storage layout
+
+- name: Ensure Vector data dir exists (data_dir + disk buffer)
+  ansible.builtin.file:
+    path: "{{ logship_data_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Ensure mock OCSF sink dir exists (mock mode)
+  ansible.builtin.file:
+    path: "{{ logship_mock_sink_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  when: logship_durable_sink_mode == 'mock'
+
+# Make the "demonstration tail, not a store" claim true. tmpfiles rather than a
+# private timer because the host already runs systemd-tmpfiles-clean.timer
+# daily; a second scheduler for one age-based sweep would be mechanism nobody
+# needs. `e` acts only on an existing directory and removes contents older than
+# the age — it will not create, and it will not touch the dir itself.
+- name: Bound mock OCSF sink retention (mock mode)
+  ansible.builtin.copy:
+    content: |
+      # {{ ansible_managed }}
+      # goat-logship mock sink: keep {{ logship_mock_sink_retain_days }} days of
+      # dated OCSF files. The mock sink is non-durable by design (ADR 1078 §5);
+      # without this the tree grew to 172 GiB on mgmt-zagros-01-thor by
+      # . Swept by systemd-tmpfiles-clean.timer.
+      #
+      # The m: prefix is load-bearing. tmpfiles' default age-by is abcmABM,
+      # which includes ATIME — and any bulk read of the directory (a backup, a
+      # du, a grep) bumps atime on every file and makes the whole tree look
+      # new. That is not hypothetical: a plain `3d` rule matched
+      # ZERO of 36 files because something had read the directory three days
+      # earlier. These are dated append-only files; mtime is the only honest
+      # clock for them.
+      e {{ logship_mock_sink_dir }} - - - m:{{ logship_mock_sink_retain_days }}d
+    dest: /etc/tmpfiles.d/goat-logship-mock-sink.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: logship_durable_sink_mode == 'mock'
+  register: _logship_mock_tmpfiles
+
+# In s3 mode the local tail is not written, so a rule pointing at a dir that no
+# longer fills is dead config that outlives its reason.
+- name: Remove mock sink retention rule (s3 mode)
+  ansible.builtin.file:
+    path: /etc/tmpfiles.d/goat-logship-mock-sink.conf
+    state: absent
+  when: logship_durable_sink_mode != 'mock'
+
+# Apply immediately: a host carrying a large backlog should not wait for the
+# next daily sweep. --clean only removes by age; it creates nothing.
+- name: Apply mock sink retention now
+  ansible.builtin.command:
+    cmd: systemd-tmpfiles --clean /etc/tmpfiles.d/goat-logship-mock-sink.conf
+  when: _logship_mock_tmpfiles is changed
+  changed_when: true
+
+- name: Ensure compose dir exists
+  ansible.builtin.file:
+    path: "{{ logship_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 2b. config:change producer — auditd watch rules on the sensitive OS config.
+#     Fires into audit.log (already tailed), classified to OCSF config:change.
+#     Catches the out-of-band manual edit git/ansible can't see.
+
+- name: Probe for auditd (config:change producer)
+  ansible.builtin.stat:
+    path: /etc/audit/rules.d
+  register: _logship_auditd_rulesd
+  when: logship_source_config_change | bool
+
+- name: Install goat config-change auditd watch rules
+  ansible.builtin.template:
+    src: goat-config-change.rules.j2
+    dest: /etc/audit/rules.d/goat-config-change.rules
+    owner: root
+    group: root
+    mode: "0640"
+  when:
+    - logship_source_config_change | bool
+    - _logship_auditd_rulesd.stat.exists | default(false)
+  notify: goat-logship reload auditd
+
+# 3. Render compose + config + .env
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ logship_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: goat-logship compose changed
+
+- name: Render Vector config
+  ansible.builtin.template:
+    src: vector.yaml.j2
+    dest: "{{ logship_compose_dir }}/vector.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: goat-logship config changed
+
+- name: Render .env (AWS ingest creds; s3 mode only; mode 0600, never committed)
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ logship_compose_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: logship_durable_sink_mode == 's3'
+  notify: goat-logship compose changed
+
+- name: Ensure a .env exists so docker compose never warns on mock mode
+  ansible.builtin.copy:
+    content: "# mock mode — no AWS creds needed. Rendered by goat-logship role.\n"
+    dest: "{{ logship_compose_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+    force: false
+  when: logship_durable_sink_mode == 'mock'
+
+# 4. Bring up
+
+- name: Pull Vector image
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ logship_compose_dir }}"
+  changed_when: true
+
+- name: Bring up goat-logship
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ logship_compose_dir }}"
+  register: _logship_up
+  changed_when: "'Started' in _logship_up.stderr or 'Created' in _logship_up.stderr or 'Recreated' in _logship_up.stderr"
+
+- name: Wait for goat-logship self-metrics endpoint
+  ansible.builtin.uri:
+    url: "http://localhost:{{ logship_metrics_port }}/metrics"
+    status_code: 200
+  register: _logship_ready
+  retries: "{{ logship_health_retries }}"
+  delay: "{{ logship_health_delay_seconds }}"
+  until: _logship_ready.status == 200
+  changed_when: false
+
+# 5. Absence-alarm rules — drop into the obs-host rules dir when present
+#    (the Orin-C multi-tier stack). The single-Thor goat-obs stack carries
+#    the same rule statically at ops/compose/goat-obs/prometheus/rules/.
+
+- name: Check whether obs-host rules dir exists (co-location probe)
+  ansible.builtin.stat:
+    path: /opt/obs-host/rules
+  register: _logship_obs_rules_dir
+
+- name: Drop goat-logship.yml alert rules into obs-host rules dir
+  ansible.builtin.template:
+    src: prom-rules-goat-logship.yml.j2
+    dest: /opt/obs-host/rules/goat-logship.yml
+    owner: root
+    group: root
+    mode: "0644"
+  when: _logship_obs_rules_dir.stat.exists | default(false)
+  notify: prometheus reload from goat-logship role
+
+- name: Banner
+  ansible.builtin.debug:
+    msg: |
+      goat-logship up.
+        Self-metrics: http://{{ ansible_host }}:{{ logship_metrics_port }}/metrics
+        Durable sink ({{ logship_durable_sink_mode }}): {{ ('s3://' ~ logship_s3_bucket ~ ' (' ~ logship_s3_region ~ ')') if logship_durable_sink_mode == 's3' else (logship_mock_sink_dir ~ '/ocsf-*.json (local mock — swap to s3 by mode)') }}
+        external-collector egress: {{ 'ENABLED → ' ~ logship_collector_endpoint if logship_sink_collector_enabled else 'default-off' }}
+      Local retention: disk buffer {{ logship_buffer_max_bytes }} bytes{{
+        ' + mock sink ' ~ logship_mock_sink_retain_days ~ 'd of ocsf-*.json'
+        if logship_durable_sink_mode == 'mock' else ' (s3 mode — no local tail)' }}.

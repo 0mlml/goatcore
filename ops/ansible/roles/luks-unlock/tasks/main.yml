@@ -1,0 +1,942 @@
+---
+- name: Install base cryptsetup tooling
+  ansible.builtin.apt:
+    name: "{{ luks_packages_base }}"
+    state: present
+    update_cache: true
+
+# ---------------------------------------------------------------------------
+# Host-site node-class paths (docs/design/host-site-node-disk-encryption.md).
+# Both are OPT-IN via their own lists and default to [], so a caller that sets
+# only luks_volumes gets byte-identical behaviour to before this change.
+#
+#   installer-luks.yml    enroll an unattended-unlock mode (TPM2 on x86-with-TPM,
+#                         Clevis+Tang in initramfs on headless no-TPM) onto the
+#                         partition the OS INSTALLER already encrypted. Never
+#                         formats; add-only crypttab edit; fail-closed.
+#   encrypted-lv-carve.yml carve a data LV out of the free space in the existing
+#                         encrypted VG and mount it (F-093 Tier-3 on a single
+#                         full-disk-LUKS NVMe). Encryption inherited from the PV;
+#                         no new LUKS header.
+#
+# NOT CERTIFIED until run on one real box + a cold boot — see the design doc.
+# ---------------------------------------------------------------------------
+- name: Enroll unlock modes on installer-created LUKS partitions (node-class path)
+  ansible.builtin.include_tasks: installer-luks.yml
+  when: (luks_installer_partitions | default([])) | length > 0
+
+- name: Carve data LVs out of existing encrypted volume groups (node-class path)
+  ansible.builtin.include_tasks: encrypted-lv-carve.yml
+  when: (luks_encrypted_lvs | default([])) | length > 0
+
+- name: Collect unlock modes requested across all volumes
+  ansible.builtin.set_fact:
+    modes_requested: "{{ luks_volumes | map(attribute='unlock_modes') | flatten | unique }}"
+
+- name: Collect unlock modes flagged for active wipe (per-volume unlock_modes_disabled)
+  ansible.builtin.set_fact:
+    modes_to_disable: "{{ luks_volumes | map(attribute='unlock_modes_disabled') | select('defined') | flatten | unique | list }}"
+
+# ---------------------------------------------------------------------------
+# Active mode wipes (Block 65 toggle ergonomics — security-review-friendly).
+# `unlock_modes_disabled` (per-volume) is an opt-in list. For each entry,
+# the role wipes the corresponding LUKS keyslot if currently enrolled.
+# Wipes happen BEFORE enrollment tasks so a single role run can both
+# remove and add modes (e.g. swap fido2 keys: disable + re-enroll).
+#
+# Safety: each wipe task pre-flights that the volume retains AT LEAST
+# ONE other working keyslot — the role refuses to wipe the last unlock
+# path. Slot 0 (passphrase) is the always-available recovery; the role
+# never wipes passphrase via this mechanism (operator must use cryptsetup
+# luksRemoveKey directly with explicit confirmation).
+#
+# See role README §"Disabling a mode for a security review" for the
+# full operational pattern.
+# ---------------------------------------------------------------------------
+
+- name: Wipe FIDO2 keyslot when explicitly disabled
+  ansible.builtin.command:
+    cmd: systemd-cryptenroll --wipe-slot=fido2 {{ vol.device }}
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }}"
+  when:
+    - "'fido2' in (vol.unlock_modes_disabled | default([]))"
+
+- name: Wipe TPM2 keyslot when explicitly disabled
+  ansible.builtin.command:
+    cmd: systemd-cryptenroll --wipe-slot=tpm2 {{ vol.device }}
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }}"
+  when:
+    - "'tpm2' in (vol.unlock_modes_disabled | default([]))"
+
+- name: Wipe Clevis (Tang/SSS) keyslot when tang_client explicitly disabled
+  # `clevis luks unbind` is the right primitive; falls back to
+  # systemd-cryptenroll --wipe-slot=clevis if needed.
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      slot=$(cryptsetup luksDump --dump-json-metadata "{{ vol.device }}" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); \
+                      tokens=d.get('tokens',{}); \
+                      slots=[t.get('keyslots',[]) for t in tokens.values() if t.get('type')=='clevis']; \
+                      print(slots[0][0] if slots and slots[0] else '')")
+      if [ -n "$slot" ]; then
+        clevis luks unbind -d {{ vol.device }} -s "$slot" -f
+      fi
+    executable: /bin/bash
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }}"
+  when:
+    - "'tang_client' in (vol.unlock_modes_disabled | default([]))"
+
+# ---------------------------------------------------------------------------
+# Optional: format-if-unformatted. Idempotent. Only acts on volumes that
+# explicitly opt in via `format_if_unformatted: true` AND that aren't already
+# LUKS-formatted. Passphrase comes from `vol.passphrase` (typically resolved
+# via `lookup('env', '<HOST>_LUKS_PASS')`). Without an explicit opt-in, this
+# block is a no-op — preserving the role's prior contract that destructive
+# format is operator-only.
+# ---------------------------------------------------------------------------
+
+- name: Probe each volume for existing LUKS header
+  ansible.builtin.command:
+    cmd: "cryptsetup isLuks {{ item.device }}"
+  register: vol_is_luks
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.device }})"
+
+- name: Refuse to format when format_if_unformatted=true but no passphrase supplied
+  ansible.builtin.fail:
+    msg: >-
+      Volume '{{ item.item.name }}' has format_if_unformatted=true but
+      vol.passphrase is empty. Set the passphrase via env (e.g.
+      lookup('env','<HOST>_LUKS_PASS')) before running this role.
+  loop: "{{ vol_is_luks.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when:
+    - item.item.format_if_unformatted | default(luks_format_if_unformatted_default) | bool
+    - item.rc != 0
+    - (item.item.passphrase | default('')) | length == 0
+
+# ---------------------------------------------------------------------------
+# F-392 — refuse to luksFormat a device that is carrying live data.
+#
+# `luksFormat` writes a new header over whatever is there. The only refusal
+# ahead of it was "no passphrase supplied", so a correct passphrase plus a
+# wrong device was an unguarded path to destroying the host.
+#
+# The usual `device: /dev/nvme0n1` for docker-data assumes the Orin layout, where
+# that is a dedicated second NVMe and root lives elsewhere. On a Jetson AGX
+# Thor developer kit there is no eMMC: /dev/nvme0n1 IS the root disk, holding
+# an 11-partition GPT with / on p1. `cryptsetup isLuks` returns non-zero for
+# it — correctly, it is not a LUKS device — so `format_if_unformatted` reads
+# that as "blank, go ahead" and the next task formats the running system.
+#
+# The check is on the PARENT device as well as the partition: naming
+# /dev/nvme0n1 while / is on /dev/nvme0n1p1 must refuse, and lsblk -s gives us
+# the whole tree under the named device in one call.
+#
+# Deliberately a hard fail with no override variable. An operator who really
+# means to wipe a disk with a mounted filesystem on it can unmount it first,
+# which is a step they will not take by accident.
+- name: "F-392 — collect mounted filesystems beneath each LUKS target device"
+  ansible.builtin.command:
+    cmd: "lsblk -n -o MOUNTPOINT {{ item.device }}"
+  register: vol_mountpoints
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.device }})"
+
+- name: "F-392 — refuse to format a device that carries a mounted filesystem"
+  ansible.builtin.fail:
+    msg: |
+      REFUSED: {{ item.item.device }} carries a mounted filesystem and this run
+      would luksFormat it.
+
+      Mounted beneath {{ item.item.device }}:
+      {{ item.stdout_lines | reject('equalto', '') | list | join('\n  ') }}
+
+      Volume '{{ item.item.name }}' is declared with format_if_unformatted, and
+      `cryptsetup isLuks` says this device has no LUKS header — which is true,
+      and is exactly what a live root disk looks like. Formatting it destroys
+      the running system.
+
+      The usual cause is a host whose disk layout differs from the group it was
+      placed in. Every mgmt group here names /dev/nvme0n1 for docker-data
+      because on an Orin that is a dedicated second NVMe. On a Jetson AGX Thor
+      dev kit there is no eMMC and /dev/nvme0n1 is the ROOT disk.
+
+      Fix the device in that host's group_vars to name a disk that is genuinely
+      spare, or give the host its own group. If you truly mean to wipe a disk
+      that has something mounted on it, unmount it first — there is no override
+      flag here on purpose.
+  loop: "{{ vol_mountpoints.results }}"
+  loop_control:
+    label: "{{ item.item.name }} ({{ item.item.device }})"
+  when:
+    - item.item.format_if_unformatted | default(luks_format_if_unformatted_default) | bool
+    - (vol_is_luks.results | selectattr('item.name', 'equalto', item.item.name) | map(attribute='rc') | first) != 0
+    - (item.stdout_lines | default([]) | reject('equalto', '') | list | length) > 0
+
+- name: Format LUKS2 volume (only if device has no LUKS header)
+  ansible.builtin.shell:
+    cmd: >-
+      printf '%s' "{{ item.item.passphrase }}"
+      | cryptsetup luksFormat --type luks2 --batch-mode --key-file - "{{ item.item.device }}"
+  no_log: true
+  loop: "{{ vol_is_luks.results }}"
+  loop_control:
+    label: "{{ item.item.name }} (already_luks={{ item.rc == 0 }})"
+  when:
+    - item.item.format_if_unformatted | default(luks_format_if_unformatted_default) | bool
+    - item.rc != 0
+    - (item.item.passphrase | default('')) | length > 0
+
+- name: Probe each LUKS-mapped device for current open state
+  ansible.builtin.stat:
+    path: "/dev/mapper/{{ item.name }}"
+  register: vol_mapper_stat
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Open LUKS volume (only if mapper device not yet present)
+  ansible.builtin.shell:
+    cmd: >-
+      printf '%s' "{{ item.item.passphrase }}"
+      | cryptsetup luksOpen --key-file - "{{ item.item.device }}" "{{ item.item.name }}"
+  no_log: true
+  loop: "{{ vol_mapper_stat.results }}"
+  loop_control:
+    label: "{{ item.item.name }} (open={{ item.stat.exists }})"
+  when:
+    - not item.stat.exists
+    - (item.item.passphrase | default('')) | length > 0
+
+- name: Probe filesystem on each opened LUKS mapper
+  ansible.builtin.command:
+    cmd: "blkid -s TYPE -o value /dev/mapper/{{ item.name }}"
+  register: vol_fs_check
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Create filesystem on opened LUKS mapper (only if blkid reports none)
+  ansible.builtin.command:
+    cmd: "mkfs.{{ item.item.filesystem }} -L {{ item.item.name }} /dev/mapper/{{ item.item.name }}"
+  loop: "{{ vol_fs_check.results }}"
+  loop_control:
+    label: "{{ item.item.name }} (fs={{ item.stdout | default('none') }})"
+  when:
+    - item.item.format_if_unformatted | default(luks_format_if_unformatted_default) | bool
+    - (item.stdout | default('')) | length == 0
+
+- name: Ensure mount point exists for each LUKS volume
+  ansible.builtin.file:
+    path: "{{ item.mount_point }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.mount_point }}"
+
+- name: Install TPM2 tooling when requested
+  ansible.builtin.apt:
+    name: "{{ luks_packages_tpm2 }}"
+    state: present
+  when: "'tpm2' in modes_requested or 'sss' in modes_requested"
+
+- name: Install FIDO2 tooling when requested
+  ansible.builtin.apt:
+    name: "{{ luks_packages_fido2 }}"
+    state: present
+  when: "'fido2' in modes_requested"
+
+- name: Install SSS tooling when requested
+  ansible.builtin.apt:
+    name: "{{ luks_packages_sss }}"
+    state: present
+  when: "'sss' in modes_requested"
+
+- name: Install Tang-client tooling when requested
+  ansible.builtin.apt:
+    name: "{{ luks_packages_tang_client }}"
+    state: present
+  when: "'tang_client' in modes_requested"
+
+- name: Discover LUKS device UUIDs (for crypttab — must be real UUIDs, not shell substitutions)
+  ansible.builtin.command:
+    cmd: "blkid -s UUID -o value {{ item.device }}"
+  register: vol_uuid_lookup
+  changed_when: false
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.device }})"
+
+- name: Build a name → UUID dict for crypttab template
+  ansible.builtin.set_fact:
+    luks_volume_uuids: "{{ dict(vol_uuid_lookup.results | map(attribute='item.name') | zip(vol_uuid_lookup.results | map(attribute='stdout'))) }}"
+
+# GUARD (node-class safety): only (re)render /etc/crypttab from this role's
+# template when the role actually manages one or more `luks_volumes`. On an
+# installer-LUKS node whose only work is installer-luks.yml + encrypted-lv-carve.yml
+# (luks_volumes == []), this template would otherwise render to just its header
+# and CLOBBER the installer's own root crypttab entry — an unbootable box. The
+# installer-luks path edits the existing crypttab in place instead.
+- name: Render /etc/crypttab
+  ansible.builtin.template:
+    src: crypttab.j2
+    dest: /etc/crypttab
+    owner: root
+    group: root
+    mode: "0644"
+  when: (luks_volumes | length) > 0
+  notify: regenerate initramfs
+
+- name: Render /etc/fstab entries for LUKS-mapped volumes
+  ansible.builtin.blockinfile:
+    path: /etc/fstab
+    marker: "# {mark} LUKS-UNLOCK ROLE (managed)"
+    block: |
+      {% for vol in luks_volumes %}
+      /dev/mapper/{{ vol.name }} {{ vol.mount_point }} {{ vol.filesystem }} defaults,noauto 0 2
+      {% endfor %}
+  when: (luks_volumes | length) > 0
+
+# Per Block 65A.1 cold-boot drill: simple string-replacement of
+# `/` with `-` is wrong for path components that themselves contain `-`
+# (e.g. `/opt/docker-data` → systemd unit name is `opt-docker\x2ddata.mount`,
+# NOT `opt-docker-data.mount` which addresses `/opt/docker/data`). Use
+# `systemd-escape --path` for the unit-file basename AND `systemd-escape`
+# for the cryptsetup-instance name (templated into the mount unit's
+# Requires/After lines). Without this, the mount unit's filename doesn't
+# match what systemd looks for at boot, the LUKS unlock fires but the
+# mount never happens.
+
+- name: Compute systemd-escaped mount unit basename per volume
+  ansible.builtin.command:
+    cmd: "systemd-escape --path {{ vol.mount_point }}"
+  register: vol_mount_escape
+  changed_when: false
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }} ({{ vol.mount_point }})"
+
+- name: Compute systemd-escaped cryptsetup instance name per volume
+  ansible.builtin.command:
+    cmd: "systemd-escape {{ vol.name }}"
+  register: vol_cs_escape
+  changed_when: false
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }}"
+
+- name: Build name → escaped-name dicts for the mount-unit template
+  ansible.builtin.set_fact:
+    luks_mount_unit_basenames: "{{ dict(vol_mount_escape.results | map(attribute='vol.name') | zip(vol_mount_escape.results | map(attribute='stdout'))) }}"
+    luks_cs_instance_names: "{{ dict(vol_cs_escape.results | map(attribute='vol.name') | zip(vol_cs_escape.results | map(attribute='stdout'))) }}"
+
+- name: Render systemd mount unit templates
+  ansible.builtin.template:
+    src: mount-unit.j2
+    dest: "/etc/systemd/system/{{ luks_mount_unit_basenames[vol.name] }}.mount"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }} -> {{ luks_mount_unit_basenames[vol.name] }}.mount"
+  notify: reload systemd
+
+# The mount unit's `[Install] RequiredBy=` only creates a
+# `<svc>.service.requires/` symlink — that is Requires= with NO ordering, so a
+# consumer may still start BEFORE the mount completes. containerd.service needs
+# an explicit dependency: without one it starts against the BARE mountpoint
+# while the LUKS volume is locked and builds an empty state tree on the eMMC,
+# which presents as total data loss (0 containers, 0 images).
+#
+# `RequiresMountsFor=` is the correct systemd idiom — it implies BOTH Requires=
+# AND After= on the mount unit covering that path. Rendered as a drop-in per
+# declared consumer so the guarantee survives a package upgrade replacing the
+# vendor unit.
+- name: Ensure drop-in dir for each service that requires a LUKS mount
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item.1 }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ luks_volumes | subelements('systemd_requires', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1 }} (needs {{ item.0.mount_point }})"
+
+- name: Render RequiresMountsFor drop-in so consumers never start on a bare mountpoint
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.1 }}.d/10-require-{{ item.0.name }}-mount.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by the luks-unlock Ansible role. Do not edit on the host.
+      # RequiresMountsFor implies Requires= AND After= on the mount unit for this
+      # path. Without the ordering half, this service can start while the LUKS
+      # volume is still locked and silently build state on the bare mountpoint.
+      [Unit]
+      RequiresMountsFor={{ item.0.mount_point }}
+  loop: "{{ luks_volumes | subelements('systemd_requires', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1 }} -> RequiresMountsFor={{ item.0.mount_point }}"
+  notify: reload systemd
+
+# Per Block 65A.1 cold-boot drill: rendering the mount unit
+# isn't enough — systemd needs the unit linked into multi-user.target.wants/
+# before it'll be activated at boot. Without `enable`, the unit exists but
+# is dormant; the LUKS volume gets unlocked by systemd-cryptsetup at boot
+# but the filesystem never gets mounted. `enabled` is required for any
+# auto-unseal mode (tpm2 / sss / tang_client) to deliver hands-off
+# continuity.
+- name: Enable systemd mount unit (boot-time activation via multi-user.target.wants)
+  ansible.builtin.systemd:
+    name: "{{ luks_mount_unit_basenames[vol.name] }}.mount"
+    enabled: true
+    daemon_reload: true
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }} -> {{ luks_mount_unit_basenames[vol.name] }}.mount"
+  when: "(vol.unlock_modes | intersect(['tpm2', 'sss', 'tang_client'])) | length > 0"
+
+- name: Enforce — SSS enrollment requires interactive wrapper (not run here)
+  ansible.builtin.debug:
+    msg: >-
+      Mode 'sss' for volume '{{ vol.name }}' requires interactive enrollment:
+      run `sudo clevis luks bind -d {{ vol.device }} sss '{...}'`
+      after this role completes. Ansible deliberately does not handle
+      SSS-threshold composition (Phase 3+).
+  loop: "{{ luks_volumes | subelements('unlock_modes') }}"
+  loop_control:
+    loop_var: vol_mode
+    # Without a label, Ansible's skip / item output prints the whole
+    # subelement tuple — which includes the volume dict's `passphrase`
+    # field. Constrain to non-secret summary.
+    label: "{{ vol_mode.0.name }} (mode={{ vol_mode.1 }})"
+  no_log: true
+  vars:
+    vol: "{{ vol_mode.0 }}"
+    mode: "{{ vol_mode.1 }}"
+  when: mode == 'sss'
+
+# ---------------------------------------------------------------------------
+# TPM2 enrollment (Block 65A.1, codified). Idempotent +
+# non-interactive on systemd 249 (Ubuntu 22.04 / JetPack 6.1).
+#
+# systemd-cryptenroll 249 doesn't honor `$PASSWORD` env var or stdin pipe
+# for the existing-slot passphrase — it uses the systemd ask-password
+# socket protocol. `--unlock-key-file=` was added in systemd 251.
+#
+# Mechanism: ship `files/tpm2-enroll-helper.sh` to the host, which runs
+# systemd-cryptenroll in a subshell, watches /run/systemd/ask-password/
+# for the request file, and answers the socket via Python from a
+# passphrase fed on stdin. Works under SSH BatchMode without TTY.
+# ---------------------------------------------------------------------------
+
+- name: Probe LUKS header for existing TPM2 token (idempotency check)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      cryptsetup luksDump --dump-json-metadata "{{ item.0.device }}" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); \
+                      tokens=d.get('tokens',{}); \
+                      print('present' if any(t.get('type')=='systemd-tpm2' for t in tokens.values()) else 'absent')"
+    executable: /bin/bash
+  register: tpm2_slot_check
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes | subelements('unlock_modes') }}"
+  loop_control:
+    label: "{{ item.0.name }} (mode={{ item.1 }})"
+  when: item.1 == 'tpm2'
+
+- name: Probe for TPM2 device (systemd-cryptenroll --tpm2-device=list)
+  ansible.builtin.command:
+    cmd: systemd-cryptenroll --tpm2-device=list
+  register: tpm2_device_probe
+  changed_when: false
+  failed_when: false
+
+- name: Set fact — TPM2 device reachable on this host
+  ansible.builtin.set_fact:
+    tpm2_device_present: >-
+      {{ (tpm2_device_probe.rc | default(1)) == 0
+         and (tpm2_device_probe.stdout_lines | default([]) | length) > 1 }}
+
+- name: Notice — TPM2 enrollment requested but no device present, skipping
+  ansible.builtin.debug:
+    msg: >-
+      Volume {{ item.item.0.name }}: TPM2 mode requested but no TPM2 device
+      visible to systemd-cryptenroll. Skipping enrollment — passphrase + FIDO2
+      remain usable. On Orin: 65A.0 fTPM availability spike must PASS first
+      (`/dev/tpm0` + tpm_ftpm_tee on JetPack 6.1).
+  loop: "{{ tpm2_slot_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.name }}"
+  when:
+    - item is not skipped
+    - (item.stdout | default('present')) == 'absent'
+    - not tpm2_device_present
+
+- name: Stage tpm2-enroll-helper.sh on target
+  ansible.builtin.copy:
+    src: tpm2-enroll-helper.sh
+    dest: /usr/local/sbin/tpm2-enroll-helper.sh
+    owner: root
+    group: root
+    mode: '0755'
+  when:
+    - tpm2_slot_check.results is defined
+    - tpm2_slot_check.results | selectattr('stdout', 'defined') | selectattr('stdout', 'equalto', 'absent') | list | length > 0
+    - tpm2_device_present | default(false)
+
+- name: Enroll TPM2 keyslot via helper (non-interactive, ask-password socket-answer pattern)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      printf '%s\n' "$LUKS_PASSPHRASE" | \
+        LUKS_DEV="{{ item.item.0.device }}" \
+        PCRS="{{ luks_tpm2_pcrs | join('+') }}" \
+        bash /usr/local/sbin/tpm2-enroll-helper.sh
+    executable: /bin/bash
+  environment:
+    LUKS_PASSPHRASE: "{{ item.item.0.passphrase }}"
+  loop: "{{ tpm2_slot_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.name }}"
+  when:
+    - item is not skipped
+    - (item.stdout | default('present')) == 'absent'
+    - tpm2_device_present
+    - (item.item.0.passphrase | default('')) | length > 0
+  no_log: true
+
+# ---------------------------------------------------------------------------
+# FIDO2 enrollment. Idempotent + graceful: probes luksDump JSON metadata for
+# an existing `systemd-fido2` token AND probes the host for a connected
+# FIDO2 device. Enrollment runs only when token is absent AND a FIDO2 device
+# is reachable. Without a device present, the task is skipped with a notice
+# (passphrase mode keeps the volume usable; re-running with a YubiKey
+# inserted later will complete the FIDO2 slot).
+#
+# Passphrase is passed via the systemd-cryptenroll(1) `$PASSWORD` env var —
+# the documented non-interactive idiom for systemd 249 (Ubuntu 22.04 / Tegra)
+# which lacks `--unlock-key-file=`. No on-disk tempfile is needed.
+# ---------------------------------------------------------------------------
+
+- name: Probe LUKS header for existing FIDO2 token (idempotency check)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      cryptsetup luksDump --dump-json-metadata "{{ item.0.device }}" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); \
+                      tokens=d.get('tokens',{}); \
+                      print('present' if any(t.get('type')=='systemd-fido2' for t in tokens.values()) else 'absent')"
+    executable: /bin/bash
+  register: fido2_slot_check
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes | subelements('unlock_modes') }}"
+  loop_control:
+    label: "{{ item.0.name }} (mode={{ item.1 }})"
+  when: item.1 == 'fido2'
+
+- name: Probe for connected FIDO2 device (skip enrollment cleanly when absent)
+  ansible.builtin.command:
+    cmd: systemd-cryptenroll --fido2-device=list
+  register: fido2_device_probe
+  changed_when: false
+  failed_when: false
+
+- name: Set fact — FIDO2 device reachable on this host
+  ansible.builtin.set_fact:
+    fido2_device_present: >-
+      {{ (fido2_device_probe.rc | default(1)) == 0
+         and (fido2_device_probe.stdout_lines | default([]) | length) > 1 }}
+
+- name: Notice — FIDO2 enrollment requested but no device present, skipping
+  ansible.builtin.debug:
+    msg: >-
+      Volume {{ item.item.0.name }}: FIDO2 mode requested but no FIDO2 device
+      connected to host. Skipping enrollment — passphrase mode keeps the
+      volume usable. Re-run this role with a YubiKey inserted to complete the
+      FIDO2 slot.
+  loop: "{{ fido2_slot_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.name }}"
+  when:
+    - item is not skipped
+    - (item.stdout | default('present')) == 'absent'
+    - not fido2_device_present
+
+- name: Wipe existing FIDO2 keyslot when force-reenroll requested (Block 65D.3 path)
+  ansible.builtin.command:
+    cmd: systemd-cryptenroll --wipe-slot=fido2 {{ item.item.0.device }}
+  environment:
+    PASSWORD: "{{ item.item.0.passphrase }}"
+  loop: "{{ fido2_slot_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.name }}"
+  when:
+    - item is not skipped
+    - (item.stdout | default('absent')) == 'present'
+    - luks_fido2_force_reenroll | bool
+    - fido2_device_present
+    - (item.item.0.passphrase | default('')) | length > 0
+  no_log: true
+  register: fido2_wipe_result
+
+# F-075 fix: use a DIFFERENT register name from the upstream
+# probe (`fido2_slot_check`). `register:` fires even when a task is skipped
+# due to `when:`, so reusing the name silently overwrites the upstream
+# probe's results with a list of skipped entries — and the Enroll task's
+# `loop: fido2_slot_check.results` then sees `item is not skipped: false`
+# for every entry and skips itself. The Enroll task's loop selects between
+# this re-probe and the original probe based on whether force-reenroll fired.
+- name: Re-probe FIDO2 token presence after wipe (so enroll task fires when wipe ran)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      cryptsetup luksDump --dump-json-metadata "{{ item.0.device }}" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); \
+                      tokens=d.get('tokens',{}); \
+                      print('present' if any(t.get('type')=='systemd-fido2' for t in tokens.values()) else 'absent')"
+    executable: /bin/bash
+  register: fido2_slot_check_after_wipe
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes | subelements('unlock_modes') }}"
+  loop_control:
+    label: "{{ item.0.name }} (mode={{ item.1 }})"
+  when:
+    - item.1 == 'fido2'
+    - luks_fido2_force_reenroll | bool
+
+- name: Pause briefly — operator should have YubiKey inserted before continuing
+  ansible.builtin.pause:
+    seconds: 10
+    prompt: |
+      ============================================================
+      FIDO2 LUKS slot enrollment about to run.
+        Volume:           {{ item.item.0.name }} ({{ item.item.0.device }})
+        User-presence:    {{ luks_fido2_user_presence | bool }} (tap required at every boot: {{ luks_fido2_user_presence | bool }})
+        Client-PIN:       {{ luks_fido2_with_pin | bool }}
+      ACTION REQUIRED:
+        1. YubiKey must be inserted in target host's USB port NOW.
+        2. When systemd-cryptenroll prompts during enrollment, TAP the
+           YubiKey button within ~30 seconds (the enrollment step itself
+           always requires presence even when the resulting keyslot does not).
+      {% if not (luks_fido2_user_presence | bool) %}
+      DOCTRINE NOTICE — Block 65D presence-via-removal (ADR 0612):
+        After enrollment, the YubiKey is NOT to be stored in this host
+        during steady-state operation. Insertion at the boot ceremony IS
+        the operator's asynchronous consent. Cold-boot with no YubiKey
+        present must FAIL to unlock; this is the security property.
+      {% endif %}
+      Auto-continuing in 10 seconds — Ctrl-C now if not ready.
+      ============================================================
+  # F-075: same loop-source selection as the Enroll task below.
+  loop: "{{ (fido2_slot_check_after_wipe.results if (luks_fido2_force_reenroll | bool) else fido2_slot_check.results) | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.name }}"
+  when:
+    - item is not skipped
+    - (item.stdout | default('present')) == 'absent'
+    - fido2_device_present
+
+# F-075 fix: loop source picks between the post-wipe re-probe
+# (when force-reenroll just ran) and the original idempotency probe
+# (default flow — re-probe was skipped, so its results contain skipped
+# entries that would make every iteration `item is not skipped` false).
+- name: Enroll FIDO2 slot via systemd-cryptenroll (BLOCKS for YubiKey tap during enrollment)
+  ansible.builtin.command:
+    cmd: >-
+      systemd-cryptenroll
+      --fido2-device={{ luks_fido2_device }}
+      --fido2-with-user-presence={{ 'yes' if (luks_fido2_user_presence | bool) else 'no' }}
+      --fido2-with-client-pin={{ 'yes' if (luks_fido2_with_pin | bool) else 'no' }}
+      {{ item.item.0.device }}
+  environment:
+    PASSWORD: "{{ item.item.0.passphrase }}"
+  loop: "{{ (fido2_slot_check_after_wipe.results if (luks_fido2_force_reenroll | bool) else fido2_slot_check.results) | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.name }}"
+  when:
+    - item is not skipped
+    - (item.stdout | default('present')) == 'absent'
+    - fido2_device_present
+    - (item.item.0.passphrase | default('')) | length > 0
+  register: fido2_enroll_result
+  no_log: true
+
+# Block 65D.3 / F-054 — detect the YubiKey 5 FIPS override of `up=no`. systemd-cryptenroll
+# emits "Locking without user presence test requested, but FIDO2 device <path> requires
+# it, enabling." when the authenticator forces user-presence regardless of the relying-party
+# request. We surface this via a per-host fact + a debug notice so the operator + future
+# role runs know that the doctrine on this hardware reverts to "tap-required at every
+# unlock." See docs/findings/F-054-yubikey-5-fips-overrides-fido2-with-user-presence-no.md.
+- name: Detect YubiKey FIPS-class user-presence override
+  ansible.builtin.set_fact:
+    luks_fido2_up_override_observed: >-
+      {{ fido2_enroll_result.results
+         | default([])
+         | selectattr('stderr', 'defined')
+         | selectattr('stderr', 'search', 'requires it, enabling')
+         | list | length > 0 }}
+  when: fido2_enroll_result is defined
+
+- name: Notice — YubiKey FIPS override observed, doctrine reverts to tap-required
+  ansible.builtin.debug:
+    msg: |
+      ============================================================
+      F-054 fired on this host — FIDO2 device enforced user-presence
+      regardless of --fido2-with-user-presence=no. The new FIDO2
+      keyslot will require a button-tap at every unlock.
+
+      Mode D ("presence-via-removal" doctrine, Block 65D / ADR 0612)
+      collapses to UX-only on this hardware. Continuity-priority
+      property does NOT apply — fall back to Modes A (fTPM) + B
+      (dropbear-initramfs) + C (Tang) for hands-off recovery.
+
+      See docs/findings/F-054-yubikey-5-fips-overrides-fido2-with-user-presence-no.md
+      ============================================================
+  when:
+    - luks_fido2_up_override_observed | default(false) | bool
+    - not (luks_fido2_user_presence | bool)
+
+# ---------------------------------------------------------------------------
+# Tang client (Block 65C). Idempotent: clevis luks bind is rejected by clevis
+# itself on a slot already bound to the same URL; we additionally probe the
+# luksDump JSON metadata for an existing `clevis` token mentioning the
+# target URL before binding, to keep the role re-run as a no-op once each
+# server is bound.
+#
+# Pre-flight: every Tang URL MUST resolve to a wg-cp0-internal address
+# (198.18.0.0/24). This enforces the "Tang never reachable from the public
+# internet" invariant of Block 65C and the silent-control-plane invariant
+# of Block 22 / ADR 0313. A non-internal URL fails the play loudly.
+# ---------------------------------------------------------------------------
+
+# ADR 0313 silent-control-plane invariant prohibits PUBLIC-INTERNET Tang
+# exposure. Same-site CGNAT-private LAN (e.g. 192.168.x.x at a Satlink
+# site) is NOT public-internet — it qualifies as a private substrate
+# suitable for Tang peer-binding. Pre-flight accepts:
+#   - wg-cp0 internal range (198.18.0.0/24 or legacy 10.99.0.0/24)
+#   - explicit per-server `class: lan` opt-in (operator declares LAN URL)
+# Pre-flight rejects everything else (public IPs, hostnames). Per F-060,
+# the wg-cp0 substrate is hub-and-spoke today, so peer-Tang between two
+# same-site mgmt-hosts uses the shared LAN with class=lan as an interim.
+- name: Pre-flight — assert every Tang URL targets a private substrate (wg-cp0 or explicit-LAN)
+  ansible.builtin.fail:
+    msg: >-
+      Tang server {{ item.name }} url={{ item.url }} is not wg-cp0-internal
+      (198.18.0.0/24 or legacy 10.99.0.0/24) AND `class: lan` is not set.
+      Block 65C requires Tang on a private substrate; public Tang is rejected.
+  loop: "{{ luks_tang_servers }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.url }})"
+  when:
+    - "'tang_client' in modes_requested"
+    - not (item.url is regex('^https?://198\\.18\\.0\\.[0-9]+(:[0-9]+)?(/.*)?$'))
+    - not (item.url is regex('^https?://10\\.99\\.0\\.[0-9]+(:[0-9]+)?(/.*)?$'))
+    - (item.class | default('wg-cp0')) != 'lan'
+
+# F-575: one Tang server is a single point of failure for an unattended boot.
+# Two are not enough if both can be down at once; with one, any single sibling's
+# bad boot strands the host.
+- name: Pre-flight — a tang_client volume needs at least luks_tang_min_reachable Tang servers
+  ansible.builtin.assert:
+    that: (luks_tang_servers | length) >= (luks_tang_min_reachable | int)
+    fail_msg: >-
+      {{ inventory_hostname }} binds a tang_client volume to {{ luks_tang_servers | length }}
+      Tang server(s); at least {{ luks_tang_min_reachable }} are required so one
+      sibling's failed boot cannot leave this host locked. Add servers to
+      luks_tang_servers, or lower luks_tang_min_reachable with a recorded reason.
+  when: "'tang_client' in modes_requested"
+
+- name: Probe LUKS header for existing clevis-tang bindings (idempotency check)
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      cryptsetup luksDump --dump-json-metadata "{{ vol.0.device }}" \
+        | python3 -c "import json,sys,re; \
+          d=json.load(sys.stdin); \
+          tokens=d.get('tokens',{}); \
+          bound=[]; \
+          [bound.append(t.get('jwe','')) for t in tokens.values() if t.get('type')=='clevis']; \
+          print('|'.join(bound))"
+    executable: /bin/bash
+  register: tang_existing
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes | subelements('unlock_modes') }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.0.name }} (mode={{ vol.1 }})"
+  when: vol.1 == 'tang_client'
+
+- name: Bind each Tang server as an additional LUKS keyslot (idempotent — skip if URL already bound)
+  # Loop over (volume, tang_server) pairs. Idempotency: probe existing
+  # Clevis bindings via `clevis luks list` and skip when the URL is
+  # already bound to this device. Without this guard, repeat runs add
+  # duplicate slots, for example when a 2-way bind is extended to a 3-way mesh.
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      if clevis luks list -d "{{ item.0.device }}" 2>/dev/null \
+         | grep -F '{{ item.1.url }}' > /dev/null; then
+        echo "ALREADY BOUND: {{ item.1.url }}"
+        exit 0
+      fi
+      printf '%s' "{{ item.0.passphrase }}" \
+        | clevis luks bind -y -k - \
+            -d "{{ item.0.device }}" \
+            tang '{"url":"{{ item.1.url }}"}'
+    executable: /bin/bash
+  register: tang_bind_result
+  changed_when: "'ALREADY BOUND' not in (tang_bind_result.stdout | default(''))"
+  no_log: true
+  loop: "{{ (luks_volumes | selectattr('unlock_modes', 'contains', 'tang_client') | list) | product(luks_tang_servers) | list }}"
+  loop_control:
+    label: "{{ item.0.name }} -> {{ item.1.name }} ({{ item.1.url }})"
+  when:
+    - "'tang_client' in modes_requested"
+    - (item.0.passphrase | default('')) | length > 0
+
+# ---------------------------------------------------------------------------
+# Post-boot auto-unlock for clevis-delivered modes. The volume stays
+# `noauto` in crypttab; this oneshot unlocks + mounts + starts consumers once
+# the system is up, where a failure cannot hang boot.
+# ---------------------------------------------------------------------------
+- name: Install post-boot unlock script for clevis-backed volumes
+  ansible.builtin.template:
+    src: goat-unlock.sh.j2
+    dest: "/usr/local/sbin/goat-unlock-{{ vol.name }}.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }}"
+  # Ansible has no `intersect` TEST for selectattr (it is a filter), so the
+  # clevis-mode check rides a per-item `when`, matching the pattern already used
+  # elsewhere in this repo.
+  when: (vol.unlock_modes | default([]) | intersect(['tang_client', 'sss'])) | length > 0
+
+- name: Install post-boot unlock unit for clevis-backed volumes
+  ansible.builtin.template:
+    src: goat-unlock.service.j2
+    dest: "/etc/systemd/system/goat-unlock-{{ vol.name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }}"
+  # Ansible has no `intersect` TEST for selectattr (it is a filter), so the
+  # clevis-mode check rides a per-item `when`, matching the pattern already used
+  # elsewhere in this repo.
+  when: (vol.unlock_modes | default([]) | intersect(['tang_client', 'sss'])) | length > 0
+  notify: reload systemd
+
+- name: Enable post-boot unlock unit
+  ansible.builtin.systemd:
+    name: "goat-unlock-{{ vol.name }}.service"
+    enabled: true
+    daemon_reload: true
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name }}"
+  # Ansible has no `intersect` TEST for selectattr (it is a filter), so the
+  # clevis-mode check rides a per-item `when`, matching the pattern already used
+  # elsewhere in this repo.
+  when: (vol.unlock_modes | default([]) | intersect(['tang_client', 'sss'])) | length > 0
+
+# F-575: measure and restore, every luks_health_interval, what decides whether
+# an unattended boot works. Installed per host (not per volume) when any volume
+# is clevis-delivered.
+- name: Install unattended-boot health check (script, unit, timer)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: goat-unlock-health.sh.j2, dest: /usr/local/sbin/goat-unlock-health.sh, mode: "0755" }
+    - { src: goat-unlock-health.service.j2, dest: /etc/systemd/system/goat-unlock-health.service, mode: "0644" }
+    - { src: goat-unlock-health.timer.j2, dest: /etc/systemd/system/goat-unlock-health.timer, mode: "0644" }
+  loop_control:
+    label: "{{ item.dest }}"
+  when: (luks_volumes | map(attribute='unlock_modes', default=[]) | flatten | intersect(['tang_client', 'sss'])) | length > 0
+  notify: reload systemd
+  tags: [luks-health]
+
+- name: Enable + start the unattended-boot health timer
+  ansible.builtin.systemd:
+    name: goat-unlock-health.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: (luks_volumes | map(attribute='unlock_modes', default=[]) | flatten | intersect(['tang_client', 'sss'])) | length > 0
+  tags: [luks-health]
+
+- name: Enable clevis-luks-askpass.path for boot-time auto-unseal via Tang
+  ansible.builtin.systemd:
+    name: clevis-luks-askpass.path
+    enabled: true
+  when: "'tang_client' in modes_requested"
+
+# ---------------------------------------------------------------------------
+# Final: ensure the volume is mounted now so the rest of the play (and any
+# subsequent plays in the same run) can write to {{ vol.mount_point }} without
+# requiring an interim reboot. Idempotent: ansible.posix.mount with
+# state=mounted is a no-op when already mounted.
+# ---------------------------------------------------------------------------
+- name: Detect already-mounted LUKS volumes
+  ansible.builtin.command:
+    cmd: "mountpoint -q {{ item.mount_point }}"
+  register: mount_already
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_volumes }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.mount_point }}"
+
+- name: Mount each LUKS volume now (verifies the path end-to-end; doesn't touch fstab)
+  ansible.builtin.command:
+    cmd: "mount /dev/mapper/{{ item.item.name }} {{ item.item.mount_point }}"
+  loop: "{{ mount_already.results }}"
+  loop_control:
+    label: "{{ item.item.name }} (mounted={{ item.rc == 0 }})"
+  when: item.rc != 0

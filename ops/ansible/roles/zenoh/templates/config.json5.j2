@@ -1,0 +1,81 @@
+// Zenoh router config — router + REST + storage_manager + RocksDB.
+// See docs/design/zenoh-data-fabric.md §"Router Configuration".
+// Rendered by ops/ansible/roles/zenoh/tasks/main.yml — do not edit on host.
+{
+  mode: "router",
+
+  // Pinned Zenoh ID — deterministic per-host (ADR 1041). Stable across
+  // restarts so the routing graph, the audit-dedup key (src_zid, key_expr),
+  // and the source-info provenance chain keep one identity instead of a fresh
+  // random ZID each boot. Derived from this host's inventory identity in the
+  // role defaults — never baked into the image, never from machine-id.
+  // Lowercase hex, 16 bytes (zenoh ZID max).
+  id: "{{ zenoh_router_zid }}",
+
+  // HLC timestamping — asserted explicitly. The router default is already
+  // `true`, but we assert it so a future config edit can't silently disable
+  // it: the storage_manager uses each sample's HLC timestamp for
+  // last-writer-wins conflict resolution and cross-router storage alignment,
+  // and the fabric ordering layer consumes it as the internal-coherence
+  // clock (ADR 1037). See docs/design/zenoh-capability-adoption.md gap 3 +
+  // ADR 1040. `enabled: true` applies to all modes (router here).
+  timestamping: {
+    enabled: true,
+    drop_future_timestamp: false,
+  },
+
+  listen: {
+    endpoints: ["{{ zenoh_listen_addr }}"]
+  },
+{% if zenoh_peer_target | default('') | length > 0 %}
+  connect: {
+    endpoints: ["tcp/{{ zenoh_peer_target }}"]
+  },
+{% endif %}
+  plugins_loading: {
+    enabled: true,
+    // The upstream eclipse/zenoh image ships rest + storage_manager
+    // plugins at "/" (NOT under /opt/zenoh/plugins/). Our mounted plugin
+    // dir is searched second for our own custom .so artifacts. Without
+    // "/" in this list, even the upstream plugins fail to load and the
+    // entire substrate goes dark — the failure mode that hid 3 days of
+    // dead-soak on integdev (2026-04-22 → 2026-04-25).
+    search_dirs: ["/", "{{ zenoh_plugin_dir }}"]
+  },
+  plugins: {
+    rest: {
+      http_port: "{{ zenoh_metrics_addr | regex_replace('^tcp/0\\.0\\.0\\.0:', '0.0.0.0:') }}"
+    },
+    storage_manager: {
+      // Declare the rocksdb backend volume. zenoh 1.x storage_manager
+      // refuses to spawn `volume.id = "rocksdb"` storages without an
+      // explicit `volumes:` entry. The backend .so is
+      // not shipped in upstream eclipse/zenoh — the role installs it
+      // into {{ zenoh_plugin_dir }} from the upstream
+      // zenoh-backend-rocksdb 1.9.0 release (see role tasks/main.yml).
+      backend_search_dirs: ["{{ zenoh_plugin_dir }}"],
+      volumes: {
+        rocksdb: {}
+      },
+      // RocksDB storage for ops/** — 7-day retention. Volume dir inside
+      // the container is {{ zenoh_storage_path }} (bind-mounted from
+      // the host so data survives container recreates).
+      storages: {
+        ops_fabric: {
+          key_expr: "ops/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ zenoh_storage_path }}",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false
+          },
+          // Garbage-collect expired samples once per day.
+          garbage_collect_period: 86400,
+          // time_to_live in milliseconds (zenoh 1.x storage_manager convention).
+          time_to_live: {{ zenoh_retention_days | int * 86400 * 1000 }}
+        }
+      }
+    }
+  }
+}

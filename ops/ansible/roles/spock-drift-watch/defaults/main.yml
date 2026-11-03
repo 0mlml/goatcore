@@ -1,0 +1,71 @@
+# Defaults for the spock-drift-watch role. Block 52A.3.
+#
+# Override per-host or per-site as needed.
+
+# Where the script + env file live on the host.
+spock_drift_watch_install_dir: /usr/local/sbin
+spock_drift_watch_env_file: /etc/spock-drift-watch.env
+
+# Site identifier (label on every metric). Inherits from the same
+# place as the observability role's external_labels — typically
+# `site_id` per inventory.
+spock_drift_watch_site: "{{ site_id | mandatory }}"
+
+# Cadence. Hourly by default; OnCalendar accepts any systemd timer
+# spec. Two-minute jitter applied via RandomizedDelaySec to avoid
+# every site running diffs at the exact same wall-clock minute.
+spock_drift_watch_oncalendar: "hourly"
+spock_drift_watch_jitter_sec: 120
+
+# Where node_exporter looks for textfile metrics. Created with
+# 0755 / 0644 by the observability role; this role assumes it
+# already exists.
+spock_drift_watch_textfile_dir: /var/lib/node_exporter/textfile
+
+# Peers. A first site has a single postgres-a entry; phase2 gains
+# postgres-b; a multi-site deployment adds peer-site entries.
+# Each peer needs `name`, `host`, `port`, `dbname`, `user`,
+# `password_env` (env var name holding the password). Credentials
+# live in /etc/spock-drift-watch.env and are referenced by env-var
+# name; the script reads them at run time.
+spock_drift_watch_peers: []
+
+# Watched tables. Default reconcile-list matches §5 of
+# docs/design/daily-state-reconciliation.md.
+spock_drift_watch_tables:
+  - { db: netbird, table: accounts }
+  - { db: netbird, table: users }
+  - { db: netbird, table: setup_keys }
+  - { db: netbird, table: peers }
+  - { db: netbird, table: groups }
+  - { db: netbird, table: policies }
+  # Ory narrow-repset inclusion list (10 tables) — see ADR 1010 D8 +
+  # docs/project/ory-spock-narrow-repset-schema-audit.md. The drift-
+  # watch table list mirrors the repset inclusion list so any
+  # divergence between a site's view of an identity-tier row and a
+  # peer site's view shows up in the audit-mode telemetry.
+  #
+  # These rows only matter operationally on sites that have flipped
+  # `ory_spock_enabled: true` (per-site opt-in). On sites where
+  # Ory-on-Spock is OFF (the default), the drift-watch SQL against
+  # these tables returns zero rows uniformly across sites — which
+  # the diff comparison correctly registers as "no drift" (both
+  # sides report 0). Safe to leave wired fleet-wide.
+  - { db: kratos,  table: identities }
+  - { db: kratos,  table: identity_credentials }
+  - { db: kratos,  table: identity_credential_identifiers }
+  - { db: kratos,  table: identity_credential_types }
+  - { db: kratos,  table: identity_recovery_addresses }
+  - { db: kratos,  table: identity_verifiable_addresses }
+  - { db: kratos,  table: networks }
+  - { db: hydra,   table: hydra_client }
+  - { db: hydra,   table: hydra_jwk }
+  # Every Hydra migration inserts its own default networks row (random id,
+  # created 2013-10-07), so the table differs between sites by design; only
+  # the pre-seeded shared row (1970, ADR 1010 D7, F-002) must match.
+  - { db: hydra,   table: networks, where: "created_at < '2013-01-01'" }
+
+# Whether the timer is enabled. Default true; set to false on hosts
+# that should not run drift-watch (e.g. when this role is installed
+# but a different orchestrator is the canonical drift-watch runner).
+spock_drift_watch_enabled: true

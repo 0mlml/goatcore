@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Rendered by the luks-unlock role (installer-luks.yml). Add-only, idempotent,
+# UUID-matched edit of /etc/crypttab.
+#
+# WHY a script and not lineinfile/blockinfile: the installer OWNS the root
+# crypttab entry (Ubuntu guided full-disk encryption wrote it). We must NOT
+# rewrite the file from a template — that would drop the installer's own entry
+# and the box would not boot. We only ADD an option token to the ONE line whose
+# source field references this partition's LUKS UUID, and only if the token is
+# not already present. If no line matches the UUID we REFUSE (exit 2) — we never
+# invent an entry.
+#
+# BOOT-CRITICAL: proven only by a cold boot on a real box.
+set -euo pipefail
+
+# CT is /etc/crypttab in production. GOAT_CRYPTTAB overrides it for offline tests
+# only (the role never sets it). The `+x` guard form is used deliberately: it is
+# safe under `set -u`, and the .envrc.example generator only extracts the `:-` /
+# `:?` env-var forms, so this test hook does not leak into that inventory.
+CT="/etc/crypttab"
+if [ -n "${GOAT_CRYPTTAB+x}" ]; then CT="$GOAT_CRYPTTAB"; fi
+UUID="{{ _ct_uuid }}"
+# comma-separated option tokens to ensure present (each added only if missing)
+REQ="{{ _ct_opts }}"
+
+[ -n "$UUID" ] || { echo "REFUSE: empty UUID passed" >&2; exit 2; }
+[ -f "$CT" ] || { echo "REFUSE: $CT does not exist" >&2; exit 2; }
+
+tmp="$(mktemp)"
+found=0
+changed=0
+
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    ''|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+  esac
+  # crypttab fields: target source keyfile options
+  # shellcheck disable=SC2086
+  set -- $line
+  target="${1:-}"; source="${2:-}"; keyfile="${3:-}"; opts="${4:-}"
+  case "$source" in
+    *"$UUID"*)
+      found=1
+      [ -n "$keyfile" ] || keyfile="none"
+      newopts="$opts"
+      [ "$newopts" = "none" ] && newopts=""
+      for tok in $(printf '%s' "$REQ" | tr ',' ' '); do
+        case ",$newopts," in
+          *",$tok,"*) : ;;   # already present
+          *)
+            if [ -z "$newopts" ]; then newopts="$tok"; else newopts="$newopts,$tok"; fi
+            changed=1
+            ;;
+        esac
+      done
+      [ -z "$newopts" ] && newopts="none"
+      printf '%s %s %s %s\n' "$target" "$source" "$keyfile" "$newopts" >> "$tmp"
+      ;;
+    *)
+      printf '%s\n' "$line" >> "$tmp"
+      ;;
+  esac
+done < "$CT"
+
+if [ "$found" -eq 0 ]; then
+  rm -f "$tmp"
+  echo "REFUSE: no /etc/crypttab entry references UUID $UUID — not inventing one" >&2
+  exit 2
+fi
+
+if [ "$changed" -eq 1 ]; then
+  # Preserve mode/owner; write in place.
+  cat "$tmp" > "$CT"
+  rm -f "$tmp"
+  echo "CHANGED"
+else
+  rm -f "$tmp"
+  echo "NOCHANGE"
+fi

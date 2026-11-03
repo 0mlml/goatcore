@@ -1,0 +1,47 @@
+---
+# wg-cp0-server — silent control-plane WireGuard listener (Block 22 / ADR 0313).
+#
+# Runs on each relay (cloud or local-physical). Provides the outer-WG listener
+# that the network host connects to, and through which all peer mgmt-API
+# traffic flows. Listener is silent under unauthenticated handshakes by
+# WireGuard's protocol property — packets without a valid peer key get
+# cryptographically dropped in-kernel.
+
+# Listener config
+wg_cp0_interface_name: "wg-cp0"
+wg_cp0_listen_port: 51821          # UDP. Configurable per-relay if defense-in-depth against port-scanning matters.
+wg_cp0_subnet: "198.18.0.0/24"      # Control-plane address space.
+
+# Per-relay address inside the wg-cp0 subnet. Override per-host in inventory.
+# Recommended assignments: network host = .1, relay-rla = .2, relay-rlb = .3, relay-rlc = .4, etc.
+wg_cp0_relay_address: ""           # REQUIRED — set per-host in inventory (e.g. 198.18.0.2)
+
+# Allowlist of peers that may connect to this relay. Set per-host in inventory:
+# wg_cp0_allowed_peers:
+#   - name: orin-a
+#     pubkey: "<base64-wg-pubkey>"
+#     allowed_ips: ["198.18.0.1/32"]
+#   - name: orin-b
+#     pubkey: "<base64-wg-pubkey>"
+#     allowed_ips: ["198.18.0.5/32"]
+#   - name: operator-laptop-maintainer
+#     pubkey: "<base64-wg-pubkey>"
+#     allowed_ips: ["198.18.0.10/32"]
+wg_cp0_allowed_peers: []
+
+# Secret custody — where to store this relay's wg-cp0 PRIVATE key.
+# Cloud relays: aws_secrets_manager (recoverable across image rebuilds).
+# Local-physical relays: local_file (no AWS dependency).
+wg_cp0_secret_storage: aws_secrets_manager   # or "local_file"
+wg_cp0_secret_name_prefix: "usareur-af-prod-goat-relay"   # Secrets Manager prefix; relay name is appended
+wg_cp0_local_secret_path: "/etc/wireguard/wg-cp0-priv.key"
+
+# nftables rate-limiting on the listen port (defense-in-depth; WireGuard
+# already drops bad packets cheaply, this just caps abusive sources).
+wg_cp0_rate_limit_per_source: 200      # packets/sec per source IP
+wg_cp0_rate_limit_burst: 800           # initial burst allowed
+wg_cp0_enable_nftables_ratelimit: true
+
+# Persistent keepalive (seconds). WireGuard sends keepalive packets if peer
+# has been silent this long. Helps NAT keep state alive. 0 = disabled.
+wg_cp0_persistent_keepalive: 25

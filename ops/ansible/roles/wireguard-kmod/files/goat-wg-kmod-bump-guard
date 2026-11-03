@@ -1,0 +1,31 @@
+#!/bin/sh
+# goat-wg-kmod-bump-guard — fires from apt's DPkg::Post-Invoke (ADR 1118).
+#
+# The one silent-degradation mode of the kernelspace WireGuard design: a
+# kernel package lands whose /lib/modules/<kver> has no pinned wireguard
+# artifacts, and on next boot netbird quietly falls back to userspace.
+# This guard makes that moment LOUD at install time and leaves a flag file
+# the soak/health checks read.
+#
+# Exit 0 always — a guard must never break apt.
+for d in /lib/modules/*/; do
+    k="$(basename "$d")"
+    [ -f "${d}modules.dep" ] || continue
+    if [ ! -f "${d}extra/wireguard.ko" ]; then
+        echo "" >&2
+        echo "############################################################" >&2
+        echo "# goat-wg-kmod GUARD (ADR 1118): kernel ${k} has NO pinned" >&2
+        echo "# WireGuard modules. Booting into it reverts netbird to" >&2
+        echo "# USERSPACE silently. Rebuild artifacts for ${k} in" >&2
+        echo "# goat-wireguard-kmod FIRST, then re-run wireguard-kmod.yml." >&2
+        echo "############################################################" >&2
+        mkdir -p /var/lib/goat/wireguard-kmod
+        grep -qs "${k}$" /var/lib/goat/wireguard-kmod/KERNEL-BUMP-PENDING 2>/dev/null || \
+            printf '%s %s\n' "$(date -u +%FT%TZ)" "${k}" >> /var/lib/goat/wireguard-kmod/KERNEL-BUMP-PENDING
+    else
+        # kernel has artifacts — clear any stale pending flag for it
+        [ -f /var/lib/goat/wireguard-kmod/KERNEL-BUMP-PENDING ] && \
+            sed -i "/ ${k}$/d" /var/lib/goat/wireguard-kmod/KERNEL-BUMP-PENDING 2>/dev/null
+    fi
+done
+exit 0

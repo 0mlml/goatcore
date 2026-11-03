@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+# OnFailure target for budget-notify.service. The notifier is a oneshot timer
+# job: when it dies the unit simply stops, no metric is written, and nothing
+# off-host changes — the silent-death class the fragility audit flagged. This
+# writes the same textfile the successful run writes, with up=0, so the gap is
+# visible to the co-resident node-exporter within one scrape.
+#
+# No shell variables in ExecStart: systemd expands $NAME itself before /bin/sh
+# ever sees the line, so a `tmp="$out.x"` idiom silently resolves to an empty
+# path. The paths are templated in literally instead. `%%s` is the systemd
+# escape for a literal `%`, leaving `date +%s` for the shell.
+[Unit]
+Description=record a failed budget-notify run as a textfile metric
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '\
+  { \
+    echo "# HELP goat_budget_notify_up 1 if the last run completed."; \
+    echo "# TYPE goat_budget_notify_up gauge"; \
+    echo "goat_budget_notify_up 0"; \
+    echo "# HELP goat_budget_notify_last_failure_timestamp_seconds Unix time of the last failed run."; \
+    echo "# TYPE goat_budget_notify_last_failure_timestamp_seconds gauge"; \
+    echo "goat_budget_notify_last_failure_timestamp_seconds $(date +%%s)"; \
+  } > {{ budget_notify_metrics_out }}.failtmp \
+  && chmod 644 {{ budget_notify_metrics_out }}.failtmp \
+  && mv {{ budget_notify_metrics_out }}.failtmp {{ budget_notify_metrics_out }}'

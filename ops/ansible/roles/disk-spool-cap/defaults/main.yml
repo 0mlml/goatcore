@@ -1,0 +1,46 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# disk-spool-cap — a BYTE ceiling for the append-only spools on a mgmt host.
+#
+# Why this role exists. A DAY COUNT does not bound bytes: goat-logship's OCSF
+# tree keeps N days, the audit subscriber's tail keeps 7 days, and both prune
+# through systemd-tmpfiles. When daily volume rises the same rule silently
+# permits a multiple of the disk it permitted last week, and the first sign of
+# it is the filesystem filling, with no retention config changed; only the
+# traffic.
+#
+# What this role adds: a small timer that trims each declared spool oldest-first
+# until it fits under its cap. The day-count prune stays — it is the normal
+# path, and this is the backstop that makes the worst case bounded rather than
+# open-ended. The two rules answer different questions: "how far back can I
+# look?" and "how much disk may this cost?".
+#
+# This role never touches an audit of record. It trims local spools whose
+# durable copy lives elsewhere (an Object-Locked bucket, an off-box SIEM).
+
+# One entry per spool. Every key is required except min_age_minutes.
+#
+#   dir              directory holding the dated files
+#   glob             shell glob selecting ONLY this spool's files, so a
+#                    neighbouring file in the same directory is never a
+#                    candidate for deletion
+#   max_bytes        the ceiling for the sum of matching files
+#   why              one line: what this spool is and where the durable copy is
+#   min_age_minutes  never delete a file modified more recently than this,
+#                    which protects the file currently being appended and any
+#                    spool entry that may not have shipped yet (default 120)
+disk_spool_cap_spools: []
+
+# How often the trim runs. A spool that can gain 18 GB in an hour wants a check
+# far more often than once a day; 15 minutes bounds the overshoot to roughly
+# 5 GB at that rate.
+disk_spool_cap_interval: "15min"
+
+# Where the script lands.
+disk_spool_cap_script: /usr/local/sbin/goat-spool-cap
+
+# Refuse to run with a cap below this. A cap of a few hundred MB on a spool
+# that gains gigabytes per hour deletes everything it just wrote on every pass,
+# producing churn and no useful retention; that is a typo, not a policy.
+disk_spool_cap_min_bytes: 1073741824  # 1 GiB

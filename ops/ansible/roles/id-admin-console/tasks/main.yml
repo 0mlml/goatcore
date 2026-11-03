@@ -1,0 +1,353 @@
+---
+# Canonical id-admin-console deploy onto a mgmt-host stack (ADR 0860).
+#
+# Pre-reqs (operator-fired BEFORE this role):
+#   1. Site Hydra + Kratos reachable on the mgmt docker network
+#      (ory-deploy.yml ran).
+#   2. oauth2-proxy-id-console role wired up (sidecar that gates the
+#      console URL on ADMINS).
+#   3. Traefik dynamic config routes admin.auth.<site>.<zone>/ to
+#      oauth2-proxy-id-console:4180 (rendered by traefik-acme.yml
+#      when id_admin_console_enabled: true).
+
+- name: Require id-admin-console inputs
+  ansible.builtin.assert:
+    that:
+      - id_admin_console_enabled | default(false) | bool
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+      # Fail-closed on a half-rendered operator-key map: a group_vars entry
+      # like "onboard-runner-<site>:{{ lookup('env', '...') }}" with the secret
+      # unset in the deploying shell renders "handle:" — the console then
+      # silently loses its local machine-realm auth for that handle. Where the
+      # runner's key doubles as a portal key the whoami delegation masks the loss,
+      # so the failure must be caught here.
+      - not (id_admin_console_onboard_operator_api_keys | default('') | regex_search(':(,|$)'))
+    fail_msg: |
+      id-admin-console role requires:
+        - id_admin_console_enabled: true
+        - site_id, site_dns_zone
+        - id_admin_console_onboard_operator_api_keys entries must each be a
+          complete "handle:key" pair — an entry ending in ":" means the key's
+          env var (ZAGROS: ZAGROS_ONBOARD_RUNNER_PORTAL_KEY) is unset in the
+          deploying shell. Export it and re-run; never deploy an empty key.
+
+- name: id-admin-console | require the NetBird service identity (console-enrollwatch)
+  ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+  vars:
+    nsi_identity: console-enrollwatch
+    nsi_token: "{{ id_admin_console_enroll_watch_nb_token }}"
+    nsi_enabled: "{{ id_admin_console_enabled | default(false) | bool }}"
+
+# Per-host permissions YAML — sync from repo so the console's /permissions
+# page reads the canonical source-of-truth (ADR 0860 + ops/permissions/
+# group-permissions.yml). Bind-mounted read-only into the container.
+- name: Ensure permissions YAML host directory
+  ansible.builtin.file:
+    path: "{{ id_admin_console_permissions_yaml_host_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Durable audit sink dir (AUDIT_BACKEND=file, ADR 0860 interim). Owned by the
+# container's non-root user (distroless 65532). On a root-owned dir the console
+# crash-loops (open audit.jsonl: permission denied → fail-loud exit), which
+# also breaks its docker-DNS entry and drops candidate notifications.
+# The portal's operator-key directory. Ensured here as well as in the portal
+# role because docker creates a MISSING bind-mount source as root-owned, and a
+# directory the portal (65532) cannot read is a set of keys that silently stop
+# working — the worst failure this whole path can produce. Same owner and mode
+# as the portal role uses, so whichever runs first leaves it correct.
+- name: Ensure the portal operator-key directory exists and both services can use it
+  ansible.builtin.file:
+    path: "{{ id_admin_console_operator_key_host_dir }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0750"
+  when: id_admin_console_operator_key_dir | default('') | length > 0
+
+- name: Ensure durable audit sink directory (container-writable)
+  ansible.builtin.file:
+    path: /var/lib/goat-id-console
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0755"
+
+- name: Sync canonical permissions YAML to host
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../permissions/group-permissions.yml"
+    dest: "{{ id_admin_console_permissions_yaml_host_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  # The console reads this file ONCE at start (cmd/console/main.go) through a
+  # read-only bind mount, so a changed matrix is invisible until the container
+  # restarts. Without this notify a matrix-only deploy reported changed=1 and
+  # served the old grid (doors declared authenticated in the file,
+  # console still saying mesh-only).
+  notify: reload id-admin-console compose
+
+# Coalition framework registry — the one home for "which nations are members of
+# which framework, since when". Synced from the repo (never hand-edited on the
+# host) so an accession/withdrawal is a reviewed repo edit that reaches every
+# goatnet, and the console's standing row changes with no re-mint of anybody.
+- name: Ensure coalition framework registry host directory
+  ansible.builtin.file:
+    path: "{{ id_admin_console_coalition_frameworks_host_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Sync canonical coalition framework registry to host
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../identity/coalition-frameworks.yaml"
+    dest: "{{ id_admin_console_coalition_frameworks_host_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# Repo-access policy (onboarding GitHub repo-grants). Content-driven from a
+# group_var so a goatnet's policy is declared in config, not a fleet file; the
+# console reads it fresh at each provision (editing it needs no redeploy — see
+# docs/design/onboarding-github-repo-grants.md §"Editing the policy").
+- name: Ensure repo-access policy host directory
+  ansible.builtin.file:
+    path: "{{ id_admin_console_repo_access_host_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write repo-access policy to host
+  ansible.builtin.copy:
+    content: "{{ id_admin_console_repo_access_content }}"
+    dest: "{{ id_admin_console_repo_access_host_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload id-admin-console compose
+
+# Token clobber-safety. The repo-grant lane depends on GITHUB_ONBOARD_TOKEN,
+# which this role templates from the DEPLOYING SHELL'S environment. So any
+# deploy run without it in scope rewrites a working token to empty and kills
+# the lane — silently, because grantRepoAccess treats an empty token as "off".
+#
+# An unrelated, perfectly legitimate console deploy by another operator is
+# enough to do this.
+#
+# Refuse the REGRESSION only (host has one, this run would clear it). A first
+# deploy with no token anywhere stays allowed — that is a goatnet that has not
+# adopted the lane, not a mistake. Override with
+# -e id_admin_console_allow_github_token_clear=true when clearing is intended.
+- name: Token clobber-safety — does the host currently hold a GitHub onboard token?
+  ansible.builtin.shell:
+    cmd: "grep -c '^GITHUB_ONBOARD_TOKEN=.' {{ id_admin_console_compose_dir }}/id-admin-console.env 2>/dev/null || true"
+  register: idac_live_gh_token
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Token clobber-safety — refuse to clear a working GITHUB_ONBOARD_TOKEN
+  ansible.builtin.assert:
+    that:
+      - (idac_live_gh_token.stdout | trim | int) == 0
+        or (id_admin_console_github_onboard_token | default('') | trim | length) > 0
+        or (id_admin_console_allow_github_token_clear | default(false) | bool)
+    quiet: true
+    fail_msg: |
+      REFUSING: {{ id_admin_console_compose_dir }}/id-admin-console.env on this host
+      currently holds a GITHUB_ONBOARD_TOKEN, and this run would write an EMPTY one —
+      silently disabling every repo grant at onboarding.
+
+      Almost certainly your shell lacks the variable. It lives in
+      .envrc.local.d/10-cloud-and-thirdparty.envrc; run the deploy from a shell
+      where direnv has loaded it, or `direnv exec <repo> <deploy command>`.
+
+      If clearing IS what you want, re-run with
+        -e id_admin_console_allow_github_token_clear=true
+    success_msg: "GitHub onboard token: no regression (live={{ idac_live_gh_token.stdout | trim }}, incoming={{ 'set' if (id_admin_console_github_onboard_token | default('') | trim | length) > 0 else 'empty' }})."
+
+# A policy that grants repos while no token exists anywhere is not an error —
+# it is a goatnet that has declared intent and not yet supplied the credential.
+# Say so once, loudly, rather than leaving it to be discovered by a partner who
+# never received a repo.
+- name: Token clobber-safety — warn when a repo policy is declared but no token exists
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: this goatnet declares a repo-access policy but GITHUB_ONBOARD_TOKEN is
+      empty, so onboarding will grant NO repositories. The console records an empty
+      grant list, which reads identically to "the policy matched nothing". Mint a
+      fine-grained PAT (Administration: write on the granted repos) and export
+      GITHUB_ONBOARD_TOKEN — see docs/design/onboarding-github-repo-grants.md.
+  when:
+    - (id_admin_console_github_onboard_token | default('') | trim | length) == 0
+    - (idac_live_gh_token.stdout | trim | int) == 0
+    - "'repo:' in (id_admin_console_repo_access_content | default(''))"
+
+# --- Store engine (ADR 1165 step A) ---
+# Refuses before anything below is rendered or started unless the image's
+# store, the declared store and the host's record of where its rows are agree;
+# provisions the Postgres databases when the store is postgres. Public, so the
+# env template reads the DSNs from the same defaults.
+- name: id-admin-console | store gate and Postgres databases (id-admin-console-store)
+  ansible.builtin.include_role:
+    name: id-admin-console-store
+    public: true
+
+- name: Render id-admin-console.env (mode 0600)
+  ansible.builtin.template:
+    src: id-admin-console.env.j2
+    dest: "{{ id_admin_console_envfile }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload id-admin-console compose
+
+# --- SPIFFE mTLS sidecar (default OFF) ---
+- name: SVID bind dir owned by the console UID (spiffe-helper writes here)
+  # The spiffe-helper (run as this UID) writes the 0600 SVID key here; the console
+  # (same UID) reads it via the /svid mount. A host bind dir chowned to the UID,
+  # so the key is owned by — and readable by — the console without ever being
+  # world-readable (docs/design/runner-console-mtls.md).
+  ansible.builtin.file:
+    path: "{{ id_admin_console_svid_dir }}"
+    state: directory
+    owner: "{{ id_admin_console_spire_uid }}"
+    group: "{{ id_admin_console_spire_uid }}"
+    mode: "0700"
+  when: id_admin_console_mtls_onboard_enabled | default(false) | bool
+
+- name: Render the console spiffe-helper.conf
+  ansible.builtin.template:
+    src: id-admin-console-spiffe-helper.conf.j2
+    dest: "{{ id_admin_console_compose_dir }}/id-admin-console-spiffe-helper.conf"
+    owner: root
+    mode: "0644"
+  when: id_admin_console_mtls_onboard_enabled | default(false) | bool
+  notify: reload id-admin-console compose
+
+- name: Lay down compose overlay
+  # Rendered from the role template (was a static file under ops/compose/mgmt-host/
+  # until the SPIFFE mTLS onboarding leg needed a conditional spiffe-helper
+  # sidecar — docs/design/runner-console-mtls.md).
+  ansible.builtin.template:
+    src: docker-compose.id-admin-console.yml.j2
+    dest: "{{ id_admin_console_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload id-admin-console compose
+
+# Easy-rollback per ADR 0859 — drive ID_ADMIN_CONSOLE_IMAGE via the
+# same compose-time env mechanism as oauth2-proxy-dashboard.
+# Bumps to id_admin_console_image MUST append a row to
+# deploy-history.yml (CI checks via deploy-history-check.yml).
+- name: Set ID_ADMIN_CONSOLE_IMAGE in /opt/mgmt-host/.env (ADR 0859 — easy rollback)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^ID_ADMIN_CONSOLE_IMAGE="
+    line: "ID_ADMIN_CONSOLE_IMAGE={{ id_admin_console_image }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  notify: reload id-admin-console compose
+
+# Force the compose overlay's `platform:` to the host arch so the
+# multi-arch LIST-digest pin resolves to the arm64 member on arm64
+# hosts instead of the amd64 default. Companion to the pin above.
+- name: "Assert the host architecture is known before pinning a platform"
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['architecture'] is defined
+      - ansible_facts['architecture'] | length > 0
+    fail_msg: >-
+      ansible_facts['architecture'] is undefined, so the container platform
+      cannot be derived. This play runs with gather_facts disabled — set
+      gather_facts: true. Guessing here writes linux/amd64 into
+      /opt/mgmt-host/.env, and the compose overlay then DEMANDS amd64: on an
+      aarch64 Jetson the console crash-loops with `exec format error`. Both
+      zagros and zagros-prod consoles went down that way on 2026-08-10.
+
+- name: Set ID_ADMIN_CONSOLE_PLATFORM in /opt/mgmt-host/.env
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^ID_ADMIN_CONSOLE_PLATFORM="
+    line: "ID_ADMIN_CONSOLE_PLATFORM={{ id_admin_console_image_platform }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  notify: reload id-admin-console compose
+
+- name: Flush handlers so id-admin-console is up before the smoke fires
+  ansible.builtin.meta: flush_handlers
+
+- name: Bring up id-admin-console (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      -f /opt/mgmt-host/docker-compose.yml
+      -f {{ id_admin_console_compose_file }}
+      up -d goat-id-console
+    chdir: /opt/mgmt-host
+  register: id_console_compose_up
+  changed_when: >-
+    'Started' in (id_console_compose_up.stderr | default(''))
+    or 'Created' in (id_console_compose_up.stderr | default(''))
+    or 'Recreated' in (id_console_compose_up.stderr | default(''))
+
+- name: Wait for id-admin-console healthy on :8080/healthz (loopback diag port)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ id_admin_console_host_port | default(8088) }}/healthz"
+    status_code: 200
+  retries: 10
+  delay: 2
+  register: id_console_ping
+  failed_when: false
+
+# The Traefik activation preflight proves readiness only at the moment the gate
+# is first installed. Re-run the classifier check after every later console
+# converge/recreation so a stale token, lost hold mount or unreadable record
+# source cannot go unnoticed while the gate remains enabled.
+- name: Verify probation classifier after console recreation
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ id_admin_console_host_port | default(8088) }}/internal/probation/ready"
+    status_code: 204
+    return_content: false
+  register: id_console_probation_ready
+  until: id_console_probation_ready.status == 204
+  retries: 10
+  delay: 2
+  when: probation_explainer_enabled | default(false) | bool
+
+- name: Print deploy summary
+  ansible.builtin.debug:
+    msg: |
+      id-admin-console deployed:
+        URL:        https://{{ id_admin_console_fqdn }}/ (gated by oauth2-proxy-id-console)
+        Container:  goat-id-console (mgmt network)
+        Permissions YAML: {{ id_admin_console_permissions_yaml_host_path }} -> {{ id_admin_console_permissions_yaml_container_path }}
+
+      Next:
+        1. Apply oauth2-proxy-id-console role so the sidecar gates ADMINS.
+        2. Apply traefik-acme.yml so the router lands.
+        3. Drill the live-fire checklist in
+           docs/operations/id-admin-console-runbook.md.
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: id-admin-console | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "id-admin-console"
+    rollback_ref: "{{ id_admin_console_image }}"

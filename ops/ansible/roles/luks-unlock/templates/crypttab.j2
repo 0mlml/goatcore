@@ -1,0 +1,69 @@
+# /etc/crypttab — managed by the luks-unlock Ansible role.
+# See docs/design/os-baseline-and-luks.md §3 for unlock mechanism semantics.
+#
+# format: <target> <source> <keyfile|none> <options>
+{% for vol in luks_volumes %}
+{#-
+   Choice of options depends on modes enrolled on the volume.
+   - passphrase: keyfile=none, options=luks,noauto (operator enters via serial at boot)
+   - tpm2:       keyfile=none, options=luks,tpm2-device=auto,tpm2-measure-pcr=yes,headless
+   - fido2:      keyfile=none, options=luks,fido2-device=auto,headless
+   - usb_keyfile: keyfile=/media/usb/<name>.key, options=luks,keyscript=/lib/cryptsetup/scripts/passdev
+-#}
+{%- set has_tpm2 = 'tpm2' in vol.unlock_modes -%}
+{%- set has_fido2 = 'fido2' in vol.unlock_modes -%}
+{%- set has_usb = 'usb_keyfile' in vol.unlock_modes -%}
+{%- set has_passphrase = 'passphrase' in vol.unlock_modes -%}
+{%- set has_sss = 'sss' in vol.unlock_modes -%}
+{%- set has_tang_client = 'tang_client' in vol.unlock_modes -%}
+{#- has_auto_unseal: any mode that completes unlock at boot without an
+    operator gesture (tpm2 silicon-anchored, sss threshold, tang_client
+    network-anchored). fido2 with FIPS-mode YubiKey requires a tap and
+    is NOT auto; passphrase requires console input; usb_keyfile requires
+    USB inserted. Block 65A.1 fix 2026-05-06: previous template added
+    noauto whenever has_passphrase=true, which prevented boot-time TPM2
+    auto-unseal even when tpm2 was also enrolled. New rule: noauto if
+    AND ONLY IF no auto-unseal mode is present. -#}
+{#- F-285 (zagros-prod 2026-08-06): `tang_client` is DELIBERATELY NOT counted as a
+    boot-time auto-unseal mode any more, so it no longer suppresses `noauto`.
+
+    Clevis/Tang unlock is delivered AFTER boot by
+    `goat-unlock-<vol>.service` (see this role's post-boot unlocker), not
+    inside the boot transaction. Two hard reasons, both measured on Orin-C:
+
+      1. `headless` (appended below) disables the systemd password QUERY, and
+         answering that query is exactly how clevis-luks-askpass delivers its
+         key. In-transaction clevis unlock is therefore impossible while
+         `headless` is set, and dropping `headless` risks a boot blocking on a
+         console prompt nobody is at.
+      2. Making it work in-transaction requires `_netdev`, which drags
+         local-fs.target into network-online.target ordering. On Jetson that
+         collides with NVIDIA's unit graph: systemd deleted SEVEN jobs to break
+         cycles — dbus.service, sockets.target, nvpmodel.service, nv.service and
+         the data volume's own mount job — and boot took ~20 MINUTES. The three
+         preceding boots had zero cycles.
+
+    So: the volume stays `noauto` (off the boot path entirely, exactly as it has
+    booted for months) and the unlock happens once the system is up, where a
+    failure leaves the host RUNNING AND REACHABLE instead of stalled. `sss` keeps
+    its `_netdev` because nothing has re-validated that path; do not copy
+    tang_client's treatment onto it without a reboot test. -#}
+{%- set has_auto_unseal = has_tpm2 or has_sss -%}
+{%- set opts = ['luks'] -%}
+{%- if has_sss -%}
+{%-   set _ = opts.append('_netdev') -%}
+{%- endif -%}
+{%- if has_tpm2 and not has_sss -%}
+{%-   set _ = opts.append('tpm2-device=' ~ luks_tpm2_device) -%}
+{%-   set _ = opts.append('tpm2-measure-pcr=yes') -%}
+{%- endif -%}
+{%- if has_fido2 -%}
+{%-   set _ = opts.append('fido2-device=' ~ luks_fido2_device) -%}
+{%- endif -%}
+{%- if not has_auto_unseal -%}
+{%-   set _ = opts.append('noauto') -%}
+{%- endif -%}
+{%- set _ = opts.append('headless') -%}
+{%- set key = '/media/usb/' ~ vol.name ~ '.key' if has_usb else 'none' -%}
+{{ vol.name }} UUID={{ luks_volume_uuids[vol.name] }} {{ key }} {{ opts | join(',') }}
+{% endfor %}

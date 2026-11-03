@@ -1,0 +1,126 @@
+---
+# breakglass-node — the host-side facts a BREAKGLASS node (ADR 1114) needs that
+# no other role owns.
+#
+# SCOPE. Deliberately narrow. Three things live here and nothing else:
+#   1. asserting tailscale's netfilter mode so the two transports coexist
+#   2. a time source for sites where NTP cannot work
+#   3. a resolver for sites that block port 53 egress
+#
+# Everything else a break-glass node needs is an EXISTING role, opted into from
+# the same group_vars: netbird-client-pin for the version pin + apt hold, and
+# netbird-boot-selfheal for the wedge watchdog. This role does not duplicate
+# them.
+#
+# EVERY TOGGLE DEFAULTS OFF. Two of the three exist because of specific hostile
+# site networks; enabling them where the network is fine would be worse than
+# leaving them alone. Opt in per host group, never fleet-wide.
+
+# -- 0. the bad-day transport itself ------------------------------------------
+# ADR 1114 requires a break-glass node to carry a second, independent transport;
+# a node with only the normal-day path may not be declared BREAKGLASS at all.
+# Nothing else in this repository manages tailscale, so a rebuilt node would
+# come back without the thing that makes it break-glass.
+#
+# This installs the package and its apt source. It CANNOT enrol the node —
+# that needs an interactive login or an auth key, and neither belongs in a
+# declared fact. After a rebuild, `sudo tailscale up` is a manual step.
+breakglass_tailscale_installed: false
+
+# -- 1. tailscale / netbird coexistence ---------------------------------------
+# Tailscale defaults to NetfilterMode=2 (full iptables management) and that
+# DROPS netbird's fwmark-routed traffic — the node leaves the mesh entirely
+# while looking healthy on its own overlay: mesh IP unreachable and every site
+# host lost, while routing is provably fine (`ip route get <peer>` returns the
+# netbird interface). The cause is netfilter, not routing.
+#
+# The pref itself survives a reboot, so this is NOT about persistence. It is
+# about a later `tailscale up` with different flags silently restoring the
+# default — the bad-day path disabling the normal-day one. A unit re-asserts it
+# on every boot and every tailscaled restart.
+#
+# Reproduce with `tailscale set --netfilter-mode=on`. NOTE: `nodivert` (mode 1)
+# does NOT reproduce it; only full mode 2 does.
+breakglass_tailscale_netfilter_off: false
+
+# -- 2. time where NTP cannot work --------------------------------------------
+# For sites whose network blocks udp/123. A board with no RTC battery then has
+# no way to be right: it can boot months out, and come back seconds out across
+# a reboot. A break-glass node with an unmoored clock
+# fails TLS and certificate operations at exactly the moment it is needed.
+#
+# htpdate takes time from HTTPS Date headers, which pass where NTP does not.
+# Accuracy is ~1 s, which is ample for certificate validity and useless for
+# fabric ordering — a break-glass node does no ordering, so that trade is fine
+# HERE and would not be on a fabric host.
+#
+# Enabling this DISABLES systemd-timesyncd. Two daemons competing for a clock
+# only one of them can reach is worse than one, and leaving timesyncd enabled
+# makes `timedatectl` report a sync that never happens.
+#
+# CONSEQUENCE TO EXPECT: NTPSynchronized reads "no" on such a host forever. That
+# is correct, not a fault, and anything grading time health must not read that
+# flag alone on these hosts.
+breakglass_http_time_enabled: false
+breakglass_http_time_servers:
+  - cloudflare.com
+  - ports.ubuntu.com
+
+# -- 2a. the clock STEP, which is what actually recovers this node ------------
+# The htpdate DAEMON alone is not enough. Daemon mode SLEWS; a slew cannot cover
+# a large offset. After a power loss an RTC-less board comes back with an old
+# clock and logs
+#   "Adjusting <n> seconds" / "Time change failed"
+# every 30 minutes until the clock is stepped. Both transports stay down the
+# whole time: every certificate reads "not yet valid" at a clock in the past,
+# which is precisely when a break-glass node is wanted.
+#
+# So this class gets the same treatment ntp-hygiene gives an RTC-less Tegra,
+# by a different mechanism because NTP is unavailable:
+#   - fake-hwclock so a cold boot starts at last-known-good, not the epoch;
+#   - a oneshot STEP before tailscaled/netbird, so neither authenticates
+#     against a broken clock;
+#   - a monotonic retry timer for the boot-before-the-uplink case;
+#   - a restart of the transports when the step was large, because a corrected
+#     clock does NOT by itself bring them back.
+#
+# Defaults ON with breakglass_http_time_enabled, because a host that needs an
+# HTTP time source is by definition one that cannot fix its own clock.
+breakglass_clock_step_enabled: true
+# Persist the wall clock to disk (hourly + at shutdown) and restore it at boot.
+# `fake-hwclock load` only ever advances the clock, so it is a no-op on a host
+# with a working RTC.
+breakglass_fake_hwclock_enabled: true
+# Offset (seconds) above which the clock is stepped rather than left to the
+# daemon's slew, and above which the overlay transports are restarted. 60s is
+# far below any certificate validity margin and far above htpdate's ~1s
+# accuracy, so normal operation never trips it.
+breakglass_clock_step_tolerance_sec: 60
+# Year below which the clock is implausible whatever the measured offset says.
+# Mirrors chrony_presync_min_year; bump as time advances.
+breakglass_clock_min_year: 2025
+# Units restarted after a large step. Both transports authenticate with TLS and
+# neither recovers on its own from a clock that was wrong when it started.
+breakglass_clock_step_restart_units:
+  - tailscaled.service
+  - netbird.service
+# One query pass (htpdate -q) and one set pass (htpdate -s), in seconds.
+breakglass_clock_step_query_timeout_sec: 30
+breakglass_clock_step_set_timeout_sec: 60
+# systemd TimeoutStartSec for the whole oneshot — must exceed query + set.
+breakglass_clock_step_timeout_sec: 120
+# Retry interval while no time source is reachable. Monotonic; stops firing as
+# soon as the step succeeds.
+breakglass_clock_step_retry_interval_sec: 60
+
+# -- 3. resolver where port 53 egress is blocked -------------------------------
+# For sites that advertise public resolvers over DHCP and then block udp/tcp 53
+# to them, so every DHCP client has nameservers it cannot reach. Every host on
+# that segment fails the same test, so it is the network and not the host, and
+# apt breaks silently.
+#
+# DNS-over-TLS on 853 usually passes. Set breakglass_dns_over_tls_servers to the
+# site's answer; the site's own resolver, if it has a reachable one, is the
+# better fix and this is the fallback when it does not.
+breakglass_dns_over_tls_enabled: false
+breakglass_dns_over_tls_servers: []

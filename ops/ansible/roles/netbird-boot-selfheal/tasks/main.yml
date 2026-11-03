@@ -1,0 +1,171 @@
+---
+# netbird-boot-selfheal — install the ordering drop-in + the watchdog timer.
+# See defaults/main.yml + docs/design/netbird-boot-selfheal.md.
+
+- name: netbird-boot-selfheal | gate
+  ansible.builtin.meta: end_host
+  when: not (netbird_selfheal_enabled | bool)
+
+- name: netbird-boot-selfheal | sanity of tunables
+  ansible.builtin.assert:
+    that:
+      - netbird_selfheal_min_peers | int >= 1
+      - netbird_selfheal_sustained_checks | int >= 1
+      - netbird_selfheal_cooldown_s | int >= 60
+      - netbird_selfheal_max_restarts_per_boot | int >= 1
+    fail_msg: >-
+      netbird-boot-selfheal tunables out of range (min_peers>=1,
+      sustained_checks>=1, cooldown_s>=60, max_restarts_per_boot>=1).
+
+# ---- root-cause mitigation: netbird waits for the network to be up ----------
+- name: netbird-boot-selfheal | netbird.service drop-in dir
+  ansible.builtin.file:
+    path: /etc/systemd/system/netbird.service.d
+    state: directory
+    mode: "0755"
+  when: netbird_selfheal_install_ordering_dropin | bool
+
+- name: netbird-boot-selfheal | order netbird after network-online.target
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/netbird.service.d/10-network-online.conf
+    mode: "0644"
+    content: |
+      # Managed by ops/ansible/roles/netbird-boot-selfheal — DO NOT EDIT ON HOST.
+      # Root-cause mitigation for the boot-time wedge: stock
+      # netbird.service waits only on network.target, which fires before routes
+      # /DNS to mgmt+relays are usable, so netbird starts into "no route to
+      # host" and its engine wedges. network-online.target waits for the
+      # network to actually be up. Additive to netbird's own After=.
+      [Unit]
+      After=network-online.target
+      Wants=network-online.target
+  when: netbird_selfheal_install_ordering_dropin | bool
+  notify: reload systemd for netbird selfheal
+
+# ---- boot survivability: enabled + able to resolve mgmt ----------------------
+# Islanding: a power cycle does not restart a `disabled` netbird.service, and
+# even a manual start cannot resolve netbird.<goatnet> if the site LAN blocks
+# public :53 (handing out 1.1.1.1/9.9.9.9 by DHCP then filtering them). The node is cut off
+# the mesh with no self-recovery — the watchdog below never fires because the
+# control plane never comes up. Both halves are fixed here, ahead of the watchdog.
+# This role runs in mgmt-host-baseline.yml, which converges BEFORE netbird is
+# installed (netbird enrolment is a later site-bringup phase). On a fresh node
+# netbird.service does not exist yet, and `systemd: enabled: true` HARD-FAILS
+# with "Could not find the requested service netbird.service". The ordering drop-in + DNS fallback above
+# are just files and are safe to pre-stage; enabling a not-yet-installed unit is
+# not. Gate the enable on the unit actually existing — it becomes effective when
+# the role re-runs after netbird install, and is a clean no-op on a fresh box.
+- name: netbird-boot-selfheal | gather service facts (is netbird.service present yet?)
+  ansible.builtin.service_facts:
+
+- name: netbird-boot-selfheal | ensure netbird is enabled for boot (only once netbird is installed)
+  ansible.builtin.systemd:
+    name: netbird.service
+    enabled: true
+  when: "'netbird.service' in (ansible_facts.services | default({}))"
+
+- name: netbird-boot-selfheal | NOTICE — netbird not installed yet, skipping enable
+  ansible.builtin.debug:
+    msg: >-
+      netbird.service is not present on this host yet, so boot-enable is skipped.
+      This is expected during mgmt-host-baseline (netbird is installed by a later
+      site-bringup phase); re-running this role after netbird install enables it.
+  when: "'netbird.service' not in (ansible_facts.services | default({}))"
+
+- name: netbird-boot-selfheal | boot-DNS fallback (resolve mgmt when the mesh is down)
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/10-netbird-bootstrap-dns.conf
+    mode: "0644"
+    content: |
+      # Managed by ops/ansible/roles/netbird-boot-selfheal — DO NOT EDIT ON HOST.
+      # Boot-time mesh bootstrap must resolve the mgmt endpoint BEFORE the mesh
+      # (and its CoreDNS) exist. On a site LAN that blocks public :53, that
+      # resolution dead-ends and netbird can never rejoin. Point systemd-resolved
+      # at a resolver this LAN actually permits (the site's ISP resolver).
+      [Resolve]
+      DNS={{ netbird_selfheal_bootstrap_dns | join(' ') }}
+      FallbackDNS={{ netbird_selfheal_bootstrap_dns | join(' ') }}
+  when: (netbird_selfheal_bootstrap_dns | default([])) | length > 0
+  notify: restart systemd-resolved for netbird selfheal
+
+# The resolved drop-in above is NOT honored on the STIG'd Jetson: its
+# systemd-resolved never returns the ISP resolver, so netbird still can't
+# resolve mgmt at boot and the node islands. The reliable form is an
+# ExecStartPre that resolves the mgmt endpoint DIRECTLY against the permitted
+# resolver (bypassing resolved) and pins the CURRENT IPs in /etc/hosts before
+# netbird starts — self-refreshing every boot, so no stale pin either.
+- name: netbird-boot-selfheal | install boot-DNS bootstrap script
+  ansible.builtin.copy:
+    src: netbird-dns-bootstrap.sh
+    dest: /usr/local/bin/netbird-dns-bootstrap.sh
+    mode: "0755"
+  when: (netbird_selfheal_bootstrap_dns | default([])) | length > 0
+
+- name: netbird-boot-selfheal | netbird ExecStartPre pins mgmt before start
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/netbird.service.d/20-dns-bootstrap.conf
+    mode: "0644"
+    content: |
+      # Managed by ops/ansible/roles/netbird-boot-selfheal — DO NOT EDIT ON HOST.
+      # Resolve the mgmt endpoint against a LAN-permitted resolver and pin the
+      # current IPs in /etc/hosts before netbird starts. Reliable form of
+      # the boot-DNS fix; the resolved drop-in is belt-and-suspenders.
+      [Service]
+      ExecStartPre=/usr/local/bin/netbird-dns-bootstrap.sh {{ site_enrollment_dns }} {{ netbird_selfheal_bootstrap_dns[0] }}
+  when: (netbird_selfheal_bootstrap_dns | default([])) | length > 0
+  notify: reload systemd for netbird selfheal
+
+# ---- the watchdog -----------------------------------------------------------
+- name: netbird-boot-selfheal | dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ netbird_selfheal_dir }}"
+    - "{{ netbird_selfheal_state_dir }}"
+
+- name: netbird-boot-selfheal | install watchdog script
+  ansible.builtin.copy:
+    src: "{{ netbird_selfheal_src }}"
+    dest: "{{ netbird_selfheal_dir }}/netbird-boot-selfheal.sh"
+    mode: "0755"
+  notify: restart netbird-boot-selfheal timer
+
+- name: netbird-boot-selfheal | env (tunables)
+  ansible.builtin.copy:
+    dest: "{{ netbird_selfheal_dir }}/netbird-boot-selfheal.env"
+    mode: "0644"
+    content: |
+      # Managed by ops/ansible/roles/netbird-boot-selfheal — DO NOT EDIT ON HOST.
+      NB_BIN={{ netbird_selfheal_nb_bin }}
+      MIN_PEERS={{ netbird_selfheal_min_peers | int }}
+      SUSTAINED_CHECKS={{ netbird_selfheal_sustained_checks | int }}
+      COOLDOWN_S={{ netbird_selfheal_cooldown_s | int }}
+      MAX_RESTARTS_PER_BOOT={{ netbird_selfheal_max_restarts_per_boot | int }}
+      RESTART_BUDGET_WINDOW_S={{ netbird_selfheal_restart_budget_window_s | default(86400) | int }}
+      STATE_DIR={{ netbird_selfheal_state_dir }}
+      METRICS_FILE={{ netbird_selfheal_state_dir }}/metrics.prom
+      CP_WEDGE_ENABLED={{ 1 if (netbird_selfheal_cp_wedge_enabled | default(false) | bool) else 0 }}
+      MGMT_PROBE_URL={{ netbird_selfheal_mgmt_probe_url | default('') }}
+      PROBE_TIMEOUT_S={{ netbird_selfheal_probe_timeout_s | default(5) | int }}
+      DATA_WEDGE_ENABLED={{ 1 if (netbird_selfheal_data_wedge_enabled | default(false) | bool) else 0 }}
+      DATA_PROBE_TARGETS={{ netbird_selfheal_data_probe_targets | default([]) | join(' ') }}
+  notify: restart netbird-boot-selfheal timer
+
+- name: netbird-boot-selfheal | systemd service + timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - netbird-boot-selfheal.service
+    - netbird-boot-selfheal.timer
+  notify: restart netbird-boot-selfheal timer
+
+- name: netbird-boot-selfheal | reload + enable + start timer
+  ansible.builtin.systemd:
+    name: netbird-boot-selfheal.timer
+    enabled: true
+    state: started
+    daemon_reload: true

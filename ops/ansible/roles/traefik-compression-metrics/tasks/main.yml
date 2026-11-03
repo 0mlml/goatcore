@@ -1,0 +1,107 @@
+---
+# Install (or fully remove) the Traefik compression metrics timer. Idempotent.
+#
+# `enabled: false` means TEAR DOWN, not "skip". A disabled site that kept its
+# last .prom would keep publishing a frozen ratio that reads as healthy
+# compression — the exact failure the exporter's own honesty block exists to
+# prevent, reintroduced by the deploy path.
+
+- name: traefik-compression-metrics | teardown when disabled
+  when: not (traefik_compression_metrics_enabled | default(false) | bool)
+  become: true
+  block:
+    - name: traefik-compression-metrics | stop + disable timer and service
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+      loop:
+        - traefik-compression-metrics.timer
+        - traefik-compression-metrics.service
+
+    - name: traefik-compression-metrics | remove unit, script, env and stale metrics
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/traefik-compression-metrics.timer
+        - /etc/systemd/system/traefik-compression-metrics.service
+        - /usr/local/sbin/traefik-compression-metrics.py
+        - "{{ traefik_compression_metrics_textfile_dir }}/{{ traefik_compression_metrics_prom_file }}"
+
+    - name: traefik-compression-metrics | remove rules file
+      ansible.builtin.file:
+        path: "{{ traefik_compression_metrics_rules_dir }}/traefik-compression.rules.yml"
+        state: absent
+      when: (traefik_compression_metrics_rules_dir | default('') | length) > 0
+
+    - name: traefik-compression-metrics | reload systemd after removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+- name: traefik-compression-metrics | install
+  when: traefik_compression_metrics_enabled | default(false) | bool
+  become: true
+  block:
+    - name: traefik-compression-metrics | ensure textfile collector directory exists
+      ansible.builtin.file:
+        path: "{{ traefik_compression_metrics_textfile_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: traefik-compression-metrics | install exporter
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/traefik-compression-metrics.py"
+        dest: /usr/local/sbin/traefik-compression-metrics.py
+        mode: "0755"
+      notify: restart traefik-compression-metrics timer
+
+    - name: traefik-compression-metrics | install unit + timer
+      ansible.builtin.template:
+        src: "traefik-compression-metrics.{{ item }}.j2"
+        dest: "/etc/systemd/system/traefik-compression-metrics.{{ item }}"
+        mode: "0644"
+      loop:
+        - service
+        - timer
+      notify: restart traefik-compression-metrics timer
+
+    - name: traefik-compression-metrics | install Prometheus rules
+      ansible.builtin.template:
+        src: traefik-compression.rules.yml.j2
+        dest: "{{ traefik_compression_metrics_rules_dir }}/traefik-compression.rules.yml"
+        mode: "0644"
+      when: (traefik_compression_metrics_rules_dir | default('') | length) > 0
+      notify: reload prometheus for compression rules
+
+    - name: traefik-compression-metrics | enable + start timer
+      ansible.builtin.systemd:
+        name: traefik-compression-metrics.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    # Publish once at deploy rather than waiting out the first interval, so the
+    # deploy can be verified on the spot instead of "check back in five minutes".
+    - name: traefik-compression-metrics | prime the metrics file
+      ansible.builtin.systemd:
+        name: traefik-compression-metrics.service
+        state: started
+      failed_when: false
+
+    - name: traefik-compression-metrics | read back what was published
+      ansible.builtin.command:
+        cmd: "grep -c '^goat_traefik_' {{ traefik_compression_metrics_textfile_dir }}/{{ traefik_compression_metrics_prom_file }}"
+      register: _tcm_series
+      changed_when: false
+      failed_when: false
+
+    - name: traefik-compression-metrics | report
+      ansible.builtin.debug:
+        msg: >-
+          traefik-compression-metrics published
+          {{ _tcm_series.stdout | default('0') }} series to
+          {{ traefik_compression_metrics_textfile_dir }}/{{ traefik_compression_metrics_prom_file }}.
+          Zero series means the access log had nothing with both size fields —
+          check `goat_traefik_compression_exporter_up` in that file.

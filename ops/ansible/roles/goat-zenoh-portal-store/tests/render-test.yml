@@ -1,0 +1,100 @@
+---
+# Renders roles/goat-zenoh-portal/templates/{portal.env.j2,docker-compose.yml.j2}
+# on localhost with the store role's defaults, in both stores, and checks what
+# the server gets. The sqlite renders must be byte-identical to a render with no
+# store variable at all (the goatnets that have not cut over). No host, no docker.
+- name: goat-zenoh-portal-store | render test
+  hosts: localhost
+  gather_facts: false
+  vars:
+    site_id: zagros-dev
+    site_dns_zone: example.test
+    ghcr_org: usareur-af
+    gzrt_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}"
+    # Every character that must not survive raw in a URL userinfo or a compose
+    # env file.
+    gzrt_password: "p@ss/w:rd'#$ %?&="
+    # portal.env.j2 reads the ACL taxonomy relative to its own role.
+    role_path: "{{ playbook_dir }}/../../goat-zenoh-portal"
+  tasks:
+    - name: Load the portal defaults (no tasks)
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../../goat-zenoh-portal/defaults/main.yml"
+
+    - name: Render with no store variable in scope (the pre-cutover baseline)
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../goat-zenoh-portal/templates/{{ item }}.j2"
+        dest: "{{ gzrt_dir }}/gzrt-baseline-{{ item }}"
+        mode: "0600"
+      loop: [portal.env, docker-compose.yml]
+
+    - name: Load the store defaults
+      ansible.builtin.include_role:
+        name: goat-zenoh-portal-store
+        tasks_from: facts.yml
+        public: true
+
+    - name: Render in each store
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../goat-zenoh-portal/templates/{{ item.1 }}.j2"
+        dest: "{{ gzrt_dir }}/gzrt-{{ item.0 }}-{{ item.1 }}"
+        mode: "0600"
+      vars:
+        portal_store: "{{ item.0 }}"
+        portal_db_password: "{{ gzrt_password }}"
+      loop: "{{ ['sqlite', 'postgres'] | product(['portal.env', 'docker-compose.yml']) | list }}"
+
+    - name: Read every render
+      ansible.builtin.slurp:
+        src: "{{ gzrt_dir }}/gzrt-{{ item }}"
+      loop:
+        - baseline-portal.env
+        - baseline-docker-compose.yml
+        - sqlite-portal.env
+        - sqlite-docker-compose.yml
+        - postgres-portal.env
+        - postgres-docker-compose.yml
+      register: gzrt_out
+
+    - name: On sqlite both files are byte-identical to the baseline
+      ansible.builtin.assert:
+        that:
+          - gzrt_out.results[0].content == gzrt_out.results[2].content
+          - gzrt_out.results[1].content == gzrt_out.results[3].content
+        fail_msg: "a sqlite render differs from the render with no store variable"
+
+    - name: The server gets the right store input
+      ansible.builtin.assert:
+        that:
+          - "'PORTAL_DB_DSN=' not in gzrt_sqlite_env"
+          - "'--db=' ~ portal_db_path in gzrt_sqlite_compose"
+          - "'PORTAL_DB_DSN=' in gzrt_pg_env"
+          - "'--db=' not in gzrt_pg_compose"
+        fail_msg: "store inputs: sqlite env/compose or postgres env/compose carry the wrong key"
+      vars:
+        gzrt_sqlite_env: "{{ gzrt_out.results[2].content | b64decode }}"
+        gzrt_sqlite_compose: "{{ gzrt_out.results[3].content | b64decode }}"
+        gzrt_pg_env: "{{ gzrt_out.results[4].content | b64decode }}"
+        gzrt_pg_compose: "{{ gzrt_out.results[5].content | b64decode }}"
+
+    - name: The DSN carries the password percent-encoded, and it decodes back
+      ansible.builtin.assert:
+        that:
+          - gzrt_dsn is match('^postgres://portal:[A-Za-z0-9%._~-]+@postgres-a:5432/portal_registry[?]sslmode=disable$')
+          - (gzrt_dsn | urlsplit('password') | urldecode) == gzrt_password
+        fail_msg: "PORTAL_DB_DSN rendered as {{ gzrt_dsn }}"
+      vars:
+        gzrt_dsn: >-
+          {{ ((gzrt_out.results[4].content | b64decode) | regex_search('(?m)^PORTAL_DB_DSN=(.*)$', '\1') | first) }}
+
+    - name: Remove the renders
+      ansible.builtin.file:
+        path: "{{ gzrt_dir }}/gzrt-{{ item }}"
+        state: absent
+      loop:
+        - baseline-portal.env
+        - baseline-docker-compose.yml
+        - sqlite-portal.env
+        - sqlite-docker-compose.yml
+        - postgres-portal.env
+        - postgres-docker-compose.yml

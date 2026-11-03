@@ -1,0 +1,58 @@
+# Rendered by ops/ansible/roles/operator-idp-kratos on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/operator-idp-kratos/templates/docker-compose.yml.j2
+# Anchor: ADR 0842 (dedicated operator IdP).
+#
+# Operator-IdP Kratos — connects to operator-idp-postgres on the same
+# Orin-C via host.docker.internal:5436. Distinct from the site Kratos
+# on Orin-A by every relevant axis (DB, cookie/cipher secrets,
+# WebAuthn RP ID).
+
+services:
+  kratos-migrate:
+    image: {{ operator_idp_kratos_image }}
+    container_name: operator-idp-kratos-migrate
+    restart: "no"
+    profiles: ["migrate"]
+    command: ["migrate", "sql", "-e", "--yes"]
+    env_file: [.env]
+    environment:
+      DSN: "{{ operator_idp_kratos_dsn }}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  kratos:
+    image: {{ operator_idp_kratos_image }}
+    container_name: {{ operator_idp_kratos_container_name }}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 384M }
+        reservations: { memory: 64M }
+    command: ["serve", "all", "--config", "/etc/config/kratos.yaml"]
+    env_file: [.env]
+    environment:
+      DSN: "{{ operator_idp_kratos_dsn }}"
+      # Kratos env-override: KRATOS_SECRETS_* arrays are read at parse
+      # time. The .env file (mode 0600) carries the comma-separated
+      # values; the empty `cookie: []` / `cipher: []` in kratos.yaml
+      # are placeholder-only.
+      KRATOS_SECRETS_COOKIE: "${KRATOS_SECRETS_COOKIE}"
+      KRATOS_SECRETS_CIPHER: "${KRATOS_SECRETS_CIPHER}"
+    volumes:
+      - {{ operator_idp_kratos_compose_dir }}/{{ operator_idp_kratos_config_subdir }}/kratos.yaml:/etc/config/kratos.yaml:ro
+      - {{ operator_idp_kratos_compose_dir }}/{{ operator_idp_kratos_config_subdir }}/identity-schema.json:/etc/config/identity-schema.json:ro
+    ports:
+      # Public + admin both bound to localhost. Traefik on Orin-C
+      # reverse-proxies the public listener via auth.ops.<site>...; the
+      # admin listener stays loopback-only for the operator-fired
+      # enrollment ceremony in 21H.2.
+      - "127.0.0.1:{{ operator_idp_kratos_public_host_port }}:4433"
+      - "127.0.0.1:{{ operator_idp_kratos_admin_host_port }}:4434"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # No docker-level healthcheck — oryd/kratos is distroless-style and
+    # lacks `wget`/`curl`. Readiness verification
+    # lives in tasks/main.yml as an ansible.builtin.uri probe against
+    # 127.0.0.1:{{ operator_idp_kratos_admin_host_port }}/admin/health/ready
+    # (which is reachable from the host because the admin port is
+    # bound to loopback above).

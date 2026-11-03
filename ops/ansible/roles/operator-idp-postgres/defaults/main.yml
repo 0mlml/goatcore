@@ -1,0 +1,70 @@
+---
+# Defaults for the `operator-idp-postgres` role.
+#
+# Block 21H.1a — single-instance Postgres on Orin-C backing the
+# operator IdP per ADR 0842. Deliberately INDEPENDENT of the
+# postgres-spock cluster on the mgmt-host pair (Orin-A/B):
+#
+#   - NOT Spock-replicated — operator identities are per-site, no
+#     cross-site sync per ADR 0842 §"Decision."
+#   - NOT in the pgBackRest stanza — backup grade is `pg_dump` cron
+#     per ADR 0842 §"Implications/Backup grade." DB is small (~1 MB)
+#     and the unreproducible portion (FIDO2 enrollments) is recoverable
+#     via 30-second operator self-action.
+#   - Single-instance — no streaming standby, no failover. Couples to
+#     Orin-C's failure domain (acceptable: when Orin-C is gone, obs
+#     stack is gone too).
+#
+# Required env vars (per-site, resolved at runtime via group_vars):
+#   - operator_idp_pg_superuser_password
+#   - operator_idp_pg_app_password    (the `operator_idp` role password)
+#   - operator_idp_pg_dump_age_recipient (age public key for dump encryption)
+
+# Postgres major version. Stays in step with the rest of the fleet so
+# pg_dump / pg_restore tooling stays cross-compatible.
+operator_idp_pg_major_version: 16
+
+# Container image. Postgres alpine — small footprint, well-known UID 70.
+# Distinct from the postgres-spock image (Block 21C) — the ops-IdP
+# Postgres has no Spock extension, no shared-lib preloading, no
+# replication slots. Stock postgres:16-alpine is correct.
+operator_idp_pg_image: "postgres:{{ operator_idp_pg_major_version }}-alpine"
+
+# Container name + compose project path. Convention matches other
+# Orin-C single-purpose roles (openobserve, minio, etc.) — each role
+# owns its own compose dir. operator-idp-kratos lives at
+# /opt/operator-idp-kratos/, operator-idp-hydra at /opt/operator-idp-hydra/.
+# Inter-role connectivity is host.docker.internal:<port> (same pattern
+# obs-host uses to reach MinIO).
+operator_idp_pg_container_name: "operator-idp-postgres"
+operator_idp_compose_dir: "/opt/operator-idp-postgres"
+operator_idp_data_root: "/opt/docker-data/operator-idp-postgres"
+
+# Listen on the localhost-bridged docker port — only the Kratos and
+# Hydra containers (also on Orin-C) need to reach it. NOT exposed on
+# the wg-cp0 mesh; operator IdP DB is a sealed unit.
+operator_idp_pg_host_port: 5436
+
+# Logical databases. One per Ory product (Kratos + Hydra) — same
+# pattern as the site-IdP postgres-spock cluster, just isolated here.
+operator_idp_pg_databases:
+  - kratos
+  - hydra
+
+# Application user (NOT superuser). Owns both kratos + hydra logical
+# DBs. Kratos and Hydra connect as this user.
+operator_idp_pg_app_user: "operator_idp"
+
+# pg_dump cron schedule — daily at 03:17 (avoids hourly + half-hour
+# alignment with other cron jobs on Orin-C; 17 is prime, less likely
+# to collide with future scheduled work).
+operator_idp_pg_dump_cron_minute: "17"
+operator_idp_pg_dump_cron_hour: "3"
+
+# Retention — how many days of encrypted dumps to keep on local NVMe.
+# 30 days × ~10 KB compressed dump = ~300 KB local footprint.
+operator_idp_pg_dump_retention_days: 30
+
+# Local dump directory + age-encrypted suffix.
+operator_idp_pg_dump_dir: "{{ operator_idp_data_root }}/dumps"
+operator_idp_pg_dump_filename_pattern: "operator-idp-%Y%m%dT%H%M%SZ.sql.age"

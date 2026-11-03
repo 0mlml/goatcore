@@ -1,0 +1,254 @@
+---
+# defaults for ops/ansible/roles/goat-logship
+#
+# Anchor: ADR 1078 + design/cyber-logging-and-conmon-export.md.
+# `goat-logship` is a Vector collector that normalizes host/OS + fabric
+# security events to OCSF and ships them OFF the host to Object-Lock S3,
+# retaining near-zero locally (§5). Absence-alarmed (§4).
+# Defaults are tuned for a single-host sandbox.
+
+# -- Storage layout ----------------------------------------------------------
+logship_compose_dir: "/opt/goat-logship"
+logship_data_root: "/opt/docker-data/goat-logship"   # Vector data_dir + disk buffer
+
+# Vector's debian image runs as root by default; the collector needs to read
+# /var/log/audit + the journal, so we do not drop to an unprivileged UID here
+# (unlike otel-collector, which only receives OTLP).
+
+# -- Image pin ---------------------------------------------------------------
+# Digest-pinned to the multi-arch INDEX digest; timberio/vector publishes
+# arm64 (Jetson) + amd64.
+logship_vector_image: "timberio/vector:0.44.0-debian@sha256:f8933ff1a3ec08df45abc6130947938d98dc85792a25592ec1aa6fe83a7f562c"
+
+# -- Host / site identity (stamped on every event) --------------------------
+logship_host_id: "{{ site_id | mandatory }}-thor"
+logship_site_id: "{{ site_id | mandatory }}"
+
+# -- Sources (toggle per host) ----------------------------------------------
+# journald is always on; the file/socket sources are opt-in because their
+# on-disk paths are host-specific.
+logship_journald_units:
+  - ssh.service          # Debian/Ubuntu sshd unit name (NOT sshd.service — F: auth:ssh missed)
+  - sshd.service         # RHEL-family name, harmless where absent
+  - sudo
+  - systemd-logind.service
+  - polkit.service
+
+logship_source_auditd: true
+logship_auditd_log_path: "/var/log/audit/audit.log"
+
+# config:change — auditd file watches on the sensitive OS config (identity /
+# privilege / remote-access / auth / audit-config). These fire into the SAME
+# audit.log the auditd source already tails, keyed so the transform classifies
+# them to OCSF config:change. Catches the out-of-band MANUAL edit that
+# config-as-code (git + ansible) never records. Narrow scope = low noise.
+# Only acts where auditd is present (probed).
+logship_source_config_change: true
+logship_config_change_key: "goat-config-change"
+logship_config_change_watch_paths:
+  - /etc/passwd
+  - /etc/group
+  - /etc/shadow
+  - /etc/gshadow
+  - /etc/sudoers
+  - /etc/sudoers.d
+  - /etc/ssh/sshd_config
+  - /etc/pam.d
+  - /etc/audit
+
+# Zenoh-audit fabric:write. The audit-subscriber's best-effort local NDJSON tail
+# (audit_subscriber_local_ndjson_dir, ADR 1078) — enable once that tee is live
+# on the host. The MinIO WORM store stays the system-of-record; this tail is a
+# read-only cyber-logging feed of the same publishes.
+logship_source_zenoh_audit: false
+logship_zenoh_audit_glob: "/opt/audit-subscriber/tail/*.ndjson"
+
+# Whether the OCSF copy of a fabric:write record carries the message BODY.
+#
+# Default false, because the body is already on this disk twice: the audit
+# subscriber writes it to its tail (the glob above), and ships the same record
+# to the Object-Locked MinIO bucket, which is the audit of record. Copying it a
+# third time into the OCSF tree buys nothing and costs the most bytes on the
+# box: on a busy fabric fabric:write is most of all OCSF bytes and
+# payload_bytes_b64 alone is more than half of the file.
+#
+# What survives with this off: key_expr, payload_hash, payload_len, ts,
+# src_zid, vendor, anchor, identity_model — who wrote what, where, when, and a
+# hash that still ties the record to the retained body. What is lost: reading
+# the body out of the OCSF tree instead of out of MinIO.
+#
+# Set true only for a goatnet whose off-box SIEM must receive bodies, and size
+# the disk for it first.
+logship_zenoh_audit_include_payload: false
+
+# Peer enroll / de-enroll (identity:enroll). The admit-audit container emits
+# one JSON line per admission to stdout; tap it via docker_logs. Safe to leave
+# on where the container is absent (docker_logs just yields nothing).
+logship_source_identity_enroll: true
+logship_admit_audit_container: "admit-audit"
+
+# Non-Zenoh application plane (app:http) — the Traefik ingress access log (JSON
+# on stdout) is the chokepoint every web/API request crosses. Safe where absent.
+logship_source_app_http: true
+logship_traefik_container: "traefik"
+
+# Access-log routes that are pure machine keepalive and carry no security
+# content: no identity, no payload, no decision. They are dropped BEFORE the
+# OCSF record is built, so they cost nothing downstream either.
+#
+# Why this list is not empty by default: NetBird's signal exchange is a
+# long-lived gRPC stream per peer pair, and every re-poll writes an access-log
+# line. Nearly all app:http records are POST /signalexchange.SignalExchange/Send
+# -> 499 (499 = the client closed the stream, the normal end of a poll), and that
+# says nothing an investigator can use: who is meshed
+# with whom is in the NetBird store, and the session itself is encrypted.
+#
+# These regexes match the request PATH with the query string already stripped.
+# A route belongs here only when it is BOTH high-rate AND evidence-free.
+logship_app_http_drop_path_regexes:
+  - '^/signalexchange\.SignalExchange/'
+
+# Web-surface auth (app:auth) — oauth2-proxy fronts every OIDC-gated surface and
+# logs the authenticated identity + auth denials. Prefix-matches all
+# oauth2-proxy-<surface> containers. Safe where absent.
+logship_source_app_auth: true
+logship_oauth2_proxy_prefix: "oauth2-proxy"
+
+# -- ADR 1128 bandwidth attribution, HTTP half -------------------------------
+# Turns the Traefik access log into Prometheus byte counters on the exporter
+# this role ALREADY runs (logship_metrics_port, scraped as job=goat_logship).
+# Requires logship_source_app_http, which supplies the `traefik` source.
+logship_http_bandwidth_metrics: true
+
+# Per-client attribution: "which peer is eating this category". Cardinality is
+# clients x categories x 2 — roughly 3.4k series at a 90-peer goatnet, which is
+# fine, and NOT fine at the ADR 1122 10k-peer envelope. Turn off there. The
+# always-on family (category x service) is unaffected either way.
+logship_http_peer_attribution: true
+
+# NOTE ON `$$`: an end-of-string anchor is written `$$`, not `$`. Vector runs
+# env-var interpolation over its config BEFORE VRL ever sees it, and a bare `$`
+# followed by a word character is consumed (a `$1` capture group in this same
+# template once crash-looped the collector with `Missing environment variable
+# "1"` — see the file header of vector.yaml.j2). `$$` is the documented escape
+# and is correct whether or not the following character would have triggered
+# interpolation, so it is used unconditionally rather than reasoned about
+# per-regex. A crash-loop here takes the WHOLE logship pipeline down, not just
+# these metrics.
+#
+# Ordered route -> category rules; FIRST MATCH WINS, so order is meaning, not
+# style. `category` must be a key from ops/observability/bandwidth-categories.yaml
+# (CI guard: ops/ci/check-bandwidth-categories.sh). Both regexes optional; when
+# both are given they AND.
+#
+# Ordering that matters, called out so a later edit does not undo it:
+#   - stream BEFORE api — /api/topics/stream matches both, and it is a stream
+#   - static BEFORE page — a .js under a surface path is an asset, not a page
+#   - identity BEFORE the fallback — auth hosts serve HTML that would otherwise
+#     read as an ordinary dynamic page
+logship_http_category_rules:
+  - category: surface-stream
+    why: "SSE/websocket — cost scales with CONCURRENT VIEWERS, not requests"
+    path_regex: '^/(api/topics/stream|api/stream|events|sse|stream|ws)(/|$$)'
+
+  - category: surface-static
+    why: "cacheable assets — the first thing worth pinning or edge-caching"
+    path_regex: '\.(css|js|mjs|map|json|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|wasm)$$'
+
+  - category: api
+    why: "JSON/REST — portal API, console API, panoscope /api/*, rest-pub-bridge"
+    path_regex: '^/(api|v1|rest)(/|$$)'
+
+  - category: identity
+    why: "Ory Kratos/Hydra, oauth2-proxy, Dex, Kanidm — login and token traffic"
+    path_regex: '^/(oauth2|oidc|login|logout|sessions|self-service|token|authorize|\.well-known)(/|$$)'
+
+  - category: identity
+    why: "identity vhosts serve HTML that would otherwise read as a plain page"
+    host_regex: '^(auth|login|id|kratos|hydra|dex|sso|kanidm)\.'
+
+logship_http_category_fallback: "surface-page"
+
+logship_source_egress: false   # nftables/proxy access log (needs a producer)
+logship_egress_log_path: "/var/log/goat-egress/access.log"
+
+# Phase 3 host-EDR sources (backlog block-18g). Off until their producer daemon
+# is deployed on the host — falcod needs a kernel driver + osqueryd a host
+# package, both maintenance-window changes; the collector-consumer side is ready.
+logship_source_falco: false             # runtime:falco
+logship_falco_events_path: "/var/log/falco/events.json"
+logship_source_osquery: false           # host:drift
+logship_osquery_results_path: "/var/log/osquery/osqueryd.results.log"
+
+# Computed: the set of normalized transforms feeding the sinks. Tracks the
+# source toggles so a disabled source never dangles a sink input.
+logship_normalized_inputs: >-
+  {{ ['journald_ocsf']
+     + (['auditd_ocsf'] if logship_source_auditd else [])
+     + (['zenoh_audit_ocsf'] if logship_source_zenoh_audit else [])
+     + (['admit_audit_ocsf'] if logship_source_identity_enroll else [])
+     + (['app_http_ocsf'] if logship_source_app_http else [])
+     + (['app_auth_ocsf'] if logship_source_app_auth else [])
+     + (['egress_ocsf'] if logship_source_egress else [])
+     + (['falco_ocsf'] if logship_source_falco else [])
+     + (['osquery_ocsf'] if logship_source_osquery else []) }}
+
+# -- Sink 1: the durable landing (pluggable) --------------------------------
+# `mode` selects the durable sink WITHOUT touching the rest of the pipeline —
+# the sink component is always `durable`, so the absence-alarm and metrics are
+# mode-agnostic. Swapping mock -> s3 is a one-line flip (ADR 1078 §5, §9.2).
+#
+#   mock : a local newline-delimited OCSF/JSON file on the host (inspectable,
+#          rotated, NON-durable — stores nothing off-box). The default: it
+#          proves the full collect->normalize->ship path with zero cloud
+#          dependency. Retain almost nothing (§5) — the mock file is a
+#          demonstration tail, not a store.
+#   s3   : the real off-box Object-Lock bucket in AWS GovCloud (US)
+#          (terraform-govcloud/cyber-logging-s3.tf). RMF/ATO cyber logs land on
+#          the government side, NOT commercial AWS. Blocked on a GovCloud account
+#          (none yet) — provisioning + an ingest key are the added steps.
+logship_durable_sink_mode: "mock"        # mock | s3
+
+# mock-mode sink — local OCSF/JSON tail, dated files under the data root.
+logship_mock_sink_dir: "{{ logship_data_root }}/ocsf"
+
+# Mock-sink retention, in whole days of dated files to keep.
+#
+# The mock file is a demonstration tail, not a store: rotated, retaining almost
+# nothing. Vector writes ocsf-%Y-%m-%d.json and rotates nothing itself, so without
+# this rule every file stays on disk and the tree grows by gigabytes per day.
+#
+# 1 day keeps the sink doing its job — proving the collect->normalize->ship
+# path end to end and staying inspectable for a day — without it being a store.
+# The mock sink mirrors real fabric volume, and under a storm the per-day output
+# balloons to tens of GiB. A demonstration sink must not scale
+# with real audit volume; 1 day still proves the path. The durable fix is a
+# byte ceiling (#1379), not a day count. In s3 mode this is not consulted:
+# durability is the bucket's job and the local tail is not written at all.
+logship_mock_sink_retain_days: 1
+logship_mock_sink_prune_oncalendar: "daily"
+
+# s3-mode sink — the dedicated GovCloud (US) Object-Lock bucket. NAME is
+# confirm-with-owner at standup. Only consulted when mode == s3.
+logship_s3_bucket: "example-logship-govcloud"
+logship_s3_region: "us-gov-west-1"
+
+logship_buffer_max_bytes: 536870912     # 512 MiB disk buffer (outage, not retention)
+
+# In s3 mode Vector reads AWS creds from the standard chain; the .env supplies
+# an ingest-only key/secret written by Ansible from env at deploy (never
+# committed). Not needed in mock mode.
+
+# -- Sink 2: external-collector egress adapter (CEF/syslog-5424-TLS) -------------------
+# DEFAULT-OFF. Enabling it is the only step that emits data outside the
+# boundary; gated on a named, confirmed collector endpoint (ADR 1078 §10).
+logship_sink_collector_enabled: false
+logship_collector_endpoint: ""            # host:port of the external collector
+logship_collector_ca_file: ""             # optional CA bundle for the collector's TLS
+
+# -- Metrics / absence-alarm -------------------------------------------------
+logship_metrics_port: 9598
+
+# -- Healthcheck timing ------------------------------------------------------
+logship_health_retries: 30
+logship_health_delay_seconds: 2

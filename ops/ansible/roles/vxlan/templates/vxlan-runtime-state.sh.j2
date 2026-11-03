@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# Managed by ops/ansible/roles/vxlan — do not edit by hand.
+#
+# Manages the FULL kernel state for goat L2 segments: bridge, vxlan netdev,
+# bridged-interface enslavement, FDB head-end-replication, IP address, MTU,
+# TCP MSS clamp, optional tc tbf BUM rate-limit qdisc.
+#
+# Bash + iproute2 directly — does NOT use systemd-networkd .netdev/.network
+# files. Reason: F-051 captured systemd-networkd 249 (Ubuntu 22.04) silently
+# loading VXLAN .netdev files but never instantiating the kernel netdev when
+# Local= depends on a DHCP-configured underlay interface. Bash + iproute2 is
+# the lingua franca of Linux networking, idempotent, debuggable, and avoids
+# the networkd quirk entirely.
+#
+# Reads /etc/vxlan/segments.conf (rendered by the Ansible role).
+# Idempotent: every operation either checks state first or uses the iproute2
+# `replace` family that's safe whether or not the resource pre-existed.
+#
+# Run by: vxlan-runtime-state.service (oneshot, RemainAfterExit=yes,
+# After=network-online.target).
+# On Ansible apply: the role triggers a `systemctl restart` which re-runs
+# this. Same code path at apply-time and at boot.
+
+set -euo pipefail
+
+CONF=/etc/vxlan/segments.conf
+[[ -r "$CONF" ]] || { echo "no $CONF — nothing to apply"; exit 0; }
+
+# Parse simple section-and-keys file into per-segment associative state.
+declare -A seg_vni seg_bridge seg_address seg_mtu seg_local_ip seg_peers
+declare -A seg_dstport seg_mss seg_tbf_rate seg_tbf_burst seg_tbf_latency seg_bridge_ifaces
+
+current_section=""
+while IFS= read -r line; do
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  [[ -z "$line" || "$line" == \#* ]] && continue
+
+  if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+    current_section="${BASH_REMATCH[1]}"
+    continue
+  fi
+  [[ -z "$current_section" ]] && continue
+
+  key="${line%%=*}"
+  val="${line#*=}"
+  case "$key" in
+    vni)               seg_vni[$current_section]="$val" ;;
+    bridge)            seg_bridge[$current_section]="$val" ;;
+    address)           seg_address[$current_section]="$val" ;;
+    mtu)               seg_mtu[$current_section]="$val" ;;
+    local_ip)          seg_local_ip[$current_section]="$val" ;;
+    peers)             seg_peers[$current_section]="$val" ;;
+    dstport)           seg_dstport[$current_section]="$val" ;;
+    mss_clamp)         seg_mss[$current_section]="$val" ;;
+    tbf_rate)          seg_tbf_rate[$current_section]="$val" ;;
+    tbf_burst)         seg_tbf_burst[$current_section]="$val" ;;
+    tbf_latency)       seg_tbf_latency[$current_section]="$val" ;;
+    bridge_interfaces) seg_bridge_ifaces[$current_section]="$val" ;;
+  esac
+done < "$CONF"
+
+# ---------------------------------------------------------------------------
+# Per-segment apply
+# ---------------------------------------------------------------------------
+for sec in "${!seg_vni[@]}"; do
+  vni="${seg_vni[$sec]}"
+  br="${seg_bridge[$sec]}"
+  addr="${seg_address[$sec]}"
+  mtu="${seg_mtu[$sec]:-1370}"
+  local_ip="${seg_local_ip[$sec]}"
+  peers_csv="${seg_peers[$sec]}"
+  dstport="${seg_dstport[$sec]:-4789}"
+  vxname="vxlan${vni}"
+
+  echo "[*] applying segment vni=$vni bridge=$br vxlan=$vxname local=$local_ip"
+
+  # --- Bridge ---
+  if ! ip -o link show dev "$br" >/dev/null 2>&1; then
+    ip link add "$br" type bridge stp_state 0
+    echo "  + created bridge $br"
+  fi
+  ip link set "$br" mtu "$mtu"
+  # `ip addr replace` is idempotent — adds if missing, replaces if present.
+  ip addr replace "$addr" dev "$br"
+
+  # --- VXLAN netdev ---
+  if ! ip -o link show dev "$vxname" >/dev/null 2>&1; then
+    ip link add "$vxname" type vxlan id "$vni" dstport "$dstport" local "$local_ip" nolearning
+    echo "  + created $vxname (id=$vni dstport=$dstport local=$local_ip)"
+  fi
+  ip link set "$vxname" mtu "$mtu"
+  # Enslave to bridge (idempotent — repeated calls are no-ops).
+  current_master="$(ip -o link show dev "$vxname" | grep -oE 'master [^ ]+' | awk '{print $2}' || echo)"
+  if [[ "$current_master" != "$br" ]]; then
+    ip link set "$vxname" master "$br"
+    echo "  + enslaved $vxname to $br"
+  fi
+
+  # --- FDB head-end replication ---
+  # Filter local IP out of peers list, then sync FDB to the desired set.
+  desired_peers=""
+  IFS=',' read -ra peer_arr <<< "$peers_csv"
+  for p in "${peer_arr[@]}"; do
+    [[ -z "$p" || "$p" == "$local_ip" ]] && continue
+    desired_peers+="$p "
+  done
+
+  current_fdb="$(bridge fdb show dev "$vxname" 2>/dev/null | awk '$1=="00:00:00:00:00:00" && $2=="dst"{print $3}' | sort -u)"
+  desired_fdb="$(echo "$desired_peers" | tr ' ' '\n' | sort -u | grep -v '^$' || true)"
+
+  # Remove FDB entries no longer wanted
+  while IFS= read -r ip_to_remove; do
+    [[ -z "$ip_to_remove" ]] && continue
+    if ! grep -qx "$ip_to_remove" <<< "$desired_fdb"; then
+      bridge fdb del 00:00:00:00:00:00 dev "$vxname" dst "$ip_to_remove" 2>/dev/null || true
+      echo "  - removed FDB entry for $ip_to_remove"
+    fi
+  done <<< "$current_fdb"
+
+  # Add FDB entries for new peers
+  while IFS= read -r ip_to_add; do
+    [[ -z "$ip_to_add" ]] && continue
+    if ! grep -qx "$ip_to_add" <<< "$current_fdb"; then
+      bridge fdb append 00:00:00:00:00:00 dev "$vxname" dst "$ip_to_add"
+      echo "  + added FDB entry for $ip_to_add"
+    fi
+  done <<< "$desired_fdb"
+
+  # --- Bridge bridged-interfaces (optional local NICs) ---
+  if [[ -n "${seg_bridge_ifaces[$sec]:-}" ]]; then
+    IFS=',' read -ra ifs <<< "${seg_bridge_ifaces[$sec]}"
+    for iface in "${ifs[@]}"; do
+      [[ -z "$iface" ]] && continue
+      iface_master="$(ip -o link show dev "$iface" 2>/dev/null | grep -oE 'master [^ ]+' | awk '{print $2}' || echo)"
+      if [[ "$iface_master" != "$br" ]]; then
+        ip link set "$iface" master "$br"
+        echo "  + enslaved $iface to $br"
+      fi
+    done
+  fi
+
+  # --- Up ---
+  ip link set "$vxname" up
+  ip link set "$br" up
+
+  # --- TCP MSS clamp on FORWARD-out-bridge ---
+  if [[ "${seg_mss[$sec]:-true}" == "true" ]]; then
+    if ! iptables -t mangle -C FORWARD -o "$br" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+      iptables -t mangle -A FORWARD -o "$br" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu
+      echo "  + added MSS clamp on FORWARD out $br"
+    fi
+  else
+    while iptables -t mangle -C FORWARD -o "$br" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do
+      iptables -t mangle -D FORWARD -o "$br" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu
+      echo "  - removed MSS clamp on FORWARD out $br"
+    done
+  fi
+
+  # --- tc tbf at bridge root ---
+  if [[ -n "${seg_tbf_rate[$sec]:-}" ]]; then
+    rate="${seg_tbf_rate[$sec]}"
+    burst="${seg_tbf_burst[$sec]:-32kbit}"
+    latency="${seg_tbf_latency[$sec]:-50ms}"
+    tc qdisc replace dev "$br" root tbf rate "$rate" burst "$burst" latency "$latency"
+    echo "  + applied tbf rate=$rate burst=$burst latency=$latency on $br"
+  else
+    if tc qdisc show dev "$br" root 2>/dev/null | grep -q tbf; then
+      tc qdisc del dev "$br" root || true
+      echo "  - removed tbf qdisc on $br"
+    fi
+  fi
+done
+
+seg_count=0
+for _s in "${!seg_vni[@]}"; do seg_count=$((seg_count + 1)); done
+echo "vxlan-runtime-state apply complete (segments=${seg_count})"

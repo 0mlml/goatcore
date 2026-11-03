@@ -1,0 +1,113 @@
+---
+- name: ubuntu_pro_token must be provided
+  ansible.builtin.assert:
+    that:
+      - ubuntu_pro_token is defined
+      - ubuntu_pro_token | length > 0
+    fail_msg: "ubuntu_pro_token is required (pass via -e or group_vars vault)."
+
+- name: Install ubuntu-advantage-tools
+  ansible.builtin.apt:
+    name: ubuntu-advantage-tools
+    state: present
+    update_cache: true
+
+- name: Detect platform (x86 / arm64 stock / arm64 L4T)
+  ansible.builtin.set_fact:
+    platform_kind: >-
+      {%- if ansible_architecture == 'x86_64' -%}x86_64
+      {%- elif ansible_architecture in ['aarch64','arm64'] and ('tegra' in ansible_kernel) -%}l4t-arm64
+      {%- elif ansible_architecture in ['aarch64','arm64'] -%}stock-arm64
+      {%- else -%}unknown
+      {%- endif -%}
+
+- name: Check current Pro attach state
+  ansible.builtin.command: pro status --format=json
+  register: pro_status_raw
+  changed_when: false
+  failed_when: false
+
+- name: Parse Pro status
+  ansible.builtin.set_fact:
+    pro_status_json: "{{ pro_status_raw.stdout | from_json }}"
+  when: pro_status_raw.rc == 0
+
+- name: Attach Ubuntu Pro subscription if not already attached
+  ansible.builtin.command: "pro attach {{ ubuntu_pro_token }}"
+  when:
+    - pro_status_raw.rc == 0
+    - pro_status_json.attached | default(false) | bool == false
+  no_log: true
+
+- name: Enable fips-updates service
+  ansible.builtin.command: pro enable fips-updates --assume-yes
+  register: fips_enable
+  changed_when: "'not already enabled' not in fips_enable.stderr | default('')"
+  failed_when:
+    - fips_enable.rc != 0
+    - "'already enabled' not in fips_enable.stderr | default('')"
+
+- name: Enable usg service (needed by usg-stig role)
+  ansible.builtin.command: pro enable usg --assume-yes
+  register: usg_enable
+  changed_when: "'not already enabled' not in usg_enable.stderr | default('')"
+  failed_when:
+    - usg_enable.rc != 0
+    - "'already enabled' not in usg_enable.stderr | default('')"
+
+- name: Read /proc/sys/crypto/fips_enabled
+  ansible.builtin.slurp:
+    src: /proc/sys/crypto/fips_enabled
+  register: kernel_fips_raw
+  failed_when: false
+
+- name: Extract kernel FIPS state
+  ansible.builtin.set_fact:
+    kernel_fips_enabled: >-
+      {{
+        (kernel_fips_raw.content | default('MA==') | b64decode | trim) == '1'
+      }}
+
+- name: Check OpenSSL FIPS mode
+  ansible.builtin.shell: |
+    set -o pipefail
+    openssl list -providers 2>/dev/null | grep -q fips && echo yes || echo no
+  register: openssl_fips_check
+  changed_when: false
+  failed_when: false
+
+- name: Compose evidence JSON
+  ansible.builtin.set_fact:
+    ubuntu_pro_fips_state:
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+      hostname: "{{ ansible_hostname }}"
+      platform: "{{ platform_kind }}"
+      kernel: "{{ ansible_kernel }}"
+      pro_attached: "{{ pro_status_json.attached | default(false) }}"
+      pro_services: "{{ pro_status_json.services | default([]) | map(attribute='name') | list }}"
+      kernel_fips_enabled: "{{ kernel_fips_enabled }}"
+      openssl_fips_enabled: "{{ openssl_fips_check.stdout == 'yes' }}"
+      gap_documented: >-
+        {%- if platform_kind == 'l4t-arm64' and not kernel_fips_enabled -%}
+        L4T kernel outside Canonical FIPS cert scope; closes on OnLogic swap
+        {%- else -%}
+        none
+        {%- endif -%}
+
+- name: Write evidence file
+  ansible.builtin.copy:
+    content: "{{ ubuntu_pro_fips_state | to_nice_json }}\n"
+    dest: "{{ ubuntu_pro_state_path }}"
+    mode: "0644"
+
+- name: Enforce kernel FIPS where expected
+  ansible.builtin.assert:
+    that:
+      - kernel_fips_enabled
+    fail_msg: >-
+      Expected FIPS kernel but fips_enabled=0. Reboot may be required
+      (Pro fips-updates installs the kernel; it activates at next boot).
+      On L4T, set ubuntu_pro_fips_enforce=false and accept documented gap.
+  when:
+    - ubuntu_pro_fips_enforce
+    - platform_kind != 'l4t-arm64'

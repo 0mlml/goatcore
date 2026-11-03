@@ -1,0 +1,260 @@
+---
+# Defaults for `goat-peering-edge` — the strongSwan IPsec peering edge for
+# cross-sovereign federation.
+#
+# Design:  docs/design/cross-sovereign-peering-transport.md  (§3 chooses IPsec)
+#          docs/design/cross-sovereign-federation.md          (trust model)
+#          docs/design/fips-pqc-path.md §"What the boundary node runs"
+# Names:   docs/design/federation-package-spec.md §3.1        (fed.<issuer>.<counterparty>.<ordinal>)
+#
+# The role builds ONE point-to-point tunnel between two edge hosts that are on
+# neither side's NetBird mesh. It carries exactly one thing: this edge's fabric
+# port talking to the far edge's fabric port.
+#
+# Every value below that has an empty default is fail-closed: the role refuses
+# rather than guessing, because a guessed endpoint or a guessed peering name is
+# refused silently at the far end and reads as a broken link.
+
+# --------------------------------------------------------------------------
+# Enablement
+# --------------------------------------------------------------------------
+# Off by default. Nothing in this role runs on a host that has not declared it.
+peering_edge_enabled: false
+
+# Short name for THIS peering, used in file names, the xfrm interface name and
+# the swanctl connection name. Lowercase a-z0-9-, <= 11 chars (the interface
+# name is "ipsec-<name>" and must fit IFNAMSIZ 15).
+peering_edge_name: ""
+
+# --------------------------------------------------------------------------
+# The peering declaration (cross-sovereign-peering-transport.md §5)
+# --------------------------------------------------------------------------
+# These mirror the fields of the peering declaration one-for-one. They are
+# agreed out of band at bootstrap steps 1 and 4; nothing here is discovered.
+
+# sovereign_id of each side. Lowercase ISO 3166-1 alpha-3, or the established
+# short name of a multinational body. Used only to CHECK the peering names
+# below — the names themselves are derived, never typed (spec §3.1).
+peering_edge_our_sovereign_id: ""
+peering_edge_their_sovereign_id: ""
+
+# Peering identities: fed.<issuer>.<counterparty>.<ordinal>, ordinal
+# zero-padded to two digits. These are the IKE identities and they are what the
+# far side's rules match. Derived from the two sovereign ids; declared here so
+# the file reads on its own, and CHECKED against the derivation in tasks.
+peering_edge_local_id: ""   # e.g. fed.aaa.xaa.01
+peering_edge_remote_id: ""   # e.g. fed.xaa.aaa.01
+
+# Endpoints. our = the address this host listens on / sources from;
+# their = the far edge. "%any" is legal for the remote when the far side is
+# behind NAT with no inbound port and always initiates.
+# USE "%any" ON ANY NAT'd HOST, which is every cloud instance with a public IP.
+# A literal address here must be one the host actually OWNS. Terraform's
+# transport_endpoint output is the host's PUBLIC address -- that is the value the
+# COUNTERPARTY puts in their remote_addr, and on a 1:1-NAT instance it appears on
+# no local interface. Put it here and the kernel discards every IKE datagram
+# sourced from it without telling charon, which logs "sending packet ... (288
+# bytes)" and retransmits while tcpdump on the same host captures nothing.
+peering_edge_local_addr: "%any"    # "%any" binds all; a literal only where the host owns it
+peering_edge_remote_addr: ""       # public IP:port of the far edge, or %any
+peering_edge_ike_port: 500
+
+# The link subnet — a /31 or /30, carrying two hosts and nothing else.
+peering_edge_link_prefix_len: 31
+peering_edge_local_link_ip: ""     # e.g. 169.254.10.0
+peering_edge_remote_link_ip: ""    # e.g. 169.254.10.1
+
+# The fabric port the tunnel exists to carry. Recorded in the state file and
+# used by the README's step-2 firewall check. NOT enforced by this role — see
+# peering_edge_local_ts / _remote_ts below.
+peering_edge_fabric_port: 7447
+
+# Traffic selectors. Default to the two link addresses, which is the shape two
+# independently-built IKE stacks narrow identically. Narrowing to the fabric
+# port belongs in the host firewall (bootstrap step 2), not here: a port-scoped
+# TS pair narrows differently across implementations and fails as a silent
+# no-match, which is the exact failure mode the design spends §4 avoiding.
+peering_edge_local_ts: "{{ peering_edge_local_link_ip }}/32"
+peering_edge_remote_ts: "{{ peering_edge_remote_link_ip }}/32"
+
+# --------------------------------------------------------------------------
+# MTU — measured, not assumed (transport design §6)
+# --------------------------------------------------------------------------
+# 1380 is a conservative floor, deliberately the SAME number the WireGuard
+# transport uses, so two teams agree one value regardless of which transport
+# the declaration selects. Headroom, worst case:
+#   1500 physical - 20 outer IPv4 - 8 UDP (NAT-T) - 8 ESP hdr - 8 GCM IV
+#        - 16 ICV - up to 3 pad - 2 trailer  =  ~1435 available
+#   a partner behind PPPoE (1492) leaves ~1427
+# 1380 clears both. Raise it only against a MEASURED path, per §6 — a number
+# measured on one cloud backbone path does not generalise to a partner on other
+# infrastructure.
+peering_edge_mtu: 1380
+
+# TCP MSS clamping. Only needed if this edge FORWARDS traffic onto the link.
+# Where the edge terminates the fabric session itself — the design's shape, one
+# edge's fabric port talking to the other's — the traffic is locally
+# originated and the kernel already derives MSS from the interface MTU above,
+# so clamping adds an nftables table for nothing. Off by default; turn it on
+# the day something behind this host routes across the link.
+peering_edge_clamp_mss: false
+
+# --------------------------------------------------------------------------
+# Cipher suite (fips-pqc-path.md §"What the boundary node runs")
+# --------------------------------------------------------------------------
+# AES-256-GCM / SHA-384 / ECDSA P-384, certificate authentication.
+#
+# NO ML-KEM. `ke1_mlkem768` needs strongSwan 6.x and a validated backend we do
+# not have, and the design deliberately does not pursue post-quantum at the
+# tunnel: the Zenoh TLS session inside already negotiates the X25519MLKEM768
+# hybrid end to end (transport design §2.1). Adding PQC here would protect only
+# the outer layer, which carries nothing the inner layer has not protected.
+peering_edge_ike_proposals: "aes256gcm16-prfsha384-ecp384"
+peering_edge_esp_proposals: "aes256gcm16-ecp384"
+
+# --------------------------------------------------------------------------
+# Rekey, DPD, liveness
+# --------------------------------------------------------------------------
+peering_edge_ike_rekey_time: "4h"
+peering_edge_ike_over_time: "10m"
+peering_edge_ike_rand_time: "10m"
+peering_edge_child_rekey_time: "1h"
+peering_edge_child_rand_time: "5m"
+peering_edge_dpd_delay: "30s"
+peering_edge_dpd_timeout: "150s"
+# start | trap | none. `start` keeps the SA up and re-initiates; correct for a
+# link that is meant to be permanently established. Set `trap` on a side that
+# is behind NAT with no inbound port and must never initiate.
+peering_edge_start_action: "start"
+peering_edge_dpd_action: "restart"
+peering_edge_close_action: "start"
+
+# --------------------------------------------------------------------------
+# Certificate material — READ, never written by this role
+# --------------------------------------------------------------------------
+# The role writes NO secret to disk. The leaf key and certificate are minted
+# beforehand by the offline-CA ceremony (docs/operations/dev-ca-cert-sign.md)
+# with Subject CN = peering_edge_local_id, and placed at the paths below.
+# The role asserts they exist and refuses otherwise.
+#
+# THIS FILE IS THE REVOCATION INSTRUMENT, not just a trust anchor.
+#
+# Nothing in this path checks a CRL or OCSP, and the fabric's access layer
+# matches the certificate common name and cannot see the issuer. So
+# re-issuing a peering leaf does NOT retire the leaf it replaces: the old
+# certificate keeps the same CN, the same trusted issuer and its unexpired
+# window, so it still authenticates and is still authorized: a replaced leaf
+# still handshakes, `Verify return code: 0`.
+#
+# What that means operationally: to actually retire a partner's peering
+# credential, ROTATE THIS CA ALONGSIDE THE LEAF. Because this file is
+# per-peering and 1:1 with that partner's peering leaf, removing the old CA
+# revokes exactly that leaf and nothing else -- it is not the blunt instrument
+# it looks like. Rotating the leaf ALONE leaves the old one live until notAfter.
+# (A peering carrying several ordinals under one CA loses all of them together;
+# that is still the right unit, since they are all the same partner.)
+#
+# Leaf validity is therefore the exposure window for a leaked key. See D-18 in
+# docs/project/cross-sovereign-federation-plan.md.
+#
+# The far side's CA goes in swanctl's cacerts as a PER-PEERING file. It is
+# never added to a core router's trust store: the access layer matches the
+# common name and cannot see the issuer, so a foreign root in a core
+# router IS authorization.
+peering_edge_swanctl_dir: /etc/swanctl
+peering_edge_cert_path: "{{ peering_edge_swanctl_dir }}/x509/{{ peering_edge_name }}-cert.pem"
+peering_edge_key_path: "{{ peering_edge_swanctl_dir }}/private/{{ peering_edge_name }}-key.pem"
+peering_edge_remote_ca_path: "{{ peering_edge_swanctl_dir }}/x509ca/{{ peering_edge_name }}-partner-ca.pem"
+
+# --------------------------------------------------------------------------
+# FIPS posture — ready, not assuming
+# --------------------------------------------------------------------------
+# The strongSwan configuration is IDENTICAL whether or not the host can provide
+# validated cryptography. Only the ASSERTION below differs.
+#
+# true  -> the role refuses to configure an edge on a host that cannot make the
+#          FIPS claim, unless a reason is recorded.
+# false -> the host is explicitly outside the FIPS claim; the role proceeds and
+#          records that the claim is not made.
+peering_edge_fips_required: true
+
+# Make the VALIDATED module actually do the crypto.
+#
+# WHY: attaching Ubuntu Pro FIPS is NOT
+# sufficient. strongSwan uses the first loaded plugin that provides an algorithm,
+# and stock Ubuntu load order puts aesni/aes ahead of openssl, so
+# `swanctl --list-algs` reports AES_GCM_16[aesni] -- the tunnel's BULK ENCRYPTION
+# from strongSwan's own AES-NI code, outside the validated module -- while
+# PRF_HMAC_SHA2_384 already came from [openssl]. Confirmed on a REAL FIPS host
+# (Ubuntu Pro 24.04, kernel 6.8.0-1063-aws-fips, fips_enabled=1, fips-updates
+# enabled): the stock reading there is still AES_GCM_16[aesni].
+#
+# THE FIX IS TO DISABLE THE TWO AES PLUGINS, NOT TO RAISE openssl's PRIORITY.
+# Raising openssl to `load = 100` also works on a non-FIPS host, and it BREAKS
+# strongSwan on a FIPS one -- it evicts the whole software crypto set and charon
+# then dies with "feature CUSTOM:libcharon-receiver in critical plugin
+# 'charon-systemd' failed to load ... failed to load 2 critical plugin features".
+# That is the host the setting exists for, so the priority approach is wrong
+# everywhere. Disabling aesni and aes moves AES_GCM_16 to [openssl] and leaves
+# the service running, verified on BOTH a FIPS and a non-FIPS 24.04 host.
+peering_edge_fips_crypto_plugins_disabled:
+  - aesni
+  - aes
+peering_edge_strongswan_plugin_conf_dir: /etc/strongswan.d/charon
+
+# The escape. Non-empty + fips_required -> proceed, and record a LOUD
+# deviation in the state file and the play output. Empty + no validated
+# crypto -> refuse. There is no path that proceeds silently.
+peering_edge_fips_waived_reason: ""
+
+# The CMVP certificate number, DECLARED by an operator who read it off the
+# public database at csrc.nist.gov. Empty by default and empty means the FIPS
+# claim is NOT made — fips-pqc-path.md is explicit that the certificate is
+# verified on the database rather than inferred from a kernel reporting itself
+# enabled. A host with fips_enabled=1 and no certificate recorded here still
+# needs a waiver, and that is the point.
+peering_edge_cmvp_certificate: ""
+
+# --------------------------------------------------------------------------
+# Packaging / service
+# --------------------------------------------------------------------------
+# swanctl-era strongSwan. `charon-systemd` provides strongswan.service and
+# reads /etc/swanctl/swanctl.conf; the legacy strongswan-starter/ipsec.conf
+# path is disabled by this role if present, because two daemons on one host
+# race for the same SPIs.
+peering_edge_packages:
+  - strongswan-swanctl
+  - charon-systemd
+  - libstrongswan-standard-plugins
+peering_edge_service: strongswan.service
+
+# The xfrm interface. Route-based, so the link subnet lives on a real
+# interface with a real MTU and the fabric can bind an address on it.
+peering_edge_link_ifname: "ipsec-{{ peering_edge_name }}"
+# Underlying device for the xfrm interface. iproute2 wants a `dev`; the host's
+# default-route interface is the right one, and is what the ESP packets leave
+# on. Overridable where the public path is not the default route.
+peering_edge_link_underlay_dev: "{{ ansible_default_ipv4.interface | default('lo') }}"
+# XFRM interface id. Must be unique per peering ON THIS HOST; it is a local
+# number, not agreed with the partner (both sides may use different values).
+#
+# DERIVED FROM THE PEERING NAME, never a fixed literal. This defaulted to a
+# constant 1001, which meant the requirement one line above was violated by the
+# default itself: a host with two peerings gave both the same id, and the second
+# `ip link add ... type xfrm` failed with the unhelpful `RTNETLINK answers: File
+# exists`. Found the first time two partners were stood up against one
+# edge -- so the role could not do the thing the trust model is built on, which is
+# one edge holding several partners in isolation.
+#
+# The id is LOCAL, so deriving it needs no agreement with the partner. Range
+# 1001-61000 keeps clear of 0 (means "no if_id") and stays well inside u32.
+peering_edge_xfrm_if_id: >-
+  {{ 1001 + ((peering_edge_name | hash('md5'))[0:8] | int(base=16) % 60000) }}
+peering_edge_link_service: "goat-peering-link@{{ peering_edge_name }}.service"
+
+# --------------------------------------------------------------------------
+# State file
+# --------------------------------------------------------------------------
+# What the role ACTUALLY OBSERVED, not what it hoped for. Sibling of
+# /var/log/ubuntu-pro-fips-state.json and read by the same evidence collection.
+peering_edge_state_path: "/var/log/goat-peering-edge-{{ peering_edge_name }}-state.json"

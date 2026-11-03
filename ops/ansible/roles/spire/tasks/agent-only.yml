@@ -1,0 +1,177 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Agent-only SPIRE node — ADR 0412 Phase B.
+#
+# Runs a SPIRE AGENT that attests to a REMOTE server and holds no CA of its own.
+# This exists because the Workload API socket is LOCAL by construction: a
+# workload can only be served by an agent on its own host, so putting a
+# SPIFFE-authenticating service on a node other than the CA holder requires
+# exactly this and nothing less.
+#
+# WHAT THIS FILE DOES NOT DO, and must not: create a server, a logical database,
+# or registration entries. Those belong to the CA holder. A second server would
+# mint a second CA inside one trust domain — the split-brain the entry guard in
+# main.yml refuses.
+#
+# TRUST BOOTSTRAP IS THE SECURITY-CRITICAL PART. The co-located path uses
+# insecure_bootstrap, which is sound only because server and agent share a host
+# and a private compose network. Across hosts that setting would let anything
+# answering on server_address become the trust root, and first contact is
+# precisely when the agent has no SVID to detect the substitution with. So the
+# bundle is FETCHED FROM THE SERVER HOST over the Ansible control path and
+# PINNED on disk before the agent ever starts.
+
+- name: spire agent-only | the remote server address is required, not defaulted
+  ansible.builtin.assert:
+    that:
+      - spire_agent_server_address | default('') | length > 0
+    fail_msg: >-
+      spire agent-only: spire_agent_server_address is empty on
+      {{ inventory_hostname }}. There is no safe default — guessing it would
+      point node attestation at whatever answers. Set it in host_vars to the
+      address the server listens on AS SEEN FROM THIS HOST. On a three-Orin site
+      that is the internal inter-node substrate (192.168.243.0/24, the same wire
+      Tang LUKS unlock already trusts), NOT the mesh: attestation should not be
+      reachable by every mesh peer, and NOT the Docker service name, which only
+      resolves on the server's own compose network.
+
+- name: spire agent-only | identify the CA holder for this goatnet
+  ansible.builtin.set_fact:
+    spire_ca_holder: >-
+      {{ (ansible_play_hosts_all
+          | map('extract', hostvars)
+          | selectattr('spire_enabled', 'defined')
+          | selectattr('spire_enabled')
+          | map(attribute='inventory_hostname') | list | first) | default('', true) }}
+
+- name: spire agent-only | refuse without exactly one reachable CA holder in play
+  ansible.builtin.assert:
+    that:
+      - spire_ca_holder | length > 0
+    fail_msg: >-
+      spire agent-only: no host in this play has spire_enabled true, so there is
+      nobody to fetch a trust bundle or a join token from. Include the server
+      host in the same run — the bundle and the token are both minted THERE and
+      delivered here over the control path, which is what avoids standing
+      host-to-host credentials between the two.
+
+- name: spire agent-only | data + socket dirs
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ spire_data_dir }}/agent", owner: "{{ spire_container_uid }}", mode: "0700" }
+    - { path: "{{ spire_socket_dir }}", owner: "{{ spire_container_uid }}", mode: "0755" }
+    - { path: "{{ spire_config_dir }}", owner: "root", mode: "0755" }
+
+# ---- trust bundle: minted on the server, pinned here ------------------------
+
+- name: spire agent-only | export the trust bundle on the CA holder
+  ansible.builtin.command:
+    cmd: >-
+      docker exec spire-server {{ spire_bin_dir }}/spire-server bundle show
+      -socketPath /run/spire/sockets/server.sock
+  register: spire_bundle_export
+  changed_when: false
+  delegate_to: "{{ spire_ca_holder }}"
+
+- name: spire agent-only | the bundle must look like a certificate
+  ansible.builtin.assert:
+    that:
+      - "'BEGIN CERTIFICATE' in spire_bundle_export.stdout"
+    fail_msg: >-
+      spire agent-only: the CA holder returned something that is not a PEM
+      bundle. Pinning it would pin garbage and the agent would fail at first
+      contact with an error about the server rather than about this file.
+
+- name: spire agent-only | pin the bundle before the agent can start
+  ansible.builtin.copy:
+    content: "{{ spire_bundle_export.stdout }}\n"
+    dest: "{{ spire_agent_trust_bundle_path }}"
+    owner: "{{ spire_container_uid }}"
+    group: "{{ spire_container_uid }}"
+    mode: "0644"
+
+# ---- join token: single-use, minted on the server for THIS node -------------
+
+- name: spire agent-only | does this agent already hold an SVID
+  ansible.builtin.stat:
+    path: "{{ spire_data_dir }}/agent/agent_svid.der"
+  register: spire_agent_svid_remote
+
+- name: spire agent-only | mint a join token on the CA holder
+  ansible.builtin.command:
+    cmd: >-
+      docker exec spire-server {{ spire_bin_dir }}/spire-server token generate
+      -socketPath /run/spire/sockets/server.sock
+      -spiffeID spiffe://{{ spire_trust_domain }}/{{ spire_agent_node_path }}
+  register: spire_token_gen_remote
+  changed_when: true
+  delegate_to: "{{ spire_ca_holder }}"
+  no_log: true
+  when: not spire_agent_svid_remote.stat.exists
+
+- name: spire agent-only | parse the token
+  ansible.builtin.set_fact:
+    spire_join_token: "{{ spire_token_gen_remote.stdout | regex_search('Token:\\s*(\\S+)', '\\1') | first }}"
+  no_log: true
+  when: not spire_agent_svid_remote.stat.exists
+
+# ---- render + run: agent only, no server -----------------------------------
+
+- name: spire agent-only | render agent.conf
+  ansible.builtin.template:
+    src: agent.conf.j2
+    dest: "{{ spire_config_dir }}/agent.conf"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: spire agent-only | copy the agent-only compose overlay
+  ansible.builtin.copy:
+    src: ../compose/mgmt-host/docker-compose.spire-agent.yml
+    dest: "{{ spire_compose_dir }}/docker-compose.spire-agent.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: spire agent-only | render the overlay env
+  ansible.builtin.template:
+    src: env.spire-agent.j2
+    dest: "{{ spire_compose_dir }}/.env.spire-agent"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: spire agent-only | up spire-agent
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ spire_compose_dir }}/.env.spire-agent
+      -f {{ spire_compose_dir }}/docker-compose.spire-agent.yml
+      up -d spire-agent
+    chdir: "{{ spire_compose_dir }}"
+  register: spire_agent_up
+  changed_when: "'Started' in spire_agent_up.stderr or 'Created' in spire_agent_up.stderr"
+
+- name: spire agent-only | the agent must actually obtain an SVID
+  ansible.builtin.stat:
+    path: "{{ spire_data_dir }}/agent/agent_svid.der"
+  register: spire_agent_svid_after
+  retries: 12
+  delay: 5
+  until: spire_agent_svid_after.stat.exists
+
+- name: spire agent-only | summary
+  ansible.builtin.debug:
+    msg: >-
+      spire agent-only on {{ inventory_hostname }} — attesting to
+      {{ spire_agent_server_address }}:{{ spire_agent_server_port }}
+      (CA holder {{ spire_ca_holder }}), trust domain {{ spire_trust_domain }},
+      bundle PINNED at {{ spire_agent_trust_bundle_path }}. Workload API socket
+      at {{ spire_socket_dir }}/agent.sock — a workload on THIS host can now get
+      an SVID. No server, no CA, no registration entries here.

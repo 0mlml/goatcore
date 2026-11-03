@@ -1,0 +1,56 @@
+---
+# Defaults for the `oauth2-proxy-id-console` role.
+#
+# Drops an oauth2-proxy sidecar in front of the goat-id-console admin
+# console on any mgmt-host stack, gating access on `ADMINS` Kratos group
+# claim per ADR 0860. Mirrors oauth2-proxy-dashboard exactly — same
+# shape, same fence, just a different upstream container and FQDN.
+#
+# Sibling-of oauth2-proxy-dashboard. Two parallel sidecars with
+# independent rollback envelopes (per-service ENV var), one OIDC client
+# each at site Hydra.
+#
+# Inputs (set in group_vars/<site>_hosts/vars.yml):
+#   - id_admin_console_oauth2_proxy_enabled: true            master gate
+#   - id_admin_console_oauth2_proxy_client_secret            env-sourced, 32+ chars
+#   - id_admin_console_oauth2_proxy_cookie_secret            env-sourced, 16/24/32 bytes b64
+#   - site_id, site_dns_zone                                 standard per-site identity
+
+id_admin_console_oauth2_proxy_compose_file: /opt/mgmt-host/docker-compose.oauth2-proxy-id-console.yml
+id_admin_console_oauth2_proxy_envfile: /opt/mgmt-host/oauth2-proxy-id-console.env
+
+# Image — same upstream pin as oauth2-proxy-dashboard (we're running the
+# same oauth2-proxy across both gates). Per-service env var so the two
+# containers roll back independently.
+id_admin_console_oauth2_proxy_image: "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d"
+
+# Public FQDN for the admin console surface. Sibling of auth.* — see ADR 0860.
+id_admin_console_oauth2_proxy_fqdn: "admin.auth.{{ site_id }}.{{ site_dns_zone }}"
+id_admin_console_oauth2_proxy_cookie_domain: "{{ id_admin_console_oauth2_proxy_fqdn }}"
+
+# Hydra issuer + client ID (must match the oauth2-proxy-id-console-oidc-client
+# role's view of the client record).
+id_admin_console_oauth2_proxy_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}/"
+id_admin_console_oauth2_proxy_oidc_client_id: "oauth2-proxy-id-console"
+
+# Authorization predicate — the whole reason this role exists.
+# MUST include every group ops/permissions/group-permissions.yml grants
+# id-admin-console (ADR 1073; CI-checked by
+# ops/ci/check-group-permissions-parity.sh — change the matrix first).
+# A goatnet enabling sponsor-scoped onboarding (ADR 1072) instead sets
+# this EMPTY in group_vars: the line is then omitted from the env and the
+# proxy admits any authenticated Ory login — the front door authenticates,
+# the app authorizes (onboardGate portal-sponsorship resolve, fail-closed;
+# every non-onboarding page stays behind the matrix-driven adminGate).
+# The parity ratchet surfaces an empty override as an authenticated-only
+# door; a NON-empty override must still be a superset of the matrix set.
+# VOCABULARY TRAP: values here must be ORY groups (the `groups` identity
+# trait — PLATFORM-ADMIN/IAM-ADMIN/OBS-ADMIN/COMPLIANCE today). NetBird
+# auto_groups names like DEVELOPER/OBSERVER are a different namespace;
+# partner identities carry no Ory groups at all, so listing NetBird names
+# admits nobody.
+id_admin_console_oauth2_proxy_allowed_groups: "PLATFORM-ADMIN,IAM-ADMIN"
+
+# On-host DNS override for the OIDC issuer (F-126 pattern; same shape
+# as oauth2-proxy-dashboard).
+id_admin_console_oauth2_proxy_oidc_host_entry: "oauth2.{{ site_id }}.{{ site_dns_zone }}:{{ mesh_ip_a }}"

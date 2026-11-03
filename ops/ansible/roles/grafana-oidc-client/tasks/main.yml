@@ -1,0 +1,119 @@
+---
+# Block 21H.3a — provision OAuth2 client for Grafana at operator-IdP
+# Hydra. ADR 0842. Idempotent GET-then-POST-or-PUT pattern (mirrors
+# netbird-dashboard 21D.1.c, with F-077 + F-078 mitigations baked in).
+
+- name: Require Grafana OIDC client secret
+  ansible.builtin.assert:
+    that:
+      - operator_idp_grafana_client_secret is defined
+      - (operator_idp_grafana_client_secret | length) >= 32
+      - site_id is defined and (site_id | length) > 0
+    fail_msg: |
+      Missing operator_idp_grafana_client_secret. Generate fresh:
+        export <SITE>_C_OPERATOR_IDP_GRAFANA_CLIENT_SECRET=$(openssl rand -hex 32)
+      and append to .envrc.local.d/30-site-services.envrc.
+
+- name: Pre-flight Hydra admin reachability
+  ansible.builtin.uri:
+    url: "{{ grafana_oidc_hydra_admin }}/health/ready"
+    status_code: 200
+  register: hydra_ready
+  retries: 5
+  delay: 2
+  until: hydra_ready.status == 200
+
+- name: Check whether Grafana OAuth2 client exists at Hydra
+  ansible.builtin.uri:
+    url: "{{ grafana_oidc_hydra_admin }}/admin/clients/{{ grafana_oidc_client_id }}"
+    status_code: [200, 404]
+    return_content: true
+  register: grafana_client_get
+  no_log: true
+
+- name: Construct desired Grafana OAuth2 client config
+  ansible.builtin.set_fact:
+    grafana_client_config:
+      client_id: "{{ grafana_oidc_client_id }}"
+      client_name: "{{ grafana_oidc_client_name }}"
+      client_secret: "{{ operator_idp_grafana_client_secret }}"
+      grant_types:
+        - authorization_code
+        - refresh_token
+      response_types:
+        - code
+      scope: "{{ grafana_oidc_scopes | join(' ') }}"
+      redirect_uris:
+        - "{{ grafana_oidc_redirect_uri }}"
+      token_endpoint_auth_method: client_secret_post
+      # F-077 mitigation: skip the consent UI for first-party clients.
+      # operator-IdP consumers are all first-party; consent UI would
+      # silently grant zero scopes if the operator unticks the
+      # checkboxes (which the default selfservice-ui-node has unticked
+      # by default).
+      skip_consent: true
+      # F-078 mitigation: JWT access tokens. Operator-IdP Hydra's
+      # default is already JWT (set at the issuer level in the hydra
+      # role), but explicit-per-client is belt-and-braces.
+      access_token_strategy: jwt
+      # Token lifespans inherit Hydra's defaults (8h/7d/1h per
+      # operator-idp-hydra defaults).
+      audience:
+        - "{{ grafana_oidc_client_id }}"
+  no_log: true
+
+- name: Create Grafana OAuth2 client (POST when not present)
+  ansible.builtin.uri:
+    url: "{{ grafana_oidc_hydra_admin }}/admin/clients"
+    method: POST
+    body_format: json
+    body: "{{ grafana_client_config }}"
+    status_code: 201
+  when: grafana_client_get.status == 404
+  no_log: true
+
+- name: Detect drift on existing Grafana OAuth2 client
+  # PUT is idempotent; only fire when the existing client diverges from
+  # the desired config (avoids unnecessary management-restart-style
+  # side effects on the Grafana side, though Grafana re-reads OIDC
+  # config every login flow so this is informational only).
+  #
+  # `default()` guards on every field — Hydra v2.3.0's GET response
+  # omits `client_secret` for some auth methods (verified against nova-a
+  # site Hydra: client returns no client_secret key for the
+  # grafana client). Missing field falls through to '' / [] / false,
+  # which mismatches the desired config → drift → PUT → rotation works.
+  ansible.builtin.set_fact:
+    grafana_client_drift: >-
+      {{ (grafana_client_get.json.client_secret | default('') != operator_idp_grafana_client_secret)
+         or ((grafana_client_get.json.redirect_uris | default([]) | sort) != ([grafana_oidc_redirect_uri] | sort))
+         or (grafana_client_get.json.skip_consent | default(false) != true)
+         or (grafana_client_get.json.access_token_strategy | default('opaque') != 'jwt') }}
+  when: grafana_client_get.status == 200
+  no_log: true
+
+- name: Update Grafana OAuth2 client (PUT on drift)
+  ansible.builtin.uri:
+    url: "{{ grafana_oidc_hydra_admin }}/admin/clients/{{ grafana_oidc_client_id }}"
+    method: PUT
+    body_format: json
+    body: "{{ grafana_client_config }}"
+    status_code: 200
+  when:
+    - grafana_client_get.status == 200
+    - grafana_client_drift | default(false) | bool
+  no_log: true
+
+- name: Surface Grafana OIDC client status
+  ansible.builtin.debug:
+    msg: |
+      Grafana OAuth2 client at operator-IdP Hydra:
+        client_id:    {{ grafana_oidc_client_id }}
+        issuer:       {{ grafana_oidc_issuer_url }}
+        redirect:     {{ grafana_oidc_redirect_uri }}
+        scopes:       {{ grafana_oidc_scopes | join(', ') }}
+        action:       {{ 'created' if grafana_client_get.status == 404
+                         else ('updated (drift)' if (grafana_client_drift | default(false))
+                               else 'no change') }}
+      Configure Grafana to consume this client via env vars in
+      group_vars/<site>_obs_hosts/vars.yml (GF_AUTH_GENERIC_OAUTH_*).

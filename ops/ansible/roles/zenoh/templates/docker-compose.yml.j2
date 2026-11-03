@@ -1,0 +1,37 @@
+# Rendered by ops/ansible/roles/zenoh/tasks/main.yml. Do not edit on host;
+# changes get overwritten on next Ansible apply. Canonical source lives
+# in the role's templates dir.
+
+services:
+  zenoh-router:
+    image: {{ zenoh_image }}
+    container_name: zenoh-router
+    restart: unless-stopped
+    # Bulkhead — same pattern as the mgmt-plane containers
+    # (docs/design/failure-isolation.md §10).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    command:
+      - --config
+      - /etc/zenoh/config.json5
+    environment:
+      RUST_LOG: "info"
+    ports:
+      - "7447:7447"
+      - "8088:8088"
+    volumes:
+      - "{{ zenoh_config_path }}:/etc/zenoh/config.json5:ro"
+      - "{{ zenoh_plugin_dir }}:/opt/zenoh/plugins:ro"
+      - "{{ zenoh_storage_path }}:/var/lib/zenoh/rocksdb"
+    healthcheck:
+      # Router admin REST — not Prometheus metrics. Returns [] when key-space
+      # is empty; any 200 is healthy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

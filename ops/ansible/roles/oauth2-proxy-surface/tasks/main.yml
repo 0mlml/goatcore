@@ -1,0 +1,280 @@
+---
+# oauth2-proxy-surface — provision the Hydra client, render the sidecar, run it.
+#
+# ORDER IS THE POINT. The Hydra client is created BEFORE the container starts,
+# because a fence whose client Hydra has never heard of is the failure nothing
+# detects: the container is healthy, every probe is green, and every actual
+# page load ends at Ory `invalid_client`. No health check on either side can
+# catch it — only loading the page can, which is why the verify step at the end
+# of this role asks the proxy to start an OIDC flow rather than asking whether it is up.
+
+- name: oauth2-proxy-surface | require the per-surface inputs
+  ansible.builtin.assert:
+    that:
+      - oauth2_proxy_surface_name | length > 0
+      - oauth2_proxy_surface_hostname | length > 0
+      - oauth2_proxy_surface_upstream_host | length > 0
+      - oauth2_proxy_surface_upstream_port | string | length > 0
+      - oauth2_proxy_surface_client_secret | length >= 32
+      - oauth2_proxy_surface_cookie_secret | length > 0
+    fail_msg: >-
+      oauth2-proxy-surface needs name, hostname, upstream host+port, a
+      client_secret of 32+ chars and a cookie_secret. Secrets are env-sourced
+      (see docs/operations/local-secrets-pattern.md); a missing one renders an
+      empty value and the sidecar starts and then refuses every login.
+
+# COOKIE SECRET LENGTH — checked here because getting it wrong crash-loops the
+# container with a message that reads like a code bug ("must be 16, 24, or 32
+# bytes to create an AES cipher"), and the door is then down while every other
+# probe on the host stays green.
+#
+# The rule is not what it looks like. oauth2-proxy accepts either a RAW secret
+# of 16/24/32 characters, or a base64 secret that decodes to that many bytes —
+# but it decodes with the URL-SAFE alphabet. A secret from
+# `openssl rand -base64 32` uses the STANDARD alphabet, so one containing `+`
+# or `/` fails to decode, falls back to its raw 44-character length, and is
+# rejected. One without them decodes fine and works. The same command therefore
+# produces a working secret or a crash-looping one at random, which is exactly
+# how this landed: on the first live run of this role, brief came up and
+# dataflows and demogame crash-looped, on secrets generated in one loop.
+#
+# The fleet convention avoids the question entirely: 32 hex characters from
+# `openssl rand -hex 16`, which is a valid raw secret and needs no decoding.
+- name: oauth2-proxy-surface | cookie secret must be a length oauth2-proxy accepts
+  ansible.builtin.assert:
+    that:
+      - (oauth2_proxy_surface_cookie_secret | trim | length) in [16, 24, 32]
+    fail_msg: >-
+      oauth2_proxy_surface_cookie_secret for {{ oauth2_proxy_surface_name }} is
+      {{ oauth2_proxy_surface_cookie_secret | trim | length }} characters.
+      oauth2-proxy wants a RAW secret of 16, 24 or 32 characters — generate one
+      with `openssl rand -hex 16`, the convention every other door on this fleet
+      follows. Do NOT use `openssl rand -base64 32`: that is 44 characters, and
+      whether oauth2-proxy accepts it depends on whether the random bytes
+      happened to avoid `+` and `/`, because it decodes with the URL-safe
+      alphabet only.
+
+- name: oauth2-proxy-surface | compose directory
+  ansible.builtin.file:
+    path: "{{ oauth2_proxy_surface_compose_root }}/oauth2-proxy-{{ oauth2_proxy_surface_name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  become: true
+
+# POST + 409-on-exists is the idempotent create. PUT is only valid on
+# /admin/clients/{id} and 404s on the collection: PUT here reports "ok" while
+# creating nothing, and the miss only shows when the sidecar is first enabled.
+- name: oauth2-proxy-surface | provision the Hydra OAuth2 client
+  ansible.builtin.uri:
+    url: "{{ oauth2_proxy_surface_hydra_admin_url }}/admin/clients"
+    method: POST
+    body_format: json
+    body:
+      client_id: "{{ oauth2_proxy_surface_oidc_client_id }}"
+      client_name: "{{ oauth2_proxy_surface_name }}"
+      client_secret: "{{ oauth2_proxy_surface_client_secret }}"
+      grant_types: ["authorization_code", "refresh_token"]
+      response_types: ["code"]
+      scope: "{{ oauth2_proxy_surface_oidc_scope }}"
+      redirect_uris:
+        - "{{ oauth2_proxy_surface_oidc_redirect_uri }}"
+      token_endpoint_auth_method: "client_secret_post"
+      # No human ever sees a consent screen for an internal surface. The grant
+      # is still recorded, and the grant — not the screen — is what carries the
+      # attribution microscope reads.
+      skip_consent: true
+      access_token_strategy: "jwt"
+    status_code: [200, 201, 409]
+  register: oauth2_proxy_surface_hydra_client
+  changed_when: oauth2_proxy_surface_hydra_client.status in [200, 201]
+  # The body carries client_secret; without no_log the uri module writes
+  # it into the host journal.
+  no_log: true
+
+# A 409 means a client with this id already exists — possibly with a DIFFERENT
+# secret, from an earlier deploy or a hand-made one. That combination is the
+# invalid_client failure again, so reconcile rather than assume.
+- name: oauth2-proxy-surface | reconcile the existing client's registration
+  ansible.builtin.uri:
+    url: "{{ oauth2_proxy_surface_hydra_admin_url }}/admin/clients/{{ oauth2_proxy_surface_oidc_client_id }}"
+    method: PUT
+    body_format: json
+    body:
+      client_id: "{{ oauth2_proxy_surface_oidc_client_id }}"
+      client_name: "{{ oauth2_proxy_surface_name }}"
+      client_secret: "{{ oauth2_proxy_surface_client_secret }}"
+      grant_types: ["authorization_code", "refresh_token"]
+      response_types: ["code"]
+      scope: "{{ oauth2_proxy_surface_oidc_scope }}"
+      redirect_uris:
+        - "{{ oauth2_proxy_surface_oidc_redirect_uri }}"
+      token_endpoint_auth_method: "client_secret_post"
+      skip_consent: true
+      access_token_strategy: "jwt"
+    status_code: [200]
+  when: oauth2_proxy_surface_hydra_client.status == 409
+  changed_when: true
+  # The body carries client_secret; without no_log the uri module writes
+  # it into the host journal.
+  no_log: true
+
+# Owned by the runtime uid because BOTH the door and the visit emitter run as
+# 65532 — the door writes this file, the emitter reads it. Created before the
+# env is rendered so the container never starts pointing at a missing directory.
+- name: oauth2-proxy-surface | per-door log directory
+  ansible.builtin.file:
+    path: "{{ oauth2_proxy_surface_log_dir }}/{{ oauth2_proxy_surface_name }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0750"
+  become: true
+  when: oauth2_proxy_surface_request_log_file | length > 0
+
+- name: oauth2-proxy-surface | render the sidecar env (0600)
+  ansible.builtin.template:
+    src: oauth2-proxy-surface.env.j2
+    dest: "{{ oauth2_proxy_surface_compose_root }}/oauth2-proxy-{{ oauth2_proxy_surface_name }}/oauth2-proxy-{{ oauth2_proxy_surface_name }}.env"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  notify: "restart oauth2-proxy-surface"
+
+- name: oauth2-proxy-surface | render the compose overlay
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ oauth2_proxy_surface_compose_root }}/oauth2-proxy-{{ oauth2_proxy_surface_name }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: "restart oauth2-proxy-surface"
+
+- name: oauth2-proxy-surface | pull the image
+  community.docker.docker_image:
+    name: "{{ oauth2_proxy_surface_image }}"
+    source: pull
+    force_source: true
+  become: true
+
+- name: oauth2-proxy-surface | bring the sidecar up
+  community.docker.docker_compose_v2:
+    project_src: "{{ oauth2_proxy_surface_compose_root }}/oauth2-proxy-{{ oauth2_proxy_surface_name }}"
+    state: present
+    pull: missing
+  become: true
+
+- name: oauth2-proxy-surface | flush handlers so the door is current before it is checked
+  ansible.builtin.meta: flush_handlers
+
+# The oauth2-proxy image is distroless: no shell, no wget, no curl. `docker
+# exec ... /bin/sh -c wget` fails with "stat /bin/sh: no such file or
+# directory", and with `failed_when: false` on it that failure reads as a pass —
+# a health check that cannot run and cannot fail. Ask the daemon about the
+# container instead; it needs nothing inside the image.
+#
+# `.State.Running` ALONE IS NOT ENOUGH, and this role learned that the hard way:
+# a crash-looping container reports Running=true during each brief window
+# between restarts, so a retrying check happily catches one and reports the door
+# healthy. On the first live run two of three doors were crash-looping on a bad
+# cookie secret while this step passed. Read the status word — a looping
+# container is "restarting", not "running" — and require the restart counter to
+# hold still across a settle window.
+- name: oauth2-proxy-surface | the sidecar must report status running
+  ansible.builtin.command:
+    cmd: "docker inspect -f '{{ '{{' }}.State.Status{{ '}}' }}' oauth2-proxy-{{ oauth2_proxy_surface_name }}"
+  register: oauth2_proxy_surface_status
+  retries: 12
+  delay: 5
+  until: oauth2_proxy_surface_status.stdout | trim == "running"
+  changed_when: false
+  become: true
+
+- name: oauth2-proxy-surface | restart counter, first read
+  ansible.builtin.command:
+    cmd: "docker inspect -f '{{ '{{' }}.RestartCount{{ '}}' }}' oauth2-proxy-{{ oauth2_proxy_surface_name }}"
+  register: oauth2_proxy_surface_restarts_before
+  changed_when: false
+  become: true
+
+- name: oauth2-proxy-surface | let the door settle before believing it
+  ansible.builtin.pause:
+    seconds: 15
+
+- name: oauth2-proxy-surface | restart counter, second read
+  ansible.builtin.command:
+    cmd: "docker inspect -f '{{ '{{' }}.RestartCount{{ '}}' }}' oauth2-proxy-{{ oauth2_proxy_surface_name }}"
+  register: oauth2_proxy_surface_restarts_after
+  changed_when: false
+  become: true
+
+- name: oauth2-proxy-surface | the door must not be crash-looping
+  ansible.builtin.assert:
+    that:
+      - oauth2_proxy_surface_restarts_after.stdout | trim == oauth2_proxy_surface_restarts_before.stdout | trim
+    fail_msg: >-
+      oauth2-proxy-{{ oauth2_proxy_surface_name }} restarted during a 15 s
+      settle window (count went
+      {{ oauth2_proxy_surface_restarts_before.stdout | trim }} ->
+      {{ oauth2_proxy_surface_restarts_after.stdout | trim }}), so it is
+      crash-looping rather than serving. Read `docker logs
+      oauth2-proxy-{{ oauth2_proxy_surface_name }}` — a bad cookie secret is the
+      usual cause and says "must be 16, 24, or 32 bytes to create an AES cipher".
+
+# THE CHECK THAT ACTUALLY MATTERS, and it is not "is the proxy up".
+#
+# A door whose OIDC client Hydra has never heard of — or holds under a
+# different redirect URI — is healthy in every probe and broken in every
+# browser: the container runs, the port answers, and each real page load ends
+# at Ory `invalid_client` or `redirect_uri mismatch`. So read the registration back from Hydra and
+# require it to match what this proxy will actually send.
+#
+# This deliberately does NOT probe https://<hostname>/oauth2/start. At the
+# moment a door is deployed its surface's Traefik route still addresses the
+# container directly, so that URL answers 200 from the app and proves nothing
+# about the door. The public path is verified after the route swings.
+- name: oauth2-proxy-surface | read the client registration back from Hydra
+  ansible.builtin.uri:
+    url: "{{ oauth2_proxy_surface_hydra_admin_url }}/admin/clients/{{ oauth2_proxy_surface_oidc_client_id }}"
+    method: GET
+    status_code: [200]
+  register: oauth2_proxy_surface_registered
+  changed_when: false
+
+- name: oauth2-proxy-surface | the registration must match what the proxy sends
+  ansible.builtin.assert:
+    that:
+      - oauth2_proxy_surface_oidc_redirect_uri in (oauth2_proxy_surface_registered.json.redirect_uris | default([]))
+      - "'authorization_code' in (oauth2_proxy_surface_registered.json.grant_types | default([]))"
+      - "'groups' in (oauth2_proxy_surface_registered.json.scope | default(''))"
+    fail_msg: >-
+      Hydra holds client {{ oauth2_proxy_surface_oidc_client_id }} but not in the
+      shape this door needs. redirect_uris =
+      {{ oauth2_proxy_surface_registered.json.redirect_uris | default([]) }},
+      wanted {{ oauth2_proxy_surface_oidc_redirect_uri }}; scope =
+      "{{ oauth2_proxy_surface_registered.json.scope | default('') }}", which must
+      include `groups`. Left unfixed this is the failure that passes every probe
+      and fails every login.
+
+- name: oauth2-proxy-surface | deploy summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ oauth2_proxy_surface_name }} door up at https://{{ oauth2_proxy_surface_hostname }}/ —
+      {{ 'group gate: ' ~ oauth2_proxy_surface_allowed_groups
+         if oauth2_proxy_surface_allowed_groups | length > 0
+         else 'authenticated door (no group refused; Hydra records the visit)' }};
+      upstream {{ oauth2_proxy_surface_upstream_host }}:{{ oauth2_proxy_surface_upstream_port }}.
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: oauth2-proxy-surface | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "oauth2-proxy-surface"
+    rollback_ref: "{{ oauth2_proxy_surface_image }}"

@@ -1,0 +1,76 @@
+#!/bin/bash
+# crutch-crl-refresh.sh — rendered by ops/ansible/roles/goat-public-mtls-crutch
+# Block 80 / ADR 0843 — Public mTLS-gated crutch tier (design §6).
+#
+# Pulls the mobile-revoked CRL from the offline-enrollment CRL endpoint over
+# the wg-cp0-client interface and writes atomically to {{ crutch_crl_path_host }}.
+# Traefik's file-watcher picks up the change without restart.
+#
+# Two freshness gates (design §6 + ADR 0843 risk row "CRL pipeline staleness"):
+#   - Stale-CRL alarm: when local CRL is older than {{ crutch_crl_stale_alarm_seconds }}s
+#     the script's `goat_crutch_crl_stale_alarm` Prometheus textfile metric flips to 1.
+#   - Stale-CRL fail-closed: NOT enforced in this script — Traefik refuses
+#     mTLS connections once the CRL file exceeds the fail-closed window via
+#     a separate watchdog (TODO Block 80D — the `mobile-revoked` CRL filter
+#     selector landing on the mgmt-plane side enables this).
+#
+# Exit codes:
+#   0 — CRL pulled + persisted successfully
+#   1 — pull failed (network / endpoint unreachable / signature invalid)
+#   2 — pull succeeded but CRL is malformed (refuses to overwrite the
+#       existing file; leaves the staleness alarm to fire)
+
+set -euo pipefail
+
+ENDPOINT="{{ crutch_crl_endpoint }}"
+CRL_PATH="{{ crutch_crl_path_host }}"
+TMP_PATH="${CRL_PATH}.new.$$"
+TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+TEXTFILE="${TEXTFILE_DIR}/goat_crutch_crl.prom"
+
+if [ -z "${ENDPOINT}" ]; then
+    echo "crutch-crl-refresh: CRL endpoint unset; nothing to pull" >&2
+    exit 0
+fi
+
+# Fetch — use the wg-cp0-client default route over the silent control plane.
+# Connection failures are not fatal to the script; the alarm fires once the
+# existing local CRL crosses the staleness threshold.
+if ! curl --fail --silent --show-error --max-time 30 \
+        --output "${TMP_PATH}" \
+        "${ENDPOINT}"; then
+    echo "crutch-crl-refresh: pull failed from ${ENDPOINT}" >&2
+    rm -f "${TMP_PATH}"
+    exit 1
+fi
+
+# Sanity-check the response is a PEM CRL (refuses to overwrite with garbage).
+if ! grep -q '^-----BEGIN X509 CRL-----' "${TMP_PATH}"; then
+    echo "crutch-crl-refresh: response is not a valid X509 CRL (no PEM header)" >&2
+    rm -f "${TMP_PATH}"
+    exit 2
+fi
+
+# Verify OpenSSL can parse it.
+if ! openssl crl -in "${TMP_PATH}" -noout >/dev/null 2>&1; then
+    echo "crutch-crl-refresh: OpenSSL refuses to parse the fetched CRL" >&2
+    rm -f "${TMP_PATH}"
+    exit 2
+fi
+
+# Atomic install.
+chmod 0644 "${TMP_PATH}"
+mv "${TMP_PATH}" "${CRL_PATH}"
+
+# Emit a Prometheus textfile metric so node_exporter scrapes age + freshness.
+if [ -d "${TEXTFILE_DIR}" ]; then
+    NOW=$(date +%s)
+    cat > "${TEXTFILE}.tmp" <<METRIC
+# HELP goat_crutch_crl_last_refresh_seconds Unix epoch of the last successful CRL pull.
+# TYPE goat_crutch_crl_last_refresh_seconds gauge
+goat_crutch_crl_last_refresh_seconds ${NOW}
+METRIC
+    mv "${TEXTFILE}.tmp" "${TEXTFILE}"
+fi
+
+exit 0

@@ -1,0 +1,44 @@
+---
+- name: Stage affiliation data when the runner emits affiliation traits
+  when: onboard_runner_aff_trait_enabled | bool
+  block:
+    - name: Validate the catalog environment before constructing paths
+      ansible.builtin.assert:
+        that:
+          - onboard_runner_only_env is match('^[a-z][a-z0-9-]{0,30}[a-z0-9]$')
+        fail_msg: "The affiliation catalog requires a valid selected goatnet ID."
+
+    - name: Select the catalog using the native CLI's JSON then YAML precedence
+      ansible.builtin.set_fact:
+        onboard_runner_catalog_source: >-
+          {{ lookup('ansible.builtin.first_found', [
+               onboard_runner_catalog_dir_src ~ '/' ~ onboard_runner_only_env ~ '.json',
+               onboard_runner_catalog_dir_src ~ '/' ~ onboard_runner_only_env ~ '.yaml']) }}
+
+    - name: Create the catalog tree readable by the runner UID
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ onboard_runner_uid }}"
+        group: "{{ onboard_runner_uid }}"
+        mode: "0750"
+      loop:
+        - "{{ onboard_runner_repo_root_host }}"
+        - "{{ onboard_runner_repo_root_host }}/ops"
+        - "{{ onboard_runner_repo_root_host }}/ops/identity"
+        - "{{ onboard_runner_repo_root_host }}/ops/identity/orgs"
+
+    - name: Refresh the selected catalog before starting the runner
+      ansible.builtin.copy:
+        src: "{{ onboard_runner_catalog_source }}"
+        dest: "{{ onboard_runner_repo_root_host }}/ops/identity/orgs/{{ onboard_runner_catalog_source | basename }}"
+        owner: "{{ onboard_runner_uid }}"
+        group: "{{ onboard_runner_uid }}"
+        mode: "0644"
+
+    - name: Remove only the superseded format for this managed environment
+      ansible.builtin.file:
+        path: >-
+          {{ onboard_runner_repo_root_host }}/ops/identity/orgs/{{ onboard_runner_only_env }}.{{
+             'yaml' if onboard_runner_catalog_source.endswith('.json') else 'json' }}
+        state: absent

@@ -1,0 +1,272 @@
+---
+# mesh-coredns — deploy CoreDNS container as the per-site mesh-internal DNS
+# server. Generic across every mgmt-host site. Idempotent.
+#
+# Pre-requisites:
+#   - Docker + docker-compose plugin installed (handled by mgmt-host-baseline.yml)
+#   - Host has a netbird mesh IP (host must be enrolled before this role runs)
+#   - mesh_coredns_bind_ip set per-host or by the wrapper play
+#
+# Post-conditions:
+#   - CoreDNS container `mesh-dns` running, bound to 127.0.0.1 and
+#     mesh_coredns_bind_ip on UDP port mesh_coredns_port (default 5353)
+#   - Corefile + mesh-hosts zone file present at mesh_coredns_dir
+#   - Smoke-tested via `dig` against a known record
+
+- name: Assert at least one bind IP is set (must be MESH or wg-cp0, not LAN)
+  ansible.builtin.assert:
+    that:
+      - (mesh_coredns_bind_ip | default('') | length > 0) or
+        (mesh_coredns_wg_cp0_bind_ip | default('') | length > 0)
+    fail_msg: >-
+      Either mesh_coredns_bind_ip (netbird mesh IP, e.g. 100.X.Y.Z) or
+      mesh_coredns_wg_cp0_bind_ip (silent-control-plane wg-cp0 IP, e.g.
+      198.18.0.1) must be set. Set in wrapper play or per-host vars.
+      Never bind to a LAN IP — that would expose mesh DNS to non-mesh
+      peers and violate the silent-control-plane invariant
+      (ADR 0313/0314).
+
+- name: Compute primary smoke-test bind IP (prefer mesh, fall back to wg-cp0)
+  ansible.builtin.set_fact:
+    mesh_coredns_smoke_bind: >-
+      {{ mesh_coredns_bind_ip
+         if (mesh_coredns_bind_ip | default('') | length > 0)
+         else mesh_coredns_wg_cp0_bind_ip }}
+
+# avahi-daemon (mDNS) binds 0.0.0.0:5353 — the SAME port CoreDNS needs — so on
+# a host where avahi is enabled, CoreDNS crash-loops with "address already in
+# use" and the mesh resolver silently never comes up. Images differ on
+# whether it is active. A headless mgmt host has
+# no use for mDNS, so free the port here, idempotently, before deploying
+# CoreDNS. failed_when:false so it's a no-op where avahi isn't installed.
+- name: Free UDP 5353 — disable avahi-daemon (mDNS), which collides with mesh CoreDNS
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop:
+    - avahi-daemon.socket
+    - avahi-daemon.service
+  failed_when: false
+
+- name: Ensure mesh DNS directory exists
+  ansible.builtin.file:
+    path: "{{ mesh_coredns_dir }}"
+    state: directory
+    owner: "{{ mesh_coredns_owner }}"
+    group: "{{ mesh_coredns_group }}"
+    mode: "0755"
+
+- name: Render Corefile (with per-host bind IP)
+  ansible.builtin.template:
+    src: Corefile.j2
+    dest: "{{ mesh_coredns_corefile_path }}"
+    owner: "{{ mesh_coredns_owner }}"
+    group: "{{ mesh_coredns_group }}"
+    mode: "0644"
+  notify: Restart coredns
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ mesh_coredns_compose_path }}"
+    owner: "{{ mesh_coredns_owner }}"
+    group: "{{ mesh_coredns_group }}"
+    mode: "0644"
+  notify: Restart coredns
+
+# -- Drift-guard: never let a stale checkout silently CLOBBER the live
+# mesh-DNS zone. A goat-coredns run from a checkout predating a service add
+# pushes an older mesh-hosts that DROPS records the live resolver serves →
+# those hostnames stop resolving fleet-wide with no warning. Refuse to
+# deploy a zone that removes any currently-live hostname.
+#
+# Two overrides, and they are not the same thing:
+#   zone_record_removal_allow: [<fqdn>, ...]  — NAMED records that may drop.
+#       The guard stays armed for every other record. This is what a
+#       re-declared external service uses (ADR 1178): when a partner's new
+#       declaration lists fewer surfaces than the one already live, the
+#       finisher passes exactly those names.
+#   allow_zone_record_removal=true            — blanket; disarms the guard
+#       for this run. Hand use only, when you have read the list yourself.
+- name: Drift-guard — hostnames in the currently-live zone (empty on first deploy)
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    if [ -f "{{ mesh_coredns_zone_path }}" ]; then
+      awk '!/^[[:space:]]*#/ && NF>=2 {print $2}' "{{ mesh_coredns_zone_path }}" | sort -u;
+    fi
+  args:
+    executable: /bin/bash
+  register: mesh_coredns_live_hostnames
+  changed_when: false
+
+- name: Drift-guard — hostnames in the zone about to be pushed
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    awk '!/^[[:space:]]*#/ && NF>=2 {print $2}' "{{ mesh_coredns_zone_dir }}/mesh-hosts" | sort -u
+  args:
+    executable: /bin/bash
+  register: mesh_coredns_push_hostnames
+  changed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Drift-guard — records this push would drop, and the named allowlist
+  ansible.builtin.set_fact:
+    mesh_coredns_dropping: "{{ mesh_coredns_live_hostnames.stdout_lines | difference(mesh_coredns_push_hostnames.stdout_lines) }}"
+    mesh_coredns_drop_allowed: "{{ zone_record_removal_allow | default([]) }}"
+
+- name: Drift-guard — refuse to drop currently-live records (stale-checkout clobber, F-215)
+  ansible.builtin.assert:
+    that:
+      - (mesh_coredns_dropping | difference(mesh_coredns_drop_allowed) | length) == 0
+    fail_msg: |
+      REFUSING to deploy the mesh-DNS zone — it would DROP records the live
+      resolver currently serves:
+        {{ mesh_coredns_dropping | difference(mesh_coredns_drop_allowed) | join(', ') }}
+      Your {{ mesh_coredns_zone_dir }}/mesh-hosts is missing hostnames that are
+      live. Fast-forward your checkout (git fetch origin main; merge/rebase),
+      regenerate the zone (python3 ops/dns/generate-mesh-hosts.py), and re-run.
+      For a DELIBERATE removal of exactly these names, re-run with
+        -e '{"zone_record_removal_allow": ["<fqdn>", ...]}'
+      (a re-declared external service's finisher passes this itself).
+      -e allow_zone_record_removal=true disarms the guard for EVERY record.
+    success_msg: >-
+      Drift-guard OK — zone push keeps all
+      {{ (mesh_coredns_live_hostnames.stdout_lines | difference(mesh_coredns_dropping)) | length }}
+      live record(s){{ (', dropping the ' ~ (mesh_coredns_dropping | length) ~ ' named in zone_record_removal_allow: ' ~ (mesh_coredns_dropping | join(', '))) if (mesh_coredns_dropping | length) > 0 else '' }}.
+  when: not (allow_zone_record_removal | default(false) | bool)
+
+- name: Deploy mesh-hosts zone file (from canonical source under ops/dns/)
+  ansible.builtin.copy:
+    src: "{{ mesh_coredns_zone_dir }}/mesh-hosts"
+    dest: "{{ mesh_coredns_zone_path }}"
+    owner: "{{ mesh_coredns_owner }}"
+    group: "{{ mesh_coredns_group }}"
+    mode: "0644"
+  notify: Restart coredns
+
+- name: Remove legacy dnsmasq container if present (one-time migration)
+  ansible.builtin.command:
+    cmd: docker rm -f mesh-dns-legacy
+  failed_when: false
+  changed_when: false
+
+- name: Flush handlers (start coredns before smoke test)
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure mesh-dns container is up (idempotent)
+  ansible.builtin.command:
+    cmd: docker compose up -d --remove-orphans
+    chdir: "{{ mesh_coredns_dir }}"
+  changed_when: false
+
+- name: Smoke-test — CoreDNS responds on primary bind IP
+  ansible.builtin.command:
+    cmd: >-
+      dig @{{ mesh_coredns_smoke_bind }} -p {{ mesh_coredns_port }}
+      {{ mesh_coredns_smoke_test_name }} +short
+  register: dns_check
+  changed_when: false
+  failed_when: dns_check.stdout == ""
+
+- name: Show smoke-test result
+  ansible.builtin.debug:
+    msg: >-
+      mesh-dns @ {{ mesh_coredns_smoke_bind }}:{{ mesh_coredns_port }} responds:
+      {{ mesh_coredns_smoke_test_name }} → {{ dns_check.stdout_lines | join(' / ') }}
+
+# --- F-282: host-local mesh-zone resolver route -----------------------------
+# See defaults for the why. Both arms are written so flipping the flag back
+# rolls the change back turnkey.
+- name: Ensure systemd-resolved drop-in dir exists
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: mesh_coredns_host_zone_route_enabled | bool
+
+- name: Route the mesh zone to local CoreDNS
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/50-goat-mesh-zone.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Rendered by the mesh-coredns role — do not edit by hand.
+      # Routes ONLY the mesh zone to the local CoreDNS listener; netbird's
+      # nameserver group cannot serve this host because it IS a nameserver.
+      [Resolve]
+      DNS=127.0.0.1:{{ mesh_coredns_port }}
+      Domains=~{{ mesh_coredns_host_zone_route_zone }}
+  when:
+    - mesh_coredns_host_zone_route_enabled | bool
+    - mesh_coredns_host_zone_route_zone | length > 0
+  notify: Restart systemd-resolved
+
+- name: Remove the mesh-zone resolver route (flag off — rollback arm)
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d/50-goat-mesh-zone.conf
+    state: absent
+  when: not (mesh_coredns_host_zone_route_enabled | bool)
+  notify: Restart systemd-resolved
+
+# --- mgmt-host enrollment-apex split-horizon --------------
+# The DNS host is ALSO the mgmt host. Once the mesh zone is routed to its local
+# CoreDNS (above), this host resolves the enrollment apex (netbird.<zone>) out
+# of the mesh-hosts zone, whose apex record lists the mesh IP FIRST (generator
+# puts mesh-IP-first, relay EIPs as fallback). But a mgmt host cannot reach the
+# apex via its own mesh IP before its netbird interface is up (chicken-and-egg
+# on every netbird restart), and it CANNOT hairpin out to a relay and back to
+# itself. So its own netbird client can never (re)connect to management, wt0
+# never comes up, and the whole node — plus every peer that depends on its
+# CoreDNS — goes dark, and a repurposed host shows dead management until the
+# apex is pinned local.
+# Fix: pin the apex to 127.0.0.1 in /etc/hosts on this host only. nsswitch
+# consults `files` before `dns`, so the netbird client dials local Traefik
+# (which serves the same LE cert by SNI and proxies to the local management
+# container). Client peers are unaffected — they keep the mesh-IP/relay apex.
+- name: Pin the enrollment apex to local Traefik on the mgmt/DNS host (split-horizon)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^\s*127\.0\.0\.1\s+{{ (mesh_coredns_mgmt_apex_fqdn | default(site_dns_zone)) | regex_escape }}\s*$'
+    line: "127.0.0.1 {{ mesh_coredns_mgmt_apex_fqdn | default(site_dns_zone) }}"
+    state: present
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - mesh_coredns_host_zone_route_enabled | bool
+    - (mesh_coredns_mgmt_apex_fqdn | default(site_dns_zone) | default('')) | length > 0
+
+- name: Remove the enrollment-apex split-horizon (flag off — rollback arm)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^\s*127\.0\.0\.1\s+{{ (mesh_coredns_mgmt_apex_fqdn | default(site_dns_zone)) | regex_escape }}\s*$'
+    state: absent
+  when: not (mesh_coredns_host_zone_route_enabled | bool)
+
+- name: Apply pending resolver changes before smoke-testing
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the host resolves its own zone
+  ansible.builtin.command:
+    cmd: resolvectl query {{ mesh_coredns_smoke_test_name }}
+  register: _zone_route_check
+  changed_when: false
+  failed_when: _zone_route_check.rc != 0
+  when: mesh_coredns_host_zone_route_enabled | bool
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: mesh-coredns | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "mesh-coredns"
+    rollback_ref: "{{ mesh_coredns_image }}"

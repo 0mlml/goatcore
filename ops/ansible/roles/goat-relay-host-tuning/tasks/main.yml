@@ -1,0 +1,312 @@
+---
+# ops/ansible/roles/goat-relay-host-tuning/tasks/main.yml
+#
+# Apply H1-H3 host-tuning levers per Block 33C.1. H4 is build-time.
+# Each H is opt-in via its own `_enable` var; the role is idempotent.
+# H2 (mitigations=off) does NOT auto-reboot — operator triggers reboot
+# per host with explicit pre-/post-verification.
+
+# ============================================================================
+# Tier-1 — sustained-Gbps sysctl baseline (the M-018 multi-Gbps shape)
+# ============================================================================
+# Persistent via /etc/sysctl.d so the values survive H2 reboot. Idempotent.
+# Apply via `goat_relay_tier1_sysctl_enable: true` in group_vars.
+
+- name: Tier-1 — Persist sustained-Gbps sysctl baseline
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-goat-relay-tier1.conf
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Block 33C.1 Tier-1 — sustained-Gbps sysctl baseline.
+      # 364 → 761 Mbps single-flow on c5n.2xlarge.
+      net.core.default_qdisc = {{ goat_relay_tier1_default_qdisc }}
+      net.ipv4.tcp_congestion_control = {{ goat_relay_tier1_tcp_congestion_control }}
+      net.core.rmem_max = {{ goat_relay_tier1_rmem_max }}
+      net.core.wmem_max = {{ goat_relay_tier1_wmem_max }}
+      net.ipv4.tcp_rmem = {{ goat_relay_tier1_tcp_rmem }}
+      net.ipv4.tcp_wmem = {{ goat_relay_tier1_tcp_wmem }}
+      net.core.netdev_max_backlog = {{ goat_relay_tier1_netdev_max_backlog }}
+      net.core.somaxconn = {{ goat_relay_tier1_somaxconn }}
+      net.ipv4.tcp_max_syn_backlog = {{ goat_relay_tier1_tcp_max_syn_backlog }}
+      net.ipv4.tcp_no_metrics_save = {{ goat_relay_tier1_tcp_no_metrics_save }}
+  register: tier1_sysctl
+  when: goat_relay_tier1_sysctl_enable | bool
+  tags: [tier1, host-tuning]
+
+- name: Tier-1 — Remove Tier-1 sysctl baseline if disabled
+  ansible.builtin.file:
+    path: /etc/sysctl.d/99-goat-relay-tier1.conf
+    state: absent
+  register: tier1_sysctl_remove
+  when: not goat_relay_tier1_sysctl_enable | bool
+  tags: [tier1, host-tuning]
+
+- name: Tier-1 — Apply sysctl now (no reboot needed)
+  ansible.builtin.command: sysctl --system
+  register: tier1_sysctl_apply
+  changed_when: false
+  when: tier1_sysctl is changed or tier1_sysctl_remove is changed
+  tags: [tier1, host-tuning]
+
+- name: Tier-1 — Verify applied congestion control + qdisc
+  ansible.builtin.shell: |
+    set -e
+    echo "tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control)"
+    echo "default_qdisc=$(sysctl -n net.core.default_qdisc)"
+    echo "rmem_max=$(sysctl -n net.core.rmem_max)"
+  register: tier1_verify
+  changed_when: false
+  when: goat_relay_tier1_sysctl_enable | bool
+  tags: [tier1, host-tuning]
+
+- name: Tier-1 — Report applied baseline
+  ansible.builtin.debug:
+    msg: "Tier-1 baseline applied:\n{{ tier1_verify.stdout_lines | default([]) | join('\n') }}"
+  when: goat_relay_tier1_sysctl_enable | bool and tier1_verify is succeeded
+  tags: [tier1, host-tuning]
+
+# ============================================================================
+# H1 — CPU frequency governor
+# ============================================================================
+
+- name: H1 — Install cpupower (linux-tools)
+  ansible.builtin.apt:
+    name: linux-tools-common
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: goat_relay_h1_cpu_governor_enable | bool
+  # F-029 class — apt over SSM intermittently times out at default 60s.
+  # Retry with backoff; install is small but the apt-update preceding it
+  # can occasionally take ~30-90s on cold-cache hosts.
+  retries: 3
+  delay: 10
+  register: h1_apt_main
+  until: h1_apt_main is succeeded
+  tags: [h1, host-tuning]
+
+- name: H1 — Install kernel-version-specific linux-tools
+  ansible.builtin.apt:
+    name: "linux-tools-{{ ansible_kernel }}"
+    state: present
+  when: goat_relay_h1_cpu_governor_enable | bool
+  retries: 3
+  delay: 10
+  register: h1_apt_kernel
+  until: h1_apt_kernel is succeeded
+  failed_when: false  # Kernel-specific package may not be available on every minor; the generic
+                      # linux-tools-common is enough on most Ubuntu 24.04 hosts.
+  tags: [h1, host-tuning]
+
+- name: H1 — Set CPU governor via systemd unit (idempotent + persistent)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/goat-relay-cpufreq.service
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Block 33C.1 lever H1 — CPU frequency governor for goat-relay hosts.
+      # Pins all online CPUs to '{{ goat_relay_h1_cpu_governor }}' at boot.
+      # Idempotent + persistent across reboots.
+      [Unit]
+      Description=goat-relay H1 CPU frequency governor
+      After=multi-user.target
+      ConditionPathExists=/usr/bin/cpupower
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/bin/cpupower frequency-set -g {{ goat_relay_h1_cpu_governor }}
+      ExecStop=/usr/bin/cpupower frequency-set -g schedutil
+
+      [Install]
+      WantedBy=multi-user.target
+  when: goat_relay_h1_cpu_governor_enable | bool
+  notify: reload systemd
+  tags: [h1, host-tuning]
+
+- name: H1 — Enable + start goat-relay-cpufreq.service
+  ansible.builtin.systemd:
+    name: goat-relay-cpufreq.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: goat_relay_h1_cpu_governor_enable | bool
+  tags: [h1, host-tuning]
+
+- name: H1 — Capture current CPU governor for audit trail
+  ansible.builtin.command: cpupower frequency-info -p
+  register: h1_governor_state
+  changed_when: false
+  failed_when: false
+  when: goat_relay_h1_cpu_governor_enable | bool
+  tags: [h1, host-tuning]
+
+- name: H1 — Report applied governor
+  ansible.builtin.debug:
+    msg: "H1 governor applied: {{ h1_governor_state.stdout_lines | default(['(no output)']) }}"
+  when: goat_relay_h1_cpu_governor_enable | bool
+  tags: [h1, host-tuning]
+
+# ============================================================================
+# H2 — mitigations=off (operator-fired reboot)
+# ============================================================================
+# Per ADR 0823: this is a deliberate carve-out from defense-in-depth
+# scoped to single-tenant goat-relay hosts. The role only writes the
+# GRUB drop-in + runs update-grub. Reboot is explicitly NOT automated.
+
+- name: H2 — Write GRUB cmdline drop-in for mitigations=off (per ADR 0823)
+  ansible.builtin.copy:
+    dest: /etc/default/grub.d/99-goat-relay-h2.cfg
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Block 33C.1 lever H2 — mitigations=off on goat-relay hosts.
+      # Risk acceptance per ADR 0823 (single-tenant + no-untrusted-code-
+      # path; relay traffic is opaque ciphertext). Disables Spectre /
+      # Meltdown / MDS / L1TF / Retbleed software workarounds.
+      #
+      # Five conditions flip this back, immediately:
+      # 1. Workload colocation
+      # 2. Untrusted-code path introduction
+      # 3. Multi-user shell access
+      # 4. Hypervisor sibling-tenant introduction
+      # 5. New side-channel attack relevant to single-tenant model
+      #
+      # Set goat_relay_h2_mitigations_off_enable: false in this host's
+      # group_vars and re-run the role to rescind.
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT mitigations=off"
+  register: h2_grub_drop
+  when: goat_relay_h2_mitigations_off_enable | bool
+  tags: [h2, host-tuning]
+
+- name: H2 — Remove GRUB drop-in if mitigations toggled back on
+  ansible.builtin.file:
+    path: /etc/default/grub.d/99-goat-relay-h2.cfg
+    state: absent
+  register: h2_grub_drop_remove
+  when: not goat_relay_h2_mitigations_off_enable | bool
+  tags: [h2, host-tuning]
+
+- name: H2 — update-grub to commit cmdline change
+  ansible.builtin.command: update-grub
+  register: h2_update_grub
+  changed_when: "'Generating grub configuration file' in h2_update_grub.stdout"
+  when: h2_grub_drop is changed or h2_grub_drop_remove is changed
+  tags: [h2, host-tuning]
+
+- name: H2 — Operator-action notice (NO auto-reboot)
+  ansible.builtin.debug:
+    msg: |
+      H2 GRUB cmdline updated. The new cmdline takes effect ONLY after a
+      reboot. Operator must:
+        1. Confirm the deploy shape still meets ADR 0823 invariants.
+        2. Reboot this host: `sudo reboot` (operator-fired, NOT automatic).
+        3. Verify post-boot:
+           cat /proc/cmdline | grep mitigations
+           cat /sys/devices/system/cpu/vulnerabilities/* | sort -u
+        4. Run iperf3 ramp + capture H2 delta vs pre-H2 baseline.
+  when: h2_grub_drop is changed or h2_grub_drop_remove is changed
+  tags: [h2, host-tuning]
+
+- name: H2 — Capture current /proc/cmdline for audit trail
+  ansible.builtin.slurp:
+    src: /proc/cmdline
+  register: h2_cmdline
+  when: goat_relay_h2_mitigations_off_enable | bool
+  tags: [h2, host-tuning]
+
+- name: H2 — Report current cmdline (whether reboot has applied yet or not)
+  ansible.builtin.debug:
+    msg: |
+      Current /proc/cmdline (post-reboot reflects applied cmdline):
+        {{ h2_cmdline.content | b64decode | trim }}
+      Has 'mitigations=off' taken effect?
+        {{ "YES — H2 active" if "mitigations=off" in (h2_cmdline.content | b64decode)
+           else "NO — operator must reboot to apply" }}
+  when: goat_relay_h2_mitigations_off_enable | bool and h2_cmdline is succeeded
+  tags: [h2, host-tuning]
+
+# ============================================================================
+# H3 — Hugepages for buffer pools
+# ============================================================================
+# 2 MB hugepages reserved at boot via sysctl. Persistent via
+# /etc/sysctl.d. The number is a tunable; default 512 = 1 GB.
+
+- name: H3 — Set vm.nr_hugepages persistently (sysctl.d)
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-goat-relay-h3-hugepages.conf
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Block 33C.1 lever H3 — hugepages for goat-relay buffer pools.
+      # 2 MB pages, count = {{ goat_relay_h3_hugepages_count }}.
+      # Reduces TLB pressure on the Bytes-slab + io_uring SQ/CQ rings
+      # (post-L5). Idempotent.
+      vm.nr_hugepages = {{ goat_relay_h3_hugepages_count }}
+  register: h3_sysctl
+  when: goat_relay_h3_hugepages_enable | bool
+  tags: [h3, host-tuning]
+
+- name: H3 — Remove hugepages config if disabled
+  ansible.builtin.file:
+    path: /etc/sysctl.d/99-goat-relay-h3-hugepages.conf
+    state: absent
+  register: h3_sysctl_remove
+  when: not goat_relay_h3_hugepages_enable | bool
+  tags: [h3, host-tuning]
+
+- name: H3 — Apply sysctl now (no reboot needed)
+  ansible.builtin.command: sysctl --system
+  register: h3_sysctl_apply
+  changed_when: false
+  when: h3_sysctl is changed or h3_sysctl_remove is changed
+  tags: [h3, host-tuning]
+
+- name: H3 — Verify hugepages count
+  ansible.builtin.slurp:
+    src: /proc/sys/vm/nr_hugepages
+  register: h3_count
+  when: goat_relay_h3_hugepages_enable | bool
+  tags: [h3, host-tuning]
+
+- name: H3 — Report applied hugepages count
+  ansible.builtin.debug:
+    msg: "H3 hugepages: {{ h3_count.content | b64decode | trim }} pages × 2 MB"
+  when: goat_relay_h3_hugepages_enable | bool and h3_count is succeeded
+  tags: [h3, host-tuning]
+
+# ============================================================================
+# Container-log bounds — F-229 host-level fix
+# ============================================================================
+# The relays install Docker via an inline apt block in relay-server.yml,
+# NOT the docker-engine role (which already renders log-bounded daemon.json
+# for mgmt hosts since the disk-fill class). So relays had NO
+# /etc/docker/daemon.json + an UNBOUNDED json-file driver. The pre-fix relay
+# binary's per-frame log flood then grew a 16 GB container log on the 19 GB
+# disk fleet-wide → 100% full → SSM agent couldn't write (mgmt dead) + relay
+# degraded → mesh DNS flap. This bounds EVERY container's stdout on
+# the relay host (the goat-relay container also sets per-container
+# log_options; this also covers rathole + coturn). Idempotent — restarts
+# docker only when the file changes.
+- name: F-229 — Render /etc/docker/daemon.json with container-log bounds
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "{{ goat_relay_docker_log_max_size }}",
+          "max-file": "{{ goat_relay_docker_log_max_file }}"
+        }
+      }
+  when: goat_relay_docker_log_bounds_enable | bool
+  notify: restart docker
+  tags: [docker-logs, host-tuning]

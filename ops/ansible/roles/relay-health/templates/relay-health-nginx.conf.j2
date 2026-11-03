@@ -1,0 +1,55 @@
+# Rendered by ops/ansible/roles/relay-health/ — DO NOT EDIT ON HOST.
+#
+# Serves the dashboard, and chooses WHICH relay-health document a viewer gets.
+# Relay topology is recon-sensitive (ADR 1066): the gate decides who is admitted,
+# this decides what they see once inside.
+#
+# THE CHOICE IS MADE HERE, NOT IN THE PAGE. Hiding fields in the dashboard's
+# JavaScript would be theatre — the page fetches relay-health.json wholesale, so
+# anyone admitted could read the withheld values from devtools or one curl. The
+# full document is only ever served to a request that carries an admin group.
+#
+# WHERE THE GROUP COMES FROM
+# oauth2-proxy sets X-Auth-Request-Groups upstream when its IdP emits a groups
+# claim. The MESH gate (Ory/Hydra, scope `groups`) does. The PUBLIC gate (Dex)
+# does NOT — ADR 1066 names a group claim as the durable follow-on — so on the
+# public surface the header is absent and EVERY viewer, admin included, gets the
+# reduced view. That is the fail-closed direction and it is deliberate: better a
+# platform admin sees less on the public path than a non-admin sees more.
+#
+# FAIL-CLOSED BY CONSTRUCTION: the map's default is the reduced document. A
+# missing header, an unknown group, a typo, or an IdP that stops emitting groups
+# all land on reduced. Only an explicit admin-group match returns full.
+
+map $http_x_auth_request_groups $relay_health_doc {
+    default                              "/relay-health-reduced.json";
+{% for g in (relay_health_full_view_groups | default('PLATFORM-ADMIN,IAM-ADMIN')).split(',') %}
+{% if g | trim | length > 0 %}
+    "~*(^|,)\s*{{ g | trim }}\s*(,|$)"   "/relay-health.json";
+{% endif %}
+{% endfor %}
+}
+
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Never cache the identity-dependent document: a shared cache could serve an
+    # admin's full copy to the next viewer.
+    location = /relay-health.json {
+        add_header Cache-Control "no-store, private" always;
+        try_files $relay_health_doc =404;
+    }
+
+    # The reduced document is also reachable by its own name, so an admin can
+    # deliberately preview what everyone else sees.
+    location = /relay-health-reduced.json {
+        add_header Cache-Control "no-store, private" always;
+    }
+
+    location / {
+        add_header Cache-Control "no-store" always;
+    }
+}

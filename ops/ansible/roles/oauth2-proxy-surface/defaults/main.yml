@@ -1,0 +1,128 @@
+---
+# oauth2-proxy-surface — ONE authenticated door, parameterised by surface.
+#
+# WHY THIS ROLE EXISTS. Eight surfaces already carry their own copy of an
+# oauth2-proxy sidecar (panoscope, isitup, relay-health, microscope, netvis,
+# herd, the id-console, the netbird dashboard). Each copy re-states the same
+# hard-won knobs, and each was fixed separately when one of them bit:
+# F-342 (a polling page mints a CSRF cookie per poll until the browser is
+# locked out), F-310 (the session dies ~86 s in without a minimal cookie),
+# F-126 (the container resolver cannot reach mesh CoreDNS), F-244 (only the
+# X-Forwarded-* family is unforgeable). Adding three more copies would have
+# tripled that debt. This role carries the lessons once and takes the
+# per-surface differences as variables.
+#
+# SCOPE. New doors use this role. The eight existing per-surface sidecars are
+# deliberately NOT migrated here — that is a separate change with its own
+# acceptance test, and rewriting eight working fences to prove a refactor is how a
+# fence stops working. This role must earn the migration on the three surfaces
+# it is built for first.
+#
+# WHAT AN "AUTHENTICATED DOOR" IS. `oauth2_proxy_surface_allowed_groups` is
+# EMPTY by default: every identity the site Hydra will issue a token for gets
+# in, and no group is refused at the door. That is the `door: authenticated`
+# value in ops/permissions/group-permissions.yml. The door's job here is
+# ATTRIBUTION, not refusal — Hydra records one consent grant per (person,
+# client), which is what makes a visit visible to microscope's hydra-consents
+# adapter. A surface with no door produces no grant and no session, so it is
+# invisible to that machinery no matter how much of it is built.
+
+# ----- Identity of the surface being fenced --------------------------------
+# Short name. Decides the container name (oauth2-proxy-<name>), the compose
+# project directory, the env filename and the Hydra client_id. Required.
+oauth2_proxy_surface_name: ""
+
+# The upstream this door sits in front of, as Docker addresses it. Required.
+oauth2_proxy_surface_upstream_host: ""
+oauth2_proxy_surface_upstream_port: ""
+
+# Public hostname the browser reaches. Sets the cookie domain, the redirect
+# URI and the whitelist. Required.
+oauth2_proxy_surface_hostname: ""
+
+# ----- OIDC (site Hydra) ---------------------------------------------------
+# Ansible's `uri` runs on the HOST, not inside a container, so this is the
+# loopback the mgmt host publishes Hydra's admin port on — not the compose
+# service name. `http://hydra-a:4445` fails with "Temporary failure in name
+# resolution", which reads like a DNS outage rather than a wrong address.
+# Same value panoscope uses.
+oauth2_proxy_surface_hydra_admin_url: "http://127.0.0.1:4445"
+oauth2_proxy_surface_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}/"
+oauth2_proxy_surface_oidc_client_id: "{{ oauth2_proxy_surface_name }}"
+oauth2_proxy_surface_oidc_scope: "openid email profile groups offline_access"
+oauth2_proxy_surface_oidc_redirect_uri: "https://{{ oauth2_proxy_surface_hostname }}/oauth2/callback"
+
+# F-126: the sidecar's embedded resolver cannot reach mesh CoreDNS on :5353,
+# so the issuer hostname is pinned to the mgmt-host mesh IP via extra_hosts.
+oauth2_proxy_surface_oidc_host_entry: "oauth2.{{ site_id }}.{{ site_dns_zone }}:{{ mesh_ip_a }}"
+
+# Secrets — env-sourced, never defaulted to a literal. client_secret must match
+# what the Hydra client registration holds; cookie_secret must be exactly
+# 16, 24 or 32 bytes base64.
+oauth2_proxy_surface_client_secret: ""
+oauth2_proxy_surface_cookie_secret: ""
+
+# ----- Authorization -------------------------------------------------------
+# EMPTY = authenticated door: any identity Hydra issues for passes. A non-empty
+# comma-separated list makes this a group gate instead, and then the matrix row
+# must say `door: group-gated` — ops/ci/check-group-permissions-parity.sh
+# enforces that agreement in both directions.
+oauth2_proxy_surface_allowed_groups: ""
+
+# ----- Route classes the door must NOT treat as a browser navigation -------
+# API_ROUTES: a request matching this returns 401 instead of starting
+# an OIDC flow. Without it a POLLING page mints a fresh 15-minute CSRF cookie
+# per poll, nobody completes a flow to clear them, the Cookie header outgrows
+# the proxy's buffer, and the operator gets `400 Request Header Or Cookie Too
+# Large` with no way back except clearing cookies by hand. A polling surface can
+# produce a thousand login-initiations in an hour and lock the operator out of
+# its neighbours. Set this to cover every XHR, SSE and websocket path
+# the surface serves.
+oauth2_proxy_surface_api_routes: ""
+
+# SKIP_AUTH_ROUTES: unauthenticated passthrough. Health and metrics endpoints
+# belong here — a prober has no cookie jar and no way to log in, so gating it
+# buys nothing and every probe becomes a guaranteed login-initiation. This is
+# not optional where a probe exists: the Prometheus `blackbox-https` job hits
+# `https://<fqdn><health_path>` through the FRONT DOOR, so a fenced /health
+# with no skip route turns a healthy service red.
+oauth2_proxy_surface_skip_auth_routes: ""
+
+# ----- Cookie / session ----------------------------------------------------
+oauth2_proxy_surface_cookie_expire: "8h"
+# F-310: without minimal, oauth2-proxy packs id_token + access_token +
+# refresh_token into the cookie, the browser drops it for size, and the session
+# evaporates ~86 s into an 8 h expiry. The proxy logs NO warning — it warns
+# when it SPLITS a cookie, never when the browser declines to keep it.
+# Mutually exclusive with COOKIE_REFRESH, which is therefore not set anywhere
+# in this role: the session lives to COOKIE_EXPIRE and the re-auth after that
+# is a redirect, not a password prompt, because Kratos holds a 24 h SSO session.
+oauth2_proxy_surface_session_cookie_minimal: true
+
+# ----- Request log destination ---------------------------------------------
+# Empty = stdout, which is the default and what every other door does.
+#
+# Set to a path when something needs to READ this door's request log — the
+# visit emitter does (ADR 1163). The alternative was letting the emitter read
+# Docker's own container-log directory, which is root:root 0710 and would have
+# meant either running the emitter as root or granting it read access to EVERY
+# container's logs on the host, including whatever a container prints at
+# startup. A per-door file is the least-privilege shape: the emitter sees one
+# door's requests and nothing else.
+#
+# What this costs: `docker logs oauth2-proxy-<surface>` no longer shows request
+# lines. It DOES still show startup and configuration failures, because those
+# happen before the log file is opened — which is how the crash-loop on
+# was diagnosed, and the reason this trade is acceptable.
+oauth2_proxy_surface_request_log_file: ""
+# Host directory holding the per-door log, owned by the runtime uid so the door
+# can write it and the emitter can read it. Both images run as 65532.
+oauth2_proxy_surface_log_dir: "/opt/oauth2-proxy-logs"
+
+# ----- Deployment ----------------------------------------------------------
+oauth2_proxy_surface_enabled: false
+# The same digest every other oauth2-proxy sidecar on the fleet runs. Pinned
+# here rather than floated so this role moves when they move, not on its own.
+oauth2_proxy_surface_image: "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d"
+oauth2_proxy_surface_traefik_network: "mgmt"
+oauth2_proxy_surface_compose_root: "/opt/mgmt-host"

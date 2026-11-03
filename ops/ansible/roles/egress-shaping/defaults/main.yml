@@ -1,0 +1,88 @@
+---
+# ops/ansible/roles/egress-shaping/defaults/main.yml
+#
+# ADR 1081 Layer 3 — site-host (Thor) egress survivability.
+# docs/design/control-plane-storm-resilience.md §"Layer 3".
+#
+# HOST-LOCAL egress shaping ONLY. This role manages the WAN-egress qdisc and
+# a host-local DSCP-steering table so the small control plane (rathole tunnel
+# control + mgmt/signal to the relays) keeps moving when a saturated bulk
+# transfer bufferbloats the uplink. It is NOT fabric QoS: the ADR 1033
+# "never DSCP for fabric classes" rule is untouched — the DSCP we set here is
+# stripped on egress by cake's `wash` (see tasks), so nothing leaks onto the
+# wire or into the Zenoh fabric. Different layer, stated boundary (ADR 1081 L3).
+#
+# The whole role is behind ONE toggle, default OFF. Turned on per-host only
+# after the tc-netem canary gate passes (README §Verification). Idempotent,
+# --check safe, reverts cleanly when toggled back off.
+
+# ─── Master toggle ────────────────────────────────────────────────
+# Default OFF. cake qdisc + DSCP-steering + BBR sysctl all gate on this.
+# Set `egress_shaping_enabled: true` in a host's group_vars once the canary
+# gate has passed for that host's uplink.
+egress_shaping_enabled: false
+
+# ─── cake bandwidth cap (REQUIRED when enabled) ───────────────────
+# Mbit/s ceiling cake shapes egress to. There is DELIBERATELY NO usable
+# default — an empty value fails the play closed when the role is enabled.
+#
+# PROVENANCE RULE (do not guess): the operator sets this from the host's
+# MEASURED egress envelope (the host-net-health / node-net-health rolling
+# measurement — ops/relay/health/host-net-publish.sh and the host-net band),
+# floored to ~90% of the measured line rate. Shaping just under the true rate
+# is what keeps the queue on the Thor (where cake manages it) instead of in
+# the modem/Starlink buffer. Too high and cake never engages; too low and you
+# throw away good capacity. On a moving link (Starlink) re-derive from the
+# rolling envelope, not a nameplate number.
+# CAVEAT: a FIXED cap is unfit for a variable-rate uplink (Starlink
+# swings ~10x: 67 Mbps good / 6 Mbps degraded). Cap high → cake no-ops during
+# degradation; cap low → throttles good times. Use on FIXED lines (fibre/DSL)
+# or x86 mgmt hosts; for Starlink Thors an autorate loop is the (unbuilt)
+# follow-on. BBR (below) is ALSO x86-only — the Tegra/JetPack kernel lacks it.
+egress_shaping_bandwidth_mbit: ""
+
+# cake diffserv mode. diffserv3 gives three tins (bulk / best-effort /
+# latency-sensitive); we steer control-plane packets into the top tin via a
+# host-local DSCP mark that `wash` then clears on egress. Leave as-is unless
+# you have a specific reason — the marking table below assumes diffserv3.
+egress_shaping_cake_diffserv: diffserv3
+
+# DSCP class used purely as the host-local cake tin selector for control-plane
+# packets. CS6 ("internetwork control") maps to cake diffserv3's top tin.
+# `wash` strips it before the packet leaves the host, so this is NOT a fabric
+# QoS signal (ADR 1033 boundary) — it never reaches the wire.
+egress_shaping_ctl_dscp: cs6
+
+# ─── Control-plane match set ──────────────────────────────────────
+# rathole tunnel CONTROL port on the relays. Traffic to this dport is the
+# tunnel keepalive/registration path — the thing that must not starve.
+egress_shaping_rathole_ctl_port: 2333
+
+# mgmt/signal dport. Marked only when the destination is a known relay IP
+# (resolved at runtime from the on-host rathole client configs — see the apply
+# script), so we prioritize mgmt/signal-bound traffic to the relays without
+# blanket-marking every :443 flow on the box.
+egress_shaping_mgmt_port: 443
+
+# Directory the apply script reads relay IPs from (same SoT the rathole-client
+# playbooks template — /etc/rathole/client-<relay>.toml `remote_addr` lines).
+egress_shaping_rathole_config_dir: "{{ rathole_config_dir | default('/etc/rathole') }}"
+
+# ─── BBR congestion control (same toggle) ─────────────────────────
+# cubic collapses under sustained ~10% loss (the storm-day uplink); BBR
+# degrades roughly linearly with loss, so the control-plane TCP flows keep
+# making progress on a lossy link. `fq` is BBR's pacing qdisc for interfaces
+# that don't carry an explicit qdisc (the WAN iface gets cake, which paces
+# itself; fq covers the rest). Applied via a dedicated sysctl.d drop-in and
+# loaded with `sysctl -e -p` (ignore-unknown-key) — the JetPack 7 Tegra
+# kernel on Thor may not expose every key, and boot-time systemd-sysctl
+# tolerates missing keys anyway (mirrors the F-182 baseline discipline of
+# NEVER running `sysctl --system` on Thor).
+egress_shaping_bbr_enable: true
+egress_shaping_default_qdisc: fq
+egress_shaping_tcp_congestion_control: bbr
+
+# ─── On-host paths (rarely overridden) ────────────────────────────
+egress_shaping_script_path: /usr/local/sbin/goat-egress-shaping.sh
+egress_shaping_teardown_path: /usr/local/sbin/goat-egress-shaping-teardown.sh
+egress_shaping_sysctl_path: /etc/sysctl.d/60-goat-egress-bbr.conf

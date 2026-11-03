@@ -1,0 +1,75 @@
+{
+  // Synthetic fixture for the acl-assemble round-trip test. Mirrors the
+  // real config's four per-org marker regions with two fake orgs, so the test
+  // never carries real tenant identities. Not a valid full router config.
+  mode: "router",
+  plugins: {
+    storage_manager: {
+      storages: {
+        // seed storage (role-owned)
+        ops: { key_expr: "ops/**", volume: { id: "rocksdb", dir: "ops" } },
+        // BEGIN: per-vendor storages (add-vendor.sh edits between these markers)
+        "acme-air": {
+          key_expr: "acme-air/**",
+          volume: { id: "rocksdb", dir: "/var/lib/goat-zenoh/rocksdb/acme-air" },
+        },
+        "beta-sys": {
+          key_expr: "beta-sys/**",
+          volume: { id: "rocksdb", dir: "/var/lib/goat-zenoh/rocksdb/beta-sys" },
+        },
+        // END: per-vendor storages
+      },
+    },
+  },
+  access_control: {
+    default_permission: "deny",
+    rules: [
+      // seed rule (role-owned)
+      { id: "trial-peer-r-all", messages: ["query"], flows: ["ingress"], permission: "allow", key_exprs: ["**"] },
+      // BEGIN: per-vendor write rules
+      {
+        id: "trial-peer-w-acme-air",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["acme-air/**", "volatile/acme-air/**"],
+      },
+      {
+        id: "trial-peer-w-beta-sys",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["beta-sys/**", "volatile/beta-sys/**"],
+      },
+      // END: per-vendor write rules
+    ],
+    subjects: [
+      // seed subject (role-owned)
+      { id: "trial-peer-read", cert_common_names: ["*-trial-peer"] },
+      // BEGIN: per-vendor subjects
+      {
+        id: "vendor-acme-air",
+        cert_common_names: ["acme-air-trial-peer"],
+      },
+      {
+        id: "vendor-beta-sys",
+        cert_common_names: ["beta-sys-trial-peer"],
+      },
+      // END: per-vendor subjects
+    ],
+    policies: [
+      // seed policy (role-owned)
+      { rules: ["trial-peer-r-all"], subjects: ["trial-peer-read"] },
+      // BEGIN: per-vendor policies
+      {
+        rules: ["trial-peer-w-acme-air", "trial-peer-w-attest-schema"],
+        subjects: ["vendor-acme-air"],
+      },
+      {
+        rules: ["trial-peer-w-beta-sys", "trial-peer-w-attest-schema"],
+        subjects: ["vendor-beta-sys"],
+      },
+      // END: per-vendor policies
+    ],
+  },
+}

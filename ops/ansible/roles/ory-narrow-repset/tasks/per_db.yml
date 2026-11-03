@@ -1,0 +1,194 @@
+---
+# Per-database tasks for ory-narrow-repset. Called once for each entry
+# in `ory_spock_databases` (kratos, hydra by default).
+#
+# Loop variable: ory_spock_db (e.g., "kratos", "hydra")
+#
+# Steps:
+#   1. CREATE EXTENSION spock (idempotent — IF NOT EXISTS)
+#   2. spock.node_create() if no row in spock.node (catalog check)
+#   3. spock.repset_create('ory_narrow') if not in spock.replication_set
+#   4. spock.replication_set_add_table() for each inclusion-list table
+#      (skip if already a member via spock.tables catalog check)
+#   5. Assert no exclusion-list table is a member of ory_narrow
+
+- name: "ory-narrow-repset[{{ ory_spock_db }}] | install spock extension"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ ory_spock_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ ory_spock_db }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - "CREATE EXTENSION IF NOT EXISTS spock;"
+  changed_when: false  # extension presence already reported via CREATE log; not noisy to flag
+
+- name: "ory-narrow-repset[{{ ory_spock_db }}] | derive Spock node name"
+  ansible.builtin.set_fact:
+    ory_spock_node_name: >-
+      {{ site_id | replace('-', '_') }}{% if intra_site_pair | default(false) | bool %}_a{% endif %}_{{ ory_spock_db }}
+
+- name: "ory-narrow-repset[{{ ory_spock_db }}] | create Spock node if missing"
+  ansible.builtin.shell:
+    cmd: |
+      docker exec -i -u postgres {{ ory_spock_postgres_container }} \
+        psql -U postgres -d {{ ory_spock_db }} -v ON_ERROR_STOP=1 -tA <<'SQL'
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM spock.node WHERE node_name = '{{ ory_spock_node_name }}') THEN
+          PERFORM spock.node_create(
+            node_name := '{{ ory_spock_node_name }}',
+            dsn := 'host={{ ory_spock_postgres_container }} port=5432 dbname={{ ory_spock_db }} user={{ ory_spock_replicator_user }} password={{ ory_spock_replicator_password }}'
+          );
+        END IF;
+      END $$;
+      SQL
+  no_log: true  # DSN contains the replicator password
+  register: ory_spock_node_create
+  changed_when: false
+
+- name: "ory-narrow-repset[{{ ory_spock_db }}] | grant spock-schema permissions to replicator"
+  # Same requirement as spock-mesh-peering Block 64Q.4: a peer's sub_create
+  # connects here as `replicator` and calls spock.node_info(); without
+  # these grants it fails "permission denied for schema spock". Idempotent.
+  # (Surfaced at first live firing of this role, ZAGROS the
+  # missing `docker exec -i` had masked every SQL step until then.)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ ory_spock_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ ory_spock_db }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        GRANT USAGE ON SCHEMA spock TO {{ ory_spock_replicator_user }};
+        GRANT SELECT ON ALL TABLES IN SCHEMA spock TO {{ ory_spock_replicator_user }};
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA spock TO {{ ory_spock_replicator_user }};
+  changed_when: true
+
+# Revocation guard (issue #1505, ADR 1193): goat_revocations + triggers on
+# identities. Before the repset step, which adds goat_revocations. Idempotent.
+- name: "ory-narrow-repset[{{ ory_spock_db }}] | install the revocation guard"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - -u
+      - postgres
+      - "{{ ory_spock_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ ory_spock_db }}"
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -q
+    stdin: "{{ lookup('ansible.builtin.file', ory_spock_revocation_guard_sql[ory_spock_db]) }}"
+  changed_when: true
+  when:
+    - ory_spock_revocation_guard | bool
+    - ory_spock_db in ory_spock_revocation_guard_sql
+
+- name: "ory-narrow-repset[{{ ory_spock_db }}] | create ory_narrow repset + populate inclusion list + assert exclusions"
+  ansible.builtin.shell:
+    cmd: |
+      docker exec -i -u postgres {{ ory_spock_postgres_container }} \
+        psql -U postgres -d {{ ory_spock_db }} -v ON_ERROR_STOP=1 -tA <<'SQL'
+      DO $$
+      DECLARE
+        v_inclusion text[] := ARRAY[{% for t in ory_spock_inclusion_tables[ory_spock_db] %}'{{ t }}'{% if not loop.last %},{% endif %}{% endfor %}];
+        v_exclusion text[] := ARRAY[{% for t in ory_spock_exclusion_tables[ory_spock_db] %}'{{ t }}'{% if not loop.last %},{% endif %}{% endfor %}];
+        t text;
+        v_violations text[] := ARRAY[]::text[];
+      BEGIN
+        -- Step 1: ensure repset exists
+        IF NOT EXISTS (
+          SELECT 1 FROM spock.replication_set WHERE set_name = '{{ ory_spock_repset_name }}'
+        ) THEN
+          PERFORM spock.repset_create('{{ ory_spock_repset_name }}');
+        END IF;
+
+        -- Step 2: add each inclusion-list table (skip if already a member)
+        FOREACH t IN ARRAY v_inclusion
+        LOOP
+          IF NOT EXISTS (
+            SELECT 1 FROM spock.tables
+            WHERE set_name = '{{ ory_spock_repset_name }}'
+              AND nspname || '.' || relname = t
+          ) THEN
+            -- to_regclass returns NULL if the table doesn't exist (e.g.,
+            -- removed by an Ory version that doesn't ship it). Skip cleanly.
+            IF to_regclass(t) IS NOT NULL THEN
+              PERFORM spock.repset_add_table('{{ ory_spock_repset_name }}', t::regclass, false);
+            END IF;
+          END IF;
+        END LOOP;
+
+        -- Step 3: assert no exclusion-list table is a member of the repset
+        FOREACH t IN ARRAY v_exclusion
+        LOOP
+          IF EXISTS (
+            SELECT 1 FROM spock.tables
+            WHERE set_name = '{{ ory_spock_repset_name }}'
+              AND nspname || '.' || relname = t
+          ) THEN
+            v_violations := array_append(v_violations, t);
+          END IF;
+        END LOOP;
+
+        IF array_length(v_violations, 1) > 0 THEN
+          RAISE EXCEPTION 'ory-narrow-repset: exclusion-list table(s) found in % repset: %',
+            '{{ ory_spock_repset_name }}', v_violations;
+        END IF;
+      END $$;
+      SQL
+  register: ory_spock_repset_apply
+  changed_when: false  # psql exit code is the source of truth; SQL is idempotent
+
+# Recovery stays on the privileged management-host door. The web console
+# receives neither database credentials nor permission to execute a command.
+- name: "ory-narrow-repset | create privileged reinstatement directories"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop: [/usr/local/libexec, /etc/goat]
+  when: ory_spock_revocation_guard | bool and ory_spock_db == 'kratos'
+
+- name: "ory-narrow-repset | install explicit identity reinstatement helper"
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../postgres/spock/revocation-guard/reinstate_identity.py"
+    dest: /usr/local/libexec/goat-reinstate-identity
+    owner: root
+    group: root
+    mode: '0700'
+  when: ory_spock_revocation_guard | bool and ory_spock_db == 'kratos'
+
+- name: "ory-narrow-repset | configure reinstatement for this site's PostgreSQL container"
+  ansible.builtin.copy:
+    content: "{{ {'postgres_container': ory_spock_postgres_container} | to_json }}"
+    dest: /etc/goat/reinstatement.json
+    owner: root
+    group: root
+    mode: '0600'
+  when: ory_spock_revocation_guard | bool and ory_spock_db == 'kratos'

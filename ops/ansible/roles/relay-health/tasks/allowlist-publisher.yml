@@ -1,0 +1,48 @@
+---
+# Allowlist auto-sync publisher (ADR 1093 Phase 1) — Thor-only; POSTs the active
+# Kratos roster to the box's allowlist ingest so gate access follows membership.
+# Gated on relay_health_allowlist_publish_url being set (empty = feature off).
+#
+# Included from TWO places in this role:
+#   1. The normal enabled path (the historical location).
+#   2. The sunset path (relay_health_enabled: false) BEFORE end_host — a Thor
+#      whose private dashboard is retired keeps FEEDING the surviving cloud
+#      dashboard, and that feeder must stay re-renderable (the "extract into a
+#      standalone maintenance path" follow-up noted in
+#      relay-health-dashboard.md §"Mesh-dashboard sunset").
+
+- name: relay-health | install allowlist auto-sync publisher (Thor)
+  ansible.builtin.copy:
+    src: "{{ relay_health_src_dir }}/relay-health-allowlist-publish.sh"
+    dest: "{{ relay_health_dir }}/relay-health-allowlist-publish.sh"
+    mode: "0755"
+  when: relay_health_allowlist_publish_url | default('') | length > 0
+
+- name: relay-health | render allowlist publisher env + units (Thor)
+  ansible.builtin.template:
+    src: "{{ item.s }}"
+    dest: "{{ item.d }}"
+    mode: "{{ item.m }}"
+  loop:
+    - { s: relay-health-allowlist-publish.env.j2, d: "{{ relay_health_dir }}/relay-health-allowlist-publish.env", m: "0600" }
+    - { s: relay-health-allowlist-publish.service.j2, d: /etc/systemd/system/relay-health-allowlist-publish.service, m: "0644" }
+    - { s: relay-health-allowlist-publish.timer.j2, d: /etc/systemd/system/relay-health-allowlist-publish.timer, m: "0644" }
+  when: relay_health_allowlist_publish_url | default('') | length > 0
+
+- name: relay-health | enable + start allowlist auto-sync timer (Thor)
+  ansible.builtin.systemd:
+    name: relay-health-allowlist-publish.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: relay_health_allowlist_publish_url | default('') | length > 0
+
+# A host that no longer publishes (url emptied) stops the timer it was given,
+# instead of failing NOTCONFIGURED every interval (zagros-dev's Thor).
+- name: relay-health | stop the allowlist auto-sync timer where nothing is published
+  ansible.builtin.systemd:
+    name: relay-health-allowlist-publish.timer
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: relay_health_allowlist_publish_url | default('') | length == 0

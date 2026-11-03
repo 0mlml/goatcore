@@ -1,0 +1,124 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy goat-crypto-posture — the evidence-based crypto-posture publisher
+# (ADR 1079 / docs/design/zenoh-pqc-tls.md). A normal mTLS Zenoh client peer;
+# persists nothing.
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. The zenoh router container is Healthy on {{ crypto_posture_zenoh_network }}.
+#   2. Leaf cert+key issued CN=fabric-health-trial-peer (so the existing
+#      ops/fabric/** ACL grant admits the publish) staged at
+#      {{ crypto_posture_cert_dir }}/{{ crypto_posture_cert_file,key_file }}.
+#   3. CA root present at {{ crypto_posture_ca_root_src }}.
+
+- name: crypto-posture | ensure cert dir
+  ansible.builtin.file:
+    path: "{{ crypto_posture_cert_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: crypto-posture | pre-flight leaf cert exists
+  ansible.builtin.stat:
+    path: "{{ crypto_posture_cert_dir }}/{{ crypto_posture_cert_file }}"
+  register: crypto_posture_cert_stat
+
+# The publisher's identity IS the fabric-health leaf (CN=fabric-health-trial-peer,
+# the subject the router ACL grants write on ops/fabric/**). When no dedicated
+# leaf is staged and the host carries the fabric-health one, use that: same
+# subject, no second offline-CA ceremony. Copied, never linked, so the ownership
+# change below touches only this role's directory.
+- name: crypto-posture | the host's fabric-health leaf
+  ansible.builtin.stat:
+    path: "{{ crypto_posture_fabric_health_cert_dir }}/fabric-health-cert.pem"
+  register: crypto_posture_fh_stat
+  when: not (crypto_posture_cert_stat.stat.exists | default(false))
+
+- name: crypto-posture | use the fabric-health leaf when no dedicated one is staged
+  ansible.builtin.copy:
+    src: "{{ crypto_posture_fabric_health_cert_dir }}/{{ item.src }}"
+    dest: "{{ crypto_posture_cert_dir }}/{{ item.dest }}"
+    remote_src: true
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: fabric-health-cert.pem, dest: "{{ crypto_posture_cert_file }}", mode: "0644" }
+    - { src: fabric-health-key.pem, dest: "{{ crypto_posture_key_file }}", mode: "0600" }
+  loop_control:
+    label: "{{ item.dest }}"
+  when:
+    - not (crypto_posture_cert_stat.stat.exists | default(false))
+    - crypto_posture_fh_stat.stat.exists | default(false)
+
+- name: crypto-posture | re-read the leaf
+  ansible.builtin.stat:
+    path: "{{ crypto_posture_cert_dir }}/{{ crypto_posture_cert_file }}"
+  register: crypto_posture_cert_stat
+
+- name: crypto-posture | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      crypto-posture: leaf cert missing at
+      {{ crypto_posture_cert_dir }}/{{ crypto_posture_cert_file }}.
+      Mint a CN=fabric-health-trial-peer leaf via the offline-CA cert-sign
+      ceremony (docs/operations/dev-ca-cert-sign.md) before re-running.
+  when: not (crypto_posture_cert_stat.stat.exists | default(false))
+
+- name: crypto-posture | pre-flight CA root exists
+  ansible.builtin.stat:
+    path: "{{ crypto_posture_ca_root_src }}"
+  register: crypto_posture_ca_stat
+
+- name: crypto-posture | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      crypto-posture: CA root missing at {{ crypto_posture_ca_root_src }} —
+      same file the router uses, so its absence means the router isn't deployed.
+  when: not (crypto_posture_ca_stat.stat.exists | default(false))
+
+- name: crypto-posture | normalize cert dir ownership for nonroot uid 65532
+  ansible.builtin.file:
+    path: "{{ crypto_posture_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+
+- name: crypto-posture | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ crypto_posture_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: crypto-posture | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ crypto_posture_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: crypto-posture | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ crypto_posture_compose_dir }}"
+  changed_when: true
+
+- name: crypto-posture | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ crypto_posture_compose_dir }}"
+  register: crypto_posture_up
+  changed_when:
+    - "'Started' in crypto_posture_up.stderr or 'Created' in crypto_posture_up.stderr or 'Recreated' in crypto_posture_up.stderr"
+
+- name: crypto-posture | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ crypto_posture_compose_dir }}"
+  register: crypto_posture_ps
+  changed_when: false
+
+- name: crypto-posture | show
+  ansible.builtin.debug:
+    msg: "{{ crypto_posture_ps.stdout_lines }}"

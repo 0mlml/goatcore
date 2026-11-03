@@ -1,0 +1,245 @@
+---
+# snitch-bundle / Linux — systemd + /usr/local/bin/snitch
+#
+# Pre-Block-61H this was the entire role; Block 61H pulled the dispatcher
+# into main.yml and renamed the original tasks here. Unchanged behavior.
+
+# Bundle-path fallback:
+# Originally this role only knew the bundle path
+# (/opt/goat/bootstrap/binaries/snitch). On hosts that didn't go
+# through Block 68 rapid-bringup, that path is empty and the role hard-
+# failed. Add a release-download fallback so the role can land on any
+# Linux/arm64 or amd64 mgmt-host without prerequisite bundle layout.
+# Universal deploy-rollback ledger (ADR 1060), Linux peers only (a Darwin peer
+# has no /var/lib/goat): the probe is a release binary, so the row's ref is the
+# release tag, and what the host runs is recorded as `served` from the marker
+# written below, judged against main by ops/scripts/served-payloads.py.
+- name: Deploy-rollback ledger (the staged snitch release)
+  ansible.builtin.include_role:
+    name: rollback-ledger
+  vars:
+    rollback_component: snitch-bundle
+    rollback_artifact_type: config
+    rollback_ref: "{{ snitch_release_tag }}"
+    rollback_restore_pointer: >-
+      set snitch_release_tag to the previous row's ref and re-run the play with
+      -e snitch_bundle_force_refresh=true
+    rollback_served_root: "{{ snitch_bundle_marker_dir }}"
+    rollback_served:
+      - {name: snitch, tag_var: snitch_release_tag, file: snitch.version.json}
+  tags: [snitch-bundle]
+
+- name: Probe for bundle binary at the canonical location
+  ansible.builtin.stat:
+    path: "{{ snitch_bundle_unpack_dir }}/binaries/snitch"
+  register: bundle_binary
+  tags: [snitch-bundle]
+
+# ONE place decides whether to (re)stage the binary.
+#
+# This used to be `not bundle_binary.stat.exists` repeated at six gates, which
+# means a staged binary is reused FOREVER once present — a rebuilt snitch never
+# reaches the hosts, the copy below compares against the stale source, reports
+# changed=0, and the play goes green while the probes run the previous build.
+- name: Decide whether the probe binary needs staging
+  ansible.builtin.set_fact:
+    snitch_bundle_needs_staging: >-
+      {{ (not bundle_binary.stat.exists) or (snitch_bundle_force_refresh | bool) }}
+  tags: [snitch-bundle]
+
+- name: Map ansible_architecture to GitHub release asset name
+  ansible.builtin.set_fact:
+    snitch_release_asset: >-
+      {%- if ansible_facts['architecture'] == 'aarch64' or ansible_facts['architecture'] == 'arm64' -%}
+      snitch-linux-arm64
+      {%- elif ansible_facts['architecture'] in ['x86_64', 'amd64'] -%}
+      snitch-linux-amd64
+      {%- else -%}
+      UNSUPPORTED-{{ ansible_facts['architecture'] }}
+      {%- endif -%}
+  when: snitch_bundle_needs_staging | bool
+  tags: [snitch-bundle]
+
+- name: Refuse to fall back on unsupported architectures
+  ansible.builtin.fail:
+    msg: >-
+      No bundle binary at {{ snitch_bundle_unpack_dir }}/binaries/snitch
+      AND no release-download fallback for ansible_architecture
+      "{{ ansible_facts['architecture'] }}". Supported fallback architectures:
+      aarch64/arm64, x86_64/amd64. Either lay down the bundle layout per
+      Block 68 rapid-bringup, OR add a manual binary copy at
+      {{ snitch_bundle_unpack_dir }}/binaries/snitch.
+  when:
+    - snitch_bundle_needs_staging | bool
+    - snitch_release_asset is defined
+    - "'UNSUPPORTED' in snitch_release_asset"
+  tags: [snitch-bundle]
+
+- name: Ensure bundle binary parent directory exists (for release-download fallback)
+  ansible.builtin.file:
+    path: "{{ snitch_bundle_unpack_dir }}/binaries"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: snitch_bundle_needs_staging | bool
+  tags: [snitch-bundle]
+
+- name: Stat the controller-side binary (operator pre-staged via gh release download)
+  ansible.builtin.stat:
+    path: "{{ snitch_release_local_path }}/{{ snitch_release_asset }}"
+  delegate_to: localhost
+  become: false
+  register: controller_binary
+  when: snitch_bundle_needs_staging | bool
+  tags: [snitch-bundle]
+
+- name: Refuse to fall back without operator-staged binary on controller
+  ansible.builtin.fail:
+    msg: >-
+      No bundle binary at {{ snitch_bundle_unpack_dir }}/binaries/snitch on
+      target, AND no operator-staged binary at
+      {{ snitch_release_local_path }}/{{ snitch_release_asset }} on the
+      controller. The repo is PRIVATE so unauthenticated GitHub release
+      download won't work. Operator action: run on the controller laptop —
+        mkdir -p {{ snitch_release_local_path }}
+        cd {{ snitch_release_local_path }} && gh release download {{ snitch_release_tag }} \
+          --repo {{ snitch_release_repo }} \
+          --pattern '{{ snitch_release_asset }}' \
+          --pattern '{{ snitch_release_asset }}.sha256' --clobber
+      Then re-run this play. (Future: when the repo goes public per Block 30
+      sanitization, switch this back to direct get_url.)
+  when:
+    - snitch_bundle_needs_staging | bool
+    - controller_binary is defined
+    - not (controller_binary.stat.exists | default(false))
+  tags: [snitch-bundle]
+
+- name: Copy snitch binary from controller (operator-staged release asset; F-074 fallback)
+  ansible.builtin.copy:
+    src: "{{ snitch_release_local_path }}/{{ snitch_release_asset }}"
+    dest: "{{ snitch_bundle_unpack_dir }}/binaries/snitch"
+    mode: "0755"
+    owner: root
+    group: root
+  when:
+    - snitch_bundle_needs_staging | bool
+    - controller_binary is defined
+    - controller_binary.stat.exists | default(false)
+  tags: [snitch-bundle]
+
+- name: Re-stat binary after download fallback (so the install step always sees a real file)
+  ansible.builtin.stat:
+    path: "{{ snitch_bundle_unpack_dir }}/binaries/snitch"
+  register: bundle_binary_post
+  tags: [snitch-bundle]
+
+- name: Hard-fail if binary still missing after fallback
+  ansible.builtin.fail:
+    msg: >-
+      snitch binary still missing after release-download fallback.
+      Expected at {{ snitch_bundle_unpack_dir }}/binaries/snitch.
+      Either Block 68 rapid-bringup didn't lay down the bundle layout AND
+      GitHub release {{ snitch_release_tag }} didn't have a working asset
+      for arch {{ ansible_facts['architecture'] }}.
+  when: not bundle_binary_post.stat.exists
+  tags: [snitch-bundle]
+
+- name: Install snitch binary from bundle (or freshly-downloaded fallback)
+  ansible.builtin.copy:
+    src: "{{ snitch_bundle_unpack_dir }}/binaries/snitch"
+    dest: /usr/local/bin/snitch
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart snitch-probe (systemd)
+  tags: [snitch-bundle]
+
+# SAY WHICH BINARY IS RUNNING. The failure this role had was silent: a stale
+# staged binary produced changed=0 and a green play, and nothing in the output
+# distinguished "up to date" from "quietly reusing last month's build". A
+# checksum in the recap costs nothing and makes the two cases tell apart.
+- name: Report the installed probe binary
+  ansible.builtin.stat:
+    path: /usr/local/bin/snitch
+    checksum_algorithm: sha256
+  register: snitch_installed_binary
+  changed_when: false
+  tags: [snitch-bundle]
+
+# Which release this binary came from, as a fact the ledger records. Written only
+# when this run staged it from the release (the tag is then known); a binary that
+# was already there keeps the marker its staging run wrote, and one staged before
+# markers existed has none, so it reads as absent until a forced refresh.
+- name: Record the staged snitch release for the ledger
+  ansible.builtin.copy:
+    dest: "{{ snitch_bundle_marker_dir }}/snitch.version.json"
+    content: >-
+      {{ {'tag': snitch_release_tag,
+          'sha256': (snitch_installed_binary.stat.checksum | default(''))} | to_json }}
+    owner: root
+    group: root
+    mode: "0644"
+  when: snitch_bundle_needs_staging | bool
+  tags: [snitch-bundle]
+
+- name: Show the installed probe binary
+  ansible.builtin.debug:
+    msg: >-
+      snitch probe binary sha256={{ (snitch_installed_binary.stat.checksum | default('?'))[:16] }}
+      staged_from={{ snitch_bundle_unpack_dir }}/binaries/snitch
+      restaged_this_run={{ snitch_bundle_needs_staging | bool }}
+      {{ '— set snitch_bundle_force_refresh=true to re-stage after a rebuild'
+         if not (snitch_bundle_needs_staging | bool) else '' }}
+  tags: [snitch-bundle]
+
+- name: Resolve snitch probe key (inventory override or bundle extract)
+  ansible.builtin.set_fact:
+    snitch_probe_key_resolved: "{{ snitch_probe_key_inventory }}"
+  when: snitch_probe_key_inventory | length > 0
+  tags: [snitch-bundle]
+
+- name: Extract snitch probe key from offline-enrollment bundle
+  ansible.builtin.command:
+    cmd: bundle-extract --field snitch_probe_key --hex {{ snitch_enrollment_bundle_path }}
+  register: bundle_extract_result
+  changed_when: false
+  no_log: true
+  when: snitch_probe_key_inventory | length == 0
+  tags: [snitch-bundle]
+
+- name: Set snitch_probe_key_resolved from bundle
+  ansible.builtin.set_fact:
+    snitch_probe_key_resolved: "{{ bundle_extract_result.stdout }}"
+  when: snitch_probe_key_inventory | length == 0
+  no_log: true
+  tags: [snitch-bundle]
+
+- name: Render snitch-probe.service systemd unit
+  ansible.builtin.template:
+    src: snitch-probe.service.j2
+    dest: /etc/systemd/system/snitch-probe.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart snitch-probe (systemd)
+  tags: [snitch-bundle]
+
+- name: Render snitch-probe environment file
+  ansible.builtin.template:
+    src: snitch-probe.env.j2
+    dest: /etc/snitch-probe.env
+    owner: root
+    group: root
+    mode: "0600"   # holds the probe API key
+  notify: Restart snitch-probe (systemd)
+  tags: [snitch-bundle]
+
+- name: Enable + start snitch-probe.service
+  ansible.builtin.systemd:
+    name: snitch-probe.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  tags: [snitch-bundle]

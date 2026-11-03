@@ -1,0 +1,63 @@
+---
+# intake-mesh-advisory  —  static on-mesh advisory page for a public
+# enrollment hostname that resolves to Thor's mesh-facing Traefik (GH #150).
+#
+# RESIDUAL net, not the fix. GH #151 (PR #215) removed the cause: the intake
+# name no longer CNAMEs onto the netbird apex, whose mesh answer leads with
+# Thor's mesh IP. This covers the DNS TTL window on cached answers and
+# clients holding a stale one. It does NOT generalise to future colliding
+# names — a name not already certed on this Traefik fails the TLS handshake
+# before any page can render, so there is no such thing as a catch-all
+# friendly page over HTTPS. Retire via the toggle; the role removes itself.
+#
+# When enabled for a site (ZAGROS today), this role deploys a tiny
+# nginx container on the mgmt host and wires a low-priority Traefik
+# router on the websecure entrypoint that matches the configured
+# hostnames and serves a self-contained HTML page explaining that the
+# invitation link is a public enrollment surface and must be opened
+# from off-mesh.
+
+# Toggle  —  off by default; ZAGROS enables this in group_vars.
+intake_mesh_advisory_enabled: false
+
+# Hostnames to match on the mesh-facing Traefik. Keep this to names that a
+# HUMAN opens in a BROWSER — the page is an HTML advisory, so it is useless
+# on an RPC or mTLS lane hostname, and on a fail-closed lane it would stand
+# up an unauthenticated HTTP surface that the lane exists to prevent.
+#
+# Every name listed here MUST already have its cert anchored by another
+# router on this Traefik. The router below declares only
+# `tls: {certResolver: ...}` and SNI-matches an existing cert; it must never
+# declare `tls.domains`, per the declare-once rule in the header of
+# templates/traefik-acme/mgmt-dynamic.yml.j2 — two routers declaring
+# overlapping SAN lists fire concurrent ACME orders that write the same
+# Cloudflare TXT record, and the loser gets error 81058. That would break
+# renewal of the cert the PUBLIC front desk serves.
+intake_mesh_advisory_hostnames: []
+
+# Compose / container wiring.
+intake_mesh_advisory_compose_dir: "/opt/intake-mesh-advisory"
+intake_mesh_advisory_container_name: "intake-mesh-advisory"
+
+# Image  —  digest-pinned nginx per ADR 0859 (easy rollback). Same
+# upstream pin as onboard-intake-collector (public intake front desk).
+intake_mesh_advisory_image: "nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
+intake_mesh_advisory_internal_port: 80
+
+# Traefik wiring  —  file-provider config in /etc/traefik/dynamic,
+# container joined to the existing mgmt network so Traefik resolves
+# the upstream by container alias. `le` is the static-config cert
+# resolver (Let's Encrypt via Cloudflare DNS-01) used by the ZAGROS
+# mgmt Traefik dynamic config.
+intake_mesh_advisory_traefik_network: "mgmt"
+intake_mesh_advisory_traefik_dynamic_dir: "/etc/traefik/dynamic"
+intake_mesh_advisory_traefik_dynamic_filename: "intake-mesh-advisory.yml"
+intake_mesh_advisory_traefik_cert_resolver: "le"
+intake_mesh_advisory_traefik_router_name: "intake-mesh-advisory"
+
+# Mesh-only gating  —  this page is intended specifically for peers
+# on the netbird mesh who have opened a public enrollment link while
+# connected. Restrict reachability to the mesh CIDR via the shared
+# `mesh-only-allowlist` middleware defined in the ZAGROS mgmt Traefik
+# dynamic config.
+intake_mesh_advisory_mesh_only_middleware: "mesh-only-allowlist@file"

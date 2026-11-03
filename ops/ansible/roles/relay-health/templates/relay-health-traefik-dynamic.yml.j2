@@ -1,0 +1,117 @@
+# Traefik dynamic config — relay-health PUBLIC gate (ADR 1061 Phase 2).
+# Rendered by ops/ansible/roles/relay-health into /opt/relay-health/traefik-dynamic/.
+# DO NOT EDIT ON HOST. File provider (no docker socket).
+#
+# Routes the one public host → oauth2-proxy (the Dex login gate) → nginx.
+# tls.certResolver=le triggers the Let's Encrypt DNS-01 cert for this domain.
+http:
+  routers:
+{% if relay_metrics_ingest_enabled | default(false) | bool %}
+    # Relay-metrics ingest (ADR 1058/1061) — token-gated in the service itself,
+    # so NO oauth2-proxy. Higher priority so /relay-metrics-ingest is matched
+    # before the Host-only dashboard router (which would send it to the login).
+    relay-metrics-ingest:
+      priority: 100
+      rule: "Host(`{{ relay_health_fqdn }}`) && PathPrefix(`/relay-metrics-ingest`)"
+      entryPoints:
+        - websecure
+      service: relay-metrics-ingest
+      tls:
+        certResolver: le
+{% if host_net_allowed_names | default('') | length > 0 %}
+    # Host-net health ingest — site network hosts
+    # (mgmt-hosts/Thors) POST their uplink/tunnel/control-plane health here so
+    # it is visible + STORED exactly when the site is degraded or dark. Same
+    # in-service bearer gate, same ingest container as relay metrics.
+    host-net-ingest:
+      priority: 100
+      rule: "Host(`{{ relay_health_fqdn }}`) && PathPrefix(`/host-net-ingest`)"
+      entryPoints:
+        - websecure
+      service: relay-metrics-ingest
+      tls:
+        certResolver: le
+
+    # Allowlist auto-sync ingest (ADR 1093 Phase 1) — the Thor (which has Kratos)
+    # POSTs the ACTIVE-roster email list here; the ingest writes it in-place to the
+    # oauth2-proxy authenticated-emails file so access follows membership without a
+    # manual redeploy. Same in-service bearer gate + fail-closed floor; NO oauth2-proxy.
+    relay-health-allowlist-ingest:
+      priority: 100
+      rule: "Host(`{{ relay_health_fqdn }}`) && PathPrefix(`/relay-health-allowlist-ingest`)"
+      entryPoints:
+        - websecure
+      service: relay-metrics-ingest
+      tls:
+        certResolver: le
+{% endif %}
+{% if zenoh_health_allowed_names | default('') | length > 0 %}
+    # Zenoh router service-health ingest — the Thor-side
+    # probe POSTs here (the outage-resilient cloud vantage stores its own copy of
+    # the band's history). Token-gated in the service, so NO oauth2-proxy.
+    zenoh-health-ingest:
+      priority: 100
+      rule: "Host(`{{ relay_health_fqdn }}`) && PathPrefix(`/zenoh-health-ingest`)"
+      entryPoints:
+        - websecure
+      service: relay-metrics-ingest
+      tls:
+        certResolver: le
+{% endif %}
+{% if relay_health_cross_fleet_allowed | default('') | length > 0 %}
+    # Cross-goatnet rollup ingest (goatnets.html) — a SIBLING goatnet POSTs its
+    # six-field rollup here. Gated in the service by its own CROSS_FLEET_TOKEN,
+    # so NO oauth2-proxy: the caller is a machine on another goatnet with no Dex
+    # session and no way to get one. Without this router the POST matches the
+    # Host-only dashboard rule and is 302'd to the login, so the publisher
+    # reports http=302 and nothing is stored.
+    goatnet-summary-ingest:
+      priority: 100
+      rule: "Host(`{{ relay_health_fqdn }}`) && PathPrefix(`/goatnet-summary-ingest`)"
+      entryPoints:
+        - websecure
+      service: relay-metrics-ingest
+      tls:
+        certResolver: le
+{% endif %}
+{% endif %}
+{% if ntfy_enabled | default(false) | bool %}
+    # ntfy pager (ADR 1168). Own hostname, own LE cert, NO oauth2-proxy: ntfy
+    # authenticates every request itself (deny-all default + per-user ACLs).
+    ntfy:
+      rule: "Host(`{{ ntfy_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: ntfy
+      tls:
+        certResolver: le
+        domains:
+          - main: "{{ ntfy_fqdn }}"
+{% endif %}
+    relay-health:
+      rule: "Host(`{{ relay_health_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: relay-health
+      tls:
+        certResolver: le
+        domains:
+          - main: "{{ relay_health_fqdn }}"
+  services:
+{% if ntfy_enabled | default(false) | bool %}
+    ntfy:
+      loadBalancer:
+        servers:
+          - url: "http://ntfy:80"
+{% endif %}
+    relay-health:
+      loadBalancer:
+        servers:
+          # oauth2-proxy on the shared compose network (resolvable by name).
+          - url: "http://oauth2-proxy:4180"
+{% if relay_metrics_ingest_enabled | default(false) | bool %}
+    relay-metrics-ingest:
+      loadBalancer:
+        servers:
+          - url: "http://relay-metrics-ingest:8090"
+{% endif %}

@@ -1,0 +1,41 @@
+# {{ ansible_managed }}
+# The public onboarding front-desk collector (ADR 1062 stage 1). Joins the
+# shared Traefik network so Traefik can route to it and it can reach the
+# mesh-only portal at {{ onboard_intake_portal_upstream_host }}:{{ onboard_intake_portal_upstream_port }}.
+services:
+  {{ onboard_intake_container_name }}:
+    image: "{{ onboard_intake_image }}"
+    container_name: "{{ onboard_intake_container_name }}"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    cap_drop:
+      - ALL
+    # Stock nginx runs a root master that chowns its cache/temp dirs and spawns
+    # workers as the unprivileged `nginx` user — the minimal caps for that model.
+    # Everything else stays dropped; the master binds :80 as root (no
+    # NET_BIND_SERVICE needed).
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - "{{ onboard_intake_dir }}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+    networks:
+      - "{{ onboard_intake_traefik_network }}"
+    labels:
+      # Routed via the file-provider dynamic config, not docker labels.
+      - "traefik.enable=false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+networks:
+  {{ onboard_intake_traefik_network }}:
+    external: true

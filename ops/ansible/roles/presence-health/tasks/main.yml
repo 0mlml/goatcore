@@ -1,0 +1,99 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the goat-presence-health meter on a mgmt-host (ADR 1040 gap 3 / ADR 1036).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the same docker network, with the
+#      infra-presence-health subject + its rules LIVE in its config (live only
+#      after a router restart — F-156), else the ops/presence/health/<site>
+#      writes are silently denied and the liveliness watch sees nothing (F-177
+#      — the meter then honestly publishes `idle`).
+#   2. Infra leaf cert + key minted via offline-CA cert-sign with Subject
+#      CN=goat-presence-health-trial-peer at {{ presence_health_cert_dir }}/presence-health-{cert,key}.pem.
+#   3. CA root present at {{ presence_health_ca_root_src }}.
+#
+# Persists nothing — no S3/MinIO/.env.
+
+- name: presence-health | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ presence_health_cert_dir }}/presence-health-cert.pem"
+  register: presence_health_cert_stat
+  when: presence_health_zenoh_endpoint is match('^tls/')
+
+- name: presence-health | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      presence-health: leaf cert missing at
+      {{ presence_health_cert_dir }}/presence-health-cert.pem. Mint one via the offline-CA
+      cert-sign ceremony (Subject CN=goat-presence-health-trial-peer) before re-running
+      (see docs/operations/dev-ca-cert-sign.md).
+  when:
+    - presence_health_zenoh_endpoint is match('^tls/')
+    - presence_health_cert_stat is not skipped
+    - not (presence_health_cert_stat.stat.exists | default(false))
+
+- name: presence-health | pre-flight CA root exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ presence_health_ca_root_src }}"
+  register: presence_health_ca_root_stat
+  when: presence_health_zenoh_endpoint is match('^tls/')
+
+- name: presence-health | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      presence-health: CA root cert missing at {{ presence_health_ca_root_src }} — same
+      file zenoh-router uses, so its absence means the router itself isn't deployed.
+  when:
+    - presence_health_zenoh_endpoint is match('^tls/')
+    - presence_health_ca_root_stat is not skipped
+    - not (presence_health_ca_root_stat.stat.exists | default(false))
+
+- name: presence-health | normalize cert dir ownership for non-root container uid 65532 (Chainguard default)
+  ansible.builtin.file:
+    path: "{{ presence_health_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: presence_health_zenoh_endpoint is match('^tls/')
+
+- name: presence-health | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ presence_health_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: presence-health | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ presence_health_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: presence-health | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ presence_health_compose_dir }}"
+  changed_when: true
+
+- name: presence-health | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ presence_health_compose_dir }}"
+  register: presence_health_up
+  changed_when:
+    - "'Started' in presence_health_up.stderr or 'Created' in presence_health_up.stderr or 'Recreated' in presence_health_up.stderr"
+
+- name: presence-health | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ presence_health_compose_dir }}"
+  register: presence_health_ps
+  changed_when: false
+
+- name: presence-health | show
+  ansible.builtin.debug:
+    msg: "{{ presence_health_ps.stdout_lines }}"

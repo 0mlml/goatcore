@@ -1,0 +1,388 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Apply the audit-integrity bucket lifecycle policy per the Block 95
+# three-tier substrate.
+#
+# The policy has TWO halves, and both are required:
+#
+#   1. NoncurrentVersionExpiration → without it noncurrent versions accumulate
+#      and the bucket grows past the stated retention horizon.
+#   2. ExpiredObjectDeleteMarker → removes the DELETE MARKERS the first half
+#      leaves behind. On a versioned bucket, expiring a current version does
+#      not hard-delete it — it writes a delete marker. Prune the versions
+#      underneath and the marker is the only thing left at that key.
+#
+# With only the first half the bucket stops growing in BYTES and keeps growing
+# in KEYS. MinIO's scanner walks every key continuously, so disk reads dwarf
+# client traffic. Delete markers are not a storage problem, they are a scan-cost
+# problem, which is why byte-level metrics stay quiet. Expiring the markers
+# roughly halves the walk; the rest is real audit objects, because scan cost is
+# per-OBJECT (see the batching knobs in defaults/main.yml).
+#
+# AUTHENTICATION. This task never assumes a persisted mc alias inside the
+# long-running minio container: that is a per-host accident, and an alias with
+# an empty access key yields Access Denied. A bucket check that swallows that
+# via `failed_when: false` reads it as "bucket does not exist" and skips every
+# task below it, leaving the bucket with no lifecycle at all behind a clean
+# deploy.
+#
+# So the alias is minted per-run from the MinIO
+# root credentials via MC_HOST_<alias>, delivered through an 0600 env file
+# that `docker exec --env-file` reads. The secret never reaches a command
+# line, so it never reaches `ps` or the ansible log.
+
+- name: audit-subscriber | lifecycle | check minio container exists + running
+  ansible.builtin.command:
+    cmd: >-
+      docker inspect -f {{ '{{.State.Status}}' | quote }}
+      {{ audit_subscriber_minio_container | quote }}
+  register: audit_subscriber_lifecycle_minio_state
+  changed_when: false
+  become: true
+  failed_when: >-
+    audit_subscriber_lifecycle_minio_state.rc != 0 or
+    'running' not in audit_subscriber_lifecycle_minio_state.stdout
+
+# Resolved here rather than in defaults/ so the failure is a named
+# assertion instead of an Access Denied twelve tasks later.
+- name: audit-subscriber | lifecycle | resolve minio root credentials
+  ansible.builtin.set_fact:
+    audit_subscriber_minio_root_user: "{{ lookup('env', audit_subscriber_minio_root_user_envvar) }}"
+    audit_subscriber_minio_root_password: "{{ lookup('env', audit_subscriber_minio_root_password_envvar) }}"
+  no_log: true
+
+- name: audit-subscriber | lifecycle | assert the root credentials are present
+  ansible.builtin.assert:
+    that:
+      - audit_subscriber_minio_root_user | length > 0
+      - audit_subscriber_minio_root_password | length > 0
+    fail_msg: |
+      No MinIO root credentials in the environment, so the lifecycle policy
+      cannot be read or written.
+
+      Wanted env vars: {{ audit_subscriber_minio_root_user_envvar }}
+                       {{ audit_subscriber_minio_root_password_envvar }}
+
+      These default to the same `minio_root_*_envvar` names the minio role
+      uses for this host, which live in group_vars/<env>/minio.yml. If this
+      host has no minio role, set audit_subscriber_apply_lifecycle: false
+      deliberately rather than leaving it to fail here.
+
+      This is an ASSERTION and not a skip on purpose. Skipping quietly on a
+      credential problem is precisely how zagros-prod ended up with no
+      lifecycle configuration on its audit bucket for months.
+    success_msg: "MinIO root credentials resolved from the environment."
+
+# MC_HOST_<alias> is mc's env-var alias form — the same mechanism
+# roles/minio/templates/mc-init.sh.j2 uses, and for the same reason: it
+# avoids writing an alias into a config file, and it means we depend on
+# nothing that a human may or may not have typed into this container once.
+#
+# Both halves are percent-encoded. A root password containing `@` or `/`
+# silently truncates the URL otherwise, and the resulting error is an
+# unhelpful Access Denied.
+- name: audit-subscriber | lifecycle | stage the mc credential env file
+  ansible.builtin.copy:
+    content: |
+      MC_HOST_{{ audit_subscriber_minio_alias }}=http://{{ audit_subscriber_minio_root_user | urlencode }}:{{ audit_subscriber_minio_root_password | urlencode }}@{{ audit_subscriber_minio_admin_endpoint }}
+    dest: "{{ audit_subscriber_lifecycle_mc_env_path }}"
+    mode: "0600"
+    owner: root
+    group: root
+  become: true
+  no_log: true
+
+- name: audit-subscriber | lifecycle | apply the policy
+  become: true
+  block:
+
+    # Reaching the SERVER is a different failure from the BUCKET not being
+    # there. This one is fatal.
+    - name: audit-subscriber | lifecycle | check the minio endpoint answers
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --env-file {{ audit_subscriber_lifecycle_mc_env_path | quote }}
+          {{ audit_subscriber_minio_container | quote }}
+          mc ls {{ audit_subscriber_minio_alias }}
+      register: audit_subscriber_lifecycle_alias_check
+      changed_when: false
+      failed_when: false
+
+    - name: audit-subscriber | lifecycle | assert the credentials actually work
+      ansible.builtin.assert:
+        that:
+          - audit_subscriber_lifecycle_alias_check.rc == 0
+        fail_msg: |
+          MinIO answered but refused the root credentials, so no lifecycle
+          policy can be applied.
+
+            {{ audit_subscriber_lifecycle_alias_check.stderr | default('') | trim }}
+
+          Check that {{ audit_subscriber_minio_root_user_envvar }} /
+          {{ audit_subscriber_minio_root_password_envvar }} hold THIS host's
+          root credentials, and that {{ audit_subscriber_minio_admin_endpoint }}
+          is where this container's MinIO listens.
+        success_msg: "MinIO root credentials accepted; bucket list readable."
+
+    - name: audit-subscriber | lifecycle | check bucket exists
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --env-file {{ audit_subscriber_lifecycle_mc_env_path | quote }}
+          {{ audit_subscriber_minio_container | quote }}
+          mc ls {{ audit_subscriber_minio_alias }}/{{ audit_subscriber_s3_bucket }}
+      register: audit_subscriber_lifecycle_bucket_check
+      changed_when: false
+      failed_when: false
+
+    # THIS skip is legitimate: bucket creation is operator preflight
+    # (`mc mb --with-lock`), and a first run before that has genuinely
+    # nothing to configure. It is only reachable once the credentials have
+    # been proven good above, so it can no longer absorb an auth failure.
+    - name: audit-subscriber | lifecycle | skip if bucket missing (logged warning)
+      ansible.builtin.debug:
+        msg: |
+          WARNING: bucket {{ audit_subscriber_s3_bucket }} does not exist on
+          {{ audit_subscriber_minio_container }} — and the credentials ARE
+          good, so this is a real absence, not an auth failure in disguise.
+          Skipping lifecycle policy application. Operator preflight
+          (mc mb --with-lock) must complete before this role can apply the
+          lifecycle. See ADR 0811 +
+          docs/design/audit-cold-storage-offload.md for the substrate.
+      when: audit_subscriber_lifecycle_bucket_check.rc != 0
+
+    - name: audit-subscriber | lifecycle | export current rules (for drift detection)
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --env-file {{ audit_subscriber_lifecycle_mc_env_path | quote }}
+          {{ audit_subscriber_minio_container | quote }}
+          mc ilm rule export {{ audit_subscriber_minio_alias }}/{{ audit_subscriber_s3_bucket }}
+      register: audit_subscriber_lifecycle_current
+      changed_when: false
+      failed_when: false
+      when: audit_subscriber_lifecycle_bucket_check.rc == 0
+
+    - name: audit-subscriber | lifecycle | render canonical rule json
+      ansible.builtin.set_fact:
+        audit_subscriber_lifecycle_canonical_json: |
+          {
+            "Rules": [
+              {
+                "ID": "audit-integrity-three-tier",
+                "Status": "Enabled",
+                "Filter": { "Prefix": "" },
+                "Expiration": {
+                  "Days": {{ audit_subscriber_minio_expiration_days }}
+                },
+                "NoncurrentVersionExpiration": {
+                  "NoncurrentDays": {{ audit_subscriber_minio_noncurrent_days }}
+                },
+                {#- The delete-marker clause does NOT go here. S3 forbids
+                    ExpiredObjectDeleteMarker alongside Expiration.Days in the
+                    same rule, so it renders as a second rule below. MinIO's
+                    own name for what it cleans up is "zombie delete markers"
+                    (`mc ilm rule add --expire-delete-marker`). -#}
+                "AbortIncompleteMultipartUpload": {
+                  "DaysAfterInitiation": {{ audit_subscriber_minio_multipart_abort_days }}
+                }
+              }{% if audit_subscriber_minio_expire_delete_markers | default(true) | bool %},
+              {
+                "ID": "audit-integrity-zombie-delete-markers",
+                "Status": "Enabled",
+                "Filter": { "Prefix": "" },
+                "Expiration": {
+                  "ExpiredObjectDeleteMarker": true
+                }
+              }{% endif %}
+            ]
+          }
+      when: audit_subscriber_lifecycle_bucket_check.rc == 0
+
+    - name: audit-subscriber | lifecycle | stage rule json on host
+      ansible.builtin.copy:
+        content: "{{ audit_subscriber_lifecycle_canonical_json }}"
+        dest: "/tmp/audit-integrity-lifecycle.json"
+        mode: "0644"
+      when: audit_subscriber_lifecycle_bucket_check.rc == 0
+
+    - name: audit-subscriber | lifecycle | copy rule json into minio container
+      ansible.builtin.command:
+        cmd: >-
+          docker cp /tmp/audit-integrity-lifecycle.json
+          {{ audit_subscriber_minio_container }}:/tmp/audit-integrity-lifecycle.json
+      when: audit_subscriber_lifecycle_bucket_check.rc == 0
+      changed_when: false
+
+    - name: audit-subscriber | lifecycle | apply policy via mc ilm import (replaces existing)
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --env-file {{ audit_subscriber_lifecycle_mc_env_path | quote }}
+          {{ audit_subscriber_minio_container | quote }} sh -c
+          "mc ilm rule import {{ audit_subscriber_minio_alias }}/{{ audit_subscriber_s3_bucket }} < /tmp/audit-integrity-lifecycle.json"
+      register: audit_subscriber_lifecycle_apply
+      when: audit_subscriber_lifecycle_bucket_check.rc == 0
+      changed_when: audit_subscriber_lifecycle_apply.rc == 0
+      failed_when: audit_subscriber_lifecycle_apply.rc != 0
+
+    - name: audit-subscriber | lifecycle | tidy rule json
+      ansible.builtin.file:
+        path: /tmp/audit-integrity-lifecycle.json
+        state: absent
+      when: audit_subscriber_lifecycle_bucket_check.rc == 0
+      changed_when: false
+
+    # VERIFY WHAT THE SUBSTRATE ACTUALLY STORED, not what we asked it to store.
+    #
+    # `mc ilm rule import` can accept a clause, exit 0, and drop it — no error,
+    # no warning — so printing the requested policy proves nothing. Re-export
+    # after the apply and read what was stored.
+    #
+    # The failure shape to guard against: every layer reports
+    # success and the composed result is not what anyone believes it is. A
+    # deploy that prints a policy it did not apply is worse than one that
+    # prints nothing, because it ends the investigation.
+    - name: audit-subscriber | lifecycle | re-export applied rules
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --env-file {{ audit_subscriber_lifecycle_mc_env_path | quote }}
+          {{ audit_subscriber_minio_container | quote }}
+          mc ilm rule export {{ audit_subscriber_minio_alias }}/{{ audit_subscriber_s3_bucket }}
+      register: audit_subscriber_lifecycle_applied
+      changed_when: false
+      when:
+        - audit_subscriber_lifecycle_bucket_check.rc == 0
+        - not ansible_check_mode
+
+    # The three lifecycle clauses are ASSERTED — losing any of them silently is
+    # what this whole task exists to prevent, so a drop is a failure.
+    - name: audit-subscriber | lifecycle | assert the lifecycle clauses actually landed
+      vars:
+        _rules: "{{ ((audit_subscriber_lifecycle_applied.stdout | default('') | trim) or '{\"Rules\":[]}') | from_json | json_query('Rules') | default([], true) }}"
+        _tier: "{{ _rules | selectattr('ID', 'equalto', 'audit-integrity-three-tier') | list | first | default({}) }}"
+        _zombie: "{{ _rules | selectattr('ID', 'equalto', 'audit-integrity-zombie-delete-markers') | list | first | default({}) }}"
+      ansible.builtin.assert:
+        that:
+          - audit_subscriber_lifecycle_applied.stdout | default('') | trim | length > 0
+          - _tier.Expiration.Days | default(0) | int == audit_subscriber_minio_expiration_days | int
+          - _tier.NoncurrentVersionExpiration.NoncurrentDays | default(0) | int == audit_subscriber_minio_noncurrent_days | int
+          - >-
+            (not (audit_subscriber_minio_expire_delete_markers | default(true) | bool))
+            or (_zombie.Expiration.ExpiredObjectDeleteMarker | default(false) | bool)
+        fail_msg: |
+          The lifecycle policy MinIO stored is not the one this role sent, and
+          mc ilm rule import reported success anyway.
+
+          Stored: {{ audit_subscriber_lifecycle_applied.stdout }}
+
+          Wanted: Expiration.Days={{ audit_subscriber_minio_expiration_days }},
+                  NoncurrentVersionExpiration.NoncurrentDays={{ audit_subscriber_minio_noncurrent_days }},
+                  ExpiredObjectDeleteMarker={{ audit_subscriber_minio_expire_delete_markers | default(true) }}
+
+          Do not re-run and hope. Check the mc/MinIO release pair — a clause the
+          running MinIO does not implement is dropped on import WITHOUT an error.
+        success_msg: "All three F-171 lifecycle clauses verified present in the stored policy."
+      when:
+        - audit_subscriber_lifecycle_bucket_check.rc == 0
+        - not ansible_check_mode
+
+    # NOT asserted, deliberately: this clause is hygiene for stalled partial
+    # uploads, not part of the retention guarantee, and MinIO
+    # RELEASE.2024-10-29T16-01-48Z + mc RELEASE.2024-10-08 drop it on import
+    # today. Failing every audit deploy fleet-wide over it would be the wrong
+    # trade. It is reported honestly instead, so nobody reads the confirm
+    # block and believes multipart cleanup is running when it is not.
+    - name: audit-subscriber | lifecycle | note whether the multipart-abort clause survived import
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'AbortIncompleteMultipartUpload stored OK.'
+            if (((audit_subscriber_lifecycle_applied.stdout | default('') | trim) or '{"Rules":[]}') | from_json | json_query('Rules') | default([], true)
+                 | selectattr('AbortIncompleteMultipartUpload', 'defined') | list | length > 0)
+            else 'AbortIncompleteMultipartUpload was SENT and NOT STORED — MinIO dropped it on
+                  import without an error. Stalled multipart uploads are NOT being cleaned up
+                  on this bucket. Not fatal, not F-171, but do not assume it is running.'
+          }}
+      when:
+        - audit_subscriber_lifecycle_bucket_check.rc == 0
+        - not ansible_check_mode
+
+    - name: audit-subscriber | lifecycle | confirm
+      ansible.builtin.debug:
+        msg: |
+          Lifecycle policy applied to {{ audit_subscriber_minio_alias }}/{{ audit_subscriber_s3_bucket }}:
+            Expiration:                     {{ audit_subscriber_minio_expiration_days }} days
+            NoncurrentVersionExpiration:    {{ audit_subscriber_minio_noncurrent_days }} day(s)
+            AbortIncompleteMultipartUpload: {{ audit_subscriber_minio_multipart_abort_days }} day(s) — REQUESTED; see the note above for whether MinIO stored it
+            ExpiredObjectDeleteMarker:      {{ 'enabled (separate rule)' if audit_subscriber_minio_expire_delete_markers | default(true) | bool else 'DISABLED — markers will accumulate' }}
+          F-171 needs BOTH clauses. NoncurrentVersionExpiration bounds the
+          noncurrent VERSIONS; ExpiredObjectDeleteMarker removes the delete
+          markers left stranded once those versions are gone. With only the
+          first, the bucket stops growing in bytes and keeps growing in keys,
+          and MinIO's scanner walks every key forever.
+      when: audit_subscriber_lifecycle_bucket_check.rc == 0
+
+    # ---------------------------------------------------------------------
+    # The writer's credential must not out-scope its function.
+    # ---------------------------------------------------------------------
+    # The binary makes exactly ONE S3 call, put_object (main.rs), so the
+    # purpose-built `audit-write` policy — s3:PutObject on this bucket — is
+    # precisely sufficient. Anything else attached is over-grant.
+    #
+    # It is checked rather than assumed because a hand-applied attachment
+    # drifts silently: MinIO's builtin `readwrite` is s3:* on arn:aws:s3:::* —
+    # every action on every bucket. MinIO unions attached policies, so the service
+    # that writes the tamper-evident audit trail could also read every other bucket,
+    # delete anything not under lock, and rewrite bucket lifecycle. The roles never
+    # produce that attachment.
+    #
+    # WARN, NOT FAIL, and deliberately. The audit writer is on the substrate's
+    # critical-write path (ADR 0811); failing an audit deploy over a policy
+    # attachment that is not breaking anything trades a real capability for a
+    # tidy one. The detach is also a decision with a blast radius — if some
+    # other consumer is quietly relying on that credential's breadth, the
+    # operator should find out by reading this, not by an outage.
+    - name: audit-subscriber | lifecycle | read the writer's attached policies
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --env-file {{ audit_subscriber_lifecycle_mc_env_path | quote }}
+          {{ audit_subscriber_minio_container | quote }}
+          mc admin user info {{ audit_subscriber_minio_alias }} {{ audit_subscriber_s3_user | default('audit-subscriber') }}
+      register: audit_subscriber_user_info
+      changed_when: false
+      failed_when: false
+
+    - name: audit-subscriber | lifecycle | warn when the writer holds more than it needs
+      vars:
+        _pol: >-
+          {{ (audit_subscriber_user_info.stdout | default('')
+              | regex_search('PolicyName:\s*(.*)', '\1') | first | default('')) | trim }}
+        _extra: >-
+          {{ _pol.split(',') | map('trim') | reject('eq', 'audit-write')
+             | reject('eq', '') | list }}
+      ansible.builtin.debug:
+        msg: |
+          OVER-GRANT on the audit writer: {{ audit_subscriber_s3_user | default('audit-subscriber') }}
+          holds {{ _pol }} where audit-write alone is sufficient.
+
+          Extra: {{ _extra | join(', ') }}
+
+          The binary makes one S3 call, put_object. Anything beyond
+          s3:PutObject on {{ audit_subscriber_s3_bucket }}/* is reach this
+          service never uses — and `readwrite` in particular is s3:* on every
+          bucket, which lets the audit writer alter the store it writes to.
+
+          Detach, then confirm the next batch still uploads:
+            mc admin policy detach <alias> {{ _extra | join(' ') }} --user {{ audit_subscriber_s3_user | default('audit-subscriber') }}
+            curl -s localhost:{{ audit_subscriber_metrics_port }}/metrics | grep batches_uploaded
+      when:
+        - audit_subscriber_user_info.rc == 0
+        - _extra | length > 0
+
+  always:
+    # `always` and not a trailing task: the credential file must not survive
+    # a mid-block failure, and every path above can fail.
+    - name: audit-subscriber | lifecycle | remove the mc credential env file
+      ansible.builtin.file:
+        path: "{{ audit_subscriber_lifecycle_mc_env_path }}"
+        state: absent
+      changed_when: false

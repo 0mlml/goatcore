@@ -1,0 +1,27 @@
+---
+- name: goat-logship compose changed
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ logship_compose_dir }}"
+  changed_when: true
+
+- name: goat-logship config changed
+  # Vector supports SIGHUP config reload, but a compose restart is the
+  # simplest idempotent path and matches the sibling otel-collector role.
+  ansible.builtin.command:
+    cmd: docker compose restart
+    chdir: "{{ logship_compose_dir }}"
+  changed_when: true
+
+- name: prometheus reload from goat-logship role
+  ansible.builtin.uri:
+    url: http://localhost:9090/-/reload
+    method: POST
+    status_code: 200
+  failed_when: false
+
+- name: goat-logship reload auditd
+  # Load the new config-change watch rules into the running auditd.
+  ansible.builtin.command:
+    cmd: augenrules --load
+  changed_when: true

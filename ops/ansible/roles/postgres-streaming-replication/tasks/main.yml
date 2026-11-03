@@ -1,0 +1,415 @@
+---
+# postgres-streaming-replication role — orchestrates the full A→B
+# streaming-replication setup. Idempotent: detects healthy existing
+# standby and skips destructive wipe.
+#
+# Targets: hosts with router_role=A (primary) and router_role=B
+# (standby). Generic across sites — does NOT hardcode a host group.
+#
+# Modules: deliberately uses ansible.builtin.command + docker exec
+# rather than community.docker.docker_container_exec so that
+# brand-new sites do NOT need the `docker` Python SDK installed on
+# target Orins. The `docker` CLI is sufficient and is already a
+# precondition of the mgmt-stack.
+
+# ----------------------------------------------------------------------
+# Phase 1 — primary-side wiring (replicator role + sync settings)
+# ----------------------------------------------------------------------
+
+- name: "Primary | ensure replicator role exists with provided password"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'replicator') THEN
+            CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '{{ postgres_replicator_password }}';
+          ELSE
+            ALTER ROLE replicator WITH PASSWORD '{{ postgres_replicator_password }}';
+          END IF;
+        END $$;
+  no_log: true
+  changed_when: true
+  tags: [streaming-repl, primary]
+
+- name: "Primary | configure synchronous_standby_names + commit mode"
+  when:
+    - (router_role | upper) == 'A'
+    - postgres_streaming_synchronous | bool
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -c
+      - >-
+        ALTER SYSTEM SET synchronous_standby_names = '{{ postgres_standby_app_name }}';
+        ALTER SYSTEM SET synchronous_commit = '{{ postgres_synchronous_commit_mode }}';
+        SELECT pg_reload_conf();
+  changed_when: true
+  tags: [streaming-repl, primary]
+
+# pg_hba: the primary must explicitly admit the standby for REPLICATION.
+# Postgres treats `replication` as its own pseudo-database: a
+# `host all all ... scram-sha-256` line does NOT cover a replication
+# connection, so pg_basebackup A->B fails with "no pg_hba.conf entry ...
+# replication connection". Without this line a fresh intra_site_pair
+# environment can never complete Phase 6A. Idempotent: grep-then-append,
+# then reload.
+- name: "Primary | admit the standby for replication in pg_hba"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.shell: |
+    set -o pipefail
+    HBA=$(docker exec {{ postgres_primary_container | default('postgres-a') }} sh -c 'echo $PGDATA')/pg_hba.conf
+    LINE="host replication {{ postgres_replicator_user | default('replicator') }} {{ mesh_ip_b }}/32 scram-sha-256"
+    docker exec {{ postgres_primary_container | default('postgres-a') }} sh -c \
+      "grep -qF \"$LINE\" $HBA || echo \"$LINE\" >> $HBA"
+    docker exec -u postgres {{ postgres_primary_container | default('postgres-a') }} \
+      psql -U postgres -c "SELECT pg_reload_conf()" >/dev/null
+  args:
+    executable: /bin/bash
+  changed_when: true
+  tags: [streaming-repl, primary, pg-hba]
+
+# WAL retention caps. Runs unconditionally on the primary (NOT gated on
+# postgres_streaming_synchronous) — these caps apply equally to the
+# streaming standby's slot AND to inter-site Spock subscription slots,
+# regardless of sync/async posture. Closes the disk-fill
+# class: a single offline / slow subscriber's restart_lsn pinning
+# unbounded WAL on the primary's disk (Postgres `max_slot_wal_keep_size`
+# default = -1 = unlimited).
+#
+# `wal_keep_size`         — minimum WAL retained on disk regardless of
+#                           slot positions. Lets a healthy standby catch
+#                           up after typical disconnects.
+# `max_slot_wal_keep_size` — per-slot upper bound. Subscribers whose
+#                           restart_lsn falls more than this many bytes
+#                           behind get invalidated; they re-snapshot on
+#                           return rather than blocking the primary.
+#
+# Idempotent: ALTER SYSTEM is a no-op when the value is already set;
+# pg_reload_conf() is cheap. Safe to re-run.
+# One statement per -c: multiple statements in a single -c run as one implicit
+# transaction, and ALTER SYSTEM refuses to run inside a transaction block.
+- name: "Primary | configure WAL retention caps (wal_keep_size + max_slot_wal_keep_size)"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -c
+      - "ALTER SYSTEM SET wal_keep_size = '{{ postgres_wal_keep_size }}'"
+      - -c
+      - "ALTER SYSTEM SET max_slot_wal_keep_size = '{{ postgres_max_slot_wal_keep_size }}'"
+      - -c
+      - "SELECT pg_reload_conf()"
+  changed_when: true
+  tags: [streaming-repl, primary, wal-retention]
+
+# max_connections is NOT a reload-time parameter — it requires a
+# server restart to take effect. ALTER SYSTEM SET writes it to
+# postgresql.auto.conf; pg_reload_conf() does NOT pick it up; the
+# value applies on next start. This is correct for steady-state
+# (most operators bump max_connections deliberately, and a controlled
+# restart is fine), but it means the role's apply step here is
+# best-paired with a follow-on operator-fired `docker compose
+# restart postgres-a` if the value actually changed. We don't
+# auto-restart from this role to avoid pulling postgres down on
+# every site-bootstrap re-run.
+#
+# The reason this lives in the role at all: it codifies the
+# cluster-wide value so operators can't get into the F-093
+# clean-up class where primary was bumped via out-of-band ALTER
+# SYSTEM and standby's auto.conf carried the image default (100),
+# making B refuse to start as standby. The apply on the primary +
+# the auto.conf include on the standby (below) keep them in lockstep.
+- name: "Primary | configure max_connections (cluster-wide; takes effect on next restart)"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -c
+      - >-
+        ALTER SYSTEM SET max_connections = '{{ postgres_max_connections }}';
+  changed_when: true
+  tags: [streaming-repl, primary, max-connections]
+
+- name: "Primary | confirm WAL retention caps applied"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -tA
+      - -c
+      - >-
+        SELECT name || '=' || setting || unit FROM pg_settings
+        WHERE name IN ('wal_keep_size','max_slot_wal_keep_size')
+        ORDER BY name;
+  register: primary_wal_retention_settings
+  changed_when: false
+  tags: [streaming-repl, primary, wal-retention]
+
+- name: "Primary | report WAL retention caps"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.debug:
+    var: primary_wal_retention_settings.stdout_lines
+  tags: [streaming-repl, primary, wal-retention]
+
+- name: "Primary | confirm sync settings applied"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -tA
+      - -c
+      - >-
+        SELECT name || '=' || setting FROM pg_settings
+        WHERE name IN ('synchronous_standby_names','synchronous_commit')
+        ORDER BY name;
+  register: primary_sync_settings
+  changed_when: false
+  tags: [streaming-repl, primary]
+
+- name: "Primary | report sync settings"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.debug:
+    var: primary_sync_settings.stdout_lines
+  tags: [streaming-repl, primary]
+
+# ----------------------------------------------------------------------
+# Phase 2 — standby-side detection
+# ----------------------------------------------------------------------
+
+- name: "Standby | check if postgres-a is already a healthy streaming standby"
+  when: (router_role | upper) == 'B'
+  block:
+    - name: "Standby | query pg_is_in_recovery + walreceiver state"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -u
+          - postgres
+          - postgres-a
+          - psql
+          - -U
+          - postgres
+          - -tA
+          - -c
+          - >-
+            SELECT pg_is_in_recovery() AS rec,
+                   EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming') AS streaming;
+      register: standby_health
+      changed_when: false
+      failed_when: false
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | parse health"
+      ansible.builtin.set_fact:
+        standby_already_healthy: >-
+          {{ (standby_health.rc | default(1)) == 0 and
+             (standby_health.stdout | default('') | trim) == 't|t' and
+             not (postgres_streaming_force_rebuild | bool) }}
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | report whether basebackup will run"
+      ansible.builtin.debug:
+        msg: >-
+          standby_health={{ standby_health.stdout | default('(no response)') }};
+          force_rebuild={{ postgres_streaming_force_rebuild | bool }};
+          basebackup_will_run={{ not standby_already_healthy }}
+      tags: [streaming-repl, standby]
+
+# ----------------------------------------------------------------------
+# Phase 3 — standby-side rebuild (idempotent: skipped when healthy)
+# ----------------------------------------------------------------------
+
+- name: "Standby | rebuild via pg_basebackup"
+  when:
+    - (router_role | upper) == 'B'
+    - not standby_already_healthy
+  block:
+    - name: "Standby | stop compose-watch watchdog"
+      ansible.builtin.systemd:
+        name: "{{ mgmt_compose_watchdog_unit }}"
+        state: stopped
+      register: watchdog_was_stopped
+      failed_when: false
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | stop mgmt-stack services that touch postgres data dir"
+      ansible.builtin.command:
+        cmd: "docker compose stop {{ mgmt_services_to_stop_for_basebackup | join(' ') }}"
+        chdir: "{{ mgmt_compose_dir }}"
+      changed_when: true
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | wipe data dir (find -delete catches dotfiles)"
+      ansible.builtin.command:
+        cmd: "find {{ postgres_data_volume_path }} -mindepth 1 -delete"
+      changed_when: true
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | run pg_basebackup A→B with -R (writes standby.signal + primary_conninfo)"
+      ansible.builtin.command:
+        cmd: >
+          docker run --rm --network=host
+          -e PGPASSWORD={{ postgres_replicator_password }}
+          -v {{ postgres_data_volume_path }}:/data
+          {{ postgres_basebackup_client_image }}
+          pg_basebackup
+          -h {{ postgres_primary_lan_ip }}
+          -p 5432
+          -U replicator
+          -D /data
+          -Fp -Xs -P -R
+      changed_when: true
+      no_log: true
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | chown data dir to postgres-spock UID:GID (basebackup wrote as root via docker)"
+      ansible.builtin.command:
+        cmd: "chown -R {{ postgres_spock_uid }}:{{ postgres_spock_gid }} {{ postgres_data_volume_path }}"
+      changed_when: true
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | chmod data dir to 700 (postgres requires this)"
+      ansible.builtin.file:
+        path: "{{ postgres_data_volume_path }}"
+        mode: "0700"
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | patch postgresql.auto.conf (application_name + max_connections in lockstep with primary)"
+      # max_connections must be >= primary's value or hot standby
+      # refuses to start ("max_connections = N is a lower setting than
+      # on the primary server"). Including it here keeps the standby
+      # in lockstep with the primary's value codified in
+      # `postgres_max_connections` — the F-093-cleanup-class drift
+      # cannot recur because both halves are written by the role from
+      # the same default.
+      ansible.builtin.copy:
+        dest: "{{ postgres_data_volume_path }}/postgresql.auto.conf"
+        content: |
+          # Do not edit this file manually!
+          # It will be overwritten by the ALTER SYSTEM command.
+          # Managed by ops/ansible/roles/postgres-streaming-replication/.
+          archive_mode = 'on'
+          archive_command = 'pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza={{ site_id | default("vega") }}-netbird archive-push %p'
+          archive_timeout = '60s'
+          primary_conninfo = 'application_name={{ postgres_standby_app_name }} user=replicator password={{ postgres_replicator_password }} host={{ postgres_primary_lan_ip }} port=5432 sslmode=prefer'
+          max_connections = {{ postgres_max_connections }}
+        owner: "{{ postgres_spock_uid }}"
+        group: "{{ postgres_spock_gid }}"
+        mode: "0600"
+      no_log: true
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | bring mgmt-stack services back up"
+      ansible.builtin.command:
+        cmd: "docker compose up -d {{ mgmt_services_to_stop_for_basebackup | join(' ') }}"
+        chdir: "{{ mgmt_compose_dir }}"
+      changed_when: true
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | wait for postgres-a to report healthy"
+      ansible.builtin.shell: |
+        docker inspect -f '{{ "{{" }}.State.Health.Status{{ "}}" }}' postgres-a
+      register: pg_health
+      until: pg_health.stdout == "healthy"
+      retries: 24
+      delay: 5
+      changed_when: false
+      tags: [streaming-repl, standby]
+
+    - name: "Standby | restart compose-watch watchdog"
+      ansible.builtin.systemd:
+        name: "{{ mgmt_compose_watchdog_unit }}"
+        state: started
+      failed_when: false
+      tags: [streaming-repl, standby]
+
+# ----------------------------------------------------------------------
+# Phase 4 — cross-host verification (run from the primary, queries both
+# pg_stat_replication on primary AND pg_is_in_recovery on standby)
+# ----------------------------------------------------------------------
+
+- name: "Verify | primary sees standby in pg_stat_replication with sync state"
+  when: (router_role | upper) == 'A'
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - postgres-a
+      - psql
+      - -U
+      - postgres
+      - -tA
+      - -c
+      - >-
+        SELECT client_addr || '|' || application_name || '|' || state || '|' || sync_state ||
+               '|' || COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::text, 'null')
+        FROM pg_stat_replication;
+  register: primary_replication_view
+  changed_when: false
+  tags: [streaming-repl, verify]
+
+- name: "Verify | assert primary sees standby streaming"
+  when:
+    - (router_role | upper) == 'A'
+    - postgres_streaming_synchronous | bool
+  ansible.builtin.assert:
+    that:
+      - primary_replication_view.stdout | length > 0
+      - "'streaming|sync|' in primary_replication_view.stdout"
+      - postgres_standby_lan_ip in primary_replication_view.stdout
+      - postgres_standby_app_name in primary_replication_view.stdout
+    fail_msg: >-
+      Primary's pg_stat_replication does not show a sync standby at
+      {{ postgres_standby_lan_ip }} with application_name=
+      {{ postgres_standby_app_name }}. Got:
+      {{ primary_replication_view.stdout | default('(empty)') }}
+    success_msg: "Streaming replication PASS — sync state confirmed."
+  tags: [streaming-repl, verify]

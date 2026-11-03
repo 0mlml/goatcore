@@ -1,0 +1,86 @@
+# {{ ansible_managed }}
+#
+# External Zenoh audit subscriber for {{ audit_subscriber_id }}. Rendered
+# by ops/ansible/roles/audit-subscriber/. One container, mTLS Zenoh client
+# peer of the router, NDJSON batches to MinIO when configured (else
+# observe-only mode).
+#
+# S3 credentials are sourced from the sibling `.env` file (mode 0600) —
+# never embedded here.
+
+services:
+  audit-subscriber:
+    image: {{ audit_subscriber_image }}
+    container_name: audit-subscriber
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 28224M
+    restart: unless-stopped
+    networks:
+      # `zenoh` reaches the router for the subscribe-side traffic;
+      # `mgmt` lets the observability Prometheus scrape :9303 by docker DNS name
+      # without going via the host port-publish. Both networks must
+      # exist (mgmt is the mgmt-host docker-compose-rendered net).
+      - zenoh
+      - mgmt
+    ports:
+      - "{{ audit_subscriber_metrics_port }}:9303"
+    environment:
+      AUDIT_SUBSCRIBER_ENDPOINT: "{{ audit_subscriber_zenoh_endpoint }}"
+      AUDIT_SUBSCRIBER_KEY: "{{ audit_subscriber_subscribe_key }}"
+      AUDIT_SUBSCRIBER_EXCLUDE_KEYS: "{{ audit_subscriber_exclude_keys }}"
+      AUDIT_SUBSCRIBER_ID: "{{ audit_subscriber_id }}"
+      AUDIT_SUBSCRIBER_IDENTITY_MODEL: "{{ audit_subscriber_identity_model }}"
+      AUDIT_SUBSCRIBER_METRICS_BIND: "0.0.0.0:9303"
+      AUDIT_SUBSCRIBER_MAX_INLINE_PAYLOAD: "{{ audit_subscriber_max_inline_payload }}"
+      AUDIT_SUBSCRIBER_BATCH_EVENTS: "{{ audit_subscriber_batch_events }}"
+      AUDIT_SUBSCRIBER_BATCH_INTERVAL_MS: "{{ audit_subscriber_batch_interval_ms }}"
+      AUDIT_SUBSCRIBER_CHANNEL_DEPTH: "{{ audit_subscriber_channel_depth }}"
+      RUST_LOG: "{{ audit_subscriber_rust_log }}"
+{% if audit_subscriber_local_ndjson_dir | length > 0 %}
+      # Best-effort local NDJSON tail for off-box cyber-logging (goat-logship,
+      # ADR 1078). The MinIO WORM write stays the system-of-record; a local
+      # failure never affects it.
+      AUDIT_SUBSCRIBER_LOCAL_NDJSON_DIR: "/tail"
+{% endif %}
+{% if audit_subscriber_zenoh_endpoint.startswith('tls/') %}
+      AUDIT_SUBSCRIBER_CERT: "/certs/audit-subscriber-cert.pem"
+      AUDIT_SUBSCRIBER_KEY_FILE: "/certs/audit-subscriber-key.pem"
+      AUDIT_SUBSCRIBER_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+{% if audit_subscriber_s3_endpoint | length > 0 %}
+      AUDIT_SUBSCRIBER_S3_ENDPOINT: "{{ audit_subscriber_s3_endpoint }}"
+      AUDIT_SUBSCRIBER_S3_BUCKET: "{{ audit_subscriber_s3_bucket }}"
+      AUDIT_SUBSCRIBER_S3_REGION: "{{ audit_subscriber_s3_region }}"
+      # The binary reads keys from env vars whose NAMES are themselves
+      # configurable; we name them generically here and supply values via
+      # the sibling .env file so the secret material never lands in this
+      # rendered (mode 0644) template.
+      AUDIT_SUBSCRIBER_S3_ACCESS_KEY_ENV: "AUDIT_SUBSCRIBER_S3_ACCESS_KEY"
+      AUDIT_SUBSCRIBER_S3_SECRET_KEY_ENV: "AUDIT_SUBSCRIBER_S3_SECRET_KEY"
+      AUDIT_SUBSCRIBER_S3_ACCESS_KEY: "${AUDIT_SUBSCRIBER_S3_ACCESS_KEY}"
+      AUDIT_SUBSCRIBER_S3_SECRET_KEY: "${AUDIT_SUBSCRIBER_S3_SECRET_KEY}"
+{% endif %}
+{% if audit_subscriber_zenoh_endpoint.startswith('tls/') or (audit_subscriber_local_ndjson_dir | length > 0) %}
+    volumes:
+{% if audit_subscriber_zenoh_endpoint.startswith('tls/') %}
+      - "{{ audit_subscriber_cert_dir }}:/certs:ro"
+      - "{{ audit_subscriber_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+{% if audit_subscriber_local_ndjson_dir | length > 0 %}
+      - "{{ audit_subscriber_local_ndjson_dir }}:/tail"
+{% endif %}
+{% endif %}
+
+networks:
+  zenoh:
+    name: {{ audit_subscriber_zenoh_network }}
+    external: true
+  mgmt:
+    # The mgmt-host docker network. Same one the observability Prometheus
+    # is on; lets the scraper resolve `audit-subscriber:9303` by DNS.
+    name: mgmt
+    external: true

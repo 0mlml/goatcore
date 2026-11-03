@@ -1,0 +1,292 @@
+# Rendered by goat-zenoh-portal Ansible role — DO NOT HAND-EDIT.
+# Source: ops/ansible/roles/goat-zenoh-portal/templates/docker-compose.yml.j2
+# Design: docs/design/zenoh-trial-fabric.md §"Vendor self-service portal + inspector"
+
+services:
+  goat-zenoh-portal:
+    container_name: "{{ portal_container_name }}"
+    image: "{{ portal_image }}"
+    restart: unless-stopped
+    env_file: ./.env
+{% if lookup('env', portal_netbird_api_token_envvar) | length > 0 and portal_netbird_host_addr | length > 0 %}
+    # NetBird management API name -> the host's traefik (portal_netbird_host_addr).
+    # Same condition as PORTAL_NETBIRD_MGMT_URL in portal.env.j2.
+    extra_hosts:
+      - "{{ portal_netbird_mgmt_url | urlsplit('hostname') }}:{{ portal_netbird_host_addr }}"
+{% endif %}
+    command:
+      - serve
+      - --listen=0.0.0.0:{{ portal_listen_port }}
+{% if portal_store | default('sqlite') == 'postgres' %}
+      # Registry on Postgres (ADR 1165 step A): PORTAL_DB_DSN in .env, no --db.
+      # The SQLite file under portal_data_dir is the read-only cutover archive.
+{% else %}
+      - --db={{ portal_db_path }}
+{% endif %}
+{% if portal_roster_path | length > 0 %}
+      # Identity-grammar Phase B — the declared-half registry roster.json
+      # (rsync'd from the repo into portal_data_dir, already host-mounted)
+      # the Data-Access COP reconciles live identities against.
+      - --roster-path={{ portal_roster_path }}
+{% endif %}
+{% if portal_release_sets_path | length > 0 %}
+      # ADR 1027 (data-access program B2) — the declared release-set registry
+      # (org → release lane) the Data-Access COP reveals. Governance picture
+      # only: reads stay flat until the B2.1 read partition enforces.
+      - --release-sets-path={{ portal_release_sets_path }}
+      - --partner-slot-blocks-path={{ portal_partner_slot_blocks_path }}
+{% endif %}
+{% if portal_coalition_frameworks_path | length > 0 %}
+      # ADR 1077 B2.2 — derive the member release lane (REL-COALITION) from
+      # onboarded orgs' nations + the active framework. Needs the roster.
+      - --coalition-frameworks-path={{ portal_coalition_frameworks_path }}
+{% if portal_coalition_framework | length > 0 %}
+      - --coalition-framework={{ portal_coalition_framework }}
+{% endif %}
+{% endif %}
+      # ADR 1075 — the per-goatnet access lane an unlabeled producer inherits
+      # (community | org | controlled). A sandbox uses community; operational
+      # goatnets set org/controlled via group_vars. Empty resolves to community.
+      - --data-label-access-default={{ portal_data_label_access_default }}
+      # Org data-governance starting posture (ADR 1102). Explicit per-goatnet
+      # so the open kick-start default is a deliberate setting, not a hidden
+      # assumption; flip to false for the canonical fail-closed model.
+      - --govern-bootstrap-open={{ portal_govern_bootstrap_open | lower }}
+      - --vendor-bundle-dir={{ portal_bundles_path }}
+      # U7 publish-my-key: public leaf persisted per mint; served at
+      # /api/access/recipient-cert for grant-keyd's cert sync.
+      - --recipient-keys-dir={{ portal_recipient_keys_path }}
+      - --schema-dir={{ portal_schema_dir }}
+      - --zenoh-rest={{ portal_zenoh_rest_url }}
+      - --acl-config={{ portal_acl_config_path }}
+      - --acl-container-name={{ portal_acl_container_name }}
+      - --acl-docker-socket={{ portal_acl_docker_socket }}
+      - --acl-storage-dir-prefix={{ portal_acl_storage_dir_prefix }}
+{% if portal_acl_reload_fake %}
+      - --acl-reload-fake
+{% endif %}
+{% if portal_acl_admin_rest_url %}
+      # F-156 live config reload — Zenoh admin-REST PUTs to live-add the
+      # per-vendor storage stanza without router restart. zenohd's SIGHUP
+      # handler is a no-op for storage_manager in 1.9.0; this is the
+      # working path. Best-effort: failure here doesn't fail mint (on-
+      # disk edit is in place; router restart picks it up).
+      - --acl-admin-rest-url={{ portal_acl_admin_rest_url }}
+{% endif %}
+{% if portal_cert_sign_fake | bool %}
+      - --cert-sign-fake
+{% else %}
+      - --ca-bundle-dir={{ portal_ca_bundle_dir }}
+      - --age-identity={{ portal_age_identity_path }}
+      - --nova-root-cert={{ portal_nova_root_cert }}
+      - --ca-id={{ portal_cert_sign_ca_id }}
+      - --site-id={{ portal_cert_sign_site_id }}
+      - --uri-prefix={{ portal_cert_sign_uri_prefix }}
+      - --cn-suffix={{ portal_cert_sign_cn_suffix }}
+      - --dns-suffix={{ portal_cert_sign_dns_suffix }}
+{% if portal_bundle_create_bin %}
+      # Mint the goat-cli .cbor into the vendor tarball (same CA as
+      # cert-sign). Empty = omit the .cbor (operator-side mint fallback).
+      - --bundle-create-bin={{ portal_bundle_create_bin }}
+      # The public half, shipped in the tarball so `goat ca add` works on a
+      # binary that trusts nothing out of the box.
+      - --bundle-ca-pubkey={{ portal_bundle_ca_pubkey }}
+{% endif %}
+{% endif %}
+      - --onboarding-packet={{ portal_onboarding_packet_path }}
+      - --onboarding-packet-name={{ portal_onboarding_packet_name }}
+      - --onboarding-tarball-stem={{ portal_onboarding_tarball_stem }}
+      - --onboarding-root-cert-name={{ portal_onboarding_root_cert_name }}
+      - --schema-dir={{ portal_schema_dir }}
+{% if portal_sunset_date %}
+      - --sunset-date={{ portal_sunset_date }}
+{% endif %}
+{% if portal_router_endpoint %}
+      - --router-endpoint={{ portal_router_endpoint }}
+{% endif %}
+{% if portal_public_url %}
+      - --portal-public-url={{ portal_public_url }}
+{% endif %}
+{% if portal_onboard_url %}
+      - --onboard-public-url={{ portal_onboard_url }}
+{% endif %}
+{% if portal_feedback_channel %}
+      - --feedback-channel={{ portal_feedback_channel }}
+{% endif %}
+{% if portal_intake_base_url %}
+      # ADR 1062 — public candidate-onboarding front-desk base URL the one-time
+      # invite links are built against. Empty (default) → invite mint returns a
+      # relative intake_path only; the public collector (step 2) sets this.
+      - --intake-base-url={{ portal_intake_base_url }}
+{% endif %}
+{% if portal_kratos_admin_url %}
+      # Block 83 / 83C.4 — site-Kratos admin endpoint the portal queries
+      # to render the per-vendor identity roster on
+      # /admin/vendor-activity.html. Empty disables (page hides the
+      # identity column + gap-notes inline). Kratos admin port has no
+      # bearer auth — network segmentation is the gate.
+      - --kratos-admin-url={{ portal_kratos_admin_url }}
+{% endif %}
+    volumes:
+      - "{{ portal_data_dir }}:{{ portal_data_dir }}"
+{% if not (portal_cert_sign_fake | bool) %}
+      # Real cert-mint mode needs the CA bundle + age identity on the
+      # host. In fake-mint mode (the first-deploy default), these
+      # mounts are skipped so docker compose can start without them
+      # placed on the host yet.
+      - "{{ portal_ca_bundle_dir }}:{{ portal_ca_bundle_dir }}:ro"
+      - "{{ portal_age_identity_path }}:{{ portal_age_identity_path }}:ro"
+      # The host provides cert-sign; bind-mount the host binary
+      # into PATH inside the container.
+      - "/usr/local/bin/cert-sign:/usr/local/bin/cert-sign:ro"
+{% if portal_bundle_create_bin %}
+      # bundle-create mints the goat-cli .cbor into the vendor tarball;
+      # bind-mount it the same way as cert-sign.
+      - "{{ portal_bundle_create_bin }}:{{ portal_bundle_create_bin }}:ro"
+      - "{{ portal_bundle_ca_pubkey }}:{{ portal_bundle_ca_pubkey }}:ro"
+      # The gear-class check in bundle-create is FAIL-CLOSED: it refuses to run
+      # without the ACL taxonomy, and the portal invokes it with no --taxonomy
+      # flag, so the binary falls back to resolving the repo-relative default
+      # by walking UP FROM ITS WORKING DIRECTORY. The container's WorkingDir is
+      # empty (= /), so the only path that default can ever find is this one.
+      # Without it every cert mint returns 500 with "taxonomy ... not found".
+      # Older bundle-create builds predate the check.
+      - "{{ portal_acl_taxonomy_host_path }}:/ops/ansible/netbird_acl_taxonomy.yml:ro"
+{% endif %}
+{% endif %}
+      - "{{ portal_onboarding_packet_path }}:{{ portal_onboarding_packet_path }}:ro"
+      # zenohd's live config.json5 — portal applies marker-based
+      # incremental edits + SIGHUPs the router via docker.sock. Both
+      # bind-mounts are required.
+      - "{{ portal_acl_config_path | dirname }}:{{ portal_acl_config_path | dirname }}"
+      - "{{ portal_acl_docker_socket }}:{{ portal_acl_docker_socket }}"
+      # Per-vendor rocksdb storage dir (the portal mkdirs into this on
+      # vendor approval, then zenohd's storage_manager spawns under it).
+      # Must match the bind the goat-zenoh role mounts INTO the
+      # zenohd container too.
+      - "{{ portal_acl_storage_dir_prefix }}:{{ portal_acl_storage_dir_prefix }}"
+    networks:
+      - portal
+      - {{ portal_traefik_network }}
+{% if portal_zenoh_network | length > 0 %}
+      - {{ portal_zenoh_network }}
+{% endif %}
+{% if portal_healthcheck_enabled | default(false) %}
+    # Container healthcheck.
+    #
+    # DEFAULT-OFF ON PURPOSE, and it is not busywork: this image is
+    # cgr.dev/chainguard/glibc-dynamic (ops/goat-zenoh-portal/Dockerfile) —
+    # no shell, no curl, no wget. A `wget http://…/api/health` probe here is
+    # UNRUNNABLE and would pin the container at `Up (unhealthy)` forever while
+    # it serves perfectly, which is precisely F-173 (same burn on the
+    # distroless oauth2-proxy images, where the fix was `test: ["NONE"]`).
+    # Worse now than then: CriticalServiceUnhealthy pages on this container.
+    #
+    # The only executable in the image is the portal binary itself, and its
+    # subcommands are serve | render-acl | version — none of which fails when
+    # the HTTP server is wedged. So the probe below depends on the binary
+    # gaining a `healthcheck` subcommand (GET /api/health, exit non-zero unless
+    # 200 + ok). That is a Go-source change; it was requested from the lane
+    # landing the real /api/health.
+    #
+    # To turn on: deploy an image whose `goat-zenoh-portal healthcheck --help`
+    # exits 0, confirm with
+    #   docker exec goat-zenoh-portal /usr/local/bin/goat-zenoh-portal healthcheck --url=http://127.0.0.1:{{ portal_listen_port }}/api/health
+    # then set portal_healthcheck_enabled: true in the goatnet's group_vars.
+    # Until then the portal's liveness comes from the blackbox-https probe of
+    # /api/health (ops/compose/goat-obs/prometheus/prometheus.yml) + the
+    # PortalProbeDown alert — which also covers the STOPPED case a container
+    # healthcheck structurally cannot see.
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/goat-zenoh-portal
+        - healthcheck
+        - --url=http://127.0.0.1:{{ portal_listen_port }}/api/health
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+{% endif %}
+    # No Traefik docker labels — the live deploy uses file-provider
+    # routing via {{ portal_traefik_dynamic_dir }}/{{ portal_traefik_dynamic_filename }}.
+    labels:
+      - "traefik.enable=false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+{% if (portal_cpus_limit | default('') | length > 0) or (portal_memory_limit | default('') | length > 0) %}
+    # Resource ceilings: blast-radius containment, not tuning.
+    #
+    # The portal ran with no limit at all, so when its authentication path
+    # turned every request into 11.7 CPU-seconds it took 12 of the host's 14
+    # cores and every other container on the box (the Zenoh router, Postgres,
+    # the mesh management plane) competed with it. The auth fix removed that
+    # workload; this makes sure the NEXT such bug is one service degrading
+    # instead of a site-wide event.
+    #
+    # cpus is DERIVED from the host rather than hard-coded, deliberately: a fixed
+    # cpus value larger than the host's vCPU count makes the container refuse to
+    # start, which is how a well-meant limit on goat-zenoh (default 6.0) locked
+    # every host with fewer than 6 vCPUs out of its own fabric. Half the cores,
+    # floor of 1, is safe on a 2-vCPU box and still leaves half of a 14-core one.
+    #
+    # memory is a FIXED default. A cap above host RAM does not stop the container
+    # from starting, so it needs no host derivation, and it matches the router's
+    # fixed goat_zenoh_memory default. It bounds the aggregate request-body size
+    # that the per-request caps in #1247 do not.
+    deploy:
+      resources:
+        limits:
+{% if portal_cpus_limit | default('') | length > 0 %}
+          cpus: "{{ portal_cpus_limit }}"
+{% endif %}
+{% if portal_memory_limit | default('') | length > 0 %}
+          memory: "{{ portal_memory_limit }}"
+{% endif %}
+{% endif %}
+
+{% if portal_problem_pages_enabled | default(false) %}
+  # The constant problem pages Traefik substitutes for its plain-text 429
+  # (traefik-portal.yml.j2). Same image, a different process: no registry, no
+  # volumes, no socket, read-only root, capped so a flood of shed requests
+  # costs this container and nothing else on the host.
+  {{ portal_problem_pages_container_name }}:
+    container_name: "{{ portal_problem_pages_container_name }}"
+    image: "{{ portal_image }}"
+    restart: unless-stopped
+    command:
+      - problem-pages
+      - --listen=0.0.0.0:{{ portal_problem_pages_listen_port }}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - {{ portal_traefik_network }}
+    labels:
+      - "traefik.enable=false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ portal_problem_pages_cpus_limit }}"
+          memory: "{{ portal_problem_pages_memory_limit }}"
+
+{% endif %}
+networks:
+  portal:
+    driver: bridge
+  {{ portal_traefik_network }}:
+    external: true
+{% if portal_zenoh_network | length > 0 %}
+  {{ portal_zenoh_network }}:
+    external: true
+{% endif %}

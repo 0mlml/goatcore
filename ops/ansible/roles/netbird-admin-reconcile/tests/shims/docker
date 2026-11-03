@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Test shim: `docker exec <pg> psql ... <SQL>` against a tiny users table.
+
+State lives in $NB_USERS, one row per line: `<id> <role> <is_service 0|1>`.
+Every UPDATE that changes a row is appended to $NB_UPDATES as `<id> <old> <new>`.
+Understands exactly the three statements netbird-admin-reconcile.sh issues.
+"""
+import os, re, sys
+
+sql = sys.argv[-1]
+path = os.environ["NB_USERS"]
+with open(path) as source_file:
+    rows = [l.split() for l in source_file if l.strip()]
+
+m = re.search(r"SELECT id FROM users WHERE role = '(\w+)'", sql)
+if m:
+    for rid, role, svc in rows:
+        if role == m.group(1) and svc == "0":
+            print(rid)
+    sys.exit(0)
+
+m = re.search(r"SELECT role FROM users WHERE id = '([^']+)'", sql)
+if m:
+    for rid, role, svc in rows:
+        if rid == m.group(1) and svc == "0":
+            print(role)
+    sys.exit(0)
+
+m = re.search(r"UPDATE users SET role = '(\w+)' WHERE id = '([^']+)' AND role (?:= '(\w+)'|IN \(([^)]*)\))", sql)
+if m:
+    new, rid = m.group(1), m.group(2)
+    allowed = {m.group(3)} if m.group(3) else {x.strip(" '") for x in m.group(4).split(",")}
+    out = []
+    for r in rows:
+        if r[0] == rid and r[1] in allowed and r[2] == "0":
+            with open(os.environ["NB_UPDATES"], "a") as f:
+                f.write(f"{rid} {r[1]} {new}\n")
+            r = [rid, new, r[2]]
+        out.append(r)
+    with open(path, "w") as f:
+        f.writelines(" ".join(r) + "\n" for r in out)
+    sys.exit(0)
+
+print(f"docker shim: unrecognised SQL: {sql}", file=sys.stderr)
+sys.exit(2)

@@ -1,0 +1,58 @@
+# {{ ansible_managed }}
+#
+# goat-mesh-health meter for {{ mesh_health_site }}. Rendered by
+# ops/ansible/roles/mesh-health/ (ADR 1042/1036). One container, mTLS Zenoh
+# client peer of the router: reads the host-side netbird status snapshot
+# (written by mesh-health-snapshot.timer, mounted read-only) and publishes
+# ops/mesh/health/{{ mesh_health_site }}. Persists nothing — no secrets, no .env.
+
+services:
+  mesh-health:
+    image: {{ mesh_health_image }}
+    container_name: mesh-health
+    restart: unless-stopped
+    networks:
+      # Reaches the router over the zenoh compose network.
+      - zenoh
+    environment:
+      MESH_HEALTH_ENDPOINT: "{{ mesh_health_zenoh_endpoint }}"
+      MESH_HEALTH_SITE: "{{ mesh_health_site }}"
+      MESH_HEALTH_STATUS_FILE: "/state/netbird-status.json"
+{% if mesh_health_registry_enabled | default(false) %}
+      MESH_HEALTH_REGISTRY_FILE: "/state/peer-registry.json"
+{% endif %}
+      MESH_HEALTH_INTERVAL_MS: "{{ mesh_health_interval_ms }}"
+      MESH_HEALTH_STALE_AFTER_MS: "{{ mesh_health_stale_after_ms }}"
+      MESH_HEALTH_LATENCY_AMBER_MS: "{{ mesh_health_latency_amber_ms }}"
+      MESH_HEALTH_LATENCY_RED_MS: "{{ mesh_health_latency_red_ms }}"
+      MESH_HEALTH_LATENCY_RELAYED_AMBER_MS: "{{ mesh_health_latency_relayed_amber_ms }}"
+      MESH_HEALTH_LATENCY_RELAYED_RED_MS: "{{ mesh_health_latency_relayed_red_ms }}"
+      MESH_HEALTH_PEER_CLASSES: "/state/peer-classes.json"
+      MESH_HEALTH_ABSENT_RED_MS: "{{ mesh_health_absent_red_ms }}"
+      MESH_HEALTH_CONNECTING_AMBER_MS: "{{ mesh_health_connecting_amber_ms }}"
+{% if mesh_health_textfile_dir | default('', true) | length > 0 %}
+      MESH_HEALTH_TEXTFILE: "/textfile/{{ mesh_health_textfile_name }}"
+{% endif %}
+      RUST_LOG: "{{ mesh_health_rust_log }}"
+{% if mesh_health_zenoh_endpoint.startswith('tls/') %}
+      MESH_HEALTH_CERT: "/certs/mesh-health-cert.pem"
+      MESH_HEALTH_KEY_FILE: "/certs/mesh-health-key.pem"
+      MESH_HEALTH_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+    volumes:
+      - "{{ mesh_health_state_dir }}:/state:ro"
+{% if mesh_health_textfile_dir | default('', true) | length > 0 %}
+      # Read-WRITE by design: the only writable mount this container has, and
+      # the meter writes exactly one file into it via tmp+rename so a scrape
+      # never sees a partial file.
+      - "{{ mesh_health_textfile_dir }}:/textfile:rw"
+{% endif %}
+{% if mesh_health_zenoh_endpoint.startswith('tls/') %}
+      - "{{ mesh_health_cert_dir }}:/certs:ro"
+      - "{{ mesh_health_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+
+networks:
+  zenoh:
+    name: {{ mesh_health_zenoh_network }}
+    external: true

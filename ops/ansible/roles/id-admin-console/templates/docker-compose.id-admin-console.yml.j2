@@ -1,0 +1,144 @@
+# {{ ansible_managed }}
+# goat-id-console overlay — IdP-plane admin console (ADR 0860).
+#
+# Rendered by ops/ansible/roles/id-admin-console/ (was a static file under
+# ops/compose/mgmt-host/ until the SPIFFE mTLS onboarding leg needed a
+# conditional spiffe-helper sidecar — docs/design/runner-console-mtls.md).
+#
+# Used as a compose OVERLAY on top of mgmt-host docker-compose.yml +
+# docker-compose.oauth2-proxy-id-console.yml:
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.id-admin-console.yml \
+#                  -f docker-compose.oauth2-proxy-id-console.yml \
+#                  up -d
+#
+# Routing (rendered into the Traefik dynamic file by traefik-acme.yml's
+# mgmt-dynamic.yml.j2 template when id_admin_console_enabled is true):
+#   https://admin.auth.<site>.<zone>/*  → oauth2-proxy-id-console:4180
+#                                         (which then forwards to
+#                                          goat-id-console:8080 once the
+#                                          ADMINS group claim passes).
+
+services:
+  goat-id-console:
+    # SHA-pinned per ADR 0859 (easy rollback). Per-service env var
+    # (ID_ADMIN_CONSOLE_IMAGE) so this container's rollback is independent of
+    # other services. The role writes ID_ADMIN_CONSOLE_IMAGE to
+    # /opt/mgmt-host/.env from its id_admin_console_image default; rollback.sh
+    # flips it via the env_file path in deploy-history.yml.
+    image: ${ID_ADMIN_CONSOLE_IMAGE:-ghcr.io/{{ ghcr_org }}/goat-id-console:sha-4d52390@sha256:443223d25baa66303b4f1a24357508d88ff23e93433da6e4d999e80b8c005b27}
+    # Force the manifest-list member to the host arch. Without this,
+    # `docker compose up` resolves the digest-pinned multi-arch reference to
+    # the amd64 member on the arm64 Thor hosts and crash-loops (exec format
+    # error). The id-admin-console role writes ID_ADMIN_CONSOLE_PLATFORM to
+    # /opt/mgmt-host/.env from ansible_architecture; amd64 is the fallback
+    # for a raw hand-run (the majority fleet arch).
+    platform: ${ID_ADMIN_CONSOLE_PLATFORM:-linux/amd64}
+    container_name: goat-id-console
+    restart: unless-stopped
+    env_file:
+      - id-admin-console.env
+    volumes:
+      # Bind-mount the canonical permissions YAML read-only into the
+      # container at the path the env file points at. Single source of
+      # truth — the same file the L7 fence survey markdown cites.
+      - /opt/goat/permissions/group-permissions.yml:/etc/goat-id-console/group-permissions.yml:ro
+      # Bind-mount the repo-access policy read-only (onboarding GitHub repo-grants,
+      # docs/design/onboarding-github-repo-grants.md). Always present (the role
+      # lays down a no-rules default when the goatnet declares none), so the
+      # console reads it at REPO_ACCESS_CONFIG; an empty/no-rules policy or an
+      # unset GITHUB_ONBOARD_TOKEN means grants are skipped (fail-open).
+      - /opt/goat/repo-access/repo-access.yaml:/etc/goat-id-console/repo-access.yaml:ro
+      # Bind-mount the coalition framework registry read-only. Backs the
+      # identity-detail coalition-standing row; absent ⇒ that row renders
+      # "unresolved" and names the missing file (it never guesses a standing),
+      # and the rest of the console is unaffected.
+      - {{ id_admin_console_coalition_frameworks_host_path }}:{{ id_admin_console_coalition_frameworks_container_path }}:ro
+{% if peerview_enabled | default(false) %}
+      # Bind-mount the peerview state directory read-only so the console can
+      # read hold-records.jsonl for the Access section. The directory is
+      # mounted, never the file, so a missing file does not create a
+      # directory on the host.
+      - {{ id_admin_console_hold_records_host_dir }}:/var/lib/peerview:ro
+{% endif %}
+{% if warrant_membership_enabled | default(false) %}
+      - /etc/goat/warrant/membership:/etc/goat/warrant/membership:ro
+{% endif %}
+{% if mesh_health_peer_summary_enabled | default(false) %}
+      # The per-peer handshake summary the mesh-health snapshot writes (four
+      # fields per peer, nothing else), read-only. Backs the enrolled card's
+      # "connected to control only" flag. The directory is mounted, never the
+      # file, so a missing file does not create a directory on the host.
+      - {{ mesh_health_peer_summary_dir | default('/var/lib/mesh-peer-summary') }}:/var/lib/mesh-peer-summary:ro
+{% endif %}
+{% if id_admin_console_operator_key_dir | default('') %}
+      # The PORTAL's operator-key directory, read-write. Approving a key writes
+      # a file here and the portal re-reads it within its reload interval, so an
+      # attributable operator key is issued without an envrc edit or a restart.
+      # Read-write on purpose: revoking is a delete, and a console that could
+      # only add would be able to grant but never take away.
+      - {{ id_admin_console_operator_key_host_dir }}:{{ id_admin_console_operator_key_dir }}
+{% endif %}
+      # Durable state that survives container recreate + image rollback:
+      # the AUDIT_BACKEND=file JSONL (audit.jsonl) AND the onboarding engine's
+      # SQLite store (onboard.db, ADR 1062/1071 — the console owns onboarding
+      # now). Both live under /var/lib/goat-id-console.
+      - /var/lib/goat-id-console:/var/lib/goat-id-console
+{% if id_admin_console_mtls_onboard_enabled | default(false) %}
+      # SVID cert+key+bundle written by the spiffe-helper sidecar below (SPIRE
+      # Phase A). The console's :9443 mTLS onboarding listener reads these to
+      # authenticate the onboard-runner by SPIFFE ID (docs/design/runner-console-mtls.md).
+      - {{ id_admin_console_svid_dir }}:/svid:ro
+{% endif %}
+    # Loopback-only diagnostic port. Production traffic comes via Traefik
+    # + oauth2-proxy-id-console; this lets the role's post-bringup ping
+    # hit /healthz without going through the gate. The :9443 mTLS onboarding
+    # listener (when enabled) is reached container-to-container on the `mgmt`
+    # network by name (goat-id-console:9443) — no host publish needed.
+    ports:
+      - "127.0.0.1:${ID_ADMIN_CONSOLE_HOST_PORT:-8088}:8080"
+    networks:
+      - mgmt
+{% if id_admin_console_notify_mgmt_url | default('') | length > 0 and id_admin_console_notify_mgmt_host_addr | default('') | length > 0 %}
+    # NetBird management API name -> the host's traefik
+    # (id_admin_console_notify_mgmt_host_addr in defaults/main.yml).
+    extra_hosts:
+      - "{{ id_admin_console_notify_mgmt_url | urlsplit('hostname') }}:{{ id_admin_console_notify_mgmt_host_addr }}"
+{% endif %}
+    # No docker-level healthcheck — the chainguard/static base has no
+    # shell + no wget/curl. The Ansible role's post-bringup `uri:` probe
+    # to http://127.0.0.1:8088/healthz is the meaningful health gate;
+    # mirrors panoscope + audit-subscriber posture for the same reason.
+    labels:
+      - "site_id=${SITE_ID:-unknown}"
+      - "adr=0860"
+{% if id_admin_console_mtls_onboard_enabled | default(false) %}
+
+  # SPIRE Phase A: fetch + rotate the console's X509-SVID from the SPIRE agent
+  # Workload API and write cert+key+bundle into the shared svid volume the
+  # console reads as /svid. The SPIRE registration entry's selector matches this
+  # service's compose label (docker:label:com.docker.compose.service:goat-id-console-spiffe-helper).
+  # Runs as the console's UID so the 0600 key it writes is readable by the console.
+  goat-id-console-spiffe-helper:
+    image: "{{ id_admin_console_spiffe_helper_image | default(fabric_health_spiffe_helper_image) }}"
+    container_name: goat-id-console-spiffe-helper
+    restart: unless-stopped
+    user: "{{ id_admin_console_spire_uid }}:{{ id_admin_console_spire_uid }}"
+    command: ["-config", "/etc/spiffe-helper/helper.conf"]
+    volumes:
+      - {{ id_admin_console_spire_socket_dir }}:/run/spire/sockets:ro
+      - {{ id_admin_console_compose_dir }}/id-admin-console-spiffe-helper.conf:/etc/spiffe-helper/helper.conf:ro
+      - {{ id_admin_console_svid_dir }}:/svid
+    networks:
+      - mgmt
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+{% endif %}
+
+networks:
+  mgmt:
+    external: true
+    name: mgmt

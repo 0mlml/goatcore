@@ -1,0 +1,48 @@
+# Rendered by ops/ansible/roles/relay-health/ — DO NOT EDIT ON HOST.
+# Thor-side probe of the LOCAL zenoh router's SERVICE health:
+# a real mTLS new-session OPEN (the seizure signal the container HEALTHCHECK
+# can't see), CLOSE-WAIT / FD trend, sessions, capacity, crypto posture. POSTs
+# to BOTH relay-health ingests so the private (Thor) and public (cloud)
+# dashboards both gain the "zenoh routers" band with history that survives the
+# router restarting. Runs as root: needs docker inspect + nsenter into the
+# router netns + /proc/<pid>/fd.
+[Unit]
+Description=zenoh router service-health probe
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile={{ relay_health_dir }}/zenoh-health-probe.env
+ExecStart=/usr/bin/env bash {{ relay_health_dir }}/zenoh-health-probe.sh
+{% if relay_health_textfile_out | default('') | length > 0 and (relay_health_enabled | default(false) | bool) %}
+# Bridge the band's health + wedge counts into Prometheus (goat_zenoh_*) so the
+# wedge alerts (rules/zenoh-wedge.yml) can page — the RESTART-RATE signal that
+# FabricRouterUnhealthy (for:10m, self-recovers first) misses. Runs after the
+# POST so the ingest's zenoh-health.json / zenoh-wedges.json are current.
+ExecStartPost={{ relay_health_dir }}/zenoh-health-to-prom.py --health {{ relay_health_www_dir }}/ingest/zenoh-health.json --wedges {{ relay_health_www_dir }}/ingest/zenoh-wedges.json --fabric {{ relay_health_www_dir }}/ingest/zenoh-fabric.json --out {{ relay_health_textfile_out | dirname }}/zenoh-health.prom
+{% else %}
+# NO ExecStartPost HERE, AND THAT IS THE POINT.
+#
+# The .prom above is rendered from {{ relay_health_www_dir }}/ingest/*.json —
+# which are written by the THOR-LOCAL ingest, not by this probe. When the served
+# dashboard is retired (relay_health_enabled: false) that ingest container is
+# removed, so those JSONs stop advancing while this probe keeps running as a
+# cloud feeder. Rendering the band anyway produces the worst possible artifact:
+# a textfile whose mtime is always current carrying a report that never changes.
+#
+# An ExecStartPost here would go on rewriting zenoh-health.prom every minute
+# from a frozen JSON. goat_zenoh_report_timestamp_seconds would sit still while
+# the file itself is seconds old, so every staleness check that watches the
+# exporter rather than the report reads green.
+#
+# The cloud ingest still receives the fresh POST from ExecStart above, so the
+# surviving dashboard's band is unaffected. Only the local textfile band retires,
+# together with the dashboard it belonged to.
+#
+# The goat_zenoh_* router-health series do NOT retire with it: the probe writes
+# them itself from its own measurements (ZENOH_PROM_OUT in the env file, set
+# under this same condition), so the zenoh-wedge alerts keep a live source.
+# Without that, no goat_zenoh_* series exists and every rule in
+# zenoh-wedge.yml stays silent through a delivery stall.
+{% endif %}

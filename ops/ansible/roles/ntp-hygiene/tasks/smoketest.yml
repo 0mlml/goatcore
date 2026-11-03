@@ -1,0 +1,65 @@
+---
+# ops/ansible/roles/ntp-hygiene/tasks/smoketest.yml
+#
+# Post-deploy smoke-test against each host's local chrony_exporter
+# /metrics endpoint (127.0.0.1:9123). Asserts:
+#   (a) offset_seconds (chrony_tracking_last_offset_seconds) absolute
+#       value < chrony_smoketest_offset_s
+#   (b) at least one chrony source reported
+#       (count of chrony_sources_state_info > 0)
+#
+# Metric names are as emitted by github.com/SuperQ/chrony_exporter v0.13.3
+# (see README.md of this role for the attribution to upstream collectors).
+
+- name: Smoketest — scrape local chrony_exporter /metrics
+  ansible.builtin.uri:
+    url: "http://{{ chrony_exporter_listen_addr }}/metrics"
+    return_content: true
+    status_code: 200
+  register: _smoketest_metrics
+
+- name: Smoketest — extract chrony_tracking_last_offset_seconds
+  ansible.builtin.set_fact:
+    _smoketest_offset: >-
+      {{ (_smoketest_metrics.content
+          | regex_search('^chrony_tracking_last_offset_seconds\s+(-?[0-9.eE+-]+)$', '\1', multiline=True)
+          | first
+          | default('nan')) | float }}
+
+- name: Smoketest — count configured chrony sources
+  # Count lines that begin with chrony_sources_reachability_ratio{...}
+  # using regex_findall with a multiline flag. Earlier attempt split
+  # on '\n' and used select('match', ...) which counted 0 against
+  # live metrics that clearly had 4 lines — the split/filter chain
+  # mis-parsed somewhere in Ansible's Jinja2 layer.
+  # reachability_ratio is emitted once per configured source when
+  # the sources collector runs; same cardinality as the hoped-for
+  # state_info metric in older chrony_exporter.
+  ansible.builtin.set_fact:
+    _smoketest_source_count: >-
+      {{ _smoketest_metrics.content
+         | regex_findall('^chrony_sources_reachability_ratio\{', multiline=True)
+         | length }}
+
+- name: Smoketest — assert offset within ceiling
+  ansible.builtin.assert:
+    that:
+      - (_smoketest_offset | float | abs) < (chrony_smoketest_offset_s | float)
+    fail_msg: >-
+      NTP smoke-test FAILED on {{ inventory_hostname }}: offset
+      {{ _smoketest_offset }}s exceeds ceiling {{ chrony_smoketest_offset_s }}s.
+    success_msg: >-
+      NTP smoke-test OK on {{ inventory_hostname }}: offset
+      {{ _smoketest_offset }}s within {{ chrony_smoketest_offset_s }}s ceiling.
+
+- name: Smoketest — assert source count > 0
+  ansible.builtin.assert:
+    that:
+      - (_smoketest_source_count | int) > 0
+    fail_msg: >-
+      NTP smoke-test FAILED on {{ inventory_hostname }}: chrony_exporter
+      reports zero sources (expected >0). chronyd may be running but
+      unable to use any configured NTS source.
+    success_msg: >-
+      NTP smoke-test OK on {{ inventory_hostname }}: {{ _smoketest_source_count }}
+      source(s) reported by chrony_exporter.

@@ -1,0 +1,35 @@
+#!/bin/bash
+# keepalived-mgmt-notify-master.sh — managed by the keepalived-mgmt
+# role; do not edit by hand. The auto_promote_postgres knob is
+# rendered from the role default at deploy time.
+
+set -uo pipefail
+
+logger -t keepalived-mgmt-notify "MASTER transition; node=$(hostname)"
+
+AUTO_PROMOTE="{{ keepalived_auto_promote_postgres | string | lower }}"
+
+if [ "$AUTO_PROMOTE" != "true" ]; then
+    logger -t keepalived-mgmt-notify "auto_promote disabled; skipping pg_ctl promote (operator-only mode)"
+    exit 0
+fi
+
+in_recovery=$(docker exec postgres-a psql -U postgres -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null | tr -d '[:space:]')
+
+if [ "$in_recovery" = "t" ]; then
+    logger -t keepalived-mgmt-notify "postgres-a in recovery; running pg_ctl promote"
+    docker exec postgres-a pg_ctl promote -D /var/lib/pgsql/16/data 2>&1 | logger -t keepalived-mgmt-notify
+    for i in {1..30}; do
+        in_recovery=$(docker exec postgres-a psql -U postgres -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null | tr -d '[:space:]')
+        if [ "$in_recovery" = "f" ]; then
+            logger -t keepalived-mgmt-notify "promote complete after ${i}s"
+            exit 0
+        fi
+        sleep 1
+    done
+    logger -t keepalived-mgmt-notify "WARN: promote did not complete within 30s"
+    exit 1
+fi
+
+logger -t keepalived-mgmt-notify "postgres-a already primary; no promote needed"
+exit 0

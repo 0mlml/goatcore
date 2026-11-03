@@ -1,0 +1,103 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the grant-keyd role — the E1 key-distribution daemon
+# (data-access M2.1, docs/design/grant-keyed-encryption.md). grant-keyd is a
+# native mTLS Zenoh client peer: it resolves an audience, mints/wraps/signs a
+# per-(release-set,generation) DEK bundle, and publishes it on keys/<rs>/<gen>.
+# It persists nothing durable of its own beyond the config it is handed.
+#
+# Identity: SPIRE SVID via a spiffe-helper sidecar — the SAME
+# pattern as the fabric-health role. The SVID is BOTH the daemon's mTLS client
+# identity to the router AND the key it signs bundles with; its Subject CN
+# admits it through the router's keys/** write-ACL carve (subject `infra-keyd`).
+
+# Image — SHA-pinned per ADR 0859. A bump requires an append to deploy-history.yml.
+grant_keyd_image: "grant-keyd:sha-0751afc"
+
+grant_keyd_site: "{{ site_id }}"
+
+# Router endpoint (mTLS). Container-network name of the zenoh router.
+grant_keyd_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+grant_keyd_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# Router server-cert verification — the offline-CA root (same file the router
+# and fabric-health use).
+grant_keyd_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# Host compose project dir + the members (recipient SVID) dir.
+grant_keyd_compose_dir: "/opt/grant-keyd"
+grant_keyd_members_dir: "/opt/grant-keyd/members"
+
+# SPIRE (spire mode is the only supported identity source here).
+grant_keyd_spire_socket_dir: "/run/spire/sockets"
+grant_keyd_svid_dir: "/opt/grant-keyd/svid"
+grant_keyd_spire_uid: 65532
+# NOTE: the spiffe-helper sidecar image is referenced directly in the compose
+# template from `spire_spiffe_helper_image` (group_vars/<site>_hosts/spire.yml) —
+# NOT held as a `*_image` role default, so the deploy-history CI guard does not
+# read it as a grant-keyd image-pin bump (same reason as the fabric-health role).
+
+# The daemon's SPIFFE id path (the SPIRE entry's spiffe_id). Its full id is
+# spiffe://{{ grant_keyd_trust_domain }}/{{ grant_keyd_spiffe_path }}.
+grant_keyd_spiffe_path: "grant-keyd"
+grant_keyd_trust_domain: "{{ spire_trust_domain | default('') }}"
+
+# --- Pilot audience ------------------------------------------------------
+# release-set -> member ids. A member id maps to <members_dir>/<id>.pem and to
+# spiffe://<trust_domain>/<id>. Default = a SELF-CONTAINED smoke test: the
+# key-service is its own sole member, so it wraps the DEK to its own SVID key
+# and the fired bundle can be opened with the SVID private key — proving the
+# whole pipeline live without a second pilot workload.
+# Production shape (grant-row mode) is the default for every goatnet:
+# the sweep list comes from the portal's producers-with-active-grants, so no
+# operator-pinned release-sets and no self-member smoke test. A dev goatnet that
+# wants the old pilot smoke sets these two back in its own group_vars.
+grant_keyd_release_sets: {}
+
+# When true, stage the key-service's own SVID cert as a member in members_dir
+# (the self-member smoke test above).
+grant_keyd_self_member: false
+
+# Daemon args. Default [] = poll daemon (restart: unless-stopped). Set
+# ["--once"] for a single supervised sweep (the first fire; container exits).
+grant_keyd_args: []
+
+grant_keyd_poll_interval_secs: 30
+grant_keyd_rust_log: "grant_keyd=info,zenoh=warn"
+
+# --- Grant-row audience mode (Piece B, ADR 1102) -------------------------
+# When grant_keyd_portal_url is set, the daemon derives each release-set's
+# audience from the portal's grant-row endpoint (GET /api/access/audience)
+# instead of the grant_keyd_release_sets member lists — so a data owner's
+# `goat access grant` drives the audience. The release_sets KEYS still name
+# which release-sets to sweep; their member-list VALUES are ignored in this
+# mode. cert_dir must hold each resolved member anchor's SVID (Piece C MVP —
+# the operator/automation stages them, or the durable directory serves them).
+# Needs a portal token the portal accepts. The deploy resolves it on the host,
+# registers it in the portal's service-key directory and proves it —
+# no laptop variable is involved any more.
+grant_keyd_portal_url: "http://goat-zenoh-portal:8090"
+# Resolved ON THE HOST at deploy time (tasks/main.yml, F-569); do not set.
+grant_keyd_portal_token: ""
+# Optional explicit token (e.g. to adopt a known value). Normally unset: the
+# host's registered key is reused, or a new one minted on first deploy.
+grant_keyd_portal_token_override: "{{ lookup('env', 'GRANT_KEYD_PORTAL_TOKEN') | default('', true) }}"
+# The portal's on-host service-key directory and this daemon's handle in it.
+grant_keyd_portal_keystore_dir: /opt/goat-zenoh-portal/operator-keys.d
+grant_keyd_portal_key_id: grant-keyd
+# The portal's public name, used only to prove the token through the host's
+# own Traefik (--resolve to 127.0.0.1) at deploy time.
+grant_keyd_portal_public_host: "portal.{{ site_id | default('') }}.{{ site_dns_zone | default('') }}"
+
+# --- Portal-CA validated key source (WS2, F-270 companion) ----------------
+# When set (e.g. "urn:goat:<site>:org="), the daemon validates portal-minted
+# members' certs in cert_dir against the offline-CA root (the SAME ca-root.pem
+# already mounted for router-server verification) with the identity binding
+# member-id = CN = URI-SAN suffix — so partner/org/human members resolve
+# through a VALIDATED source instead of the unvalidated cert-dir fallback.
+# Empty = off (SPIRE-SVID validation only). Per-goatnet; set in group_vars.
+# The URI-SAN prefix portal-minted member certs carry. DERIVED from the
+# portal's own signing prefix so the two cannot disagree: a keyd config copied
+# from another goatnet would reject every member.
+grant_keyd_portal_uri_prefix: "{{ portal_cert_sign_uri_prefix | mandatory }}"

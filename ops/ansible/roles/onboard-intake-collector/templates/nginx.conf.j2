@@ -1,0 +1,105 @@
+# {{ ansible_managed }}
+# Public candidate-onboarding front desk (ADR 1062 stage 1). THIN ALLOWLIST
+# reverse proxy: it serves ONLY the candidate form + the two token-gated
+# candidate endpoints, forwarding them to the mesh-only onboarding engine
+# (goat-id-console since docs/design/onboarding-extraction-plan.md). Everything
+# else is 404, so the engine's operator surfaces (/onboarding, the machine
+# /api/onboard/* realm, /api/whoami, …) are NEVER reachable via this public host.
+# The console's admin surface stays behind its own oauth2-proxy ADMINS gate; this
+# collector reaches only the console's un-gated /public routes by hitting the
+# container directly. It holds no secrets and no state.
+#
+# Candidate-facing URLs are unchanged (/onboard.html, /api/onboard/preview,
+# /api/onboard/submit) so a link already handed out keeps working; nginx rewrites
+# each to the console's /public route. proxy_pass uses a variable upstream, so a
+# `rewrite ... break` sets the rewritten URI (a bare-variable proxy_pass would
+# otherwise forward the original $uri unchanged).
+server {
+    listen 80;
+    server_name _;
+    server_tokens off;
+    client_max_body_size 64k;          # a candidate submission is tiny; cap floods
+
+    # TLS terminates at Traefik; this server only ever sees plain HTTP on :80.
+    # nginx builds an absolute Location for `return 302 /path` from ITS scheme,
+    # so the bare-root redirect below was emitted as http://<host>/onboard.html
+    # and the relays do not answer on :80 (seen live 2026-09-10: a candidate
+    # who trimmed the invite link to the host hung on the redirect). Relative
+    # Location keeps the browser on the https origin it arrived on.
+    absolute_redirect off;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+
+    # Re-resolve the upstream via docker's embedded DNS so a console restart (new
+    # container IP) doesn't strand the proxy.
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    set $engine {{ onboard_intake_portal_upstream_host }};
+
+    # Bare / → the form, preserving the ?t=<token>.
+    location = / { return 302 /onboard.html$is_args$args; }
+
+    # The candidate form (static; the console substitutes the org lexicon at serve).
+    location = /onboard.html {
+        rewrite ^ /public/onboard.html break;
+        proxy_pass http://$engine:{{ onboard_intake_portal_upstream_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # What a site network must allow before anyone enrols (names and ports only,
+    # no addresses). Public by design: the network team reads it before the
+    # participant has any mesh access (zagros, 2026-10-05).
+    location = /network-requirements {
+        rewrite ^ /public/network-requirements break;
+        proxy_pass http://$engine:{{ onboard_intake_portal_upstream_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # The two token-gated candidate endpoints — the ONLY engine API reachable here.
+    location = /api/onboard/preview {
+        rewrite ^ /public/onboard/preview break;
+        proxy_pass http://$engine:{{ onboard_intake_portal_upstream_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location = /api/onboard/submit {
+        rewrite ^ /public/onboard/submit break;
+        proxy_pass http://$engine:{{ onboard_intake_portal_upstream_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # F-242 compatibility: the console's served form historically fetched its OWN
+    # /public/onboard/{preview,submit} routes (the engine's native paths), not the
+    # /api/ public aliases above — so a candidate loaded through this front desk
+    # got a 404 on preview and the form dead-ended. Forward those two exact paths
+    # through unchanged (bare-variable proxy_pass keeps $uri) so an already-
+    # deployed console form works. Still exact-match, token-gated candidate
+    # endpoints only; the deny-all below is untouched. Redundant once the console
+    # form emits /api/ (this change ships that fix to the form too).
+    location = /public/onboard/preview {
+        proxy_pass http://$engine:{{ onboard_intake_portal_upstream_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location = /public/onboard/submit {
+        proxy_pass http://$engine:{{ onboard_intake_portal_upstream_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Health probe for isitup / Traefik (local, not proxied).
+    location = /healthz { return 200 "ok\n"; add_header Content-Type text/plain; }
+
+    # Everything else → 404. Nothing else is proxied inward.
+    location / { return 404; }
+}

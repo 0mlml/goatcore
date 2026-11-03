@@ -1,0 +1,60 @@
+# {{ ansible_managed }}
+# nginx config for the on-mesh intake advisory page.
+#
+# Serves one static page for every path, plus /healthz for local checks.
+# Holds no secrets and no state.
+
+server {
+    listen {{ intake_mesh_advisory_internal_port }};
+    server_name _;
+    server_tokens off;
+
+    # The candidate link carries the one-time invite token as ?t=<token>, and
+    # the default access log writes the full request line — query string
+    # included — to stdout and therefore into the container json-file log.
+    # This page does NOT consume the token (the real collector does), so
+    # anything logged here stays redeemable until it expires. Off.
+    access_log off;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+
+    root /usr/share/nginx/html;
+
+    # `return` short-circuits before the static handler, so this answers on
+    # any method. default_type rather than add_header: nginx add_header
+    # inheritance REPLACES the server-level set for a location rather than
+    # merging it, and add_header Content-Type appends a second header
+    # instead of setting one.
+    location = /healthz {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Served only as the 503 body below, never routed to directly.
+    location = /index.html {
+        internal;
+    }
+
+    # Everything else — bare host, /onboard.html, and whatever path a stale
+    # answer carries — gets the advisory.
+    #
+    # 503, not 200, deliberately. A browser renders the body identically, so
+    # candidate-facing behaviour is unchanged, but reaching this page means
+    # the PUBLIC front desk was NOT reached. At 200, any prober with a mesh
+    # vantage point (the Thor itself) would report the intake surface healthy
+    # while it is unreachable — isitup grew an Off-Mesh Services section
+    # (#2515) and intake is an obvious row to add, so keep that row honest
+    # before it exists.
+    #
+    # `return` also answers non-GET verbs; `try_files` would hand off to the
+    # static module, which rejects them, so a candidate who loaded the form
+    # off-mesh, joined the mesh, then submitted got a stock error page rather
+    # than the advisory.
+    location / {
+        return 503;
+    }
+
+    error_page 503 /index.html;
+}

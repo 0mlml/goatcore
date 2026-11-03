@@ -1,0 +1,390 @@
+---
+# ops/ansible/roles/goat-relay/tasks/main.yml
+#
+# Deploys goat-relay onto a Linux host. Encodes the two
+# load-bearing operational invariants:
+#
+#   1. F-023 — Linux's `tls` ULP module is NOT auto-loaded on stock
+#      Ubuntu 22.04 / 24.04 / Debian 12. Without it, the cfg(linux)
+#      kTLS branch in `goat-relay/src/listener/ws_ktls.rs` silently
+#      falls back to userspace TLS (correct fallback behavior, but
+#      operator loses the per-packet AEAD bypass benefit ADR 0709
+#      D8 specifies).
+#      → ENCODED: write /etc/modules-load.d/tls.conf containing `tls`,
+#        modprobe tls now to make it active without reboot.
+#
+#   2. F-027 — Docker bridged networking puts the container in a
+#      fresh netns whose `/proc/sys/net/ipv4/tcp_available_ulp`
+#      doesn't inherit modules registered in the host netns. The
+#      F-023 runtime probe inside the container reads "no tls" and
+#      falls back to userspace silently.
+#      → ENCODED: docker run with `network_mode: host` so the
+#        container shares the host netns and sees the modprobe'd
+#        modules.
+#
+# Both invariants required; neither sufficient alone. See the
+# corresponding findings + M-009 measurement record for the empirical
+# evidence chain.
+#
+# Required host vars: none. All knobs in defaults/main.yml.
+# Optional extra-vars: see defaults/main.yml header.
+
+- name: Require goat_relay_image
+  ansible.builtin.assert:
+    that: goat_relay_image is defined and goat_relay_image | length > 0
+    fail_msg: "goat_relay_image must be set (defaults/main.yml or -e)."
+
+# Fail-closed relay-client auth — refuse to deploy a relay that cannot
+# authenticate its clients. Mirrors the binary's own GOAT_RELAY_AUTH_SECRET
+# fail-closed check. Without this secret the relay is an open relay on the
+# public :33073 port (anyone can register/evict peer-ID routing slots).
+# Defaults to the per-site `relay_secret` (the same secret clients + the
+# legacy relay tier use); see docs/design/wg-cp0-prod.md.
+- name: Require goat_relay_auth_secret (fail-closed relay-client auth)
+  ansible.builtin.assert:
+    that: goat_relay_auth_secret is defined and goat_relay_auth_secret | length > 0
+    fail_msg: >-
+      goat_relay_auth_secret is empty. The goat-relay rewrite tier
+      authenticates relay clients with a per-site shared secret
+      (timed-HMAC, wire-compatible with the legacy relay tier). Set
+      `relay_secret` for this site (env-sourced, e.g. VEGA_RELAY_SECRET)
+      or pass goat_relay_auth_secret explicitly. The relay refuses to
+      start without it — deploying an open relay is not permitted.
+
+# ---------------------------------------------------------------------------
+# F-023: persistent + immediate kernel TLS ULP module load.
+# ---------------------------------------------------------------------------
+- name: F-023 — persist tls module load via modules-load.d
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/goat-relay-tls.conf
+    content: |
+      # Block 33B step 8 / F-023 — Linux kTLS ULP module load on boot.
+      # Without this the goat-relay kTLS hand-off (ADR 0709 D8) silently
+      # falls back to userspace TLS. See docs/findings/F-023-* + M-009.
+      tls
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart goat-relay
+
+- name: F-023 — modprobe tls now (no reboot needed for first-light)
+  community.general.modprobe:
+    name: tls
+    state: present
+    persistent: present
+
+- name: F-023 — verify tls ULP appears in /proc/sys/net/ipv4/tcp_available_ulp
+  ansible.builtin.command: cat /proc/sys/net/ipv4/tcp_available_ulp
+  register: ulp_check
+  changed_when: false
+
+- name: F-023 — assert tls is registered (defense-in-depth)
+  ansible.builtin.assert:
+    that: "'tls' in ulp_check.stdout"
+    fail_msg: >-
+      tls ULP module did NOT appear in tcp_available_ulp after
+      modprobe + modules-load.d entry. Kernel may have been built
+      without TLS support. Use a different distro/AMI.
+    success_msg: "kernel TLS ULP available on host (tcp_available_ulp = '{{ ulp_check.stdout }}')"
+
+# ---------------------------------------------------------------------------
+# Cert directory + permissions (operator delivers actual cert/key
+# out-of-band; this task just ensures the directory exists with
+# correct mode).
+# ---------------------------------------------------------------------------
+- name: Ensure cert directory exists
+  ansible.builtin.file:
+    path: "{{ goat_relay_cert_host_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Stat cert + key on the host
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ goat_relay_cert_host_path }}"
+    - "{{ goat_relay_key_host_path }}"
+  register: cert_files
+
+# `failed_when: not cert_files.results | map(...)` was broken — `.results`
+# only exists AFTER the loop completes; during iteration the register var
+# is the per-item stat dict. Split into a post-loop assert.
+- name: Verify both cert + key exist on the host
+  ansible.builtin.assert:
+    that:
+      - cert_files.results | map(attribute='stat.exists') | list | min
+    fail_msg: |
+      Cert or key not found on host. If first deploy, pre-generate before
+      running this role:
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+          -subj "/CN=goat-relay-<site>" \
+          -keyout /etc/goat-relay/key.pem -out /etc/goat-relay/cert.pem
+      Production: real CA-signed certs delivered via secure channel.
+
+# ---------------------------------------------------------------------------
+# Pull image + run container with F-027 host networking.
+# ---------------------------------------------------------------------------
+- name: Log target docker daemon in to private registry (when enabled)
+  community.docker.docker_login:
+    registry_url: "{{ goat_relay_pull_registry }}"
+    username: "{{ goat_relay_pull_username }}"
+    password: "{{ goat_relay_pull_password }}"
+  become: true
+  when:
+    - goat_relay_pull_auth_enabled | bool
+    - goat_relay_pull_password | length > 0
+  no_log: true   # keep the PAT out of ansible-playbook stdout
+  # Login persists in /root/.docker/config.json so subsequent pulls
+  # (CI-rebuild redeploys, :sha-... pins) keep working without re-running.
+
+- name: Check if goat-relay image is already present locally
+  ansible.builtin.command:
+    cmd: "docker image inspect {{ goat_relay_image }}"
+  register: image_present
+  changed_when: false
+  failed_when: false
+
+- name: Pull goat-relay image
+  community.docker.docker_image:
+    name: "{{ goat_relay_image }}"
+    source: pull
+    force_source: true
+  when: image_present.rc != 0
+
+# F-NNN (M-NNN cycle): an orphan goat-relay binary survived
+# a prior cycle and held the listener, blocking the new container's bind
+# even after `docker rm -f`. Pre-flight: kill any goat-relay process
+# whose parent is init (PID 1) — those are the orphans. Container-managed
+# processes have containerd-shim as their parent, so this is a clean
+# discriminator without needing to look up the container PID inside Jinja
+# (which fights the {{ }} escaping).
+- name: Belt-and-suspenders — kill orphan goat-relay processes (parent=init)
+  ansible.builtin.shell: |
+    set -eu
+    # `pgrep -P 1 -f` matches processes whose parent is PID 1 (init/systemd)
+    # AND whose cmdline matches the binary path. Container processes have
+    # containerd-shim as parent, not init, so they are skipped.
+    pgrep -P 1 -f /usr/local/bin/goat-relay 2>/dev/null | while read pid; do
+      if [ -n "$pid" ]; then
+        echo "killing orphan goat-relay pid=$pid (parent=init)"
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    done
+    exit 0
+  args:
+    executable: /bin/bash
+  register: orphan_kill
+  changed_when: "'killing orphan' in (orphan_kill.stdout | default(''))"
+
+- name: F-027 — run goat-relay container with network_mode=host
+  community.docker.docker_container:
+    name: "{{ goat_relay_container_name }}"
+    image: "{{ goat_relay_image }}"
+    state: started
+    restart_policy: "{{ goat_relay_restart_policy }}"
+    # F-027: MUST be host networking so the container's view of
+    # /proc/sys/net/ipv4/tcp_available_ulp matches the host's (which
+    # has tls loaded per F-023). Bridged networking → silent kTLS
+    # bypass. Do NOT change to bridge without re-reading the F-027
+    # finding doc.
+    network_mode: host
+    # Docker log rotation: the relay logs to stdout, Docker's default json-file
+    # driver has NO size cap, and a chatty/looping binary can grow a single
+    # container log until it fills the relay's root disk → SSM agent can no longer
+    # write (management dead) + the relay degrades → mesh flap / nameserver
+    # unreachable. Cap + rotate the log so an unbounded writer can never fill the
+    # disk.
+    log_driver: "{{ goat_relay_log_driver }}"
+    log_options:
+      max-size: "{{ goat_relay_log_max_size }}"
+      max-file: "{{ goat_relay_log_max_file }}"
+    # File-descriptor ceiling. The relay holds several FDs per connection; the
+    # container's default NOFILE soft limit is 1024, so under connection accumulation
+    # the WS accept path hits "Too many open files (os error 24)". Admission control CAPS
+    # connections; this raises the ceiling so a legitimate busy relay
+    # (4096 conns/shard × shards) isn't strangled by a 1024 default.
+    ulimits:
+      - "nofile:{{ goat_relay_nofile_limit }}:{{ goat_relay_nofile_limit }}"
+    volumes:
+      - "{{ goat_relay_cert_host_path }}:/etc/goat-relay/cert.pem:ro"
+      - "{{ goat_relay_key_host_path }}:/etc/goat-relay/key.pem:ro"
+    # GOAT_RELAY_AUTH_SECRET — per-site relay shared secret for
+    # relay-client timed-HMAC auth (wire-compatible with netbird relay v2
+    # + the legacy relay tier). Sourced from `goat_relay_auth_secret`
+    # (defaults to the site `relay_secret`). Passed via container env,
+    # never argv (argv is world-readable in /proc/<pid>/cmdline). The
+    # binary + the assert above both fail closed on an empty secret.
+    # GOAT_RELAY_REQUIRE_PEER_BOUND — ADR 1021 Phase C. Only set (to '1')
+    # when goat_relay_require_peer_bound is true; default off = dual-accept
+    # migration window. Flip to true fleet-wide only once the management
+    # server issues peer-bound (algo-2) tokens, or peers lock out.
+    env: >-
+      {{
+        {
+          'NB_RELAY_HC_ATTEMPT_THRESHOLD': goat_relay_hc_attempt_threshold | string,
+          'GOAT_RELAY_AUTH_SECRET': goat_relay_auth_secret,
+        }
+        | combine(
+            {'GOAT_RELAY_USE_URING': '1'} if (goat_relay_use_uring | bool) else {}
+          )
+        | combine(
+            {'GOAT_RELAY_REQUIRE_PEER_BOUND': '1'} if (goat_relay_require_peer_bound | bool) else {}
+          )
+        | combine(
+            {'GOAT_RELAY_PEER_STATS': goat_relay_peer_stats} if (goat_relay_peer_stats | default('')) != '' else {}
+          )
+      }}
+    # ADR 0711 / Block 33C.1 lever L5 — io_uring requires Docker
+    # seccomp opt-out for io_uring_setup / io_uring_enter syscalls.
+    # F-038 Cause 1 (leftover systemd unit) + Cause 2 (runtime gating
+    # bug) are both fixed; preflight catches the systemd-unit class
+    # at deploy time. seccomp_opts now applies when use_uring is true.
+    security_opts: "{{ ['seccomp=unconfined'] if (goat_relay_use_uring | bool) else [] }}"
+    command: >-
+      {{ ['--tls-cert', '/etc/goat-relay/cert.pem',
+          '--tls-key',  '/etc/goat-relay/key.pem',
+          '--bind',     goat_relay_bind_addr,
+          '--advertised', goat_relay_advertised_addr]
+        + (['--shards', goat_relay_shards | string] if goat_relay_shards != '' else [])
+        + (['--cbpf-affinity'] if (goat_relay_cbpf_affinity | default(false) | bool) else [])
+        + (['--prefer-quic-bias-ms', goat_relay_prefer_quic_bias_ms | string]
+           if (goat_relay_prefer_quic_bias_ms | default(0) | int) > 0 else [])
+        + (['--stats-addr', goat_relay_stats_addr]
+           if (goat_relay_stats_addr | default('')) != '' else [])
+      }}
+    pull: false  # already pulled above
+    # No `ports:` — host networking exposes the listener directly.
+    # No `labels:` for now; revisit once OCI labels land in the image.
+  register: container_state
+
+- name: Capture goat-relay startup banner (FIRST lines for F-023 probe verdict)
+  # NO `set -o pipefail` here: `head -40` closes the pipe after 40 lines, so
+  # `docker logs` (still writing on a busy relay) takes SIGPIPE and exits 141.
+  # Without pipefail the pipeline rc is head's (0); `|| true` is belt-and-braces.
+  # The stdout (the startup banner) is captured fully regardless.
+  ansible.builtin.shell: |
+    docker logs {{ goat_relay_container_name }} 2>&1 | head -40 || true
+  register: relay_logs
+  changed_when: false
+  retries: 3
+  delay: 2
+  # goat-relay emits log lines to stderr via Rust `eprintln!` — `2>&1` merges
+  # them into stdout. Read the HEAD (oldest lines = the startup banner), NOT
+  # `--tail`: on a recreate the reconnect storm floods the log within seconds,
+  # so the once-emitted kTLS verdict scrolls out of any tail window (it made
+  # the assert below flap-fail on fra/pdx during the convergence
+  # while the relay was perfectly healthy). The banner is always at the head.
+  until: relay_logs.stdout != ""
+
+- name: Show goat-relay startup logs
+  ansible.builtin.debug:
+    msg: "{{ relay_logs.stdout_lines }}"
+
+# F-023 probe verdict. NOTE: this is a soft/informational check, NOT a gate —
+# the AUTHORITATIVE kTLS-availability assertion is the host-level
+# `tcp_available_ulp` pre-check earlier in this role (it hard-fails if the
+# kernel lacks the TLS ULP). This second check only reads the container's own
+# startup banner for confirmation; the banner may legitimately be absent if the
+# container just recreated and no client has connected yet, so it WARNS rather
+# than failing the deploy (a healthy relay must not be reported failed).
+- name: F-023 probe verdict — warn (not fail) if the container banner is absent
+  ansible.builtin.debug:
+    msg: >-
+      {{ "goat-relay running; kTLS path confirmed in container banner per F-023."
+         if ("kernel TLS ULP available" in relay_logs.stdout
+             or "awaiting ctrl-c" in relay_logs.stdout)
+         else "WARNING: container startup banner does not yet show the kTLS-available
+               probe verdict. Host-level kTLS ULP was already asserted available, so
+               this is informational (the banner probe fires on first connection /
+               may have scrolled). Re-check `docker logs` after first traffic." }}
+
+# ---------------------------------------------------------------------------
+# Relay-metrics self-publish (ADR 1058) — OPT-IN. Reads this relay's own host
+# metrics locally (no SSM/creds) and POSTs them to the mgmt-host ingest over the
+# rathole :443 path, so the relay-health dashboard throughput panel
+# auto-populates. Additive + fail-safe: a failed post leaves the relay
+# untouched (the dashboard just shows operator-deep-only for it).
+# ---------------------------------------------------------------------------
+- name: relay-metrics | install publisher + units (ADR 1058)
+  when: relay_metrics_publish_enabled | default(false) | bool
+  tags: [relay_metrics]   # run in isolation (--tags relay_metrics) to add the
+                          # publisher without recreating the goat-relay container
+  block:
+    - name: relay-metrics | dir
+      ansible.builtin.file:
+        path: "{{ relay_metrics_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: relay-metrics | install metrics-publish.sh (bash; stays for rollback)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../relay/metrics-publish.sh"
+        dest: "{{ relay_metrics_dir }}/metrics-publish.sh"
+        mode: "0755"
+      notify: restart relay-metrics-publish timer
+
+    # Phase 3 deploy-swap: the typed Go publisher. Only when
+    # relay_metrics_publisher=binary. The controller cross-compiles the
+    # stdlib-only binary for the host arch (no release/token, cf. F-232) and
+    # copies it to the relay; the service ExecStart (template) then runs
+    # `relay-probe publish`, which reads RELAY_STATS_URL and folds the per-peer
+    # distribution into the deep block (ADR 1055 §2b).
+    - name: relay-metrics | cross-compile relay-probe on the controller (linux/{{ relay_probe_go_arch }})
+      ansible.builtin.command:
+        cmd: go build -trimpath -o "{{ relay_probe_build_out }}" .
+        chdir: "{{ playbook_dir }}/../relay-probe"
+      environment:
+        GOOS: linux
+        GOARCH: "{{ relay_probe_go_arch }}"
+        CGO_ENABLED: "0"
+      delegate_to: localhost
+      changed_when: true
+      when: relay_metrics_publisher == 'binary'
+
+    - name: relay-metrics | install relay-probe binary
+      ansible.builtin.copy:
+        src: "{{ relay_probe_build_out }}"
+        dest: "{{ relay_metrics_dir }}/relay-probe"
+        mode: "0755"
+      when: relay_metrics_publisher == 'binary'
+      notify: restart relay-metrics-publish timer
+
+    - name: relay-metrics | render env (0600 — holds the bearer token)
+      ansible.builtin.template:
+        src: relay-metrics-publish.env.j2
+        dest: "{{ relay_metrics_dir }}/relay-metrics-publish.env"
+        mode: "0600"
+      no_log: true
+      notify: restart relay-metrics-publish timer
+
+    - name: relay-metrics | install systemd service + timer
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - relay-metrics-publish.service
+        - relay-metrics-publish.timer
+      notify: restart relay-metrics-publish timer
+
+    - name: relay-metrics | enable + start timer
+      ansible.builtin.systemd:
+        name: relay-metrics-publish.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+# CVE-2026-98432 (IPv4 TCP request-socket use-after-free, CVSS 9.8). The
+# published exploit needs an MPTCP listener, and Go 1.24+ listeners request
+# MPTCP by default. Ubuntu had no fixed kernel on 2026-11-02; MPTCP stays off
+# until the fixed kernel is live on the host, then this task is removed.
+- name: CVE-2026-98432 mitigation — MPTCP off until the fixed kernel ships
+  ansible.posix.sysctl:
+    name: net.mptcp.enabled
+    value: "0"
+    sysctl_file: /etc/sysctl.d/98-goat-cve-2026-98432.conf
+    state: present
+    reload: true
+  when: ansible_kernel is not search('tegra')

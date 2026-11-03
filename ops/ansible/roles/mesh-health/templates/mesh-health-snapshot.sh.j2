@@ -1,0 +1,95 @@
+#!/bin/sh
+# {{ ansible_managed }}
+#
+# mesh-health-snapshot — atomically refresh the netbird status snapshot the
+# goat-mesh-health meter reads (ADR 1042). Run by mesh-health-snapshot.timer.
+#
+# Failure posture is honest-by-absence: on any failure the previous snapshot
+# is left in place untouched, its mtime ages past the meter's staleness
+# window, and the published reading degrades to `unmetered` — never a false
+# green. The daemon-socket guard mirrors F-098 (a socketless netbird CLI
+# enters an indefinite retry loop; never invoke it without the socket).
+set -eu
+
+STATE_DIR="{{ mesh_health_state_dir }}"
+OUT="${STATE_DIR}/netbird-status.json"
+REG_OUT="${STATE_DIR}/peer-registry.json"
+
+# F-098 guard: no daemon socket -> no CLI call (avoid the retry-loop hang).
+[ -S /var/run/netbird.sock ] || exit 0
+
+tmp="$(mktemp "${STATE_DIR}/.netbird-status.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+
+if timeout 10 netbird status --json > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+  chmod 0644 "$tmp"
+  mv "$tmp" "$OUT"
+  trap - EXIT
+fi
+
+{% if mesh_health_peer_summary_enabled | bool %}
+# ── Per-peer handshake summary (identity console) ───────────────────────────
+#
+# The console flags a device that registered with management but never formed
+# a tunnel (a site that passes TCP 443 and blocks the data ports). The
+# management API reports such a peer as connected, so the fact has to come
+# from a peer's own view: this host's last WireGuard handshake with each peer.
+# Only the four fields below leave the snapshot. Same honest-by-absence posture:
+# on any failure the previous file stays and ages; the console ignores a stale
+# file rather than believing it.
+if [ -s "$OUT" ] && command -v python3 >/dev/null 2>&1; then
+  stmp="$(mktemp "{{ mesh_health_peer_summary_dir }}/.peer-handshakes.XXXXXX")"
+  if python3 - "$OUT" > "$stmp" 2>/dev/null <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+rows = []
+for p in (d.get("peers") or {}).get("details") or []:
+    rows.append({
+        "ip": (p.get("netbirdIp") or "").split("/")[0],
+        "fqdn": p.get("fqdn") or "",
+        "status": p.get("status") or "",
+        "last_handshake": p.get("lastWireguardHandshake") or "",
+    })
+json.dump({"peers": rows}, sys.stdout)
+PY
+  then
+    chmod 0644 "$stmp"
+    mv "$stmp" "{{ mesh_health_peer_summary_dir }}/peer-handshakes.json"
+  else
+    rm -f "$stmp"
+  fi
+fi
+{% endif %}
+{% if mesh_health_registry_enabled | default(false) %}
+# ── Management peer registry (optional) ──────────────────────────────────────
+#
+# `netbird status` answers "can this vantage reach the peer". The management
+# API answers "does the peer exist, and when did the control plane last hear
+# from it" — the two questions a local daemon cannot separate, and the only way
+# to tell a DELETED peer from one that merely fell out of this vantage's ACL
+# scope.
+#
+# Fetched here rather than in the container so the token never enters it: the
+# meter stays passive and file-driven, exactly like the netbird snapshot.
+#
+# Same honest-by-absence posture as above — on any failure the previous file is
+# left untouched, ages past the meter's staleness window, and the meter simply
+# stops trusting it. A stale registry is ignored, never believed.
+if [ -r "{{ mesh_health_registry_env_file }}" ]; then
+  # shellcheck disable=SC1091
+  . "{{ mesh_health_registry_env_file }}"
+fi
+
+if [ -n "${NB_API_TOKEN:-}" ]; then
+  rtmp="$(mktemp "${STATE_DIR}/.peer-registry.XXXXXX")"
+  trap 'rm -f "$rtmp"' EXIT
+  if timeout 15 curl -fsS \
+       -H "Authorization: Token ${NB_API_TOKEN}" \
+       -H "Accept: application/json" \
+       "{{ mesh_health_registry_url }}" > "$rtmp" 2>/dev/null && [ -s "$rtmp" ]; then
+    chmod 0644 "$rtmp"
+    mv "$rtmp" "$REG_OUT"
+    trap - EXIT
+  fi
+fi
+{% endif %}

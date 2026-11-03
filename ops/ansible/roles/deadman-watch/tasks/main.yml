@@ -1,0 +1,137 @@
+---
+# ops/ansible/roles/deadman-watch — the external half of the dead-man's switch.
+# Anchor: F-231 W2 (external liveness), F-289 (the switch that had nowhere to send).
+
+- name: deadman-watch | skip unless enabled
+  ansible.builtin.meta: end_host
+  when: not (deadman_watch_enabled | default(false) | bool)
+
+# The one deployment error that would silently void this whole mechanism is
+# installing it on the host it watches. Refuse rather than deploy a watcher that
+# dies with its subject.
+- name: deadman-watch | refuse to run alongside the obs stack it watches
+  # Two distinct ways a host can BE the thing being watched. Do not test
+  # `has_obs_host` for this directly:
+  #
+  #   `has_obs_host` is a SITE-TOPOLOGY flag — "this site has a separate obs
+  #   host" — not "this host is the obs host". Testing it refuses the right
+  #   targets (mgmt pairs at sites that DO have a dedicated obs host) and permits
+  #   the genuinely dangerous case below.
+  #
+  # 1. site_role == 'observability' — this IS the dedicated obs host.
+  # 2. has_obs_host is FALSE — the site has no separate obs host, so the obs
+  #    stack is co-located on this mgmt host via the legacy `observability`
+  #    role. Installing the watcher here watches the box it lives on.
+  #
+  # 3. deadman_watch_off_site — the host is not part of the watched site at all
+  #    (a goatnet's cloud relay-health box watching a single-host site). It
+  #    cannot be the obs host, so both conditions above are moot for it.
+  ansible.builtin.assert:
+    that:
+      - (deadman_watch_off_site | default(false) | bool) or (site_role | default('')) != 'observability' or (deadman_watch_allow_colocation | default(false) | bool)
+      - (deadman_watch_off_site | default(false) | bool) or (has_obs_host | default(false) | bool) or (deadman_watch_allow_colocation | default(false) | bool)
+    fail_msg: >-
+      deadman-watch would end up on the same host as the obs stack it watches
+      ({{ inventory_hostname }}: site_role={{ site_role | default('unset') }},
+      has_obs_host={{ has_obs_host | default(false) }}). The entire premise is
+      that it observes from OUTSIDE — an obs stack cannot witness its own death.
+      Either this host IS the dedicated obs host, or the site has no separate obs
+      Orin and runs the obs stack here. Deploy to a host that is neither.
+      Override with deadman_watch_allow_colocation=true only for a lab.
+    success_msg: >-
+      {{ inventory_hostname }} is separate from the obs stack it will watch.
+
+- name: deadman-watch | service account
+  ansible.builtin.user:
+    name: "{{ deadman_watch_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ deadman_watch_state_dir }}"
+    create_home: false
+
+- name: deadman-watch | directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "0755"
+  loop:
+    - { path: "{{ deadman_watch_install_dir }}", owner: root }
+    - { path: "{{ deadman_watch_state_dir }}", owner: "{{ deadman_watch_user }}" }
+
+- name: deadman-watch | install receiver + checker
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../deadman-watch/{{ item }}"
+    dest: "{{ deadman_watch_install_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - deadman-receive.py
+    - deadman-check.sh
+  notify: restart deadman-receive
+
+- name: deadman-watch | render systemd units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - deadman-receive.service
+    - deadman-check.service
+    - deadman-check.timer
+  notify:
+    - restart deadman-receive
+    - restart deadman-check timer
+
+- name: deadman-watch | enable receiver + timer
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop:
+    - deadman-receive.service
+    - deadman-check.timer
+
+- name: deadman-watch | flush handlers before verifying
+  ansible.builtin.meta: flush_handlers
+
+# Prove the receiver actually answers. F-289 was a component everyone assumed
+# was there; this role does not get to make the same assumption about itself.
+- name: deadman-watch | verify the receiver answers
+  ansible.builtin.uri:
+    url: "http://{{ deadman_watch_listen_addr }}:{{ deadman_watch_listen_port }}/healthz"
+    status_code: 200
+  register: _dm_health
+  retries: 10
+  delay: 2
+  until: _dm_health.status == 200
+  changed_when: false
+
+- name: deadman-watch | warn when no PagerDuty key is present
+  # Not fatal: the mechanism is still worth installing while a key is sorted out.
+  # But it must be SAID, because a watcher that cannot page is the decorative
+  # state this whole effort exists to eliminate.
+  ansible.builtin.debug:
+    msg: >-
+      WARNING — deadman_watch_routing_key is empty. The staleness check will run
+      and log, but CANNOT page. Set PAGERDUTY_INTEGRATION_KEY in the deploy
+      environment and re-run, or this watcher notices the pipeline dying and
+      tells nobody.
+  when: deadman_watch_routing_key | default('') | length == 0
+
+- name: deadman-watch | summary
+  ansible.builtin.debug:
+    msg: >-
+      deadman-watch live on {{ inventory_hostname }} —
+      listening {{ deadman_watch_listen_addr }}:{{ deadman_watch_listen_port }},
+      staleness threshold {{ deadman_watch_threshold_seconds }}s,
+      checked every {{ deadman_watch_check_interval }},
+      paging {{ 'ENABLED' if (deadman_watch_routing_key | default('') | length > 0) else 'DISABLED (no key)' }}.
+      judging {{ (deadman_watch_expected_sources | join(', ')) if deadman_watch_expected_sources else 'ONE shared heartbeat (legacy — any live sender masks a dead one)' }}.
+      Point each obs host's deadman_webhook_url at
+      http://{{ deadman_watch_listen_addr }}:{{ deadman_watch_listen_port }}/<its inventory_hostname>

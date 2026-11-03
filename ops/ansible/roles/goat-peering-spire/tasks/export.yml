@@ -1,0 +1,32 @@
+---
+# Phase 2. Our PUBLIC bundle, for the out-of-band exchange in phase 5. You cannot
+# authenticate a bundle over the channel it secures, so the first copy travels by hand.
+- name: peering-spire | no SPIRE server declared here; nothing to export
+  ansible.builtin.debug:
+    msg: "peering_spire_enabled is false on {{ inventory_hostname }}: no bundle written for the exchange."
+  when: not (peering_spire_enabled | bool)
+
+- name: peering-spire | read our bundle
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ peering_spire_container }}"
+      - "{{ peering_spire_bin }}"
+      - bundle
+      - show
+      - -format
+      - spiffe
+  delegate_to: "{{ peering_spire_server_host }}"
+  register: _ps_ours
+  changed_when: false
+  when: peering_spire_enabled | bool
+
+- name: peering-spire | write it where the exchange step names it
+  ansible.builtin.copy:
+    content: "{{ _ps_ours.stdout }}\n"
+    dest: "{{ peering_spire_our_bundle_file }}"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  when: peering_spire_enabled | bool

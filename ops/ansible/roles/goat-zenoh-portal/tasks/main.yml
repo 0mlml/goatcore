@@ -1,0 +1,815 @@
+---
+# ops/ansible/roles/goat-zenoh-portal/tasks/main.yml
+#
+# Deploys the vendor self-service portal + inspector for the Zenoh
+# trial fabric. Single Docker container per design at
+# docs/design/zenoh-trial-fabric.md §"Vendor self-service portal +
+# inspector."
+#
+# Coordinates with the zenoh router role:
+#   - The router role owns zenohd + the access_control config-load path.
+#   - This role writes the JSON5 config the portal renders and runs
+#     the operator-supplied reload command (defaults to SIGHUP into
+#     the zenohd container).
+#
+# Pre-requisites:
+#   - The zenohd container is running (or about to come up).
+#   - The CA root cert + age identity are present on the host
+#     at portal_ca_bundle_dir / portal_age_identity_path.
+#   - The community-onboarding packet is on the host at
+#     portal_onboarding_packet_path (rsync'd from the repo).
+
+- name: Require string operator-key settings
+  ansible.builtin.assert:
+    that:
+      - portal_operator_api_key | default('') is string
+      - portal_operator_api_keys | default('') is string
+    fail_msg: "Portal operator-key settings must be strings; values withheld."
+    quiet: true
+
+- name: Validate named operator-key pairs before rendering
+  vars:
+    _portal_pairs: "{{ portal_operator_api_keys | default('') | split(',') | map('trim') | reject('equalto', '') | list }}"
+  ansible.builtin.assert:
+    that:
+      - (_portal_pairs | reject('match', '^\\s*[^:\\s](?:[^:]*[^:\\s])?\\s*:\\s*[^:\\s](?:[^:]*[^:\\s])?\\s*$') | list | length) == 0
+      - not (portal_operator_api_keys | default('')).startswith(lookup('env', 'GOAT_SECRET_REF_PREFIX') | default('op://', true))
+    fail_msg: >-
+      PORTAL_OPERATOR_API_KEYS requires comma-separated handle:key pairs with
+      exactly one colon and nonempty trimmed sides. A bare key belongs in the
+      singular PORTAL_OPERATOR_API_KEY. Resolve store references with with-secrets.
+      Values withheld; no portal configuration was rendered.
+    quiet: true
+
+- name: Require a resolved operator key before rendering
+  vars:
+    _portal_pair_count: "{{ portal_operator_api_keys | default('') | split(',') | map('trim') | reject('equalto', '') | list | length }}"
+  ansible.builtin.assert:
+    that:
+      - (portal_operator_api_key | default('') | length) > 0 or (_portal_pair_count | int) > 0
+      - not (portal_operator_api_key | default('')).startswith(lookup('env', 'GOAT_SECRET_REF_PREFIX') | default('op://', true))
+    fail_msg: >-
+      Portal needs a resolved singular bearer or named handle:key pairs.
+      For a new site, run ops/scripts/newsite-secrets.sh <site-id> with the
+      configured secret store, then direnv allow and with-secrets.
+      The singular is a bare bearer; the plural is a handle:key CSV.
+      Initial named seeding requires an explicit --bootstrap-operator handle.
+      Routine human grants use goat admin platform-admin and two-person approval
+      (ADR 1182). For unprefixed deployments, reference PORTAL_OPERATOR_API_KEY
+      or PORTAL_OPERATOR_API_KEYS in a .refs file; do not hand-mint plaintext env files.
+    quiet: true
+
+- name: Require slot-pool salt in per-uuid-slot-pool mode
+  ansible.builtin.assert:
+    that:
+      - portal_slot_pool_salt | length > 0
+    fail_msg: >-
+      portal_slot_pool_salt is EMPTY while portal_identity_model is
+      "per-uuid-slot-pool". The portal bakes its pool into SQLite at
+      FIRST BOOT from this salt; the router role derives the SAME pool
+      from zenoh_slot_pool_salt at render. An unsourced environment on
+      either side produces mismatched pools and every minted cert then
+      writes nothing, silently (F-177 class; hit live on hobby
+      2026-07-17). Source the site envrc and re-run.
+  when: portal_identity_model == "per-uuid-slot-pool"
+
+- name: Require the signing CA id in real-mint mode
+  ansible.builtin.assert:
+    that:
+      - portal_cert_sign_ca_id | trim | length > 0
+    fail_msg: >-
+      portal_cert_sign_ca_id is EMPTY while portal_cert_sign_fake is false.
+      The portal refuses to start without --ca-id, so set this goatnet's
+      signing CA id in its group_vars (the id of the CA whose root and key
+      sit at portal_ca_bundle_dir) and re-run. Checked here so the running
+      portal is not replaced by one that cannot start.
+  when: not (portal_cert_sign_fake | bool)
+
+# ---------------------------------------------------------------------------
+# ADR 1116 §9 mesh-prefix preflight (machine-enrollment.md §"The mesh half").
+# portal_mesh_site_prefix is DERIVED (site_id | upper), and the derivation only
+# coincidentally equals the taxonomy's site_prefix: a site_id and its taxonomy
+# prefix can differ. Assert equality BEFORE templating the env file,
+# so a portal can never ship a prefix whose groups nothing creates.
+# ---------------------------------------------------------------------------
+
+- name: Load NetBird ACL taxonomy for mesh-prefix preflight
+  ansible.builtin.set_fact:
+    _portal_mesh_taxonomy: "{{ lookup('file', role_path ~ '/../../netbird_acl_taxonomy.yml') | from_yaml }}"
+
+- name: Assert derived mesh site prefix equals the taxonomy site_prefix
+  ansible.builtin.assert:
+    that:
+      - portal_mesh_site_prefix == _portal_mesh_taxonomy.netbird_acl_taxonomy[site_id].site_prefix
+    fail_msg: >-
+      portal_mesh_site_prefix is "{{ portal_mesh_site_prefix }}" but
+      ops/ansible/netbird_acl_taxonomy.yml declares site_prefix
+      "{{ _portal_mesh_taxonomy.netbird_acl_taxonomy[site_id].site_prefix }}"
+      for site_id "{{ site_id }}". The mint would derive NetBird groups nothing
+      creates. Fix the taxonomy or override portal_mesh_site_prefix in
+      group_vars — do not deploy the disagreement.
+  when: site_id | mandatory in _portal_mesh_taxonomy.netbird_acl_taxonomy
+
+- name: Assert key mint stays off on a goatnet absent from the taxonomy
+  ansible.builtin.assert:
+    that:
+      - not (portal_mesh_key_mint_enabled | bool)
+    fail_msg: >-
+      portal_mesh_key_mint_enabled is true but site_id
+      "{{ site_id | mandatory }}" has no entry in
+      ops/ansible/netbird_acl_taxonomy.yml — there is no declared group
+      vocabulary to derive setup-key auto_groups from, so a mint here is a
+      contradiction. Declare the goatnet in the taxonomy first.
+  when: site_id | mandatory not in _portal_mesh_taxonomy.netbird_acl_taxonomy
+
+# The mesh-key mint needs the portal's own NetBird identity. Without it the
+# env renders without the NetBird URL and token, the deploy goes green, and the
+# portal refuses every machine enrollment at runtime (412
+# mesh_mint_unconfigured).
+- name: goat-zenoh-portal | require the NetBird service identity (portal-mint)
+  ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+  vars:
+    nsi_identity: portal-mint
+    nsi_token: "{{ lookup('env', portal_netbird_api_token_envvar) }}"
+    nsi_enabled: "{{ portal_mesh_key_mint_enabled | bool }}"
+
+# --- Store engine (ADR 1165 step A) ---
+# Refuses before anything below is published, rendered or started unless the
+# image's store, the declared store (portal_store) and the host's record of
+# where the registry's rows are agree; provisions the Postgres database when the
+# store is postgres. Public, so the compose and env templates read the DSN from
+# the same defaults.
+- name: goat-zenoh-portal | store gate and Postgres database (goat-zenoh-portal-store)
+  ansible.builtin.include_role:
+    name: goat-zenoh-portal-store
+    public: true
+
+# ---------------------------------------------------------------------------
+# Cloudflare DNS publish — mirrors the demogame + panoscope pattern.
+# Runs only when portal_publish_cloudflare_dns is true; delegate_to:
+# localhost so the API call leaves the operator workstation, not the
+# target host. Auth via CLOUDFLARE_API_TOKEN env var resolved through
+# the play-level `cloudflare_api_token` var.
+# ---------------------------------------------------------------------------
+
+- name: Cloudflare — look up zone id
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones?name={{ portal_cloudflare_zone }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | default('') }}"
+    return_content: true
+  register: portal_cf_zone_lookup
+  when: portal_publish_cloudflare_dns | bool
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Cloudflare — record zone id fact
+  ansible.builtin.set_fact:
+    portal_cf_zone_id: "{{ portal_cf_zone_lookup.json.result[0].id }}"
+  when: portal_publish_cloudflare_dns | bool
+  run_once: true
+
+- name: Cloudflare — list existing A records for the hostname
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ portal_cf_zone_id }}/dns_records?type=A&name={{ portal_traefik_host }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | default('') }}"
+    return_content: true
+  register: portal_cf_existing
+  when: portal_publish_cloudflare_dns | bool
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Cloudflare — capture existing A-record content set
+  ansible.builtin.set_fact:
+    portal_cf_existing_ips: "{{ portal_cf_existing.json.result | map(attribute='content') | list }}"
+  when: portal_publish_cloudflare_dns | bool
+  run_once: true
+
+- name: Cloudflare — create missing A records
+  ansible.builtin.uri:
+    url: "https://api.cloudflare.com/client/v4/zones/{{ portal_cf_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ cloudflare_api_token | default('') }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      type: A
+      name: "{{ portal_traefik_host }}"
+      content: "{{ item }}"
+      ttl: 60
+      proxied: false
+    status_code: [200, 201]
+  loop: "{{ portal_cloudflare_a_record_ips }}"
+  when:
+    - portal_publish_cloudflare_dns | bool
+    - item not in (portal_cf_existing_ips | default([]))
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+# ---------------------------------------------------------------------------
+
+- name: Ensure data directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0750"
+  loop:
+    - "{{ portal_data_dir }}"
+    - "{{ portal_bundles_path }}"
+    - "{{ portal_schema_dir }}"
+    # Service operator-key store — machine keys (e.g. onboard-runner) that a
+    # service's OWN role writes here so a portal redeploy can't drop them
+    # (see portal_operator_keys_dir). Under portal_data_dir so it's already
+    # host-mounted + persistent; the portal reads it via PORTAL_OPERATOR_API_KEYS_DIR.
+    - "{{ portal_operator_keys_dir }}"
+    - "/etc/goat-zenoh-portal"
+
+# The portal applies marker-based incremental edits to the live
+# zenohd config.json5. The atomic-write pattern in
+# ops/goat-zenoh-portal/internal/acl/acl.go creates a temp file in
+# the SAME directory as the config (via os.CreateTemp), then renames
+# it into place — so the portal container user needs write on the
+# parent directory, not just the file.
+#
+# A portal-driven ACL render returns "permission denied" on the temp-file
+# create even when the config FILE is 65532-owned.
+# This task chowns the directory group + adds group-write; the existing
+# file-chown task below remains unchanged.
+#
+# tls/ subdir inside /etc/goat-zenoh/ stays root:root 0755 — portal
+# can read certs but cannot write under tls/.
+- name: Ensure live zenohd config DIR is writable by portal container user (atomic-write temp file lands here)
+  ansible.builtin.file:
+    path: "{{ portal_acl_config_path | dirname }}"
+    state: directory
+    group: "65532"
+    mode: "0775"
+  when: not (portal_acl_reload_fake | bool)
+
+- name: Ensure live zenohd config is readable + writable by portal container user
+  ansible.builtin.file:
+    path: "{{ portal_acl_config_path }}"
+    owner: "65532"
+    group: "65532"
+    mode: "0644"
+  when: not (portal_acl_reload_fake | bool)
+  # When reload-fake is on (lab spike) there's no live config to chown;
+  # the renderer's apply step still runs but on whatever path is set.
+
+# Per-vendor rocksdb storage parent — both portal AND zenohd write
+# under this. Group-writable so they coexist.
+- name: Ensure rocksdb storage parent exists + is writable
+  ansible.builtin.file:
+    path: "{{ portal_acl_storage_dir_prefix }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0775"
+  when: not (portal_acl_reload_fake | bool)
+
+# Docker socket access: the portal needs to POST to the engine API
+# to SIGHUP the router. Group-membership-based access — make the
+# socket group-readable + portal container user a member.
+# Simpler alternative on Linux: just make the socket world-writable
+# (but that's a fleet-wide privilege escalation). For the trial
+# fabric we keep it tight: portal container's uid in the docker
+# socket's group via docker daemon's default permissions.
+- name: Ensure docker socket is group-accessible to portal container user
+  ansible.builtin.file:
+    path: "{{ portal_acl_docker_socket }}"
+    group: "65532"
+    mode: "0660"
+  when: not (portal_acl_reload_fake | bool)
+  # On boot the socket re-renders with the docker daemon's default
+  # group/perms; this task is idempotent at apply time. Long-term
+  # the right shape is a sidecar with narrower docker-API scope,
+  # tracked separately.
+
+# The DIRECTORIES, not just the files inside them. Chowning only the files
+# leaves the parents root-owned 0700, so the container cannot traverse in and
+# cert-sign fails with "read root cert: permission denied" — a 500 on the first
+# real mint, indistinguishable from a portal fault, even though the file-level
+# chown below ran correctly.
+- name: Normalize CA bundle + age identity DIRECTORY ownership to container uid (real-mint mode)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0700"
+  loop:
+    - "{{ portal_ca_bundle_dir }}"
+    - "{{ portal_age_identity_path | dirname }}"
+  when: not (portal_cert_sign_fake | bool)
+
+# Stage the per-goatnet CA bundle + age identity from the CONTROLLER onto the
+# host BEFORE the chown below. Path B (portal_cert_sign_fake=false) mints real
+# leaves on the host, so the offline-CA key + root cert + operator age identity
+# must be present. These live on the operator laptop (sovereignty: the dev-mode
+# CA key never enters the repo), so copy them from there. Without this the role
+# created /etc/<site>-ca but left it empty, the chown failed, and the whole
+# portal deploy (including its Traefik router) never completed — the goatnet's
+# portal came up unroutable. Guarded on real-mint mode; fake-sign needs none.
+- name: Stage CA root cert from controller (real-mint mode)
+  ansible.builtin.copy:
+    src: "{{ portal_ca_root_src }}"
+    dest: "{{ portal_ca_bundle_dir }}/root-cert.pem"
+    mode: "0644"
+  when: not (portal_cert_sign_fake | bool)
+
+- name: Stage encrypted CA key from controller (real-mint mode)
+  ansible.builtin.copy:
+    src: "{{ portal_ca_key_src }}"
+    dest: "{{ portal_ca_bundle_dir }}/ca.key.age"
+    mode: "0600"
+  when: not (portal_cert_sign_fake | bool)
+
+- name: Stage operator age identity from controller (real-mint mode)
+  ansible.builtin.copy:
+    src: "{{ portal_age_identity_src }}"
+    dest: "{{ portal_age_identity_path }}"
+    mode: "0600"
+  when: not (portal_cert_sign_fake | bool)
+
+- name: Normalize CA bundle + age identity ownership to container uid (real-mint mode)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: "65532"
+    group: "65532"
+  loop:
+    - "{{ portal_ca_bundle_dir }}/root-cert.pem"
+    - "{{ portal_ca_bundle_dir }}/ca.key.age"
+    - "{{ portal_age_identity_path }}"
+  when: not (portal_cert_sign_fake | bool)
+  # Container runs as Chainguard non-root uid 65532; without chown the
+  # mounted files fail to open (Permission denied) and cert-sign aborts
+  # with HTTP 500 on the first real-mint POST.
+
+# The compose bind-mounts /usr/local/bin/cert-sign from the HOST. Nothing
+# installs it, and docker silently CREATES AN EMPTY DIRECTORY at a missing
+# bind-mount source — so the container gets a directory where it expects a
+# binary and every real mint 500s. Refuse at deploy time instead, and name the build.
+#
+# A MISSING binary is built here, on the controller, for the host's architecture,
+# from this checkout's ops/enrollment, and installed. A DIRECTORY at that path is
+# still refused: that is a portal that already ran against nothing, and removing
+# it is the operator's call. Go is on the controller by the doctor's tool list.
+- name: Assert the host cert-sign binary exists and is a FILE (real-mint mode)
+  block:
+    - name: Stat the host cert-sign binary
+      ansible.builtin.stat:
+        path: /usr/local/bin/cert-sign
+      register: portal_cert_sign_bin
+
+    - name: Build cert-sign on the controller for this host's architecture (missing on the host)
+      ansible.builtin.command:
+        argv:
+          - go
+          - build
+          - -tags
+          - nopiv
+          - -o
+          - "{{ playbook_dir }}/../../.cert-sign-{{ inventory_hostname }}"
+          - ./cmd/cert-sign
+        chdir: "{{ playbook_dir }}/../enrollment"
+      environment:
+        GOOS: linux
+        GOARCH: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+        CGO_ENABLED: "0"
+      delegate_to: localhost
+      become: false
+      when: not portal_cert_sign_bin.stat.exists
+      changed_when: true
+
+    - name: Install cert-sign on the host (missing on the host)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../.cert-sign-{{ inventory_hostname }}"
+        dest: /usr/local/bin/cert-sign
+        mode: "0755"
+        owner: root
+        group: root
+      become: true
+      when: not portal_cert_sign_bin.stat.exists
+
+    - name: Remove the controller-side build artefact
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../.cert-sign-{{ inventory_hostname }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      when: not portal_cert_sign_bin.stat.exists
+
+    - name: Stat the host cert-sign binary again
+      ansible.builtin.stat:
+        path: /usr/local/bin/cert-sign
+      register: portal_cert_sign_bin_after
+
+    - name: Refuse to deploy a portal whose cert-sign mount is a directory
+      ansible.builtin.assert:
+        that:
+          - portal_cert_sign_bin_after.stat.exists
+          - portal_cert_sign_bin_after.stat.isreg | default(false)
+        fail_msg: >-
+          /usr/local/bin/cert-sign on this host is
+          {{ 'a DIRECTORY (docker created it from a missing bind-mount source)'
+             if portal_cert_sign_bin_after.stat.isdir | default(false)
+             else 'missing' }}.
+          The portal bind-mounts it, so every real cert mint would 500. A missing
+          binary is built and installed by the tasks above; a directory is removed
+          by hand. By hand, build and install it for this host's arch, then re-run:
+            cd ops/enrollment && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+              go build -tags nopiv -o /tmp/cert-sign ./cmd/cert-sign
+            scp /tmp/cert-sign <host>:  &&  ssh <host> 'sudo rmdir /usr/local/bin/cert-sign 2>/dev/null;
+              sudo install -m 0755 ~/cert-sign /usr/local/bin/cert-sign'
+          (Use GOARCH=amd64 on x86 hosts. `-tags nopiv` avoids the PIV/PCSC cgo
+          dependency, which is not needed for age-encrypted dev-CA signing.)
+        quiet: true
+  when: not (portal_cert_sign_fake | bool)
+
+- name: Copy zenoh-trial onboarding packet from controller
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../docs/operations/zenoh-trial-onboarding.md"
+    dest: "{{ portal_onboarding_packet_path }}"
+    mode: "0644"
+
+- name: Remove a roster this host is no longer served (ADR 1172)
+  # SKIPPING THE COPY DOES NOT REMOVE THE FILE. A host that stops being served
+  # a roster keeps whatever the last converge left in portal_data_dir, which can
+  # be the controller-side union of every declared person.
+  # The portal stops READING it when portal_roster_path is empty; the identity
+  # records stay on disk. Closing the boundary means deleting them, not just
+  # ceasing to refresh them.
+  ansible.builtin.file:
+    path: "{{ portal_data_dir }}/roster.json"
+    state: absent
+  when: portal_roster_path | length == 0 or portal_roster_env | length == 0
+  notify: restart goat-zenoh-portal
+
+- name: Refuse a roster with no goatnet named (ADR 1172)
+  ansible.builtin.assert:
+    that: portal_roster_env | length > 0
+    fail_msg: >-
+      portal_roster_path is set but portal_roster_env is not, so this play cannot
+      tell which goatnet's roster this host should be served. Set
+      portal_roster_env to this goatnet's name in its group_vars (zagros /
+      zagros-prod / zagros-dev). Do NOT point it at the controller-side union
+      docs/operators/roster.json — that file spans every environment and
+      shipping it here is the boundary crossing ADR 1172 forbids.
+    quiet: true
+  when: portal_roster_path | length > 0
+
+- name: Copy declared-half registry (roster.json) from controller
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../docs/operators/{{ portal_roster_env }}/roster.json"
+    dest: "{{ portal_roster_path }}"
+    mode: "0644"
+  when: portal_roster_path | length > 0 and portal_roster_env | length > 0
+  notify: restart goat-zenoh-portal
+  # Identity-grammar Phase B (ADR 1031 / ADR 1043), scoped per goatnet by
+  # ADR 1172. The committed, sanitized roster is the Data-Access COP's declared
+  # half; regenerate this goatnet's with
+  #   ops/operators/gen-roster.py --env {{ portal_roster_env }}
+  # after any manifest change before deploying. That artifact is built from
+  # ops/operators/{{ portal_roster_env }}/ — the manifests this goatnet's own
+  # console minted — so no other environment's people can reach this host.
+
+- name: Copy release-set registry (release-sets.yaml) from controller
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../ops/permissions/release-sets.yaml"
+    dest: "{{ portal_release_sets_path }}"
+    mode: "0644"
+  when: portal_release_sets_path | length > 0
+  notify: restart goat-zenoh-portal
+  # ADR 1027 (data-access program B2). The committed release-set registry is the
+  # Data-Access COP's release-governance picture (org → release lane); edit
+  # ops/permissions/release-sets.yaml to change membership, then redeploy.
+
+- name: Render partner slot blocks (ADR 1138) from the SAME group_var the router reads
+  ansible.builtin.copy:
+    content: |
+      # GENERATED — do not edit on the host.
+      # Rendered by roles/goat-zenoh-portal from `zenoh_partner_slot_blocks`,
+      # the same variable roles/goat-zenoh renders into the router ACL. Editing
+      # this file by hand desynchronizes the portal from the router: the portal
+      # would allocate a partner into a range the router does not carve, and
+      # that partner reads the whole fabric silently.
+      # Change ops/ansible/group_vars/<env>/data-access.yml and redeploy BOTH.
+      version: 1
+      {% if (zenoh_partner_slot_blocks | default([]) | length) > 0 %}
+      partner_slot_blocks:
+      {{ zenoh_partner_slot_blocks | to_nice_yaml(indent=2) | trim }}
+      {% else %}
+      partner_slot_blocks: []
+      {% endif %}
+    dest: "{{ portal_partner_slot_blocks_path }}"
+    mode: "0644"
+  when: portal_partner_slot_blocks_path | length > 0
+  notify: restart goat-zenoh-portal
+
+- name: Copy coalition frameworks registry (coalition-frameworks.yaml) from controller
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../ops/identity/coalition-frameworks.yaml"
+    dest: "{{ portal_coalition_frameworks_path }}"
+    mode: "0644"
+  when: portal_coalition_frameworks_path | length > 0
+  notify: restart goat-zenoh-portal
+  # ADR 1077 (data-access program B2.2). With the roster, lets the COP derive the
+  # member release lane (REL-COALITION) from onboarded orgs' nations — a coalition
+  # member auto-appears in the framework's lane without a hand edit.
+
+- name: Stage the ACL taxonomy for bundle-create
+  # bundle-create's gear-class check is fail-closed and the portal invokes it
+  # with no --taxonomy, so the binary resolves the repo-relative default by
+  # walking up from its working directory — which is / inside the container.
+  # The compose file mounts this at /ops/ansible/netbird_acl_taxonomy.yml so
+  # that walk can succeed. Skipped entirely when bundle-create is off.
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../netbird_acl_taxonomy.yml"
+    dest: "{{ portal_acl_taxonomy_host_path }}"
+    mode: "0644"
+  when: portal_bundle_create_bin | length > 0
+  notify: restart goat-zenoh-portal
+
+# The compose file bind-mounts this path when bundle-create is on. Docker
+# silently creates a DIRECTORY for a bind-mount source that does not exist, so
+# a missing source here does not fail the deploy — it produces a portal that
+# mints tarballs whose CA file is a directory. Stage it, and assert first.
+- name: Assert the bundle-signing CA public key exists in the checkout
+  ansible.builtin.assert:
+    that:
+      - portal_bundle_ca_pubkey_src is exists
+    fail_msg: >-
+      {{ portal_bundle_ca_pubkey_src }} not found. It is derived from
+      portal_cert_sign_ca_id ({{ portal_cert_sign_ca_id }}) — the CA that
+      bundle-create signs the .cbor with. Either that id is wrong for this
+      goatnet, or the public key was never committed to
+      ops/enrollment/public-keys/. goat-cli compiles in no CA root, so without
+      this file the tarball ships a bundle the recipient cannot verify.
+  when: portal_bundle_create_bin | length > 0
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Stage the bundle-signing CA public key for the onboarding tarball
+  # Public key material — 0644 is correct and deliberate. This is what the
+  # recipient runs `goat ca add` on.
+  ansible.builtin.copy:
+    src: "{{ portal_bundle_ca_pubkey_src }}"
+    dest: "{{ portal_bundle_ca_pubkey }}"
+    mode: "0644"
+  when: portal_bundle_create_bin | length > 0
+  notify: restart goat-zenoh-portal
+
+- name: Render docker-compose for portal
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ portal_data_dir }}/docker-compose.yml"
+    mode: "0640"
+  notify: restart goat-zenoh-portal
+
+# F-569. PORTAL_OPERATOR_API_KEYS is re-rendered from the DEPLOYING shell's
+# environment. A redeploy from a shell where that variable is empty or stale
+# silently revokes every key that lived only there: that dropped
+# grant-keyd's key, and key distribution 401'd for three days while the play
+# reported success. Compare HANDLES (never values) on the host with what this
+# run is about to render, and refuse to remove any handle that is not either
+# re-homed in the on-host service-key directory or named for removal by the
+# operator (-e '{"portal_operator_keys_allow_removal":["handle"]}').
+- name: Operator keys | handles in the portal's current .env
+  ansible.builtin.shell: |
+    set -o pipefail
+    f="{{ portal_data_dir }}/.env"
+    [ -f "$f" ] || exit 0
+    grep '^PORTAL_OPERATOR_API_KEYS=' "$f" | cut -d= -f2- | tr ',' '\n' | sed -n 's/^\([^:]*\):.*/\1/p' | sort -u
+  args:
+    executable: /bin/bash
+  register: portal_keys_env_before
+  changed_when: false
+  become: true
+
+- name: Operator keys | handles held in the on-host service-key directory
+  ansible.builtin.shell: |
+    set -o pipefail
+    d="{{ portal_operator_keys_dir }}"
+    [ -d "$d" ] || exit 0
+    set -- "$d"/*.key
+    # A new goatnet has the directory and no keys yet; that is a valid empty
+    # answer, not an error. cat on an unmatched glob fails under pipefail.
+    [ -e "$1" ] || exit 0
+    awk -F: '/^[[:space:]]*#/ { next } NF { print $1 }' "$@" | sort -u
+  args:
+    executable: /bin/bash
+  register: portal_keys_dir_handles
+  changed_when: false
+  become: true
+
+- name: Operator keys | refuse to drop a handle this run does not render
+  vars:
+    _after: >-
+      {{ (portal_operator_api_keys | default('', true)).split(',')
+         | map('trim') | select | map('regex_replace', ':.*$', '') | list }}
+    _dropped: >-
+      {{ portal_keys_env_before.stdout_lines
+         | difference(_after)
+         | difference(portal_keys_dir_handles.stdout_lines)
+         | difference(portal_operator_keys_allow_removal | default([])) }}
+  ansible.builtin.assert:
+    that: _dropped | length == 0
+    fail_msg: >-
+      goat-zenoh-portal: this run would REVOKE operator key(s) {{ _dropped }} —
+      they are in the portal's current PORTAL_OPERATOR_API_KEYS but not in this
+      shell's, and not in {{ portal_operator_keys_dir }}. That is how grant-keyd
+      lost its key on 2026-09-22. Load the goatnet's envrc so
+      PORTAL_OPERATOR_API_KEYS is complete, move a service key into the key
+      directory, or, if the removal is intended, re-run with
+      -e '{"portal_operator_keys_allow_removal":{{ _dropped | to_json }}}'.
+    quiet: true
+
+- name: Render .env for portal
+  ansible.builtin.template:
+    src: portal.env.j2
+    dest: "{{ portal_data_dir }}/.env"
+    mode: "0600"
+  notify: restart goat-zenoh-portal
+
+- name: Pull portal image
+  community.docker.docker_compose_v2_pull:
+    project_src: "{{ portal_data_dir }}"
+  changed_when: false
+
+# A Traefik router that names a middleware nothing defines does
+# not fail loudly — it goes into ERROR STATE and stops serving, which presents
+# as a plain 404 on every path with OriginStatus 0, while the container stays
+# healthy and isitup shows the row green. Nothing says the front door is shut.
+#
+# The deploy ORDER matters ("run traefik-acme.yml BEFORE portal-deploy.yml"), and
+# this check enforces it.
+#
+# Checked against the host's ACTUAL dynamic directory rather than against what
+# this play would render, because the failure is precisely a disagreement
+# between what the route references and what the host already has.
+- name: Read the Traefik dynamic dir to check referenced middlewares exist
+  ansible.builtin.shell:
+    cmd: "cat {{ portal_traefik_dynamic_dir }}/*.yml 2>/dev/null || true"
+  register: _portal_traefik_dynamic_blob
+  changed_when: false
+  check_mode: false
+
+- name: Refuse to render a portal route whose middlewares the host does not define
+  ansible.builtin.assert:
+    that:
+      - (item | regex_replace('@file$', '')) ~ ':' in _portal_traefik_dynamic_blob.stdout
+    fail_msg: >-
+      portal.yml would reference the Traefik middleware
+      "{{ item }}", which is not defined anywhere in
+      {{ portal_traefik_dynamic_dir }}. Rendering it would put the portal's
+      router into error state and 404 EVERY request to
+      {{ portal_public_url | default('the portal hostname') }} — with a healthy
+      container and a green isitup row, which is how this went unnoticed for
+      nine days on zagros-prod. Run traefik-acme.yml (or the traefik
+      role) against this host FIRST so the definition lands, then re-run this
+      play. To deploy without the middleware instead, set the corresponding
+      portal_traefik_*_middleware var to "".
+    success_msg: 'middleware "{{ item }}" is defined on this host'
+  loop: "{{ [portal_traefik_mesh_only_middleware, portal_traefik_inflight_middleware] | select('string') | reject('equalto', '') | list }}"
+  when: _portal_traefik_dynamic_blob.stdout | length > 0
+
+- name: Render Traefik file-provider dynamic config
+  ansible.builtin.template:
+    src: traefik-portal.yml.j2
+    dest: "{{ portal_traefik_dynamic_dir }}/{{ portal_traefik_dynamic_filename }}"
+    mode: "0644"
+  # Traefik picks up file-provider changes automatically — no SIGHUP needed.
+
+# The route filename changed. Traefik's file provider reads
+# the whole directory, so an orphaned old file is not inert: it declares a
+# second router on the same Host() rule. Guarded on the two names differing so
+# this is a no-op once the rename is old.
+- name: goat-zenoh-portal | remove pre-rename Traefik route file
+  ansible.builtin.file:
+    path: "{{ portal_traefik_dynamic_dir }}/{{ portal_traefik_dynamic_filename_legacy }}"
+    state: absent
+  become: true
+  when:
+    - portal_traefik_dynamic_filename_legacy | default('') | length > 0
+    - portal_traefik_dynamic_filename_legacy != portal_traefik_dynamic_filename
+
+- name: Bring up portal
+  community.docker.docker_compose_v2:
+    project_src: "{{ portal_data_dir }}"
+    state: present
+
+# Portal image is glibc-dynamic distroless — no curl / wget / sh inside.
+# Verify the container is Running here; full /api/health end-to-end check
+# belongs in the operator runbook (curl from operator workstation against
+# the live Traefik route).
+- name: Wait for container to be Running
+  ansible.builtin.command:
+    cmd: "docker inspect -f {{ '{{.State.Running}}' }} {{ portal_container_name }}"
+  register: portal_running
+  retries: 30
+  delay: 2
+  until: portal_running.stdout | trim == 'true'
+  changed_when: false
+
+- name: Wait for the problem-pages sidecar to be Running
+  ansible.builtin.command:
+    cmd: "docker inspect -f {{ '{{.State.Running}}' }} {{ portal_problem_pages_container_name }}"
+  register: portal_problem_pages_running
+  retries: 30
+  delay: 2
+  until: portal_problem_pages_running.stdout | trim == 'true'
+  changed_when: false
+  when: portal_problem_pages_enabled | default(false)
+
+# Crash-loop guard. The above task is satisfied by the container being
+# Running for one instant — a crash-looping container passes it because
+# docker reports Running=true between restarts. The
+# portal-peering-section deploy hit this exactly: the playbook reported
+# success while the container was actually exiting with "flag provided
+# but not defined" every ~5s.
+#
+# Re-inspect after a short settle (15s) and require the container has
+# been continuously up since BEFORE the previous inspect. If RestartCount
+# has incremented OR StartedAt has moved forward in our window, the
+# container is crash-looping and the deploy is broken — fail loudly
+# instead of reporting changed=3 success.
+- name: Capture container start state pre-settle
+  ansible.builtin.shell: |
+    docker inspect -f '{{ "{{.State.StartedAt}}" }}|{{ "{{.RestartCount}}" }}' {{ portal_container_name }}
+  register: portal_state_pre
+  changed_when: false
+
+# The sidecar gets the same guard: "unknown subcommand" from an image that
+# predates `problem-pages` is exactly the F-157 shape, and the Running wait
+# above passes a crash-looping container between restarts.
+- name: Capture problem-pages sidecar start state pre-settle
+  ansible.builtin.shell: |
+    docker inspect -f '{{ "{{.State.StartedAt}}" }}|{{ "{{.RestartCount}}" }}' {{ portal_problem_pages_container_name }}
+  register: portal_problem_pages_state_pre
+  changed_when: false
+  when: portal_problem_pages_enabled | default(false)
+
+- name: Settle window (15s) — catch crash-loops
+  ansible.builtin.pause:
+    seconds: 15
+
+- name: Capture container start state post-settle
+  ansible.builtin.shell: |
+    docker inspect -f '{{ "{{.State.StartedAt}}" }}|{{ "{{.RestartCount}}" }}' {{ portal_container_name }}
+  register: portal_state_post
+  changed_when: false
+
+- name: Fail if container restarted during the settle window
+  ansible.builtin.fail:
+    msg: |
+      goat-zenoh-portal restarted during the post-deploy settle window:
+        before:  {{ portal_state_pre.stdout }}
+        after:   {{ portal_state_post.stdout }}
+      The container is crash-looping. Inspect logs:
+        ssh {{ inventory_hostname }} sudo docker logs {{ portal_container_name }} --tail 50
+      Common cause: CLI-surface drift between the role's compose template
+      and the image binary. Roll back with:
+        ops/scripts/rollback.sh goat-zenoh-portal
+  when: portal_state_pre.stdout != portal_state_post.stdout
+
+- name: Capture problem-pages sidecar start state post-settle
+  ansible.builtin.shell: |
+    docker inspect -f '{{ "{{.State.StartedAt}}" }}|{{ "{{.RestartCount}}" }}' {{ portal_problem_pages_container_name }}
+  register: portal_problem_pages_state_post
+  changed_when: false
+  when: portal_problem_pages_enabled | default(false)
+
+- name: Fail if the problem-pages sidecar restarted during the settle window
+  ansible.builtin.fail:
+    msg: |
+      {{ portal_problem_pages_container_name }} restarted during the post-deploy settle window:
+        before:  {{ portal_problem_pages_state_pre.stdout }}
+        after:   {{ portal_problem_pages_state_post.stdout }}
+      The sidecar is crash-looping. Inspect logs:
+        ssh {{ inventory_hostname }} sudo docker logs {{ portal_problem_pages_container_name }} --tail 50
+      Common cause: the pinned portal image predates the `problem-pages`
+      subcommand (#1247), so the process exits on an unknown subcommand.
+      Either move the pin or set portal_problem_pages_enabled to false for
+      this site and re-run; the errors middleware is already rendered, so
+      until then a 429 answers with Traefik's Bad Gateway body.
+  when:
+    - portal_problem_pages_enabled | default(false)
+    - portal_problem_pages_state_pre.stdout != portal_problem_pages_state_post.stdout
+
+# Deploy ledger (/var/lib/goat/goat-zenoh-portal/deploy-history.jsonl) is now
+# written by the shared `rollback-ledger` meta-dependency (meta/main.yml) per
+# ADR 1060 — no per-role ledger task here. Because portal_image can be pinned in
+# group_vars (not the role default), the on-host jsonl is the only
+# record that reflects what actually ran, which is what makes a running
+# portal targetable by ops/scripts/rollback.sh. The in-repo deploy-history.yml
+# is unchanged.

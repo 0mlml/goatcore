@@ -1,0 +1,32 @@
+groups:
+  - name: enrolment-watch
+    rules:
+      # A device somebody is waiting on. NOT attack traffic — every instance
+      # found so far was our own misconfiguration, so the response is to
+      # attribute and fix the client, never to rate-limit the source.
+      - alert: NetbirdPeerStuckEnrolling
+        expr: goat_netbird_enrol_stuck_peers > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} peer(s) repeatedly refused enrolment and never succeeded"
+          description: >-
+            A device is retrying enrolment and cannot complete it. Read
+            /var/log/enrolment-watch/last-run.txt on the mgmt host for the key
+            prefix and the reason. Do NOT rate-limit it: fix or revoke the
+            client. Attribution needs the client address, which netbird does not
+            record for a peer that never enrols — see the role README.
+
+      # The guard itself going quiet is the failure it exists to prevent,
+      # arriving by a different road.
+      - alert: EnrolmentWatchStale
+        expr: time() - goat_netbird_enrol_watch_last_run_timestamp_seconds > 10800
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "enrolment-watch has not completed a run in 3h"
+          description: >-
+            No verdict is being produced, so a stuck device would now be as
+            invisible as it was before this guard existed. Check the timer.

@@ -1,0 +1,76 @@
+---
+# ops/ansible/roles/ansible-bastion/defaults/main.yml
+#
+# Defaults for the in-theater Ansible bastion + git workspace on Orin-C.
+# Override per-host in group_vars/<host>/vars.yml or via -e.
+
+# UNIX group name for operators with workspace + (later) tooling access.
+ansible_bastion_group: goat-ops
+
+# Workspace root. Lives on the NVMe (per ADR 0826) so disk pressure
+# never threatens /. Operators clone the trunk repo under here and run
+# plays against the fleet from this directory.
+ansible_bastion_workspace: /opt/ansible-workspace
+
+# Apt packages needed to operate the cluster from this host.
+# - ansible / ansible-lint    : run plays against the fleet
+# - git                       : clone + pull trunk
+# - python3-pip / python3-venv: operator-installable extras (e.g. boto3)
+# - direnv                    : operator-friendly .envrc usage
+# - jq / yq / less / vim      : routine Ansible / shell hygiene
+# - sshpass                   : seed-ssh-key.sh helper (Ansible-discouraged
+#                               but required by ops/scripts/seed-ssh-key.sh)
+# - openssh-client            : ssh, scp, ssh-keygen, ssh-keyscan
+# - rsync                     : ad-hoc fleet pulls
+# - tmux                      : long-running plays survive ssh drops
+# - golang-go                 : build snitch + bundle-create + cert-sign
+#                               from operator workspace if needed
+# - shellcheck                : pre-commit lint parity
+# - python3-yaml              : Ansible JSON/YAML helpers
+# - curl / ca-certificates    : routine HTTP + TLS root store
+ansible_bastion_apt_packages:
+  - ansible
+  - ansible-lint
+  - git
+  - python3-pip
+  - python3-venv
+  - python3-yaml
+  - direnv
+  - jq
+  - less
+  - vim
+  - sshpass
+  - openssh-client
+  - rsync
+  - tmux
+  - golang-go
+  - shellcheck
+  - curl
+  - ca-certificates
+
+# Operators with workspace access. Each entry:
+#   - name        : UNIX account (created if missing)
+#   - email       : git config user.email
+#   - ssh_pubkey  : authorized_keys for SSH access
+#   - comment     : free-form note (date added, role, etc.)
+#
+# Empty by default — set in group_vars/vega_obs_hosts/vars.yml or via -e.
+# The `ca_signing_host_operators` roster on the same host is the durable
+# named record; this list MAY mirror it (same operators) or diverge if
+# bastion access is broader than CA-signing access.
+ansible_bastion_operators: []
+
+# Pre-clone trunk repo into the workspace (via HTTPS — operators add their
+# own auth tokens or switch to SSH push remote post-clone). Set to "" to
+# skip; set to a clone URL to clone if not already present. Idempotent
+# (no overwrite if .git/ exists).
+ansible_bastion_trunk_repo_url: ""
+ansible_bastion_trunk_repo_dir: "goat"  # under workspace/
+ansible_bastion_trunk_repo_branch: "main"
+
+# SSH known_hosts pre-population for the fleet. Each entry is a
+# `host=<name>:port=<22>` plus the host's currently-published pubkey
+# (rendered into ~/.ssh/known_hosts for each operator). Optional —
+# operators can also let StrictHostKeyChecking=accept-new prompt them
+# on first contact. Empty by default.
+ansible_bastion_known_hosts: []

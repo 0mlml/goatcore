@@ -1,0 +1,48 @@
+{#- registry-rows.json.j2 — what the obs host needs to know about each service
+    its goatnet declares, to decide whether to probe it (#1518).
+
+    `reg` is the hostvars of one host in obs_blackbox_registry_group (the
+    goatnet's mgmt group; the obs host inherits none of its vars). Emits one
+    {fqdn, lifecycle, listed} per isitup_services row and per external-service
+    hostname. A row past its retire_after date is emitted `listed: false`, and a
+    declaration's `enabled: false`, `status.list`, `status.lifecycle` and
+    per-hostname `status.hostnames.<h>` overrides are applied, so the probe
+    templates only ever test two fields.
+
+    The status page builds its own row list the same way
+    (roles/isitup/templates/isitup-rows.json.j2); keep the rules in step. -#}
+{%- set _today = now(utc=True, fmt='%Y-%m-%d') -%}
+{%- set _rows = [] -%}
+{%- for s in reg.isitup_services | default([]) -%}
+{%-   set _retire = (s.retire_after | default('')) | string -%}
+{%-   set _ = _rows.append({
+        'fqdn': (s.fqdn | default('')) | lower,
+        'lifecycle': s.lifecycle | default('live'),
+        'listed': (s.listed | default(true) | bool) and not (_retire and _retire < _today),
+      }) -%}
+{%- endfor -%}
+{#- A hostname an isitup_services row already names is that row's, as on the
+    status page. -#}
+{%- set _claimed = _rows | map(attribute='fqdn') | list -%}
+{%- for _var in reg.keys() | select('match', '^external_service_') | sort -%}
+{%-   set _ext = reg[_var] -%}
+{%-   if _ext is mapping -%}
+{%-     set _st = _ext.status | default({}) -%}
+{%-     set _per = _st.hostnames | default({}) -%}
+{%-     set _retire = (_ext.retire_after | default('')) | string -%}
+{%-     for _h in _ext.hostnames | default([_ext.name]) -%}
+{%-       set _ho = _per[_h] | default({}) -%}
+{%-       set _fqdn = (_h ~ '.' ~ reg.site_id ~ '.' ~ reg.site_dns_zone) | lower -%}
+{%-       if _fqdn not in _claimed -%}
+{%-       set _ = _rows.append({
+            'fqdn': _fqdn,
+            'lifecycle': _ho.lifecycle | default(_st.lifecycle | default('live')),
+            'listed': (_ext.enabled | default(true) | bool)
+                      and (_ho.list | default(_st.list | default(true)) | bool)
+                      and not (_retire and _retire < _today),
+          }) -%}
+{%-       endif -%}
+{%-     endfor -%}
+{%-   endif -%}
+{%- endfor -%}
+{{ _rows | to_json }}

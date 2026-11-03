@@ -1,0 +1,36 @@
+# Rendered by ops/ansible/roles/obs-traefik for route `{{ route.name }}`
+# on {{ ansible_date_time.iso8601 }}. One file per route; consumer
+# roles add their own files to /etc/goat/traefik-dynamic/ via
+# the same template.
+#
+# DO NOT EDIT on host; edit the obs-traefik role + re-run.
+
+http:
+  routers:
+    {{ route.name }}:
+      rule: "{% for h in route.hosts %}Host(`{{ h }}`){% if not loop.last %} || {% endif %}{% endfor %}"
+      entryPoints: [websecure]
+      service: {{ route.name }}
+      tls:
+        # Per-route cert. cert-sign output covers the SANs in
+        # route.hosts; one cert per service keeps blast-radius small.
+        # Cert files delivered into <tls_root>/<route.name>/.
+        # (Traefik picks up the cert via the inline tls.certificates
+        # block below since file provider is the static-config source.)
+{% if route.middlewares is defined and route.middlewares | length > 0 %}
+      middlewares:
+{% for m in route.middlewares %}
+        - {{ m }}
+{% endfor %}
+{% endif %}
+  services:
+    {{ route.name }}:
+      loadBalancer:
+        servers:
+          - url: "{{ route.backend }}"
+
+tls:
+  certificates:
+    - certFile: "{{ obs_traefik_tls_root }}/{{ route.name }}/cert.pem"
+      keyFile:  "{{ obs_traefik_tls_root }}/{{ route.name }}/key.pem"
+      stores: [default]

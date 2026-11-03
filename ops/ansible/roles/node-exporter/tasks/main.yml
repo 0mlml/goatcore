@@ -1,0 +1,113 @@
+---
+# ops/ansible/roles/node-exporter
+#
+# Anchor: F-289 — a declared scrape target with nothing behind it.
+# Companion to the obs-host role, which ships the obs host's own exporter.
+
+- name: node-exporter | ensure compose dir exists
+  ansible.builtin.file:
+    path: "{{ node_exporter_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: node-exporter | ensure textfile collector dir exists
+  # Must exist before first start: the container mounts it, and a missing
+  # source path makes compose fail rather than create it.
+  ansible.builtin.file:
+    path: "{{ node_exporter_textfile_host_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: node-exporter | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ node_exporter_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: node-exporter compose changed
+
+- name: node-exporter | publish the declared link capacity (ADR 1128 denominator)
+  # A static textfile rather than a probe: capacity is a DECLARED fact about
+  # the host's link, so it belongs to config, and re-rendering it is how it
+  # changes. Where source is unknown this still renders — emitting
+  # goat_link_capacity_declared 0 — because "nobody has characterised this
+  # host" is itself the thing the dashboard needs to know.
+  ansible.builtin.template:
+    src: link-capacity.prom.j2
+    dest: "{{ node_exporter_textfile_host_dir }}/goat_link_capacity.prom"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: node-exporter | pull image
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ node_exporter_compose_dir }}"
+  changed_when: true
+
+- name: node-exporter | bring up
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ node_exporter_compose_dir }}"
+  register: _ne_up
+  changed_when: "'Started' in _ne_up.stderr or 'Created' in _ne_up.stderr or 'Recreated' in _ne_up.stderr"
+
+# Verification, not hope. F-289's whole shape was a component that was declared,
+# assumed present, and never checked — so this role proves the endpoint answers
+# before it reports success.
+- name: node-exporter | wait for /metrics to answer
+  ansible.builtin.uri:
+    # Probe the address it was actually TOLD to bind. Hard-coding localhost
+    # would pass on a bind-all exporter and then hang forever on a narrowly
+    # bound one — a readiness check that only works in the easy case.
+    url: "http://{{ node_exporter_listen_addr | default('localhost', true) or 'localhost' }}:{{ node_exporter_port }}/metrics"
+    status_code: 200
+    return_content: false
+  register: _ne_ready
+  retries: 15
+  delay: 2
+  until: _ne_ready.status == 200
+  changed_when: false
+
+- name: node-exporter | prove the capacity declaration is being served
+  # F-289's shape was a declared thing nobody checked. The capacity metric is
+  # the denominator of every utilisation panel, so a silently-absent textfile
+  # would make those panels quietly wrong rather than visibly empty.
+  ansible.builtin.uri:
+    url: "http://{{ node_exporter_listen_addr | default('localhost', true) or 'localhost' }}:{{ node_exporter_port }}/metrics"
+    return_content: true
+  register: _ne_caps
+  changed_when: false
+  failed_when: "'goat_link_capacity_declared' not in _ne_caps.content"
+
+# The 503 in F-289 was a 200-less scrape that still had a live listener, so
+# "port answers" is not sufficient — confirm it is actually emitting node
+# metrics, and do it within a bounded time so a hung collector shows up here
+# rather than as a mystery target-down days later.
+- name: node-exporter | confirm it emits node metrics (catches a hung collector)
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      curl -s --max-time 10 http://localhost:{{ node_exporter_port }}/metrics
+      | grep -c '^node_' || true
+    executable: /bin/bash
+  register: _ne_metric_count
+  changed_when: false
+
+- name: node-exporter | fail if the exporter answers but emits nothing
+  ansible.builtin.assert:
+    that:
+      - (_ne_metric_count.stdout | trim | int) > 0
+    fail_msg: >-
+      node_exporter is listening on {{ node_exporter_port }} but returned no
+      node_* metrics within 10s. That is the concurrency-limit signature from
+      F-289: a collector is hanging and holding request slots until all 40 fill,
+      after which every scrape 503s. Check
+      node_exporter_disabled_collectors (thermal_zone hangs on Jetson Orin).
+    success_msg: >-
+      node_exporter healthy — {{ _ne_metric_count.stdout | trim }} node_* metrics.

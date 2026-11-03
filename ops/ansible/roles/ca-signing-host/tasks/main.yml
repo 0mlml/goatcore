@@ -1,0 +1,261 @@
+---
+# Block 22M interim — multi-operator dev-CA signing host.
+# See docs/adr/0406-offline-ca-yubikey-piv.md §"Interim mode" and the role
+# README. Idempotent; safe to re-run when the operator roster changes.
+
+- name: Ensure base packages present
+  become: true
+  ansible.builtin.apt:
+    name:
+      - git
+      - auditd
+      - golang-go
+      - acl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create signing-host workdir
+  become: true
+  ansible.builtin.file:
+    path: "{{ ca_signing_host_workdir }}"
+    state: directory
+    owner: root
+    group: "{{ ca_signing_host_group }}"
+    mode: "0755"
+  # group ownership flips to goat-ca-operators after the group is created
+  # below; on first run the group doesn't exist yet, so chgrp via a follow-up
+  # task. Mark notify-handler if the group is freshly created.
+
+- name: Ensure goat-ca-operators group present
+  become: true
+  ansible.builtin.group:
+    name: "{{ ca_signing_host_group }}"
+    state: present
+    system: true
+
+- name: Re-apply group ownership to workdir (now that group exists)
+  become: true
+  ansible.builtin.file:
+    path: "{{ ca_signing_host_workdir }}"
+    state: directory
+    owner: root
+    group: "{{ ca_signing_host_group }}"
+    mode: "0755"
+
+- name: Copy encrypted CA blob to workdir
+  become: true
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../enrollment/ca/dev/ca.key.age"
+    dest: "{{ ca_signing_host_workdir }}/ca.key.age"
+    owner: root
+    group: "{{ ca_signing_host_group }}"
+    mode: "0644"
+
+- name: Copy CA root certificate to workdir
+  become: true
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../enrollment/ca/dev/root-cert.pem"
+    dest: "{{ ca_signing_host_workdir }}/root-cert.pem"
+    owner: root
+    group: "{{ ca_signing_host_group }}"
+    mode: "0644"
+
+- name: Copy operator-curated wg-cp0 relays file to workdir
+  become: true
+  ansible.builtin.copy:
+    src: "{{ ca_signing_host_relays_file }}"
+    dest: "{{ ca_signing_host_workdir }}/wg-cp0-relays.json"
+    owner: root
+    group: "{{ ca_signing_host_group }}"
+    mode: "0644"
+
+- name: Write CA ID marker file
+  become: true
+  ansible.builtin.copy:
+    content: "{{ ca_signing_host_ca_id }}\n"
+    dest: "{{ ca_signing_host_workdir }}/ca-id"
+    owner: root
+    group: "{{ ca_signing_host_group }}"
+    mode: "0644"
+
+- name: Clone repo for the allowlist git checkout
+  become: true
+  ansible.builtin.git:
+    repo: "{{ ca_signing_host_repo_url }}"
+    dest: "{{ ca_signing_host_workdir }}/repo"
+    version: "{{ ca_signing_host_repo_branch }}"
+    update: true
+  # This clone is shared by every operator. Each operator commits + pushes
+  # under their UNIX user identity (configured per-user below); git uses the
+  # working-tree clone but each push authenticates with the operator's own
+  # credentials (HTTPS token in env or SSH agent forwarded — operator's call).
+
+- name: Set group ownership recursively on the cloned repo
+  become: true
+  ansible.builtin.file:
+    path: "{{ ca_signing_host_workdir }}/repo"
+    state: directory
+    owner: root
+    group: "{{ ca_signing_host_group }}"
+    mode: "g+rw"
+    recurse: true
+
+- name: Configure git safe.directory for the shared repo
+  become: true
+  ansible.builtin.command:
+    cmd: "git config --system --add safe.directory {{ ca_signing_host_workdir }}/repo"
+  changed_when: false  # idempotent at the git level
+
+# ops/enrollment declares `go 1.26.0` since the x/crypto bump
+# (GO-2026-6354/6355 are reachable through cmd/wg-cp0's ssh.NewClientConn, and
+# the fix is only in x/crypto v0.56.0, which itself requires go >= 1.26.0 — the
+# directive bump is forced, not a preference).
+#
+# This host builds bundle-create from source on EVERY run, with whatever `go`
+# the `golang-go` distro package provides. When that toolchain is older than the
+# directive, Go 1.21+ tries to fetch a matching toolchain from proxy.golang.org.
+# On a CA signing host that may have no such egress, and the resulting build
+# error names neither the toolchain nor the network as the cause.
+#
+# So: probe the real thing first, and if it cannot build, say which of the two
+# fixes applies. Cheap (`go list` on one package) and fail-closed — an operator
+# reads a remedy instead of a compiler error about a missing toolchain.
+- name: Preflight — this host's Go can satisfy the enrollment module's directive
+  become: true
+  ansible.builtin.command:
+    # `go list` resolves the module + toolchain without compiling, so this is
+    # cheap and fails for exactly the reason a build would.
+    cmd: "go list ./ops/enrollment/cmd/bundle-create/"
+    chdir: "{{ ca_signing_host_workdir }}/repo"
+  environment:
+    GOPATH: "/root/go"
+    HOME: "/root"
+  register: ca_signing_host_go_probe
+  changed_when: false
+  failed_when: false
+
+- name: Report the Go toolchain in use (for the failure message below)
+  become: true
+  ansible.builtin.command: "go version"
+  register: ca_signing_host_go_version
+  changed_when: false
+  failed_when: false
+
+- name: Assert the Go toolchain can build the enrollment module
+  ansible.builtin.assert:
+    that:
+      - ca_signing_host_go_probe.rc == 0
+    fail_msg: >-
+      This host cannot build ops/enrollment.
+      Toolchain: "{{ ca_signing_host_go_version.stdout | default('go not found') }}".
+      Error: {{ (ca_signing_host_go_probe.stderr | default('')) | truncate(400) }}
+      ops/enrollment requires go >= 1.26.0 (forced by golang.org/x/crypto v0.56.0,
+      which carries the fix for GO-2026-6354/6355). Either install a Go >= 1.26 on
+      this host (the distro golang-go package is older), or give it egress to
+      proxy.golang.org so Go can fetch the matching toolchain itself.
+    quiet: true
+
+- name: Build bundle-create binary
+  become: true
+  ansible.builtin.command:
+    cmd: "go build -o {{ ca_signing_host_bindir }}/bundle-create ./ops/enrollment/cmd/bundle-create/"
+    chdir: "{{ ca_signing_host_workdir }}/repo"
+  environment:
+    GOPATH: "/root/go"
+    HOME: "/root"
+  changed_when: false  # always rebuilds; cheap, fine on a single host
+
+- name: Build bundle-extract binary
+  become: true
+  ansible.builtin.command:
+    cmd: "go build -o {{ ca_signing_host_bindir }}/bundle-extract ./ops/enrollment/cmd/bundle-extract/"
+    chdir: "{{ ca_signing_host_workdir }}/repo"
+  environment:
+    GOPATH: "/root/go"
+    HOME: "/root"
+  changed_when: false
+
+- name: Install issue-bundle wrapper script
+  become: true
+  ansible.builtin.template:
+    src: issue-bundle.j2
+    dest: "{{ ca_signing_host_bindir }}/issue-bundle"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Provision operator UNIX accounts
+  become: true
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    comment: "{{ item.email }}"
+    groups:
+      - "{{ ca_signing_host_group }}"
+    append: true
+    shell: /bin/bash
+    state: present
+  loop: "{{ ca_signing_host_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Install operator SSH authorized_keys
+  become: true
+  ansible.posix.authorized_key:
+    user: "{{ item.name }}"
+    key: "{{ item.ssh_pubkey }}"
+    state: present
+  loop: "{{ ca_signing_host_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Configure per-operator git author identity
+  become: true
+  ansible.builtin.lineinfile:
+    path: "/home/{{ item.name }}/.gitconfig"
+    line: "{{ git_line }}"
+    create: true
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: "0644"
+    regexp: "{{ git_line_regexp }}"
+  vars:
+    git_line: |-
+      [user]
+          name = {{ item.name }}
+          email = {{ item.email }}
+    git_line_regexp: '^\[user\]'
+  loop: "{{ ca_signing_host_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Install auditd rules for bundle-create + issue-bundle
+  become: true
+  ansible.builtin.template:
+    src: bundle-audit.rules.j2
+    dest: /etc/audit/rules.d/goat-ca.rules
+    owner: root
+    group: root
+    mode: "0640"
+  notify: reload auditd
+
+- name: Configure sshd Match Group for goat-ca-operators
+  become: true
+  ansible.builtin.blockinfile:
+    path: /etc/ssh/sshd_config.d/50-goat-ca-operators.conf
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+    block: |
+      # Block 22M interim — restrict goat-ca-operators access.
+      # See docs/operations/dev-ca-multi-operator-ceremony.md.
+      Match Group {{ ca_signing_host_group }}
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+          PermitTTY yes
+          AllowAgentForwarding yes
+          X11Forwarding no
+          AllowTcpForwarding no
+          PermitUserRC no
+  notify: reload sshd

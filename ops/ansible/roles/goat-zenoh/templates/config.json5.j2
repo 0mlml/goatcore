@@ -1,0 +1,1907 @@
+// Trial fabric — Zenoh router config
+//
+// Rendered by ops/ansible/roles/goat-zenoh/. Single-router deployment
+// per zenoh-trial-fabric.md §"Zenoh deployment shape" — mTLS-required
+// transport, per-vendor URI-SAN ACL via the top-level access_control:
+// block (Zenoh 1.x built-in, NOT a dynamic plugin — F-124 item 4),
+// RocksDB replay storage on every registered <vendor>/** prefix,
+// audit-logger capturing every publish.
+//
+// Do not edit on host — changes get overwritten by the role's template
+// task on next Ansible run. The add-vendor.sh helper appends per-vendor
+// entries between the `// BEGIN:` / `// END:` markers in the
+// access_control block below + SIGHUPs zenohd; the helper's edits are
+// transient and re-rendered out by Ansible unless nova_seed_vendors
+// is also extended in group_vars. Canonical source lives at this
+// template path.
+{# ---------------------------------------------------------------------------
+   PARTNER LANE MAP (ADR 1138). Two ways an anchor becomes a partitioned
+   partner, merged here so every render site below reads ONE map:
+
+     1. zenoh_partner_slot_blocks — PRE-CUT ranges of the slot pool, each
+        block bound to a lane-set. This is the ADR 1025 trick applied to the
+        partner dimension: the subjects for every slot in the block exist in
+        the ACL BEFORE anyone holds the cert, so onboarding a partner into a
+        pre-cut block needs no ACL edit and NO ROUTER RESTART. Unassigned
+        pre-cut slots are inert — no cert exists with that CN, so the subject
+        matches nobody, exactly like the pre-cut slot pool above.
+     2. zenoh_partner_read_lanes — the EXPLICIT per-anchor map, for anchors
+        already minted outside a block. Costs a restart (F-156: zenohd 1.9.0
+        ignores SIGHUP for ACL reload), which is precisely what the blocks
+        exist to avoid for everyone minted after them.
+
+   Explicit entries are applied LAST and therefore WIN: an operator's
+   deliberate line about one anchor beats the block it happens to fall in.
+   -------------------------------------------------------------------------- #}
+{% set _partner_lane_map = {} %}
+{% if zenoh_identity_model == 'per-uuid-slot-pool' %}
+{% for _blk in (zenoh_partner_slot_blocks | default([])) %}
+{% for _k in range(_blk.from | int, (_blk.to | int) + 1) %}
+{% set _ = _partner_lane_map.update({((zenoh_slot_pool_salt ~ ':' ~ _k) | hash('sha256'))[:32]: _blk.lanes}) %}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% for _a, _l in (zenoh_partner_read_lanes | default({})).items() %}
+{% set _ = _partner_lane_map.update({_a: _l}) %}
+{% endfor %}
+{
+  mode: "router",
+
+  // Pinned Zenoh ID — deterministic per-host (ADR 1041). Stable across
+  // container recreates so the routing graph, the audit-dedup key
+  // (src_zid, key_expr) used by the audit-subscriber + panoscope replay, and
+  // the source-info provenance chain keep one identity instead of a fresh
+  // random ZID each boot. Derived from this host's inventory identity in the
+  // role defaults — never baked into the image, never from machine-id.
+  // Lowercase hex, 16 bytes (zenoh ZID max).
+  id: "{{ goat_zenoh_router_zid }}",
+
+  // HLC timestamping — asserted explicitly. The router default is already
+  // `true`, but we assert it so a future config edit can't silently disable
+  // it: the storage_manager uses each sample's HLC timestamp for
+  // last-writer-wins conflict resolution and cross-router storage alignment,
+  // and the fabric ordering layer consumes it as the internal-coherence
+  // clock (ADR 1037). Disabling it would silently corrupt LWW the moment two
+  // routers hold the same key. See docs/design/zenoh-capability-adoption.md
+  // gap 3 + ADR 1040. `enabled: true` applies to all modes (router here).
+  timestamping: {
+    enabled: true,
+    drop_future_timestamp: false,
+  },
+
+  // ----------------------------------------------------------------
+  // Transport — mTLS-required. Server certificate from the offline CA;
+  // client certificates verified against the offline-CA root.
+  //
+  // The "tls/" scheme triggers TLS-with-mTLS when the verify_client_auth
+  // section below sets client_auth = "require". Zenoh 1.9.0 supports
+  // this via the standard transport-link config keys.
+  //
+  // In-container bind is 0.0.0.0 (always). The host-side reachability
+  // is decoupled — docker-compose.yml port-map renders
+  // `{{ goat_zenoh_listen_host }}:{{ goat_zenoh_listen_port }}:{{ goat_zenoh_listen_port }}`
+  // so the host-IP exposure stays narrow. Rendering the host mesh-IP
+  // here panics zenohd with AddrNotAvailable inside the container
+  //.
+  // ----------------------------------------------------------------
+  listen: {
+    // QUIC (when enabled) shares the transport/link/tls block below — same
+    // cert, same mTLS, same offline-CA root, same X25519MLKEM768 on the PQ
+    // images (ADR 1086 §7). In-container bind stays 0.0.0.0; the compose
+    // port-map narrows host exposure (/udp for quic).
+    endpoints: [
+      "tls/0.0.0.0:{{ goat_zenoh_listen_port }}",
+{% if goat_zenoh_quic_enabled | bool %}
+      "quic/0.0.0.0:{{ goat_zenoh_quic_port }}",
+{% endif %}
+    ],
+  },
+{% for _p in (zenoh_sovereign_peerings | default([])) %}
+      // Sovereign peering: {{ _p.sovereign }} (ADR 1157). INGRESS WRITE ONLY,
+      // confined to that sovereign's own prefix. There is deliberately NO read
+      // rule here -- a sovereign reads only what an explicit release rule grants,
+      // so the default for a new peering is "may send us data, may see nothing".
+      {
+        id: "sovereign-{{ _p.sovereign }}-w",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["from/{{ _p.sovereign }}/**"],
+      },
+{% if (_p.release_key_exprs | default([])) | length > 0 %}
+      // Declared release set for {{ _p.sovereign }}: EGRESS only, and only the
+      // prefixes named in the peering declaration. Never a wildcard -- a release
+      // set is a decision, and a wildcard is the absence of one.
+      {
+        id: "sovereign-{{ _p.sovereign }}-r",
+        messages: ["declare_subscriber", "query", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [{% for _k in _p.release_key_exprs %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+{% endif %}
+{% endfor %}
+{% if goat_zenoh_connect_endpoints | default([]) | length > 0 %}
+
+  // Outbound router-to-router federation (ADR 0844 topology + ADR 1020 canonical
+  // goat↔goat, decision 1). Empty by default — every single-router deploy renders
+  // WITHOUT this block, byte-unchanged. Populated per-goatnet in group_vars with
+  // the peer router's mesh IP: same CA, same mTLS, same ACL. The dialing router
+  // presents its own router leaf as the client cert (connect_certificate below);
+  // the accepting router authorizes it via the `router-peer` ACL subject. A
+  // session forms if EITHER end dials, but both sides declare it so the link
+  // re-forms after a restart on either end.
+  connect: {
+    endpoints: [
+{% for _ep in goat_zenoh_connect_endpoints %}
+      "{{ _ep }}",
+{% endfor %}
+    ],
+  },
+{% endif %}
+
+  transport: {
+    // Per-peer link cap. zenoh's default is 1 (zenoh-config 1.0.4 defaults.rs,
+    // TransportUnicastConf.max_links). goat pins the ZID to the cert anchor
+    // (ADR 1039/1041), so every command from one identity shares ONE transport —
+    // at max_links:1 a single lingering link (a background subscriber, or a
+    // not-yet-reclaimed close) makes the next OpenSyn fail with MAX_LINKS.
+    // 50 gives ample headroom for an operator running
+    // many commands + concurrent subscribers on one anchor.
+    unicast: {
+      max_links: 50,
+    },
+    link: {
+      // Shorten dead-link reclaim: a silently-dropped link is declared dead after
+      // `lease` ms (default 10000). Halving it frees the link's max_links slot
+      // sooner. keep_alive:4 → a keepalive every lease/4 (1250ms), well within the
+      // window on the sandbox mesh.
+      tx: {
+        lease: 5000,
+        keep_alive: 4,
+        // Transmit-queue policy. One subscriber that stops draining its
+        // socket fills this router's queue for that link; every non-droppable
+        // message bound for it then blocks an rx worker for `wait_before_close`,
+        // and with zenoh's 2 rx workers two such waits stop ALL ingress. On the
+        // rig a 60 s freeze cost a healthy victim pair 59-119 s of delivery at
+        // stock settings and 2.1 s with this deadline plus the container's
+        // ZENOH_RUNTIME rx workers (docker-compose.yml.j2).
+        //
+        // wait_before_close is a give-up-and-close deadline, not a drop: the
+        // router still never silently discards a non-droppable message. Keep it
+        // above lease/4 (1250 ms here) so a slow-but-alive link is not evicted
+        // between its own keepalives. Measured, it evicts LESS than stock once
+        // the workers are raised (4 closes per run against 33-41).
+        queue: {
+{% if (goat_zenoh_tx_queue_size | default(none)) is not none %}
+          // Queue size is OFF by default: it bought nothing measurable at
+          // either worker count, and it is the expensive knob - the per-link
+          // ceiling is 8 priorities x size x 64 KiB (~4 MiB per link at 8,
+          // against ~1 MiB at zenoh's default 2). A goatnet that sets it has
+          // checked its router's memory headroom first.
+          size: {
+            control: {{ goat_zenoh_tx_queue_size }},
+            real_time: {{ goat_zenoh_tx_queue_size }},
+            interactive_high: {{ goat_zenoh_tx_queue_size }},
+            interactive_low: {{ goat_zenoh_tx_queue_size }},
+            data_high: {{ goat_zenoh_tx_queue_size }},
+            data: {{ goat_zenoh_tx_queue_size }},
+            data_low: {{ goat_zenoh_tx_queue_size }},
+            background: {{ goat_zenoh_tx_queue_size }},
+          },
+{% endif %}
+          congestion_control: {
+            block: {
+              wait_before_close: {{ goat_zenoh_tx_block_wait_before_close_us }},
+            },
+          },
+        },
+      },
+      tls: {
+        // Server-side cert (router identity) — TLS clients verify this
+        // against the root they received in their onboarding
+        // bundle. Zenoh 1.9.0 schema names server-side fields `listen_*`
+        // (sibling of `connect_*` for outbound peer dials, which we
+        // don't use — router only listens).
+        listen_certificate: "{{ goat_zenoh_tls_dir }}/router-cert.pem",
+        listen_private_key: "{{ goat_zenoh_tls_dir }}/router-key.pem",
+{% if goat_zenoh_connect_endpoints | default([]) | length > 0 %}
+
+        // Outbound-dial client identity (federation, ADR 1020 decision 1). When
+        // this router dials a peer router (connect: block above) it is the TLS
+        // client on that link and must present a chain-verifiable cert — the same
+        // router leaf. Rendered only when federation endpoints are set, so a
+        // listen-only router's config is unchanged.
+        connect_certificate: "{{ goat_zenoh_tls_dir }}/router-cert.pem",
+        connect_private_key: "{{ goat_zenoh_tls_dir }}/router-key.pem",
+{% endif %}
+
+        // Client-side verification — every connecting peer presents a
+        // cert that must chain to this root. The access_control plugin
+        // then reads the verified cert's URI-SAN to apply the per-vendor
+        // ACL.
+        root_ca_certificate: "{{ goat_zenoh_tls_dir }}/ca-root-cert.pem",
+
+        // mTLS — client cert is required, not optional.
+        // Maps to the upstream `verify_name_on_connect` + `enable_mtls`
+        // shape; exact key names confirmed against 1.9.0 schema at
+        // deploy time. The intent: refuse handshakes that don't present
+        // a chain-verifiable client cert.
+        enable_mtls: true,
+      },
+    },
+  },
+
+  // ----------------------------------------------------------------
+  // Plugin loading — rest + storage_manager. Search dirs: "/" first
+  // (upstream-bundled plugins from eclipse/zenoh image), then the host
+  // plugin dir (mounted via docker-compose) for the rocksdb backend
+  // .so that the upstream image does not ship.
+  //
+  // access_control is NOT a plugin in Zenoh 1.x — it's a built-in
+  // module configured via the top-level access_control: block below
+  //.
+  // ----------------------------------------------------------------
+  plugins_loading: {
+    enabled: true,
+    search_dirs: ["/", "/opt/zenoh/plugins"],
+  },
+
+  // -- Admin space ---------------------------------------------------
+  //
+  // Zenoh's admin space `@/<self_zid>/...` answers session-transport
+  // and routing-state queries. DEFAULTS TO DISABLED in zenoh-1.x
+  // (panoscope's `session.get("@/<router_zid>/**")` gets zero replies without
+  // this block).
+  //
+  // Read = panoscope (and future observers) discover the router's
+  // connected-peer list — that's where audit-subscriber + every
+  // synth-vendor session surface for the Data-COP.
+  //
+  // Write = portal's vendor-mint flow live-adds per-vendor storage +
+  // ACL stanzas without a router restart. zenohd v1.9.0's
+  // SIGHUP handler is a no-op for ACL + storage_manager reload, so
+  // the only way to make a fresh mint take effect on the live router
+  // is admin-space PUT to
+  //   @/<zid>/router/config/plugins/storage_manager/storages/<v>
+  //   @/<zid>/router/config/access_control/rules/<rule-id>
+  // The portal posts to these endpoints, verifies via GET round-trip
+  // (HTTP 200 alone isn't proof — zenohd returns 200 even when the
+  // permission gate blocks the write; the GET tells the truth).
+  //
+  // Trust boundary: the REST plugin binds 0.0.0.0:8000 inside the
+  // container; the docker-compose host-side bind in the role is the
+  // gate. The portal reaches the router over the docker network
+  // ({{ zenoh_stack }}_default), which is not exposed to mesh/public
+  // traffic. Off-host writers cannot reach :8000.
+  adminspace: {
+    enabled: true,
+    permissions: {
+      read: true,
+      write: true,
+    },
+  },
+
+  plugins: {
+    rest: {
+      // In-container bind 0.0.0.0 (always); docker-compose maps the
+      // host-side reachability narrowly per goat_zenoh_rest_host.
+      // Same logic as the transport listener above.
+      http_port: "0.0.0.0:{{ goat_zenoh_rest_port }}",
+    },
+
+    storage_manager: {
+      // Register the RocksDB backend as a named volume. The storage
+      // entries below set volume.id = "rocksdb"; without this top-level
+      // block zenohd refuses to spawn them with
+      // `Cannot find volume 'rocksdb' to spawn storage '<id>'`
+      //.
+      //
+      // The rocksdb backend .so is not shipped in upstream eclipse/zenoh;
+      // the role installs it into /opt/zenoh/plugins (bind-mounted from
+      // the host's goat_zenoh_plugin_dir). backend_search_dirs is
+      // distinct from plugins_loading.search_dirs above — storage_manager
+      // walks this list to find libzenoh_backend_<id>.so.
+      // FIPS variant (goat_zenoh_fips_variant): the glibc image bakes
+      // its matched-pair backend at /opt/zenoh/plugins-baked instead.
+      backend_search_dirs: ["{{ goat_zenoh_backend_search_dir }}"],
+      volumes: {
+        rocksdb: {},
+      },
+      storages: {
+        // Operator / control topics — `ops/**` is the canonical operator
+        // namespace (ADR 0844 / ADR 1035). Backs cold-start get-replay for
+        // service control planes (e.g. `ops/<service>/control/**`).
+        ops: {
+          key_expr: "ops/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/ops",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_retention_days | int * 86400 * 1000 }},
+        },
+
+        // Operator-action audit — a DEDICATED long-retention store for the
+        // accountability record (`ops/audit/operator/**`, F-207 / ADR 0811).
+        // Zenoh writes a matching sample to EVERY storage covering the key, so
+        // these samples land here (1y default) AND in `ops` above (7d);
+        // `goat audit ops` GETs `ops/audit/operator/**` and reads the full
+        // window back from this store. More-specific key_expr than `ops/**` by
+        // design. Cheap: small, infrequent, encrypted protobufs — a year is
+        // trivial disk (goat_zenoh_audit_retention_days).
+        ops_audit_operator: {
+          key_expr: "ops/audit/operator/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/ops_audit_operator",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_audit_retention_days | int * 86400 * 1000 }},
+        },
+
+{% if (zenoh_sovereign_peerings | default([])) | length > 0 %}
+        // Sovereign ingress (ADR 1157 P2). Partner data lands under
+        // `from/<sov>/**` and MUST persist here, or the word "quarantine" is a
+        // promise the config does not keep: without a store a put is accepted,
+        // delivered to live subscribers, and then gone -- a later query answers
+        // EMPTY and nobody can audit what a partner actually sent.
+        //
+        // Its own store rather than a carve-out of another, for two reasons.
+        // Partner data is the one class we did not generate and may be obliged
+        // to delete on request or on peering termination, and its retention is a
+        // different decision from ours (zenoh_from_retention_days).
+        sovereign_from: {
+          key_expr: "from/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/sovereign_from",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ zenoh_from_retention_days | int * 86400 * 1000 }},
+        },
+{% endif %}
+{% if goat_zenoh_legacy_system_namespace | default(false) | bool %}
+        // DEPRECATED operator namespace (ADR 1035) — only rendered for an
+        // instance that opts in via `goat_zenoh_legacy_system_namespace`
+        // (transitionally). NEW deployments leave this
+        // OFF and get clean `ops/`-only. Remove the opt-in once the instance
+        // has migrated everything to `ops/**`.
+        system: {
+          key_expr: "system/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/system",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_retention_days | int * 86400 * 1000 }},
+        },
+{% endif %}
+
+        // Schema declarations across all vendors.
+        attest_schema: {
+          key_expr: "attest/schema/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/attest_schema",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_retention_days | int * 86400 * 1000 }},
+        },
+
+        // Grant-keyed encryption — the DEK-bundle key surface (data-access M2.1,
+        // grant-keyed-encryption.md §"History + late joiners"). grant-keyd PUTs a
+        // signed, per-(release-set,generation) wrapped-DEK bundle on
+        // `keys/<rs>/<gen>` (write-gated by the `infra-w-keys` ACL above). Without
+        // a store the PUT is fire-and-forget: only a subscriber present at publish
+        // time gets it. This store RETAINS each bundle so a late or
+        // newly-authorized reader can `z_get keys/<rs>/**` and fetch the current
+        // (and historical) generations to open live + stored ciphertext — the
+        // design's "keys retained as long as the ciphertext they cover is". The
+        // bundle is ciphertext at rest (each DEK is ECDH-wrapped per member), so
+        // RocksDB persistence adds no plaintext-key exposure. Long retention
+        // (audit tier, not the 7d fabric tier): keys are tiny and infrequent, and
+        // losing a key makes every generation of history it covers unreadable —
+        // over-retaining past the ciphertext is harmless, under-retaining is not.
+        keys: {
+          key_expr: "keys/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/keys",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_audit_retention_days | int * 86400 * 1000 }},
+        },
+
+{% if zenoh_identity_model == 'per-uuid-slot-pool' %}
+{% if zenoh_lazy_slot_storage | default(false) | bool %}
+        // LAZY slot-pool storages:
+        // a store is declared ONLY for a live/onboarded slot anchor, NOT for the
+        // whole pre-cut pool. The ACL write-rule loop below still pre-cuts ALL
+        // pool slots (cheap; restart-free onboarding preserved) — this decouples
+        // the ACL pool size from the store count, which is the O(N) the
+        // adminspace_getter fan-out scales with. New slots get their store added
+        // live via the admin REST API at mint (no restart); this list is the
+        // set persisted across restarts (registry-derived; interim: anchors whose
+        // rocksdb dir already holds data). Empty pool slots get NO store.
+{% for _anchor in zenoh_active_slot_anchors | default([]) %}
+{# ADR 1104 per-class retention: a test-class slot ages out in hours, not the
+   site default. Absent class = real (fail-safe: never shortens retention). #}
+{% set _lc = (zenoh_slot_lifecycle_classes | default({}))[_anchor] | default('real') %}
+        "slot-{{ _anchor }}": {
+          key_expr: "{{ _anchor }}/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/{{ _anchor }}",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ (zenoh_lifecycle_test_ttl_hours | default(72) | int * 3600 * 1000) if _lc == 'test' else (goat_zenoh_retention_days | int * 86400 * 1000) }},
+        },
+{% endfor %}
+{% else %}
+        // Pre-cut slot-pool storages (ADR 1025) — one rocksdb dir per slot
+        // anchor <uuid>. The deterministic anchor is sha256(salt:k)[:32]; the
+        // portal uses the SAME formula to mint CN=<uuid> and assign slot k, so
+        // the baked rule and the minted cert always agree. No add-vendor.sh in
+        // this mode — onboarding is pure cert-mint against a pre-existing slot.
+        // (F-186: this pre-cuts a store per POOL slot; see zenoh_lazy_slot_storage
+        // above to declare stores only for live slots.)
+{% for k in range(zenoh_slot_pool_size | int) %}
+{% set _anchor = ((zenoh_slot_pool_salt ~ ':' ~ k) | hash('sha256'))[:32] %}
+{% set _lc = (zenoh_slot_lifecycle_classes | default({}))[_anchor] | default('real') %}
+        "slot-{{ _anchor }}": {
+          key_expr: "{{ _anchor }}/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/{{ _anchor }}",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ (zenoh_lifecycle_test_ttl_hours | default(72) | int * 3600 * 1000) if _lc == 'test' else (goat_zenoh_retention_days | int * 86400 * 1000) }},
+        },
+{% endfor %}
+{% endif %}
+{% if zenoh_copublish_enabled | default(false) %}
+        // ADR 1105 multi-publisher topic storage. Each registered
+        // multi-publisher topic that persists gets its own rocksdb store on
+        // multipub/<pool>/<topic>/** — a DISTINCT namespace, never a
+        // single-owner <uuid>/** root. Routed-only multi-publisher topics are
+        // simply omitted from zenoh_multipub_topics. Default [] renders
+        // nothing.
+{% for _base in (zenoh_multipub_topics | default([])) %}
+        "st-{{ _base | replace('/', '-') }}": {
+          key_expr: "{{ _base }}/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/{{ _base | replace('/', '_') }}",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_retention_days | int * 86400 * 1000 }},
+        },
+{% endfor %}
+{% endif %}
+{% else %}
+{% for vendor in nova_seed_vendors %}
+        // {{ vendor }} vendor — seed entry.
+        // The add-vendor.sh helper appends new entries between BEGIN
+        // and END markers further below. New per-vendor storage entries
+        // are added inside the same `storages` block.
+        // Key is quoted: vendor prefixes containing hyphens (org164x,
+        // org20x, …) are illegal as unquoted JSON5 identifiers; quoting
+        // unconditionally keeps the template safe for any vendor name
+        //.
+        "{{ vendor }}": {
+          key_expr: "{{ vendor }}/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/{{ vendor }}",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_retention_days | int * 86400 * 1000 }},
+        },
+{% endfor %}
+        // BEGIN: per-vendor storages (add-vendor.sh edits between these markers)
+        // END: per-vendor storages
+{% endif %}
+
+        // RESERVATION — the `volatile/**` class is NON-PERSISTED by
+        // design (docs/design/zenoh-volatile-class.md, ADR 1032). It
+        // carries high-throughput telemetry (volatile/<peer>/stream/**)
+        // and bounded large-file transfer (volatile/<peer>/blob/**) that
+        // the router must route live but NEVER write to disk, so it
+        // cannot fill the rootfs and evict real vendor data. DO NOT add a
+        // storages entry matching `volatile/**` here — that would defeat
+        // the entire purpose of the class. (The audit half is the
+        // subscriber's --exclude-key volatile/**; see the audit-subscriber
+        // role. ACL write-grant for volatile/<peer>/** is added per-peer
+        // in the access_control block below, and only together with the
+        // audit exclude — granting the write without it routes the
+        // firehose into the locked audit bucket.)
+      },
+    },
+  },
+
+  // ----------------------------------------------------------------
+  // access_control — per-vendor URI-SAN ACL.
+  //
+  // Built-in module in Zenoh 1.x (NOT a dynamic plugin — F-124 item 4
+  // captured the older plugin-shaped mis-wiring). Posture: default-deny
+  // floor + universal read for any peer carrying a CA-rooted
+  // leaf cert + per-vendor write scope keyed off the cert URI-SAN.
+  // Reads wide open, writes vendor-scoped.
+  //
+  // The add-vendor.sh helper edits this same file between the
+  // `// BEGIN:` / `// END:` markers below, then SIGHUPs zenohd so the
+  // policy reloads without a full router restart.
+  //
+  // MATCHER-SYNTAX (resolved) — Zenoh 1.9.0 access_control supports
+  // `id`, `interfaces`, `cert_common_names` (plural list, exact match),
+  // `usernames`, `link_protocols`, `zids`. There is NO URI-SAN matcher.
+  // The trial-fabric identity axis is the leaf CN; URI-SAN is still
+  // minted for forward-compat with ADR 0844 but not consulted
+  // by this ACL. See subjects: block below for the wire shape.
+  // ----------------------------------------------------------------
+  access_control: {
+    enabled: true,
+    default_permission: "deny",
+    rules: [
+      // Universal read — any CA-rooted peer subscribes /
+      // queries any topic on the fabric. Wide-open reads per the
+      // community-of-trust posture. Zenoh 1.x `messages:` variant set:
+      // put | delete | declare_subscriber | query | declare_queryable |
+      // reply | liveliness_token | declare_liveliness_subscriber |
+      // liveliness_query (the older `get` keyword is rejected by
+      // zenoh-config 1.9.0).
+      //
+      // MUST include `put` + `delete` even though this is the "read"
+      // rule. In Zenoh access-control semantics `flows: ["egress"]`
+      // here means "messages the ROUTER egresses TO this subject" —
+      // i.e., the delivery of published samples to subscribers IS a
+      // `put` from the router's perspective. Without `put` in the
+      // messages array, declared subscribers connect cleanly but
+      // receive zero samples (router silently drops the egress
+      // delivery): a session open with a ** subscriber declared sees
+      // data_samples_seen=0.
+      //
+      // `ingress` mirrors the same set so subscribers also accept
+      // queryable replies + future cross-direction messages without
+      // a separate rule.
+      //
+      // `declare_queryable` + `reply`: without them the storage_manager's
+      // per-storage queryables register but cannot deliver replies to a remote
+      // `session.get()` (denied by default-deny), and the portal inspector's
+      // GET /api/topics/decoded?key=... path returns empty samples[] for every
+      // published topic even though the storage captures publishes to disk.
+      // Storage queryables also match no ACL subject when default-deny is in
+      // force (the storage_manager runs in-process; no link_protocols=tls and no
+      // cert CN), so remote queries against storages can return 0 without a
+      // router-zid-keyed subject.
+      //
+      // ADR 1020 ingress/egress split: the `put`/`delete`
+      // half of this universal rule is removed and moved to a SEPARATE
+      // egress-only rule (trial-peer-deliver-all, below). The reason the
+      // delivery `put` was here (router→subscriber egress) is preserved;
+      // what is REMOVED is the side-effect ingress `put`/`delete` on **,
+      // which would let any CA-rooted peer PUBLISH to any prefix. After the split,
+      // ingress write is granted SOLELY by the scoped per-vendor rules
+      // (+ the ingress-gateway quarantine-prefix rule when it lands).
+      //
+      // Liveliness (ADR 1040 gap 3): `declare_liveliness_subscriber`
+      // + `liveliness_query` join the universal read set — presence is a READ
+      // surface (watch/query who is alive), wide open like every other read.
+      // Declaring a token (the write half) stays scoped to the per-identity
+      // write rules below. NOTE: the F-124 wiring only taught the config the
+      // VARIANT KEYWORDS (the comment block above); no rule ever granted them,
+      // so under default-deny all liveliness was silently denied until this
+      // rule landed.
+      //
+      // `**/@adv/**` (ADR 1040 gap 5): zenoh-ext AdvancedPublisher/Subscriber
+      // park their admin keys UNDER the data key (`<key>/@adv/<entity>/<zid>/…`),
+      // and `@`-prefixed chunks are VERBATIM — `**` never matches them — so
+      // every `**` grant silently excludes the @adv space. Without this added
+      // pattern the per-producer PublicationCache queryable + the recovery
+      // queries against it are denied and gap-5 must-deliver silently no-ops
+      // (the F-177 failure class).
+      //
+      // EDGE QUERYABLE LOCKDOWN.
+      //
+      // The universal read set above grants `declare_queryable` and `query`
+      // EGRESS on `**` to a subject that — with the partner partition off —
+      // is `link_protocols: ["tls"]`, i.e. ANY mTLS peer. That authorizes any
+      // CA-rooted device to advertise itself as the queryable of record for
+      // the ENTIRE keyspace and to be sent every matching fabric query.
+      //
+      // A device running `zenohd` (whose default mode is ROUTER) with a memory
+      // storage on `key_expr: "**"` joins the fabric as a routing participant
+      // answering for everything. When its link stalls it stops replying, every
+      // fabric query burns its full timeout, and the router can eventually wedge.
+      //
+      // The CA gate proves a peer is LEGITIMATE. It says nothing about whether
+      // it should be ASKED questions. A sensor must be able to ask, never to be
+      // asked. With the flag on, the universal grant keeps the read half
+      // (subscribe / ask / receive answers) and the answer half narrows to
+      // `**/@adv/**` — the zenoh-ext PublicationCache recovery path the comment
+      // above documents, which is the only reason `declare_queryable` was in
+      // the universal set to begin with.
+      //
+      // DEFAULT OFF and per-goatnet. Flipping it changes what is DENIED, and a
+      // denial in zenoh is silent — a wrong narrowing here removes a
+      // capability with no error anywhere. Enable per goatnet only after
+      // live-fire: confirm every peer that legitimately answers queries still
+      // does (portal, grant-keyd, any rest-pub-bridge publisher, AdvancedPub
+      // recovery) before turning it on for the next one.
+      //
+      // BEFORE ENABLING, read the router adminspace + the live ACL:
+      //   - `trial-peer-r-all` is the ONLY rule granting `declare_queryable`
+      //     to peers (the sole other match is a DENY on ops/audit/operator/**),
+      //     so every peer-declared queryable on the fabric hangs off it.
+      //   - Queryables that are REMOTE (clients=1) and outside `**/@adv/**` die
+      //     silently when this narrows: typically keys/**  ops/**
+      //     attest/schema/**  ops/audit/operator/**  and tenant slot roots.
+      //   - A bare `**` queryable that is ROUTER-LOCAL (clients=0, routers=1) is
+      //     the router's own storage, not ACL-gated, so the lockdown does not
+      //     touch it.
+      // Sequence: add per-service `declare_queryable` grants (grant-keyd
+      // `keys/**`, the attest schema service, the `ops/**` responder) and a
+      // per-slot grant for tenant roots, THEN narrow the universal rule.
+{% if zenoh_edge_queryable_lockdown | default(false) %}
+      {
+        // Read half — unchanged reach, minus the right to answer.
+        id: "trial-peer-r-all",
+        messages: ["declare_subscriber", "query", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: ["**", "**/@adv/**"],
+      },
+      {
+        // Answer half — scoped to the AdvancedPublisher admin space ONLY.
+        // `<key>/@adv/**` is where PublicationCache parks its queryable; the
+        // verbatim `@` chunk means the `**` above can never reach it, so this
+        // is additive rather than a re-grant of the general keyspace.
+        id: "trial-peer-adv-queryable",
+        messages: ["declare_queryable"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: ["**/@adv/**"],
+      },
+{% for _g in zenoh_edge_queryable_lockdown_grants | default([]) %}
+      {
+        // Re-grant: narrowing `trial-peer-r-all` above strips declare_queryable
+        // from EVERY subject, because every service policy includes that rule —
+        // that is why the lockdown is not a peer-only change. Each entry here
+        // hands the right to answer back to ONE subject on ONLY its own
+        // namespace, which is the least-privilege shape the universal grant
+        // never had. Sourced from zenoh_edge_queryable_lockdown_grants, which
+        // the role refuses to leave empty when the lockdown is on.
+        id: "lockdown-q-{{ _g.subject }}",
+        messages: ["declare_queryable"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: [{% for _k in _g.key_exprs %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+{% endfor %}
+{% else %}
+      {
+        id: "trial-peer-r-all",
+        messages: ["declare_subscriber", "query", "declare_queryable", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: ["**", "**/@adv/**"],
+      },
+{% endif %}
+{% if zenoh_peer_read_scoped | default(false) | bool %}
+
+      // ---- SCOPED PEER READ ----
+      //
+      // Subscribing to the WHOLE KEYSPACE is an infrastructure grant bound to
+      // named certificates. It is not part of universal read.
+      //
+      // WHY. A router blocks its receive threads for ~5 s at a time pushing to
+      // slow `**` subscribers, so slow subscribers can stop fabric-wide delivery
+      // while every process-level signal reads healthy. Any mTLS peer could
+      // do that if the universal read rule above granted the entire keyspace in
+      // ONE key-expression.
+      //
+      // WHAT CHANGES, AND WHAT DOES NOT. Read REACH is unchanged: a peer
+      // still reads every namespace it reads today, wildcards included. What it
+      // may no longer do is name the ENTIRE keyspace in ONE declaration. A
+      // filter across tenants — one vendor (`**/<vendor>/**`) or one topic
+      // (`**/airtracks/v1/*`) — is a legitimate subscription and keeps working
+      // without any grant; those shapes are declared in
+      // zenoh_peer_cross_tenant_read. `**` is the grant.
+      //
+      // THE MECHANISM, and the shape of rule that was NOT available. Verified
+      // against zenoh 1.9.0 (keyexpr include.rs `LTRIncluder`, authorization.rs
+      // §rule matching): a rule applies when its key_expr INCLUDES the declared
+      // key, and a rule chunk that is not `**` never includes a declared `**`
+      // chunk.
+      //
+      //   * `*/**` therefore covers every declaration that does NOT start with
+      //     `**` — every anchor, every root, every concrete key — and refuses a
+      //     declared `**`. That is this rule's first key_expr.
+      //   * The rule one would reach for to cover `**`-leading filters too,
+      //     `**/*/**`, IS NOT A KEY EXPRESSION: zenoh canonizes `**/*` to
+      //     `*/**`, so `key_exprs` (which deserialize as OwnedKeyExpr) REFUSE
+      //     it and the router does not start. Proven against the crate in
+      //     crates/goat-cli/src/cmd/flow.rs::everything_except_star_star_is_not_a_key_expression
+      //     and re-derived by files/acl-evaluate.py --self-test.
+      //   * A DENY cannot carve `**` out either: matching is by inclusion in
+      //     BOTH trees (authorization.rs policy_decision_point), and the only
+      //     rule key that includes a declared `**` is `**` itself — which
+      //     includes everything else as well, so it denies the fabric.
+      //
+      // So `**`-leading filters are granted by ENUMERATED SHAPE, which is the
+      // second half of this rule's key_exprs.
+      //
+      // THE RESIDUAL HOLE, stated rather than discovered later. A declaration
+      // made only of `*` chunks — `*/**`, `*/*/**`, `*` — is allowed by the
+      // `*/**` key_expr, and `*/**` matches every key with at least one chunk,
+      // i.e. everything really published. A peer that wants the whole fabric
+      // can still have it by typing `*/**` instead of `**`. This is a deliberate
+      // trade: closing it means going back to enumerating every namespace
+      // (~2,100 more rendered lines on a 1,000-slot goatnet) for a stricter
+      // rule against a rare accident.
+      // ACCIDENT (a subscriber written as `**` because that was the example) is
+      // what this rule buys; it is not a guard against a determined peer.
+      //
+      // The evaluator that proves these decisions without a router lives at
+      // files/acl-evaluate.py (`--self-test` carries the upstream vectors and
+      // the canon-form constraint); the render tests assert the refusals and
+      // the allows by name.
+      {
+        id: "peer-r-scoped",
+        messages: ["declare_subscriber", "query", "declare_queryable", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: [
+          "*/**",          // everything that does not begin with `**`
+          "**/@adv/**",    // the verbatim @adv admin space (ADR 1040 gap 5)
+{% for _s in zenoh_peer_cross_tenant_read | default([]) %}
+          "{{ _s }}",
+{% endfor %}
+        ],
+      },
+      {
+        // Delivery half, egress-only, over the SAME key set. Kept in step with
+        // the read half deliberately: if delivery stayed on `**` while the
+        // declare narrowed, the config would read as though a peer could still
+        // receive the whole fabric, and the next person to widen a subscriber
+        // would believe it.
+        id: "peer-deliver-scoped",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [
+          "*/**",
+          "**/@adv/**",
+{% for _s in zenoh_peer_cross_tenant_read | default([]) %}
+          "{{ _s }}",
+{% endfor %}
+        ],
+      },
+      {
+        id: "fabric-wide-r",
+        messages: ["declare_subscriber", "query", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: ["**", "**/@adv/**"],
+      },
+{% endif %}
+
+      // Router pub/sub CENSUS read.
+      //
+      // Grants the query/reply round-trip against the router's own admin
+      // space so a passive observer (panoscope Data-COP) can enumerate the
+      // SUBSCRIBER side of the fabric — who is pulling which data — not just
+      // publishers. The router's adminspace lists every subscription routing
+      // through it at:
+      //   @/<router_zid>/router/subscriber/<subscribed_keyexpr>   -> {routers,peers,clients:[zid...]}
+      //   @/<router_zid>/router/publisher/<published_keyexpr>     -> {…}
+      //   @/<router_zid>/router/queryable/<keyexpr>               -> {…}
+      // (verified against zenoh-1.9.0 net/runtime/adminspace.rs subscribers_data
+      // + the crate's own tests/adminspace.rs). This is the authoritative
+      // consumption surface — no self-declaration — and is what finally makes
+      // pure subscribers (audit-subscriber on `**`, non-publishing sinks)
+      // visible on the COP, closing F-147 acceptance criterion 1.
+      //
+      // WHY A SEPARATE RULE AND NOT JUST WIDENING trial-peer-r-all's `**`:
+      // the admin space is under the `@/` prefix, and `@`-prefixed chunks are
+      // VERBATIM in zenoh keyexpr matching — `**` NEVER matches them (proven at
+      // zenoh-keyexpr-1.9.0 key_expr/intersect/classical.rs: `(b"**", _) =>
+      // return !it2.has_verbatim()`, and the crate's tests.rs asserts
+      // `intersect("@a","@a/**")` requires the explicit `@a/**` form). That is
+      // the exact reason F-152 saw zero replies after adminspace.enabled +
+      // the panoscope router-admin query both landed (#331/#337) — the query
+      // reached the router but the ACL grant (`**`) could not match `@/...`, so
+      // egress of every admin reply was denied. The `**/@adv/**` pattern on
+      // trial-peer-r-all handles DATA-key-parented advertisement keys
+      // (`<key>/@adv/…`); it does NOT reach the TOP-LEVEL `@/` adminspace.
+      //
+      // LEAST-PRIVILEGE — SCOPED TO THE CENSUS LEAVES ONLY. Deliberately does
+      // NOT grant `@/*/router/**` (which would expose `@/*/router/config/**` —
+      // the live ACL ruleset + storage config) nor `@/*/router/metrics` /
+      // `linkstate`. Only the pub/sub/queryable resource lists, which are a
+      // read surface consistent with this fabric's wide-open reads and strictly
+      // less sensitive than the data itself. `@/*/...` uses `*` for the ZID
+      // chunk so it is router-ZID-agnostic (and multi-router-safe) while the
+      // verbatim `@` chunk still pins it to the admin space.
+      {
+        id: "trial-peer-r-admin-census",
+        messages: ["query", "reply"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: [
+          "@/*/router/subscriber/**",
+          "@/*/router/publisher/**",
+          "@/*/router/queryable/**",
+        ],
+      },
+
+      // Operator-action audit carve-out — DENY leg (F-207 / ADR 1025
+      // restricted-read tier; docs/design/operator-action-audit.md §7).
+      // ops/audit/operator/** carries the who-did-what trail for the backend
+      // super-user tier. It is the FIRST restricted-read prefix in the
+      // otherwise community-read ops/ namespace: vendors/slots must NOT be
+      // able to watch the admin trail. Bound (in policies: below) to the
+      // UNIVERSAL trial-peer-read subject only.
+      //
+      // Mechanism (verified against zenoh 1.9.0 authorization.rs):
+      //   - WITHIN one subject, deny-tree-first wins over that subject's own
+      //     `**` allow → on trial-peer-read this denies the prefix for the
+      //     messages below.
+      //   - ACROSS subjects, allow-from-any wins (the decision loop breaks on
+      //     the first Allow). So the operator + infra peers + the audit
+      //     subscriber — each of which ALSO matches a dedicated subject whose
+      //     policy carries trial-peer-r-all/trial-peer-deliver-all on `**`
+      //     (⊇ the prefix) — are rescued to Allow. Vendors/slots match ONLY
+      //     trial-peer-read for reads (their own subjects grant writes), so
+      //     they stay Denied. (The audit subscriber gets its own subject +
+      //     policy below for exactly this reason — without it the deny would
+      //     break audit persistence, an F-203-class silent gap.)
+      //
+      // The enforcement vector is BOTH the pull/read path (declare_subscriber,
+      // query, declare_queryable, reply) AND egress DELIVERY (put/delete):
+      // a vendor subscribes on `**` (which this deny's narrower key does not
+      // match at declare-time), so the load-bearing block is the per-sample
+      // egress put — the deny key `ops/audit/operator/**` INCLUDES each
+      // concrete delivered key, so router→subscriber delivery is denied.
+      // The payload is ALSO age-encrypted to the operator roster (§7), so the
+      // ACL is defense-in-depth, not the sole control.
+      {
+        id: "audit-operator-read-deny",
+        messages: ["put", "delete", "declare_subscriber", "query", "declare_queryable", "reply"],
+        flows: ["ingress", "egress"],
+        permission: "deny",
+        key_exprs: ["ops/audit/operator/**"],
+      },
+
+      // Universal subscriber DELIVERY — egress-only put/delete on ** so
+      // the router can deliver published samples + queryable replies to
+      // subscribers. `flows: ["egress"]` = router→client direction only;
+      // this grants NO publish capability (a peer publishing is ingress).
+      // This carries the original "delivery is a put from the router's
+      // perspective" need without the ingress
+      // over-grant.
+      // `liveliness_token` egress (ADR 1040 gap 3): a token DECLARATION is
+      // delivered router→watcher the same way a sample is — without it a
+      // liveliness subscriber connects cleanly and sees nothing (the same
+      // silent-egress-drop class the put widening above fixed).
+      // Egress-only: this grants no token-declare capability.
+      // `**/@adv/**`: same verbatim-chunk reason as trial-peer-r-all — the
+      // gap-5 publisher-detection tokens live at `<key>/@adv/pub/<zid>/…`.
+      {
+        id: "trial-peer-deliver-all",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: ["**", "**/@adv/**"],
+      },
+{% if zenoh_partner_read_partition | default(false) %}
+      // B2.1 partner read + delivery rules (partner-read-partition.md). Each
+      // partner reads ONLY its own anchor + its granted release lanes — key
+      // scoped, so unlike trial-peer-r-all/deliver-all these do NOT grant `**`.
+      // Read (r-*) mirrors trial-peer-r-all's message set: pure read ops, NO
+      // put/delete → zero write grant. Delivery (deliver-*) is egress-only
+      // put/delete scoped to the same keys so the partner receives ONLY samples
+      // under its granted prefixes (the operator-audit §7 lesson: egress is the
+      // load-bearing delivery vector). Writes stay own-anchor-only via
+      // slot-w-<anchor>, bound in policies below.
+      //
+      // KEY BUNDLES. Each lane also carries "keys/<set>/**", because a
+      // member that cannot read the key bundle for a release set cannot decrypt
+      // anything in it — grant-keyed encryption simply does not work end to end
+      // without this, and the gap is SILENT: a missing rule is default-deny, so
+      // the fetch returns empty and reads as "no data".
+      //
+      // Scoped per release set, NEVER "keys/**": a member belongs to the
+      // audiences it produces to or reads from and to no others, and a broad
+      // grant would hand it every audience's bundle. Same rule the peering edge
+      // already applies (roles/goat-zenoh-edge, goat_zenoh_edge_key_bundle_key_exprs).
+      //
+      // WHY THIS IS EXTRA key_exprs AND NOT A SEPARATE RULE, since the edge role
+      // deliberately made the opposite choice: there, the alternative host rule
+      // carried INGRESS put/delete, so folding key reads into it would have let a
+      // partner publish a bundle wrapping a DEK of its own choosing. Here neither
+      // rule can do that — partner-r-* has no put/delete at all, and
+      // partner-deliver-* is egress-only, which is the router DELIVERING to the
+      // member, not the member authoring. Member writes stay confined to
+      // slot-w-<anchor> on ingress, which never names keys/. The narrowness that
+      // matters is preserved; a third rule per anchor would add ~106 rules to a
+      // 2,383-rule ACL for no privilege difference.
+      //
+      // This grants a read that should always have existed. It does NOT give a
+      // fast way to withdraw key access: that would mean re-rendering the ACL and
+      // restarting on every audience change. Cutting a member off is
+      // `goat access revoke` -> grant-keyd mints a new generation with no copy
+      // wrapped to them. Rollback: zenoh_member_key_read_enabled=false.
+{% for _anchor, _lanes in _partner_lane_map.items() %}
+      {
+        id: "partner-r-{{ _anchor }}",
+        messages: ["declare_subscriber", "query", "declare_queryable", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: [
+          "{{ _anchor }}/**", "volatile/{{ _anchor }}/**", "{{ _anchor }}/**/@adv/**",
+{% for _set in _lanes %}
+          "release/{{ _set }}/**", "release/{{ _set }}/**/@adv/**",
+{% if zenoh_member_key_read_enabled | default(true) | bool %}
+          "keys/{{ _set }}/**", "keys/{{ _set }}/**/@adv/**",
+{% endif %}
+{% endfor %}
+        ],
+      },
+      {
+        id: "partner-deliver-{{ _anchor }}",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [
+          "{{ _anchor }}/**", "volatile/{{ _anchor }}/**", "{{ _anchor }}/**/@adv/**",
+{% for _set in _lanes %}
+          "release/{{ _set }}/**", "release/{{ _set }}/**/@adv/**",
+{% if zenoh_member_key_read_enabled | default(true) | bool %}
+          "keys/{{ _set }}/**", "keys/{{ _set }}/**/@adv/**",
+{% endif %}
+{% endfor %}
+        ],
+      },
+{% endfor %}
+{% endif %}
+
+      // Schema declarations — every vendor publishes their own schema
+      // docs under attest/schema/. Portal (when it lands) enforces the
+      // <vendor>-prefix invariant at registration; ACL allows the broader
+      // pattern so vendors don't need a second cert.
+      // INGRESS-only after the ADR 1020 split: this is a publish grant.
+      // Egress delivery of these keys to subscribers is covered by the
+      // universal trial-peer-deliver-all rule above.
+      {
+        id: "trial-peer-w-attest-schema",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["attest/schema/**"],
+      },
+
+      // Operator writes the operator/control namespace: announcements,
+      // audit-stream, fabric health, and per-service control planes.
+      // `ops/**` is canonical (ADR 0844 / ADR 1035). The deprecated
+      // `system/**` is added ONLY for an instance that opts in via
+      // `goat_zenoh_legacy_system_namespace` so
+      // its live fabric doesn't flag-day during migration; NEW deployments
+      // get clean `ops/`-only. Vendors cannot publish under
+      // either. INGRESS-only (publish grant) after the ADR 1020 split.
+      // `liveliness_token` (ADR 1040 gap 3): the operator may declare
+      // presence tokens under its own namespace (ops/presence/<service>).
+      {
+        id: "operator-w-ops",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/**"{% if goat_zenoh_legacy_system_namespace | default(false) | bool %}, "system/**"{% endif %}],
+      },
+{% if goat_zenoh_connect_endpoints | default([]) | length > 0 %}
+      // Federation ingress (ADR 1020 decision 1, goat↔goat). A peered PEER ROUTER
+      // (cert CN goat-zenoh-router — see the `router-peer` subject) forwards its
+      // site's samples across the federation link; on this router they arrive as
+      // an INGRESS from that peer, so without an explicit grant they are denied by
+      // the decision-5 ingress split. This lets the peer bring in the two prefixes
+      // we federate: fabric/ops infra data and the shared schema tree. Scoped
+      // deliberately — NOT `**` — so federation cannot re-open the decision-5 hole;
+      // widen the key_exprs to add prefixes (e.g. vendor data once schemas ride
+      // the fabric, decision 2). Safe as goat↔goat because the peer enforces the
+      // identical ACL: it only forwards what was already authorized at its origin.
+      {
+        id: "router-peer-w-federated",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/**", "attest/schema/**"],
+      },
+
+      // ---- Peer-router READ + DELIVERY, scoped by variable ----
+      // A peer router may inherit READ and DELIVERY on `**` from the
+      // universal `trial-peer-r-all` + `trial-peer-deliver-all` rules. That is
+      // defensible for a SAME-CA, same-goatnet two-site federation,
+      // where both ends are one fabric under one authority. It is NOT
+      // defensible across a CA boundary: per F-424 the ACL cannot see which CA
+      // issued a leaf, so any foreign root in the trust store could mint
+      // CN=goat-zenoh-router and inherit read of the entire fabric.
+      //
+      // These two rules are bound to `router-peer` INSTEAD of the universal ones,
+      // so a peering's reach is a per-environment decision rather than a
+      // side effect of the fabric-wide grant. The defaults reproduce the previous
+      // key_exprs EXACTLY, so a same-goatnet deploy is semantically unchanged;
+      // a cross-sovereign edge profile sets them to the agreed prefixes only.
+      //
+      // DO NOT narrow these on a live goatnet without a live-fire test. ACL denial
+      // is silent at both ends: if the scoped set is wrong, cross-site
+      // delivery stops and NOTHING logs it at the sender. Widen by measurement.
+      {
+        id: "router-peer-r-scoped",
+{% if zenoh_edge_queryable_lockdown | default(false) %}
+        messages: ["declare_subscriber", "query", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+{% else %}
+        messages: ["declare_subscriber", "query", "declare_queryable", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+{% endif %}
+        flows: ["egress", "ingress"],
+        permission: "allow",
+        key_exprs: [{% for _k in goat_zenoh_router_peer_read_key_exprs | default(["**", "**/@adv/**"]) %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+      {
+        id: "router-peer-deliver-scoped",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [{% for _k in goat_zenoh_router_peer_deliver_key_exprs | default(["**", "**/@adv/**"]) %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+{% endif %}
+
+      // Self-claims (ADR 1082 Amendment 2): ANY authenticated peer may
+      // publish its own signed name→IP claim under ops/names/claim/**.
+      // Safe as a broad ingress-allow because the trust is in the leaf
+      // signature + the snapshot's peer_bindings, verified at read by
+      // every consumer — a peer publishing a claim for a name it does not
+      // own produces an artifact that fails verification everywhere, so
+      // the ACL need only let claims flow (consistent with the collector
+      // being untrusted transport: it can deny, never forge). Scoped to
+      // exactly the claim subtree, INGRESS-only; nothing here grants read
+      // of anyone else's data. Inert until a peer runs `goat names
+      // publish-claim`.
+      {
+        id: "peer-w-name-claim",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/names/claim/**"],
+      },
+
+      // Fabric-health meter (ADR 1034) writes ONLY the fabric-observability
+      // sub-namespace (ops/fabric/health/** + ops/fabric/footprint/**) — scoped
+      // tighter than the operator's full ops/** so the meter is a
+      // least-privilege, separately-attributable infra identity. Operator-
+      // minted leaf carries CN=fabric-health-trial-peer. INGRESS-only (publish
+      // grant). Present in BOTH ACL modes — an infra peer is not a vendor/uuid
+      // slot. Inert until a cert with that CN connects, so it adds no exposure
+      // to instances not (yet) running the meter.
+      {
+        id: "infra-w-fabric-health",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/fabric/**"],
+      },
+
+      // Topology surface (ADR 1160): the per-router publisher writes ONLY its
+      // own node's snapshot under ops/fabric/topology/. Narrower than
+      // infra-w-fabric-health on purpose — this meter has no reason to write
+      // anywhere else under ops/fabric/**, and a least-privilege grant is what
+      // keeps "one meter, one namespace" true as meters multiply.
+      // Inert until a cert with CN=goat-topology-trial-peer connects.
+      {
+        id: "infra-w-topology",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/fabric/topology/**"],
+      },
+
+      // Single lazy crawler (zenoh-cardinality-budget-and-lazy-crawler.md §4)
+      // writes ONLY its two rollup keys: the cardinality budget sensor +
+      // the byte-faithful adminspace census mirror everyone reads instead of
+      // walking the router. Reads via trial-peer-r-all + the admin census
+      // selectors (trial-peer-r-admin-census). Operator-minted leaf carries
+      // CN=goat-fabric-crawler-trial-peer. INGRESS-only. Present in BOTH ACL
+      // modes (an infra peer); PRE-CUT + inert until a cert with that CN
+      // connects (F-156: ACL edits are a no-op live, so this lands ahead of
+      // the cert ceremony; first deploys may reuse the fabric-health leaf,
+      // whose ops/fabric/** grant covers these keys).
+      {
+        id: "infra-w-fabric-crawler",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/fabric/cardinality/**", "ops/fabric/census/**"],
+      },
+
+      // grant-keyd — the E1 key-distribution daemon writes ONLY the key-bundle
+      // namespace keys/** (data-access M2.1, docs/design/grant-keyed-encryption.md
+      // §7: write on keys/** is the first authenticity gate — only the
+      // key-service identity may publish a bundle). Inert until a cert with CN
+      // grant-keyd-trial-peer connects.
+      {
+        id: "infra-w-keys",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["keys/**"],
+      },
+
+      // ntp-health-pub republisher (ADR 1036/1037, F-184) writes ONLY the
+      // per-host signed-attestation sub-namespace ops/time/attest/** — the
+      // signed NtpState verdict it forwards verbatim from the local
+      // ntp-health-agent. Under ops/ (ADR 1035), NOT the `@/` adminspace.
+      // Operator-minted leaf carries CN=ntp-health-pub-trial-peer. INGRESS-only.
+      // Present in BOTH ACL modes (an infra peer, not a vendor/uuid slot); inert
+      // until a cert with that CN connects.
+      {
+        id: "infra-w-time-attest",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/time/attest/**"],
+      },
+
+      // goat-time-health roll-up (ADR 1036/1037, F-184) writes ONLY the per-site
+      // time-health viewing sub-namespace ops/time/health/** (the rolled-up
+      // EnvHealthV1{domain:"time"} reading). It READS ops/time/attest/** via the
+      // shared trial-peer read-all rule. Operator-minted leaf carries
+      // CN=goat-time-health-trial-peer. INGRESS-only. Present in BOTH ACL modes
+      // (an infra peer); inert until a cert with that CN connects.
+      {
+        id: "infra-w-time-health",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/time/health/**"],
+      },
+
+      // goat-mesh-health meter (ADR 1042) writes ONLY the per-site mesh-health
+      // viewing sub-namespace ops/mesh/health/** (the per-site
+      // EnvHealthV1{domain:"mesh"} reading graded from the vantage host's own
+      // netbird status snapshot — passive, no probes). Subscribes nothing.
+      // Operator-minted leaf carries CN=goat-mesh-health-trial-peer.
+      // INGRESS-only. Present in BOTH ACL modes (an infra peer); inert until a
+      // cert with that CN connects.
+      // goat-surface-visit (ADR 1163) writes ONLY the per-visit attribution
+      // namespace ops/audit/surface/**. One age-encrypted SurfaceVisitV1 per
+      // authenticated request to a fenced web surface, tailed from that
+      // surface's oauth2-proxy door log. Subscribes nothing.
+      // Operator-minted leaf carries CN=goat-surface-visit-trial-peer.
+      // INGRESS-only: this peer publishes and can never read the stream back.
+      // That is deliberate — the payload is age-encrypted to the operator
+      // roster and the emitter holds only public recipients, so it cannot read
+      // its own writes at either layer. Inert until a cert with that CN
+      // connects.
+      {
+        id: "infra-w-surface-visit",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/audit/surface/**"],
+      },
+
+      {
+        id: "infra-w-mesh-health",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/mesh/health/**"],
+      },
+
+      // The acceptance assay's probe identity (goatnet-acceptance-suite.md
+      // §"The probe identity"; operator-minted leaf CN=goat-assay-probe-trial-peer,
+      // a non-person). It writes ONLY its own round-trip keys: `goat hello`
+      // under the context it runs as (hello/assay-probe) and the volatile
+      // bus round trip (volatile/goat-assay/**, routed, never stored). Its read
+      // is the universal read (zenoh_universal_read_cns on a partitioned
+      // goatnet), which carries the operator-audit deny. Present in BOTH ACL
+      // modes; inert until a cert with that CN connects.
+      {
+        id: "infra-w-assay-probe",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["hello/assay-probe", "volatile/goat-assay/**"],
+      },
+
+      // goat-node-net-health publisher (node-net-health.md / ADR 1036 net
+      // domain) writes ONLY the per-node net-health sub-namespace
+      // ops/net/health/** (the per-node EnvHealthV1{domain:"net"} connection
+      // inventory — observation, not enforcement). Subscribes nothing.
+      // Operator-minted leaf carries CN=goat-node-net-health-trial-peer.
+      // INGRESS-only. Present in BOTH ACL modes (an infra peer); inert until a
+      // cert with that CN connects.
+      {
+        id: "infra-w-net-health",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/net/health/**"],
+      },
+
+      // ops/consistency/report/** + ops/consistency/health/** — the CF-3
+      // convergence surface (consistency-foundation.md §5, ADR 1110). Two
+      // topics following the time domain exactly: each node self-publishes its
+      // own record on report/<host_id>, and ONE passive rollup per goatnet
+      // publishes the graded EnvHealthV1{domain:"consistency"} on
+      // health/<site>. Both writers carry the same CN, so this is one rule
+      // pair rather than one subject per node — the least-privilege line that
+      // matters here is "consistency and nothing else", not "this host and no
+      // other", because a node forging another node's record still cannot
+      // forge the GRADE (the rollup computes that against the artifact, and
+      // reads identity off the KEY the router authorised).
+      // INGRESS-only. Present in BOTH ACL modes; inert until a cert with that
+      // CN connects.
+      //
+      // F-177: a denied write is SILENT — the publisher logs a happy
+      // "published" either way. Verify with a live subscriber, never a storage
+      // read-back, which also returns empty on a default deny.
+      // F-156: zenohd 1.9.0 SIGHUP is a NO-OP. Adding these rules requires a
+      // full router restart before they are live.
+      {
+        id: "infra-w-consistency",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/consistency/report/**", "ops/consistency/health/**"],
+      },
+
+      // goat-presence-health roll-up (ADR 1040 gap 3 / ADR 1036) writes ONLY
+      // the per-site presence viewing sub-namespace ops/presence/health/**
+      // (the rolled-up EnvHealthV1{domain:"presence"} reading graded from the
+      // liveliness token set). It WATCHES tokens via the universal
+      // declare_liveliness_subscriber grant; it declares no token of its own.
+      // Operator-minted leaf carries CN=goat-presence-health-trial-peer.
+      // INGRESS-only. Present in BOTH ACL modes (an infra peer); inert until
+      // a cert with that CN connects.
+      {
+        id: "infra-w-presence-health",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["ops/presence/health/**"],
+      },
+
+{% if zenoh_identity_model == 'per-uuid-slot-pool' %}
+      // Pre-cut slot-pool write rules (ADR 1025): slot k grants put/delete on
+      // its own anchor <uuid> only (<uuid> = sha256(salt:k)[:32]) plus the
+      // non-persisted volatile/<uuid>/** class (no storage entry; excluded by
+      // the audit subscriber's --exclude-key volatile/**). One grant per slot,
+      // ingress-only — a slot can publish into its own namespace and nowhere
+      // else.
+      //
+      // Topic-prefix subdivision (cardinality-budget layer 3): when the
+      // tenant's topic-budget grant record (zenoh_topic_budget_grants —
+      // group_vars, layer 2b) names `prefixes` for an anchor, that slot's one
+      // open `<anchor>/**` write grant is SUBDIVIDED into exactly those
+      // pre-cut named prefixes — the tenant gets N named channels, not a
+      // blank namespace, and sprawl becomes attributable per channel. The
+      // names are tenant-chosen and stable (they ARE the channel names; a
+      // count alone cannot render an ACL). Ungranted slots keep the open
+      // grant — absence of a prefix grant means "not yet subdivided", never
+      // lost write access (the restart-free onboarding property of the
+      // pre-cut pool is preserved for fresh slots). F-156: this renders
+      // pre-cut and takes effect on router restart — there is no live ACL
+      // reload and deliberately no incremental path. Ceiling, stated
+      // honestly: a prefix ACL bounds declared PREFIXES, never leaf keys
+      // beneath them — a tenant granted <anchor>/video/** can still mint 64k
+      // keys under it; only the crawler counts leaves (layer 4).
+{% set _topic_budget_grants = zenoh_topic_budget_grants | default({}) %}
+{% for k in range(zenoh_slot_pool_size | int) %}
+{% set _anchor = ((zenoh_slot_pool_salt ~ ':' ~ k) | hash('sha256'))[:32] %}
+{% set _prefixes = (_topic_budget_grants[_anchor] | default({})).prefixes | default([]) %}
+      {
+        id: "slot-w-{{ _anchor }}",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+{% if _prefixes | length > 0 %}
+        key_exprs: [
+{% for _p in _prefixes %}
+          "{{ _anchor }}/{{ _p }}/**", "volatile/{{ _anchor }}/{{ _p }}/**", "{{ _anchor }}/{{ _p }}/**/@adv/**",
+{% endfor %}
+        ],
+{% else %}
+        key_exprs: ["{{ _anchor }}/**", "volatile/{{ _anchor }}/**", "{{ _anchor }}/**/@adv/**"],
+{% endif %}
+      },
+{% endfor %}
+{% if zenoh_copublish_enabled | default(false) %}
+      // ADR 1105 co-publish WRITE grants (PUBSUB-ORG-ADMIN). Each granted
+      // (publisher, multipub-topic-base) pair renders ONE additive ingress
+      // write allow so the publisher may `put` on a registered MULTI-PUBLISHER
+      // topic (base = "multipub/<pool>/<topic>", a DISTINCT namespace — NEVER
+      // a single-owner <uuid>/** root, which stays inviolable). Purely
+      // additive atop deny-by-default: it never edits the publisher's own
+      // slot-w rule and never references any single-owner root.
+      // At-most-own-org + the multipub-topic-only guardrail are enforced
+      // upstream at grant issuance (the portal, data.govern.org gate), not
+      // re-checked in the render. Default-off; empty dict renders nothing.
+      // F-156: takes effect only on router restart (no live ACL reload).
+      // F-177: an un-granted key stays denied SILENTLY — live-fire verifies a
+      // grant by PRESENCE at a subscriber and an un-granted key by ABSENCE.
+{% for _writer, _targets in (zenoh_copublish_grants | default({})).items() %}
+{% for _base in _targets %}
+      {
+        id: "copub-w-{{ _writer }}-{{ loop.index0 }}",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["{{ _base }}/**", "volatile/{{ _base }}/**", "{{ _base }}/**/@adv/**"],
+      },
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% if (zenoh_release_writers | default({})) | length > 0 %}
+      // Release-lane WRITE grants (partner-data-exchange.md / ADR 0821 + ADR 1027).
+      // The producer half of partner sharing. A producer authorized to PUBLISH
+      // into a release lane gets ONE additive ingress put/delete on
+      // release/<set>/** for each set it may write. This is the WRITE counterpart
+      // to the B2.1 partner READ lanes (partner-r-<anchor>): partners READ
+      // release/<set>/**, producers WRITE it — both registry-driven, symmetric.
+      // "release" is the deliberately-marked cross-org sharing prefix: a producer
+      // publishes there instead of its own <uuid>/** root precisely so a partner
+      // (who is denied that root) can read it. Purely additive atop
+      // deny-by-default + the producer's own-anchor slot-w rule — it NEVER edits a
+      // slot root and NEVER references a single-owner <uuid>/** root. Default-off;
+      // empty dict renders nothing (byte-identical). F-156: takes effect only on
+      // router restart. F-177: an un-granted lane stays SILENTLY denied — live-fire
+      // verifies a grant by PRESENCE at a subscriber, an un-granted lane by ABSENCE.
+{% for _anchor, _sets in (zenoh_release_writers | default({})).items() %}
+      {
+        id: "release-w-{{ _anchor }}",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: [
+{% for _set in _sets %}
+          "release/{{ _set }}/**", "release/{{ _set }}/**/@adv/**",
+{% endfor %}
+        ],
+      },
+{% endfor %}
+{% endif %}
+      // F-517: seeded vendor-CN publishers under the slot pool. A goatnet in
+      // per-uuid-slot-pool mode still declares nova_seed_vendors (the
+      // storages above render from it), and a seeded vendor that publishes
+      // with CN=<vendor>-trial-peer (demogame via the rest-pub-bridge
+      // sidecar) needs a write grant on its own namespace exactly as the
+      // per-vendor org fragment gives it. Without a rule here the CN matches
+      // only trial-peer-read and every PUT is dropped silently at ingress.
+      // Same shape as acl-org-fragment.json5.j2, one rule per
+      // seeded vendor, ingress-only, own namespace + its volatile class.
+{% for vendor in nova_seed_vendors %}
+      {
+        id: "trial-peer-w-{{ vendor }}",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["{{ vendor }}/**", "volatile/{{ vendor }}/**", "{{ vendor }}/**/@adv/**"],
+      },
+{% endfor %}
+{% else %}
+      // BEGIN: per-vendor write rules
+      // END: per-vendor write rules
+{% endif %}
+    ],
+
+    // Subjects key off the cert Common Name. Zenoh 1.9.0 access_control
+    // schema supports `cert_common_names` (plural list, exact match)
+    // along with `interfaces`, `usernames`, `link_protocols`, `zids` —
+    // and NOT a URI-SAN matcher (despite the trial-fabric design's
+    // initial pencil sketch). The MATCHER-SYNTAX TODO is now resolved
+    // against the real 1.9.0 schema.
+    //
+    // Convention: every minted leaf carries `CN=<vendor>-trial-peer`
+    // (or `CN=operator-trial-peer` for the operator leaf). The portal
+    // and any add-vendor flow MUST preserve this CN shape — it is the
+    // load-bearing identity axis for the trial fabric's ACL.
+    //
+    // The universal-read subject keys off `link_protocols: ["tls"]`
+    // rather than enumerating every vendor CN: with transport-layer
+    // mTLS forcing a chain-verifiable client cert via
+    // root_ca_certificate (offline-CA root), every TLS peer
+    // is by construction a CA-rooted peer. Looser-looking but
+    // chain-equivalent.
+    subjects: [
+      // Universal read — any peer that completed mTLS handshake. The
+      // transport.link.tls.root_ca_certificate gate ahead of this
+      // subject enforces "CA-rooted" structurally.
+{% if zenoh_partner_read_partition | default(false) and _partner_lane_map | length > 0 %}
+      // B2.1 partition ON (partner-read-partition.md): the universal read is
+      // narrowed off link_protocols to the ENUMERATED non-partner population so
+      // partner anchors match ONLY their partner-<anchor> subject below (and are
+      // NOT rescued to universal read by allow-from-any). Non-partner slots are
+      // enumerated automatically; extra non-slot read consumers come from
+      // zenoh_universal_read_cns. Operator/infra/audit keep read via their own
+      // subjects. An omission here LOSES read — enabling is live-fire
+      // gated. When the flag is off this renders as the byte-stable
+      // link_protocols:["tls"] universal grant.
+      {
+        id: "trial-peer-read",
+        cert_common_names: [
+{% if zenoh_identity_model == 'per-uuid-slot-pool' %}
+{% for k in range(zenoh_slot_pool_size | int) %}
+{% set _a = ((zenoh_slot_pool_salt ~ ':' ~ k) | hash('sha256'))[:32] %}
+{% if _a not in _partner_lane_map %}
+          "{{ _a }}",
+{% endif %}
+{% endfor %}
+{% endif %}
+{% for _cn in zenoh_universal_read_cns | default([]) %}
+          "{{ _cn }}",
+{% endfor %}
+        ],
+      },
+{% else %}
+      {
+        id: "trial-peer-read",
+        link_protocols: ["tls"],
+      },
+{% endif %}
+
+{% if zenoh_peer_read_scoped | default(false) | bool %}
+      // Fabric-wide read. The ONE subject that may
+      // subscribe to the whole keyspace. Every CN here is a declared line in
+      // zenoh_fabric_wide_read with an owner and a reason; the role refuses a
+      // malformed entry and refuses a partner anchor outright (naming a partner
+      // here would silently undo the B2.1 read partition for that partner).
+      //
+      // Renders even when the list is empty — an empty subject matches no CN
+      // (cert_common_names is present but empty), which is the fail-closed
+      // direction: nobody gets the fabric-wide read by omission.
+      {
+        id: "fabric-wide-read",
+        cert_common_names: [
+{% for _e in zenoh_fabric_wide_read | default([]) %}
+{% if _e.cn is defined %}
+{% set _fw_cn = _e.cn %}
+{% else %}
+{% set _fw_cn = ((zenoh_slot_pool_salt ~ ':' ~ _e.slot_idx) | hash('sha256'))[:32] %}
+{% endif %}
+{# owner/reason are free text from group_vars and land inside a `//` comment.
+   A newline in either would end the comment and leave the rest of the sentence
+   as invalid JSON5 — a router that will not start. Flatten, never trust. #}
+          "{{ _fw_cn }}",   // {{ _e.owner | replace('\n', ' ') }} — {{ _e.reason | replace('\n', ' ') }}{% if _e.until is defined %} (review {{ _e.until }}){% endif %}
+
+{% endfor %}
+        ],
+      },
+
+{% endif %}
+      // Operator — operator leaf carries CN=operator-trial-peer.
+      // Distinct from any vendor subject so the operator can be
+      // restricted to ops/** (+ transitional system/**) writes via the
+      // policies block below.
+      {
+        id: "operator",
+        cert_common_names: ["operator-trial-peer"],
+      },
+{% if goat_zenoh_connect_endpoints | default([]) | length > 0 %}
+      // Federation peer router (ADR 1020 decision 1). Matches the OTHER goatnet
+      // router across the federation link — every router leaf carries
+      // CN=goat-zenoh-router, so this subject is the remote peer, never a client
+      // (clients carry service CNs) and never self (a router does not ACL-check
+      // itself). Its policy grants read + delivery + the scoped federation ingress.
+      {
+        id: "router-peer",
+        cert_common_names: ["goat-zenoh-router"],
+      },
+{% endif %}
+
+{% for _p in (zenoh_sovereign_peerings | default([])) %}
+      // Sovereign peering subject: {{ _p.sovereign }} (ADR 1157). Matches the CN
+      // agreed with that sovereign and set as the FIRST dns_name on their SPIRE
+      // entry -- SPIRE derives the X509-SVID Subject CN from it, which is what
+      // this matches. Rendered from the peering declaration and NOT gated on
+      // goat_zenoh_connect_endpoints: a core router accepts a sovereign whose
+      // edge dials IN, so it has no connect endpoint of its own for that peer.
+      {
+        id: "sovereign-{{ _p.sovereign }}",
+        cert_common_names: ["{{ _p.cn }}"],
+      },
+{% endfor %}
+      // Fabric-health meter — operator-minted leaf carries
+      // CN=fabric-health-trial-peer (ADR 1034 infra peer). Distinct from the
+      // operator subject so its ops/fabric/** writes are least-privilege +
+      // separately attributable. Present in both ACL modes.
+      {
+        id: "infra-fabric-health",
+        cert_common_names: ["fabric-health-trial-peer"],
+      },
+
+      // Topology publisher (ADR 1160) — operator-minted leaf carries
+      // CN=goat-topology-trial-peer. One publisher per ROUTER HOST, each
+      // describing only itself; they share this subject because they share a
+      // grant, and attribution comes from the <node> segment of the key rather
+      // than from the certificate. Present in both ACL modes.
+      {
+        id: "infra-topology",
+        cert_common_names: ["goat-topology-trial-peer"],
+      },
+
+      // grant-keyd key-distribution daemon — SVID Subject CN
+      // grant-keyd-trial-peer. Least-privilege keys/** writer, separately
+      // attributable. Present in both ACL modes.
+      {
+        id: "infra-keyd",
+        cert_common_names: ["grant-keyd-trial-peer"],
+      },
+
+      // ntp-health-pub republisher — operator-minted leaf carries
+      // CN=ntp-health-pub-trial-peer (ADR 1036/1037 infra peer). Least-privilege
+      // ops/time/attest/** writer; present in both ACL modes.
+      {
+        id: "infra-ntp-health-pub",
+        cert_common_names: ["ntp-health-pub-trial-peer"],
+      },
+
+      // goat-time-health roll-up — operator-minted leaf carries
+      // CN=goat-time-health-trial-peer (ADR 1036/1037 infra peer). Least-privilege
+      // ops/time/health/** writer (reads ops/time/attest/** via read-all); both modes.
+      {
+        id: "infra-time-health",
+        cert_common_names: ["goat-time-health-trial-peer"],
+      },
+
+      // goat-mesh-health meter — operator-minted leaf carries
+      // CN=goat-mesh-health-trial-peer (ADR 1042 infra peer). Least-privilege
+      // ops/mesh/health/** writer; both modes.
+      {
+        id: "infra-mesh-health",
+        cert_common_names: ["goat-mesh-health-trial-peer"],
+      },
+
+      // The assay probe — operator-minted leaf CN=goat-assay-probe-trial-peer
+      // (goatnet-acceptance-suite.md). Writes its two round-trip keys only.
+      {
+        id: "infra-assay-probe",
+        cert_common_names: ["goat-assay-probe-trial-peer"],
+      },
+
+      // goat-surface-visit emitter — operator-minted leaf carries
+      // CN=goat-surface-visit-trial-peer (ADR 1163 infra peer). Least-privilege
+      // ops/audit/surface/** writer, no read; both modes.
+      {
+        id: "infra-surface-visit",
+        cert_common_names: ["goat-surface-visit-trial-peer"],
+      },
+
+      // goat-presence-health roll-up — operator-minted leaf carries
+      // CN=goat-presence-health-trial-peer (ADR 1040 gap 3 infra peer).
+      // Least-privilege ops/presence/health/** writer (watches liveliness
+      // tokens via read-all); both modes.
+      {
+        id: "infra-presence-health",
+        cert_common_names: ["goat-presence-health-trial-peer"],
+      },
+
+      // goat-node-net-health publisher — operator-minted leaf carries
+      // CN=goat-node-net-health-trial-peer (node-net-health.md net-domain
+      // infra peer). Least-privilege ops/net/health/** writer; both modes.
+      {
+        id: "infra-node-net-health",
+        cert_common_names: ["goat-node-net-health-trial-peer"],
+      },
+
+      // goat-consistency-health — operator-minted leaf carries
+      // CN=goat-consistency-health-trial-peer (consistency-foundation.md §5
+      // infra peer; the per-node publisher and the goatnet rollup share it).
+      // Least-privilege ops/consistency/** writer; both modes.
+      {
+        id: "infra-consistency-health",
+        cert_common_names: ["goat-consistency-health-trial-peer"],
+      },
+
+      // goat-fabric-crawler — operator-minted leaf carries
+      // CN=goat-fabric-crawler-trial-peer (cardinality-budget layer-4 infra
+      // peer). Least-privilege ops/fabric/{cardinality,census}/** writer;
+      // both modes. Pre-cut inert until the leaf is minted (first deploys may
+      // run on the fabric-health leaf instead — see the rule comment).
+      {
+        id: "infra-fabric-crawler",
+        cert_common_names: ["goat-fabric-crawler-trial-peer"],
+      },
+
+      // goat-consistency-console — operator-minted leaf carries
+      // CN=goat-consistency-console-trial-peer (CF-6, consistency-
+      // foundation.md §7). SUBSCRIBE-ONLY: the console renders
+      // ops/consistency/health/** + report/** and publishes nothing, so its
+      // policy below carries NO write rule (contrast infra-consistency-health,
+      // which is the publisher/rollup WRITER subject). A dedicated subject is
+      // REQUIRED, not a nicety: under the B2.1 partner read partition the
+      // universal trial-peer-read subject is narrowed to enumerated CNs, and
+      // a console cert matching no subject would be denied SILENTLY (F-177 —
+      // the page would honestly render "nothing heard" forever). Present in
+      // both ACL modes; inert until a cert with that CN connects.
+      {
+        id: "infra-consistency-console",
+        cert_common_names: ["goat-consistency-console-trial-peer"],
+      },
+
+      // Audit subscriber — the external **-subscriber that persists every
+      // sample three-tier (ADR 0858 / audit-subscriber role). It previously
+      // matched ONLY trial-peer-read; it now needs its own subject so the
+      // F-207 audit-operator-read-deny on trial-peer-read does not stop it
+      // persisting ops/audit/operator/** (across-subject allow-from-any
+      // rescues it via the policy below). Present in both ACL modes; inert
+      // until a cert with one of these CNs connects.
+      //
+      // BOTH CN spellings are listed because goatnets differ: CN=audit-subscriber
+      // and the strict <name>-trial-peer leaf convention →
+      // CN=audit-subscriber-trial-peer. Listing both keeps the carve-out turnkey across
+      // every goatnet without per-site templating; a CN no real cert presents
+      // is inert (the offline-CA root gate still applies).
+      {
+        id: "audit-subscriber",
+        cert_common_names: ["audit-subscriber", "audit-subscriber-trial-peer"],
+      },
+
+{% if zenoh_identity_model == 'per-uuid-slot-pool' %}
+      // Pre-cut slot-pool subjects (ADR 1025): the cert CN *is* the slot
+      // anchor <uuid>. The portal mints CN=<uuid> for the system assigned
+      // slot k; that cert matches this pre-existing subject — no ACL edit,
+      // no restart.
+{% for k in range(zenoh_slot_pool_size | int) %}
+{% set _anchor = ((zenoh_slot_pool_salt ~ ':' ~ k) | hash('sha256'))[:32] %}
+      {
+        id: "slot-{{ _anchor }}",
+        cert_common_names: ["{{ _anchor }}"],
+      },
+{% endfor %}
+{% if zenoh_partner_read_partition | default(false) %}
+      // B2.1 partner subjects: a partner anchor matches ONLY here (it is
+      // excluded from the narrowed trial-peer-read above), so its read is
+      // exactly what partner-r-/deliver- grant — own anchor + release lanes.
+{% for _anchor in _partner_lane_map.keys() %}
+      {
+        id: "partner-{{ _anchor }}",
+        cert_common_names: ["{{ _anchor }}"],
+      },
+{% endfor %}
+{% endif %}
+      // F-517: one subject per seeded vendor CN (see the write rules above).
+      // Reads still come through trial-peer-read, which enumerates the same
+      // CNs; this subject exists so the vendor's own write policy can bind.
+{% for vendor in nova_seed_vendors %}
+      {
+        id: "vendor-{{ vendor }}",
+        cert_common_names: ["{{ vendor }}-trial-peer"],
+      },
+{% endfor %}
+{% else %}
+      // BEGIN: per-vendor subjects
+      // END: per-vendor subjects
+{% endif %}
+    ],
+
+    // Policies bind rules to subjects.
+    policies: [
+      // Every trial peer can read everything + receive subscriber
+      // deliveries. NO ingress write here — that is the ADR 1020 fix.
+      // A peer can only PUBLISH via its scoped per-vendor policy below.
+      // The universal subject ALSO carries the F-207 audit-operator-read-deny
+      // so vendors/slots (which read ONLY via this subject) cannot watch the
+      // operator-action trail. Operator + infra peers + audit-subscriber are
+      // rescued by their dedicated-subject read grants (allow-from-any).
+      // peer-w-name-claim is attached HERE (the universal subject) on
+      // purpose: any mTLS peer may publish its OWN signed self-claim under
+      // ops/names/claim/** (ADR 1082 Amendment 2 §7.3). This is a narrow,
+      // deliberate exception to the ADR 1020 "no ingress write on
+      // trial-peer-read" rule — the grant's key_exprs are scoped to exactly
+      // the claim subtree, and forgery is inert (every consumer verifies the
+      // leaf signature + snapshot binding at read; the collector is untrusted
+      // transport — it can drop a claim, never forge one). Without this the
+      // rule is defined but bound to no subject → default-deny → publishes
+      // silently dropped.
+{% if zenoh_peer_read_scoped | default(false) | bool %}
+      // F-287 amendment fix 8: the universal subject's read is the ENUMERATED
+      // namespace set, not `**`. Same reach, no single fan-in declaration.
+      // Everything else on this binding is unchanged — the self-claim write, the
+      // operator-audit deny, the admin census round-trip.
+      { rules: ["peer-r-scoped", "peer-deliver-scoped", "peer-w-name-claim", "audit-operator-read-deny", "trial-peer-r-admin-census"], subjects: ["trial-peer-read"] },
+
+      // The named fabric-wide readers. They get `**` for the read half and the
+      // universal delivery rule, PLUS the scoped rules — which is what carries
+      // their per-namespace `declare_queryable`, deliberately absent from
+      // fabric-wide-r. The operator-audit deny rides here too: a named reader is
+      // not the audit subscriber, and without this line its `**` allow inside
+      // THIS subject would hand it the operator trail that trial-peer-read
+      // denies (across subjects the first Allow wins, so the deny has to be
+      // present in every subject that grants a superset).
+      { rules: ["fabric-wide-r", "trial-peer-deliver-all", "peer-r-scoped", "audit-operator-read-deny", "trial-peer-r-admin-census"], subjects: ["fabric-wide-read"] },
+{% else %}
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "peer-w-name-claim", "audit-operator-read-deny", "trial-peer-r-admin-census"], subjects: ["trial-peer-read"] },
+{% endif %}
+
+      // Operator can read everything, receive deliveries, + write the
+      // operator/control namespace (ops/** canonical + system/** transitional).
+      // The trial-peer-r-all/deliver-all here (on the `operator` subject, not
+      // trial-peer-read) is what rescues the operator's read of
+      // ops/audit/operator/** past the deny above (allow-from-any).
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "operator-w-ops"], subjects: ["operator"] },
+{% if goat_zenoh_connect_endpoints | default([]) | length > 0 %}
+      // Federation peer router: read + query (trial-peer-r-all), delivery
+      // (trial-peer-deliver-all), and the scoped federation ingress. Read is
+      // granted EXPLICITLY here rather than relying on the universal
+      // `trial-peer-read` subject, because with zenoh_partner_read_partition:true
+      // that universal grant is narrowed to enumerated CNs and would exclude the
+      // peer router.
+      { rules: ["router-peer-r-scoped", "router-peer-deliver-scoped", "router-peer-w-federated"], subjects: ["router-peer"] },
+{% endif %}
+{% for _p in (zenoh_sovereign_peerings | default([])) %}
+      // {{ _p.sovereign }}: write into its own prefix{% if (_p.release_key_exprs | default([])) | length > 0 %}, read the declared release set{% else %}, read NOTHING{% endif %}.
+      { rules: [{% if (_p.release_key_exprs | default([])) | length > 0 %}"sovereign-{{ _p.sovereign }}-w", "sovereign-{{ _p.sovereign }}-r"{% else %}"sovereign-{{ _p.sovereign }}-w"{% endif %}], subjects: ["sovereign-{{ _p.sovereign }}"] },
+{% endfor %}
+
+      // Audit subscriber: read + receive deliveries on ** so it persists
+      // every sample INCLUDING ops/audit/operator/**. Its dedicated
+      // subject's `**` allow rescues it past the trial-peer-read deny. No
+      // write grant — it only subscribes.
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all"], subjects: ["audit-subscriber"] },
+
+      // Fabric-health meter: reads + receives deliveries (it subscribes ** to
+      // meter load) + writes its own ops/fabric/** surface only (ADR 1034).
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-fabric-health"], subjects: ["infra-fabric-health"] },
+      // Topology publisher: reads + receives deliveries (it needs neither, but
+      // the baseline pair is how every meter is granted) + writes only its own
+      // ops/fabric/topology/** surface (ADR 1160).
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-topology"], subjects: ["infra-topology"] },
+      // grant-keyd: baseline read/deliver + writes its own keys/** bundle surface.
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-keys"], subjects: ["infra-keyd"] },
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-time-attest"], subjects: ["infra-ntp-health-pub"] },
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-time-health"], subjects: ["infra-time-health"] },
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-mesh-health"], subjects: ["infra-mesh-health"] },
+      // The assay probe: its own round-trip writes and nothing else. No read
+      // rule here on purpose — it reads through the universal subject, so the
+      // operator-audit deny there holds for it (no allow-from-any rescue).
+      { rules: ["infra-w-assay-probe"], subjects: ["infra-assay-probe"] },
+      // No trial-peer-r-all and no deliver rule on purpose: the visit emitter
+      // is write-only. Granting it read would let a peer that lives inside the
+      // door's log directory also read every other surface's visit stream.
+      { rules: ["infra-w-surface-visit"], subjects: ["infra-surface-visit"] },
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-presence-health"], subjects: ["infra-presence-health"] },
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-net-health"], subjects: ["infra-node-net-health"] },
+      // The rollup must READ ops/consistency/report/** as well as write, which
+      // trial-peer-r-all already grants; the write half is the added rule.
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "infra-w-consistency"], subjects: ["infra-consistency-health"] },
+      // Consistency console (CF-6): read + receive deliveries ONLY — the
+      // audit-subscriber shape. It subscribes ops/consistency/health/** +
+      // report/**; trial-peer-r-all covers the declare, trial-peer-deliver-all
+      // the egress sample delivery. Deliberately NO write rule of any kind.
+      // F-156: adding this policy requires a FULL router restart to go live
+      // (SIGHUP is a no-op); F-177: until then the subscribe is denied
+      // silently and the page renders "nothing heard".
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all"], subjects: ["infra-consistency-console"] },
+      // Single lazy crawler: baseline read/deliver + the admin census
+      // selectors (trial-peer-r-admin-census is otherwise bound only to the
+      // trial-peer-read subject, which under per-uuid-slot-pool matches slot
+      // CNs — an infra cert without this explicit grant gets ZERO census
+      // replies, silently, F-177) + writes its own cardinality + census
+      // rollup keys.
+      { rules: ["trial-peer-r-all", "trial-peer-deliver-all", "trial-peer-r-admin-census", "infra-w-fabric-crawler"], subjects: ["infra-fabric-crawler"] },
+
+{% if zenoh_identity_model == 'per-uuid-slot-pool' %}
+      // Pre-cut slot-pool policies (ADR 1025): bind each slot subject to its
+      // own write rule + the shared attest-schema write. Each slot is
+      // hard-isolated to its own anchor.
+{% for k in range(zenoh_slot_pool_size | int) %}
+{% set _anchor = ((zenoh_slot_pool_salt ~ ':' ~ k) | hash('sha256'))[:32] %}
+      {
+        rules: ["slot-w-{{ _anchor }}", "trial-peer-w-attest-schema"],
+        subjects: ["slot-{{ _anchor }}"],
+      },
+{% endfor %}
+{% if zenoh_copublish_enabled | default(false) %}
+      // ADR 1105 co-publish policies: bind each writer's additive copub-w-*
+      // rules onto its EXISTING slot-<writer> subject (the writer authenticates
+      // with its own cert CN=<writer>). An extra policy entry on the same
+      // subject accumulates allows atop the writer's own slot-w rule — never
+      // replaces it. No new subject, no new cert.
+{% for _writer, _targets in (zenoh_copublish_grants | default({})).items() %}
+      {
+        rules: [{% for _base in _targets %}"copub-w-{{ _writer }}-{{ loop.index0 }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+        subjects: ["slot-{{ _writer }}"],
+      },
+{% endfor %}
+{% endif %}
+{% if zenoh_edge_queryable_lockdown | default(false) and (zenoh_edge_queryable_lockdown_grants | default([])) | length > 0 %}
+      // Edge-queryable-lockdown re-grants. Narrowing trial-peer-r-all
+      // strips declare_queryable from every subject that carries it — which is
+      // every service, since each service policy includes that rule. These bind
+      // each lockdown-q-<subject> rule back onto its OWN subject, so a service
+      // keeps answering on its own namespace and nothing else does.
+      //
+      // A rule bound to NO subject is default-deny and silently inert,
+      // so the binding is the load-bearing half: emitting the rule without this
+      // block would look correct in the config and deny in production.
+{% for _g in zenoh_edge_queryable_lockdown_grants | default([]) %}
+      {
+        rules: ["lockdown-q-{{ _g.subject }}"],
+        subjects: ["{{ _g.subject }}"],
+      },
+{% endfor %}
+{% endif %}
+{% if (zenoh_release_writers | default({})) | length > 0 %}
+      // Release-writer policies (partner-data-exchange.md): bind each producer's
+      // additive release-w-<anchor> onto its EXISTING slot-<anchor> subject
+      // (same-cert accumulation, like the ADR 1105 co-publish policies). Never
+      // replaces the producer's slot-w rule; the producer keeps own-anchor write
+      // and GAINS release-lane write. A partner-partitioned anchor still matches
+      // slot-<anchor> (rendered for every pool k), so this binds correctly whether
+      // or not the producer is itself a partitioned reader.
+{% for _anchor in (zenoh_release_writers | default({})).keys() %}
+      {
+        rules: ["release-w-{{ _anchor }}"],
+        subjects: ["slot-{{ _anchor }}"],
+      },
+{% endfor %}
+{% endif %}
+{% if zenoh_partner_read_partition | default(false) %}
+      // B2.1 partner policies: own-anchor WRITE (slot-w-<anchor> + attest
+      // schema, same as any slot) + the key-scoped partner READ/DELIVER. The
+      // audit-operator-read-deny is bound here too (defense-in-depth: a partner
+      // must never watch the operator trail even inside a granted lane).
+{% for _anchor in _partner_lane_map.keys() %}
+      {
+        rules: ["slot-w-{{ _anchor }}", "trial-peer-w-attest-schema", "partner-r-{{ _anchor }}", "partner-deliver-{{ _anchor }}", "audit-operator-read-deny"],
+        subjects: ["partner-{{ _anchor }}"],
+      },
+{% endfor %}
+{% endif %}
+      // F-517: bind each seeded vendor's write rule (+ the shared
+      // attest-schema write) to its CN subject. Without this binding the rule
+      // above is defined but reaches nobody — default-deny, silent.
+{% for vendor in nova_seed_vendors %}
+      {
+        rules: ["trial-peer-w-{{ vendor }}", "trial-peer-w-attest-schema"],
+        subjects: ["vendor-{{ vendor }}"],
+      },
+{% endfor %}
+{% else %}
+      // BEGIN: per-vendor policies
+      // END: per-vendor policies
+{% endif %}
+    ],
+  },
+}

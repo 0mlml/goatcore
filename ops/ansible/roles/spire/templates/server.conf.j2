@@ -1,0 +1,68 @@
+# {{ ansible_managed }}
+# SPIRE server — Phase A. Rendered by ops/ansible/roles/spire/.
+# Started with `-expandEnv` so ${SPIRE_DB_PASSWORD} resolves from the
+# container env (supplied via --env-file .env.spire). Sandbox single-node.
+
+server {
+    bind_address       = "0.0.0.0"
+    bind_port          = "8081"
+    trust_domain       = "{{ spire_trust_domain }}"
+    data_dir           = "/opt/spire/data/server"
+    log_level          = "{{ spire_log_level }}"
+    ca_ttl             = "{{ spire_ca_ttl }}"
+    default_x509_svid_ttl = "{{ spire_default_svid_ttl }}"
+    # Agent SVIDs outlive workload SVIDs so the agent survives power-off
+    # (1h agent SVID + single-use join token = dead agent after any
+    # outage > 1h).
+    agent_ttl          = "{{ spire_agent_svid_ttl }}"
+{% if spire_federation_enabled | default(false) %}
+
+    # Federation (Phase C — recognition layer only; docs/design/federated-trust-model.md).
+    # Serve our PUBLIC bundle so partners can pull it, and pull each declared
+    # partner's bundle (auto-refresh after the one-time `bundle set` bootstrap).
+    # Only public bundles cross; no private key ever leaves a domain. Recognition
+    # != authorization — the per-partner Zenoh ACL/namespace stays the separate
+    # authz layer. Default off (empty federates_with list keeps this a no-op).
+    federation {
+        bundle_endpoint {
+            address = "{{ spire_federation_bundle_endpoint_address | default('0.0.0.0') }}"
+            port    = {{ spire_federation_bundle_endpoint_port | default(8443) }}
+            # Explicit serving profile — SPIRE 1.11 warns "Bundle endpoint is
+            # configured but has no profile set … This will be fatal in a future
+            # release" without it. https_spiffe: peers authenticate this endpoint by our
+            # own SVID (no web-PKI cert), the right fit for mesh-internal peering.
+            profile "https_spiffe" {}
+        }
+{% for p in spire_federates_with | default([]) %}
+        federates_with "{{ p.trust_domain }}" {
+            bundle_endpoint_url = "{{ p.bundle_endpoint_url }}"
+            bundle_endpoint_profile "https_spiffe" {
+                endpoint_spiffe_id = "{{ p.endpoint_spiffe_id }}"
+            }
+        }
+{% endfor %}
+    }
+{% endif %}
+}
+
+plugins {
+    DataStore "sql" {
+        plugin_data {
+            database_type     = "{{ spire_datastore_type | default('postgres') }}"
+            connection_string = "{{ spire_datastore_connection_string | default('dbname=' ~ spire_db_name ~ ' user=' ~ spire_db_user ~ ' password=${SPIRE_DB_PASSWORD} host=postgres-a port=5432 sslmode=disable') }}"
+        }
+    }
+
+    # Single-host sandbox node attestation. join_token is the minimal
+    # bare-host attestor; Phase B hardens to x509pop chained off the
+    # WireGuard/machine identity (ADR 0412 "machine attests workload").
+    NodeAttestor "join_token" {
+        plugin_data {}
+    }
+
+    KeyManager "disk" {
+        plugin_data {
+            keys_path = "/opt/spire/data/server/keys.json"
+        }
+    }
+}

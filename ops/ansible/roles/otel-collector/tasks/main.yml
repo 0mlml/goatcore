@@ -1,0 +1,127 @@
+---
+# ops/ansible/roles/otel-collector
+#
+# Anchor: ADR 0822 + design/observability-wide-events.md.
+# Receives OTLP/gRPC :4317 + OTLP/HTTP :4318, forwards to OpenObserve
+# via otlphttp exporter.
+#
+# Pre-flight: openobserve role must have completed on this host
+# (healthz reachable). Init task probes.
+
+# 1. Pre-flight
+
+- name: Pre-flight — OpenObserve creds for forward auth
+  ansible.builtin.assert:
+    that:
+      - otel_openobserve_user | length > 0
+      - otel_openobserve_pass | length > 0
+    fail_msg: |
+      VEGA_C_OPENOBSERVE_ROOT_EMAIL / _PASSWORD must be exported so
+      the OTel Collector can forward OTLP to OpenObserve.
+
+- name: Pre-flight — OpenObserve /healthz is up
+  ansible.builtin.uri:
+    url: "http://localhost:5080/healthz"
+    status_code: 200
+  register: _oo_pre
+  retries: 5
+  delay: 3
+  until: _oo_pre.status == 200
+  changed_when: false
+
+# 2. Storage layout
+
+- name: Ensure OTel data dir exists with container-matching ownership
+  ansible.builtin.file:
+    path: "{{ otel_data_root }}"
+    state: directory
+    owner: "{{ otel_uid }}"
+    group: "{{ otel_gid }}"
+    mode: "0750"
+
+- name: Ensure compose dir exists
+  ansible.builtin.file:
+    path: "{{ otel_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 3. Render compose + config + .env
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ otel_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: otel-collector compose changed
+
+- name: Render OTel Collector config
+  ansible.builtin.template:
+    src: otel-config.yaml.j2
+    dest: "{{ otel_compose_dir }}/otel-config.yaml"
+    owner: root
+    group: "{{ otel_gid }}"
+    mode: "0640"
+  notify: otel-collector config changed
+
+- name: Render .env
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ otel_compose_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: otel-collector compose changed
+
+# 4. Bring up
+
+- name: Pull OTel Collector image
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ otel_compose_dir }}"
+  changed_when: true
+
+- name: Bring up OTel Collector
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ otel_compose_dir }}"
+  register: _otel_up
+  changed_when: "'Started' in _otel_up.stderr or 'Created' in _otel_up.stderr or 'Recreated' in _otel_up.stderr"
+
+- name: Wait for OTel Collector self-metrics endpoint
+  ansible.builtin.uri:
+    url: "http://localhost:{{ otel_metrics_port }}/metrics"
+    status_code: 200
+  register: _otel_ready
+  retries: "{{ otel_health_retries }}"
+  delay: "{{ otel_health_delay_seconds }}"
+  until: _otel_ready.status == 200
+  changed_when: false
+
+- name: Check whether obs-host rules dir exists (co-location probe)
+  ansible.builtin.stat:
+    path: /opt/obs-host/rules
+  register: _otel_obs_rules_dir
+
+- name: Drop otel-collector.yml alert rules into obs-host rules dir
+  ansible.builtin.template:
+    src: prom-rules-otel-collector.yml.j2
+    dest: /opt/obs-host/rules/otel-collector.yml
+    owner: root
+    group: root
+    mode: "0644"
+  when: _otel_obs_rules_dir.stat.exists | default(false)
+  notify: prometheus reload from otel-collector role
+
+- name: Banner
+  ansible.builtin.debug:
+    msg: |
+      OTel Collector up.
+        OTLP/gRPC: {{ ansible_host }}:{{ otel_otlp_grpc_port }}
+        OTLP/HTTP: {{ ansible_host }}:{{ otel_otlp_http_port }}
+        Self-metrics: http://{{ ansible_host }}:{{ otel_metrics_port }}/metrics
+      Forwards to OpenObserve at {{ otel_openobserve_endpoint }}

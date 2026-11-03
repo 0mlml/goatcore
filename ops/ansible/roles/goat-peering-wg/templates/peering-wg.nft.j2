@@ -1,0 +1,38 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+#
+# Bootstrap step 2 of cross-sovereign-peering-transport.md: the tunnel carries the
+# far edge's fabric port and what the role was told to add, and nothing else.
+# Filtered at prerouting because the edge router's published port is a DNAT: its
+# traffic never reaches the input chain.
+{% set _pw_table = 'goat_peering_' ~ (peering_wg_interface | regex_replace('[^a-zA-Z0-9_]', '_')) %}
+{% set _pw_ports = ([peering_wg_fabric_port | int] + (peering_wg_extra_ports | map('int') | list)) | unique | join(', ') %}
+table inet {{ _pw_table }}
+delete table inet {{ _pw_table }}
+table inet {{ _pw_table }} {
+  chain from_tunnel {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "{{ peering_wg_interface }}" ct state established,related accept
+    iifname "{{ peering_wg_interface }}" meta l4proto icmp accept
+    iifname "{{ peering_wg_interface }}" ip saddr {{ peering_wg_remote_link_ip }} ip daddr {{ peering_wg_local_link_ip }} tcp dport { {{ _pw_ports }} } accept
+    iifname "{{ peering_wg_interface }}" counter drop
+{% if _pw_peer_addr | trim | length > 0 %}
+    # The tunnel port answers its one counterparty.
+    udp dport {{ peering_wg_listen_port }} ip saddr != {{ _pw_peer_addr | trim }} counter drop
+{% endif %}
+  }
+  chain onto_tunnel {
+    type filter hook postrouting priority mangle; policy accept;
+    oifname "{{ peering_wg_interface }}" ct state established,related accept
+    oifname "{{ peering_wg_interface }}" meta l4proto icmp accept
+    oifname "{{ peering_wg_interface }}" ip daddr {{ peering_wg_remote_link_ip }} tcp dport { {{ _pw_ports }} } accept
+    oifname "{{ peering_wg_interface }}" counter drop
+  }
+{% if peering_wg_clamp_mss | bool %}
+  chain clamp {
+    type filter hook forward priority mangle; policy accept;
+    oifname "{{ peering_wg_interface }}" tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+    iifname "{{ peering_wg_interface }}" tcp flags syn / syn,rst tcp option maxseg size set rt mtu
+  }
+{% endif %}
+}

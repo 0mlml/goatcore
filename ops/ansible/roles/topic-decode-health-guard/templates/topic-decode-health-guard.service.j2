@@ -1,0 +1,53 @@
+# Managed by ansible (roles/topic-decode-health-guard). Do not edit on the host.
+#
+# Grades every registered topic: do the bytes on the key match the format the
+# registry says they are? READ-ONLY — GETs against the portal and the goatnet's
+# zenoh router, no writes to either, and no writes to this host outside
+# ReadWritePaths below. If you are chasing a change on this goatnet, this unit
+# did not make it.
+[Unit]
+Description=Hourly topic decode-health audit (do the bytes match the declared format?)
+Documentation=https://github.com/usareur-af/goatcore/blob/main/docs/design/live-state-guard-scheduling.md
+Documentation=https://github.com/usareur-af/goatcore/blob/main/docs/design/topic-decode-health.md
+# Deliberately NOT After=docker.service. This reads the portal and the router
+# over the network; ordering it behind docker would make a docker restart look
+# like an audit failure. Both being containers on this host is incidental —
+# they are reached by URL like any other peer would reach them.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec={{ topic_decode_health_guard_timeout_sec }}
+EnvironmentFile=/etc/goat/topic-decode-health-guard.env
+ExecStart=/usr/local/sbin/topic-decode-health-guard.sh
+
+# Confinement. This unit holds a portal operator key, so the host-side blast
+# radius is pinned as small as the job allows: it writes its report directory
+# and its metrics file, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths={{ topic_decode_health_guard_report_dir }}{% if topic_decode_health_guard_textfile_dir | length > 0 %} {{ topic_decode_health_guard_textfile_dir }}{% endif %}
+
+
+# Politeness on a host that also carries the mesh control plane and the portal.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

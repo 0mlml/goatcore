@@ -1,0 +1,145 @@
+---
+# Store-era gate (ADR 1165 step A). id-admin-console runs it before anything is
+# rendered, so a refusal leaves the host exactly as it was.
+#
+# Three facts must agree before the console is (re)deployed:
+#   declared  id_admin_console_store in group_vars           sqlite | postgres
+#   image     the image's org.usareur-af.goat-id-console.store label
+#             (absent = an image built before the Postgres server = sqlite)
+#   host      id_admin_console_store_marker, written by the cutover (postgres)
+#             and the rollback (sqlite); absent = never cut over = sqlite
+#
+# The one exception is a host with no rows anywhere — no marker and no SQLite
+# files — declared postgres: a new goatnet starts on Postgres directly, and the
+# role provisions the databases and writes the marker itself.
+
+- name: id-admin-console-store | gate — the declared store is one the role knows
+  ansible.builtin.assert:
+    that:
+      - id_admin_console_store in ['sqlite', 'postgres']
+    fail_msg: >-
+      id_admin_console_store is {{ id_admin_console_store | to_json }}; it must be
+      sqlite or postgres.
+    quiet: true
+
+- name: id-admin-console-store | gate — the host architecture is known (the image pull below needs it)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['architecture'] is defined
+      - ansible_facts['architecture'] | length > 0
+    fail_msg: >-
+      ansible_facts['architecture'] is undefined; run this play with
+      gather_facts: true.
+    quiet: true
+
+- name: id-admin-console-store | gate — is the image present on the host?
+  ansible.builtin.command:
+    argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ id_admin_console_image }}"]
+  register: idac_image_labels
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Pulling is what `docker compose up` would do next anyway; doing it first lets
+# the gate read the label before the image can start.
+- name: id-admin-console-store | gate — pull the pinned image to read its label
+  ansible.builtin.command:
+    argv: ["docker", "pull", "--platform", "{{ id_admin_console_image_platform }}", "{{ id_admin_console_image }}"]
+  when: idac_image_labels.rc != 0
+  changed_when: true
+  check_mode: false
+
+- name: id-admin-console-store | gate — read the image's store label
+  ansible.builtin.command:
+    argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ id_admin_console_image }}"]
+  register: idac_image_labels_pulled
+  when: idac_image_labels.rc != 0
+  changed_when: false
+  check_mode: false
+
+- name: id-admin-console-store | gate — read the host's store marker
+  ansible.builtin.slurp:
+    src: "{{ id_admin_console_store_marker }}"
+  register: idac_store_marker
+  failed_when: false
+
+- name: id-admin-console-store | gate — are the SQLite files present?
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ id_admin_console_onboard_db_path }}"
+    - "{{ id_admin_console_org_db_path }}"
+  register: idac_sqlite_files
+
+- name: id-admin-console-store | gate — derive image, host and fresh-host facts
+  ansible.builtin.set_fact:
+    idac_image_store: >-
+      {{ ((idac_image_labels_pulled.stdout if idac_image_labels.rc != 0 else idac_image_labels.stdout)
+          | default('null', true) | from_json | default({}, true))[id_admin_console_store_label]
+         | default('sqlite', true) }}
+    idac_host_store: >-
+      {{ ((idac_store_marker.content | b64decode).splitlines() | first | trim)
+         if (idac_store_marker.content | default('') | length > 0) else '' }}
+    idac_host_has_sqlite: "{{ idac_sqlite_files.results | selectattr('stat.exists') | list | length > 0 }}"
+
+- name: id-admin-console-store | gate — the image's store matches the declared store
+  ansible.builtin.assert:
+    that:
+      - idac_image_store == id_admin_console_store
+    fail_msg: >-
+      REFUSING: {{ id_admin_console_image }} is a {{ idac_image_store }}-era console
+      image ({{ id_admin_console_store_label }}={{ idac_image_store }}), and this
+      goatnet declares id_admin_console_store: {{ id_admin_console_store }}.
+      {% if idac_image_store == 'postgres' %}
+      Started here it would serve empty Postgres databases while every proposal
+      and org is still in SQLite. Move this goatnet with
+      ops/ansible/id-console-postgres-cutover.yml
+      (docs/operations/id-console-postgres-cutover.md); a pin bump alone is not a
+      cutover.
+      {% else %}
+      Going back to a SQLite-era image is
+      ops/ansible/id-console-postgres-rollback.yml, which exports Postgres to
+      SQLite first (docs/operations/id-console-postgres-cutover.md).
+      {% endif %}
+    quiet: true
+
+- name: id-admin-console-store | gate — the host's rows are in the declared store
+  ansible.builtin.assert:
+    that:
+      - >-
+        (id_admin_console_store == 'sqlite' and idac_host_store in ['', 'sqlite'])
+        or (id_admin_console_store == 'postgres' and idac_host_store == 'postgres')
+        or (id_admin_console_store == 'postgres' and idac_host_store == '' and not idac_host_has_sqlite)
+    fail_msg: >-
+      REFUSING: this goatnet declares id_admin_console_store: {{ id_admin_console_store }},
+      but {{ id_admin_console_store_marker }} on {{ inventory_hostname }} says
+      {{ idac_host_store | default('', true) or 'nothing (never cut over)' }}{{ ' and the SQLite stores are present' if idac_host_has_sqlite else '' }}.
+      {% if id_admin_console_store == 'postgres' %}
+      This host's rows are still in SQLite. Cut it over with
+      ops/ansible/id-console-postgres-cutover.yml
+      (docs/operations/id-console-postgres-cutover.md).
+      {% else %}
+      This host's rows are in Postgres. Going back to SQLite is
+      ops/ansible/id-console-postgres-rollback.yml; a SQLite-era console started
+      here would open the read-only cutover archive.
+      {% endif %}
+    quiet: true
+
+- name: id-admin-console-store | gate — a Postgres store needs its database password
+  ansible.builtin.assert:
+    that:
+      - id_admin_console_db_password | default('') | length > 0
+    fail_msg: >-
+      id_admin_console_store is postgres but {{ id_admin_console_db_password_env }}
+      is empty in the deploying environment. It is resolved from the secret store
+      per command (ADR 1186): run the deploy through ops/scripts/with-secrets, with
+      a reference for {{ id_admin_console_db_password_env }} in .envrc.local.d.
+    quiet: true
+  when: id_admin_console_store == 'postgres'
+
+- name: id-admin-console-store | gate — summary
+  ansible.builtin.debug:
+    msg: >-
+      store gate passed: declared={{ id_admin_console_store }}
+      image={{ idac_image_store }} host={{ idac_host_store or 'unmarked' }}
+      sqlite-files={{ idac_host_has_sqlite }}

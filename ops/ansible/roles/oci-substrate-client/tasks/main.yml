@@ -1,0 +1,100 @@
+---
+# ops/ansible/roles/oci-substrate-client/tasks/main.yml
+#
+# Configure docker daemon (and future containerd) to route image pulls
+# through the OCI distribution substrate.
+
+- name: oci-substrate-client | sanity-check inputs
+  ansible.builtin.assert:
+    that:
+      - oci_substrate_t2_endpoint is defined
+    quiet: true
+    msg: |
+      oci_substrate_t2_endpoint must be set in group_vars/<site>_hosts/vars.yml
+      (e.g. "192.168.1.253:3030" for vega). Empty value is allowed for
+      single-Orin sites that skip T2 — the role no-ops those.
+
+- name: oci-substrate-client | skip if no T2 endpoint set (single-Orin sites today)
+  when: oci_substrate_t2_endpoint | length == 0
+  block:
+    - name: oci-substrate-client | report skip
+      ansible.builtin.debug:
+        msg: "No T2 endpoint configured; substrate-client no-ops on this host."
+    - name: oci-substrate-client | end host play
+      ansible.builtin.meta: end_host
+
+- name: oci-substrate-client | ensure /etc/docker exists
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: oci-substrate-client | read existing daemon.json (so we merge, not replace)
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  register: oci_existing_daemon_json_b64
+  failed_when: false
+  become: true
+
+- name: oci-substrate-client | parse existing daemon.json
+  ansible.builtin.set_fact:
+    oci_existing_daemon_json: >-
+      {{
+        (oci_existing_daemon_json_b64.content | b64decode | from_json)
+        if (oci_existing_daemon_json_b64.content is defined)
+        else {}
+      }}
+
+- name: oci-substrate-client | compute insecure-registries list (preserve existing)
+  ansible.builtin.set_fact:
+    oci_insecure_registries: >-
+      {{
+        (oci_existing_daemon_json.get('insecure-registries', [])
+         + ([oci_substrate_t2_endpoint] if oci_substrate_t2_insecure_http else []))
+        | unique
+      }}
+
+- name: oci-substrate-client | compute registry-mirrors list (preserve existing)
+  ansible.builtin.set_fact:
+    oci_registry_mirrors: >-
+      {{
+        (oci_existing_daemon_json.get('registry-mirrors', [])
+         + (['http://' ~ (oci_substrate_t2_endpoint | regex_replace(':[0-9]+$', '')) ~ ':' ~ (oci_substrate_t2_mirrors.docker_io | string)]
+            if oci_substrate_enable_dockerio_mirror else []))
+        | unique
+      }}
+
+- name: oci-substrate-client | render merged daemon.json
+  ansible.builtin.copy:
+    content: "{{ (oci_existing_daemon_json
+                 | combine({'insecure-registries': oci_insecure_registries,
+                            'registry-mirrors': oci_registry_mirrors})
+                 | to_nice_json(indent=2)) ~ '\n' }}"
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  become: true
+  notify: oci-substrate-client | restart docker
+
+- name: oci-substrate-client | log substrate config rendered
+  ansible.builtin.debug:
+    msg: |
+      OCI substrate-client config:
+        T2 endpoint:           {{ oci_substrate_t2_endpoint }}
+        Insecure (HTTP):       {{ oci_substrate_t2_insecure_http }}
+        Insecure registries:   {{ oci_insecure_registries }}
+        Registry mirrors:      {{ oci_registry_mirrors }}
+        Containerd hosts.toml: {{ 'enabled' if oci_substrate_enable_containerd_hosts_toml else 'skipped (Block 16 Quadlet trigger)' }}
+
+# Future: containerd hosts.toml config (Block 16 Quadlet trigger).
+# Today: docker-daemon-only. The hosts.toml machinery lands when the
+# orchestrator flips per ADR 0207 trigger conditions.
+- name: oci-substrate-client | TODO containerd hosts.toml (Block 16)
+  ansible.builtin.debug:
+    msg: "containerd hosts.toml deferred to Block 16 Quadlet adoption per ADR 0207"
+  when: oci_substrate_enable_containerd_hosts_toml

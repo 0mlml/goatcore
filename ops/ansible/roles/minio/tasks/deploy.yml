@@ -1,0 +1,325 @@
+---
+# ops/ansible/roles/minio
+#
+# Anchors: ADR 0811 (audit-integrity bucket — Object Lock COMPLIANCE) +
+# ADR 0822 (telemetry-otlp bucket — TTL retention). Single MinIO instance,
+# two buckets, one role.
+#
+# What this role does:
+#   1. Pre-flight (root creds set; NVMe mounted; image pin shape OK).
+#   2. Storage layout under /opt/docker-data/minio/ owned by the
+#      container UID (1000:1000 by default).
+#   3. Render compose (server + one-shot mc-init container).
+#   4. Bring up MinIO server, wait for /minio/health/live.
+#   5. Run mc-init: create both buckets (audit with --with-lock at
+#      creation time — Object Lock can't be enabled retroactively),
+#      apply default retention to audit bucket, apply lifecycle
+#      expiration to telemetry bucket.
+#   6. Verify: mc admin info reports server up; mc ls shows both
+#      buckets; mc retention info on audit bucket reports COMPLIANCE.
+#
+# Idempotent. Re-runs do not recreate buckets (`mc mb --ignore-existing`)
+# and re-applying retention / lifecycle is a no-op when settings match.
+
+# 1. Pre-flight
+
+- name: Pre-flight — minio_root_user is set
+  ansible.builtin.assert:
+    that:
+      - minio_root_user | length > 0
+    fail_msg: |
+      Env var {{ minio_root_user_envvar }} is not exported. Set it in
+      .envrc.local (1Password-backed) and re-run with `direnv allow`
+      active. The role will not start MinIO with an empty root identity.
+
+- name: Pre-flight — minio_root_password is set + meets minimum length
+  ansible.builtin.assert:
+    that:
+      - minio_root_password | length >= 8
+    fail_msg: |
+      Env var {{ minio_root_password_envvar }} is missing or shorter
+      than 8 chars. MinIO refuses to start with passwords below the
+      floor; we would crash-loop. Set a strong value in .envrc.local.
+
+- name: Pre-flight — NVMe data root parent exists
+  ansible.builtin.stat:
+    path: /opt/docker-data
+  register: _minio_nvme_stat
+
+- name: Fail if /opt/docker-data is missing (LUKS not up?)
+  ansible.builtin.assert:
+    that:
+      - _minio_nvme_stat.stat.exists | default(false)
+      - _minio_nvme_stat.stat.isdir | default(false)
+    fail_msg: |
+      /opt/docker-data is missing on this host. MinIO data path requires
+      the LUKS-mounted NVMe per ADR 0826. Run mgmt-host-luks.yml first.
+
+# 2. Storage layout
+
+- name: Ensure MinIO data dir exists with container-matching ownership
+  ansible.builtin.file:
+    path: "{{ minio_data_root }}"
+    state: directory
+    owner: "{{ minio_uid }}"
+    group: "{{ minio_gid }}"
+    mode: "0750"
+  # 0750 keeps the data tree off other host users while matching the
+  # in-container `minio-user` UID. The container fails to start if the
+  # path isn't writable as UID 1000 — same crash-loop class as the
+  # obs-host UID-mapping bug fixed in commit 00dad9e.
+
+- name: Ensure compose dir exists
+  ansible.builtin.file:
+    path: "{{ minio_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 3. Render compose + init script
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ minio_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0640"
+    # 0640 because compose carries the root creds via env. The .env
+    # file (next task) is 0600.
+  notify: minio compose changed
+
+- name: Render .env (root creds)
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ minio_compose_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: minio compose changed
+
+- name: Pre-flight — each minio_extra_users entry resolves a non-empty secret
+  ansible.builtin.assert:
+    that:
+      - lookup('env', item.secret_envvar) | length > 0
+    fail_msg: |
+      Env var {{ item.secret_envvar }} (for MinIO user {{ item.name }})
+      resolves empty. Generate a secret locally (e.g.
+      `openssl rand -hex 24`) and export it from your
+      .envrc.local.d/30-site-services.envrc before re-running.
+  loop: "{{ minio_extra_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: minio_extra_users | length > 0
+
+- name: Ensure policies dir exists (extra users)
+  ansible.builtin.file:
+    path: "{{ minio_compose_dir }}/policies"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: minio_extra_users | length > 0
+
+- name: Copy extra-user policy JSON files to host
+  ansible.builtin.copy:
+    src: "{{ item.policy_src }}"
+    dest: "{{ minio_compose_dir }}/policies/{{ item.policy_name }}.json"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ minio_extra_users }}"
+  loop_control:
+    label: "{{ item.policy_name }} <- {{ item.policy_src }}"
+  when: minio_extra_users | length > 0
+
+- name: Render mc-extra-users.env (per-user secrets, mc-init container env_file)
+  ansible.builtin.template:
+    src: mc-extra-users.env.j2
+    dest: "{{ minio_compose_dir }}/mc-extra-users.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: minio_extra_users | length > 0
+  notify: minio compose changed
+
+- name: Render mc-init.sh (idempotent bucket + lifecycle bootstrap)
+  ansible.builtin.template:
+    src: mc-init.sh.j2
+    dest: "{{ minio_compose_dir }}/mc-init.sh"
+    owner: root
+    group: root
+    mode: "0750"
+
+# 3b. Mesh-internal console exposure (Traefik file-provider overlay).
+# Off by default; sites that expose the console (ZAGROS) set
+# minio_console_traefik_enabled. Traefik watches the dynamic dir and reloads
+# on change — no container restart needed.
+- name: Render Traefik dynamic overlay for the MinIO console
+  ansible.builtin.template:
+    src: traefik-minio.yml.j2
+    dest: "{{ minio_console_traefik_dynamic_dir }}/{{ minio_console_traefik_dynamic_filename }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: minio_console_traefik_enabled | default(false) | bool
+
+# 4. Bring up MinIO server
+
+- name: Pull MinIO + mc images
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ minio_compose_dir }}"
+  changed_when: true
+
+- name: Bring up MinIO server (mc-init runs only on demand below)
+  ansible.builtin.command:
+    cmd: docker compose up -d minio
+    chdir: "{{ minio_compose_dir }}"
+  register: _minio_up
+  changed_when: "'Started' in _minio_up.stderr or 'Created' in _minio_up.stderr or 'Recreated' in _minio_up.stderr"
+
+- name: Wait for MinIO /minio/health/live
+  ansible.builtin.uri:
+    url: "http://localhost:{{ minio_api_port }}/minio/health/live"
+    status_code: 200
+  register: _minio_ready
+  retries: "{{ minio_health_retries }}"
+  delay: "{{ minio_health_delay_seconds }}"
+  until: _minio_ready.status == 200
+  changed_when: false
+
+# 5. Bucket + lifecycle bootstrap (one-shot mc container)
+
+- name: Run mc-init (creates buckets + applies Object Lock + lifecycle)
+  ansible.builtin.command:
+    cmd: docker compose run --rm mc-init
+    chdir: "{{ minio_compose_dir }}"
+  register: _minio_mc_init
+  changed_when: "'created' in _minio_mc_init.stdout or 'updated' in _minio_mc_init.stdout"
+  # mc-init.sh is internally idempotent; it prints `created` / `updated`
+  # / `unchanged` per resource and the changed_when picks up only the
+  # interesting cases.
+
+# 6. Verify
+
+- name: Verify both buckets exist
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm mc-init mc --json ls local/
+    chdir: "{{ minio_compose_dir }}"
+  register: _minio_buckets
+  changed_when: false
+
+- name: Assert all three buckets visible (audit + runtime-detection + telemetry)
+  ansible.builtin.assert:
+    that:
+      - minio_audit_bucket in _minio_buckets.stdout
+      - minio_runtime_detection_bucket in _minio_buckets.stdout
+      - minio_telemetry_bucket in _minio_buckets.stdout
+    fail_msg: |
+      One or more expected buckets is missing after mc-init. The Block 27
+      §"Storage substrate" table lists exactly three buckets; we must
+      see all of them. Inspect via `docker compose -f
+      {{ minio_compose_dir }}/docker-compose.yml run --rm mc-init mc
+      ls local/` on the host.
+
+- name: Verify Object Lock COMPLIANCE on runtime-detection-archive
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm mc-init mc retention info --default
+      local/{{ minio_runtime_detection_bucket }}
+    chdir: "{{ minio_compose_dir }}"
+  register: _minio_rda_lock
+  changed_when: false
+
+- name: Assert runtime-detection-archive carries COMPLIANCE retention
+  ansible.builtin.assert:
+    that:
+      - "'COMPLIANCE' in _minio_rda_lock.stdout"
+    fail_msg: |
+      runtime-detection-archive bucket lacks COMPLIANCE retention.
+      Block 18G evidence (Falco / osquery / auditd) is IR-grade and
+      requires Object Lock parity with audit-integrity. Recreate the
+      bucket with --with-lock at creation time.
+
+- name: Verify Object Lock on audit bucket
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm mc-init mc retention info --default
+      local/{{ minio_audit_bucket }}
+    chdir: "{{ minio_compose_dir }}"
+  register: _minio_audit_lock
+  changed_when: false
+
+- name: Assert audit bucket carries the declared lock-mode retention
+  ansible.builtin.assert:
+    that:
+      - "minio_audit_object_lock_mode in _minio_audit_lock.stdout"
+    fail_msg: |
+      Audit bucket does not carry the expected {{ minio_audit_object_lock_mode }}-mode
+      default Object Lock retention. ADR 0811 + Block 95 require Object Lock
+      enabled at bucket creation (--with-lock); the lock MODE (COMPLIANCE
+      or GOVERNANCE) is per-deployment via `minio_audit_object_lock_mode`.
+      Do NOT continue without re-running mc-init or recreating the bucket
+      with --with-lock (Object Lock cannot be enabled retroactively, but
+      the mode of new PUTs CAN be changed via `mc retention set --default`).
+
+- name: Verify telemetry bucket has expiration lifecycle rule
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm mc-init mc ilm rule list
+      local/{{ minio_telemetry_bucket }}
+    chdir: "{{ minio_compose_dir }}"
+  register: _minio_telemetry_ilm
+  changed_when: false
+  failed_when:
+    - _minio_telemetry_ilm.rc != 0
+    # `mc ilm rule list` on a bucket with no rules currently returns rc
+    # 0 with empty output on recent mc versions; older versions return
+    # rc 1 with "no lifecycle". Tolerate both since assertion below
+    # checks the substantive condition.
+    - "'no lifecycle' not in _minio_telemetry_ilm.stderr"
+
+- name: Assert telemetry bucket carries an Expiration rule
+  ansible.builtin.assert:
+    that:
+      - "'Expiration' in _minio_telemetry_ilm.stdout or 'expiration' in _minio_telemetry_ilm.stdout or 'Days: ' + (minio_telemetry_retention_days | string) in _minio_telemetry_ilm.stdout"
+    fail_msg: |
+      Telemetry bucket lifecycle rule is missing the expected
+      Expiration. Re-run mc-init or inspect with `mc ilm rule list
+      local/{{ minio_telemetry_bucket }}`.
+
+# 7. Drop Prometheus alert rules into obs-host's rules dir if obs-host
+# is co-located on this host (the vega-obs-bootstrap.yml pattern).
+# Each Phase-2 obs role drops its own rules file; obs-host owns the
+# directory but not the rules (separation of concerns).
+
+# TAGGED `rules` so an alert-rule change can ship on its own. Without a tag
+# the only way to land a one-file Prometheus template is to run the whole
+# minio role, which restarts MinIO — an object-storage restart to deploy a
+# text file, on the host that carries the audit archive. The two tasks are
+# tagged as a pair because the template task is gated on the probe's result;
+# tagging only the template would select a task whose `when:` reads an
+# undefined register.
+- name: Check whether obs-host rules dir exists (co-location probe)
+  ansible.builtin.stat:
+    path: /opt/obs-host/rules
+  register: _obs_rules_dir
+  tags:
+    - rules
+
+- name: Drop minio.yml alert rules into obs-host rules dir
+  ansible.builtin.template:
+    src: prom-rules-minio.yml.j2
+    dest: /opt/obs-host/rules/minio.yml
+    owner: root
+    group: root
+    mode: "0644"
+  when: _obs_rules_dir.stat.exists | default(false)
+  notify: prometheus reload from minio role
+  tags:
+    - rules

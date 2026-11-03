@@ -1,0 +1,174 @@
+---
+- name: Pre-flight — assert listen address is set
+  ansible.builtin.fail:
+    msg: >-
+      tang_listen_address is unset. Set it to this host's wg-cp0 address
+      (e.g. via group_vars wg_cp0_address) OR to a same-site LAN IP with
+      tang_listen_address_class=lan.
+  when: tang_listen_address | length == 0
+
+# ADR 0313 silent-control-plane invariant prohibits PUBLIC-INTERNET Tang
+# exposure. Same-site LAN (e.g. Satlink-CGNAT-private 192.168.1.0/24) is
+# NOT public-internet — it qualifies as a private substrate suitable for
+# Tang peer-binding. Pre-flight accepts:
+#   - wg-cp0 internal range (198.18.0.0/24 per Block 22K.7 migration; 10.99.0.0/24 legacy)
+#   - explicit `tang_listen_address_class: lan` opt-in (operator declares LAN bind)
+# Pre-flight rejects everything else (e.g. public IPs, 0.0.0.0).
+- name: Pre-flight — assert listen address is wg-cp0-internal OR explicit-LAN
+  ansible.builtin.fail:
+    msg: >-
+      tang_listen_address={{ tang_listen_address }} is not wg-cp0-internal
+      (198.18.0.0/24 or legacy 10.99.0.0/24) AND
+      tang_listen_address_class is not 'lan'. Block 65C requires Tang on
+      a private substrate; public Tang is rejected. Set the address class
+      explicitly to 'lan' if binding to a same-site LAN IP is intentional.
+  when:
+    - tang_listen_address | length > 0
+    - not (tang_listen_address is regex('^198\\.18\\.0\\.[0-9]+$'))
+    - not (tang_listen_address is regex('^10\\.99\\.0\\.[0-9]+$'))
+    - (tang_listen_address_class | default('wg-cp0')) != 'lan'
+
+- name: Install Tang package
+  ansible.builtin.apt:
+    name: "{{ tang_packages }}"
+    state: present
+    update_cache: true
+
+- name: Ensure Tang DB parent directory exists
+  ansible.builtin.file:
+    path: "{{ tang_db_dir | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure Tang DB directory exists
+  ansible.builtin.file:
+    path: "{{ tang_db_dir }}"
+    state: directory
+    owner: "{{ tang_user }}"
+    group: "{{ tang_group }}"
+    mode: "0700"
+
+# Tang's stock systemd units bind 0.0.0.0 by default. We render drop-ins
+# that override ListenStream to the wg-cp0 address only. This is the
+# load-bearing constraint per ADR 0313 + ADR 0612 — Tang must not be
+# reachable from any path other than wg-cp0.
+
+- name: Ensure socket-unit drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/tangd.socket.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render socket-unit drop-in to bind specified address + order on network-online
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tangd.socket.d/override.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Block 65C — Tang socket override, per ADR 0612 + ADR 0313.
+      # Stock unit ships ListenStream=80 (any-address); we override to
+      # constrain to a private substrate (wg-cp0 internal OR same-site LAN).
+      #
+      # NO `After=network-online.target` HERE, and no `Wants=` either.
+      #
+      # `Wants=` was dropped for creating an ordering cycle.
+      # `After=` was dropped for the SAME reason once this
+      # host's LUKS volume became a Tang client: `_netdev` in crypttab pulls
+      # local-fs.target -> network-online.target, which closes the loop
+      # network-online.target -> ... -> sockets.target -> tangd.socket ->
+      # network-online.target. A boot with the After= present has systemd delete jobs
+      # to break cycles, including `dbus.service`, `sockets.target`, `nvpmodel.service`
+      # (the Orin power model), `nv.service`, and — self-defeatingly — the
+      # `opt-docker\x2ddata.mount` job itself. A Tang server ordered "safely" after the network is worthless if
+      # it costs the mount it exists to enable.
+      #
+      # Binding before the address exists is handled by `FreeBind=true` below,
+      # plus `net.ipv4.ip_nonlocal_bind=1`, which is already a mgmt-host
+      # baseline invariant fleet-wide. Between them, "Cannot assign
+      # requested address" — the original reason for the ordering — cannot
+      # occur, so the dependency buys nothing and costs the boot transaction.
+      [Socket]
+      FreeBind=true
+      ListenStream=
+      ListenStream={{ tang_listen_address }}:{{ tang_listen_port }}
+  notify:
+    - reload systemd
+    - restart tangd socket
+
+# Tang keeps its keys as *.jwk files directly in tang_db_dir. A guard of
+# `creates: <dir>/.well-known/keys` names a path Ubuntu's tang never writes, so
+# every run would generate ANOTHER key pair on a running server.
+# Extra pairs do not break existing
+# clevis bindings, but they churn the advertisement for no reason. Key on the
+# files that actually exist.
+- name: Find existing Tang keys
+  ansible.builtin.find:
+    paths: "{{ tang_db_dir }}"
+    patterns: "*.jwk"
+  register: tang_existing_keys
+
+- name: Generate Tang ECDH keys (only when the server has none)
+  ansible.builtin.command:
+    cmd: /usr/libexec/tangd-keygen {{ tang_db_dir }}
+  become_user: "{{ tang_user }}"
+  when: tang_existing_keys.matched == 0
+
+- name: Enable + start Tang socket
+  ansible.builtin.systemd:
+    name: tangd.socket
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# Handlers normally run at END of play — i.e. AFTER the verification below.
+# That ordering would make the role fail on a config change:
+# the drop-in is rendered, `state: started` is a no-op because the socket is
+# already active with the OLD ListenStream, and systemd logs "Socket unit
+# configuration has changed while unit has been running, no open socket file
+# descriptor left. The socket unit is not functional until restarted." The
+# verify then failed with connection-refused on a socket systemd reported as
+# `active (listening)`. Flush here so the restart lands before we assert on it.
+- name: Apply any pending socket restart before verifying
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify Tang advertisement is reachable on the configured listener
+  ansible.builtin.uri:
+    url: "http://{{ tang_listen_address }}:{{ tang_listen_port }}/adv"
+    method: GET
+    status_code: 200
+    return_content: true
+  register: tang_adv_probe
+  retries: 5
+  delay: 2
+  until: tang_adv_probe.status == 200
+
+# `tang-show-keys <port>` curls LOCALHOST — but this role deliberately binds the
+# socket to the private substrate address ONLY (that constraint is the whole
+# point, per ADR 0313). So the stock helper always fails here with
+# "Failed to connect to localhost port 7500: Connection refused" even though the
+# server is healthy — the /adv probe above, which uses the real listener, has
+# already proven that. Derive the thumbprints from the advertisement instead,
+# and never fail the play on an audit-display convenience.
+- name: Display Tang key thumbprints (operator records these for audit)
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      curl -sf --max-time 5 "http://{{ tang_listen_address }}:{{ tang_listen_port }}/adv"
+      | jose fmt -j- -Og payload -SyOg keys -Af-
+      | jose jwk thp -i-
+    executable: /bin/bash
+  register: tang_thumbprints
+  changed_when: false
+  failed_when: false
+
+- name: Notice — Tang server up; record thumbprints
+  ansible.builtin.debug:
+    msg: |
+      Tang server is up at http://{{ tang_listen_address }}:{{ tang_listen_port }}/
+      Key thumbprints (record these for audit):
+      {{ tang_thumbprints.stdout | default('(thumbprint derivation unavailable — server health is proven by the /adv probe above)') }}

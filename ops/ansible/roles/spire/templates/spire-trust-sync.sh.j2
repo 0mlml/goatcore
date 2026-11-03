@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# spire-trust-sync — two self-heal arms for the co-located SPIRE pair
+# (both are what a host relocation breaks):
+#
+#   1. Router trust: SPIRE rotates its self-signed CA; the deploy-time concat
+#      into the router's root_ca bundle goes stale, after which the router
+#      answers every SVID with TLS alert UnknownCA. Re-export the live bundle
+#      and append any cert the router trust file doesn't already carry;
+#      restart the router only when something was appended.
+#   2. Agent rescue: an agent whose SVID expired while powered off cannot
+#      re-attest (join token is single-use) and crash-loops with "join token
+#      does not exist or has already been used". Mint a fresh token, splice it
+#      into .env.spire, recreate the agent.
+#
+# Idempotent; both arms are no-ops when healthy. Run by
+# spire-trust-sync.timer ({{ spire_trust_sync_interval }} + at boot).
+#
+# `--dry-run` reports every add, REMOVE and restart this run would perform and
+# performs none of them, mints no token, and leaves every file alone. Removing a
+# certificate authority from a live edge is not a step anyone should take blind,
+# so the removing path is reachable in report-only form before the timer reaches
+# it: `/usr/local/sbin/spire-trust-sync.sh --dry-run`.
+set -euo pipefail
+
+BUNDLE_EXPORT="{{ spire_data_dir }}/server/spire-ca.pem"
+ROUTER_TRUST_FILE="{{ spire_trust_sync_router_trust_file }}"
+RESTART_CONTAINERS="{{ spire_trust_sync_restart_containers | join(' ') }}"
+COMPOSE_DIR="{{ spire_compose_dir }}"
+SPIRE_BIN="{{ spire_bin_dir }}"
+TRUST_DOMAIN="{{ spire_trust_domain }}"
+AGENT_NODE_PATH="{{ spire_agent_node_path }}"
+AGENT_RESCUE_ENABLED="{{ '1' if spire_agent_rescue_enabled else '0' }}"
+{% if spire_federation_enabled | default(false) %}
+# Reconciliation: converge each EDGE trust file on exactly the declared set
+# rather than only adding to it. Off = the historical append-only behaviour, in
+# which a retired peering's certificate authority stays trusted forever. Only
+# rendered with federation on, because only federated EDGE files are reconciled
+# -- the core is append-only in every configuration.
+PRUNE_ENABLED="{{ '1' if spire_trust_sync_prune_enabled | default(true) else '0' }}"
+{% endif %}
+
+DRY_RUN=0
+case "${1:-}" in
+  --dry-run)  DRY_RUN=1 ;;
+  -h|--help)  echo "usage: $(basename "$0") [--dry-run]"; exit 0 ;;
+  "")         ;;
+  *)          echo "$(basename "$0"): unknown argument: $1" >&2; exit 2 ;;
+esac
+
+log() { echo "spire-trust-sync: $*"; }
+dry() { [ "$DRY_RUN" = 1 ]; }
+# Prefix for every line describing a mutation, so a dry-run transcript and a
+# real one differ in the one word that matters.
+would() { if dry; then printf 'would '; fi; }
+
+if ! docker exec spire-server "$SPIRE_BIN/spire-server" healthcheck >/dev/null 2>&1; then
+  log "spire-server not healthy; nothing to sync"
+  exit 0
+fi
+
+# --- Arm 1: bundle export + router trust append -----------------------------
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+docker exec spire-server "$SPIRE_BIN/spire-server" bundle show -format pem > "$tmp"
+if ! grep -q "BEGIN CERTIFICATE" "$tmp"; then
+  log "bundle export came back empty; refusing to touch trust files"
+  exit 1
+fi
+{% if spire_federation_enabled | default(false) %}
+# Phase C (docs/design/federated-trust-model.md). TWO separations govern where a
+# foreign certificate authority may land. Both are structural -- a code path that
+# cannot reach the wrong file -- rather than remembered, and both are CI-guarded.
+#
+#   CORE vs EDGE.  $tmp is the OWN bundle and is the ONLY thing written to
+#   ROUTER_TRUST_FILE, the CORE router. Per F-424 the Zenoh ACL matches a peer's
+#   Common Name and cannot see which CA issued it, so a partner CA on the core is
+#   not "trusting a partner" -- it is handing them every identity the core knows,
+#   CN=goat-zenoh-router included. Federated content is never written to $tmp.
+#   Guard: ops/ci/check-spire-federated-trust-files.sh
+#
+#   EDGE vs EDGE.  Each edge trust file gets our own bundle plus EXACTLY ONE
+#   partner's, fetched by trust domain. It used to get `bundle list` -- EVERY
+#   federated authority -- written into EVERY edge file. That is invisible with
+#   one partner and wrong with two: the edge facing B would also trust A's CA,
+#   and because the ACL matches the CN, A could mint B's agreed peering CN and
+#   be admitted at B's edge. (Per-peering tunnels and firewall rules still stand
+#   in front of that, so this is defence in depth, not the only control.)
+#   Guard: ops/ci/check-per-partner-trust-isolation.sh
+#
+# Re-run every tick, so a partner CA rotation re-converges here on the same
+# make-before-break machinery as F-202; the per-cert append below is idempotent.
+#
+# The peering table, one line per edge: "<trust_domain> <trust_file>". Rendered
+# from spire_trust_sync_federated_edges. A quoted heredoc, so nothing in a
+# declared path or domain is expanded by the shell.
+federated_edges() {
+  cat <<'EDGES'
+{% for _edge in spire_trust_sync_federated_edges | default([]) %}
+{{ _edge.trust_domain }} {{ _edge.trust_file }}
+{% endfor %}
+EDGES
+}
+
+# RETIRED peerings, same shape, rendered from
+# spire_trust_sync_federated_edges_retired. Deleting an entry from the ACTIVE
+# table above stops the partner's authority being ADDED; it does not remove the
+# copy already in the file, because nothing visits a file no table names. So a
+# retirement is DECLARED: the entry moves from the active table to this one, and
+# this one converges its trust file on OUR OWN BUNDLE ALONE — the partner
+# authority is removed and the edge router restarted on the next tick.
+#
+# The entry stays here until the edge itself is decommissioned. Removing it from
+# both tables is the same silent non-removal as before, which is why
+# ops/ci/check-federated-trust-retirement.sh refuses a peering that leaves the
+# active table without arriving here.
+retired_edges() {
+  cat <<'RETIRED'
+{% for _edge in spire_trust_sync_federated_edges_retired | default([]) %}
+{{ _edge.trust_domain | default('-') }} {{ _edge.trust_file }}
+{% endfor %}
+RETIRED
+}
+{% endif %}
+
+if ! cmp -s "$tmp" "$BUNDLE_EXPORT"; then
+  if dry; then
+    log "would refresh bundle export at $BUNDLE_EXPORT"
+  else
+    install -m 0644 "$tmp" "$BUNDLE_EXPORT"
+    log "refreshed bundle export at $BUNDLE_EXPORT"
+  fi
+fi
+
+# --- certificate helpers, shared by the adding and the reconciling paths -----
+
+# Split a PEM bundle into one file per certificate under $2.
+split_certs() {  # $1 = pem bundle, $2 = output dir
+  awk -v dir="$2" '/BEGIN CERTIFICATE/{n++; f=1} f{print > (dir "/cert" n ".pem")} /END CERTIFICATE/{f=0; close(dir "/cert" n ".pem")}' "$1"
+}
+
+# The whitespace-stripped base64 body is the identity used for EVERY comparison
+# here, so line-wrapping differences can never read as a different certificate
+# (the deploy task's whole-file grep -qF match breaks as soon as a bundle holds
+# >1 cert — that whole-file mismatch is exactly how F-202 bit).
+cert_body() {  # $1 = single-cert pem file
+  sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$1" | grep -v -- '-----' | tr -d ' \n'
+}
+
+# A human-checkable name for a certificate about to be added or removed. openssl
+# is not guaranteed on every host, so this falls back to a body prefix rather
+# than printing nothing: an operator reading a REMOVE line needs something they
+# can match against the file in front of them.
+cert_ident() {  # $1 = single-cert pem file
+  local subj="" fp=""
+  if command -v openssl >/dev/null 2>&1; then
+    subj="$(openssl x509 -in "$1" -noout -subject 2>/dev/null | sed 's/^subject=[[:space:]]*//')"
+    fp="$(openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')"
+  fi
+  [ -n "$subj" ] || subj="<no openssl; body starts $(cert_body "$1" | cut -c1-24)>"
+  [ -n "$fp" ] || fp="unavailable"
+  echo "$subj  sha256=$fp"
+}
+
+# Per-cert idempotent APPEND. Adds what is missing and never removes what is
+# present, which is what makes it safe to run every 15 minutes against a live
+# trust file: a transient failure to read a bundle cannot empty one. It is still
+# the only path used for the CORE router trust file, and the fallback for an
+# edge whose partner bundle could not be fetched this tick. Returns 0 (changed)
+# only when something was appended.
+append_certs() {  # $1 = source pem bundle, $2 = destination trust file
+  local src="$1" dest="$2" trust_norm splitdir c body rc=1
+  [ -n "$dest" ] && [ -f "$dest" ] || return 1
+  trust_norm="$(tr -d ' \n' < "$dest")"
+  splitdir="$(mktemp -d)"
+  split_certs "$src" "$splitdir"
+  for c in "$splitdir"/cert*.pem; do
+    [ -f "$c" ] || continue
+    body="$(cert_body "$c")"
+    [ -n "$body" ] || continue
+    case "$trust_norm" in
+      *"$body"*) ;;  # already trusted
+      *)
+        dry || cat "$c" >> "$dest"
+        log "$(would)ADD trust to $dest: $(cert_ident "$c")"
+        trust_norm="${trust_norm}${body}"
+        rc=0
+        ;;
+    esac
+  done
+  rm -rf "$splitdir"
+  return $rc
+}
+
+# Converge a trust file on EXACTLY the declared certificate set — the direction
+# append_certs cannot go.
+#
+# WHY IT EXISTS. Append-only means nothing ever removes a certificate authority.
+# A peering retired from spire_trust_sync_federated_edges left the partner's
+# authority trusted on that edge indefinitely, and a host that ran the
+# pre-isolation all-partners fold kept every partner's authority with no path
+# back. Per F-424 the Zenoh ACL matches a Common Name and cannot see the issuer,
+# so a stale authority on an edge is a live ability to mint that edge's names.
+#
+# WHY REMOVAL IS SAFE HERE. It writes the file FROM the declared set, and the
+# caller only reaches it when that whole set is in hand: our own bundle (this
+# script has already exited if that export came back empty) plus, for an active
+# peering, that partner's bundle actually fetched this tick. A fetch that fails
+# falls back to append_certs instead, so a transient failure can never reduce
+# trust. It also refuses outright to write an empty set.
+#
+# THE CONTRACT ON THE FILE. A file named to this function is WHOLLY OWNED by
+# this script: anything in it that is not in the declared set is removed. Never
+# point it at a trust file that also carries a hand-placed or separately-managed
+# CA. The CORE router trust file is deliberately never reconciled for exactly
+# that reason — it legitimately carries CAs this script knows nothing about.
+#
+# Returns 0 when the file changed (or, under --dry-run, would change).
+reconcile_certs() {  # $1 = desired pem set, $2 = destination trust file
+  local src="$1" dest="$2" src_norm dest_norm splitdir c body mode
+  local added=0 removed=0 rc=1
+  [ -n "$dest" ] && [ -f "$dest" ] || return 1
+  if ! grep -q "BEGIN CERTIFICATE" "$src"; then
+    log "REFUSING to reconcile $dest: the declared set came back empty"
+    return 1
+  fi
+  src_norm="$(tr -d ' \n' < "$src")"
+  dest_norm="$(tr -d ' \n' < "$dest")"
+
+  # Removals: what the file carries that the declared set does not.
+  splitdir="$(mktemp -d)"
+  split_certs "$dest" "$splitdir"
+  for c in "$splitdir"/cert*.pem; do
+    [ -f "$c" ] || continue
+    body="$(cert_body "$c")"
+    [ -n "$body" ] || continue
+    case "$src_norm" in
+      *"$body"*) ;;
+      *)
+        removed=$((removed + 1))
+        log "$(would)REMOVE trust from $dest: $(cert_ident "$c")"
+        ;;
+    esac
+  done
+  rm -rf "$splitdir"
+
+  # Additions: what the declared set carries that the file does not.
+  splitdir="$(mktemp -d)"
+  split_certs "$src" "$splitdir"
+  for c in "$splitdir"/cert*.pem; do
+    [ -f "$c" ] || continue
+    body="$(cert_body "$c")"
+    [ -n "$body" ] || continue
+    case "$dest_norm" in
+      *"$body"*) ;;
+      *)
+        added=$((added + 1))
+        log "$(would)ADD trust to $dest: $(cert_ident "$c")"
+        ;;
+    esac
+  done
+  rm -rf "$splitdir"
+
+  if [ "$removed" -gt 0 ] || [ "$added" -gt 0 ]; then
+    rc=0
+    if dry; then
+      log "would rewrite $dest from the declared set (+$added/-$removed)"
+    else
+      # Preserve the existing mode. A trust file that becomes unreadable to the
+      # router is the F-039 class of failure: the reader loads nothing and says
+      # nothing.
+      mode="$(stat -c '%a' "$dest" 2>/dev/null || echo 0644)"
+      install -m "$mode" "$src" "$dest"
+      log "rewrote $dest from the declared set (+$added/-$removed)"
+    fi
+  fi
+  return $rc
+}
+
+changed=0
+
+# The CORE router receives the OWN bundle only. $tmp never contains federated
+# content — see the federation block above. This is the line that keeps a
+# partner CA off the core.
+if append_certs "$tmp" "$ROUTER_TRUST_FILE"; then changed=1; fi
+
+{% if spire_federation_enabled | default(false) %}
+# EDGE routers: own bundle ⊕ THIS peering's partner bundle, and nothing else.
+# The per-domain fetch is `bundle list -id <spiffe id>`; `bundle list` with no
+# -id returns every federated authority and must never feed an edge file.
+# (`bundle show` is the OWN bundle and takes no -id -- that is $tmp above.)
+#
+# RECONCILED, not appended — but only when the whole declared set is in hand.
+# The declared set for an edge is our own bundle plus that ONE partner's, so the
+# file is fully derivable and can be written from it, which is the only way a
+# retired or stale authority ever leaves. The rule that makes removal safe:
+#
+#   partner bundle fetched  -> reconcile: the file becomes exactly own ⊕ partner,
+#                              and anything else in it is removed.
+#   partner bundle MISSING  -> append only: the file keeps whatever it has. A
+#                              transient `bundle list` failure must never be the
+#                              reason a partner stops being trusted.
+#
+# A missing partner bundle is also the NORMAL state before a peering's first
+# exchange completes, which is the same branch — the edge holds our own bundle,
+# nothing is removed, and the note below says so.
+edge_tmp="$(mktemp)"
+edge_one="$(mktemp)"
+trap 'rm -f "$tmp" "$edge_tmp" "$edge_one"' EXIT
+while read -r _td _ftf; do
+  [ -n "$_td" ] && [ -n "$_ftf" ] || continue
+  # Accept either "partner.example" or "spiffe://partner.example"; SPIRE wants
+  # the SPIFFE ID form, and spire_federates_with declares the bare form.
+  _td_id="spiffe://${_td#spiffe://}"
+  cat "$tmp" > "$edge_tmp"
+  _partner_ok=0
+  if docker exec spire-server "$SPIRE_BIN/spire-server" \
+       bundle list -id "$_td_id" -format pem 2>/dev/null \
+       | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' > "$edge_one" \
+     && grep -q "BEGIN CERTIFICATE" "$edge_one"; then
+    cat "$edge_one" >> "$edge_tmp"
+    _partner_ok=1
+  else
+    # NORMAL before a peering has completed its first bundle exchange, and NOT
+    # fatal: the edge keeps our own bundle and simply cannot yet verify the
+    # partner. Logged because a peering stuck in this state is indistinguishable
+    # from a healthy one unless something says so.
+    log "NOTE: no federated bundle for $_td_id yet; $_ftf gets our own bundle only"
+  fi
+  if [ "$PRUNE_ENABLED" = "1" ] && [ "$_partner_ok" = "1" ]; then
+    if reconcile_certs "$edge_tmp" "$_ftf"; then
+      changed=1
+      log "edge trust file $_ftf reconciled to own ⊕ $_td_id"
+    fi
+  else
+    if [ "$PRUNE_ENABLED" = "1" ]; then
+      log "NOTE: $_ftf appended, NOT reconciled this tick — the declared set is"
+      log "      incomplete ($_td_id bundle unavailable), so nothing is removed."
+    fi
+    if append_certs "$edge_tmp" "$_ftf"; then
+      changed=1
+      log "edge trust file $_ftf gained cert(s) for $_td_id"
+    fi
+  fi
+done < <(federated_edges)
+
+# RETIRED peerings. The declared set is our own bundle ALONE, and $tmp is
+# guaranteed non-empty (the script exited above otherwise), so this converges
+# every time it runs rather than only when a fetch happens to succeed. This is
+# the line that makes "we stopped trusting them" true on the host rather than
+# only true in group_vars.
+while read -r _td _ftf; do
+  [ -n "$_ftf" ] || continue
+  if [ "$PRUNE_ENABLED" != "1" ]; then
+    log "WARNING: $_ftf is declared RETIRED but spire_trust_sync_prune_enabled is"
+    log "         false, so ${_td} stays trusted on that edge. Retirement is not"
+    log "         in effect on this host."
+    continue
+  fi
+  [ -f "$_ftf" ] || continue   # edge already decommissioned; nothing to converge
+  if reconcile_certs "$tmp" "$_ftf"; then
+    changed=1
+    log "retired peering ${_td}: $_ftf reconciled to our own bundle alone"
+  fi
+done < <(retired_edges)
+{% endif %}
+
+if [ "$changed" = 1 ]; then
+  # A REMOVAL only takes effect when the router re-reads its trust file, so the
+  # restart is part of the retirement, not a cosmetic follow-up.
+  log "$(would)restart on changed trust material: ${RESTART_CONTAINERS:-<none configured>}"
+  if ! dry; then
+    for cont in $RESTART_CONTAINERS; do
+      if docker restart "$cont" >/dev/null; then
+        log "restarted $cont"
+      else
+        log "WARNING: restart of $cont failed"
+      fi
+    done
+  fi
+fi
+
+# --- Arm 2: rescue a join-token-dead agent -----------------------------------
+{% raw %}
+if [ "$AGENT_RESCUE_ENABLED" = "1" ] \
+   && docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E '^spire-agent\s+Restarting' >/dev/null \
+   && docker logs spire-agent --tail 10 2>&1 | grep -q 'join token does not exist'; then
+{% endraw %}
+  if dry; then
+    log "would mint a fresh join token and recreate spire-agent"
+    log "done (dry run; nothing was changed)"
+    exit 0
+  fi
+  log "agent is join-token-dead; minting fresh token + recreating agent"
+  token="$(docker exec spire-server "$SPIRE_BIN/spire-server" token generate \
+    -spiffeID "spiffe://$TRUST_DOMAIN/$AGENT_NODE_PATH" | sed -n 's/^Token: *//p')"
+  if [ -n "$token" ]; then
+    sed -i "s/^SPIRE_JOIN_TOKEN=.*/SPIRE_JOIN_TOKEN=${token}/" "$COMPOSE_DIR/.env.spire"
+    (cd "$COMPOSE_DIR" && docker compose --env-file .env --env-file .env.spire \
+      -f docker-compose.yml -f docker-compose.spire.yml up -d --force-recreate spire-agent)
+    log "agent recreated with fresh join token"
+  else
+    log "WARNING: token generation produced no token; agent left as-is"
+  fi
+fi
+
+if dry; then
+  log "done (dry run; nothing was changed)"
+else
+  log "done"
+fi

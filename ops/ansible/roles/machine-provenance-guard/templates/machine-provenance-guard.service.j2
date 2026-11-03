@@ -1,0 +1,53 @@
+# Managed by ansible (roles/machine-provenance-guard). Do not edit on the host.
+#
+# Audits every gear-class peer against the portal machine registry: does a
+# custody edge exist saying who brought this machine on? READ-ONLY — GETs
+# against the NetBird management API and the portal, no writes to either, and no
+# writes to this host outside ReadWritePaths below. If you are chasing a change
+# on this goatnet, this unit did not make it.
+[Unit]
+Description=Audit gear-class peers against the mint's custody registry (ADR 1130)
+Documentation=https://github.com/usareur-af/goatcore/blob/main/docs/design/live-state-guard-scheduling.md
+Documentation=https://github.com/usareur-af/goatcore/blob/main/docs/design/machine-provenance-guard-scheduling.md
+# Deliberately NOT After=docker.service. This reads the management API and the
+# portal over the network; ordering it behind docker would make a docker restart
+# look like an audit failure. The portal being a container on this host is
+# incidental — it is reached by URL like any other peer would reach it.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec={{ machine_provenance_guard_timeout_sec }}
+EnvironmentFile=/etc/goat/machine-provenance-guard.env
+ExecStart=/usr/local/sbin/machine-provenance-guard.sh
+
+# Confinement. This unit holds an admin-scoped mesh token AND a portal operator
+# key, so the host-side blast radius is pinned as small as the job allows: it
+# writes its report directory and its metrics file, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths={{ machine_provenance_guard_report_dir }}{% if machine_provenance_guard_textfile_dir | length > 0 %} {{ machine_provenance_guard_textfile_dir }}{% endif %}
+
+
+# Politeness on a host that also carries the mesh control plane and the portal.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

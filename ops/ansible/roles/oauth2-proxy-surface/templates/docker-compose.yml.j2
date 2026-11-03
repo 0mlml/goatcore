@@ -1,0 +1,43 @@
+# Rendered by ops/ansible/roles/oauth2-proxy-surface/ — DO NOT EDIT ON HOST.
+#
+# One sidecar, its own compose project. It deliberately does NOT live in the
+# fenced surface's compose file: three of those are owned by other roles, and
+# editing each to graft a service in is how a redeploy of one stomps the door
+# of another. Both containers meet on the external Traefik network instead, so
+# the surface's route can address this sidecar by container name.
+---
+services:
+  oauth2-proxy-{{ oauth2_proxy_surface_name }}:
+    image: "{{ oauth2_proxy_surface_image }}"
+    container_name: "oauth2-proxy-{{ oauth2_proxy_surface_name }}"
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      - "{{ oauth2_proxy_surface_traefik_network }}"
+    expose:
+      - "4180"
+    extra_hosts:
+      # F-126: the container's embedded resolver cannot reach mesh CoreDNS on
+      # :5353, so the OIDC issuer hostname pins to the mgmt-host mesh IP.
+      - "{{ oauth2_proxy_surface_oidc_host_entry }}"
+    env_file:
+      - "oauth2-proxy-{{ oauth2_proxy_surface_name }}.env"
+{% if oauth2_proxy_surface_request_log_file | length > 0 %}
+    volumes:
+      # This door's own request log, read by the visit emitter. Scoped to one
+      # directory per door on purpose — see the role defaults.
+      - "{{ oauth2_proxy_surface_log_dir }}/{{ oauth2_proxy_surface_name }}:{{ oauth2_proxy_surface_request_log_file | dirname }}"
+{% endif %}
+    labels:
+      # Routed by the fenced surface's own Traefik file, never by a label here.
+      - "traefik.enable=false"
+
+networks:
+  "{{ oauth2_proxy_surface_traefik_network }}":
+    external: true
+    name: "{{ oauth2_proxy_surface_traefik_network }}"

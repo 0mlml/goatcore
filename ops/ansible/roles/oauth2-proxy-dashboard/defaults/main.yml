@@ -1,0 +1,94 @@
+---
+# Defaults for the `oauth2-proxy-dashboard` role.
+#
+# Drops an oauth2-proxy sidecar in front of the netbird admin dashboard on
+# any mgmt-host stack, gating access on `ADMINS` Kratos group claim
+# (Block 83C.2-L7, closes the L7 portion of F-132). The proxy stands in
+# front of the existing `dashboard` container — Traefik routes
+# https://dashboard.<site>.<zone>/ to oauth2-proxy-dashboard:4180, which
+# either redirects unauthenticated browsers through Hydra (and refuses any
+# identity whose JWT `groups` claim lacks ADMINS), or forwards the request
+# to http://dashboard:80 once a valid session cookie is present.
+#
+# Depends on the patched site-Hydra consent UI per ADR 0857
+# (ghcr.io/{{ ghcr_org }}/kratos-selfservice-ui-node-patched) so the JWT carries
+# the `groups` claim — without it, --allowed-groups can never match.
+#
+# Inputs (set in group_vars/<site>_hosts/vars.yml):
+#   - dashboard_oauth2_proxy_enabled: true                   master gate
+#   - dashboard_oauth2_proxy_client_secret                   env-sourced, 32+ chars
+#   - dashboard_oauth2_proxy_cookie_secret                   env-sourced, 16/24/32 bytes b64
+#   - site_id, site_dns_zone                                 standard per-site identity
+#
+# What this role does:
+#   1. Renders /opt/mgmt-host/oauth2-proxy-dashboard.env (mode 0600) with
+#      oauth2-proxy config — OIDC issuer, client_id, --allowed-groups=ADMINS,
+#      upstream http://dashboard:80, cookie scoped to the dashboard FQDN.
+#   2. Lays down the compose overlay docker-compose.oauth2-proxy-dashboard.yml.
+#   3. Sets OAUTH2_PROXY_DASHBOARD_OIDC_HOST_ENTRY in /opt/mgmt-host/.env so
+#      the container can resolve the public OIDC hostname on the mgmt host (F-126
+#      pattern, same shape as isitup's OAUTH2_PROXY_OIDC_HOST_ENTRY).
+#   4. Brings the container up on the `mgmt` Docker network.
+
+# Instance identity. The role deploys ONE oauth2-proxy per run; these five
+# values let the same role run a second instance in its own play without a
+# copy of the role — the admin-dashboard fence of mesh change control
+# (dashboard-fence-deploy.yml, docs/design/mesh-change-control.md §2). The
+# defaults are the everyday dashboard fence, unchanged.
+dashboard_oauth2_proxy_service: oauth2-proxy-dashboard
+dashboard_oauth2_proxy_compose_src: docker-compose.oauth2-proxy-dashboard.yml
+# Prefix of this instance's keys in /opt/mgmt-host/.env (<prefix>_IMAGE,
+# <prefix>_OIDC_HOST_ENTRY) — the names its compose overlay substitutes.
+dashboard_oauth2_proxy_env_prefix: OAUTH2_PROXY_DASHBOARD
+dashboard_oauth2_proxy_upstream: "http://dashboard:80"
+dashboard_oauth2_proxy_host_port: 4181
+
+dashboard_oauth2_proxy_compose_file: /opt/mgmt-host/docker-compose.oauth2-proxy-dashboard.yml
+dashboard_oauth2_proxy_envfile: /opt/mgmt-host/oauth2-proxy-dashboard.env
+
+# Image — digest-pinned per ADR 0859 (easy rollback). Compose-time
+# substitution via /opt/mgmt-host/.env — the role writes
+# OAUTH2_PROXY_DASHBOARD_IMAGE there alongside
+# OAUTH2_PROXY_DASHBOARD_OIDC_HOST_ENTRY. Bumps require an append to
+# deploy-history.yml (CI checks via deploy-history-check.yml). Upstream
+# oauth2-proxy image. Per-service env var name (vs sharing
+# OAUTH2_PROXY_IMAGE with oauth2-proxy-isitup) so the two containers
+# can be rolled back independently.
+oauth2_proxy_dashboard_image: "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d"
+
+# Public FQDN for the dashboard surface. Tracks per-site mesh-internal
+# naming. The cookie domain locks to this exact host so a stolen cookie
+# can't be replayed against auth.* / oauth2.* / mgmt.* on sibling subdomains.
+dashboard_oauth2_proxy_fqdn: "dashboard.{{ site_id }}.{{ site_dns_zone }}"
+dashboard_oauth2_proxy_cookie_domain: "{{ dashboard_oauth2_proxy_fqdn }}"
+
+# Hydra issuer + client ID (must match the
+# oauth2-proxy-dashboard-oidc-client role's view of the client record).
+# Issuer trailing slash NOT optional — Hydra emits the trailing slash in
+# the iss claim, oauth2-proxy compares string-exact.
+dashboard_oauth2_proxy_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}/"
+dashboard_oauth2_proxy_oidc_client_id: "oauth2-proxy-dashboard"
+
+# Authorization predicate — the whole reason this role exists. Comma-separated
+# list of values that must intersect the JWT's `groups` claim (per ADR 0857
+# patched consent UI). MUST equal the groups ops/permissions/group-permissions.yml
+# grants netbird-dashboard (ADR 1073; CI-checked by
+# ops/ci/check-group-permissions-parity.sh — change the matrix first).
+dashboard_oauth2_proxy_allowed_groups: "PLATFORM-ADMIN,IAM-ADMIN"
+
+# The admin-dashboard fence (second instance, dashboard-fence-deploy.yml play 2;
+# only where netbird_dashboard_split_enabled). The write address of mesh change
+# control admits only NETBIRD-ADMIN (docs/design/mesh-change-control.md §1-2).
+# Same ADR 1073 rule: MUST equal the groups the matrix grants
+# netbird-dashboard-admin (CI: ops/ci/check-group-permissions-parity.sh).
+dashboard_admin_oauth2_proxy_allowed_groups: "NETBIRD-ADMIN"
+
+# On-host DNS override for the OIDC issuer. Docker's
+# embedded resolver (127.0.0.11) only forwards to host /etc/resolv.conf on
+# port 53; mesh CoreDNS may listen on :5353, so the container CANNOT
+# reach it through the standard resolver path. Static host entry maps the
+# public OIDC hostname to the mgmt-host's mesh IP so the OIDC discovery
+# request lands on Traefik (which then routes to hydra-public on the mgmt
+# docker network). Override per-site if the mgmt-plane IP isn't `mesh_ip_a`
+# (e.g. multi-host sites where VRRP floats a virtual IP).
+dashboard_oauth2_proxy_oidc_host_entry: "oauth2.{{ site_id }}.{{ site_dns_zone }}:{{ mesh_ip_a }}"

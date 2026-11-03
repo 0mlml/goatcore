@@ -1,0 +1,91 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# netbird-apex-pin — keep a node's enrollment apex resolvable when its tunnel
+# is DOWN, so it can always dial management and rebuild the tunnel.
+#
+# THE TRAP. NetBird installs a systemd-resolved ROUTING domain for the goatnet
+# zone on wt0:
+#
+#     DNS Servers: <this node's own mesh IP>     (its forwarder, ON the tunnel)
+#     DNS Domain:  ~netbird.<zone>
+#
+# A `~` routing domain has NO fallback — queries for that zone go only to that
+# link's DNS server. Tunnel down => forwarder dead => the query dies. And the
+# name being routed away is the PUBLIC enrollment apex (a plain Cloudflare
+# record pointing at the relay IPs) that the client needs in order to reach
+# management and rebuild the tunnel. The node cannot bootstrap out of it.
+#
+# On a healthy box this reads as `getent hosts <apex>` returning nothing while
+# every other name resolves fine via eth0. Pinning the apex restores Management +
+# Signal in seconds, and stalled connections then complete on their own.
+#
+# macOS operators never see this: the same rule lands as a `Supplemental` match
+# domain, which DOES fall back. Linux does not. That asymmetry is why the trap
+# stays latent — laptops self-heal, field nodes don't.
+#
+# WHY A RESTART WATCHDOG IS NOT ENOUGH. Restarting netbird re-installs the same
+# routing domain pointing at the same dead forwarder, so a net-watchdog that
+# remedies this symptom with exactly that would loop forever without recovering.
+# check RESOLUTION, not just connectivity — see the README.
+#
+# ── SCOPE: EDGE NODES ONLY ───────────────────────────────────────────────────
+# goat-netbird-account-init.yml deliberately does NOT auto-edit the enrollment
+# apex on MGMT hosts, and that reasoning stands: a mgmt host may legitimately
+# map the apex to 127.0.0.1 when its management-url carries the local mgmt gRPC
+# port (:8443) — the standup phase-8 local-enroll design. Blindly pinning would
+# break it.
+#
+# That ambiguity CANNOT arise on an edge node: a Pi, pod, octopod or sensor
+# relay never hosts the management plane, so there is no valid local-enroll path
+# and apex -> relay IPs is unambiguously correct. This role is therefore
+# fail-closed on that distinction: it refuses to run on a host that looks like a
+# mgmt host, rather than trusting the caller to only apply it to edge nodes.
+
+- name: netbird-apex-pin | refuse on a mgmt host
+  ansible.builtin.assert:
+    that:
+      - not (netbird_apex_pin_is_mgmt_host | default(false) | bool)
+    fail_msg: >-
+      netbird-apex-pin is for EDGE nodes only. This host is flagged as a mgmt
+      host, where the apex may legitimately resolve to 127.0.0.1 with a local
+      :8443 management-url. Pinning it to the relay
+      IPs would break that path. If this host genuinely does not serve the
+      management plane, set netbird_apex_pin_is_mgmt_host: false explicitly.
+    quiet: true
+
+- name: netbird-apex-pin | require the apex + at least one relay IP
+  ansible.builtin.assert:
+    that:
+      - netbird_apex_fqdn | default('') | length > 0
+      - netbird_apex_ips | default([]) | length > 0
+    fail_msg: >-
+      netbird-apex-pin needs netbird_apex_fqdn (e.g. netbird.zagros-prod.example) and
+      netbird_apex_ips (the goatnet's relay public IPs). Resolve them from a
+      host that is ON the mesh: `dig +short <apex> @1.1.1.1`. Do NOT read them
+      from a node that is already trapped — its answer is exactly what is
+      broken.
+    quiet: true
+
+# lineinfile-per-IP rather than blockinfile: the apex is a round-robin A record
+# across relays, each line is independently correct, and a partial edit degrades
+# to "fewer relays" instead of "no entry at all". regexp keys on the IP so
+# re-running is idempotent and a relay IP change rewrites its own line.
+- name: netbird-apex-pin | pin the enrollment apex so it survives a tunnel loss
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ item }} {{ netbird_apex_fqdn }}  # F-286 enrollment-apex pin (managed by netbird-apex-pin role)"
+    regexp: "^{{ item | regex_escape }}\\s+{{ netbird_apex_fqdn | regex_escape }}(\\s|$)"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ netbird_apex_ips }}"
+
+# Proves the pin actually took effect through the resolver rather than just
+# landing in the file — /etc/hosts precedence is what beats the routing domain,
+# and that is the whole mechanism being relied on here.
+- name: netbird-apex-pin | verify the apex resolves locally
+  ansible.builtin.command: "getent hosts {{ netbird_apex_fqdn }}"
+  register: netbird_apex_pin_check
+  changed_when: false
+  failed_when: netbird_apex_pin_check.rc != 0

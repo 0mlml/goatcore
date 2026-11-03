@@ -1,0 +1,379 @@
+// ============================================================================
+// SOVEREIGN EDGE ROUTER — one per federated partner.
+//
+// Canon: docs/adr/1157-cross-sovereign-federation-edge-terminated.md
+//        docs/design/cross-sovereign-federation.md
+//        docs/findings/F-424-*.md
+//
+// THIS IS NOT config.json5.j2 WITH EDITS, AND IT MUST NEVER BECOME THAT.
+// Zenoh's ACL takes the FIRST Allow across matched subjects and breaks
+// (access_control.rs:983-1021), so a narrow subject can never subtract from a
+// broad one. Rendering the core profile here and then "tightening" it does not
+// tighten anything. This profile is empty by construction and only ever grows
+// by explicit grant.
+//
+// WHY A SEPARATE PROCESS AT ALL. The ACL matches a peer on its certificate
+// Common Name and has no listener, port or ISSUER axis (zenoh-config
+// AclConfigSubjects, deny_unknown_fields, five fields). Per-endpoint TLS trust
+// override does work — but two listeners on one process still share one flat CN
+// namespace, so a partner CA could mint CN=goat-zenoh-router and match the core's
+// own router subject. Proven, not argued: ops/federation-smoke/assert-pki.sh.
+// The process is the only available unit of separation.
+// ============================================================================
+{
+  mode: "router",
+
+  // Faces the partner. Their CA is the SOLE anchor on this listener.
+  listen: {
+    endpoints: [
+      "tls/{{ goat_zenoh_edge_bind_address if goat_zenoh_edge_network_mode == 'host' else '0.0.0.0' }}:{{ goat_zenoh_edge_listen_port | default(7448) }}",
+    ],
+  },
+
+  // Dials INWARD to our own core. We are the TLS CLIENT on this link, which
+  // means we must verify OUR core's server certificate — and `root_ca_certificate`
+  // below is GLOBAL to this process and holds the PARTNER's CA.
+  //
+  // So each inward endpoint MUST carry a per-endpoint trust override:
+  //
+  //     tls/core-host:7447#root_ca_certificate_file=/path/to/our-ca.pem
+  //
+  // Without it the dial fails `UnknownCA`; it is the
+  // first thing that breaks. `goat_zenoh_edge_core_endpoints` is asserted
+  // non-empty in tasks/main.yml; the override is asserted there too.
+  connect: {
+    endpoints: [
+{% for _e in goat_zenoh_edge_core_endpoints | default([]) %}
+      "{{ _e }}",
+{% endfor %}
+{% if goat_zenoh_edge_partner_dial | default('') | length > 0 %}
+      // The agreement says the partner listens, so this edge dials it. Over this
+      // endpoint we present the OUTWARD identity: the global connect_certificate
+      // below is the INWARD one our core matches, and the partner's ACL matches the
+      // outward CN and no other. The partner's CA is already the process's trust.
+      "tls/{{ goat_zenoh_edge_partner_dial }}:{{ goat_zenoh_edge_partner_port }}#connect_certificate_file={{ goat_zenoh_edge_outward_cert }};connect_private_key_file={{ goat_zenoh_edge_outward_key }}",
+{% endif %}
+    ],
+  },
+
+  // A partner peering must not learn our internal topology, and must not be
+  // able to advertise itself into it. Both off, explicitly — 1.9.0 defaults are
+  // not relied upon.
+  scouting: {
+    gossip:    { enabled: false },
+    multicast: { enabled: false },
+  },
+
+  // Read-only admin surface. `write: true` accepts live PUTs that rewrite ACL
+  // rules; on a partner-facing process that is an unconditional bypass.
+  adminspace: { permissions: { read: true, write: false } },
+
+  transport: {
+    link: {
+      tls: {
+        // THE partner's trust anchors, and nothing else. Fed by spire-trust-sync
+        // pointed at THIS file — never at a core router's trust file.
+        // In `bundle` mode this is our CA and the partner's concatenated, so the
+        // edge can verify both the partner (inbound) and our core (outbound)
+        // without per-link config -- which upstream zenoh 1.9.0 discards
+        // silently. In `fragment` mode it is the partner's CA alone and
+        // each core endpoint carries its own override.
+        root_ca_certificate: "{{ goat_zenoh_edge_bundle_path if goat_zenoh_edge_trust_mode == 'bundle' else goat_zenoh_edge_partner_ca_path }}",
+
+        // What we present TO the partner.
+        listen_certificate: "{{ goat_zenoh_edge_outward_cert }}",
+        listen_private_key: "{{ goat_zenoh_edge_outward_key }}",
+
+        // What we present INWARD to our core: an identity from our own domain,
+        // with the agreed per-partner CN the core's ACL matches.
+        connect_certificate: "{{ goat_zenoh_edge_inward_cert }}",
+        connect_private_key: "{{ goat_zenoh_edge_inward_key }}",
+
+        enable_mtls: true,
+
+        // A revoked or expired peering leaf must drop the live session, not
+        // merely fail the next handshake. There is no CRL path here.
+        close_link_on_expiration: true,
+      },
+    },
+  },
+
+  // ---- Ingress rate + size limits on the partner link (ADR 1157 P2) --------
+  // The partner link is the one place load arrives that we neither control nor
+  // can ask to slow down. Both interceptors are INGRESS-only: egress is our own
+  // release traffic, already bounded by what we choose to publish, and
+  // throttling it would silently degrade a release set while looking like a
+  // partner-side fault.
+  //
+  // Rendered only when the operator has declared numbers. Empty is the correct
+  // default for a link that has never carried traffic -- pick the values from
+  // the first live-fire rather than inventing them. See F-446: a partner
+  // publishing outside the agreed prefix is refused SILENTLY, so an unexpectedly
+  // quiet link is more likely a prefix mismatch than a rate limit. Check that
+  // before tuning these.
+{% if goat_zenoh_edge_downsampling_rules | default([]) | length > 0 %}
+  downsampling: [
+    {
+      id: "partner-ingress-rate",
+      flows: ["ingress"],
+      messages: ["put", "delete"],
+      rules: [
+{% for r in goat_zenoh_edge_downsampling_rules %}
+        { key_expr: "{{ r.key_expr }}", freq: {{ r.freq }} },
+{% endfor %}
+      ],
+    },
+  ],
+{% endif %}
+{% if goat_zenoh_edge_low_pass_key_exprs | default([]) | length > 0 and (goat_zenoh_edge_low_pass_size_limit | default(0) | int) > 0 %}
+  low_pass_filter: [
+    {
+      id: "partner-ingress-size",
+      flows: ["ingress"],
+      messages: ["put", "delete"],
+      key_exprs: [{% for k in goat_zenoh_edge_low_pass_key_exprs %}"{{ k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      size_limit: {{ goat_zenoh_edge_low_pass_size_limit | int }},
+    },
+  ],
+{% endif %}
+
+  // No storages. A partner's data lands in the core's declared `from/` store or
+  // it does not land at all — an edge that stores is an unaudited copy.
+  plugins_loading: { enabled: true, search_dirs: ["/"] },
+  plugins: {
+    // NO `rest` plugin. Its in-process session presents no certificate and
+    // matches no ACL subject, so it is an authorization hole by construction.
+    storage_manager: { storages: {} },
+  },
+
+  access_control: {
+    enabled: true,
+    default_permission: "deny",
+
+    rules: [
+      // THE PARTNER LINK CARRIES DATA ONE WAY PER KEY SET AND INTEREST THE OTHER,
+      // exactly as the core link below does. Without this a peering carries
+      // nothing in either direction:
+      //
+      //   - to RECEIVE their data we must be able to SEND a subscriber
+      //     declaration on the INGRESS key set. Without it their router computes
+      //     an empty route north (`compute_data_route ... return=[]`), never
+      //     learns anyone wants the data, and forwards nothing.
+      //   - to SEND them the release set we must be able to ACCEPT a subscriber
+      //     declaration on the EGRESS key set, because their declaration arrives
+      //     here as INGRESS carrying an egress-set key.
+      //
+      // The link is ESTABLISHED throughout and no denial is logged, so
+      // the failure looks like a healthy link with no traffic.
+      //
+      // THE KEY EXPRESSIONS DO NOT WIDEN. Each rule still names exactly one
+      // declared set; only the flow and the message list grow to what carrying
+      // that set actually requires. `put`/`delete` remain ONE-WAY per set — the
+      // partner writes only into its landing prefix and receives only the
+      // release prefixes — which is the property the two rules exist to keep.
+
+      // Their landing prefix: they write, we express interest.
+      {
+        id: "partner-land",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: [
+{% for _k in goat_zenoh_edge_ingress_key_exprs | default([]) %}
+          "{{ _k }}",
+{% endfor %}
+        ],
+      },
+      {
+        id: "partner-land-interest",
+        messages: ["declare_subscriber", "query", "declare_queryable", "liveliness_query"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [
+{% for _k in goat_zenoh_edge_ingress_key_exprs | default([]) %}
+          "{{ _k }}",
+{% endfor %}
+        ],
+      },
+      // The release set: we send, they express interest.
+      {
+        id: "partner-receive",
+        messages: ["put", "delete", "declare_subscriber", "query", "reply"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [
+{% for _k in goat_zenoh_edge_egress_key_exprs | default([]) %}
+          "{{ _k }}",
+{% endfor %}
+        ],
+      },
+      {
+        id: "partner-receive-interest",
+        messages: ["declare_subscriber", "query", "declare_queryable", "liveliness_query"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: [
+{% for _k in goat_zenoh_edge_egress_key_exprs | default([]) %}
+          "{{ _k }}",
+{% endfor %}
+        ],
+      },
+{% if goat_zenoh_edge_key_bundle_key_exprs | default([]) | length > 0 %}
+      // Key bundles: READ ONLY, and only for the release-sets this partner is a
+      // member of. Without this a federated partner cannot obtain a DEK,
+      // so it can ship bytes at us but can never seal anything to an audience --
+      // every grant-keyed capability an ally has inside the goatnet would stop
+      // at this edge.
+      //
+      // A SEPARATE rule, not extra key_exprs on partner-receive, for one reason:
+      // the message list here is deliberately smaller. `put` and `delete` are
+      // ABSENT and must stay absent. Anyone able to publish on keys/** can
+      // publish a bundle wrapping a DEK of their own choosing, so write here is
+      // a different privilege in kind from write into their own landing prefix.
+      //
+      // Scope per release-set -- "keys/weather/**", never "keys/**". A partner
+      // is a member of the audiences it produces to or reads from and of no
+      // others; a broad grant would hand it every audience's bundle.
+      {
+        id: "partner-keys",
+        // `declare_queryable` is load-bearing: the bundle is served by a STORAGE
+        // on our core, and a storage answers queries. If we cannot advertise
+        // that queryable to the partner they have nothing to ask, compute no
+        // route, and get an empty result that reads as "no bundle".
+        messages: ["declare_subscriber", "query", "reply", "declare_queryable"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [
+{% for _k in goat_zenoh_edge_key_bundle_key_exprs %}
+          "{{ _k }}",
+{% endfor %}
+        ],
+      },
+      // THE PARTNER HAS TO BE ABLE TO ASK, and asking arrives as INGRESS.
+      //
+      // Same trap as partner-land/partner-receive: data flows one way
+      // and INTEREST flows the other, so an egress-only grant on the key lane
+      // lets us answer a question the partner can never put. Without this the
+      // bundle is unreachable and the failure is silent — the fetch returns
+      // empty and reads as "no bundle published". With partner-keys egress-only
+      // the partner's query for keys/<set>/** returns [] with the bundle sitting
+      // on our fabric.
+      //
+      // STILL READ-ONLY. `put` and `delete` are absent here exactly as they are
+      // above, and must stay absent: anyone able to publish on keys/** can
+      // publish a bundle wrapping a DEK of their own choosing.
+      {
+        id: "partner-keys-interest",
+        messages: ["declare_subscriber", "query", "declare_queryable", "liveliness_query"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: [
+{% for _k in goat_zenoh_edge_key_bundle_key_exprs %}
+          "{{ _k }}",
+{% endfor %}
+        ],
+      },
+{% endif %}
+{% if goat_zenoh_edge_core_cn | length > 0 %}
+      // The core link carries BOTH key sets in BOTH directions, and it has to.
+      //
+      // Data flows one way per key set, but INTEREST flows the other: the core
+      // declares a subscriber for the partner's ingress namespace, and that
+      // declaration arrives as INGRESS on the core link carrying an ingress-set
+      // key. Restricting core-return to the release set alone therefore drops
+      // the core's subscription silently, the edge never learns anyone wants the
+      // data, and nothing is forwarded -- with the link ESTABLISHED and no
+      // denial logged after connect.
+      //
+      // The KEY EXPRESSIONS stay narrow, which is what matters: the union of the
+      // two declared sets, never a wildcard. The edge remains unable to carry
+      // anything the agreement did not name, in either direction.
+      {
+        id: "core-forward",
+        messages: ["put", "delete", "declare_subscriber", "query", "reply", "liveliness_token"],
+        flows: ["ingress", "egress"],
+        permission: "allow",
+        key_exprs: [
+{% for k in goat_zenoh_edge_ingress_key_exprs %}
+          "{{ k }}",
+{% endfor %}
+        ],
+      },
+      // The key lane on the CORE link. Without it the edge can serve a partner
+      // nothing, because it cannot fetch the bundle from our own fabric in the
+      // first place — core-forward and core-return carry only the two data key
+      // sets. Both flows, for the same interest-direction reason as those two.
+{% if goat_zenoh_edge_key_bundle_key_exprs | default([]) | length > 0 %}
+      {
+        id: "core-keys",
+        // Same reason as above, on the other side of the edge: the queryable
+        // declaration originates at the core's storage and has to reach us
+        // before it can reach the partner.
+        messages: ["put", "delete", "declare_subscriber", "query", "reply", "declare_queryable", "liveliness_token"],
+        flows: ["ingress", "egress"],
+        permission: "allow",
+        key_exprs: [
+{% for _k in goat_zenoh_edge_key_bundle_key_exprs %}
+          "{{ _k }}",
+{% endfor %}
+        ],
+      },
+{% endif %}
+      {
+        id: "core-return",
+        messages: ["put", "delete", "declare_subscriber", "query", "reply", "liveliness_token"],
+        flows: ["ingress", "egress"],
+        permission: "allow",
+        key_exprs: [
+{% for k in goat_zenoh_edge_egress_key_exprs %}
+          "{{ k }}",
+{% endfor %}
+        ],
+      },
+{% endif %}
+    ],
+
+    subjects: [
+      // The AGREED Common Name, exactly. Not link_protocols, not a wildcard —
+      // matching is exact string equality (authorization.rs HashMap<Subject,_>),
+      // so this is the whole population that can match.
+      {
+        id: "partner-peer",
+        cert_common_names: ["{{ goat_zenoh_edge_partner_cn }}"],
+{% if goat_zenoh_edge_partner_interface | default('') | length > 0 %}
+        // Only over the partner link.
+        interfaces: ["{{ goat_zenoh_edge_partner_interface }}"],
+{% endif %}
+      },
+{% if goat_zenoh_edge_core_cn | length > 0 %}
+      // OUR OWN CORE. Without this the edge has exactly one subject -- the
+      // partner -- so its link to the core matches NOTHING and
+      // default_permission deny applies to every message on it. The link is
+      // ESTABLISHED, one INFO line is written at connect, and no data moves:
+      // "<zid> did not match any configured ACL subject".
+      //
+      // The rules below are deliberately the MIRROR of the partner's, not a
+      // wildcard. Whatever the partner may land, the edge may forward inward;
+      // whatever the partner may receive, the edge may accept from the core.
+      // A wildcard here would make the edge a general router with a partner
+      // attached, which is the thing the per-partner process exists to prevent.
+      {
+        id: "our-core",
+        cert_common_names: ["{{ goat_zenoh_edge_core_cn }}"],
+{% if goat_zenoh_edge_core_interface | default('') | length > 0 %}
+        // Only over the core link. The partner's CA can mint this name, and over
+        // the partner link it now matches no subject at all.
+        interfaces: ["{{ goat_zenoh_edge_core_interface }}"],
+{% endif %}
+      },
+{% endif %}
+    ],
+
+    policies: [
+      { rules: ["partner-land", "partner-land-interest", "partner-receive", "partner-receive-interest"{% if goat_zenoh_edge_key_bundle_key_exprs | default([]) | length > 0 %}, "partner-keys", "partner-keys-interest"{% endif %}], subjects: ["partner-peer"] },
+{% if goat_zenoh_edge_core_cn | length > 0 %}
+      { rules: ["core-forward", "core-return"{% if goat_zenoh_edge_key_bundle_key_exprs | default([]) | length > 0 %}, "core-keys"{% endif %}], subjects: ["our-core"] },
+{% endif %}
+    ],
+  },
+}

@@ -1,0 +1,76 @@
+---
+# ADR 1055 — peer-name resolver (Thor-only; needs mgmt Postgres access). Reads
+# (pubkey,name) from the store, computes the exact hex the relay emits, writes the
+# {hex:name} map locally + POSTs it to the cloud ingest so BOTH dashboards render
+# names. Runs as a systemd timer. Gated: only where the mgmt store is reachable.
+- name: relay-health | peer-names resolver env + timer (ADR 1055)
+  when: relay_peer_names_enabled | bool
+  block:
+    # Installed here, not only in the enabled path's script loop: a Thor on the
+    # sunset path ran whatever resolver it was last given, so a fix to the script
+    # never reached it.
+    - name: relay-health | peer-names resolver script + shared peer→person client
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ relay_health_dir }}/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ relay_health_src_dir }}/relay-peer-names.py", dest: relay-peer-names.py, mode: "0755" }
+        - { src: "{{ playbook_dir }}/../identity/peerowner.py", dest: peerowner.py, mode: "0644" }
+
+    - name: relay-health | peer-names resolver .env
+      ansible.builtin.copy:
+        dest: "{{ relay_health_dir }}/relay-peer-names.env"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          RELAY_PEER_NAMES_PG_CONTAINER={{ relay_peer_names_pg_container }}
+          RELAY_PEER_NAMES_PG_DB={{ relay_peer_names_pg_db }}
+          RELAY_PEER_NAMES_PG_USER={{ relay_peer_names_pg_user }}
+          RELAY_PEER_NAMES_LOCAL_DIR={{ relay_health_www_dir }}/ingest
+          RELAY_PEER_NAMES_INGEST_URLS={{ relay_peer_names_ingest_urls }}
+          RELAY_METRICS_BEARER_TOKEN={{ relay_metrics_bearer_token }}
+          RELAY_PEER_NAMES_PORTAL_URL={{ relay_peer_names_portal_url }}
+          RELAY_PEER_NAMES_PORTAL_KEY={{ relay_peer_names_portal_key }}
+          RELAY_PEER_NAMES_ID_CONSOLE_URL={{ relay_peer_names_id_console_url }}
+          RELAY_PEER_NAMES_PORTAL_CONTAINER={{ relay_peer_names_portal_container }}
+          RELAY_PEER_NAMES_PORTAL_NET={{ relay_peer_names_portal_net }}
+          RELAY_PEER_NAMES_PORTAL_PORT={{ relay_peer_names_portal_port }}
+      no_log: true
+
+    - name: relay-health | install peer-names resolver service + timer
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - relay-peer-names.service
+        - relay-peer-names.timer
+
+    - name: relay-health | seed an initial peer-names resolve
+      ansible.builtin.command:
+        cmd: "/usr/bin/env python3 {{ relay_health_dir }}/relay-peer-names.py"
+      environment:
+        RELAY_PEER_NAMES_PG_CONTAINER: "{{ relay_peer_names_pg_container }}"
+        RELAY_PEER_NAMES_PG_DB: "{{ relay_peer_names_pg_db }}"
+        RELAY_PEER_NAMES_PG_USER: "{{ relay_peer_names_pg_user }}"
+        RELAY_PEER_NAMES_LOCAL_DIR: "{{ relay_health_www_dir }}/ingest"
+        RELAY_PEER_NAMES_INGEST_URLS: "{{ relay_peer_names_ingest_urls }}"
+        RELAY_METRICS_BEARER_TOKEN: "{{ relay_metrics_bearer_token }}"
+        RELAY_PEER_NAMES_PORTAL_URL: "{{ relay_peer_names_portal_url }}"
+        RELAY_PEER_NAMES_PORTAL_KEY: "{{ relay_peer_names_portal_key }}"
+        RELAY_PEER_NAMES_ID_CONSOLE_URL: "{{ relay_peer_names_id_console_url }}"
+        RELAY_PEER_NAMES_PORTAL_CONTAINER: "{{ relay_peer_names_portal_container }}"
+        RELAY_PEER_NAMES_PORTAL_NET: "{{ relay_peer_names_portal_net }}"
+        RELAY_PEER_NAMES_PORTAL_PORT: "{{ relay_peer_names_portal_port }}"
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: relay-health | enable + start peer-names timer
+      ansible.builtin.systemd:
+        name: relay-peer-names.timer
+        enabled: true
+        state: started
+        daemon_reload: true

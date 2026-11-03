@@ -1,0 +1,51 @@
+# Managed by ansible (roles/warrant-membership). Do not edit on the host.
+#
+# Converges NetBird peer membership on scope {{ warrant_membership_scope }} to the
+# declaration directory {{ warrant_membership_dest_dir }}/
+# (docs/design/mesh-change-control.md §4.4). Whether it only reports or also
+# enforces is its _scope.yaml `converge:` field. It refuses to make more than
+# --max-changes peer-group changes in one run.
+#
+#   systemctl list-timers warrant-membership.timer
+#   journalctl -u warrant-membership.service -n 50
+[Unit]
+Description=Warrant membership converger, scope {{ warrant_membership_scope }} (ADR 1189)
+Documentation=https://github.com/usareur-af/goatcore/blob/main/docs/design/mesh-change-control.md
+# Talks to the management API over the network; not coupled to docker.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec={{ warrant_membership_timeout_sec }}
+EnvironmentFile=/etc/goat/warrant/warrant.env
+# goat refuses to start without a profile directory, and a system unit has no
+# $HOME; the state dir gives it one. The converger itself reads no profile
+# content; the operator-action audit emit reads router_endpoint from the
+# profile.toml the role installs there (#1455).
+StateDirectory=goat-warrant
+Environment=HOME=/var/lib/goat-warrant
+Environment=GOAT_PROFILE_DIR=/var/lib/goat-warrant/profile
+ExecStart={{ warrant_membership_goat_bin }} warrant apply --membership --scope {{ warrant_membership_scope }} --file {{ warrant_membership_dest_dir }} --mode {{ warrant_membership_mode }} --json --textfile-dir {{ warrant_membership_textfile_dir }}
+
+# Confinement. The unit holds an admin-scoped mesh token; on the host it needs
+# the network, its declaration (read) and the textfile dir (write).
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths={{ warrant_membership_textfile_dir }}
+
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

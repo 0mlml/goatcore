@@ -1,0 +1,70 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# disk-spool-cap — byte ceilings for append-only spools. See defaults/main.yml.
+
+- name: Assert every declared spool is complete and its cap is sane
+  ansible.builtin.assert:
+    that:
+      - item.dir is defined and item.dir is string
+      - item.glob is defined and item.glob is string
+      - item.why is defined and item.why is string
+      - item.max_bytes is defined
+      - (item.max_bytes | int) >= (disk_spool_cap_min_bytes | int)
+    fail_msg: >-
+      Spool entry {{ item | to_json }} is incomplete, or its cap is below
+      {{ disk_spool_cap_min_bytes }} bytes. A cap smaller than one interval's
+      writes deletes what it just wrote on every pass; declare a real ceiling
+      or drop the entry.
+    quiet: true
+  loop: "{{ disk_spool_cap_spools }}"
+
+- name: Install the spool-cap script
+  ansible.builtin.template:
+    src: goat-spool-cap.sh.j2
+    dest: "{{ disk_spool_cap_script }}"
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Install the spool-cap unit
+  ansible.builtin.template:
+    src: goat-spool-cap.service.j2
+    dest: /etc/systemd/system/goat-spool-cap.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: _spool_cap_unit
+
+- name: Install the spool-cap timer
+  ansible.builtin.template:
+    src: goat-spool-cap.timer.j2
+    dest: /etc/systemd/system/goat-spool-cap.timer
+    owner: root
+    group: root
+    mode: "0644"
+  register: _spool_cap_timer
+
+- name: Reload systemd when a unit changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: _spool_cap_unit is changed or _spool_cap_timer is changed
+
+- name: Enable and start the spool-cap timer
+  ansible.builtin.systemd_service:
+    name: goat-spool-cap.timer
+    enabled: "{{ (disk_spool_cap_spools | length) > 0 }}"
+    state: "{{ 'started' if (disk_spool_cap_spools | length) > 0 else 'stopped' }}"
+
+# Run it once now rather than waiting for the timer. A host is converged when
+# its spools are inside their caps, not when a timer exists that will get
+# there eventually.
+- name: Trim the spools now
+  ansible.builtin.command: "{{ disk_spool_cap_script }}"
+  register: _spool_cap_run
+  changed_when: "'deleted' in _spool_cap_run.stdout"
+  when: (disk_spool_cap_spools | length) > 0
+
+- name: Show what the trim did
+  ansible.builtin.debug:
+    var: _spool_cap_run.stdout_lines
+  when: _spool_cap_run.stdout_lines is defined

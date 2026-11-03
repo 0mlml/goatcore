@@ -1,0 +1,36 @@
+---
+# Defaults for the pubsub-state-checkout role (Block 86 recovery side).
+#
+# The MIRROR half (roles/pubsub-state-repo) runs on the ACTIVE mgmt node and
+# pushes the portal's state-of-record into Forgejo. This role is the STANDBY
+# half: it keeps a warm, current CHECKOUT of that Forgejo repo on the passive
+# node plus a staged `pubsub-apply` binary, so that on failover the operator
+# runs one command to rebuild the fabric structure from local disk — no clone
+# over a possibly-degraded network at the worst possible moment.
+#
+# This role NEVER runs pubsub-apply. Reconciling mutates the portal; that is a
+# deliberate failover action, not a routine one. The role drops a RECOVERY.md
+# next to the checkout with the exact one-liner.
+
+# Where the warm checkout + staged binary live (NVMe-backed).
+pubsub_state_checkout_dir: /opt/pubsub-state
+
+# Forgejo source. Defaults to the Orin-C mesh address; mesh_ip_c is valid in
+# the zagros_prod_hosts group where this role is applied (Orin-B).
+pubsub_state_checkout_forgejo_url: "http://{{ mesh_ip_c }}:3030"
+pubsub_state_checkout_org: goat-pubsub-state
+pubsub_state_checkout_repo: "{{ site_id | mandatory }}"
+
+# Read credential. The mirror bot PAT is reused for the pull (read-only use).
+pubsub_state_checkout_user: pubsub-state-mirror
+pubsub_state_checkout_token: "{{ lookup('env', 'FORGEJO_PUBSUB_TOKEN') | default('', true) }}"
+
+# Pull cadence. Matches the mirror's snapshot cadence so the standby is at most
+# ~1 interval behind the primary.
+pubsub_state_checkout_interval_sec: 300
+
+# Staged pubsub-apply binary. pubsub_state_apply_binary_src is a CONTROL-NODE
+# path to a prebuilt static linux/arm64 binary (the deploy play cross-compiles
+# it). Empty = skip staging (checkout-only).
+pubsub_state_apply_binary_src: ""
+pubsub_state_apply_binary_dest: "{{ pubsub_state_checkout_dir }}/bin/pubsub-apply"

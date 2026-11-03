@@ -1,0 +1,162 @@
+---
+# ops/ansible/roles/ntp-health-agent/tasks/main.yml
+#
+# Installs and configures the ntp-health-agent daemon (Block 12A).
+# Design: docs/design/universal-ntp-hygiene.md §4
+# Source: ops/time-hygiene/cmd/ntp-health-agent/
+#
+# Prerequisites: ntp-hygiene role (chrony + chrony_exporter already running)
+
+- name: Create attestation key directory
+  ansible.builtin.file:
+    path: "{{ ntp_health_agent_key_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# Generate the Ed25519 attestation keypair if not already present.
+# Private key stays on-host (never leaves). Public key is read back and
+# recorded in the offline-enrollment bundle at issuance time (Block 12B-prehook).
+- name: Check if attestation private key exists
+  ansible.builtin.stat:
+    path: "{{ ntp_health_agent_key_dir }}/attestation.key"
+  register: attestation_key_stat
+
+- name: Generate Ed25519 attestation keypair (first deploy only)
+  ansible.builtin.command:
+    cmd: >-
+      openssl genpkey -algorithm Ed25519
+      -out {{ ntp_health_agent_key_dir }}/attestation.key
+  when: not attestation_key_stat.stat.exists
+  notify: restart ntp-health-agent
+
+- name: Restrict attestation key permissions
+  ansible.builtin.file:
+    path: "{{ ntp_health_agent_key_dir }}/attestation.key"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Derive and save attestation public key
+  ansible.builtin.shell:
+    cmd: >-
+      openssl pkey -pubout
+      -in {{ ntp_health_agent_key_dir }}/attestation.key
+      -out {{ ntp_health_agent_key_dir }}/attestation.pub
+  args:
+    creates: "{{ ntp_health_agent_key_dir }}/attestation.pub"
+
+- name: Slurp attestation public key for recording
+  ansible.builtin.slurp:
+    src: "{{ ntp_health_agent_key_dir }}/attestation.pub"
+  register: attestation_pubkey_b64
+
+- name: Record attestation public key in host facts
+  ansible.builtin.set_fact:
+    ntp_attestation_pubkey: "{{ attestation_pubkey_b64.content | b64decode }}"
+
+# Build-freshness. The binary below is gitignored build
+# output, so a fresh checkout — or one where nobody has run `make build` since
+# the attestation work landed — ships a stale artifact. The guard below refuses
+# it, and that stops the whole play short of the observability stack it deploys.
+#
+# The guard's advice was "go run make build and re-run", which is a manual step
+# the play can simply take itself. Build when the artifact is missing or older
+# than any Go source; skip silently when it is current, so the common case
+# costs nothing.
+- name: Check whether the local ntp-health-agent artifact is current
+  ansible.builtin.shell: |
+    set -euo pipefail
+    src_dir="{{ playbook_dir }}/../../ops/time-hygiene"
+    bin="{{ ntp_health_agent_binary_src }}"
+    [ -f "$bin" ] || { echo REBUILD; exit 0; }
+    newest=$(find "$src_dir" -name '*.go' -newer "$bin" -print -quit)
+    [ -n "$newest" ] && echo REBUILD || echo CURRENT
+  register: ntp_health_agent_freshness
+  changed_when: false
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Rebuild ntp-health-agent from source when the artifact is stale
+  ansible.builtin.command:
+    cmd: make build
+    chdir: "{{ playbook_dir }}/../../ops/time-hygiene"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: "'REBUILD' in ntp_health_agent_freshness.stdout"
+
+- name: Install ntp-health-agent binary
+  ansible.builtin.copy:
+    src: "{{ ntp_health_agent_binary_src }}"
+    dest: "{{ ntp_health_agent_install_dir }}/ntp-health-agent"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart ntp-health-agent
+
+# Binary-freshness guard (2a): the systemd unit below passes -attestation-key
+# when attestation is enabled. A pre-2a binary does not know that flag and would
+# exit fatally — crash-looping the daemon and (via the admit sidecar) blocking
+# all enrollment. Probe the just-installed binary's help text and refuse to
+# proceed with a clear rebuild instruction rather than deploy a crash-loop.
+- name: Probe ntp-health-agent for signed-attestation support
+  ansible.builtin.command: "{{ ntp_health_agent_install_dir }}/ntp-health-agent --help"
+  register: ntp_health_agent_help
+  changed_when: false
+  failed_when: false
+  when: ntp_health_agent_attestation_enabled | bool
+
+- name: Require a signing-capable binary when attestation is enabled
+  ansible.builtin.assert:
+    that:
+      - "'attestation-key' in (ntp_health_agent_help.stderr | default('') + ntp_health_agent_help.stdout | default(''))"
+    fail_msg: >-
+      Installed ntp-health-agent predates the signed-attestation work (2a) and
+      does not support -attestation-key. The play rebuilds stale artifacts
+      automatically, so reaching this means the build itself produced an
+      unsupported binary — check `cd ops/time-hygiene && make build` output and
+      that the source tree carries the attestation work. (Or set
+      ntp_health_agent_attestation_enabled=false to deploy unattested.)
+    success_msg: "ntp-health-agent supports signed attestation — enabling the gate."
+  when: ntp_health_agent_attestation_enabled | bool
+
+- name: Render ntp-health-agent systemd unit
+  ansible.builtin.template:
+    src: ntp-health-agent.service.j2
+    dest: /etc/systemd/system/ntp-health-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart ntp-health-agent
+
+- name: Enable + start ntp-health-agent
+  ansible.builtin.systemd:
+    name: ntp-health-agent
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Flush handlers (ensure daemon is running before smoke-test)
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for ntp-health-agent /health to respond
+  # Always hit loopback — the bind address may be 0.0.0.0 so Docker-side
+  # scrapers can reach it, but the uri module can't always connect to
+  # 0.0.0.0 directly. Port is derived from the bind address.
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ ntp_health_agent_http_addr.split(':')[-1] }}/health"
+    status_code: [200, 503]
+    return_content: false
+  register: agent_ready
+  retries: 15
+  delay: 2
+  until: agent_ready.status in [200, 503]
+
+- name: Print ntp-health-agent verdict
+  ansible.builtin.debug:
+    msg: "ntp-health-agent is up — check /health for current verdict"

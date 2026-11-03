@@ -1,0 +1,214 @@
+# Rendered by ops/ansible/roles/minio on {{ ansible_date_time.iso8601 }}
+# Anchor: ADR 0822 + ADR 0811. Alerts for the Phase-2 MinIO substrate
+# on Orin-C. Loaded by Prometheus via /etc/prometheus/rules/.
+
+groups:
+  - name: minio
+    interval: 30s
+    rules:
+
+      - alert: MinIODown
+        expr: up{job="minio"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: minio
+          site: "{{ site_id }}"
+        annotations:
+          summary: "MinIO instance is down on {{ '{{' }} $labels.target_name {{ '}}' }}"
+          description: |
+            MinIO has been unreachable for 5+ minutes. Audit-integrity,
+            telemetry-otlp, and runtime-detection-archive buckets are
+            all unavailable. Investigate before next scheduled audit
+            emission.
+            Runbook: docs/operations/minio-runbook.md (TODO)
+
+      - alert: MinIOAuditBucketNoWrites
+        # Catches a stuck audit pipeline — if the bucket hasn't grown in
+        # 24h, no audit records are landing. Either the system is
+        # genuinely silent (unlikely at production rate) or the emitter
+        # path is broken. Compare against rate at other sites once
+        # multi-site lands.
+        expr: increase(minio_bucket_usage_object_total{bucket="audit-integrity"}[24h]) == 0
+        for: 1h
+        labels:
+          severity: warning
+          service: minio
+          site: "{{ site_id }}"
+        annotations:
+          summary: "audit-integrity bucket has not received writes in 24h"
+          description: |
+            ADR 0811 expects continuous audit emission. Zero new objects
+            in 24h indicates either the audit emitter pipeline is
+            broken or the system is anomalously quiet. Check
+            admit-audit sidecar / Falco / auditd / netbird-mgmt.
+
+      - alert: MinIOAuditBucketDeleteMarkersNeverReclaimed
+        # `minio_bucket_usage_deletemarker_total` is exported by MinIO and scraped
+        # into this Prometheus; this rule is what makes someone get TOLD about it.
+        #
+        # A delete marker with nothing beneath it stores nothing and records
+        # nothing, but MinIO's scanner walks it on every pass forever. That cost is
+        # invisible to every byte-oriented metric, so the bucket-size and quota
+        # alerts stay quiet while the scanner burns disk read far out of proportion
+        # to client traffic.
+        #
+        # WHY min_over_time AND NOT A BARE THRESHOLD WITH `for:`.
+        # A healthy versioned bucket carries markers transiently: one appears
+        # when a current version expires and disappears on the next
+        # ExpiredObjectDeleteMarker pass. The ratio is therefore a SAWTOOTH
+        # with a ~24h period (scanner speed=default), and any bare threshold
+        # has to be set above the peak — which means it also sits above the
+        # broken state until the pile is enormous.
+        #
+        # A bare `> 0.5 for: 6h` does not fire on this condition: a broken bucket's
+        # ratio can sit below it. min_over_time asks the question that actually
+        # matters: over two full scanner passes, did the ratio ever come DOWN?
+        # If the minimum across 48h is still a fifth, nothing is being
+        # reclaimed, whatever the peak looks like.
+        #
+        # 0.2 IS VALIDATED FROM BOTH SIDES, which is the only way a
+        # threshold is worth anything:
+        #
+        #   broken (no expiry clause)           0.385   fires
+        #   healthy (one scanner pass after)    0.056   quiet
+        #
+        # Healthy is measured after the ExpiredObjectDeleteMarker clause has run
+        # exactly one scanner pass. 0.2 sits with a ~3.5x margin above healthy and
+        # a ~2x margin below broken.
+        #
+        # If you retune it, retune against BOTH sides again. A threshold
+        # calibrated only on the failure it was written for can miss that failure.
+        expr: >-
+          min_over_time(
+            (
+              minio_bucket_usage_deletemarker_total{bucket="audit-integrity"}
+              / clamp_min(minio_bucket_usage_version_total{bucket="audit-integrity"}, 1)
+            )[48h:10m]
+          ) > 0.2
+        for: 1h
+        labels:
+          severity: warning
+          service: minio
+          site: "{{ site_id }}"
+        annotations:
+          summary: "audit-integrity delete markers are never reclaimed (48h floor {% raw %}{{ $value | humanizePercentage }}{% endraw %} of versions)"
+          description: |
+            Across two full scanner passes, delete markers never fell below a
+            fifth of audit-integrity's object versions. They are accumulating,
+            not cycling.
+
+            A delete marker left as the only thing at a key stores nothing and
+            records nothing, but the scanner walks it on every pass. At ZAGROS's
+            531k markers that was 47% of the versions the scanner walked and 1.128 MB/s of disk
+            read to serve 33 KB/s of client traffic. It will not show up in
+            bucket size, quota utilisation, or any other byte-oriented metric.
+
+            FIRST THING TO CHECK — is the clause even there:
+              mc ilm rule list <alias>/audit-integrity
+            The EXPIRE DELETEMARKER column must read `true` on a rule. If no
+            rule has it, this is F-171's tail returning: re-run the
+            audit-subscriber role with `--tags lifecycle`. If a rule DOES have
+            it, the clause is present and the scanner is behind — check
+            `mc admin config get <alias> scanner`.
+
+            F-171, F-372, docs/design/audit-cold-storage-offload.md.
+
+      - alert: MinIOAuditBucketLifecycleMissing
+        # The audit bucket is bounded by a lifecycle policy the audit-subscriber
+        # role owns (Block 95). An Access Denied rendered as "bucket does not exist"
+        # can skip every lifecycle task while every deploy reports clean, which leaves a
+        # bucket with NO lifecycle configuration at all.
+        #
+        # There is no metric for "a lifecycle rule exists", so this infers it
+        # from the consequence: a versioned bucket under an expiration policy
+        # ALWAYS carries some delete markers, because expiring a current
+        # version is what creates them. Exactly zero markers on a bucket that
+        # is receiving writes means nothing has ever expired anything.
+        #
+        # 7d is chosen to sit comfortably past the 30d expiration horizon
+        # being reachable — a genuinely new bucket has no expired objects yet
+        # and would false-positive on a shorter window. This is a slow,
+        # cheap-to-be-wrong alert, and it is the only one that names that gap.
+        expr: >-
+          minio_bucket_usage_deletemarker_total{bucket="audit-integrity"} == 0
+          and minio_bucket_usage_object_total{bucket="audit-integrity"} > 10000
+        for: 7d
+        labels:
+          severity: warning
+          service: minio
+          site: "{{ site_id }}"
+        annotations:
+          summary: "audit-integrity has zero delete markers — likely no lifecycle policy at all"
+          description: |
+            A versioned bucket under an expiration policy always carries some
+            delete markers: writing one is what expiring a current version
+            does. Zero markers on a bucket holding
+            {% raw %}{{ with query "minio_bucket_usage_object_total{bucket=\"audit-integrity\"}" }}{{ . | first | value | humanize }}{{ end }}{% endraw %}
+            objects means nothing has ever expired anything here.
+
+            CHECK:
+              mc ilm rule export <alias>/audit-integrity
+            "The lifecycle configuration does not exist" confirms it.
+
+            FIX: re-run the audit-subscriber role with `--tags lifecycle`.
+            Read the task output rather than the recap — F-372 is the case
+            where it skipped nine tasks and still reported green.
+
+      - alert: MinIOTelemetryBucketGrowingFast
+        # Bytes-stored growth > 5 GB/h sustained suggests either a
+        # producer is emitting at unintended volume or sampling has
+        # disengaged. The 90d TTL doesn't help if the growth rate
+        # outpaces deletion.
+        expr: rate(minio_bucket_usage_total_bytes{bucket="telemetry-otlp"}[1h]) > 5e9 / 3600
+        for: 30m
+        labels:
+          severity: warning
+          service: minio
+          site: "{{ site_id }}"
+        annotations:
+          summary: "telemetry-otlp bucket growing > 5 GB/h"
+          description: |
+            Wide-event volume exceeds the budgeted rate. Either a
+            producer is misbehaving (check OTel Collector
+            otelcol_processor_batch_batch_send_size) or sampling has
+            disengaged. ADR 0822 §"Trigger conditions for revisit"
+            line 2 fires on this. Tighten sampling or drop verbose
+            attributes.
+
+      - alert: MinIONVMeNearFull
+        expr: minio_node_drive_free_bytes / minio_node_drive_total_bytes < 0.15
+        for: 30m
+        labels:
+          severity: warning
+          service: minio
+          site: "{{ site_id }}"
+        annotations:
+          summary: "MinIO NVMe < 15% free on {{ '{{' }} $labels.drive {{ '}}' }}"
+          description: |
+            Orin-C NVMe is running low on space. Buckets in use:
+            audit-integrity (1y+6y retention), runtime-detection-archive
+            (90d), telemetry-otlp (90d). Future video-archive bucket
+            (Block 35) will dominate. Verify lifecycle expiration is
+            running; consider widening NVMe per ADR 0826 storage budget.
+
+      - alert: MinIOObjectLockMisconfigured
+        # COMPLIANCE retention should NEVER be 0d on the audit or
+        # runtime-detection buckets. If a misconfiguration drops it to
+        # 0, Object Lock effectively disables. Use minio_bucket_objects
+        # as a presence probe + the bucket-default-retention metric
+        # if MinIO exposes it (varies by version — soft alert).
+        expr: minio_bucket_objects_count{bucket="audit-integrity"} == 0 and time() - minio_node_uptime > 86400
+        for: 24h
+        labels:
+          severity: warning
+          service: minio
+          site: "{{ site_id }}"
+        annotations:
+          summary: "audit-integrity bucket has zero objects after 24h uptime"
+          description: |
+            audit-integrity should accumulate objects continuously
+            once the audit emitter is wired. If empty 24h after MinIO
+            startup, either no emitter is producing or the bucket is
+            misconfigured (wrong path, wrong creds). Distinct from
+            MinIOAuditBucketNoWrites which detects steady-state stalls.

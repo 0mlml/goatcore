@@ -1,0 +1,178 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the mesh-health role — deploys the goat-mesh-health meter (the
+# mesh domain of the environment-health surface; ADR 1042/1036). Two pieces:
+#
+#   1. A host-side systemd timer (mesh-health-snapshot) that atomically writes
+#      `netbird status --json` to {{ mesh_health_state_dir }}/netbird-status.json.
+#      Passive — netbird already measures per-peer latency + direct-vs-relayed
+#      for its own connection management; nothing new is injected on the wire.
+#   2. A containerized mTLS Zenoh client peer that reads the snapshot
+#      (bind-mounted read-only), grades each WireGuard link with the 5-state
+#      honesty colors, and publishes ops/mesh/health/<site> as
+#      EnvHealthV1{domain:"mesh"}. Subscribes nothing. Persists nothing.
+#
+# Out-of-the-box config targets the default host group; override with -e target=<site>_hosts.
+
+# Image — pinned per ADR 0859 (easy rollback). Built by
+# .github/workflows/mesh-health-image.yml. Multi-arch index digest
+# (linux/amd64 + linux/arm64) verified against ghcr. To bump: resolve the
+# new index digest with
+#   docker buildx imagetools inspect ghcr.io/{{ ghcr_org }}/goat-mesh-health:sha-<short> --format '{{.Manifest.Digest}}'
+# and append a matching deploy-history row.
+mesh_health_image: "ghcr.io/{{ ghcr_org }}/goat-mesh-health:sha-58f2d2f@sha256:7728aa9a6a1292acf94f9ad040414828b57622541802bef8017608e3dd3483dc"
+
+# Site identifier — the `<site>` segment of ops/mesh/health/<site>.
+mesh_health_site: "nova-a"
+
+# Zenoh router endpoint + network (internal docker, container-name resolution),
+# derived from zenoh_stack.
+mesh_health_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+mesh_health_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# Publish interval (ms) + snapshot staleness window (a snapshot older than this
+# publishes `unmetered` — never a false green) + snapshot timer cadence (s).
+mesh_health_interval_ms: 30000
+mesh_health_stale_after_ms: 90000
+mesh_health_snapshot_interval_s: 20
+
+# Path-aware measured-latency grading thresholds (ms), environment-health-surface.md
+# §3.4: posture picks the yardstick, the measurement drives the color. A DIRECT
+# link should be fast (tight thresholds); a RELAYED link rides a relay hop (often
+# WAN/satellite) so it's judged against a looser baseline — "slow because relayed"
+# reads calm, but the same latency on a link that should be fast reads hot. An
+# UNMEASURED latency (netbird reports 0) never grades.
+mesh_health_latency_amber_ms: 250
+mesh_health_latency_red_ms: 600
+mesh_health_latency_relayed_amber_ms: 1000
+mesh_health_latency_relayed_red_ms: 2500
+
+# Host-side cert directory. Infra-class leaf cert + key minted via offline-CA
+# cert-sign with Subject CN=goat-mesh-health-trial-peer (zenoh ACL subject
+# `infra-mesh-health`, granted ingress write on ops/mesh/health/** via rule
+# `infra-w-mesh-health`). A wrong/empty CN means the meter's publishes are
+# silently denied.
+#   {cert_dir}/mesh-health-cert.pem
+#   {cert_dir}/mesh-health-key.pem
+mesh_health_cert_dir: "/opt/mesh-health/certs"
+
+# CA root the client uses to verify the router (same file the router uses).
+mesh_health_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# Host-side state dir the snapshot timer writes into; bind-mounted RO at /state.
+mesh_health_state_dir: "/opt/mesh-health/state"
+
+mesh_health_compose_dir: "/opt/mesh-health"
+mesh_health_rust_log: "goat_mesh_health=info,zenoh=warn"
+
+# ── Declared peer expectations (docs/design/peer-liveness-expectations.md) ────
+#
+# A node that drops off cannot report its own absence, and absence only means
+# something against a DECLARED expectation. This map is that declaration. It is
+# reviewed config, never inferred from behaviour — inferring "this peer is
+# usually up so it should be up" learns an outage as normal, and a peer can then
+# sit off the mesh for a day with nothing saying so.
+#
+# Authored here as YAML; rendered to JSON next to the netbird snapshot and
+# bind-mounted read-only. Classes:
+#   always-up   field nodes, pods, network hosts, mgmt Orins,
+#               switches, routers        -> absence ALERTS
+#   attended    site laptops, bench boxes -> inform, don't page
+#   ephemeral   operator laptops, dev machines, browse users -> never alert
+# Anything undeclared reads `unclassified`: counted and visible so the gap
+# shows, but never alerted on. Empty map = nothing alerts (prior behaviour).
+#
+# `peers` are exact FQDNs and beat `patterns`; patterns are `*`-prefixed
+# suffixes, longest match wins.
+mesh_health_peer_classes:
+  peers: {}
+  patterns: {}
+
+# Peers declared to share this host group's site LAN (issue #240). Exact
+# netbird FQDNs, exactly as the vantage reports them. An entry the vantage's
+# roster does not contain (a typo, a deleted peer, one out of ACL scope) is
+# named in `goat_mesh_lan_peer_unseen` and counted in
+# `goat_mesh_lan_peers_unseen`; it still counts toward
+# `goat_mesh_lan_peers_declared`. Declared, never inferred: F-206 proved a
+# shared RFC1918 subnet is not evidence of a shared LAN. A vantage may see its own FQDN in
+# the list (one list per host group); the meter ignores the self-entry. The
+# meter counts and NAMES any declared LAN peer whose selected ICE pair is not
+# host/host (`goat_mesh_lan_peers_hairpinning`) — LAN-neighbour traffic
+# transiting the WAN. Empty list = the surface is inert and emits no series,
+# so "not declared" can never read as "not hairpinning".
+mesh_health_lan_peers: []
+
+# An `always-up` peer that is absent grades amber IMMEDIATELY — never green
+# while a peer we declared must be up is missing — and escalates to red at this
+# threshold. There is deliberately no amber grace period: on a meter restart the
+# measured absence duration reads 0, so a grace period would publish green with
+# a node gone. The
+# don't-page-on-a-blip tier belongs in the alert rule, which can read both this
+# color and the per-peer absent_ms.
+mesh_health_absent_red_ms: 3600000
+
+# How long an always-up peer must sit in `Connecting` before it is REPORTED in
+# `connecting_stuck` — the F-286 half-state, where a node is enrolled, powered
+# and permanently unable to rejoin because the enrolment apex resolves only
+# through the tunnel that is down. Worth calling out separately because the
+# remedy differs: repair name resolution, do NOT restart.
+#
+# It does NOT colour on its own, and must not. From the hub vantage netbird
+# reports any unreachable peer as `Connecting` whether it is wedged or simply
+# switched off, and most of them are ordinary powered-down laptops. Colouring on
+# it would page for the normal resting state of a large part of the fleet.
+mesh_health_connecting_amber_ms: 300000
+
+# ── Prometheus export ────────────────────────────────────────────────────────
+#
+# The meter writes the textfile itself rather than a second service subscribing
+# its own publish back off the bus: it already holds every value an alert needs,
+# and a separate exporter would need its own cert, ACL subject and container —
+# three more things that can be down while the alarm looks fine.
+#
+# Host directory is node_exporter's textfile collector dir. Empty disables the
+# export (prior behaviour). Alert rules:
+#   ops/compose/goat-obs/prometheus/rules/mesh-liveness.yml
+#
+# This MUST match the directory node_exporter actually reads
+# (`--collector.textfile.directory`), which the node-exporter/obs-host roles
+# mount from host `/var/lib/node_exporter/textfile` (see obs_textfile_host_dir).
+# A sibling path such as `…/textfile_collector` is not the read dir: the meter
+# would drop goat_mesh_health.prom into a directory node_exporter never scans, so
+# `:9100` exposes zero goat_mesh_* series, Prometheus ingests nothing, and the
+# mesh-liveness alerts have no metric to fire on, while the scrape target stays
+# `up` and empty. Every other host-side probe — fabric-crawler,
+# machine-provenance-guard, traefik-compression, topic-decode-health, spock-ace
+# — writes to `…/textfile`. Keep this equal to the read dir; a probe that writes
+# elsewhere is silently unmonitored.
+mesh_health_textfile_dir: "/var/lib/node_exporter/textfile"
+mesh_health_textfile_name: "goat_mesh_health.prom"
+
+# ── Management peer registry (optional; default OFF) ─────────────────────────
+#
+# `netbird status` says whether the vantage can REACH a peer. The management
+# API says whether the peer EXISTS and when the control plane last heard from
+# it. Only the second can supply a true `last_seen`, or tell a DELETED peer
+# (declaration is now fiction; it cannot return without re-enrolment) from one
+# that merely fell out of this vantage's ACL scope (a visibility problem).
+# Without it both render amber and say so; with it, deleted grades red.
+#
+# Fetched HOST-SIDE by the snapshot timer, so the token never enters the
+# container — the meter stays passive and file-driven and never calls an API.
+# The token lands in a root-only 0600 env file, resolved at run time from the
+# environment, never committed (same pattern as the docker .env files).
+mesh_health_registry_enabled: false
+mesh_health_registry_url: "https://{{ mesh_health_registry_host | default('localhost') }}/api/peers"
+mesh_health_registry_env_file: "/etc/mesh-health-registry.env"
+# Per-site token, e.g. <SITE>_NB_API_TOKEN — the convention the DNS and obs
+# playbooks already use.
+mesh_health_registry_token: "{{ lookup('env', (site_id | mandatory | upper | replace('-','_')) + '_NB_API_TOKEN') }}"
+
+# Per-peer handshake summary for the identity console (control-only flag).
+# The console reads ONLY this directory, mounted read-only — never the full
+# snapshot, the peer registry, the docker socket or the netbird socket.
+# Each row: NetBird IP, FQDN, status, last WireGuard handshake as THIS host's
+# client saw it. Default off; enabled per goatnet in group_vars.
+mesh_health_peer_summary_enabled: false
+mesh_health_peer_summary_dir: "/var/lib/mesh-peer-summary"

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>octo-pod — {{ goat_get_hostname }}</title>
+<style>
+  body { font: 16px/1.55 system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 20px; color: #1a1d1b; background: #fafaf7; }
+  h1 { font-size: 1.4rem; } code, pre { font-family: ui-monospace, monospace; font-size: .88em; background: #eef0ed; border-radius: 4px; }
+  code { padding: 1px 5px; } pre { padding: 12px 14px; overflow-x: auto; }
+  table { border-collapse: collapse; } td, th { text-align: left; padding: 6px 14px 6px 0; border-bottom: 1px solid #d8ddd9; }
+  a { color: #0b6b58; }
+</style>
+</head>
+<body>
+<h1>octo-pod {{ goat_get_octopod_version }}</h1>
+<p>The edge appliance: it takes raw TCP/UDP off a sensor, gives each source its
+own identity and certificate on a local Zenoh router, and forwards upstream
+only what has been explicitly released. Capture and retention work with no
+upstream connection at all. Release {{ goat_get_octopod_release_tag }}.</p>
+
+<h2>Verify first</h2>
+<p>One signature covers the release: <code>SHA256SUMS</code> lists every
+artifact and is signed by the release pipeline, so verifying it and then
+checking hashes against it covers both artifacts below.</p>
+<pre>curl -fLO https://{{ goat_get_hostname }}/{{ goat_get_octopod_www_subdir }}/SHA256SUMS
+curl -fLO https://{{ goat_get_hostname }}/{{ goat_get_octopod_www_subdir }}/SHA256SUMS.cosign-bundle
+
+cosign verify-blob \
+  --bundle SHA256SUMS.cosign-bundle \
+  --certificate-identity-regexp '^https://github.com/{{ goat_get_octopod_release_repo }}/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS</pre>
+<p>This surface is a mirror, not a signer. The signature is made at release
+time and checked on the pod, so a tampered mirror serves software that no pod
+will install.</p>
+
+<h2>Install (on the pod)</h2>
+<p>There is no <code>octo-pod</code> apt repository. The <code>.deb</code> is
+installed by file; the second line pulls the three dependencies the first
+reports as missing.</p>
+<pre>curl -fLO https://{{ goat_get_hostname }}/{{ goat_get_octopod_www_subdir }}/octo-pod_{{ goat_get_octopod_version }}_all.deb
+sudo dpkg -i ./octo-pod_{{ goat_get_octopod_version }}_all.deb
+sudo apt-get install -f -y
+
+sudo octo-pod bootstrap
+sudo octo-pod join --setup-key &lt;KEY&gt; --mgmt &lt;mgmt-url&gt; --pod &lt;name&gt;</pre>
+<p>No apt on the box? Take the tarball instead, unpack it to
+<code>/opt/octo-pod-{{ goat_get_octopod_version }}</code> and symlink
+<code>/opt/octo-pod</code> at it.</p>
+
+<h2>Later versions</h2>
+<p>Point the pod's <code>octo_repo_url</code> at this directory and it takes
+new releases over the mesh, without reaching GitHub:</p>
+<pre>octo_repo_url: "https://{{ goat_get_hostname }}/{{ goat_get_octopod_www_subdir }}"</pre>
+<pre>sudo octo-pod upgrade --check    # what it would take; changes nothing
+sudo octo-pod upgrade
+sudo octo-pod upgrade --rollback # back to the version you came from</pre>
+<p><code>upgrade</code> reads <code>LATEST</code> from this directory, then
+verifies the signature above before installing. An unverifiable release is
+refused rather than installed. A pod's identity in <code>/etc/octo-pod</code>
+is never touched by installing or upgrading.</p>
+
+<h2>Artifacts</h2>
+<table>
+<tr><th>File</th><th>What it is</th></tr>
+{% for asset in goat_get_octopod_assets %}
+<tr><td><a href="{{ asset }}">{{ asset }}</a></td>
+<td>{% if asset.endswith('.deb') %}Debian/Ubuntu package (Architecture: all){% elif asset.endswith('.tar.gz') %}tarball, for a box with no apt{% elif asset.endswith('.sha256') %}single-artifact checksum{% elif asset == 'SHA256SUMS.cosign-bundle' %}signature over SHA256SUMS{% elif asset == 'SHA256SUMS' %}checksums for every artifact{% elif asset == 'LATEST' %}version <code>upgrade</code> reads{% else %}—{% endif %}</td></tr>
+{% endfor %}
+</table>
+<p><a href="/">← back to the goat download surface</a></p>
+</body>
+</html>

@@ -1,0 +1,42 @@
+# Rendered by ops/ansible/roles/operator-idp-hydra on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/operator-idp-hydra/templates/docker-compose.yml.j2
+# Anchor: ADR 0842.
+
+services:
+  hydra-migrate:
+    image: {{ operator_idp_hydra_image }}
+    container_name: operator-idp-hydra-migrate
+    restart: "no"
+    profiles: ["migrate"]
+    command: ["migrate", "sql", "-e", "--yes", "--config", "/etc/config/hydra.yaml"]
+    env_file: [.env]
+    volumes:
+      - {{ operator_idp_hydra_compose_dir }}/{{ operator_idp_hydra_config_subdir }}/hydra.yaml:/etc/config/hydra.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  hydra:
+    image: {{ operator_idp_hydra_image }}
+    container_name: {{ operator_idp_hydra_container_name }}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 384M }
+        reservations: { memory: 64M }
+    command: ["serve", "all", "--config", "/etc/config/hydra.yaml"]
+    env_file: [.env]
+    environment:
+      # Hydra's env-override pattern reads SECRETS_SYSTEM /
+      # SECRETS_COOKIE as comma-separated arrays at parse time.
+      SECRETS_SYSTEM: "${HYDRA_SECRETS_SYSTEM}"
+      SECRETS_COOKIE: "${HYDRA_SECRETS_COOKIE}"
+    volumes:
+      - {{ operator_idp_hydra_compose_dir }}/{{ operator_idp_hydra_config_subdir }}/hydra.yaml:/etc/config/hydra.yaml:ro
+    ports:
+      - "127.0.0.1:{{ operator_idp_hydra_public_host_port }}:4444"
+      - "127.0.0.1:{{ operator_idp_hydra_admin_host_port }}:4445"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # No docker-level healthcheck — oryd/hydra image is distroless-style
+    # and lacks wget/curl (F-097-class trap; same as operator-idp-kratos
+    # role). Readiness verification lives in tasks/main.yml.

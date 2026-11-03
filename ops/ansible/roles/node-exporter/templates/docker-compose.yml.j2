@@ -1,0 +1,36 @@
+# Rendered by ops/ansible/roles/node-exporter — do not edit on the host.
+#
+# Standalone node_exporter for a scraped host that runs no obs stack of its own.
+# Service definition intentionally mirrors the obs-host role's own exporter so
+# the two stay comparable; when you change one, change the other.
+services:
+  node-exporter:
+    image: {{ node_exporter_image }}
+    container_name: node-exporter
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+    command:
+      - --path.rootfs=/host
+      - --collector.systemd
+      - --collector.processes
+      - --collector.textfile.directory={{ node_exporter_textfile_dir }}
+{% if node_exporter_listen_addr %}
+      # Bound narrow (usually the mesh IP) so the exporter is reachable from
+      # the obs host and not from the LAN. Empty default = bind-all, which is
+      # what every pre-existing deployment already does.
+      - --web.listen-address={{ node_exporter_listen_addr }}:{{ node_exporter_port }}
+{% endif %}
+{% for c in node_exporter_disabled_collectors | default([]) %}
+      # see role defaults for why thermal_zone is off by default on Jetson
+      - --no-collector.{{ c }}
+{% endfor %}
+    # host networking: the exporter must see the host's real interfaces and
+    # processes, and the obs host scrapes it at <mesh-ip>:{{ node_exporter_port }}.
+    # Reachability is governed by the mesh ACL, not by port publishing.
+    pid: host
+    network_mode: host
+    volumes:
+      - /:/host:ro,rslave
+      - {{ node_exporter_textfile_host_dir }}:{{ node_exporter_textfile_dir }}:ro

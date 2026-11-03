@@ -1,0 +1,134 @@
+---
+# lan-coredns — deploy CoreDNS as the closed-LAN authoritative DNS server.
+# Sibling-shape to mesh-coredns but with the inverse bind + forwarder
+# posture. See README.md for the load-bearing invariants.
+#
+# Pre-requisites:
+#   - Docker + docker-compose plugin installed (handled by mgmt-host-baseline.yml).
+#   - Host has a LAN IP set via lan_coredns_bind_ip.
+#   - Zone-data file present at {{ lan_coredns_zone_dir }}/{{ lan_coredns_zone_name }}.hosts.
+#
+# Post-conditions:
+#   - CoreDNS container `lan-dns` running, bound to 127.0.0.1 and lan_coredns_bind_ip
+#     on UDP port lan_coredns_port (default 53).
+#   - Corefile + zone file present at lan_coredns_dir.
+#   - Smoke-tested via `dig` against a known record.
+#   - NO forwarder configured — unknown queries return NXDOMAIN (closed-network posture).
+
+- name: Assert required vars are set
+  ansible.builtin.assert:
+    that:
+      - lan_coredns_bind_ip is defined
+      - lan_coredns_bind_ip | length > 0
+      - lan_coredns_zone_name is defined
+      - lan_coredns_zone_name | length > 0
+      - lan_coredns_smoke_test_name is defined
+      - lan_coredns_smoke_test_expect is defined
+    fail_msg: >-
+      lan-coredns requires lan_coredns_bind_ip (LAN IP, NOT mesh/wg-cp0),
+      lan_coredns_zone_name (e.g. "nova.lan"), and smoke-test vars.
+      See ops/ansible/roles/lan-coredns/README.md.
+
+- name: Sanity-check bind IP is NOT in the mesh range (100.64/10 reserved for netbird)
+  ansible.builtin.assert:
+    that:
+      - not (lan_coredns_bind_ip is match("^100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\."))
+    fail_msg: >-
+      lan_coredns_bind_ip {{ lan_coredns_bind_ip }} is in the netbird mesh
+      range 100.64.0.0/10. The closed-LAN posture requires a real LAN IP.
+      If this host is on a netbird mesh, use mesh-coredns, not lan-coredns.
+
+- name: Sanity-check bind IP is NOT in the wg-cp0 range (198.18/16 reserved for fleet)
+  ansible.builtin.assert:
+    that:
+      - not (lan_coredns_bind_ip is match("^198\\.18\\."))
+    fail_msg: >-
+      lan_coredns_bind_ip {{ lan_coredns_bind_ip }} is in the wg-cp0 fleet
+      range 198.18.0.0/24 (ADR 0319). The closed-LAN posture requires a
+      real LAN IP. If this host is on wg-cp0, use mesh-coredns with the
+      wg-cp0 bind option.
+
+- name: Ensure lan-dns directory exists
+  ansible.builtin.file:
+    path: "{{ lan_coredns_dir }}"
+    state: directory
+    owner: "{{ lan_coredns_owner }}"
+    group: "{{ lan_coredns_group }}"
+    mode: "0755"
+
+- name: Render Corefile (authoritative; no forwarder)
+  ansible.builtin.template:
+    src: Corefile.j2
+    dest: "{{ lan_coredns_corefile_path }}"
+    owner: "{{ lan_coredns_owner }}"
+    group: "{{ lan_coredns_group }}"
+    mode: "0644"
+  notify: Restart lan-coredns
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ lan_coredns_compose_path }}"
+    owner: "{{ lan_coredns_owner }}"
+    group: "{{ lan_coredns_group }}"
+    mode: "0644"
+  notify: Restart lan-coredns
+
+- name: Deploy zone-data file (from canonical source under ops/dns/)
+  ansible.builtin.copy:
+    src: "{{ lan_coredns_zone_dir }}/{{ lan_coredns_zone_name }}.hosts"
+    dest: "{{ lan_coredns_zone_path }}"
+    owner: "{{ lan_coredns_owner }}"
+    group: "{{ lan_coredns_group }}"
+    mode: "0644"
+  notify: Restart lan-coredns
+
+- name: Flush handlers (start coredns before smoke test)
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure lan-dns container is up (idempotent)
+  ansible.builtin.command:
+    cmd: docker compose up -d --remove-orphans
+    chdir: "{{ lan_coredns_dir }}"
+  changed_when: false
+
+- name: Smoke-test — CoreDNS responds on bind IP for a known hostname
+  ansible.builtin.command:
+    cmd: >-
+      dig @{{ lan_coredns_bind_ip }} -p {{ lan_coredns_port }}
+      {{ lan_coredns_smoke_test_name }} +short
+  register: dns_check
+  changed_when: false
+  failed_when: dns_check.stdout == ""
+
+- name: Smoke-test — CoreDNS returns NXDOMAIN for an unknown hostname (closed-network posture)
+  ansible.builtin.command:
+    cmd: >-
+      dig @{{ lan_coredns_bind_ip }} -p {{ lan_coredns_port }}
+      this-name-does-not-exist.{{ lan_coredns_zone_name }} +short
+  register: dns_nxdomain_check
+  changed_when: false
+  # Expect empty stdout — hosts plugin doesn't match, no forwarder configured,
+  # CoreDNS returns NXDOMAIN. If a forwarder is accidentally configured this
+  # would return a public-DNS NXDOMAIN response containing nothing in +short
+  # output but would still leak the query externally. The structural defense
+  # is the Corefile template having no forward directive.
+  failed_when: dns_nxdomain_check.stdout != ""
+
+- name: Show smoke-test result
+  ansible.builtin.debug:
+    msg: >-
+      lan-dns @ {{ lan_coredns_bind_ip }}:{{ lan_coredns_port }} responds:
+      {{ lan_coredns_smoke_test_name }} → {{ dns_check.stdout_lines | join(' / ') }}
+      | NXDOMAIN OK for unknown
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: lan-coredns | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "lan-coredns"
+    rollback_ref: "{{ lan_coredns_image }}"

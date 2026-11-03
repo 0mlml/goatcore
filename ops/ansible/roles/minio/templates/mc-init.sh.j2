@@ -1,0 +1,233 @@
+#!/bin/sh
+# mc-init.sh — bucket + Object-Lock + lifecycle bootstrap for the
+# Orin-C MinIO instance. Idempotent.
+#
+# Rendered by ops/ansible/roles/minio. Edit the .j2, not this file.
+#
+# Anchors:
+#   - audit-integrity bucket: ADR 0811 — Object Lock COMPLIANCE,
+#     {{ minio_audit_retention_days }}d default retention. Created
+#     with --with-lock at creation time (cannot enable retroactively).
+#   - telemetry-otlp bucket: ADR 0822 — no Object Lock; lifecycle
+#     expiration at {{ minio_telemetry_retention_days }}d.
+#
+# Output convention: prints `created`, `updated`, or `unchanged` per
+# resource so the calling Ansible task's changed_when picks up only
+# substantive runs.
+
+set -eu
+
+# MC_HOST_local is the env-var configuration form recognized by `mc` —
+# alias `local` resolves to http://USER:PASS@minio:9000 at every
+# invocation. Avoids `mc alias set` writing to a config file inside
+# the throwaway container.
+
+# 1. audit-integrity bucket — Object Lock COMPLIANCE
+if mc ls "local/{{ minio_audit_bucket }}" >/dev/null 2>&1; then
+  echo "unchanged: bucket {{ minio_audit_bucket }} already exists"
+else
+  # --with-lock enables Object Lock at creation time. Cannot be enabled
+  # later. ADR 0811 requires this; the failure mode of skipping it is
+  # silent — the bucket appears to work but isn't tamper-resistant.
+  mc mb --with-lock "local/{{ minio_audit_bucket }}"
+  echo "created: bucket {{ minio_audit_bucket }} with Object Lock"
+fi
+
+# Apply default retention. Re-applying same value is a no-op at the
+# server side; mc returns rc 0 either way. We treat any successful
+# call as `updated` for visibility.
+#
+# Lock mode is parameterized as the AUDIT-MIDDLE-TIER property in Block 95
+# (docs/design/audit-cold-storage-offload.md). COMPLIANCE = locked even
+# from root until retention expires. GOVERNANCE = same default lock, but
+# an identity with s3:BypassGovernanceRetention can release oldest-first
+# for quota-relief (FIFO-eviction substrate). Per-deployment override
+# lives in group_vars/<env>/minio.yml; a site with a cold-storage tier can be
+# GOVERNANCE per the Block 95 substrate refinement (that tier carries the COMPLIANCE bar
+# instead). Production sites keep COMPLIANCE if they're the long-term
+# preservation tier without cold-archive offload.
+mc retention set --default \
+  "{{ minio_audit_object_lock_mode }}" "{{ minio_audit_retention_days }}d" \
+  "local/{{ minio_audit_bucket }}"
+echo "updated: {{ minio_audit_bucket }} default retention = {{ minio_audit_object_lock_mode }} {{ minio_audit_retention_days }}d"
+
+{% if minio_audit_expiration_days is defined and minio_audit_expiration_days %}
+# Optional lifecycle expiration on the audit bucket — sites with a
+# disk-constrained host (e.g., a trial fabric on a single host)
+# override `minio_audit_expiration_days` to auto-delete objects once
+# their COMPLIANCE retention expires. Without this rule, objects sit on
+# disk forever after retention; Object-Lock retention only prevents
+# delete, it does not auto-delete. Production (allocated storage) leaves
+# this unset to keep audit objects until manual archival.
+AUDIT_LIFECYCLE_JSON=$(cat <<'EOF'
+{
+  "Rules": [
+    {
+      "ID": "expire-audit-after-{{ minio_audit_expiration_days }}d",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "Expiration": { "Days": {{ minio_audit_expiration_days }} }
+    }
+  ]
+}
+EOF
+)
+echo "$AUDIT_LIFECYCLE_JSON" > /tmp/audit-lifecycle.json
+mc ilm import "local/{{ minio_audit_bucket }}" < /tmp/audit-lifecycle.json
+echo "updated: {{ minio_audit_bucket }} expiration = {{ minio_audit_expiration_days }}d"
+{% else %}
+echo "unchanged: {{ minio_audit_bucket }} has no auto-expiration (production posture; manual archive lifecycle)"
+{% endif %}
+
+# 2a. runtime-detection-archive bucket — Object Lock COMPLIANCE 90d (Block 18G)
+if mc ls "local/{{ minio_runtime_detection_bucket }}" >/dev/null 2>&1; then
+  echo "unchanged: bucket {{ minio_runtime_detection_bucket }} already exists"
+else
+  # --with-lock at creation time, same reasoning as audit-integrity.
+  # Falco / osquery / auditd records are IR-evidence-grade.
+  mc mb --with-lock "local/{{ minio_runtime_detection_bucket }}"
+  echo "created: bucket {{ minio_runtime_detection_bucket }} with Object Lock"
+fi
+mc retention set --default \
+  COMPLIANCE "{{ minio_runtime_detection_retention_days }}d" \
+  "local/{{ minio_runtime_detection_bucket }}"
+echo "updated: {{ minio_runtime_detection_bucket }} default retention = COMPLIANCE {{ minio_runtime_detection_retention_days }}d"
+
+# 2b. telemetry-otlp bucket — no Object Lock; TTL via lifecycle
+if mc ls "local/{{ minio_telemetry_bucket }}" >/dev/null 2>&1; then
+  echo "unchanged: bucket {{ minio_telemetry_bucket }} already exists"
+else
+  # Deliberately NO --with-lock. ADR 0822 §"Assessor view" is explicit:
+  # this bucket is best-effort operational telemetry, not evidence-grade.
+  mc mb "local/{{ minio_telemetry_bucket }}"
+  echo "created: bucket {{ minio_telemetry_bucket }} (no Object Lock)"
+fi
+
+# Apply / re-apply the expiration lifecycle rule. `mc ilm rule add`
+# fails on duplicates so use `--force` semantic via `add | edit`
+# fallback. Simpler: import a JSON document; that's idempotent for
+# matching content.
+LIFECYCLE_JSON=$(cat <<'EOF'
+{
+  "Rules": [
+    {
+      "ID": "expire-telemetry-after-{{ minio_telemetry_retention_days }}d",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "Expiration": { "Days": {{ minio_telemetry_retention_days }} }
+    }
+  ]
+}
+EOF
+)
+echo "$LIFECYCLE_JSON" > /tmp/lifecycle.json
+mc ilm import "local/{{ minio_telemetry_bucket }}" < /tmp/lifecycle.json
+echo "updated: {{ minio_telemetry_bucket }} expiration = {{ minio_telemetry_retention_days }}d"
+
+{% if (minio_operator_idp_enabled | default(operator_idp_enabled | default(false))) | bool %}
+# 2.5 Block 21H.3c — alias policies for operator-IdP claim -> policy mapping.
+# MinIO matches each value in the JWT `groups` claim to a policy of the
+# same name (CASE-SENSITIVE). The group names are site-specific Ory groups
+# (e.g. `PLATFORM-ADMIN`/`OBS-ADMIN`, uppercase), so the admin/readonly
+# policy names are driven by minio_oidc_{admin,readonly}_policy_groups —
+# they MUST match the real Ory group names or every operator-IdP login
+# lands with zero policies attached and bucket access denied ("None of the
+# given policies are defined").
+echo "--- creating operator-IdP alias policies ---"
+for OPERATOR_GROUP in {{ minio_oidc_admin_policy_groups | join(' ') }}; do
+  cat > /tmp/policy-${OPERATOR_GROUP}.json <<'POL'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["admin:*"], "Resource": ["arn:aws:s3:::*"]},
+    {"Effect": "Allow", "Action": ["s3:*"],    "Resource": ["arn:aws:s3:::*"]}
+  ]
+}
+POL
+  mc admin policy create local "${OPERATOR_GROUP}" /tmp/policy-${OPERATOR_GROUP}.json
+done
+
+for OPERATOR_GROUP in {{ minio_oidc_readonly_policy_groups | join(' ') }}; do
+  cat > /tmp/policy-${OPERATOR_GROUP}.json <<'POL'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": ["arn:aws:s3:::*"]}
+  ]
+}
+POL
+  mc admin policy create local "${OPERATOR_GROUP}" /tmp/policy-${OPERATOR_GROUP}.json
+done
+
+rm -f /tmp/policy-*.json
+{% endif %}
+
+# 3. Per-bucket hard-size quotas (for trial fabrics; production unset)
+# `mc quota set ... --size <N>GiB` rejects new PutObject once the bucket
+# crosses the cap. Combined with the lifecycle expiration rules above
+# this gives "rolling rotation under a hard ceiling" so a runaway
+# producer cannot fill the disk.
+{% if minio_audit_bucket_quota_gib is defined and minio_audit_bucket_quota_gib %}
+mc quota set "local/{{ minio_audit_bucket }}" --size "{{ minio_audit_bucket_quota_gib }}GiB"
+echo "updated: {{ minio_audit_bucket }} quota = {{ minio_audit_bucket_quota_gib }} GiB"
+{% else %}
+echo "unchanged: {{ minio_audit_bucket }} has no quota (production posture)"
+{% endif %}
+{% if minio_telemetry_bucket_quota_gib is defined and minio_telemetry_bucket_quota_gib %}
+mc quota set "local/{{ minio_telemetry_bucket }}" --size "{{ minio_telemetry_bucket_quota_gib }}GiB"
+echo "updated: {{ minio_telemetry_bucket }} quota = {{ minio_telemetry_bucket_quota_gib }} GiB"
+{% else %}
+echo "unchanged: {{ minio_telemetry_bucket }} has no quota (production posture)"
+{% endif %}
+{% if minio_runtime_detection_bucket_quota_gib is defined and minio_runtime_detection_bucket_quota_gib %}
+mc quota set "local/{{ minio_runtime_detection_bucket }}" --size "{{ minio_runtime_detection_bucket_quota_gib }}GiB"
+echo "updated: {{ minio_runtime_detection_bucket }} quota = {{ minio_runtime_detection_bucket_quota_gib }} GiB"
+{% else %}
+echo "unchanged: {{ minio_runtime_detection_bucket }} has no quota (production posture)"
+{% endif %}
+
+{% if minio_extra_users %}
+# 3.5 Extra service users — per-bucket IAM policies + scoped users
+# Each entry mints a named policy from a controller-side JSON file, adds
+# the user with the secret from {{ '${' + (minio_extra_users[0].name | upper | replace('-', '_')) + '_SECRET}' }} (etc.)
+# loaded into the container via env_file mc-extra-users.env. Idempotent:
+#   - `mc admin policy create` overwrites if same name (no-op when content matches)
+#   - `mc admin user add` overwrites if same access key (rotates secret atomically)
+#   - `mc admin policy attach` returns rc=1 if already attached; we trap that case
+{% for user in minio_extra_users %}
+{% set sec_var = (user.name | upper | replace('-', '_')) + '_SECRET' %}
+echo "--- mc extra user: {{ user.name }} ---"
+mc admin policy create local "{{ user.policy_name }}" "/policies/{{ user.policy_name }}.json"
+echo "updated: policy {{ user.policy_name }}"
+mc admin user add local "{{ user.name }}" "${{ '{' }}{{ sec_var }}{{ '}' }}"
+echo "updated: user {{ user.name }}"
+# POSIX case — the upstream minio/mc image ships a minimal busybox
+# without grep/sed, so we inspect mc's stderr/stdout via shell pattern
+# match instead of piping through grep.
+attach_out=$(mc admin policy attach local "{{ user.policy_name }}" --user "{{ user.name }}" 2>&1) || true
+case "$attach_out" in
+  *already*|*exists*) echo "unchanged: policy {{ user.policy_name }} already attached to user {{ user.name }}" ;;
+  *) echo "updated: attached policy {{ user.policy_name }} to user {{ user.name }} ($attach_out)" ;;
+esac
+{% endfor %}
+{% endif %}
+
+# 4. Sanity print
+echo "--- mc admin info ---"
+mc admin info local
+echo "--- mc ls ---"
+mc ls local/
+echo "--- mc retention info ({{ minio_audit_bucket }}) ---"
+mc retention info --default "local/{{ minio_audit_bucket }}"
+echo "--- mc ilm rule list ({{ minio_telemetry_bucket }}) ---"
+mc ilm rule list "local/{{ minio_telemetry_bucket }}" || true
+echo "--- mc quota info (all three buckets) ---"
+for b in "{{ minio_audit_bucket }}" "{{ minio_telemetry_bucket }}" "{{ minio_runtime_detection_bucket }}"; do
+  mc quota info "local/$b" 2>&1 | sed "s|^|  $b: |" || true
+done
+{% if minio_extra_users %}
+echo "--- mc admin user list (extra users) ---"
+for u in {% for user in minio_extra_users %}"{{ user.name }}" {% endfor %}; do
+  mc admin user info local "$u" 2>&1 | sed "s|^|  $u: |" || true
+done
+{% endif %}

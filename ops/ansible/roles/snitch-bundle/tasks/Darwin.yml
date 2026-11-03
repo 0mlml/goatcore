@@ -1,0 +1,77 @@
+---
+# snitch-bundle / Darwin — launchd + /usr/local/bin/snitch
+#
+# Block 61H multi-platform builds. macOS variant of the systemd path.
+# Same bundle layout (snitch_bundle_unpack_dir/binaries/snitch); the
+# bundle-create CLI is responsible for picking the right per-OS binary
+# at issuance time so the bundle on a Darwin host carries the darwin
+# build.
+
+- name: Verify bundle binary present (Darwin)
+  ansible.builtin.stat:
+    path: "{{ snitch_bundle_unpack_dir }}/binaries/snitch"
+  register: bundle_binary
+  failed_when: not bundle_binary.stat.exists
+  tags: [snitch-bundle]
+
+- name: Install snitch binary from bundle (Darwin)
+  ansible.builtin.copy:
+    src: "{{ snitch_bundle_unpack_dir }}/binaries/snitch"
+    dest: /usr/local/bin/snitch
+    remote_src: true
+    owner: root
+    group: wheel
+    mode: "0755"
+  notify: Restart snitch-probe (launchd)
+  tags: [snitch-bundle]
+
+- name: Resolve snitch probe key (inventory override or bundle extract)
+  ansible.builtin.set_fact:
+    snitch_probe_key_resolved: "{{ snitch_probe_key_inventory }}"
+  when: snitch_probe_key_inventory | length > 0
+  tags: [snitch-bundle]
+
+- name: Extract snitch probe key from offline-enrollment bundle (Darwin)
+  ansible.builtin.command:
+    cmd: bundle-extract --field snitch_probe_key --hex {{ snitch_enrollment_bundle_path }}
+  register: bundle_extract_result
+  changed_when: false
+  no_log: true
+  when: snitch_probe_key_inventory | length == 0
+  tags: [snitch-bundle]
+
+- name: Set snitch_probe_key_resolved from bundle (Darwin)
+  ansible.builtin.set_fact:
+    snitch_probe_key_resolved: "{{ bundle_extract_result.stdout }}"
+  when: snitch_probe_key_inventory | length == 0
+  no_log: true
+  tags: [snitch-bundle]
+
+- name: Render snitch-probe LaunchDaemon plist
+  ansible.builtin.template:
+    src: snitch-probe.plist.j2
+    dest: /Library/LaunchDaemons/net.goat.snitch-probe.plist
+    owner: root
+    group: wheel
+    mode: "0644"
+  notify: Restart snitch-probe (launchd)
+  tags: [snitch-bundle]
+
+- name: Bootstrap snitch-probe LaunchDaemon
+  ansible.builtin.command:
+    cmd: launchctl bootstrap system /Library/LaunchDaemons/net.goat.snitch-probe.plist
+  register: launchctl_bootstrap
+  failed_when:
+    - launchctl_bootstrap.rc != 0
+    - "'service already loaded' not in launchctl_bootstrap.stderr"
+    - "'Bootstrap failed: 17' not in launchctl_bootstrap.stderr"
+  changed_when: launchctl_bootstrap.rc == 0
+  tags: [snitch-bundle]
+
+- name: Ensure snitch-probe LaunchDaemon is started
+  ansible.builtin.command:
+    cmd: launchctl kickstart -k system/net.goat.snitch-probe
+  register: launchctl_kickstart
+  changed_when: launchctl_kickstart.rc == 0
+  failed_when: false  # kickstart returns non-zero if not loaded; bootstrap above handles that
+  tags: [snitch-bundle]

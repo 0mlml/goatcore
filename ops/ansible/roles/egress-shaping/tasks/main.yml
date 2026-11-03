@@ -1,0 +1,202 @@
+---
+# ops/ansible/roles/egress-shaping/tasks/main.yml
+#
+# ADR 1081 Layer 3 — site-host (Thor) egress survivability.
+# docs/design/control-plane-storm-resilience.md §"Layer 3".
+#
+# HOST-LOCAL egress shaping ONLY (cake qdisc + DSCP-steering + BBR sysctl).
+# NOT fabric QoS — the ADR 1033 "never DSCP for fabric classes" rule is
+# untouched (cake `wash` strips the host-local marks on egress). Whole role is
+# behind `egress_shaping_enabled`, default OFF. Idempotent + --check safe.
+
+# ============================================================================
+# Fail-closed: a cap is REQUIRED when enabled (never guessed)
+# ============================================================================
+- name: egress-shaping | require a bandwidth cap when enabled (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - egress_shaping_bandwidth_mbit | string | length > 0
+      - (egress_shaping_bandwidth_mbit | int) > 0
+    fail_msg: >-
+      egress_shaping_enabled is true but egress_shaping_bandwidth_mbit is unset.
+      Set it from the host's MEASURED egress envelope (host-net-health), floored
+      to ~90% of line rate. Never guess a cap — see the role defaults comments.
+    quiet: true
+  when: egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+# ============================================================================
+# Enabled path — cake + DSCP steering + BBR
+# ============================================================================
+- name: egress-shaping | ensure nftables is present (DSCP-steering table)
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+- name: egress-shaping | install apply script
+  ansible.builtin.template:
+    src: goat-egress-shaping.sh.j2
+    dest: "{{ egress_shaping_script_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: egress_shaping_enabled | bool
+  notify: reapply egress shaping
+  tags: [egress-shaping]
+
+- name: egress-shaping | install teardown script
+  ansible.builtin.template:
+    src: goat-egress-shaping-teardown.sh.j2
+    dest: "{{ egress_shaping_teardown_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+- name: egress-shaping | install boot-reapply systemd oneshot
+  ansible.builtin.template:
+    src: goat-egress-shaping.service.j2
+    dest: /etc/systemd/system/goat-egress-shaping.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: egress_shaping_enabled | bool
+  notify:
+    - reload systemd
+    - reapply egress shaping
+  tags: [egress-shaping]
+
+- name: egress-shaping | enable + start the oneshot (applies cake + marks now)
+  ansible.builtin.systemd:
+    name: goat-egress-shaping.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+# ─── BBR (same toggle) ────────────────────────────────────────────
+- name: egress-shaping | ensure tcp_bbr module loads at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/goat-bbr.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # ADR 1081 L3 — BBR needs the tcp_bbr module selectable.
+      tcp_bbr
+  when: egress_shaping_enabled | bool and egress_shaping_bbr_enable | bool
+  tags: [egress-shaping, bbr]
+
+- name: egress-shaping | modprobe tcp_bbr now (tolerate a kernel without it)
+  community.general.modprobe:
+    name: tcp_bbr
+    state: present
+  failed_when: false
+  when: egress_shaping_enabled | bool and egress_shaping_bbr_enable | bool
+  tags: [egress-shaping, bbr]
+
+- name: egress-shaping | write BBR sysctl drop-in
+  ansible.builtin.copy:
+    dest: "{{ egress_shaping_sysctl_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # ADR 1081 L3 — BBR + fq. cubic collapses under sustained ~10% loss (the
+      # storm-day uplink); BBR degrades roughly linearly so control-plane TCP
+      # keeps progressing. fq is BBR's pacing qdisc for interfaces without an
+      # explicit qdisc (the WAN iface carries cake, which paces itself).
+      net.core.default_qdisc = {{ egress_shaping_default_qdisc }}
+      net.ipv4.tcp_congestion_control = {{ egress_shaping_tcp_congestion_control }}
+  register: egress_bbr_sysctl
+  when: egress_shaping_enabled | bool and egress_shaping_bbr_enable | bool
+  tags: [egress-shaping, bbr]
+
+- name: egress-shaping | apply BBR sysctl now (ignore-unknown-key; never --system)
+  # `sysctl -e -p <file>` ignores unknown keys and keeps going — the JetPack 7
+  # Tegra kernel on Thor may not expose net.core.default_qdisc. NEVER run
+  # `sysctl --system` here: it re-applies every drop-in and fails on ANY absent
+  # key fleet-wide (the F-182 baseline discipline). Boot-time systemd-sysctl
+  # likewise tolerates missing keys.
+  ansible.builtin.command: sysctl -e -p "{{ egress_shaping_sysctl_path }}"
+  changed_when: false
+  failed_when: false
+  when: egress_bbr_sysctl is changed
+  tags: [egress-shaping, bbr]
+
+- name: egress-shaping | flush handlers so cake/marks are live before verify
+  ansible.builtin.meta: flush_handlers
+
+- name: egress-shaping | capture effective qdisc + congestion control (honest report)
+  ansible.builtin.shell: |
+    set -e
+    IFACE="$(ip -o route show default | awk '{print $5; exit}')"
+    echo "wan_iface=${IFACE}"
+    echo "qdisc=$(tc qdisc show dev "${IFACE}" | head -1)"
+    echo "tcp_congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '(key absent)')"
+    echo "default_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '(key absent)')"
+    echo "available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo '(key absent)')"
+  register: egress_verify
+  changed_when: false
+  failed_when: false
+  when: egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+- name: egress-shaping | report effective state
+  ansible.builtin.debug:
+    msg: >-
+      egress-shaping applied (cap {{ egress_shaping_bandwidth_mbit }}mbit):
+      {{ egress_verify.stdout_lines | default(['(no output)']) }}
+      — if tcp_congestion_control is not '{{ egress_shaping_tcp_congestion_control }}',
+      BBR is not available on this kernel; check available_cc and the canary gate.
+  when: egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+# ============================================================================
+# Disabled path — revert cleanly (toggle-off rollback per ADR 1081 L3)
+# ============================================================================
+- name: egress-shaping | stat teardown script (may pre-exist from a prior enable)
+  ansible.builtin.stat:
+    path: "{{ egress_shaping_teardown_path }}"
+  register: egress_teardown_stat
+  when: not egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+- name: egress-shaping | disable + stop the oneshot (runs ExecStop teardown)
+  ansible.builtin.systemd:
+    name: goat-egress-shaping.service
+    enabled: false
+    state: stopped
+    daemon_reload: true
+  failed_when: false
+  when: not egress_shaping_enabled | bool
+  tags: [egress-shaping]
+
+- name: egress-shaping | belt-and-braces teardown (revert qdisc + drop nft table)
+  ansible.builtin.command: "{{ egress_shaping_teardown_path }}"
+  changed_when: false
+  failed_when: false
+  when:
+    - not egress_shaping_enabled | bool
+    - egress_teardown_stat.stat.exists | default(false)
+  tags: [egress-shaping]
+
+- name: egress-shaping | remove installed artifacts when disabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/goat-egress-shaping.service
+    - "{{ egress_shaping_script_path }}"
+    - "{{ egress_shaping_teardown_path }}"
+    - "{{ egress_shaping_sysctl_path }}"
+    - /etc/modules-load.d/goat-bbr.conf
+  when: not egress_shaping_enabled | bool
+  notify: reload systemd
+  tags: [egress-shaping]

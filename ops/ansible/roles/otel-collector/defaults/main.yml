@@ -1,0 +1,52 @@
+---
+# defaults for ops/ansible/roles/otel-collector
+#
+# Anchor: ADR 0822 §"Topology" + design/observability-wide-events.md
+# §"Architecture" — OpenTelemetry Collector receives OTLP from goat
+# services and forwards to OpenObserve. v1 is single-instance on
+# Orin-C; ADR 0822 D1 (active-passive behind keepalived VIP) is
+# Block 27D's per-site shape.
+
+# -- Storage layout ----------------------------------------------------------
+otel_data_root: "/opt/docker-data/otel-collector"
+otel_compose_dir: "/opt/otel-collector"
+
+# Container UID. The official otel/opentelemetry-collector-contrib
+# Dockerfile pins `USER 10001` since v0.86. Verify with
+# `docker run --rm otel/opentelemetry-collector-contrib id -u`.
+otel_uid: 10001
+otel_gid: 10001
+
+# -- Image pin ---------------------------------------------------------------
+# Use the contrib distribution because we'll need community processors
+# (tail_sampling, resourcedetection) once 27C producer instrumentation
+# lands. Spike-time the core distribution would suffice; pinning to
+# contrib now avoids a swap later.
+otel_image: "otel/opentelemetry-collector-contrib:0.113.0"
+
+# -- Listen ports ------------------------------------------------------------
+# Standard OTLP gRPC + HTTP. Internal metrics on 8888.
+otel_otlp_grpc_port: 4317
+otel_otlp_http_port: 4318
+otel_metrics_port: 8888
+
+# -- Forward to OpenObserve --------------------------------------------------
+# Cross-compose-project comms via host.docker.internal. OpenObserve
+# accepts OTLP over its native HTTP API at /api/<org>/<stream>/_json
+# (organization=default, stream=default for v1). Rather than wire OTLP
+# directly we use the otlphttp exporter pointed at OpenObserve's OTLP
+# ingest endpoint at /api/default — supported since OO v0.10.x.
+#
+# v1 simplification: Collector authenticates with OpenObserve root
+# creds. Block 27D introduces a dedicated ingest-only token.
+otel_openobserve_endpoint: "http://host.docker.internal:5080/api/default"
+otel_openobserve_user: "{{ lookup('env', 'VEGA_C_OPENOBSERVE_ROOT_EMAIL') | default('', true) }}"
+otel_openobserve_pass: "{{ lookup('env', 'VEGA_C_OPENOBSERVE_ROOT_PASSWORD') | default('', true) }}"
+
+# -- Site identity (auto-stamped on every record) ---------------------------
+otel_site_id: "{{ site_id | mandatory }}"
+otel_site_role: "{{ site_role | default('observability') }}"
+
+# -- Healthcheck timing ------------------------------------------------------
+otel_health_retries: 30
+otel_health_delay_seconds: 2

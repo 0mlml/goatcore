@@ -1,0 +1,244 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the grant-keyd E1 key-distribution daemon on a mgmt-host (ZAGROS Thor).
+# docs/design/grant-keyed-encryption.md §8 (Option B). Identity = SPIRE SVID via
+# a spiffe-helper sidecar; the SVID is the daemon's mTLS client cert AND its
+# bundle signing key. Reversible via the deploy-rollback ledger (meta dep).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the {{ grant_keyd_zenoh_network }}.
+#   2. SPIRE registration entry for spiffe://{{ grant_keyd_trust_domain }}/{{ grant_keyd_spiffe_path }}
+#      applied (spire role, selector on the grant-keyd-spiffe-helper service),
+#      Subject CN = grant-keyd-trial-peer.
+#   3. The keys/** write-ACL carve to CN grant-keyd-trial-peer applied to the
+#      router (goat-zenoh config.json5.j2 subject `infra-keyd`) + router
+#      reloaded — else the bundle PUTs are silently denied.
+#   4. CA root present at {{ grant_keyd_ca_root_src }}.
+
+- name: grant-keyd | pre-flight CA root exists
+  ansible.builtin.stat:
+    path: "{{ grant_keyd_ca_root_src }}"
+  register: grant_keyd_ca_stat
+
+- name: grant-keyd | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      grant-keyd: router CA root missing at {{ grant_keyd_ca_root_src }} —
+      the zenoh-router isn't deployed on this host.
+  when: not (grant_keyd_ca_stat.stat.exists | default(false))
+
+# Portal token — the HOST is its source of truth.
+#
+# grant-keyd reads grant rows from the portal with a bearer token that must be
+# a key the portal accepts. It used to come from the deploying shell
+# (GRANT_KEYD_PORTAL_TOKEN) and to be accepted only because a matching
+# `grant-keyd:` entry sat in the portal's PORTAL_OPERATOR_API_KEYS — also a
+# deploying-shell variable. Two laptop variables had to agree, and nothing held
+# them together: an unset GRANT_KEYD_PORTAL_TOKEN rendered an empty
+# token and crash-looped the daemon; a portal redeploy with an
+# empty PORTAL_OPERATOR_API_KEYS revoked the key and every sweep 401'd for three
+# days.
+#
+# Now: the token is resolved on the host (an explicit GRANT_KEYD_PORTAL_TOKEN
+# wins; else the key already registered in the portal's service-key directory;
+# else the one in the running config; else a new random one), registered in the
+# portal's on-host key directory, which survives any portal redeploy, and then
+# proven against the endpoint the daemon actually calls before the play succeeds.
+- name: grant-keyd | resolve the portal token on the host
+  ansible.builtin.shell: |
+    set -o pipefail
+    if [ -n "${GK_ENV_TOKEN}" ]; then printf '%s' "${GK_ENV_TOKEN}"; exit 0; fi
+    f="{{ grant_keyd_portal_keystore_dir }}/{{ grant_keyd_portal_key_id }}.key"
+    if [ -s "$f" ]; then sed -n 's/^{{ grant_keyd_portal_key_id }}://p' "$f" | head -1 | tr -d '\n'; exit 0; fi
+    c="{{ grant_keyd_compose_dir }}/config.json"
+    if [ -s "$c" ]; then
+      t=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("portal_token") or "")' "$c")
+      if [ -n "$t" ]; then printf '%s' "$t"; exit 0; fi
+    fi
+    openssl rand -hex 24
+  args:
+    executable: /bin/bash
+  environment:
+    GK_ENV_TOKEN: "{{ grant_keyd_portal_token_override }}"
+  register: grant_keyd_token_resolved
+  changed_when: false
+  no_log: true
+  become: true
+  when: (grant_keyd_portal_url | default('', true) | trim) | length > 0
+
+- name: grant-keyd | use the host-resolved portal token
+  ansible.builtin.set_fact:
+    grant_keyd_portal_token: "{{ grant_keyd_token_resolved.stdout | trim }}"
+  no_log: true
+  when: (grant_keyd_portal_url | default('', true) | trim) | length > 0
+
+- name: grant-keyd | refuse an empty portal token
+  ansible.builtin.assert:
+    that: (grant_keyd_portal_token | default('') | length) >= 32
+    fail_msg: >-
+      grant-keyd: could not resolve a portal token on the host. Refusing rather
+      than rendering a config the daemon rejects.
+    quiet: true
+  when: (grant_keyd_portal_url | default('', true) | trim) | length > 0
+
+- name: grant-keyd | register the token in the portal's service-key directory
+  # Same place and shape as the other service keys (onboard-runner, flashlight,
+  # panoscope …). The portal re-reads this directory every 30s, so no portal
+  # restart, and no portal redeploy from any laptop can drop it.
+  ansible.builtin.copy:
+    content: "{{ grant_keyd_portal_key_id }}:{{ grant_keyd_portal_token }}\n"
+    dest: "{{ grant_keyd_portal_keystore_dir }}/{{ grant_keyd_portal_key_id }}.key"
+    owner: "65532"
+    group: "65532"
+    mode: "0640"
+  no_log: true
+  become: true
+  when: (grant_keyd_portal_url | default('', true) | trim) | length > 0
+
+- name: grant-keyd | ensure compose + members dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ grant_keyd_compose_dir }}"
+
+- name: grant-keyd | svid + members dirs owned by the daemon UID
+  # The helper (this UID) writes the SVID; the daemon (same UID) reads it and
+  # the member certs. Owning by the daemon UID lets the 0600 SVID key be read
+  # without ever being world-readable.
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ grant_keyd_spire_uid }}"
+    group: "{{ grant_keyd_spire_uid }}"
+    mode: "0750"
+  loop:
+    - "{{ grant_keyd_svid_dir }}"
+    - "{{ grant_keyd_members_dir }}"
+
+- name: grant-keyd | render spiffe-helper.conf
+  ansible.builtin.template:
+    src: spiffe-helper.conf.j2
+    dest: "{{ grant_keyd_compose_dir }}/spiffe-helper.conf"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: grant-keyd | render config.json
+  ansible.builtin.template:
+    src: config.json.j2
+    dest: "{{ grant_keyd_compose_dir }}/config.json"
+    owner: "{{ grant_keyd_spire_uid }}"
+    group: "{{ grant_keyd_spire_uid }}"
+    mode: "0640"
+
+- name: grant-keyd | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ grant_keyd_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: grant-keyd | log the host in to GHCR (the package is private)
+  community.docker.docker_login:
+    registry_url: ghcr.io
+    username: "{{ ghcr_login_user | default('goat-deploy') }}"
+    password: "{{ lookup('env', 'GHCR_READ_TOKEN') }}"
+  become: true
+  when:
+    - grant_keyd_image is match('ghcr\\.io/')
+    - (lookup('env', 'GHCR_READ_TOKEN') | default('')) | length > 0
+  no_log: true
+
+- name: grant-keyd | pull images
+  ansible.builtin.command:
+    cmd: "docker compose pull --ignore-pull-failures"
+    chdir: "{{ grant_keyd_compose_dir }}"
+  changed_when: true
+
+# Phase 1: start the spiffe-helper first so the SVID exists before grant-keyd
+# (and the self-member staging) needs it.
+- name: grant-keyd | start the spiffe-helper sidecar
+  ansible.builtin.command:
+    cmd: "docker compose up -d grant-keyd-spiffe-helper"
+    chdir: "{{ grant_keyd_compose_dir }}"
+  changed_when: true
+
+- name: grant-keyd | wait for the SVID to be written
+  ansible.builtin.stat:
+    path: "{{ grant_keyd_svid_dir }}/grant-keyd-cert.pem"
+  register: grant_keyd_svid_stat
+  until: grant_keyd_svid_stat.stat.exists | default(false)
+  retries: 20
+  delay: 3
+
+# Self-member smoke test: stage the daemon's own SVID cert as a member so it
+# wraps the DEK to its own key and the fired bundle can be opened with the SVID
+# private key — a self-contained live proof.
+- name: grant-keyd | stage the self-member SVID (smoke test)
+  ansible.builtin.copy:
+    src: "{{ grant_keyd_svid_dir }}/grant-keyd-cert.pem"
+    dest: "{{ grant_keyd_members_dir }}/{{ grant_keyd_spiffe_path }}.pem"
+    remote_src: true
+    owner: "{{ grant_keyd_spire_uid }}"
+    group: "{{ grant_keyd_spire_uid }}"
+    mode: "0640"
+  when: grant_keyd_self_member | bool
+
+# Phase 2: bring up grant-keyd (and refresh the project).
+- name: grant-keyd | bring up grant-keyd
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ grant_keyd_compose_dir }}"
+  register: grant_keyd_up
+  changed_when:
+    - "'Started' in grant_keyd_up.stderr or 'Created' in grant_keyd_up.stderr or 'Recreated' in grant_keyd_up.stderr"
+
+- name: grant-keyd | container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ grant_keyd_compose_dir }}"
+  register: grant_keyd_ps
+  changed_when: false
+
+- name: grant-keyd | show
+  ansible.builtin.debug:
+    msg: "{{ grant_keyd_ps.stdout_lines }}"
+
+# Prove it, on the endpoint the daemon calls every sweep. A keyd whose portal
+# token is refused starts, stays healthy and distributes nothing, so
+# the deploy is not a success until the portal answers 200. Asked through the
+# host's own Traefik (SNI pinned to 127.0.0.1) so no DNS or relay is involved.
+- name: grant-keyd | prove the portal accepts the token for release-sets
+  ansible.builtin.shell: |
+    curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+      --resolve "{{ grant_keyd_portal_public_host }}:443:127.0.0.1" \
+      -H "Authorization: Bearer ${GK_TOKEN}" \
+      "https://{{ grant_keyd_portal_public_host }}/api/access/release-sets"
+  environment:
+    GK_TOKEN: "{{ grant_keyd_portal_token }}"
+  register: grant_keyd_portal_probe
+  until: grant_keyd_portal_probe.stdout == '200'
+  retries: 12
+  delay: 5
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: (grant_keyd_portal_url | default('', true) | trim) | length > 0
+
+- name: grant-keyd | fail the deploy if the portal refuses the token
+  ansible.builtin.fail:
+    msg: >-
+      grant-keyd: the portal answered {{ grant_keyd_portal_probe.stdout | default('nothing') }}
+      (not 200) to GET /api/access/release-sets with grant-keyd's token after 60s.
+      The daemon would run and distribute no keys. Check
+      {{ grant_keyd_portal_keystore_dir }}/{{ grant_keyd_portal_key_id }}.key and
+      the portal log line "operator keys changed".
+  when:
+    - (grant_keyd_portal_url | default('', true) | trim) | length > 0
+    - grant_keyd_portal_probe.stdout | default('') != '200'

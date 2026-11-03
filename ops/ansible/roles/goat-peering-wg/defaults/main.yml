@@ -1,0 +1,71 @@
+---
+# Defaults for `goat-peering-wg` — the WireGuard link for a cross-sovereign peering.
+#
+# Design:  docs/design/cross-sovereign-peering-transport.md
+# Waiver:  docs/compliance/waivers/wireguard-fips-validation.md (DBB-WVR-001)
+# Sibling: roles/goat-peering-edge, the same step for ipsec-fips
+#
+# One point-to-point tunnel between two edge hosts on neither side's mesh. Its
+# link values are the agreement's, rendered by `goat federate apply` into
+# federation-<them>-transport.yml. The far key and endpoint are the counterparty
+# package's transport_offer. Nothing below that is agreed is typed here.
+
+# Off by default. Nothing in this role runs on a host that has not declared it.
+peering_wg_enabled: false
+
+# The interface `[transport] interface` names in federation.toml. `goat federate init`
+# reads its key from here, so the two have to be the same string. <= 15 chars (IFNAMSIZ).
+peering_wg_interface: wg-fed0
+peering_wg_listen_port: 51820
+
+# --- from the agreement, through federation-<them>-transport.yml -------------
+peering_wg_kind: "{{ goat_peering_transport_kind | default('') }}"
+peering_wg_our_sovereign: "{{ goat_peering_our_sovereign | default('') }}"
+peering_wg_partner_sovereign: "{{ goat_peering_partner_sovereign | default('') }}"
+peering_wg_local_link_ip: "{{ goat_peering_local_link_ip | default('') }}"
+peering_wg_remote_link_ip: "{{ goat_peering_remote_link_ip | default('') }}"
+peering_wg_link_prefix_len: "{{ goat_peering_link_prefix_len | default(31) }}"
+peering_wg_mtu: "{{ goat_peering_mtu | default(1380) }}"
+peering_wg_we_listen: "{{ goat_peering_we_listen | default(false) }}"
+
+# --- from the counterparty package ------------------------------------------
+# The file phase 5 placed. Read on the machine running the driver.
+peering_wg_counterparty_package: "{{ fed_counterparty | default('') }}"
+
+# The side that dials keeps the path open from behind NAT.
+peering_wg_keepalive: 25
+
+# --- what crosses -----------------------------------------------------------
+# Inbound on the tunnel, and outbound onto it: the fabric port and these, TCP.
+# Bootstrap step 2 of the transport design: "the only port reachable across it is
+# the far edge's fabric port". A SPIRE bundle endpoint is the one addition the design
+# names, and goat-peering-spire refuses unless its port is listed here.
+peering_wg_fabric_port: "{{ goat_zenoh_edge_listen_port | default(7448) }}"
+peering_wg_extra_ports: []
+
+# Clamp TCP MSS to the path through this interface. The edge router runs in a compose
+# network, so its session is FORWARDED onto the link, and a kernel that originates
+# nothing derives no MSS from this interface's MTU. Large samples would fragment or
+# vanish while small ones work.
+peering_wg_clamp_mss: true
+
+# --- FIPS posture -----------------------------------------------------------
+# WireGuard's primitives are not FIPS-approved, so this role can never make the
+# claim: `claimed` is false on every host. The claim sits in the Zenoh TLS session
+# inside the tunnel (cross-sovereign-federation.md §5.1). Three outcomes:
+#   required, reason set    proceed-waived    recorded, with a deviation banner
+#   required, reason empty  refuse            having written the observations first
+#   not required            proceed-no-claim  recorded
+peering_wg_fips_required: true
+peering_wg_fips_waived_reason: ""
+
+peering_wg_packages:
+  - wireguard-tools
+  - nftables
+
+peering_wg_config_dir: /etc/goat-peering-wg
+peering_wg_key_path: "{{ peering_wg_config_dir }}/{{ peering_wg_interface }}.key"
+peering_wg_env_path: "{{ peering_wg_config_dir }}/{{ peering_wg_interface }}.env"
+peering_wg_nft_path: "{{ peering_wg_config_dir }}/{{ peering_wg_interface }}.nft"
+peering_wg_service: "goat-peering-wg@{{ peering_wg_interface }}.service"
+peering_wg_state_path: "/var/log/goat-peering-wg-{{ peering_wg_interface }}-state.json"

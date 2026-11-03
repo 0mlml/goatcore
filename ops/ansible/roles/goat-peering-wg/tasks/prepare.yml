@@ -1,0 +1,86 @@
+---
+# Phase 2. The interface and its key, with no address and no peer. Idempotent, and
+# it never rotates a key: the public half is in a signed package by the next phase.
+- name: peering-wg | skip unless this host declared a WireGuard peering edge
+  ansible.builtin.meta: end_host
+  when: not (peering_wg_enabled | bool)
+
+- name: peering-wg | the interface name fits IFNAMSIZ
+  ansible.builtin.assert:
+    that:
+      - peering_wg_interface | length > 0
+      - peering_wg_interface | length <= 15
+      - peering_wg_interface is match('^[a-zA-Z0-9_-]+$')
+    fail_msg: "peering_wg_interface must be 1-15 chars of a-zA-Z0-9_-; got {{ peering_wg_interface }}"
+
+- name: peering-wg | install WireGuard and nftables
+  ansible.builtin.apt:
+    name: "{{ peering_wg_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: peering-wg | config directory
+  ansible.builtin.file:
+    path: "{{ peering_wg_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# The private key is made here and never leaves this host. Only the public half
+# crosses, inside the signed package.
+- name: peering-wg | make the private key if there is none
+  ansible.builtin.shell:
+    cmd: "umask 077; wg genkey > {{ peering_wg_key_path }}"
+    creates: "{{ peering_wg_key_path }}"
+
+- name: peering-wg | link script
+  ansible.builtin.template:
+    src: goat-peering-wg-link.sh.j2
+    dest: /usr/local/sbin/goat-peering-wg-link
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: peering-wg | link service
+  ansible.builtin.template:
+    src: goat-peering-wg@.service.j2
+    dest: /etc/systemd/system/goat-peering-wg@.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart goat peering wg
+
+# force: false, because phase 11 writes the full file and a re-run of this phase
+# must not take the address and the peer away.
+- name: peering-wg | link environment, interface only until the agreement says more
+  ansible.builtin.copy:
+    dest: "{{ peering_wg_env_path }}"
+    force: false
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      WG_IFNAME={{ peering_wg_interface }}
+      WG_KEY_FILE={{ peering_wg_key_path }}
+      WG_LISTEN_PORT={{ peering_wg_listen_port }}
+
+- name: peering-wg | bring the interface up
+  ansible.builtin.systemd:
+    name: "{{ peering_wg_service }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: peering-wg | flush handlers so the checks below see this run's service
+  ansible.builtin.meta: flush_handlers
+
+- name: peering-wg | the interface answers with a public key
+  ansible.builtin.command: "wg show {{ peering_wg_interface }} public-key"
+  register: _pw_public
+  changed_when: false
+
+- name: peering-wg | say what init will read
+  ansible.builtin.debug:
+    msg: "{{ peering_wg_interface }} holds {{ _pw_public.stdout }}; no address and no peer until phase 11."

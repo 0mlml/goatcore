@@ -1,0 +1,113 @@
+---
+# machine-provenance-guard — scheduled run of the mint-provenance audit
+# (ADR 1130). Conforms to the contract in
+# docs/design/live-state-guard-scheduling.md §4; sibling role is
+# mesh-membership-reconcile, and the two are folded at a third guard, not before.
+#
+# What it audits: every peer holding a gear-class group is joined to the portal
+# machine registry (`peer name == system_handle`) and graded aligned /
+# pending-reconcile / violation / unknown. A violation is a peer wearing a gear
+# class with no custody edge — i.e. one that did not come through the mint.
+#
+# Why it is a background process rather than a hand-run check: a guard nobody
+# runs is indistinguishable from no guard, and a machine that skipped the mint
+# goes undetected until someone stumbles on it.
+
+# Master gate. false = full TEARDOWN (units, script, env, allowlist and the
+# stale metric), never "skip the install tasks". A role that only skips leaves a
+# timer running on a host with nothing in the repo admitting it exists.
+machine_provenance_guard_enabled: true
+
+# --- credentials: TWO planes, and both are required --------------------------
+# This guard is the reason the shared-runner proposal was withdrawn: it joins
+# live mesh membership to the portal registry, so one token field is not enough.
+
+# NetBird management API for THIS goatnet.
+machine_provenance_guard_nb_api_url: ""
+
+# NetBird PAT. MUST be a dedicated service user, not a human's and not shared
+# with netvis/microscope, so it is revocable on its own and its reads are
+# attributable. Necessarily `role: admin` — NetBird has no read-only role that
+# can list what this needs. A dedicated credential scopes revocation and
+# restores attribution; it is NOT least privilege, and nobody should read
+# "service user" as containment.
+machine_provenance_guard_nb_token: ""
+
+# The goatnet's own portal. MESH-INTERNAL — this is the leg that makes a
+# GitHub-hosted runner structurally unable to run this guard.
+machine_provenance_guard_portal_url: ""
+
+# Portal operator key. A SERVICE key, minted and registered in the portal's
+# hot-reload key directory by ops/scripts/create-provenance-guard-identity.sh —
+# never a per-person op_ key, because an audit that stops when somebody
+# offboards is not an audit, and never as a playbook side effect.
+machine_provenance_guard_portal_key: ""
+
+# --- posture -----------------------------------------------------------------
+# Fail the unit on violations. TRUE only where the fleet is backfilled. Elsewhere the guard
+# still runs, still reports and still alarms on an unreadable source — it just
+# does not treat standing debt as a regression, per the contract's
+# "never fail on a backlog".
+machine_provenance_guard_enforce: false
+
+# Break-glass / offline-bundle peers that legitimately have no custody edge YET.
+# Rendered from here to the host; NEVER hand-edited on the box, because an
+# exception list living on one machine is invisible to review and this guard's
+# whole value is that exceptions are visible for exactly as long as they are
+# real. Each entry states why and when it is expected to clear.
+#   - name: some-peer-name
+#     why: issued from an offline bundle at a site standup
+#     clear_by: ""
+machine_provenance_guard_reconcile_allowlist: []
+
+# --- schedule ----------------------------------------------------------------
+# Hourly. A side door open for at most an hour is categorically different from
+# Hourly. A side door open for at most an hour is categorically different from
+# one open for days. Five minutes would buy detection latency nobody needs
+# Offset from the sibling audit's 06:41 and from the host's other timers.
+machine_provenance_guard_oncalendar: "*-*-* *:17:00"
+
+# Spread over five minutes — the contract's floor. The mgmt host runs several
+# timers; landing on the same second is how unrelated jobs end up in each
+# other's incident timelines.
+machine_provenance_guard_jitter_sec: 300
+
+# Hard ceiling on one run. A handful of HTTP GETs; a hung unit holding a systemd
+# job slot is worse than a failed one.
+machine_provenance_guard_timeout_sec: 180
+
+# --- where things land -------------------------------------------------------
+# node_exporter textfile-collector directory. EMPTY BY DEFAULT, DELIBERATELY.
+#
+# node_exporter's textfile directory differs per host. It may run containerised
+# reading /opt/<site_id>-obs/expected-vendors/textfile, while the obvious-looking
+# /var/lib/node_exporter/textfile also exists, is writable, and is read by
+# NOTHING, so a .prom file dropped there is invisible.
+# An alert on a metric that never arrives never fires and looks exactly like all-clear.
+#
+# A wrong path fails silently forever; an unset one fails once, loudly, at
+# deploy time. Find the real value with:
+#   ps -o args= -C node_exporter | tr ' ' '\n' | grep textfile.directory
+# and then confirm the SERIES IS IN PROMETHEUS, not merely that a file is on disk.
+machine_provenance_guard_textfile_dir: ""
+
+# Human-readable last run. Evidence, not state — teardown leaves it behind.
+machine_provenance_guard_report_dir: /var/lib/goat/machine-provenance-guard
+
+# Where the check and its taxonomy are installed. The check resolves its own
+# REPO_ROOT as `dirname($0)/../..` and then reads ops/ansible/netbird_acl_taxonomy.yml
+# beneath it, so the layout under this prefix must mirror the repo or the script
+# fails looking for a taxonomy beside a copy of itself. Same class of bug as
+# testing a copied script that resolves paths relative to its own location.
+machine_provenance_guard_lib_dir: /usr/local/lib/goat/provenance-guard
+
+# Prometheus rules go here IF the directory exists; a goatnet without a local
+# Prometheus still gets the audit, the report and the journal, and is told it
+# has nothing to alert with. Rules ship from the ROLE, not the shared obs tree,
+# so the absent() alert exists only where the timer does — in the shared tree it
+# would fire forever on every goatnet that has not deployed this.
+machine_provenance_guard_rules_dir: "/opt/{{ site_id }}-obs/prometheus/rules"
+
+# Run once inline at deploy, with somebody watching, rather than discovering at
+# :17 unattended that a credential was wrong.
+machine_provenance_guard_run_now: true

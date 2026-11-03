@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Rendered by ops/ansible/roles/docker-registry-mirror on {{ ansible_date_time.iso8601 }}.
+#
+# Emit per-upstream cache metrics to node_exporter's textfile collector.
+
+set -euo pipefail
+
+TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+OUT="$TEXTFILE_DIR/docker-registry-mirror.prom"
+
+mkdir -p "$TEXTFILE_DIR"
+TMP=$(mktemp "$OUT.XXXXXX")
+
+{
+  echo "# HELP docker_registry_mirror_cache_size_bytes Bytes in upstream cache."
+  echo "# TYPE docker_registry_mirror_cache_size_bytes gauge"
+  echo "# HELP docker_registry_mirror_container_running 1 if the per-upstream registry container is running."
+  echo "# TYPE docker_registry_mirror_container_running gauge"
+{% for item in docker_registry_mirror_upstreams %}
+  size=$(du -sb "{{ docker_registry_mirror_storage_root }}/{{ item.name }}" 2>/dev/null | awk '{print $1}' || echo 0)
+  echo "docker_registry_mirror_cache_size_bytes{upstream=\"{{ item.name }}\"} ${size}"
+  if docker ps --filter "name=registry-{{ item.name }}" --filter "status=running" --format '{% raw %}{{.Names}}{% endraw %}' | grep -q "^registry-{{ item.name }}$"; then
+    echo "docker_registry_mirror_container_running{upstream=\"{{ item.name }}\"} 1"
+  else
+    echo "docker_registry_mirror_container_running{upstream=\"{{ item.name }}\"} 0"
+  fi
+{% endfor %}
+} > "$TMP"
+
+mv "$TMP" "$OUT"
+chmod 0644 "$OUT"

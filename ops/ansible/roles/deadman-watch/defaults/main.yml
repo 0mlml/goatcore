@@ -1,0 +1,59 @@
+---
+# defaults for ops/ansible/roles/deadman-watch
+#
+# The external half of the dead-man's switch. The obs host's
+# Alertmanager sends the always-firing `Watchdog` alert here on a short interval;
+# this host notices when it STOPS and pages PagerDuty directly.
+#
+# PLACEMENT IS THE WHOLE POINT: this must NOT run on the host it watches. An obs
+# stack cannot witness its own death. Deploy it to a mgmt host — a different
+# physical machine, reachable over the mesh, with its own internet egress.
+#
+# COVERAGE. A same-site watcher catches the obs host dying. It does NOT catch
+# the whole site losing
+# power or connectivity, because it dies too. Closing that needs a watcher in a
+# different failure domain entirely; the relays cannot host one without opening a
+# new public listener (they are TLS-passthrough L4 only and are never mesh
+# peers), so the genuinely independent option is a third-party absence-detector.
+# This is strictly better than nothing and explicitly not everything.
+
+deadman_watch_enabled: false
+
+deadman_watch_user: deadman
+deadman_watch_state_dir: /var/lib/deadman-watch
+deadman_watch_install_dir: /opt/deadman-watch
+
+# Listener. Binds the mesh IP, not 0.0.0.0 — the only client is the obs host's
+# Alertmanager, over the mesh. Requires net.ipv4.ip_nonlocal_bind=1 so it can
+# bind before netbird assigns wt0 at boot.
+deadman_watch_listen_addr: "{{ mesh_ip_a | default('127.0.0.1') }}"
+deadman_watch_listen_port: 9099
+
+# Staleness that counts as death. Must be comfortably longer than the sender's
+# repeat_interval (1m by default) or ordinary jitter reads as a dead pipeline.
+# 5m against a 1m heartbeat tolerates four consecutive misses.
+deadman_watch_threshold_seconds: 300
+# Obs hosts this watcher judges ONE BY ONE. Each posts its Watchdog to
+# http://<listen>:<port>/<its inventory_hostname> and is paged on separately.
+# Empty = legacy single shared timestamp, where any one live sender keeps the
+# switch green for every other sender, so a dead obs host hides behind a live
+# one's heartbeat. List every obs host that points
+# its deadman_webhook_url here; ops/ci/check-deadman-sources.py enforces it.
+deadman_watch_expected_sources: []
+
+# How often to evaluate. Finer than the threshold so detection latency is bounded
+# by the threshold rather than by the polling gap.
+deadman_watch_check_interval: "1min"
+
+# Shared secret the obs host presents. Defence in depth behind the mesh: a
+# spoofable heartbeat would let any peer mask the obs host dying.
+deadman_watch_token: "{{ lookup('env', 'DEADMAN_WATCH_TOKEN') | default('', true) }}"
+
+# PagerDuty Events API v2 integration key. Paged DIRECTLY — never through the
+# Alertmanager being watched, which is unavailable precisely when this fires.
+# Routing key + endpoint MUST be a matching pair. An EU-hosted PagerDuty account
+# rejects (or silently misfiles) events sent to the US endpoint, and vice versa.
+# Same precedence ops/monitoring/net-health/alert-eval.py uses — EU key first,
+# because a goatnet with an EU key set is an EU goatnet.
+deadman_watch_routing_key: "{{ lookup('env', 'PAGERDUTY_INTEGRATION_KEY_EU') | default(lookup('env', 'PAGERDUTY_INTEGRATION_KEY'), true) | default('', true) }}"
+deadman_watch_events_url: "{{ lookup('env', 'PAGERDUTY_EVENTS_URL') | default('https://events.pagerduty.com/v2/enqueue', true) }}"

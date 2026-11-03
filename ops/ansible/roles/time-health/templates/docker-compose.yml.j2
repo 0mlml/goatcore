@@ -1,0 +1,42 @@
+# {{ ansible_managed }}
+#
+# goat-time-health roll-up for {{ time_health_site }}. Rendered by
+# ops/ansible/roles/time-health/ (ADR 1036/1037, F-184). One container, mTLS
+# Zenoh client peer of the router: subscribes ops/time/attest/** and publishes
+# ops/time/health/{{ time_health_site }}. Persists nothing — no secrets, no .env.
+
+services:
+  time-health:
+    image: {{ time_health_image }}
+    container_name: time-health
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      # Reaches the router over the zenoh compose network.
+      - zenoh
+    environment:
+      TIME_HEALTH_ENDPOINT: "{{ time_health_zenoh_endpoint }}"
+      TIME_HEALTH_SITE: "{{ time_health_site }}"
+      TIME_HEALTH_INTERVAL_MS: "{{ time_health_interval_ms }}"
+      TIME_HEALTH_STALE_AFTER_MS: "{{ time_health_stale_after_ms }}"
+      RUST_LOG: "{{ time_health_rust_log }}"
+{% if time_health_zenoh_endpoint.startswith('tls/') %}
+      TIME_HEALTH_CERT: "/certs/time-health-cert.pem"
+      TIME_HEALTH_KEY_FILE: "/certs/time-health-key.pem"
+      TIME_HEALTH_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+{% if time_health_zenoh_endpoint.startswith('tls/') %}
+    volumes:
+      - "{{ time_health_cert_dir }}:/certs:ro"
+      - "{{ time_health_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+
+networks:
+  zenoh:
+    name: {{ time_health_zenoh_network }}
+    external: true

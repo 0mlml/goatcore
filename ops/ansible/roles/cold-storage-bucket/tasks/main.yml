@@ -1,0 +1,92 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Provisions a cold-storage bucket on a MinIO instance, with Object
+# Lock + default retention. Idempotent: re-running checks bucket
+# exists + Object Lock is configured as declared; does NOT delete
+# data or relax retention if those drift from the declared shape.
+#
+# Pairs with ops/scripts/offload-to-cold.sh which performs the actual
+# `mc mirror` + manifest emit. This role just creates the empty
+# locked-and-ready bucket.
+
+- name: cold-storage | preflight — dataset_id is set
+  ansible.builtin.assert:
+    that:
+      - "cold_storage_dataset_id | length > 0"
+      - "cold_storage_bucket_name | length > 0"
+    fail_msg: >-
+      cold_storage_dataset_id must be set. Pass with:
+        -e cold_storage_dataset_id=<dataset-id>
+      e.g. cold_storage_dataset_id=nova-1.0
+
+- name: cold-storage | preflight — Object Lock mode is recognized
+  ansible.builtin.assert:
+    that:
+      - "cold_storage_object_lock in ['COMPLIANCE', 'GOVERNANCE']"
+    fail_msg: >-
+      cold_storage_object_lock must be COMPLIANCE or GOVERNANCE.
+      Got: {{ cold_storage_object_lock }}
+
+- name: cold-storage | preflight — minio container exists + running
+  ansible.builtin.command:
+    cmd: "docker inspect -f {{ '{{.State.Status}}' | quote }} {{ cold_storage_minio_container | quote }}"
+  register: cold_storage_minio_state
+  changed_when: false
+  become: true
+  failed_when: cold_storage_minio_state.rc != 0 or 'running' not in cold_storage_minio_state.stdout
+
+- name: cold-storage | check if bucket already exists
+  ansible.builtin.command:
+    cmd: >-
+      docker exec {{ cold_storage_minio_container | quote }} mc ls
+      {{ cold_storage_target_alias }}/{{ cold_storage_bucket_name }}
+  register: cold_storage_bucket_check
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: cold-storage | create bucket with Object Lock (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec {{ cold_storage_minio_container | quote }} mc mb --with-lock
+      {{ cold_storage_target_alias }}/{{ cold_storage_bucket_name }}
+  when: cold_storage_bucket_check.rc != 0
+  register: cold_storage_bucket_create
+  changed_when: cold_storage_bucket_create.rc == 0
+  become: true
+
+# Set bucket-default retention. This applies to objects PUT without an
+# explicit per-object retention; `mc mirror --preserve` carries source
+# retention through, so the bucket default is a fallback floor.
+- name: cold-storage | set bucket default retention
+  ansible.builtin.command:
+    cmd: >-
+      docker exec {{ cold_storage_minio_container | quote }} mc retention set --default
+      {{ cold_storage_object_lock }} {{ cold_storage_retention_days }}d
+      {{ cold_storage_target_alias }}/{{ cold_storage_bucket_name }}
+  register: cold_storage_set_retention
+  changed_when: cold_storage_set_retention.rc == 0
+  failed_when: cold_storage_set_retention.rc != 0
+  become: true
+
+- name: cold-storage | apply bucket tags (operator + description)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec {{ cold_storage_minio_container | quote }} mc tag set
+      {{ cold_storage_target_alias }}/{{ cold_storage_bucket_name }}
+      "dataset_id={{ cold_storage_dataset_id }}&object_lock={{ cold_storage_object_lock }}&retention_days={{ cold_storage_retention_days }}{% if cold_storage_operator %}&operator={{ cold_storage_operator }}{% endif %}{% if cold_storage_description %}&description={{ cold_storage_description | regex_replace(' ', '_') }}{% endif %}"
+  register: cold_storage_tag_apply
+  changed_when: cold_storage_tag_apply.rc == 0
+  become: true
+
+- name: cold-storage | confirm bucket ready
+  ansible.builtin.debug:
+    msg: |
+      Cold-storage bucket ready:
+        bucket:       {{ cold_storage_target_alias }}/{{ cold_storage_bucket_name }}
+        lock-mode:    {{ cold_storage_object_lock }}
+        retention:    {{ cold_storage_retention_days }} days (bucket default)
+        dataset_id:   {{ cold_storage_dataset_id }}
+      Next: run ops/scripts/offload-to-cold.sh to mirror source bucket
+      into this bucket and emit the dataset manifest.

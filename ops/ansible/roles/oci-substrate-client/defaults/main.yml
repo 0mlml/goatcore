@@ -1,0 +1,54 @@
+---
+# ops/ansible/roles/oci-substrate-client/defaults/main.yml
+#
+# Client-side wiring for the OCI image distribution substrate per
+# ADR 0838 + docs/design/oci-goat-substrate.md §5. Configures docker
+# daemon (and future containerd) to route image pulls through the
+# tier ladder: T2 Orin-C local cache (preferred) → T1 R2/ECR (fallback)
+# → T0 upstream (last resort).
+#
+# Applied to: every consumer host that pulls images for compose stacks
+# (mgmt-host pair Orin-A/B, future single-Orin sites).
+#
+# Today's scope: T2-only mode. T1 (R2 + ECR) wiring lands
+# when those tiers are stood up. Trust anchors land with first cosign
+# verify gate.
+
+# T2 — per-site Orin-C cache endpoint. Site-resolved at run time via
+# group_vars/<site>_hosts/vars.yml. Empty default = role no-ops on
+# hosts that don't have a per-site Orin-C (single-Orin sites today).
+oci_substrate_t2_endpoint: ""   # e.g. "192.168.1.253:3030"
+
+# Forgejo OCI registry on Orin-C is HTTP-only on :3030 today (no
+# internal-CA-issued cert yet for Forgejo's port). Adding the endpoint
+# to docker's insecure-registries list lets docker push/pull over HTTP.
+# When the internal-CA cert lands (per ADR 0407), this flips to false
+# and the role drops the trust-anchor file under /etc/docker/certs.d/
+# instead.
+oci_substrate_t2_insecure_http: true
+
+# Mirrors for upstream registries on Orin-C (registry:2 pull-through
+# instances per Block 71 docker-registry-mirror role). Each maps an
+# upstream to a local port on Orin-C.
+#
+# Today's role config only enables docker's docker.io registry-mirror;
+# multi-upstream client-side mirror redirection requires containerd
+# hosts.toml (which docker-daemon does not consume). Listed here for
+# completeness / future Quadlet adoption per Block 16.
+oci_substrate_t2_mirrors:
+  docker_io: 5000   # docker.io upstream → Orin-C registry:2 pull-through
+  ghcr_io: 5001     # ghcr.io upstream
+  quay_io: 5002     # quay.io upstream
+  cgr_dev: 5003     # cgr.dev (Chainguard) upstream
+  nvcr_io: 5004     # nvcr.io (NVIDIA NGC) upstream
+  canonical: 5005   # registry.canonical.com upstream
+
+# Whether to add Orin-C's docker.io registry-mirror to docker daemon
+# config (`registry-mirrors` entry). Useful only when the host pulls
+# from docker.io upstream often enough to warrant the indirection.
+oci_substrate_enable_dockerio_mirror: false
+
+# Whether to drop the containerd hosts.toml config (for future Quadlet
+# adoption per Block 16). Off by default until containerd is the
+# client.
+oci_substrate_enable_containerd_hosts_toml: false

@@ -1,0 +1,297 @@
+---
+# defaults for ops/ansible/roles/obs-host
+#
+# Anchor: ADR 0826 — per-site three-Orin topology (mgmt-A + mgmt-B + obs-C).
+# Decision: observability + storage (Prom / Alertmanager / Grafana /
+# OpenObserve / MinIO / OTel Collector) live on Orin-C, NOT co-located on
+# the mgmt-host pair. This role brings up the Phase 1 subset (Prom +
+# Alertmanager + Grafana + node_exporter); Phase 2 (OpenObserve + MinIO +
+# OTel Collector — Block 17D + Block 27) is a follow-on.
+#
+# Companion to ops/ansible/roles/observability (the legacy single-host
+# pattern). Don't merge these — they have different scrape-target shapes.
+
+# Storage layout on the host's NVMe (mounted at /opt/docker-data per ADR 0826).
+obs_data_root: "/opt/docker-data/observability"
+
+# Compose project layout. Distinct from /opt/mgmt-host because Orin-C does
+# NOT run the mgmt-host stack (no postgres / signal / management / traefik).
+obs_compose_dir: "/opt/obs-host"
+
+# Image pins — production sites override per-host or per-group. Defaults
+# below are tag-only fallbacks; pin to digests in group_vars.
+prometheus_image:    "prom/prometheus:v2.55.0"
+alertmanager_image:  "prom/alertmanager:v0.27.0"
+grafana_image:       "grafana/grafana:11.3.0"
+node_exporter_image: "prom/node-exporter:v1.8.2"
+
+# --- Storage tier: WHAT DISK IS UNDER THIS OBS HOST ------------------------
+# `nvme`  — dedicated NVMe (the ADR 0826 Orin-C design). Roomy; time-based
+#           retention alone is adequate.
+# `emmc`  — FALLBACK: the Jetson's built-in ~57 GB eMMC, shared with the root
+#           filesystem. Used when the NVMe is absent or failed.
+#
+# The tier is not cosmetic — it changes where data lands and forces a HARD SIZE
+# CEILING, because on eMMC the observability stack and the operating system are
+# competing for the same 57 GB and filling it takes the host down, not just the
+# metrics.
+obs_storage_tier: "nvme"
+
+# Retention TIME. On the NVMe tier we hold longer than the legacy mgmt-host
+# pattern (15d) because there is room; on eMMC this is cut hard below.
+prometheus_retention_days: 30
+
+# Retention SIZE — a HARD CEILING on the TSDB, independent of time. Prometheus
+# honours whichever limit is reached first, so this is the fail-safe: if the
+# series count grows, or a new scrape target triples the ingest rate, the time
+# limit will not save the disk and this will.
+#
+# EMPTY MEANS NO CEILING, which is the historical behaviour and is only
+# defensible on a dedicated 1.8 TB device. The role ASSERTS a non-empty value
+# on the emmc tier rather than defaulting one, because a guessed ceiling on a
+# disk shared with the OS is exactly the wrong thing to be silently wrong about.
+prometheus_retention_size: ""
+
+# Default Grafana admin (operator MUST override via group_vars / env).
+# This is the FIRST-LOGIN password; force-change on first login is enforced
+# in the dashboard provisioning by setting GF_SECURITY_ADMIN_PASSWORD with
+# a fresh value per deploy.
+grafana_admin_user:     "admin"
+grafana_admin_password: "{{ lookup('env', 'GRAFANA_ADMIN_PASSWORD') | default('changeme', true) }}"
+
+# Scrape targets. Required — list of dicts with {name, addr, job}.
+# See group_vars/<obs-group>/vars.yml for an instance.
+obs_scrape_targets: []
+
+# Receiver pattern matches the legacy single-host group_vars exactly so the same env
+# vars wire both legacy single-host and Orin-C deployments.
+alertmanager_receiver: "noop"
+
+# Dead-man's switch. The Watchdog rule fires forever; this is where the
+# heartbeat is sent. MUST be an endpoint that lives off the obs host and that
+# complains when the heartbeat STOPS — Dead Man's Snitch, healthchecks.io, or a
+# self-hosted ntfy topic with a no-message-in-N-minutes watch.
+#
+# Left empty the heartbeat routes to webhook-noop and the switch is decorative:
+# Prometheus can die and nothing anywhere will notice. That is the exact
+# capability-absent-but-looks-fine state F-289 is about, so the acceptance suite
+# fails a goatnet that ships rules without wiring this
+# (`deadman-switch-has-external-receiver`).
+deadman_webhook_url: ""
+# Heartbeat cadence. The external watcher's own timeout must be comfortably
+# longer than this (a 1m heartbeat against a 5m watch window is a sane pairing)
+# or normal jitter reads as death.
+deadman_repeat_interval: "1m"
+
+# Second, INDEPENDENT absence-detector — a third-party service (Dead Man's
+# Snitch, healthchecks.io). Peer to deadman_webhook_url, not a replacement:
+# the on-site watcher dies with the site, this one does not; this one depends on
+# an external account, the on-site one does not. Empty = only the on-site
+# watcher runs, which is the state the coverage table in the role docs describes.
+deadman_external_url: ""
+
+pagerduty_integration_key: ""
+slack_webhook_url:         ""
+slack_warnings_channel:    "#goat-alerts"
+smtp_smarthost:            ""
+smtp_from:                 "person-13@example.org"
+smtp_auth_username:        ""
+smtp_auth_password:        ""
+email_digest_recipients:   ""
+ntfy_alertmanager_webhook_url: ""
+
+# -- mesh path-quality probe -------------------------------------
+# Measures what makes a mesh link UNUSABLE rather than DOWN: path MTU vs tunnel
+# MTU (a blackhole can make a surface unloadable while every dashboard stays
+# green), RTT jitter, and loss. mesh-health (ADR 1042) excludes jitter/loss from
+# v1 and has no MTU field; snitch probes MTU but is off by default; the blackbox
+# ICMP job targets relays, not mesh peers.
+obs_mesh_pq_enabled: false          # opt-in per site; needs obs_mesh_pq_peers
+obs_mesh_pq_dir: "/opt/obs-host/mesh-path-quality"
+obs_mesh_pq_interval: "5min"
+obs_mesh_pq_ping_count: 20
+# The tunnel MTU to compare against. If a site runs a non-default WireGuard
+# MTU this MUST match it, or the blackhole alert compares against fiction.
+obs_mesh_pq_tunnel_mtu: 1420
+# [{name: <label>, ip: <mesh ip>}, ...] — the peers this host serves users from.
+obs_mesh_pq_peers: []
+
+# node-exporter textfile collector — where host-side probes drop .prom files.
+obs_textfile_host_dir: "/var/lib/node_exporter/textfile"
+obs_textfile_dir: "/textfile"
+
+# Collectors to disable. thermal_zone HANGS on Jetson Orin: thermal_zone1-4
+# expose /sys/class/thermal/thermal_zoneN/temp that never returns, so the
+# collector blocks, the scrape holds a request slot, Prometheus retries every
+# 15s, and the 40-slot --web.max-requests limit fills. node_exporter then
+# answers every request with
+#   "Limit of concurrent requests reached (40), try again later."
+# Scrapes then never succeed and the obs host reports no node metrics at all, with
+# nothing alerting unless something watches scrape-target health.
+obs_node_exporter_disabled_collectors:
+  - thermal_zone
+
+# Alert rules to install into this obs stack. EXPLICIT, not a glob: shared rules
+# carry absent() guards for services that do not run on an obs host, and those
+# fire immediately and forever. Previously this list did not exist and the
+# Rule files to DROP from obs_rule_files for this site, without restating the
+# list. Use it when a goatnet does not run the thing a default rule watches: a
+# goatnet with no audit-subscriber and no MinIO has six audit-subscriber.yml
+# rules that can never fire.
+#
+# Prefer this over editing obs_rule_files: an overridden list stops inheriting
+# every rule file added to the role later, which is the same
+# quietly-falls-behind shape as F-449 itself. Excluding names what the site does
+# not have; overriding freezes what the site does have.
+# -- Grafana dashboards -------------------------------------------------------
+# Provisioning a Prometheus DATASOURCE with no dashboards leaves Grafana empty
+# beside hundreds of metric names: data collected and nothing rendering it.
+# Checking that metrics exist is not checking that a human can see them.
+#
+# Dashboards come from the SAME source as the co-located stack,
+# ops/compose/goat-obs/grafana/dashboards/, so a fix to a panel query reaches
+# both stacks instead of being made twice.
+obs_grafana_dashboards_enabled: true
+
+# Dashboards this site does NOT install, by filename. Same contract as
+# obs_rule_files_exclude: name what the site cannot serve, rather than
+# overriding the whole list and silently freezing out every dashboard added
+# later.
+#
+# WHY EXCLUDE AT ALL, given a dashboard costs nothing to ship: a panel with no
+# series renders as empty, and empty reads as idle. A goatnet with no cadvisor
+# showing a container dashboard of blank graphs is worse than not showing it —
+# it answers "how are the containers" with silence that looks like calm. Score a
+# candidate against the site's real metric inventory before adding it back:
+#   curl -s <prom>/api/v1/label/__name__/values
+obs_grafana_dashboards_exclude: []
+
+obs_rule_files_exclude: []
+
+obs_rule_files:
+  # Unattended-boot health: locked LUKS volume, Tang quorum lost, Tang
+  # server down, boot ordering cycle. Safe everywhere: series exist only on
+  # hosts with a clevis volume; no absent().
+  - luks-unlock.yml
+  - mesh-path-quality.yml
+  # Watches the monitoring itself. F-289: 4 of 5 targets down for 24h+ and
+  # nothing said so, because a broken collection makes its dependent alerts go
+  # QUIET, and quiet is indistinguishable from healthy.
+  - scrape-health.yml
+  # Link utilisation + bandwidth attribution (ADR 1128). Safe on a goatnet that
+  # has not deployed the attribution collector: every alert keys on a series
+  # that simply does not exist there, so nothing fires. That is asserted, not
+  # assumed — tests/bandwidth-attribution.test.yml case 8 feeds the rules a
+  # goatnet with none of these metrics and requires silence from all eight.
+  - bandwidth-attribution.yml
+  # Peer liveness — always-up absence + the redundancy-pair alarm
+  # (peer-liveness-expectations.md). This file has to be in the rule set or the
+  # alarm cannot fire even with the meter red, and an outage is found only by a
+  # person asking. Safe on a goatnet without the
+  # meter: every expr keys on a goat_mesh_* series that does not exist there and
+  # yields an empty vector — none use absent(), so nothing false-fires. Verified
+  # against tests/mesh-liveness.test.yml. Pairs with the mesh-health textfile-dir
+  # fix in the same change; a rule with no metric is exactly as silent as no rule.
+  - mesh-liveness.yml
+  # Audit-subscriber writes + audit-integrity bucket health, including the two
+  # F-171/F-372 delete-marker alerts. Added for the same reason
+  # the rules and the metric can both exist, but with the file not in this list
+  # the alerts are structurally unable to fire on any obs-host stack. Delete
+  # markers can grow to nearly half a bucket's object versions, and a goatnet can
+  # run for months with NO audit lifecycle, both invisible;
+  # AuditBucketLifecycleMissing is written precisely to name the second one.
+  #
+  # Safe on a goatnet that scrapes neither the audit-subscriber nor the
+  # minio-bucket job: none of the six alerts use absent(), every expr is a
+  # positive condition over a series that will not exist there, and an empty
+  # vector fires nothing. ASSERTED, not assumed — tests/audit-delete-markers.
+  # test.yml feeds the rules NO input series at all and requires silence from
+  # all six. That is the fitness test for being in this list; the reason
+  # tls-cert-renewal.yml is excluded below is that it would fail it.
+  - audit-subscriber.yml
+  # Signal-plane amplification: peers retrying sessions to peers that are not
+  # there. Added and it is the THIRD file to arrive here for the
+  # identical reason — the rules were written, reviewed and merged, and were
+  # structurally unable to fire because nothing added them to this list. See
+  # mesh-liveness above and audit-subscriber. The
+  # pattern is that authoring a rule file and enabling it are two acts, and a
+  # merged rule file looks finished.
+  #
+  # Passes the fitness test in the audit-subscriber note. The two alerts key on
+  # positive conditions over `signal_server_deliver_duration_seconds_count`,
+  # which does not exist on a stack that scrapes no signal server, so an empty
+  # vector fires nothing. ASSERTED — tests/signal-notfound-storm.test.yml case 6
+  # feeds NO input series and requires silence.
+  #
+  # AN absent() GUARD WAS WRITTEN AND REMOVED. The first version carried
+  # SignalMeterUnread (`absent(signal_server_connected_peers)`) on the honest
+  # principle that a silent rule and an unscraped one look identical. It is the
+  # right principle and the wrong home: it would fire permanently on every
+  # goatnet without a signal server, which is a guard red from its first run,
+  # i.e. one nobody reads. scrape-health.yml already owns "the
+  # collection is broken" fleet-wide, which is the same statement made once
+  # instead of once per rule file.
+  - signal-notfound-storm.yml
+
+# -- Blackbox probing (active HTTPS probes + TLS certificate observability) ---
+#
+# OFF BY DEFAULT, and the default is load-bearing. `tls-cert-renewal.yml`
+# carries `TlsCertExpiryUnobserved: absent(probe_ssl_earliest_cert_expiry{...})`,
+# which is TRUE on any Prometheus that does not scrape blackbox — so shipping
+# that rule to an obs host without an exporter fires a critical alert
+# immediately and forever, which is how alerting gets switched off. The rule
+# file is therefore appended to the rule set by `obs_blackbox_enabled` rather
+# than listed in `obs_rule_files` above; the two move together or not at all.
+#
+# WHY THIS EXISTS: with no blackbox job of any kind,
+# `probe_ssl_earliest_cert_expiry` has no series and the renewal alerts are
+# structurally unable to fire. Certificates renew unattended via Traefik's ACME
+# resolver, but the 30-day runway the whole arrangement leans on only exists
+# where something is watching. See ADR 1140 §Consequences.
+obs_blackbox_enabled: false
+
+# obs_blackbox_image is DELIBERATELY NOT DEFAULTED HERE. It lives in the obs
+# group_vars of each goatnet that enables probing, next to the flag that turns
+# it on — the two are declared together or not at all.
+#
+# The reason is this role's deploy ledger, which says so itself: it carries ONE
+# `history[0].image`, while check-deploy-history.sh compares EVERY changed
+# `*_image` in this file against that single row. Four image vars already sit
+# here (prometheus / alertmanager / grafana / node_exporter) and bumping any of
+# them fails that gate today. Adding a fifth would deepen a trap the ledger
+# comment already flags, and the fix it names is exactly this: move the var to
+# group_vars. Making the ledger multi-image is the real repair and it belongs
+# to the shared rollback machinery, not to this change.
+#
+# The role preflight fails closed when probing is enabled without a pin, so a
+# missing value is an explicit error rather than an undefined-variable crash
+# part-way through the play.
+
+# Probe targets — full https:// URLs including the health path. Every entry
+# becomes one `blackbox-https` target, and every target that completes a TLS
+# handshake emits `probe_ssl_earliest_cert_expiry`. To observe renewal on ALL
+# of a goatnet's certificates, every vhost needs an entry: the metric is
+# per-target, so an unprobed vhost's certificate is unwatched even while the
+# alert reads green from its neighbours.
+obs_blackbox_targets: []
+
+# The mgmt host group whose isitup_services is this goatnet's service registry
+# (e.g. <site>_hosts). When set, any target whose host belongs to a registry
+# row marked `lifecycle: planned` / `retiring` or `listed: false` is dropped
+# before rendering, so taking a service out of alerting is one edit to its
+# registry row (#1518). ops/ci/check-blackbox-covers-registry.sh requires it on
+# every goatnet that enables blackbox probing. Empty = probe every target.
+obs_blackbox_registry_group: ""
+
+# Mesh IP that every name in obs_blackbox_targets resolves to, rendered into
+# the exporter's extra_hosts. Required because docker's embedded DNS cannot
+# reach mesh CoreDNS on :5353, so a mesh-zone probe target is
+# otherwise NXDOMAIN inside the container. Leave empty on a goatnet whose probe
+# targets are publicly resolvable.
+obs_blackbox_resolve_ip: ""
+
+# Blackbox module used for the HTTPS probes. `http_gate` does not follow
+# redirects, so whatever answers first IS the reading — a probe that chases a
+# 302 to the identity provider grades Ory while wearing the target's label
+# (ADR 1133). Modules are defined in ops/compose/goat-obs/blackbox/blackbox.yml.
+obs_blackbox_module: "http_gate"

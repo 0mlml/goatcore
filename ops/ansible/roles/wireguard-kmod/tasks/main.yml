@@ -1,0 +1,293 @@
+---
+# wireguard-kmod — install/remove the pinned kernel WireGuard modules and cut
+# netbird between kernelspace and userspace. ADR 1118 /
+# docs/design/jetson-kernel-wireguard.md.
+#
+# Ordering invariant: the module must load and pass an interface smoke test
+# BEFORE netbird is restarted. A host that cannot load the module is left
+# running userspace exactly as before, and the play aborts (any_errors_fatal
+# at the play level).
+
+- name: resolve artifact paths for kernel {{ ansible_kernel }}
+  ansible.builtin.set_fact:
+    wg_kmod_artifact_dir: "{{ wg_kmod_artifact_root }}/artifacts/{{ ansible_kernel }}"
+    wg_kmod_extra_dir: "/lib/modules/{{ ansible_kernel }}/extra"
+
+- name: enumerate .ko artifacts on the control machine
+  ansible.builtin.set_fact:
+    wg_kmod_kos: "{{ lookup('ansible.builtin.fileglob', wg_kmod_artifact_dir ~ '/*.ko', wantlist=True) | sort }}"
+
+- name: refuse — no artifacts for this host's kernel
+  ansible.builtin.assert:
+    that: wg_kmod_kos | length > 0
+    fail_msg: >-
+      No .ko artifacts for kernel {{ ansible_kernel }} under
+      {{ wg_kmod_artifact_dir }}. Build them first (goat-wireguard-kmod
+      build/) or point wg_kmod_artifact_root at the right checkout.
+
+- name: install modules and cut over to kernelspace
+  when: wg_kmod_state == 'present'
+  block:
+    - name: verify artifact checksums on the control machine
+      ansible.builtin.shell: sha256sum -c SHA256SUMS 2>/dev/null || shasum -a 256 -c SHA256SUMS
+      args:
+        chdir: "{{ wg_kmod_artifact_dir }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: ensure {{ wg_kmod_extra_dir }} exists
+      ansible.builtin.file:
+        path: "{{ wg_kmod_extra_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: copy kernel modules
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ wg_kmod_extra_dir }}/{{ item | basename }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ wg_kmod_kos }}"
+      register: wg_kmod_copied
+
+    - name: depmod
+      ansible.builtin.command: depmod -a
+      when: wg_kmod_copied is changed
+
+    - name: load the wireguard module (host is left untouched if this fails)
+      ansible.builtin.command: modprobe wireguard
+      changed_when: false
+
+    - name: smoke — create and delete a throwaway wireguard interface
+      ansible.builtin.shell: ip link add wgkmodsmoke type wireguard && ip link del wgkmodsmoke
+      changed_when: false
+
+    - name: load wireguard at boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/wireguard.conf
+        content: "wireguard\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    # Kernel-bump guard (the design's one silent-degradation mode): warn at
+    # apt time when a kernel tree lands without pinned artifacts, and leave
+    # /var/lib/goat/wireguard-kmod/KERNEL-BUMP-PENDING for health checks.
+    - name: install kernel-bump guard script
+      ansible.builtin.copy:
+        src: goat-wg-kmod-bump-guard
+        dest: /usr/local/sbin/goat-wg-kmod-bump-guard
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: hook kernel-bump guard into apt
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99-goat-wg-kmod-guard
+        content: |
+          // ADR 1118: warn when a kernel lands without pinned wireguard
+          // artifacts (silent userspace fallback on next boot).
+          DPkg::Post-Invoke { "/usr/local/sbin/goat-wg-kmod-bump-guard || true"; };
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: check current wt0 driver
+      ansible.builtin.shell: ip -d link show wt0
+      register: wg_kmod_wt0_before
+      changed_when: false
+      failed_when: false
+
+    - name: restart netbird into kernel mode (async — drops our own transport)
+      ansible.builtin.shell: sleep 2 && systemctl restart {{ wg_kmod_netbird_service }}
+      async: 90
+      poll: 0
+      when: "'wireguard' not in wg_kmod_wt0_before.stdout"
+
+    - name: wait for the host's mesh transport to return
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: "{{ wg_kmod_reconnect_timeout }}"
+      when: "'wireguard' not in wg_kmod_wt0_before.stdout"
+
+    - name: verify wt0 is kernelspace wireguard
+      ansible.builtin.shell: ip -d link show wt0
+      register: wg_kmod_wt0_after
+      until: "'wireguard' in wg_kmod_wt0_after.stdout"
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    - name: verify netbird is connected
+      ansible.builtin.command: netbird status
+      register: wg_kmod_nb_status
+      until: "'Connected' in wg_kmod_nb_status.stdout"
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    # In kernel mode netbird moves its ACL from the in-process userspace
+    # filter into the kernel (which is why the artifact set includes
+    # nft_ct/nft_fib* and xt_TCPMSS). WHICH kernel firewall it drives is
+    # version-dependent: >=0.70 uses the native nftables manager
+    # (`table ip netbird`, nft_ct expressions); 0.68 uses the
+    # iptables manager (NETBIRD-* chains, xt_* matches). Accept either. "Connected" with NEITHER
+    # present = unfiltered node = abort.
+    - name: verify netbird installed its kernel-mode ACL (either firewall manager)
+      ansible.builtin.shell: >-
+        nft list tables | grep -q 'table ip netbird' ||
+        iptables -S | grep -q 'NETBIRD-ACL'
+      register: wg_kmod_acl_check
+      until: wg_kmod_acl_check.rc == 0
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    # xt_TCPMSS.ko heals netbird's MSS clamp: before it, netbird logged
+    # "unknown option --set-mss" and left NETBIRD-RT-MSSCLAMP empty. iptables
+    # autoloads the module on first rule insert, so presence in extra/ is
+    # enough. Report-only — hosts that route nothing keep an empty chain
+    # legitimately, so an empty result must not gate the deploy.
+    - name: report MSS-clamp chain population (informational)
+      ansible.builtin.shell: iptables -t mangle -S NETBIRD-RT-MSSCLAMP 2>/dev/null | grep -c TCPMSS || true
+      register: wg_kmod_mssclamp
+      changed_when: false
+      failed_when: false
+
+    - name: show MSS-clamp rule count
+      ansible.builtin.debug:
+        msg: "NETBIRD-RT-MSSCLAMP TCPMSS rules on {{ inventory_hostname }}: {{ wg_kmod_mssclamp.stdout | default('0') }}"
+
+    # ------------------------------------------------------------------
+    # BBR/fq default-CC policy (default OFF — see defaults/main.yml).
+    # ------------------------------------------------------------------
+    - name: persist BBR + fq as host defaults
+      when: wg_kmod_bbr_policy | bool
+      block:
+        - name: load tcp_bbr + sch_fq at boot
+          ansible.builtin.copy:
+            dest: /etc/modules-load.d/goat-bbr.conf
+            content: "tcp_bbr\nsch_fq\n"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: load tcp_bbr + sch_fq now
+          ansible.builtin.command: modprobe {{ item }}
+          loop: [tcp_bbr, sch_fq]
+          changed_when: false
+
+        - name: persist bbr + fq sysctls
+          ansible.builtin.copy:
+            dest: /etc/sysctl.d/90-goat-bbr.conf
+            content: |
+              # goat wireguard-kmod role (wg_kmod_bbr_policy). F-301: the
+              # Starlink uplink reorders ~2% of packets; cubic collapses on
+              # that signal, BBR ignores it. fq is BBR's pacing qdisc.
+              net.core.default_qdisc = fq
+              net.ipv4.tcp_congestion_control = bbr
+            owner: root
+            group: root
+            mode: "0644"
+          register: wg_kmod_bbr_sysctl_file
+
+        - name: apply bbr + fq sysctls
+          ansible.builtin.command: sysctl -p /etc/sysctl.d/90-goat-bbr.conf
+          when: wg_kmod_bbr_sysctl_file is changed
+
+    - name: withdraw BBR/fq policy (persistence + runtime) when disabled
+      when: not (wg_kmod_bbr_policy | bool)
+      block:
+        - name: remove BBR policy files
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/sysctl.d/90-goat-bbr.conf
+            - /etc/modules-load.d/goat-bbr.conf
+          register: wg_kmod_bbr_removed
+
+        - name: revert runtime congestion control if this policy had set it
+          ansible.builtin.shell: |
+            [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ] || exit 0
+            sysctl -w net.ipv4.tcp_congestion_control=cubic
+            sysctl -w net.core.default_qdisc=fq_codel
+          when: wg_kmod_bbr_removed is changed
+          register: wg_kmod_bbr_reverted
+          changed_when: wg_kmod_bbr_reverted.stdout | length > 0
+
+- name: remove modules and revert to userspace
+  when: wg_kmod_state == 'absent'
+  block:
+    - name: drop boot-load entries and BBR policy
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/modules-load.d/wireguard.conf
+        - /etc/modules-load.d/goat-bbr.conf
+        - /etc/sysctl.d/90-goat-bbr.conf
+        - /etc/apt/apt.conf.d/99-goat-wg-kmod-guard
+        - /usr/local/sbin/goat-wg-kmod-bump-guard
+
+    - name: revert runtime congestion control if the policy had set it
+      ansible.builtin.shell: |
+        [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ] || exit 0
+        sysctl -w net.ipv4.tcp_congestion_control=cubic
+        sysctl -w net.core.default_qdisc=fq_codel
+      register: wg_kmod_bbr_absent_revert
+      changed_when: wg_kmod_bbr_absent_revert.stdout | length > 0
+
+    # tcp_bbr/sch_fq/xt_TCPMSS unload only if idle; a module pinned by a
+    # live socket or qdisc stays resident until reboot — files are gone and
+    # depmod below makes that permanent, which is the guarantee that matters.
+    - name: unload gap-set modules where idle
+      ansible.builtin.command: rmmod {{ item }}
+      loop: [xt_TCPMSS, sch_fq, tcp_bbr]
+      failed_when: false
+      changed_when: false
+
+    - name: remove kernel module files
+      ansible.builtin.file:
+        path: "{{ wg_kmod_extra_dir }}/{{ item | basename }}"
+        state: absent
+      loop: "{{ wg_kmod_kos }}"
+
+    - name: depmod
+      ansible.builtin.command: depmod -a
+      changed_when: false
+
+    # Stop netbird, unload the module (it stays loaded until nothing uses
+    # it), start netbird — which now finds no module and goes userspace.
+    - name: restart netbird into userspace (async — drops our own transport)
+      ansible.builtin.shell: >-
+        sleep 2 && systemctl stop {{ wg_kmod_netbird_service }} &&
+        (rmmod wireguard || true) &&
+        systemctl start {{ wg_kmod_netbird_service }}
+      async: 120
+      poll: 0
+
+    - name: wait for the host's mesh transport to return
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: "{{ wg_kmod_reconnect_timeout }}"
+
+    - name: verify wt0 is userspace tun again
+      ansible.builtin.shell: ip -d link show wt0
+      register: wg_kmod_wt0_reverted
+      until: "'tun' in wg_kmod_wt0_reverted.stdout"
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    - name: verify netbird is connected
+      ansible.builtin.command: netbird status
+      register: wg_kmod_nb_status_reverted
+      until: "'Connected' in wg_kmod_nb_status_reverted.stdout"
+      retries: 18
+      delay: 10
+      changed_when: false

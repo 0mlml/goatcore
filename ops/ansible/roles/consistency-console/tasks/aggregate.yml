@@ -1,0 +1,342 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# CF-7 AGGREGATOR MODE (consistency-foundation.md §7.8 as-built) — deploy the
+# consistency console binary with --aggregate on a cloud relay-health host,
+# beside the multi-env relay-health dashboard: same host, sibling DNS, same
+# Traefik, PLATFORM-ADMIN oauth2 fence (the per-goatnet console ceremony).
+# Invoked ONLY via tasks_from: aggregate (consistency-aggregator-deploy.yml);
+# tasks/main.yml (the single-mode console) is untouched.
+#
+# Pre-flight (operator-side, the deploy phase — NOT this role):
+#   1. Pin consistency_aggregator_image from the first post-aggregator-product
+#      main build (multi-arch INDEX digest, F-245) with a deploy-history row.
+#   2. Per goatnet: mint a subscribe-only leaf with THAT goatnet's zenoh CA
+#      (CN=goat-consistency-console-trial-peer — the subject its router
+#      already ACLs) and stage it under
+#      {{ consistency_aggregator_cert_dir }}/<name>/.
+#   3. The HOSTING goatnet's router must admit this host's mesh IP on :7447
+#      (mesh policy); verify with a live subscriber, because a denied write is
+#      silent.
+#   4. Hydra OIDC client `consistency-aggregator` minted on the hosting
+#      goatnet (the P12 loop) + the two env secrets exported.
+#   5. The sibling Cloudflare record (the goatnet's Terraform
+#      consistency_aggregator_dns_enabled=true) applies IN THE SAME CHANGE as
+#      the flag flip: no record before the deploy.
+#   6. The PEER env's transport: the env-doors Tier 2 zenoh-door lane
+#      (ADR 1117, env-doors.md §"As-built"). A
+#      lane outage renders that goatnet indeterminate-with-age, which is
+#      the §7.8 contract, not a failure.
+#   7. The box needs a persisted GHCR read login (docker login ghcr.io with
+#      the fleet read token) — the console image is private and compose
+#      pull 401s without it.
+
+- name: consistency-aggregator | require enablement + a PINNED image (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - consistency_aggregator_enabled | bool
+      - "'@sha256:' in consistency_aggregator_image"
+      - "'PENDING' not in consistency_aggregator_image"
+    fail_msg: >-
+      consistency-aggregator requires consistency_aggregator_enabled and a
+      digest-pinned consistency_aggregator_image — a multi-arch INDEX digest
+      of a main build that CONTAINS the aggregate-v1 API (the CF-6 pin
+      predates it and must not be reused here).
+
+- name: consistency-aggregator | at least two goatnets, uniquely named, and a hostname
+  ansible.builtin.assert:
+    that:
+      - consistency_aggregator_goatnets | length >= 2
+      - (consistency_aggregator_goatnets | map(attribute='name') | list | unique | length) == (consistency_aggregator_goatnets | length)
+      - consistency_aggregator_hostname | length > 0
+    fail_msg: >-
+      consistency_aggregator_goatnets needs >= 2 uniquely named entries (a
+      cross-goatnet aggregator of one goatnet is that goatnet's own console)
+      and consistency_aggregator_hostname must be set by the hosting
+      group_vars — the role default is empty by design.
+
+- name: consistency-aggregator | refuse fence-on without its secrets (hydra-groups)
+  ansible.builtin.assert:
+    that:
+      - consistency_aggregator_oauth2_proxy_oidc_issuer_url | length > 0
+      - consistency_aggregator_oauth2_proxy_client_secret | length > 0
+      # oauth2-proxy counts the cookie secret in CHARACTERS: only 16/24/32
+      # pass; anything else crash-loops at boot behind a green play recap.
+      - consistency_aggregator_oauth2_proxy_cookie_secret is defined and ((consistency_aggregator_oauth2_proxy_cookie_secret | length) in [16, 24, 32])
+    fail_msg: >-
+      consistency_aggregator_oauth2_proxy_enabled=true but issuer/client_secret/
+      cookie_secret are unset or malformed — the fence would deploy broken-open.
+  when:
+    - consistency_aggregator_oauth2_proxy_enabled | bool
+    - consistency_aggregator_gate | default('hydra-groups') != 'dex-allowlist'
+
+# dex-allowlist mode (the relay-health public-door ceremony): needs the shared
+# Dex client secret + a well-formed cookie secret, AND the roster-synced
+# allowlist file must already exist on this host — the fence consumes the
+# relay-health door's file; deploying without it would 500 every login.
+- name: consistency-aggregator | refuse fence-on without its secrets (dex-allowlist)
+  ansible.builtin.assert:
+    that:
+      - consistency_aggregator_dex_issuer_url | length > 0
+      - consistency_aggregator_dex_client_secret | length > 0
+      - consistency_aggregator_oauth2_proxy_cookie_secret is defined and ((consistency_aggregator_oauth2_proxy_cookie_secret | length) in [16, 24, 32])
+    fail_msg: >-
+      consistency_aggregator_gate=dex-allowlist but the Dex issuer/client
+      secret/cookie secret are unset or malformed — the fence would deploy
+      broken-open.
+  when:
+    - consistency_aggregator_oauth2_proxy_enabled | bool
+    - consistency_aggregator_gate | default('hydra-groups') == 'dex-allowlist'
+
+- name: consistency-aggregator | dex-allowlist requires the roster-synced allowlist file
+  ansible.builtin.stat:
+    path: "{{ consistency_aggregator_allowlist_file }}"
+  register: gca_allowlist_stat
+  when:
+    - consistency_aggregator_oauth2_proxy_enabled | bool
+    - consistency_aggregator_gate | default('hydra-groups') == 'dex-allowlist'
+
+- name: consistency-aggregator | fail on a missing allowlist file (dex-allowlist)
+  ansible.builtin.fail:
+    msg: >-
+      consistency_aggregator_gate=dex-allowlist but
+      {{ consistency_aggregator_allowlist_file }} does not exist on this host —
+      deploy the relay-health public door (relay-health-cloud-deploy.yml) first;
+      its ADR 1093 auto-sync owns that file.
+  when:
+    - consistency_aggregator_oauth2_proxy_enabled | bool
+    - consistency_aggregator_gate | default('hydra-groups') == 'dex-allowlist'
+    - not (gca_allowlist_stat.stat.exists | default(false))
+
+# --- door lane client (env-doors Tier 2, ADR 1117) -------------------
+- name: consistency-aggregator | door config must be complete when enabled
+  ansible.builtin.assert:
+    that:
+      - consistency_aggregator_zagros_door_sni | length > 0
+      - consistency_aggregator_zagros_door_relays | length >= 1
+      - "'@sha256:' in consistency_aggregator_zagros_door_image"
+    fail_msg: >-
+      consistency_aggregator_zagros_door_enabled=true but the lane's SNI /
+      relay list / digest-pinned image are unset — the sidecar would deploy
+      with no road to dial. The hosting group_vars own the literals.
+  when: consistency_aggregator_zagros_door_enabled | bool
+
+- name: consistency-aggregator | door client cert seat (fail-closed)
+  ansible.builtin.stat:
+    path: "{{ consistency_aggregator_cert_dir }}/zagros-door/client.pem"
+  register: gca_door_cert_stat
+  when: consistency_aggregator_zagros_door_enabled | bool
+
+- name: consistency-aggregator | fail on a missing door client cert
+  ansible.builtin.fail:
+    msg: >-
+      zagros-door is enabled but
+      {{ consistency_aggregator_cert_dir }}/zagros-door/client.pem is missing.
+      Mint a lane client cert with the offline dev CA
+      (docs/operations/dev-ca-cert-sign.md), concatenate cert+key into one
+      PEM (haproxy `crt` format) and stage it there — the outer mTLS
+      handshake at the ZAGROS Traefik refuses anything else, so deploying
+      without it would only manufacture a silent indeterminate.
+  when:
+    - consistency_aggregator_zagros_door_enabled | bool
+    - not (gca_door_cert_stat.stat.exists | default(false))
+
+- name: consistency-aggregator | dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ consistency_aggregator_compose_dir }}"
+    - "{{ consistency_aggregator_intent_dir }}"
+    - "{{ consistency_aggregator_cert_dir }}"
+
+# ansible.builtin.copy does NOT create parent directories — without these the
+# per-goatnet intent placement below fails on first deploy.
+- name: consistency-aggregator | per-goatnet intent dirs
+  ansible.builtin.file:
+    path: "{{ consistency_aggregator_intent_dir }}/{{ item.goatnet }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ consistency_aggregator_goatnets }}"
+  loop_control:
+    label: "{{ item.goatnet }}"
+
+# The console verifies signature + content hash at EVERY render, per goatnet
+# independently — the transport, this role included, is untrusted by
+# construction. One tampered artifact refuses its own grid only.
+- name: consistency-aggregator | place each goatnet's committed intent artifact + signature
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../consistency/intent/{{ item.0.goatnet }}/{{ item.1 }}"
+    dest: "{{ consistency_aggregator_intent_dir }}/{{ item.0.goatnet }}/{{ item.1 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ consistency_aggregator_goatnets | product(['intent.json', 'intent.json.sig']) | list }}"
+  loop_control:
+    label: "{{ item.0.name }}/{{ item.1 }}"
+  notify: consistency-aggregator | recreate container
+
+- name: consistency-aggregator | place the offline-CA public keys (the CF-5 trust root)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../enrollment/public-keys/"
+    dest: "{{ consistency_aggregator_intent_dir }}/public-keys/"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: consistency-aggregator | recreate container
+
+# The release-readiness document (/release, release-graduation.md §8). FLEET-scoped, not
+# per-goatnet: the ladder spans the rungs, so one document sits at the intent
+# root rather than under a goatnet dir. Derived at deploy time for the same
+# reason as the single-mode path — see tasks/main.yml.
+- name: consistency-aggregator | a controller-side seat for the rendered readiness document
+  ansible.builtin.tempfile:
+    state: file
+    suffix: .release-readiness.json
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  register: gca_readiness_tmp
+
+- name: consistency-aggregator | render the release-readiness document from this checkout
+  ansible.builtin.command:
+    cmd: >-
+      {{ ansible_playbook_python }} {{ playbook_dir }}/../release/graduate.py readiness
+      --out {{ gca_readiness_tmp.path }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+
+- name: consistency-aggregator | place the release-readiness document
+  ansible.builtin.copy:
+    src: "{{ gca_readiness_tmp.path }}"
+    dest: "{{ consistency_aggregator_intent_dir }}/release-readiness.json"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: consistency-aggregator | recreate container
+
+- name: consistency-aggregator | drop the controller-side seat
+  ansible.builtin.file:
+    path: "{{ gca_readiness_tmp.path }}"
+    state: absent
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+
+# Missing leaf certs for the HOSTING env fail the deploy (its endpoint must
+# work); a peer env's certs may be absent only if its entry is expected to
+# render indeterminate — but a tls/ endpoint WITH no cert would refuse the
+# session at open, so require the seat for every tls/ entry to keep the
+# failure honest and early.
+- name: consistency-aggregator | pre-flight per-goatnet leaf certs (tls/ endpoints)
+  ansible.builtin.stat:
+    path: "{{ consistency_aggregator_cert_dir }}/{{ item.name }}/leaf-cert.pem"
+  register: gca_cert_stat
+  loop: "{{ consistency_aggregator_goatnets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.endpoint is match('^tls/')
+
+- name: consistency-aggregator | fail on a missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      consistency-aggregator: goatnet {{ item.item.name }} declares a tls/
+      endpoint but has no leaf at
+      {{ consistency_aggregator_cert_dir }}/{{ item.item.name }}/leaf-cert.pem.
+      Mint a subscribe-only leaf with THAT goatnet's zenoh CA
+      (CN=goat-consistency-console-trial-peer) via
+      docs/operations/dev-ca-cert-sign.md and stage leaf-cert.pem /
+      leaf-key.pem / ca-root-cert.pem there.
+  loop: "{{ gca_cert_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('skipped') }}"
+  when:
+    - item is not skipped
+    - not (item.stat.exists | default(false))
+
+- name: consistency-aggregator | cert dir ownership for non-root container uid 65532
+  ansible.builtin.file:
+    path: "{{ consistency_aggregator_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+
+- name: consistency-aggregator | render aggregator.yaml
+  ansible.builtin.template:
+    src: aggregator.yaml.j2
+    dest: "{{ consistency_aggregator_compose_dir }}/aggregator.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: consistency-aggregator | recreate container
+
+- name: consistency-aggregator | render door haproxy config (Tier 2 lane client)
+  ansible.builtin.template:
+    src: zagros-door-haproxy.cfg.j2
+    dest: "{{ consistency_aggregator_compose_dir }}/zagros-door-haproxy.cfg"
+    owner: root
+    group: root
+    mode: "0644"
+  when: consistency_aggregator_zagros_door_enabled | bool
+  notify: consistency-aggregator | recreate container
+
+- name: consistency-aggregator | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.aggregate.yml.j2
+    dest: "{{ consistency_aggregator_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: consistency-aggregator | recreate container
+
+- name: consistency-aggregator | render oauth2-proxy env
+  ansible.builtin.template:
+    src: oauth2-proxy-consistency-aggregator.env.j2
+    dest: "{{ consistency_aggregator_compose_dir }}/oauth2-proxy-consistency-aggregator.env"
+    owner: root
+    group: root
+    mode: "0600"
+  when: consistency_aggregator_oauth2_proxy_enabled | bool
+  notify: consistency-aggregator | recreate container
+
+- name: consistency-aggregator | render Traefik dynamic config (sibling of relay-health's)
+  ansible.builtin.template:
+    src: traefik-consistency-aggregator.yml.j2
+    dest: "{{ consistency_aggregator_traefik_dynamic_dir }}/consistency-aggregator.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: consistency-aggregator | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ consistency_aggregator_compose_dir }}"
+  changed_when: true
+
+- name: consistency-aggregator | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ consistency_aggregator_compose_dir }}"
+  register: gca_up
+  changed_when:
+    - "'Started' in gca_up.stderr or 'Created' in gca_up.stderr or 'Recreated' in gca_up.stderr"
+
+- name: consistency-aggregator | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ consistency_aggregator_compose_dir }}"
+  register: gca_ps
+  changed_when: false
+
+- name: consistency-aggregator | show
+  ansible.builtin.debug:
+    msg: "{{ gca_ps.stdout_lines }}"

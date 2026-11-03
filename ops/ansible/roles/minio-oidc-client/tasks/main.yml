@@ -1,0 +1,96 @@
+---
+# Block 21H.3c — provision OAuth2 client for MinIO at operator-IdP
+# Hydra. Same pattern as grafana/openobserve-oidc-client.
+
+- name: Require MinIO OIDC client secret
+  ansible.builtin.assert:
+    that:
+      - operator_idp_minio_client_secret is defined
+      - (operator_idp_minio_client_secret | length) >= 32
+      - site_id is defined and (site_id | length) > 0
+    fail_msg: |
+      Missing operator_idp_minio_client_secret. Generate fresh:
+        export <SITE>_C_OPERATOR_IDP_MINIO_CLIENT_SECRET=$(openssl rand -hex 32)
+
+- name: Pre-flight Hydra admin reachability
+  ansible.builtin.uri:
+    url: "{{ minio_oidc_hydra_admin }}/health/ready"
+    status_code: 200
+  retries: 5
+  delay: 2
+
+- name: Check whether MinIO OAuth2 client exists at Hydra
+  ansible.builtin.uri:
+    url: "{{ minio_oidc_hydra_admin }}/admin/clients/{{ minio_oidc_client_id }}"
+    status_code: [200, 404]
+    return_content: true
+  register: minio_client_get
+
+- name: Construct desired MinIO OAuth2 client config
+  ansible.builtin.set_fact:
+    minio_client_config:
+      client_id: "{{ minio_oidc_client_id }}"
+      client_name: "{{ minio_oidc_client_name }}"
+      client_secret: "{{ operator_idp_minio_client_secret }}"
+      grant_types: [authorization_code, refresh_token]
+      response_types: [code]
+      scope: "{{ minio_oidc_scopes | join(' ') }}"
+      redirect_uris: ["{{ minio_oidc_redirect_uri }}"]
+      # MinIO's console authenticates at the token endpoint with HTTP Basic
+      # (client_secret_basic). Registering the client as client_secret_post
+      # makes Hydra reject the code exchange with `invalid_client` and the
+      # console shows "Error from IDP".
+      token_endpoint_auth_method: client_secret_basic
+      skip_consent: true
+      access_token_strategy: jwt
+      audience: ["{{ minio_oidc_client_id }}"]
+
+- name: Create MinIO OAuth2 client (POST when not present)
+  ansible.builtin.uri:
+    url: "{{ minio_oidc_hydra_admin }}/admin/clients"
+    method: POST
+    body_format: json
+    body: "{{ minio_client_config }}"
+    status_code: 201
+  when: minio_client_get.status == 404
+  no_log: true
+
+# Hydra's GET /admin/clients/{id} never returns client_secret (write-only),
+# so secret drift is undetectable here — comparing it crashes every re-run
+# against an existing client. A changed secret must be re-asserted by
+# deleting the client (next run POSTs it fresh) or forcing the PUT.
+- name: Detect drift on existing MinIO OAuth2 client
+  ansible.builtin.set_fact:
+    minio_client_drift: >-
+      {{ (minio_client_get.json.redirect_uris | sort) != ([minio_oidc_redirect_uri] | sort)
+         or minio_client_get.json.skip_consent != true
+         or minio_client_get.json.access_token_strategy != 'jwt'
+         or minio_client_get.json.token_endpoint_auth_method != 'client_secret_basic' }}
+  when: minio_client_get.status == 200
+
+- name: Update MinIO OAuth2 client (PUT on drift)
+  ansible.builtin.uri:
+    url: "{{ minio_oidc_hydra_admin }}/admin/clients/{{ minio_oidc_client_id }}"
+    method: PUT
+    body_format: json
+    body: "{{ minio_client_config }}"
+    status_code: 200
+  when:
+    - minio_client_get.status == 200
+    - minio_client_drift | default(false) | bool
+  no_log: true
+
+- name: Surface MinIO OIDC client status
+  ansible.builtin.debug:
+    msg: |
+      MinIO OAuth2 client at operator-IdP Hydra:
+        client_id:    {{ minio_oidc_client_id }}
+        issuer:       {{ minio_oidc_issuer_url }}
+        redirect:     {{ minio_oidc_redirect_uri }}
+        action:       {{ 'created' if minio_client_get.status == 404
+                         else ('updated (drift)' if (minio_client_drift | default(false))
+                               else 'no change') }}
+      MinIO env-var consumption: see minio role's compose template
+      (MINIO_IDENTITY_OPENID_*) + mc-init.sh extension that creates
+      the alias policies (obs-admin, minio-admin, obs-readonly,
+      minio-readonly) so claim → policy matching works.

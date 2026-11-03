@@ -1,0 +1,52 @@
+#!/bin/sh
+# Rendered by ops/ansible/roles/operator-idp-postgres on {{ ansible_date_time.iso8601 }}.
+#
+# Daily backup of the operator-IdP Postgres. Runs as root via cron;
+# uses docker exec to run pg_dump inside the running container.
+#
+# Backup grade: pg_dump (logical) + age-encrypt + retention-by-age.
+# This is INTENTIONALLY simpler than the pgBackRest stanza on the
+# mgmt-host pair — see ADR 0842 §"Implications/Backup grade" for why
+# pgBackRest properties (PITR, fast restore at scale, incr/diff) are
+# not value-additive at this DB's scale (~1 MB) and stakes (operator
+# identities + OAuth2 client config, mostly Ansible-reproducible).
+#
+# Recovery: dump file is `age -d`-decrypted to a SQL file, then
+# `psql -U postgres operator_idp < dump.sql` restores. Manual
+# operator-fired procedure documented in
+# docs/operations/operator-idp-onboarding.md (21H.2 artifact).
+#
+# Output filename pattern includes UTC timestamp so collisions are
+# impossible; one file per run; lexicographic sort = chronological.
+
+set -eu
+
+DUMP_DIR="{{ operator_idp_pg_dump_dir }}"
+RETENTION_DAYS="{{ operator_idp_pg_dump_retention_days }}"
+AGE_RECIPIENT="{{ operator_idp_pg_dump_age_recipient }}"
+CONTAINER="{{ operator_idp_pg_container_name }}"
+
+mkdir -p "$DUMP_DIR"
+chmod 0700 "$DUMP_DIR"
+
+TIMESTAMP="$(date -u +'%Y%m%dT%H%M%SZ')"
+OUTFILE="$DUMP_DIR/operator-idp-${TIMESTAMP}.sql.age"
+
+# pg_dump --create --clean so the restore is a single self-contained
+# script that drops + recreates each DB. The role-level password is
+# included in the script (CREATE ROLE ... PASSWORD ...) so a dump
+# fully restores cold.
+docker exec -i "$CONTAINER" \
+  pg_dumpall -U postgres --clean --if-exists \
+  | age --encrypt --recipient "$AGE_RECIPIENT" --output "$OUTFILE"
+
+chmod 0600 "$OUTFILE"
+
+# Retention sweep — delete encrypted dumps older than the configured
+# window. mtime, not ctime, so a `touch` on a file extends its life
+# (deliberate — operator can pin a known-good dump by touching it).
+find "$DUMP_DIR" -name 'operator-idp-*.sql.age' -mtime "+${RETENTION_DAYS}" -delete
+
+# One-line success log to syslog so operators can `journalctl -u cron`
+# and see the dump cadence at a glance.
+logger -t operator-idp-pg-dump "ok ${OUTFILE}"

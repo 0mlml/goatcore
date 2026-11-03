@@ -1,0 +1,69 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the ntp-health-pub role — deploys the goat-ntp-health-pub
+# per-host attestation republisher (ADR 1036/1037, F-184). A normal mTLS Zenoh
+# client peer that reads the local ntp-health-agent's signed verdict over HTTP
+# (:9753/health) and republishes it VERBATIM on ops/time/attest/<host_id> at a
+# 30s heartbeat. Persists nothing — no S3/MinIO/.env.
+#
+# Out-of-the-box config targets the default host group; override with
+# `-e target=<site>_hosts`. The zenoh router container + network + CA names
+# derive from zenoh_stack.
+
+# Image — pinned per ADR 0859 (easy rollback). A bump requires an append to
+# deploy-history.yml (CI: deploy-history-check.yml). Built by
+# .github/workflows/ntp-health-image.yml.
+#
+# Multi-arch index digest verified against ghcr (sha-3a4bb4e == the
+# current :latest, built by PR #980). To bump: a new main build retags :latest;
+# resolve the index digest with
+#   docker buildx imagetools inspect ghcr.io/{{ ghcr_org }}/goat-ntp-health-pub:sha-<short> --format '{{.Manifest.Digest}}'
+# and append a matching deploy-history row.
+ntp_health_pub_image: "ghcr.io/{{ ghcr_org }}/goat-ntp-health-pub:sha-3a4bb4e@sha256:6a4f54ee28efa5beb4f52ee0acb6ac7aa46dd0c5ad9aa586d032bde0dbd742d2"
+
+# Host identifier — the `<host_id>` segment of ops/time/attest/<host_id>. MUST
+# match the ntp-health-agent's host_id (the agent defaults to the OS hostname),
+# so it is the OS short hostname, NOT the container's. The Rust default
+# (hostname::get()) would read the *container's* hostname under the zenoh
+# network, so we pin it explicitly here.
+ntp_health_pub_host_id: "{{ ansible_hostname }}"
+
+# The local ntp-health-agent verdict endpoint. The agent is a host systemd
+# binary bound 0.0.0.0:9753; this container is on the zenoh docker network (not
+# host net), so it reaches the host via host.docker.internal (wired in compose
+# with extra_hosts: host-gateway), NOT 127.0.0.1.
+ntp_health_pub_agent_url: "http://host.docker.internal:9753/health"
+
+# Zenoh router endpoint. Internal docker network — container-name resolution.
+# The router listens mTLS-only on 7447. `<zenoh_stack>-router` derives from the
+# one deployment param.
+ntp_health_pub_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+
+# Docker network the zenoh-router container lives on (the zenoh compose
+# project's external network, `<zenoh_stack>_default`).
+ntp_health_pub_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# Republish interval (ms). 30s heartbeat per universal-ntp-hygiene §5.1.
+ntp_health_pub_interval_ms: 30000
+
+# Host-side cert directory. Infra-class leaf cert + key minted via the
+# offline-CA cert-sign ceremony with Subject CN=ntp-health-pub-trial-peer (the
+# zenoh ACL subject `infra-ntp-health-pub` matches on cert_common_names, granted
+# ingress write on ops/time/attest/** via rule `infra-w-time-attest`). A
+# wrong/empty CN means the attestation publishes are silently denied.
+# Operator pre-stages:
+#   {cert_dir}/ntp-health-pub-cert.pem
+#   {cert_dir}/ntp-health-pub-key.pem
+ntp_health_pub_cert_dir: "/opt/ntp-health-pub/certs"
+
+# Source path on the host for the trial fabric's CA root certificate. Read-only
+# bind-mounted as /ca/ca-root.pem so the client verifies the router's server
+# cert. Same file the zenoh-router + audit-subscriber + fabric-health use.
+ntp_health_pub_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# Host-side compose project dir.
+ntp_health_pub_compose_dir: "/opt/ntp-health-pub"
+
+# Logging filter.
+ntp_health_pub_rust_log: "goat_ntp_health_pub=info,zenoh=warn"

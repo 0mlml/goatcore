@@ -1,0 +1,283 @@
+---
+# netbird-client-pin — hold the netbird client at netbird_version and restore
+# the dpkg-managed binary when the one on disk isn't it.
+#
+# Exists because an unsigned hand-built binary `cp`'d over /usr/bin/netbird
+# leaves dpkg believing the stock package is installed while something else
+# runs — invisible to apt, and with no hold the
+# next `apt upgrade` would silently float the client to whatever pkgs.netbird.io
+# ships. This role makes the installed client an Ansible-declared fact:
+#   - reinstalls the pinned package when the RUNNING binary's version string
+#     differs from the pin; from apt when the repo carries the pin, else from
+#     the checksum-verified release .deb (a host with no netbird apt source,
+#     F-306) (dpkg's own version can't see a hand-copied binary,
+#     so the check is against `netbird version` output);
+#   - apt-holds the package so unattended/apt upgrades can't move it.
+#
+# The reinstall restarts the netbird daemon (deb maintscript), which drops the
+# mesh path this play usually arrives over — so the reinstall+restart fires
+# async fire-and-forget, then the play waits for the connection to come back
+# and verifies the version. Expect a ~10-30s mesh blip on the target.
+
+- name: netbird-client-pin ({{ netbird_version | default('unset — no-op') }})
+  when: (netbird_version | default('')) | length > 0
+  block:
+
+    - name: Read the RUNNING netbird binary version
+      ansible.builtin.command: netbird version
+      register: nb_running
+      changed_when: false
+      failed_when: false
+
+    - name: Read the dpkg-registered netbird version
+      ansible.builtin.command: dpkg-query -W -f='${Version}' netbird
+      register: nb_dpkg
+      changed_when: false
+      failed_when: false
+
+    - name: Decide whether a reinstall is needed
+      ansible.builtin.set_fact:
+        nb_pin_reinstall: >-
+          {{ (nb_running.stdout | default('') | trim != netbird_version)
+             or (nb_dpkg.stdout | default('') | trim != netbird_version) }}
+
+    - name: Reinstall pinned netbird {{ netbird_version }} + restart (async — the daemon bounce drops the mesh path this play rides on)
+      ansible.builtin.shell: |
+        set -e
+        apt-mark unhold netbird >/dev/null 2>&1 || true
+        apt-get update -qq || true
+        if apt-cache policy netbird 2>/dev/null | grep -q "{{ netbird_version }}"; then
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --allow-downgrades "netbird={{ netbird_version }}"
+        else
+          # No apt candidate for the pin: a host enrolled from a hand-placed
+          # binary with no netbird apt source (the zagros-prod Orins, F-306), or
+          # a repo that has moved past the pin. Take the release .deb instead,
+          # checksum-verified against the release's checksums file, so the
+          # pin still lands and dpkg owns the result.
+          arch="$(dpkg --print-architecture)"
+          tmp="$(mktemp -d)"; cd "$tmp"
+          base="https://github.com/netbirdio/netbird/releases/download/v{{ netbird_version }}"
+          curl -fsSL -o netbird.deb "$base/netbird_{{ netbird_version }}_linux_${arch}.deb"
+          curl -fsSL -o checksums.txt "$base/netbird_{{ netbird_version }}_checksums.txt"
+          want="$(grep " netbird_{{ netbird_version }}_linux_${arch}.deb$" checksums.txt | cut -d' ' -f1)"
+          [ -n "$want" ]
+          echo "$want  netbird.deb" | sha256sum -c - >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "$tmp/netbird.deb"
+          cd /; rm -rf "$tmp"
+        fi
+        # A hand-placed /usr/local/bin/netbird sits ahead of /usr/bin on PATH and
+        # in the unit's ExecStart; point it at the dpkg-owned binary so the
+        # running daemon and `netbird version` are the pin, not the old copy.
+        if [ -f /usr/local/bin/netbird ] && [ ! -L /usr/local/bin/netbird ]; then
+          ln -sf /usr/bin/netbird /usr/local/bin/netbird
+        fi
+        systemctl restart netbird
+      async: 180
+      poll: 0
+      when: nb_pin_reinstall | bool
+
+    - name: Wait for the host to come back over the mesh
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 180
+      when: nb_pin_reinstall | bool
+
+    - name: Verify the running binary now reports the pin
+      ansible.builtin.command: netbird version
+      register: nb_verify
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: nb_verify.stdout | trim == netbird_version
+      when: nb_pin_reinstall | bool
+
+    - name: Hold netbird at {{ netbird_version }}
+      ansible.builtin.dpkg_selections:
+        name: netbird
+        selection: hold
+
+# ---------------------------------------------------------------------------
+# netbird.out / netbird.err rotation.
+#
+# DELIBERATELY OUTSIDE the pin block above. That block no-ops when
+# netbird_version is unset, and log hygiene has nothing to do with whether this
+# goatnet pins a client version — a host running an unpinned netbird fills its
+# disk exactly as fast. See the defaults for the measurement and for why
+# copytruncate is mandatory here.
+# ---------------------------------------------------------------------------
+- name: netbird log rotation
+  when: netbird_log_rotate_enabled | bool
+  block:
+    - name: Does this host run the netbird service (i.e. are there raw logs)?
+      ansible.builtin.stat:
+        path: /var/log/netbird
+      register: nb_logdir
+
+    # logrotate is NOT necessarily installed on these hosts: a freshly-written
+    # stanza then silently does nothing (`logrotate: command not found`) while
+    # /etc/logrotate.d/ holds package-shipped stanzas — apt, apport, dpkg, rsyslog,
+    # chrony and friends, every one of them inert.
+    # The directory existing is not evidence that anything rotates.
+    #
+    # Installing it activates those dormant stanzas on first run. That is the
+    # behaviour the packages shipped them for, and it is desirable, but it IS a
+    # change in what happens on the host — hence its own flag rather than a
+    # silent dependency.
+    - name: Ensure logrotate exists (the stanza below is inert without it)
+      ansible.builtin.apt:
+        name: logrotate
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: nb_logdir.stat.exists | default(false)
+
+    # copytruncate ALONE IS NOT ENOUGH, and getting this wrong is worse than
+    # doing nothing. The stock unit uses `StandardOutput=file:`, which systemd
+    # opens WITHOUT O_APPEND. After a truncate the daemon keeps writing at its
+    # old offset, so the file becomes SPARSE: right after the first rotation the
+    # apparent size stays near 10 GB on 9 MiB of real blocks. df is correct and the space really did come back, but
+    # logrotate reads apparent st_size, so it sees a 9.6 GiB file that "needs
+    # rotating" on every single run and re-copies the hole forever.
+    #
+    # `append:` opens O_APPEND, so a truncate resets the write offset to 0 and
+    # copytruncate behaves the way its name promises. A drop-in rather than an
+    # edit to the unit: the unit ships in the netbird .deb and an upgrade would
+    # silently take the edit away with it.
+    - name: Ensure the netbird drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/netbird.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: nb_logdir.stat.exists | default(false)
+
+    - name: Drop-in — netbird stdout/stderr must be O_APPEND for copytruncate to work
+      ansible.builtin.copy:
+        content: |
+          # {{ ansible_managed }}
+          # See roles/netbird-client-pin: `file:` is not O_APPEND, so
+          # logrotate's copytruncate leaves a sparse file whose apparent size
+          # never shrinks. `append:` makes truncation actually reset the offset.
+          [Service]
+          StandardOutput=append:/var/log/netbird/netbird.out
+          StandardError=append:/var/log/netbird/netbird.err
+        dest: /etc/systemd/system/netbird.service.d/10-goat-log-append.conf
+        owner: root
+        group: root
+        mode: "0644"
+      when: nb_logdir.stat.exists | default(false)
+      register: nb_logappend_dropin
+
+    - name: Reload systemd for the netbird drop-in
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: nb_logappend_dropin is changed
+
+    # Is the RUNNING daemon actually on an O_APPEND fd yet?
+    #
+    # `systemctl show` is NOT evidence: after daemon-reload it reports the new
+    # StandardOutput while the live process still holds the fd it was started
+    # with. The only truth is the process's own fd flags. O_APPEND is 0o2000.
+    #
+    # This gate exists because installing the logrotate stanza before the
+    # daemon is on an appending fd is WORSE than installing nothing:
+    # copytruncate would leave a sparse file whose apparent size never shrinks,
+    # and logrotate would then re-copy that hole on every run.
+    - name: Check whether the running netbird holds an O_APPEND stdout fd
+      ansible.builtin.shell: |
+        set -o pipefail
+        p=$(pgrep -x netbird | head -1) || exit 1
+        f=$(awk '/^flags/{print $2}' "/proc/$p/fdinfo/1")
+        test $(( 8#$f & 8#2000 )) -ne 0
+      args:
+        executable: /bin/bash
+      register: nb_fd_append
+      changed_when: false
+      failed_when: false
+      when: nb_logdir.stat.exists | default(false)
+
+    - name: Say that netbird must restart before rotation can be enabled safely
+      ansible.builtin.debug:
+        msg: >-
+          netbird is still running on a non-appending stdout fd, so the
+          logrotate stanza is NOT being installed on this host yet — with
+          copytruncate it would produce a sparse netbird.out. The drop-in is in
+          place; restart netbird (`systemctl restart netbird`, ~10-30s mesh
+          blip) and re-run this role.
+      when:
+        - nb_logdir.stat.exists | default(false)
+        - nb_fd_append.rc | default(1) != 0
+
+    - name: Install logrotate stanza for the raw stdout/stderr capture
+      ansible.builtin.copy:
+        content: |
+          # {{ ansible_managed }}
+          # The netbird unit's raw stdout/stderr capture. netbird rotates its
+          # own --log-file (client.log); these two it does not, and nothing
+          # else does either, so they grow without bound.
+          #
+          # copytruncate: systemd holds these open as the daemon's fd 1/2. A
+          # rename-and-create rotation would leave netbird writing to the
+          # unlinked inode and the space would never come back.
+          /var/log/netbird/netbird.out
+          /var/log/netbird/netbird.err
+          {
+              su root root
+              daily
+              maxsize {{ netbird_log_rotate_maxsize }}
+              rotate {{ netbird_log_rotate_keep }}
+              compress
+              # NO delaycompress. It exists for rotations where the writer keeps
+              # its fd on the OLD file; copytruncate copies then truncates, so
+              # nothing ever writes to the .1 and delaying buys nothing. It does
+              # cost: on the first rotation of a 9.7 GiB file it leaves a
+              # 9.7 GiB uncompressed .1 and frees exactly zero bytes until the
+              # next cycle. Compressed immediately, that same file is ~180 MiB.
+              missingok
+              notifempty
+              copytruncate
+          }
+        dest: /etc/logrotate.d/netbird-goat
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - nb_logdir.stat.exists | default(false)
+        - nb_fd_append.rc | default(1) == 0
+      register: nb_logrotate_cfg
+
+    - name: Rotate now so an existing backlog is not left until the next daily run
+      ansible.builtin.command:
+        cmd: logrotate /etc/logrotate.d/netbird-goat
+      when: nb_logrotate_cfg is changed
+      changed_when: true
+      failed_when: false
+
+- name: netbird log rotation teardown
+  when: not (netbird_log_rotate_enabled | bool)
+  block:
+    - name: Remove the logrotate stanza and the O_APPEND drop-in
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/logrotate.d/netbird-goat
+        - /etc/systemd/system/netbird.service.d/10-goat-log-append.conf
+      register: nb_logrot_removed
+
+    - name: Reload systemd after removing the drop-in
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: nb_logrot_removed is changed
+
+    # Deliberately does NOT restart netbird. Reverting to the stock `file:`
+    # behaviour needs a daemon bounce, and silently dropping the mesh path as a
+    # side effect of a teardown is worse than leaving the drop-in effective
+    # until the next restart. Say so instead.
+    - name: Say what teardown did and did not do
+      ansible.builtin.debug:
+        msg:
+          - "netbird log rotation is TORN DOWN. netbird.out/.err will grow unbounded again."
+          - "The O_APPEND drop-in file is gone but STAYS IN EFFECT on the running"
+          - "daemon until netbird next restarts — this teardown will not bounce it."

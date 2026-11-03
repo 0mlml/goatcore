@@ -1,0 +1,136 @@
+---
+# ory-narrow-repset — defaults.
+#
+# Block 21G. Idempotent role that lands the narrow
+# Ory Spock repset per ADR 1010 D8. Installs the Spock extension in
+# the `kratos` and `hydra` databases (the production init script
+# explicitly does NOT do this; the comment there gates on "when
+# intra-site Spock for kratos+hydra is validated" — Pattern C IS
+# that validation), creates the `ory_narrow` repset, adds the
+# canonical inclusion list of 10 tables (plus the goat_revocations
+# ledger, ADR 1193), asserts no exclusion-list
+# table is a member, and wires per-DB subscriptions to peer sites'
+# `ory_narrow` repsets.
+#
+# Design: docs/design/identity-architecture.md §13.5.3.
+# Plan: docs/project/ory-spock-narrow-repset-plan.md.
+# Schema audit (per-table classification): docs/project/ory-spock-narrow-repset-schema-audit.md.
+# ADR: docs/adr/1010-ory-on-spock-mindful-operation.md D8.
+
+# Master gate. Defaults OFF. Sites opt in by setting `ory_spock_enabled: true`
+# in their group_vars. Until flipped on, the role short-circuits via
+# end_play at the top of tasks/main.yml — no SQL runs, no extension
+# is installed.
+ory_spock_enabled: "{{ ory_spock_enabled | default(false) | bool }}"
+
+# Topology mode inherits from the same group_var spock-mesh-peering
+# uses, so a site's inter-site topology setting applies uniformly to
+# both netbird (default repset, Block 64Q) and Ory (ory_narrow,
+# Block 21G).
+ory_spock_topology: "{{ inter_site_spock_topology | default('none') }}"
+ory_spock_explicit_peers: "{{ inter_site_spock_peers | default([]) }}"
+
+# Databases this role manages. Both get the Spock extension, both
+# get the `ory_narrow` repset, both get inclusion-list tables added,
+# both get cross-site subscriptions wired.
+ory_spock_databases:
+  - kratos
+  - hydra
+
+# Postgres container name. Shared convention across the project.
+ory_spock_postgres_container: postgres-a
+
+# Replication user. Cluster-shared password resolved from
+# <SITE_UPPER>_REPLICATOR_PASS env var at runtime (same convention
+# as spock-mesh-peering).
+ory_spock_replicator_user: replicator
+
+# Replicating-timeout (seconds) for sub_show_status() polling after
+# fresh sub_create. Matches spock-mesh-peering default.
+ory_spock_replicating_timeout_seconds: 60
+ory_spock_replicating_poll_interval_seconds: 2
+
+# Subscription tunables — match spock-mesh-peering for consistency.
+# synchronize_data := false  → no initial-data sync (sites stand up
+#   with their own kratos/hydra-migrate-created rows, peers
+#   incrementally pick up new writes from their bootstrap time
+#   forward).
+# forward_origins := empty  → prevent re-replication loops in N-way
+#   meshes.
+ory_spock_synchronize_data: false
+ory_spock_forward_origins: []
+
+# Inclusion list — the 10 canonical tables that ride on Spock, plus the
+# goat_revocations ledger (ADR 1193) that the revocation guard adds,
+# replication under D8. Per-table rationale in
+# docs/project/ory-spock-narrow-repset-schema-audit.md.
+ory_spock_inclusion_tables:
+  kratos:
+    - public.identities
+    - public.identity_credentials
+    - public.identity_credential_identifiers
+    - public.identity_credential_types
+    - public.identity_recovery_addresses
+    - public.identity_verifiable_addresses
+    - public.networks
+    # Not a Kratos table: the revocation ledger (ADR 1193).
+    - public.goat_revocations
+  hydra:
+    - public.hydra_client
+    - public.hydra_jwk
+    - public.networks
+
+# Canonical exclusion list — explicitly NOT in the repset. The
+# pre-flight asserts none of these are repset members; if any are,
+# the role refuses to continue (manual recovery required, since
+# something landed them in the wrong scope). The list below
+# represents the v1.3.1 / v2.3.0 schema; new tables in a future
+# version-bump go through the reality-check pass per the schema
+# audit doc.
+ory_spock_exclusion_tables:
+  kratos:
+    - public.selfservice_login_flows
+    - public.selfservice_registration_flows
+    - public.selfservice_recovery_flows
+    - public.selfservice_settings_flows
+    - public.selfservice_verification_flows
+    - public.sessions
+    - public.session_devices
+    - public.session_token_exchanges
+    - public.continuity_containers
+    - public.courier_messages
+    - public.schema_migration
+  hydra:
+    - public.hydra_oauth2_access
+    - public.hydra_oauth2_refresh
+    - public.hydra_oauth2_code
+    - public.hydra_oauth2_pkce
+    - public.hydra_oauth2_logout_request
+    - public.hydra_oauth2_consent_request
+    - public.hydra_oauth2_consent_request_handled
+    - public.hydra_oauth2_authentication_request
+    - public.hydra_oauth2_authentication_request_handled
+    - public.hydra_oauth2_authentication_session
+    - public.hydra_oauth2_obfuscated_authentication_session
+    - public.hydra_oauth2_trusted_jwt_bearer_issuer
+    - public.hydra_oauth2_flow
+    - public.hydra_schema_migration
+
+# Repset name. Singular across both databases; future expansion
+# (e.g., separating signing keys from identity rows for distinct
+# durability profiles) would split this.
+ory_spock_repset_name: ory_narrow
+
+# Pre-flight wait: how many seconds to wait for kratos / hydra
+# containers to be healthy before the role touches their databases.
+# Ensures kratos-migrate / hydra-migrate have run and the tables
+# actually exist before we try to add them to a repset.
+ory_spock_preflight_wait_seconds: 60
+
+# Revocation guard (issue #1505, ADR 1193): identities set inactive or deleted
+# cannot be made active again by a later write from another site, and each
+# site deletes its own sessions for a revoked identity. Hydra has no guard:
+# the goat revoke path does not revoke through Hydra rows.
+ory_spock_revocation_guard: true
+ory_spock_revocation_guard_sql:
+  kratos: "{{ role_path }}/../../../postgres/spock/revocation-guard/kratos.sql"

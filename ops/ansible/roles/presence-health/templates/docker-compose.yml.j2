@@ -1,0 +1,44 @@
+# {{ ansible_managed }}
+#
+# goat-presence-health meter for {{ presence_health_site }}. Rendered by
+# ops/ansible/roles/presence-health/ (ADR 1040 gap 3 / ADR 1036). One container,
+# mTLS Zenoh client peer of the router: watches the fabric's liveliness
+# presence tokens (`{{ presence_health_watch_key }}`, history-replayed on
+# connect) and publishes ops/presence/health/{{ presence_health_site }}.
+# Persists nothing — no secrets, no .env.
+
+services:
+  presence-health:
+    image: {{ presence_health_image }}
+    container_name: presence-health
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      # Reaches the router over the zenoh compose network.
+      - zenoh
+    environment:
+      PRESENCE_HEALTH_ENDPOINT: "{{ presence_health_zenoh_endpoint }}"
+      PRESENCE_HEALTH_SITE: "{{ presence_health_site }}"
+      PRESENCE_HEALTH_INTERVAL_MS: "{{ presence_health_interval_ms }}"
+      PRESENCE_HEALTH_WATCH_KEY: "{{ presence_health_watch_key }}"
+      RUST_LOG: "{{ presence_health_rust_log }}"
+{% if presence_health_zenoh_endpoint.startswith('tls/') %}
+      PRESENCE_HEALTH_CERT: "/certs/presence-health-cert.pem"
+      PRESENCE_HEALTH_KEY_FILE: "/certs/presence-health-key.pem"
+      PRESENCE_HEALTH_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+{% if presence_health_zenoh_endpoint.startswith('tls/') %}
+    volumes:
+      - "{{ presence_health_cert_dir }}:/certs:ro"
+      - "{{ presence_health_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+
+networks:
+  zenoh:
+    name: {{ presence_health_zenoh_network }}
+    external: true

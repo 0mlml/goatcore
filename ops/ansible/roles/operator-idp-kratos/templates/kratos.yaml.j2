@@ -1,0 +1,119 @@
+# Rendered by ops/ansible/roles/operator-idp-kratos on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/operator-idp-kratos/templates/kratos.yaml.j2
+# Anchor: ADR 0842 (dedicated operator IdP).
+#
+# WebAuthn-only credential method (no password, no totp). Operator
+# population is small + already YubiKey-equipped per the dev-CA
+# multi-operator distribution; password adds attack surface without
+# usability gain. Recovery from token loss = operator-fired re-enroll
+# via the operator-IdP onboarding runbook (21H.2 artifact).
+
+version: v1.3.1
+
+dsn: $DSN
+
+serve:
+  public:
+    base_url: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/"
+    cors:
+      enabled: true
+      allowed_origins:
+        - "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}"
+      allowed_methods: [POST, GET, PUT, PATCH, DELETE]
+      allowed_headers: [Authorization, Cookie, Content-Type]
+      exposed_headers: [Content-Type, Set-Cookie]
+  admin:
+    base_url: "http://127.0.0.1:{{ operator_idp_kratos_admin_host_port }}/"
+
+selfservice:
+  default_browser_return_url: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/"
+  allowed_return_urls:
+    - "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/"
+    # Hydra consent UI redirect target for OAuth2 flows initiated by
+    # operator-IdP consumers (Grafana, MinIO, etc.).
+    - "https://oauth2.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/"
+  flows:
+    settings:
+      ui_url: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/settings"
+      privileged_session_max_age: 15m
+      required_aal: highest_available
+    login:
+      ui_url: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/login"
+      # 60m, matching the ory role. A LOGIN FLOW lifespan is how long a
+      # rendered sign-in form stays submittable — not the session — so
+      # shortening it buys no session security; an unsubmitted form grants
+      # nothing. At 10m a form opened while reading something else is dead
+      # by the time anyone types into it — Kratos re-renders cleanly in that
+      # case, so the cost is interruption, not an error. See ADR 1010 D2.
+      lifespan: {{ operator_idp_kratos_login_flow_lifespan | default('60m') }}
+    # Self-service registration is OFF for the operator IdP — operator
+    # identities are admin-managed via 21H.2 enrollment script. Anyone
+    # who can hit the registration page must NOT be able to mint
+    # themselves an obs-admin role.
+    registration:
+      enabled: false
+      # Inert while registration is disabled; kept in step with login so the
+      # two cannot drift if it is ever switched on.
+      lifespan: {{ operator_idp_kratos_registration_flow_lifespan | default('60m') }}
+      ui_url: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/registration"
+    error:
+      ui_url: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/error"
+    logout:
+      after:
+        default_browser_return_url: "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}/"
+
+  methods:
+    # WebAuthn-ONLY per ADR 0842 §"Open questions" → resolved.
+    # Operator population is small + YubiKey-equipped; password adds
+    # attack surface without usability gain.
+    password:
+      enabled: false
+    totp:
+      enabled: false
+    webauthn:
+      enabled: true
+      config:
+        # Passwordless: WebAuthn IS the credential, not a second factor
+        # over a password.
+        passwordless: true
+        rp:
+          display_name: "Operator IdP — {{ site_id | upper }}"
+          # Distinct RP ID from site Kratos. Per ADR 0842, a credential
+          # issued for site Hydra MUST NOT be replayable against
+          # operator IdP and vice versa.
+          id: "{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}"
+          origins:
+            - "https://auth.{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}"
+
+identity:
+  default_schema_id: operator
+  schemas:
+    - id: operator
+      url: file:///etc/config/identity-schema.json
+
+session:
+  lifespan: 8h
+  cookie:
+    domain: "{{ operator_idp_kratos_webauthn_rp_id_prefix }}.{{ site_id }}.{{ site_dns_zone }}"
+    same_site: Lax
+    persistent: true
+
+secrets:
+  # Populated at runtime from /opt/operator-idp-kratos/.env (mode 0600)
+  # via env-override on KRATOS_SECRETS_COOKIE / KRATOS_SECRETS_CIPHER.
+  # FRESH per site (NOT cluster-shared) — operator-IdP DB is per-site
+  # so per-site cipher/cookie keys are correct.
+  cookie: []
+  cipher: []
+
+courier:
+  smtp:
+    # No-op courier. WebAuthn-only flow doesn't email; this block
+    # exists because Kratos requires it. Pointing at a local sink that
+    # won't deliver is the safe default.
+    connection_uri: "smtps://localhost:1025/?disable_starttls=true"
+
+log:
+  level: info
+  format: json
+  leak_sensitive_values: false

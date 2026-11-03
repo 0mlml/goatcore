@@ -1,0 +1,317 @@
+---
+# Install (or fully remove) the warrant membership converger. Idempotent.
+# docs/design/mesh-change-control.md §4.4.
+
+# ---------------------------------------------------------------------------
+# Teardown branch: runs when disabled, and removes what an earlier deploy put
+# there rather than merely declining to install it again.
+# ---------------------------------------------------------------------------
+- name: warrant-membership | teardown when disabled
+  when: not (warrant_membership_enabled | bool)
+  block:
+    - name: warrant-membership | stop + disable timer and service
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - warrant-membership.timer
+        - warrant-membership.service
+      failed_when: false
+
+    - name: warrant-membership | remove units, env file and declaration
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/warrant-membership.timer
+        - /etc/systemd/system/warrant-membership.service
+        - /etc/goat/warrant/warrant.env
+        - /etc/goat/warrant/membership
+        # The profile the role wrote; the fallback audit log beside it is
+        # left for whoever reads the record.
+        - /var/lib/goat-warrant/profile/contexts/default/profile.toml
+
+    # A gauge file the exporter keeps serving after the job is gone reads as a
+    # converger that simply stopped finding drift.
+    - name: warrant-membership | find the converger's gauge files
+      ansible.builtin.find:
+        paths: "{{ warrant_membership_textfile_dir }}"
+        patterns: "goat_warrant_membership*.prom"
+      register: warrant_membership_stale_prom
+      when: warrant_membership_textfile_dir | length > 0
+
+    - name: warrant-membership | remove the converger's gauge files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ warrant_membership_stale_prom.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: warrant-membership | reload systemd after removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# Install branch.
+# ---------------------------------------------------------------------------
+- name: warrant-membership | install
+  when: warrant_membership_enabled | bool
+  block:
+    - name: warrant-membership | require the NetBird service identity (warrant-membership)
+      ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+      vars:
+        nsi_identity: warrant-membership
+        nsi_token: "{{ lookup('env', warrant_membership_token_env) if warrant_membership_token_env | length > 0 else '' }}"
+
+    - name: warrant-membership | refuse to install unconfigured
+      ansible.builtin.assert:
+        that:
+          - warrant_membership_scope | length > 0
+          - warrant_membership_scope is match('^[a-z0-9][a-z0-9-]*$')
+          - lookup('env', warrant_membership_token_env) | length >= 20
+          - warrant_membership_api_url | length > 0
+          - warrant_membership_textfile_dir | length > 0
+        fail_msg: >-
+          warrant-membership needs warrant_membership_scope (a taxonomy scope),
+          a token of at least 20 characters in ${{ warrant_membership_token_env | default('<warrant_membership_token_env>', true) }}
+          (the svc-{{ site_id }}-warrant PAT), warrant_membership_api_url and
+          warrant_membership_textfile_dir (the directory this host's
+          node_exporter actually reads, F-335).
+        quiet: true
+
+    # The declaration is the switch (design §4.1): a scope is the DIRECTORY
+    # ops/warrant/membership/<scope>/, and its _scope.yaml carries `converge:`.
+    # A scope with no _scope.yaml is not governed, so installing a converger for
+    # it is a mistake, not a default.
+    - name: warrant-membership | the declaration exists in the repo
+      ansible.builtin.stat:
+        path: "{{ warrant_membership_src_dir }}/_scope.yaml"
+      delegate_to: localhost
+      become: false
+      register: warrant_membership_decl
+
+    - name: warrant-membership | refuse a scope with no declaration
+      ansible.builtin.assert:
+        that:
+          - warrant_membership_decl.stat.exists
+        fail_msg: >-
+          ops/warrant/membership/{{ warrant_membership_scope }}/_scope.yaml does
+          not exist. A scope is governed by warrant only when its declaration
+          directory exists (docs/design/mesh-change-control.md §4.1); author and
+          merge it first, or set warrant_membership_enabled: false.
+        quiet: true
+
+    # The timer does what the declaration says. The CLI's own default is
+    # `report` (safe for a person at a terminal), so the unit passes
+    # _scope.yaml's `converge:` explicitly; changing it means redeploying the
+    # directory, so the two cannot drift.
+    - name: warrant-membership | read the declaration's converge mode
+      ansible.builtin.set_fact:
+        warrant_membership_mode: "{{ (lookup('ansible.builtin.file', warrant_membership_src_dir ~ '/_scope.yaml') | from_yaml).converge | default('') }}"
+
+    - name: warrant-membership | converge mode is report or enforce
+      ansible.builtin.assert:
+        that:
+          - warrant_membership_mode in ['report', 'enforce']
+        fail_msg: "converge: must be report or enforce, got {{ warrant_membership_mode }}"
+        quiet: true
+
+    - name: warrant-membership | the goat CLI is installed
+      ansible.builtin.stat:
+        path: "{{ warrant_membership_goat_bin }}"
+      register: warrant_membership_goat
+
+    - name: warrant-membership | refuse without the goat CLI
+      ansible.builtin.assert:
+        that:
+          - warrant_membership_goat.stat.exists
+        fail_msg: >-
+          {{ warrant_membership_goat_bin }} is not on this host. The converger
+          is `goat warrant apply --membership`; install the goat CLI first.
+        quiet: true
+
+    - name: warrant-membership | directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /etc/goat
+        - /etc/goat/warrant
+        - /etc/goat/warrant/membership
+
+    # The whole scope directory — _scope.yaml, every fragment at any depth, and
+    # _baseline.generated.yaml — mirrored to /etc/goat/warrant/membership/<scope>/.
+    # Only *.yaml is installed (it is all the converger reads), and a file the
+    # repo no longer has is removed: a fragment deleted in a reviewed PR must
+    # not keep converging from the host.
+    - name: warrant-membership | list the declaration's files in the repo
+      ansible.builtin.find:
+        paths: "{{ warrant_membership_src_dir }}"
+        patterns: "*.yaml"
+        recurse: true
+        hidden: false
+      delegate_to: localhost
+      become: false
+      register: warrant_membership_src_files
+
+    - name: warrant-membership | the declaration's relative paths
+      ansible.builtin.set_fact:
+        warrant_membership_rel_files: >-
+          {{ warrant_membership_src_files.files | map(attribute='path')
+             | map('relpath', warrant_membership_src_dir | realpath)
+             | list | sort }}
+
+    - name: warrant-membership | scope directory tree on the host
+      ansible.builtin.file:
+        path: "{{ warrant_membership_dest_dir }}/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ [''] + (warrant_membership_rel_files | map('dirname') | select | unique | list) }}"
+
+    - name: warrant-membership | install the declaration's files
+      ansible.builtin.copy:
+        src: "{{ warrant_membership_src_dir }}/{{ item }}"
+        dest: "{{ warrant_membership_dest_dir }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ warrant_membership_rel_files }}"
+      notify: restart warrant-membership timer
+
+    - name: warrant-membership | list what the host holds
+      ansible.builtin.find:
+        paths: "{{ warrant_membership_dest_dir }}"
+        file_type: file
+        recurse: true
+        hidden: true
+      register: warrant_membership_dest_files
+
+    - name: warrant-membership | remove files the repo no longer has
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ warrant_membership_dest_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: (item.path | relpath(warrant_membership_dest_dir)) not in warrant_membership_rel_files
+      notify: restart warrant-membership timer
+
+    # The retired single-file layout. Left in place it is a second declaration
+    # nothing converges from, and the lifecycle sweep would still read it.
+    - name: warrant-membership | remove the retired single-file declaration
+      ansible.builtin.file:
+        path: "/etc/goat/warrant/membership/{{ warrant_membership_scope }}.yaml"
+        state: absent
+      notify: restart warrant-membership timer
+
+    - name: warrant-membership | install env file
+      ansible.builtin.template:
+        src: warrant.env.j2
+        dest: /etc/goat/warrant/warrant.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: restart warrant-membership timer
+
+    # The unit's goat profile (StateDirectory=goat-warrant, GOAT_PROFILE_DIR=
+    # /var/lib/goat-warrant/profile). Only the audit emit reads it: its
+    # router_endpoint is where the OperatorActionV1 is published (#1455).
+    - name: warrant-membership | profile directory
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        # 0755 on the first two: systemd's StateDirectory and goat itself
+        # create them that way, so any other mode reports changed every run.
+        - { path: /var/lib/goat-warrant, mode: "0755" }
+        - { path: /var/lib/goat-warrant/profile, mode: "0755" }
+        - { path: /var/lib/goat-warrant/profile/contexts, mode: "0700" }
+        - { path: /var/lib/goat-warrant/profile/contexts/default, mode: "0700" }
+      loop_control:
+        label: "{{ item.path }}"
+      when: warrant_membership_router_endpoint | length > 0
+
+    - name: warrant-membership | install the profile (audit emit router)
+      ansible.builtin.template:
+        src: profile.toml.j2
+        dest: /var/lib/goat-warrant/profile/contexts/default/profile.toml
+        owner: root
+        group: root
+        mode: "0600"
+      when: warrant_membership_router_endpoint | length > 0
+
+    - name: warrant-membership | say what the audit emit still lacks
+      ansible.builtin.debug:
+        msg: >-
+          Operator-action audit: recipients {{ 'rendered' if warrant_membership_operator_age_recipients else 'MISSING (GOAT_OPERATOR_AGE_RECIPIENTS unset in this shell)' }};
+          router {{ warrant_membership_router_endpoint if warrant_membership_router_endpoint else 'MISSING (portal_router_endpoint unset)' }}.
+          No mTLS identity is installed for this unit, so its OperatorActionV1
+          still lands in /var/lib/goat-warrant/profile/audit/operator-actions.log
+          until one is minted (#1455).
+
+    - name: warrant-membership | install units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - warrant-membership.service
+        - warrant-membership.timer
+      notify: restart warrant-membership timer
+
+    - name: warrant-membership | flush handlers so the timer starts from current unit files
+      ansible.builtin.meta: flush_handlers
+
+    - name: warrant-membership | enable + start timer
+      ansible.builtin.systemd:
+        name: warrant-membership.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: warrant-membership | run once now
+      ansible.builtin.command:
+        cmd: systemctl start --wait warrant-membership.service
+      register: warrant_membership_run
+      changed_when: false
+      failed_when: false
+      when: warrant_membership_run_now | bool
+
+    - name: warrant-membership | read back the run
+      ansible.builtin.command:
+        cmd: journalctl -u warrant-membership.service -n 40 --no-pager -o cat
+      register: warrant_membership_journal
+      changed_when: false
+      failed_when: false
+      when: warrant_membership_run_now | bool
+
+    - name: warrant-membership | report
+      ansible.builtin.debug:
+        msg: "{{ warrant_membership_journal.stdout_lines | default([]) }}"
+      when: warrant_membership_run_now | bool
+
+    # A converger that fails on its first run with an operator watching must
+    # stop the play; left alone it fails every five minutes unattended.
+    - name: warrant-membership | fail the play if the first run failed
+      ansible.builtin.fail:
+        msg: >-
+          warrant-membership.service failed its first run (rc={{ warrant_membership_run.rc }}).
+          The timer is installed. Read: journalctl -u warrant-membership.service -n 50.
+          A refusal for exceeding --max-changes is deliberate; fix the
+          declaration rather than raising the ceiling.
+      when:
+        - warrant_membership_run_now | bool
+        - warrant_membership_run.rc | default(0) != 0

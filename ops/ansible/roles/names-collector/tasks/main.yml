@@ -1,0 +1,88 @@
+---
+# Deploy the passive self-claims collector on a mgmt host (ADR 1082
+# Amendment 2 §7.3). Pre-flight (operator-side, NOT this role): the leaf
+# cert + key (Subject CN=names-collector-trial-peer, clientAuth) minted via
+# the offline-CA cert-sign ceremony, read through goat_leaf (the site manifest's
+# out_dir, then ops/enrollment/<site>/ as a fallback; #2165).
+# Its CN is granted the fabric read set by the router's `trial-peer-r-all`
+# rule (any CA-rooted peer may declare_subscriber), so NO new ACL rule is
+# needed — the collector only reads.
+
+- name: names-collector | pre-flight leaf cert present
+  ansible.builtin.stat:
+    path: "{{ names_collector_cert_src | goat_leaf }}"
+  register: nc_cert_stat
+  delegate_to: localhost
+  become: false
+
+- name: names-collector | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      GB-071 names-collector: leaf cert missing at
+      {{ names_collector_cert_src | goat_leaf }}. Mint it
+      ({{ names_collector_cert_src | goat_leaf_mint }}) or via the
+      offline-CA cert-sign ceremony (CN=names-collector-trial-peer,
+      --eku clientAuth) before re-running — see
+      docs/design/name-fallback-resolver.md §7.3.
+  when: not (nc_cert_stat.stat.exists | default(false))
+
+- name: names-collector | context dir
+  ansible.builtin.file:
+    path: "{{ names_collector_ctx_dir }}/contexts/collector"
+    state: directory
+    mode: "0750"
+  become: true
+
+- name: names-collector | install leaf cert + key + CA root
+  ansible.builtin.copy:
+    src: "{{ (item.src | goat_leaf) if item.leaf else (playbook_dir ~ '/../enrollment/' ~ item.src) }}"
+    dest: "{{ names_collector_ctx_dir }}/contexts/collector/{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ names_collector_cert_src }}", dest: "mtls.cert.pem", mode: "0644", leaf: true }
+    - { src: "{{ names_collector_key_src }}", dest: "mtls.key.pem", mode: "0640", leaf: true }
+    - { src: "{{ names_collector_ca_root_src }}", dest: "ca-roots.pem", mode: "0644", leaf: false }
+  become: true
+  notify: Restart names-collector
+
+- name: names-collector | render profile.toml
+  ansible.builtin.template:
+    src: profile.toml.j2
+    dest: "{{ names_collector_ctx_dir }}/contexts/collector/profile.toml"
+    mode: "0644"
+  become: true
+  notify: Restart names-collector
+
+- name: names-collector | stage goat binary (from the goat-get pinned release)
+  ansible.builtin.copy:
+    src: "{{ names_collector_goat_src }}"
+    dest: "{{ names_collector_goat_bin }}"
+    mode: "0755"
+    remote_src: true
+  become: true
+  notify: Restart names-collector
+
+- name: names-collector | render systemd unit
+  ansible.builtin.template:
+    src: goat-names-collector.service.j2
+    dest: /etc/systemd/system/goat-names-collector.service
+    mode: "0644"
+  become: true
+  notify:
+    - Reload systemd
+    - Restart names-collector
+
+- name: names-collector | enable + start
+  ansible.builtin.systemd:
+    name: goat-names-collector.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+
+- name: names-collector | wait for the service to be active
+  ansible.builtin.command: systemctl is-active goat-names-collector.service
+  register: nc_active
+  changed_when: false
+  failed_when: nc_active.stdout != "active"
+  become: true

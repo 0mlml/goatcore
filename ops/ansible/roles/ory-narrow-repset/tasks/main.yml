@@ -1,0 +1,127 @@
+---
+# ory-narrow-repset — install Spock extension + create narrow repset
+# + add inclusion-list tables + wire cross-site subscriptions for the
+# Ory `kratos` and `hydra` databases.
+#
+# Block 21G. ADR 1010 D8 amendment.
+#
+# Idempotent: per-database EXISTS checks on spock catalog tables
+# (spock.replication_set, spock.tables, spock.node, spock.subscription)
+# short-circuit re-runs.
+#
+# Convention (mirrors spock-mesh-peering):
+#   Spock node name per DB:
+#     intra_site_pair=true  → <site_id_underscored>_a_<db>
+#     intra_site_pair=false → <site_id_underscored>_<db>
+#   Subscription name:
+#     ory_sub_<provider_node>_to_<subscriber_node>
+#     Created ON the subscriber, pulls FROM the provider.
+#   Repset name: ory_narrow (in both kratos and hydra DBs)
+
+- name: "ory-narrow-repset | short-circuit when ory_spock_enabled=false or site doesn't participate"
+  ansible.builtin.meta: end_play
+  when: >-
+    not (ory_spock_enabled | bool)
+    or not (participates_in_spock | default(false) | bool)
+    or ory_spock_topology == 'none'
+
+- name: "ory-narrow-repset | refuse unknown topology values"
+  ansible.builtin.assert:
+    that:
+      - ory_spock_topology in ['full_mesh', 'explicit']
+    fail_msg: >-
+      inter_site_spock_topology={{ ory_spock_topology }} is not recognized.
+      Accepted: none | full_mesh | explicit. (Same gate as
+      spock-mesh-peering.)
+
+# ----------------------------------------------------------------------
+# Pre-flight — replicator password + role health
+# ----------------------------------------------------------------------
+
+- name: "ory-narrow-repset | resolve cluster-shared replicator password from env"
+  ansible.builtin.set_fact:
+    ory_spock_replicator_password: >-
+      {{ lookup('env', (site_id | upper | replace('-', '_')) ~ '_REPLICATOR_PASS') }}
+  no_log: true
+
+- name: "ory-narrow-repset | refuse to start without replicator password"
+  ansible.builtin.assert:
+    that:
+      - ory_spock_replicator_password | length > 0
+    fail_msg: >-
+      {{ (site_id | upper | replace('-', '_')) ~ '_REPLICATOR_PASS' }} is empty.
+      Cluster-shared replicator password MUST be set in operator env
+      (same value cluster-wide; see spock-mesh-peering pre-flight).
+
+- name: "ory-narrow-repset | wait for kratos + hydra containers healthy"
+  # Ensures kratos-migrate / hydra-migrate have created the v1.3.1 /
+  # v2.3.0 schema before we touch their databases. Container names vary by
+  # deploy shape: integdev uses explicit kratos-a/hydra-a container_names;
+  # ZAGROS-shaped sites get compose-generated mgmt-host-{kratos,hydra}-1
+  # (no container_name in the ory compose). Override per-site via
+  # ory_spock_kratos_container / ory_spock_hydra_container group_vars.
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      docker inspect --format '{{ "{{" }}.State.Health.Status{{ "}}" }}' {{ ory_spock_kratos_container | default('kratos-a') }} 2>/dev/null | grep -q healthy
+      docker inspect --format '{{ "{{" }}.State.Health.Status{{ "}}" }}' {{ ory_spock_hydra_container | default('hydra-a') }} 2>/dev/null | grep -q healthy
+  register: ory_spock_container_health
+  retries: "{{ (ory_spock_preflight_wait_seconds / 5) | int }}"
+  delay: 5
+  until: ory_spock_container_health.rc == 0
+  changed_when: false
+
+# ----------------------------------------------------------------------
+# Per-database substrate: extension + node + repset + tables
+# ----------------------------------------------------------------------
+
+- name: "ory-narrow-repset | install + populate per database"
+  ansible.builtin.include_tasks: per_db.yml
+  loop: "{{ ory_spock_databases }}"
+  loop_control:
+    loop_var: ory_spock_db
+
+# ----------------------------------------------------------------------
+# Subscriptions — wire cross-site per Ory DB. Mirrors spock-mesh-peering
+# logic but scoped to ory_narrow + kratos/hydra DBs.
+# ----------------------------------------------------------------------
+
+- name: "ory-narrow-repset | compute peer site_ids for subscription mesh"
+  ansible.builtin.set_fact:
+    ory_spock_peer_sites: >-
+      {%- if ory_spock_topology == 'full_mesh' -%}
+        {{ groups['mgmt_hosts']
+           | map('extract', hostvars)
+           | selectattr('participates_in_spock', 'defined')
+           | selectattr('participates_in_spock', 'eq', true)
+           | map(attribute='site_id')
+           | reject('eq', site_id)
+           | unique
+           | list }}
+      {%- else -%}
+        {{ ory_spock_explicit_peers }}
+      {%- endif -%}
+
+- name: "ory-narrow-repset | report peer set"
+  ansible.builtin.debug:
+    msg: >-
+      site_id={{ site_id }} replicates ory_narrow against peers:
+      {{ ory_spock_peer_sites | default([]) | join(', ') or '(none)' }}
+
+- name: "ory-narrow-repset | wire subscriptions per database x peer"
+  ansible.builtin.include_tasks: per_subscription.yml
+  loop: "{{ ory_spock_databases | product(ory_spock_peer_sites) | list }}"
+  loop_control:
+    loop_var: ory_spock_db_peer
+  when: ory_spock_peer_sites | length > 0
+
+# A separate pass: both directions must be wired before either site's snapshot
+# is taken, or a write between the snapshot and reverse subscription is lost.
+- name: "ory-narrow-repset | reconcile history after subscription wiring"
+  ansible.builtin.include_tasks: per_subscription.yml
+  vars:
+    ory_spock_reconcile_only: true
+  loop: "{{ ory_spock_databases | product(ory_spock_peer_sites) | list }}"
+  loop_control:
+    loop_var: ory_spock_db_peer
+  when: ory_spock_peer_sites | length > 0

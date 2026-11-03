@@ -1,0 +1,53 @@
+! keepalived.conf — managed by ops/ansible/roles/keepalived-mgmt/.
+! Per-site active-passive VRRP for mgmt-host VIP failover.
+! See docs/design/ha-failover.md for the design and the role README
+! for the failure-mode design.
+
+global_defs {
+    router_id mgmt-{{ site_id }}-{{ router_role | lower }}
+    enable_script_security
+    script_user root
+}
+
+! Health-check vrrp_script — monitors postgres-a + traefik + postgres
+! healthcheck. Returns non-zero on failure → the running MASTER demotes,
+! BACKUP promotes.
+vrrp_script chk_mgmt_stack {
+    script "{{ keepalived_health_check_script }}"
+    interval {{ keepalived_health_check_interval }}
+    timeout {{ keepalived_health_check_timeout }}
+    rise {{ keepalived_health_check_rise }}
+    fall {{ keepalived_health_check_fall }}
+    weight 0
+}
+
+vrrp_instance mgmt {
+    state {{ 'MASTER' if (router_role | upper) == 'A' else 'BACKUP' }}
+    interface {{ keepalived_lan_interface }}
+    virtual_router_id {{ keepalived_router_id }}
+    priority {{ keepalived_priority_a if (router_role | upper) == 'A' else keepalived_priority_b }}
+    advert_int {{ keepalived_advert_int }}
+{% if keepalived_nopreempt | default(true) | bool %}
+    ! nopreempt — F-055 + ADR 0318 no-auto-failback stance. Once this
+    ! node is BACKUP, it does not preempt the current MASTER even if
+    ! its priority is higher. Failback is operator-fired.
+    nopreempt
+{% endif %}
+
+    authentication {
+        auth_type {{ keepalived_auth_type }}
+        auth_pass {{ keepalived_auth_pass }}
+    }
+
+    virtual_ipaddress {
+        {{ keepalived_vip }} dev {{ keepalived_lan_interface }} label {{ keepalived_lan_interface }}:vip
+    }
+
+    track_script {
+        chk_mgmt_stack
+    }
+
+    notify_master "{{ keepalived_notify_master }}"
+    notify_backup "{{ keepalived_notify_backup }}"
+    notify_fault "{{ keepalived_notify_fault }}"
+}

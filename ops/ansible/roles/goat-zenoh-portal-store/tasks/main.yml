@@ -1,0 +1,43 @@
+---
+# Run by goat-zenoh-portal before it renders anything (ADR 1165 step A).
+#
+# 1. The gate: image store label, declared store and host marker agree.
+# 2. Postgres database: always on a host with no rows yet (a new goatnet
+#    starting on Postgres), otherwise whenever the deployer supplied the
+#    superuser password, which re-asserts the pg_hba line after a postgres-a
+#    recreate. A routine portal deploy without it skips this step; the cutover
+#    playbook always runs it.
+# 3. On that new host, the marker that says its rows are in Postgres.
+
+- name: goat-zenoh-portal-store | gate
+  ansible.builtin.include_tasks: gate.yml
+
+- name: goat-zenoh-portal-store | provision the Postgres database
+  ansible.builtin.include_tasks: postgres-db.yml
+  when:
+    - portal_store == 'postgres'
+    - (gzps_host_store == '') or (postgres_superuser_password | default('') | length > 0)
+
+- name: goat-zenoh-portal-store | the marker directory
+  ansible.builtin.file:
+    path: "{{ portal_store_marker | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - portal_store == 'postgres'
+    - gzps_host_store == ''
+
+- name: goat-zenoh-portal-store | record that this new host's registry is Postgres
+  ansible.builtin.copy:
+    content: |
+      postgres
+      new host with no SQLite rows; started on Postgres by the goat-zenoh-portal role at {{ now(utc=true).isoformat() }}Z
+    dest: "{{ portal_store_marker }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - portal_store == 'postgres'
+    - gzps_host_store == ''

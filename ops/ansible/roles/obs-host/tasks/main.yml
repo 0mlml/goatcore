@@ -1,0 +1,583 @@
+---
+# STORAGE-TIER GUARD. On the eMMC fallback the observability stack shares
+# ~57 GB with the root filesystem, so an unbounded TSDB does not degrade metrics,
+# it takes the host down. Fail closed rather than pick a ceiling on the operator's
+# behalf: a guessed number on a disk shared with the OS is the wrong thing to be
+# quietly wrong about.
+- name: obs-host | the emmc tier requires an explicit TSDB size ceiling
+  ansible.builtin.assert:
+    that:
+      - obs_storage_tier in ['nvme', 'emmc']
+      - not (obs_storage_tier == 'emmc' and (prometheus_retention_size | default('') | length == 0))
+    fail_msg: >-
+      obs-host: obs_storage_tier must be 'nvme' or 'emmc' (got
+      '{{ obs_storage_tier | default("unset") }}'), and the emmc tier REQUIRES a
+      non-empty prometheus_retention_size. On eMMC the TSDB shares ~57 GB with
+      the operating system; time-based retention alone does not bound it, and a
+      full root filesystem is a dead host rather than a gap in graphs. Set both
+      in host_vars for this node.
+
+- name: obs-host | data root must not sit on the missing NVMe when on emmc
+  ansible.builtin.assert:
+    that:
+      - not (obs_storage_tier == 'emmc' and obs_data_root is search('^/opt/docker-data'))
+    fail_msg: >-
+      obs-host: obs_storage_tier is 'emmc' but obs_data_root still points at
+      {{ obs_data_root }}, which is the NVMe-backed path. On the fallback tier
+      the data root must be on the root filesystem, or the deploy writes to a
+      directory that only exists when the failed disk is present.
+
+- name: obs-host | blackbox probing requires targets, and targets require a resolver
+  # Both halves fail closed, because both silent failures look like success.
+  # No targets: the exporter runs, the job has an empty target list, the
+  # absent() guard in tls-cert-renewal.yml fires critical within 30m and the
+  # deploy looks fine. No resolve IP with mesh-zone targets: docker's embedded
+  # DNS cannot reach mesh CoreDNS, so every probe NXDOMAINs and
+  # the same guard fires — with probe_success 0 rather than absent, which reads
+  # as an outage of every surface at once.
+  ansible.builtin.assert:
+    that:
+      - not (obs_blackbox_enabled | default(false) and (obs_blackbox_targets | default([]) | length) == 0)
+      - not (obs_blackbox_enabled | default(false) and (site_dns_zone | mandatory | length) == 0)
+      - not (obs_blackbox_enabled | default(false) and (obs_blackbox_image | default('') | length) == 0)
+    fail_msg: >-
+      obs-host: obs_blackbox_enabled is true but obs_blackbox_targets is empty.
+      An enabled exporter with no targets emits no
+      probe_ssl_earliest_cert_expiry at all, so TlsCertExpiryUnobserved fires
+      critical 30 minutes after this deploy and keeps firing. Declare the probe
+      targets in this goatnet's obs group_vars, or set
+      obs_blackbox_enabled: false.
+
+      site_dns_zone must also be set on this group: the shared blackbox module
+      file carries it in its DNS-probe module, and an obs host is not a member
+      of its goatnet's mgmt group so it inherits nothing from there. Without it
+      the config render dies on an undefined variable mid-play, after the
+      compose file has already been written.
+    success_msg: >-
+      blackbox: {{ 'enabled with ' ~ (obs_blackbox_targets | default([]) | unique | length) ~ ' declared target(s)'
+                   if (obs_blackbox_enabled | default(false)) else 'disabled' }}
+
+# Probe only what the goatnet says is LIVE (#1518). obs_blackbox_targets is
+# the hand-kept list in this obs group's vars; the service registry
+# (isitup_services) lives in the mgmt group's vars, which an obs host does not
+# inherit. So read it through hostvars, from the group named by
+# obs_blackbox_registry_group, and drop every target whose host belongs to a
+# row marked `lifecycle: planned` / `retiring` or `listed: false`.
+#
+# That makes silencing a service a one-line edit to its registry row. Before
+# this, a deprecated service kept paging until someone ALSO deleted its line
+# here — two lists, one of which was always forgotten.
+- name: obs-host | the registry group named for probe filtering exists in this inventory
+  ansible.builtin.assert:
+    that:
+      - (groups[obs_blackbox_registry_group] | default([])) | length > 0
+    fail_msg: >-
+      obs_blackbox_registry_group is {{ obs_blackbox_registry_group }}, but that
+      group has no hosts in this inventory, so the registry cannot be read and
+      a service marked planned or retiring would keep being probed. Run with
+      the inventory that carries the goatnet's mgmt group (mgmt-hosts.ini).
+  when:
+    - obs_blackbox_enabled | default(false)
+    - (obs_blackbox_registry_group | default('')) | length > 0
+
+- name: obs-host | read the service registry the probe targets are filtered against
+  # One {fqdn, lifecycle, listed} per isitup_services row and per external-
+  # service hostname, with past-retire_after and disabled declarations folded
+  # into listed: false (templates/registry-rows.json.j2). prometheus.yml.j2 and
+  # docker-compose.yml.j2 drop every target whose host is on a row that is not
+  # live or not listed.
+  ansible.builtin.set_fact:
+    obs_blackbox_registry_rows: >-
+      {{ lookup('ansible.builtin.template', 'registry-rows.json.j2',
+                template_vars={'reg': hostvars[groups[obs_blackbox_registry_group][0]]}) | from_json }}
+  when:
+    - obs_blackbox_enabled | default(false)
+    - (obs_blackbox_registry_group | default('')) | length > 0
+
+- name: obs-host | resolve the effective rule set
+  # obs_rule_files is the operator-facing list. tls-cert-renewal.yml is NOT in
+  # it and must not be: its TlsCertExpiryUnobserved guard is
+  # absent(probe_ssl_earliest_cert_expiry{job="blackbox-https"}), which is TRUE
+  # on every obs host that does not scrape blackbox — so listing it flatly
+  # would fire a permanent critical on each of them. It travels with the
+  # exporter instead, so the rule and the metric it needs arrive together or
+  # not at all. Both the install loop and the did-they-load assertion read this
+  # fact, so they cannot disagree about what was shipped.
+  #
+  # obs_rule_files_exclude drops individual files from the default list without
+  # restating it. Without it, a site that runs no audit-subscriber
+  # could only stop loading audit-subscriber.yml by copying all six defaults
+  # into its group_vars minus one — which then silently stops inheriting the
+  # NEXT rule file added to the role, so the cheap option would be to leave the
+  # dead rule loaded.
+  ansible.builtin.set_fact:
+    obs_rule_files_all: >-
+      {{ ((obs_rule_files | default([]))
+          | reject('in', obs_rule_files_exclude | default([])) | list)
+         + (['tls-cert-renewal.yml'] if (obs_blackbox_enabled | default(false)) else []) }}
+
+# ops/ansible/roles/obs-host
+#
+# Anchor: ADR 0826 — per-site three-Orin topology.
+# Companion to ops/ansible/roles/observability (legacy single-host pattern).
+#
+# What this role does:
+#   1. Ensure NVMe-backed storage layout (/opt/docker-data/observability/<service>)
+#   2. Render docker-compose.yml + prometheus.yml + alertmanager.yml +
+#      rules into /opt/obs-host/.
+#   3. Bring up the obs stack (Prometheus + Alertmanager + Grafana +
+#      node_exporter) via docker compose.
+#
+# Phase 2 obs services (MinIO + OpenObserve + OTel Collector — Block 17D +
+# Block 27) live in their own roles (`minio`, `openobserve`, `otel-collector`)
+# and are sequenced by the obs bootstrap playbook's Phases 4-6 directly. This
+# role no longer carries Phase-2 stubs; it owns the Prometheus + Alertmanager +
+# Grafana + node_exporter substrate, and the rules dir (`/opt/obs-host/rules/`)
+# into which the Phase-2 roles drop their alert files.
+#
+# Pre-flight: obs_scrape_targets must be set (typically in group_vars).
+
+- name: Pre-flight — obs_scrape_targets is set
+  ansible.builtin.assert:
+    that:
+      - obs_scrape_targets is defined
+      - obs_scrape_targets | length > 0
+    fail_msg: |
+      The obs-host role requires `obs_scrape_targets` set in group_vars.
+      Each entry: {name, addr, job}. See group_vars/vega_obs_hosts/vars.yml
+      for the vega instance.
+
+- name: Pre-flight — obs_data_root parent (NVMe at /opt/docker-data) exists
+  ansible.builtin.stat:
+    path: /opt/docker-data
+  register: _obs_nvme_stat
+
+- name: Fail if /opt/docker-data is missing (NVMe LUKS not yet up?)
+  ansible.builtin.assert:
+    that:
+      - _obs_nvme_stat.stat.exists | default(false)
+      - _obs_nvme_stat.stat.isdir | default(false)
+    fail_msg: |
+      /opt/docker-data is missing on this host. Per ADR 0826 every
+      Orin gets a 1 TB NVMe mounted at /opt/docker-data. Run
+      ops/ansible/mgmt-host-luks.yml against this host first.
+
+# 1. Storage layout
+
+- name: Ensure obs storage tree exists with container-matching ownership
+  ansible.builtin.file:
+    path: "{{ obs_data_root }}/{{ item.name }}"
+    state: directory
+    owner: "{{ item.uid }}"
+    group: "{{ item.gid }}"
+    mode: "0755"
+  loop:
+    # Container UIDs are baked into the upstream images. If the host
+    # path is root-owned, the container can't write (Prom:
+    # queries.active mmap; Grafana: grafana.db) and crash-loops.
+    - { name: prometheus,   uid: 65534, gid: 65534 }   # 'nobody' in prom/prometheus
+    - { name: alertmanager, uid: 65534, gid: 65534 }   # 'nobody' in prom/alertmanager
+    - { name: grafana,      uid: 472,   gid: 472 }     # 'grafana' user in grafana/grafana
+  # Phase-2 obs services (minio / openobserve / otel-collector) own their
+  # own data dirs under /opt/docker-data/<service>/ — created by their own
+  # roles, not here. obs-host owns only the prom/alertmanager/grafana tier.
+
+- name: Ensure compose dir exists
+  ansible.builtin.file:
+    path: "{{ obs_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure rules + grafana provisioning dirs exist
+  ansible.builtin.file:
+    path: "{{ obs_compose_dir }}/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - rules
+    - grafana/provisioning
+    - grafana/provisioning/datasources
+    - grafana/provisioning/dashboards
+
+# -- Grafana dashboards -------------------------------------
+# A datasource with nothing to draw with it leaves Grafana empty beside hundreds
+# of metric names, so the role provisions dashboards too.
+- name: obs-host | dashboards dir
+  ansible.builtin.file:
+    path: "{{ obs_compose_dir }}/grafana/dashboards"
+    state: directory
+    owner: "472"
+    group: "472"
+    mode: "0755"
+  when: obs_grafana_dashboards_enabled | default(true) | bool
+
+- name: obs-host | resolve the dashboard set this site can actually serve
+  # Everything in the shared dashboards dir, minus what the site declares it
+  # cannot populate. Excluding is deliberate: a panel with no series renders
+  # empty and empty reads as idle, so a container dashboard on a goatnet with no
+  # cadvisor answers "how are the containers" with silence that looks like calm.
+  ansible.builtin.set_fact:
+    obs_grafana_dashboards_all: >-
+      {{ (lookup('fileglob', playbook_dir + '/../compose/goat-obs/grafana/dashboards/*.json',
+                 wantlist=True) | map('basename') | list)
+         | reject('in', obs_grafana_dashboards_exclude | default([])) | sort }}
+  when: obs_grafana_dashboards_enabled | default(true) | bool
+
+- name: obs-host | install the dashboards
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/goat-obs/grafana/dashboards/{{ item }}"
+    dest: "{{ obs_compose_dir }}/grafana/dashboards/{{ item }}"
+    owner: "472"
+    group: "472"
+    mode: "0644"
+  loop: "{{ obs_grafana_dashboards_all }}"
+  when: obs_grafana_dashboards_enabled | default(true) | bool
+  notify: obs-host restart grafana
+
+- name: obs-host | provision the dashboard provider
+  # Points Grafana at the bind-mounted dir. Same provider contract the
+  # co-located stack uses, so the two behave identically.
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/goat-obs/grafana/provisioning/dashboards/dashboards.yml"
+    dest: "{{ obs_compose_dir }}/grafana/provisioning/dashboards/dashboards.yml"
+    owner: "472"
+    group: "472"
+    mode: "0644"
+  when: obs_grafana_dashboards_enabled | default(true) | bool
+  notify: obs-host restart grafana
+
+- name: obs-host | remove dashboards this site no longer serves
+  # Excluding a dashboard must REMOVE it, not merely stop copying it. A file
+  # left behind keeps being provisioned and the exclusion reads as applied.
+  ansible.builtin.file:
+    path: "{{ obs_compose_dir }}/grafana/dashboards/{{ item }}"
+    state: absent
+  loop: "{{ obs_grafana_dashboards_exclude | default([]) }}"
+  when: obs_grafana_dashboards_enabled | default(true) | bool
+  notify: obs-host restart grafana
+
+- name: obs-host | install Prometheus alert rules
+  # prometheus.yml.j2 loads /etc/prometheus/rules/*.yml and the dir was created
+  # but never populated — so this Prometheus ran with NO alert rules at all.
+  # An EXPLICIT list, not a glob of the shared rules dir: many shared rules use
+  # absent() guards for services that do not run on an obs host, and those
+  # would fire immediately and permanently. False alerts are how alerting gets
+  # switched off.
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/goat-obs/prometheus/rules/{{ item }}"
+    dest: "{{ obs_compose_dir }}/rules/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ obs_rule_files_all }}"
+  notify: prometheus reload
+
+# 2. Render configs
+
+- name: obs-host | install blackbox probe modules
+  # Templated, not copied: the shared file carries `{{ site_dns_zone }}` in its
+  # DNS module, so a plain copy ships the literal Jinja and blackbox refuses to
+  # start on a malformed config. Sourced from the goat-obs tree rather than a
+  # role-local duplicate so the module definitions have ONE home — the
+  # http_gate semantics (no redirect-following, 401/403 counted as alive) are
+  # decided in ADR 1133 and must not fork per stack.
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../compose/goat-obs/blackbox/blackbox.yml"
+    dest: "{{ obs_compose_dir }}/blackbox.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  when: obs_blackbox_enabled | default(false)
+  notify: blackbox restart
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ obs_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: obs-host compose changed
+
+- name: Lay down offline-CA root for Grafana OIDC TLS (when operator_idp_enabled)
+  # Required by GF_AUTH_GENERIC_OAUTH_TLS_CLIENT_CA env var when
+  # operator-IdP OIDC is wired (Block 21H.3a). Source path is the
+  # offline-CA bundle present on every Orin per Block 22K. Without
+  # this file, compose start fails because the volume mount
+  # references a non-existent file.
+  ansible.builtin.copy:
+    src: "{{ offline_ca_root_path | default('/opt/goat/bootstrap/offline-ca-root.pem') }}"
+    dest: "{{ obs_compose_dir }}/grafana/offline-ca.pem"
+    remote_src: true
+    owner: root
+    group: "472"  # grafana UID/GID per the obs storage tree task above
+    mode: "0644"
+  when: operator_idp_enabled | default(false) | bool
+  notify: obs-host compose changed
+
+- name: Render prometheus.yml
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: "{{ obs_compose_dir }}/prometheus.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: prometheus reload
+
+- name: Render base alert rules
+  ansible.builtin.template:
+    src: base-alerts.rules.yml.j2
+    dest: "{{ obs_compose_dir }}/rules/base-alerts.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: prometheus reload
+
+- name: Render alertmanager.yml
+  ansible.builtin.template:
+    src: alertmanager.yml.j2
+    dest: "{{ obs_compose_dir }}/alertmanager.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: alertmanager reload
+
+- name: Render Grafana datasource provisioning (Prometheus auto-wired)
+  ansible.builtin.copy:
+    dest: "{{ obs_compose_dir }}/grafana/provisioning/datasources/prometheus.yml"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: false
+  notify: obs-host compose changed
+
+# 3. Bring up the stack
+
+- name: Pull images
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ obs_compose_dir }}"
+  changed_when: true
+
+- name: Bring up obs stack
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ obs_compose_dir }}"
+  register: _obs_compose_up
+  changed_when: "'Started' in _obs_compose_up.stderr or 'Created' in _obs_compose_up.stderr or 'Recreated' in _obs_compose_up.stderr"
+
+- name: Wait for Prometheus ready
+  ansible.builtin.uri:
+    url: http://localhost:9090/-/ready
+    status_code: 200
+  register: _prom_ready
+  retries: 30
+  delay: 2
+  until: _prom_ready.status == 200
+  changed_when: false
+
+- name: Wait for Alertmanager ready
+  ansible.builtin.uri:
+    url: http://localhost:9093/-/ready
+    status_code: 200
+  register: _am_ready
+  retries: 30
+  delay: 2
+  until: _am_ready.status == 200
+  changed_when: false
+
+- name: Wait for Grafana ready
+  ansible.builtin.uri:
+    url: http://localhost:3000/api/health
+    status_code: 200
+  register: _grafana_ready
+  retries: 60
+  delay: 2
+  until: _grafana_ready.status == 200
+  changed_when: false
+
+# -- mesh path-quality probe -------------------------------------------------
+# Opt-in: a site with no obs_mesh_pq_peers gets nothing rather than a probe
+# that measures an empty list and reports healthy silence.
+- name: obs-host | textfile collector dir for host-side probes
+  ansible.builtin.file:
+    path: "{{ obs_textfile_host_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: obs-host | mesh path-quality probe dir
+  ansible.builtin.file:
+    path: "{{ obs_mesh_pq_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: obs_mesh_pq_enabled | bool
+
+- name: obs-host | install the mesh path-quality probe
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../obs/mesh-path-quality/mesh-path-quality.sh"
+    dest: "{{ obs_mesh_pq_dir }}/mesh-path-quality.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  when: obs_mesh_pq_enabled | bool
+
+- name: obs-host | refuse an enabled probe with no peers
+  # A probe with an empty peer list emits no series, and the staleness alert
+  # would then be the only thing firing -- noise that teaches people to ignore
+  # it. Fail loudly at deploy instead.
+  ansible.builtin.assert:
+    that:
+      - obs_mesh_pq_peers | length > 0
+    fail_msg: >-
+      obs_mesh_pq_enabled is true but obs_mesh_pq_peers is empty. Set the peers
+      this host serves users from, or leave the probe disabled.
+  when: obs_mesh_pq_enabled | bool
+
+- name: obs-host | mesh path-quality unit + timer
+  ansible.builtin.template:
+    src: "mesh-path-quality.{{ item }}.j2"
+    dest: "/etc/systemd/system/mesh-path-quality.{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [service, timer]
+  notify: reload systemd
+  when: obs_mesh_pq_enabled | bool
+
+- name: obs-host | enable the mesh path-quality timer
+  ansible.builtin.systemd:
+    name: mesh-path-quality.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: obs_mesh_pq_enabled | bool
+
+- name: obs-host | prime the probe once so metrics exist before the first tick
+  ansible.builtin.systemd:
+    name: mesh-path-quality.service
+    state: started
+  when: obs_mesh_pq_enabled | bool
+  changed_when: false
+
+# -- prove the rules are actually LOADED, not merely on disk -----------------
+# The `prometheus reload` handler carries failed_when: false (correct — a
+# not-yet-up Prometheus must not fail the play), which means a skipped reload
+# is indistinguishable from a successful one, and rule files can sit on disk and
+# mounted while Prometheus reports zero rule groups until a
+# manual reload. A rule that exists but is not loaded is exactly as useful as
+# no rule, and it LOOKS deployed — so assert the outcome rather than trust the
+# notification.
+# Single-file bind mounts bind the INODE, not the path. ansible's `template`
+# writes a temp file and RENAMES it into place, which creates a NEW inode — so
+# a running container keeps the ORIGINAL file forever. A run can rewrite
+# prometheus.yml, report `changed`, and have ZERO effect on the running
+# Prometheus; a /-/reload re-reads the same stale bytes, and the host file and
+# the container can disagree at the same path.
+#
+# Recreating the container is what re-binds the new inode. This is why
+# "reload, don't restart" — correct for a CONTENT change inside a stable file —
+# is wrong for a templated single-file mount.
+- name: obs-host | detect a config the running container cannot see (inode drift)
+  ansible.builtin.shell: |
+    set -o pipefail
+    for f in prometheus.yml alertmanager.yml; do
+      case "$f" in
+        prometheus.yml)   cpath=/etc/prometheus/prometheus.yml;   cname=prometheus ;;
+        alertmanager.yml) cpath=/etc/alertmanager/alertmanager.yml; cname=alertmanager ;;
+      esac
+      docker inspect "$cname" >/dev/null 2>&1 || continue
+      host_sum=$(sha256sum "{{ obs_compose_dir }}/$f" 2>/dev/null | cut -d" " -f1)
+      cont_sum=$(docker exec "$cname" sha256sum "$cpath" 2>/dev/null | cut -d" " -f1)
+      [ -n "$host_sum" ] && [ "$host_sum" != "$cont_sum" ] && echo "$cname"
+    done
+    true
+  args:
+    executable: /bin/bash
+  register: obs_inode_drift
+  changed_when: false
+  check_mode: false
+
+- name: obs-host | recreate containers whose mounted config drifted
+  ansible.builtin.command:
+    cmd: "docker compose -f {{ obs_compose_dir }}/docker-compose.yml up -d --force-recreate {{ item }}"
+  loop: "{{ obs_inode_drift.stdout_lines | default([]) | unique }}"
+  when: (obs_inode_drift.stdout_lines | default([]) | length) > 0
+
+- name: obs-host | reload Prometheus and confirm the rules loaded
+  # Deliberately UNCONDITIONAL. base-alerts.yml is rendered unconditionally a few
+  # tasks up, so a guard that ran only when obs_rule_files was non-empty would ship
+  # the base rules on most goatnets and skip the did-they-actually-load check. The
+  # role always ships rules, so the check always runs.
+  block:
+    - name: obs-host | reload Prometheus (post-handler, explicit)
+      ansible.builtin.uri:
+        url: "http://localhost:9090/-/reload"
+        method: POST
+        status_code: [200]
+      register: obs_prom_reload
+      retries: 5
+      delay: 5
+      until: obs_prom_reload is succeeded
+
+    - name: obs-host | read back the loaded rule groups
+      ansible.builtin.uri:
+        url: "http://localhost:9090/api/v1/rules"
+        return_content: true
+      register: obs_prom_rules
+
+    # Assert EVERY installed file's group is loaded, not merely that SOME
+    # group is. A ">0 groups" check passes while a newly-added file sits
+    # unloaded on disk, and the play would still go green.
+    #
+    # EXPECTATIONS ARE READ OUT OF THE FILES, not guessed from their names.
+    # File stems are not a rule: a group name is the stem only "by convention".
+    # audit-subscriber.yml declares `audit-subscriber.writes` and
+    # `audit-integrity.bucket`, so a stem-derived list would fail this assertion on
+    # EVERY obs host, fleet-wide, for a file that loaded perfectly well.
+    #
+    # Stems are also weaker in the other direction: bandwidth-attribution.yml has TWO
+    # groups, so checking only the stem-named one lets
+    # `bandwidth-attribution-alerts` sit unloaded while the play passes. Parsing gives both.
+    #
+    # base-alerts.yml stays out of the set for an unrelated reason: it is
+    # rendered from a template a few tasks above, so there is no source file
+    # here to parse. Extra loaded groups are fine — this is a subset check.
+    - name: obs-host | derive the expected rule groups from the shipped files
+      ansible.builtin.set_fact:
+        obs_expected_groups: >-
+          {{ (obs_expected_groups | default([]))
+             + ((lookup('file', playbook_dir ~ '/../compose/goat-obs/prometheus/rules/' ~ item)
+                 | from_yaml).groups | map(attribute='name') | list) }}
+      loop: "{{ obs_rule_files_all }}"
+
+    - name: obs-host | fail if any installed rule file is not loaded
+      vars:
+        obs_loaded_groups: "{{ obs_prom_rules.json.data.groups | default([]) | map(attribute='name') | list }}"
+      ansible.builtin.assert:
+        that:
+          - (obs_expected_groups | difference(obs_loaded_groups) | length) == 0
+        fail_msg: >-
+          Installed rule file(s) whose group is NOT loaded in Prometheus:
+          {{ obs_expected_groups | difference(obs_loaded_groups) | join(', ') }}.
+          Loaded: {{ obs_loaded_groups | join(', ') | default('(none)') }}.
+          Rules that exist on disk but are not loaded alert on NOTHING while
+          looking deployed.
+        success_msg: >-
+          All {{ obs_expected_groups | length }} installed rule group(s) loaded
+          ({{ obs_loaded_groups | join(', ') }}).

@@ -1,0 +1,421 @@
+---
+# ops/ansible/roles/onboard-runner/tasks/main.yml
+#
+# Deploys the onboard-runner auto-executor on the site's mgmt host as a CONTAINER with
+# its own scoped portal identity. Default-off: the container only comes up when
+# onboard_runner_enabled=true (and is brought DOWN when false).
+# Design: docs/design/operator-onboard-intake.md §"Fast-follow".
+
+# --- The runner's portal key is a MACHINE credential owned + persisted on the
+#     host, NOT sourced from the deploying laptop's direnv. Generate once, reuse
+#     forever, and register it in the portal's service-key store so a portal
+#     redeploy from any laptop keeps it (the runner-key fragility fix). ---
+- name: Ensure the runner key dir exists
+  ansible.builtin.file:
+    path: "{{ onboard_runner_key_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Check whether the persisted portal key exists
+  ansible.builtin.stat:
+    path: "{{ onboard_runner_key_file }}"
+  register: onboard_runner_keyfile_stat
+
+- name: Generate a fresh portal key (first deploy only, when no seed given)
+  ansible.builtin.command: openssl rand -base64 24
+  register: onboard_runner_genkey
+  changed_when: true
+  when:
+    - not onboard_runner_keyfile_stat.stat.exists
+    - onboard_runner_portal_key_seed | length == 0
+
+- name: Persist the portal key (seed the existing direnv value, else the fresh one)
+  ansible.builtin.copy:
+    # Reuse the direnv value on first deploy (seamless migration off the env),
+    # else the freshly-generated key. Written once; never regenerated after.
+    content: "{{ (onboard_runner_portal_key_seed if (onboard_runner_portal_key_seed | length > 0) else onboard_runner_genkey.stdout) | trim }}"
+    dest: "{{ onboard_runner_key_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: not onboard_runner_keyfile_stat.stat.exists
+  no_log: true
+
+- name: Read the persisted portal key
+  ansible.builtin.slurp:
+    src: "{{ onboard_runner_key_file }}"
+  register: onboard_runner_keyfile
+  no_log: true
+
+- name: Set the portal key fact
+  ansible.builtin.set_fact:
+    onboard_runner_portal_key: "{{ onboard_runner_keyfile.content | b64decode | trim }}"
+  no_log: true
+
+- name: Ensure the portal service-key store dir exists (portal reads it)
+  ansible.builtin.file:
+    path: "{{ onboard_runner_portal_keystore_dir }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0750"
+
+- name: Register the runner key in the portal service-key store
+  ansible.builtin.copy:
+    # The portal reads PORTAL_OPERATOR_API_KEYS_DIR at startup and merges these.
+    # Owned by the portal container uid so it can read the file. Because it lives
+    # under portal_data_dir (persistent + mounted), a portal redeploy from any
+    # laptop keeps it — no dependency on the deploying laptop's direnv.
+    content: "{{ onboard_runner_runner_id }}:{{ onboard_runner_portal_key }}\n"
+    dest: "{{ onboard_runner_portal_keystore_dir }}/onboard-runner.key"
+    owner: "65532"
+    group: "65532"
+    mode: "0640"
+  no_log: true
+  register: onboard_runner_keystore_write
+
+- name: Restart the portal to pick up a newly-written service key
+  # Only when the keystore entry actually changed — so the runner authenticates
+  # immediately on first bring-up without waiting for a separate portal redeploy.
+  # A no-op on steady-state reruns. failed_when:false so a not-yet-deployed
+  # portal (fresh host) doesn't fail the runner deploy.
+  ansible.builtin.command: "docker restart {{ onboard_runner_portal_container_name }}"
+  register: onboard_runner_portal_restart
+  changed_when: onboard_runner_portal_restart.rc == 0
+  failed_when: false
+  when: onboard_runner_keystore_write is changed
+
+- name: onboard-runner | require the NetBird service identity (netbird-infra)
+  ansible.builtin.include_tasks: "{{ role_path }}/../../tasks/require-netbird-service-identity.yml"
+  vars:
+    nsi_identity: netbird-infra
+    nsi_token: "{{ onboard_runner_nb_api_token }}"
+
+- name: Assert the mint credentials are present
+  ansible.builtin.assert:
+    that:
+      - onboard_runner_portal_key | length > 0
+    fail_msg: >-
+      onboard-runner needs a portal key (auto-managed on the Thor at
+      {{ onboard_runner_key_file }}). Its NetBird token is the netbird-infra
+      service identity, checked by the task above.
+    quiet: true
+
+# The collab leg is default-off, but a goatnet that turns it ON and gives it no
+# door gets a runner that disables that leg at RUNTIME with a WARN and reports
+# "collab provider not configured" — while `goat admin onboard --revoke` keeps
+# printing `onboard-runner -collab revoke` as the remedy. Offboarding then
+# leaves a live collaboration account behind. Enabled means configured.
+- name: Assert the collab leg is configured when it is enabled
+  ansible.builtin.assert:
+    that:
+      - onboard_runner_collab_kanidm_url | length > 0
+      - (onboard_runner_collab_kanidm_api_token | length > 0) or (onboard_runner_collab_kanidm_admin_pw | length > 0)
+    fail_msg: >-
+      onboard_runner_collab_enabled is true but the collab leg has no door or no
+      credential: set onboard_runner_collab_kanidm_url in this site's group_vars
+      and export COLLAB_KANIDM_API_TOKEN (preferred) or COLLAB_KANIDM_IDM_ADMIN_PW
+      (60-collab-services.envrc). Set onboard_runner_collab_enabled false if this
+      goatnet has no collab identity plane.
+    quiet: true
+  when: onboard_runner_collab_enabled | bool
+
+# --- Auto-sync the host goat binary to what get.<site> serves on THIS host, so
+#     the runner stays current on every CLI-release redeploy with no out-of-band
+#     step and no second pin (see defaults). Reads goat-get's on-disk served file
+#     (the host may not resolve its own get.<site> hostname), verifies it against the
+#     sibling .sha256 goat-get wrote, installs atomically. ---
+- name: Resolve this host's goat asset name
+  ansible.builtin.set_fact:
+    onboard_runner_goat_asset: >-
+      goat-linux-{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}
+  when: onboard_runner_goat_autoupdate | bool
+
+- name: Check whether goat-get has served this asset on-disk here
+  ansible.builtin.stat:
+    path: "{{ onboard_runner_goat_served_dir }}/{{ onboard_runner_goat_asset }}"
+  register: onboard_runner_served_bin
+  when: onboard_runner_goat_autoupdate | bool
+
+- name: Auto-sync the host goat binary from the on-disk served copy
+  when:
+    - onboard_runner_goat_autoupdate | bool
+    - onboard_runner_served_bin.stat.exists | default(false)
+  block:
+    # Verify the served binary against the sidecar .sha256 goat-get wrote before
+    # trusting it. Compare the hash field only (first whitespace-delimited token),
+    # so the check is independent of the sidecar's second (filename) column — the
+    # same rule `goat update` uses (crates/goat-cli/src/cmd/update.rs). A missing
+    # sidecar is fatal here: install nothing unverified.
+    - name: Verify the served binary against its checksum sidecar
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd "{{ onboard_runner_goat_served_dir }}"
+        [ -f "{{ onboard_runner_goat_asset }}.sha256" ] || { echo "no sidecar for {{ onboard_runner_goat_asset }}"; exit 1; }
+        want="$(awk '{print $1}' "{{ onboard_runner_goat_asset }}.sha256")"
+        got="$(sha256sum "{{ onboard_runner_goat_asset }}" | awk '{print $1}')"
+        [ "$want" = "$got" ] || { echo "checksum mismatch: want=$want got=$got"; exit 1; }
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Install the verified served binary atomically to the host goat path
+      ansible.builtin.copy:
+        src: "{{ onboard_runner_goat_served_dir }}/{{ onboard_runner_goat_asset }}"
+        dest: "{{ onboard_runner_goat_bin_host }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      register: onboard_runner_goat_installed
+
+# Binary-freshness guard: the container BIND-MOUNTS the host `goat`, which shells
+# `goat admin onboard --native` with the GOAT_ONBOARD_KRATOS_ADMIN_URL override
+# (reaching Kratos by container name) — only present on goat >= 0.4.15. A stale
+# host goat would fail the Ory leg; refuse rather than mint half a candidate.
+- name: Probe the host goat binary version
+  ansible.builtin.command: "{{ onboard_runner_goat_bin_host }} --version"
+  register: onboard_runner_goat_ver
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# What is installed, as a fact the ledger records (rollback_served in meta): the
+# version the binary itself reports, not the tag that was meant to be copied.
+- name: Record the installed host goat version for the ledger
+  ansible.builtin.copy:
+    dest: "{{ onboard_runner_goat_marker_dir }}/goat-cli.version.json"
+    content: >-
+      {{ {'version': _onboard_runner_goat_semver,
+          'tag': ('goat-cli-v' ~ _onboard_runner_goat_semver) if _onboard_runner_goat_semver else ''} | to_json }}
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    _onboard_runner_goat_semver: "{{ (onboard_runner_goat_ver.stdout | default('') | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+')) or '' }}"
+  when: onboard_runner_goat_autoupdate | bool
+
+- name: Require goat >= {{ onboard_runner_min_goat_version }} on the host
+  ansible.builtin.assert:
+    that:
+      - onboard_runner_goat_ver.rc == 0
+      - (onboard_runner_goat_ver.stdout | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+')) is version(onboard_runner_min_goat_version, '>=')
+    fail_msg: >-
+      onboard-runner bind-mounts the host goat at {{ onboard_runner_goat_bin_host }}
+      and needs >= {{ onboard_runner_min_goat_version }} (native onboard +
+      GOAT_ONBOARD_KRATOS_ADMIN_URL). Found:
+      "{{ onboard_runner_goat_ver.stdout | default('(missing)') }}". Install it
+      from the get.{{ site_id }} download surface or the goat-cli release first.
+    quiet: true
+  when: onboard_runner_enabled | bool
+
+- name: Create the compose dir
+  ansible.builtin.file:
+    path: "{{ onboard_runner_dir }}"
+    state: directory
+    mode: "0750"
+
+# --- SPIFFE mTLS sidecar (default OFF) ---
+- name: SVID bind dir owned by the runner UID (spiffe-helper writes here)
+  # The spiffe-helper (run as this UID) writes the 0600 SVID key here; the runner
+  # (same UID) reads it. A host bind dir chowned to the UID, so the key is owned
+  # by — and readable by — the runner without ever being world-readable.
+  ansible.builtin.file:
+    path: "{{ onboard_runner_svid_dir }}"
+    state: directory
+    owner: "{{ onboard_runner_spire_uid }}"
+    group: "{{ onboard_runner_spire_uid }}"
+    mode: "0700"
+  when: onboard_runner_mtls_enabled | bool
+
+- name: Render the runner spiffe-helper.conf
+  ansible.builtin.template:
+    src: spiffe-helper.conf.j2
+    dest: "{{ onboard_runner_dir }}/spiffe-helper.conf"
+    owner: root
+    mode: "0644"
+  when: onboard_runner_mtls_enabled | bool
+
+# The native mint reads the manifest schema (enum validation), the selected
+# environment's affiliation catalog when enabled, and ops/operators/<env>/ (it writes the
+# materialized manifest there + a bundle under ops/operators/out/). It does NOT
+# need the whole repo or the other manifests — and a full clone of the PRIVATE
+# repo would need a token on the host. So place the schema, enabled catalog, and dirs, owned
+# by the container's non-root uid so the mint can write.
+- name: Create the operators tree the native mint reads/writes (container-uid-owned)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ onboard_runner_uid }}"
+    group: "{{ onboard_runner_uid }}"
+    mode: "0750"
+  loop:
+    # The FULL chain is listed (not just the leaves) so every level is owned by
+    # the container uid — the mint's os.MkdirAll/WriteFile runs as that uid and
+    # must be able to traverse + write from the repo-root down. Listing only the
+    # leaves left the parents root/prior-owned (0750), so the container (65532)
+    # couldn't even open /repo. Also re-chowns any stale ownership left by the
+    # earlier host-process daemon's service user.
+    - "{{ onboard_runner_repo_root_host }}"
+    - "{{ onboard_runner_repo_root_host }}/ops"
+    - "{{ onboard_runner_repo_root_host }}/ops/operators"
+    - "{{ onboard_runner_repo_root_host }}/ops/operators/schema"
+    - "{{ onboard_runner_repo_root_host }}/ops/operators/{{ onboard_runner_only_env }}"
+    - "{{ onboard_runner_repo_root_host }}/ops/operators/out"
+    - "{{ onboard_runner_repo_root_host }}/ops/scripts"
+
+- name: Place the manifest schema
+  ansible.builtin.copy:
+    src: "{{ onboard_runner_schema_src }}"
+    dest: "{{ onboard_runner_repo_root_host }}/ops/operators/schema/operator-manifest.schema.json"
+    owner: "{{ onboard_runner_uid }}"
+    group: "{{ onboard_runner_uid }}"
+    mode: "0644"
+
+- name: Stage the selected environment's affiliation catalog
+  ansible.builtin.include_tasks: affiliation-catalog.yml
+
+- name: Place the lifecycle release engine
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/lifecycle-sweep.py"
+    dest: "{{ onboard_runner_repo_root_host }}/ops/scripts/lifecycle-sweep.py"
+    owner: "{{ onboard_runner_uid }}"
+    group: "{{ onboard_runner_uid }}"
+    mode: "0555"
+
+- name: Allow the runner to lock and atomically replace lifecycle hold records
+  ansible.builtin.file:
+    path: "{{ peerview_state_dir | default('/var/lib/peerview') }}"
+    state: directory
+    owner: root
+    group: "{{ onboard_runner_uid }}"
+    mode: "0770"
+  when: peerview_enabled | default(false) | bool
+
+- name: Share lifecycle hold-record files with the runner
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: touch
+    owner: root
+    group: "{{ onboard_runner_uid }}"
+    mode: "0660"
+    access_time: preserve
+    modification_time: preserve
+  loop:
+    - "{{ peerview_state_dir | default('/var/lib/peerview') }}/hold-records.jsonl"
+    - "{{ peerview_state_dir | default('/var/lib/peerview') }}/hold-records.jsonl.lock"
+  when:
+    - onboard_runner_enabled | bool
+    - peerview_enabled | default(false) | bool
+
+- name: Render the compose env-file (mint credentials — 0600)
+  ansible.builtin.template:
+    src: onboard-runner.env.j2
+    dest: "{{ onboard_runner_dir }}/.env"
+    mode: "0600"
+  no_log: true
+
+- name: Render the compose file
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ onboard_runner_dir }}/docker-compose.yml"
+    mode: "0644"
+
+- name: Bring the runner up (only when the go-live gate is on)
+  when: onboard_runner_enabled | bool
+  block:
+    - name: Pull the runner image
+      community.docker.docker_compose_v2_pull:
+        project_src: "{{ onboard_runner_dir }}"
+      changed_when: false
+
+    - name: Bring up the onboard-runner container
+      community.docker.docker_compose_v2:
+        project_src: "{{ onboard_runner_dir }}"
+        state: present
+
+    - name: Confirm the container is running
+      community.docker.docker_container_info:
+        name: "{{ onboard_runner_container_name }}"
+      register: onboard_runner_state
+      retries: 5
+      delay: 2
+      until: onboard_runner_state.exists and onboard_runner_state.container.State.Running | bool
+      changed_when: false
+
+    # --- Fail-closed gate: the runner container must reach THIS goatnet's
+    #     NetBird management API at the address it resolves the public mgmt FQDN
+    #     to, before this play is allowed to succeed. A wrong extra_hosts address
+    #     otherwise reports ok/changed/failed=0 and surfaces only as `failed`
+    #     proposals.
+    #     Same probe as acceptance row onboard-runner-reaches-mgmt-api, run
+    #     here so no converge path (ansible, deploy-component.sh, fastlane,
+    #     rc.sh) can land a runner that cannot mint. 200/401/403 = reached. ---
+    - name: Probe the NetBird management API from inside the runner container
+      ansible.builtin.command: >-
+        docker exec {{ onboard_runner_container_name }}
+        curl -s -o /dev/null -w '%{http_code}' --max-time 10
+        https://{{ public_mgmt_fqdn }}/api/groups
+      register: onboard_runner_mgmt_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a runner that cannot reach the NetBird management API
+      ansible.builtin.assert:
+        that:
+          - onboard_runner_mgmt_probe.rc == 0
+          - onboard_runner_mgmt_probe.stdout in ['200', '401', '403']
+        fail_msg: >-
+          Inside {{ onboard_runner_container_name }}, https://{{ public_mgmt_fqdn }}/api/groups
+          answered '{{ onboard_runner_mgmt_probe.stdout }}' (curl rc {{ onboard_runner_mgmt_probe.rc }})
+          instead of the management API's 401. Every mint would fail at GET /api/groups
+          and the runner will refuse to claim proposals. The container resolves that name
+          through extra_hosts to '{{ onboard_runner_mgmt_fqdn_addr }}' — check that traefik
+          publishes 443 on the host (`docker port traefik`) and that nothing overrides
+          onboard_runner_traefik_ip for this goatnet.
+        quiet: true
+
+    # A single-file bind-mount pins the inode present at container-start; replacing
+    # the host binary underneath a running container leaves it on the OLD goat until
+    # a restart. `state: present` above is a no-op when only the mounted file changed,
+    # so restart explicitly on an actual binary swap (harmless extra cycle on first
+    # bring-up, where the container already mounted the fresh binary).
+    # Compare what the CONTAINER actually runs against what the HOST has,
+    # rather than trusting this run's `changed` flag. The flag only reports
+    # whether THIS run swapped the binary — so if an earlier run installed it
+    # and then failed before restarting (image pull, network blip), every
+    # later run sees changed=false and the container stays pinned to the old
+    # inode forever, and re-running the play does not fix it.
+    # A version comparison is self-healing; a changed-flag is not.
+    - name: Read the goat version the running container actually has mounted
+      ansible.builtin.command: "docker exec {{ onboard_runner_container_name }} {{ onboard_runner_goat_bin_host }} --version"
+      register: onboard_runner_container_goat_ver
+      changed_when: false
+      failed_when: false
+
+    - name: Restart the runner when its mounted goat differs from the host's
+      ansible.builtin.command: "docker restart {{ onboard_runner_container_name }}"
+      when: >-
+        (onboard_runner_goat_installed is defined and onboard_runner_goat_installed is changed)
+        or (
+          onboard_runner_container_goat_ver.rc == 0
+          and onboard_runner_goat_ver.rc == 0
+          and (onboard_runner_container_goat_ver.stdout | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+'))
+              != (onboard_runner_goat_ver.stdout | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+'))
+        )
+      changed_when: true
+
+- name: Bring the runner DOWN when disabled (so toggling off actually stops it)
+  community.docker.docker_compose_v2:
+    project_src: "{{ onboard_runner_dir }}"
+    state: absent
+  when: not (onboard_runner_enabled | bool)
+
+- name: Note the go-live state
+  ansible.builtin.debug:
+    msg: >-
+      onboard-runner (container) deployed. enabled={{ onboard_runner_enabled }}.
+      {{ 'Container RUNNING — polling ' + onboard_runner_portal_internal_url if onboard_runner_enabled | bool
+         else 'Container DOWN — set onboard_runner_enabled=true to go live.' }}

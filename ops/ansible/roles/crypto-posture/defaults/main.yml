@@ -1,0 +1,57 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the crypto-posture role — deploys goat-crypto-posture, the
+# evidence-based crypto-posture publisher (ADR 1079 / zenoh-pqc-tls.md). A
+# normal mTLS Zenoh client peer that (1) performs a live raw-TLS handshake
+# against the router with a PQ-capable client and records the negotiated
+# key-exchange group, (2) reads the host-side FIPS attestation the
+# goat-zenoh role writes, (3) reads the router version from REST admin,
+# and publishes a freshness-stamped CryptoPostureV1 on ops/fabric/crypto/<site>.
+# Persists nothing.
+#
+# Reuses the fabric-health leaf identity by default: same CN, and the router
+# ACL already grants that subject write on ops/fabric/** (which covers
+# ops/fabric/crypto/**). No new cert to mint.
+
+# Image — SHA-pinned per ADR 0859. Bumps require a deploy-history.yml append.
+# Built by .github/workflows/crypto-posture-image.yml. Placeholder until the
+# first image publishes on merge to main; the ZAGROS pin lands in a follow-up.
+crypto_posture_image: "ghcr.io/{{ ghcr_org }}/goat-crypto-posture@sha256:1303d5d5189f29962b0c276e137e6eb1cf1ae56f3e145dcd9d9ded3c20d3983d"
+
+crypto_posture_site: "{{ fabric_health_site | default('nova-a') }}"
+
+# Router for the raw-TLS probe (host:port) and the zenoh publish endpoint.
+crypto_posture_router_host: "{{ zenoh_stack | default('goat-zenoh') }}-router"
+crypto_posture_probe_addr: "{{ crypto_posture_router_host }}:7447"
+crypto_posture_endpoint: "tls/{{ crypto_posture_router_host }}:7447"
+crypto_posture_rest_url: "http://{{ crypto_posture_router_host }}:8000"
+crypto_posture_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# The SNI the router leaf is issued for. nova-a + ZAGROS both issue the router
+# leaf with a SAN that matches the container name; override per-goatnet only
+# if the router cert SAN differs.
+crypto_posture_sni: "{{ crypto_posture_router_host }}"
+
+# mTLS identity — a dedicated leaf, but issued with CN=fabric-health-trial-peer
+# so the existing router ACL subject (granted write on ops/fabric/**, which
+# covers ops/fabric/crypto/**) admits its publishes with NO ACL change. The
+# operator pre-stages the leaf at {cert_dir}/{cert_file,key_file}; mint via the
+# offline-CA cert-sign ceremony (same shape as the fabric-health leaf). The
+# same cert is used for both the raw-TLS probe and the publish client.
+crypto_posture_cert_dir: "/opt/crypto-posture/certs"
+crypto_posture_cert_file: "crypto-posture-cert.pem"
+crypto_posture_key_file: "crypto-posture-key.pem"
+# Where the host keeps the fabric-health static leaf (the same identity).
+crypto_posture_fabric_health_cert_dir: "/opt/fabric-health/certs"
+crypto_posture_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# Host-side FIPS attestation file written by the goat-zenoh role on a
+# fips-variant deploy. Absent on a non-FIPS router — its absence is honest
+# evidence ("no FIPS attestation"), rendered grey, never green.
+crypto_posture_attest_file: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/fips-attest.json"
+
+crypto_posture_interval_ms: 30000
+crypto_posture_attest_max_age_ms: 86400000
+crypto_posture_compose_dir: "/opt/crypto-posture"
+crypto_posture_rust_log: "goat_crypto_posture=info,zenoh=warn"

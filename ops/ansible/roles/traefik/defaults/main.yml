@@ -1,0 +1,106 @@
+---
+# defaults for ops/ansible/roles/traefik
+#
+# Anchor: docs/design/internal-tls-ca.md §6 (Traefik integration).
+# Decision: ADR 0407 (internal X.509 CA for service TLS).
+
+# traefik_image — pinned via group_vars in production. The default below
+# is for ad-hoc dev only and is flagged by ops/ci/check-pin-compat.sh.
+# Production sites pin to a digest-resolved upstream traefik image or
+# a Chainguard image once procurement lands. See CLAUDE.md "Supply
+# chain" for the procurement-question status.
+traefik_image: "traefik:v3.7.16@sha256:1336e85aaed293bd63d005086e0dd013b04078b26aaeb1c18b26a2f928af7e65"
+
+# Where on the host the cert + key files for each TLS-terminated service
+# live. The traefik container mounts this directory read-only at the same
+# path. Sub-directory per service — operator laptop's cert-sign output
+# is delivered into <traefik_tls_root>/<service>/{cert.pem,key.pem}.
+traefik_tls_root: /etc/goat/tls
+
+# Path to the next-up trust anchor (PEM) on the operator laptop. Concatenated
+# onto the leaf to form the chain Traefik presents on the wire. Naming
+# carries pre-Block-79 history — under the Ed25519 dev CA + the original
+# ECDSA dev-ecdsa setup this pointed at the intermediate cert. Block 79
+# ships with **root-direct leaf signing** (F-107 closure-pending — `ca-init`
+# emits pathlen:0 on root + intermediate, breaking the 3-tier chain) so
+# this default points at the **root**. Clients verifying the chain see
+# `leaf, root` — fine because root is the ultimate trust anchor anyway.
+# When F-107 lands and the root → intermediate → leaf chain is enabled,
+# flip this back to the intermediate path; sites pick up automatically.
+traefik_intermediate_cert: "{{ playbook_dir }}/../enrollment/ca/dev/root-cert.pem"
+
+# Where the dynamic config (TLS options + routers + services) lives on
+# the host. Mounted read-only into the traefik container at the same path.
+traefik_dynamic_dir: /etc/traefik/dynamic
+
+# traefik_services — required, set per-host or per-group. List of dicts;
+# each dict declares one TLS-terminated service.
+#
+#   - name:       service identifier (becomes /etc/goat/tls/<name>/)
+#     hosts:      list of Host header rules — peer-reachable hostnames + IPs
+#     backend:    docker-network URL of the upstream container
+#                 (e.g. "http://management-a:80")
+#     cert_src:   path on the *operator laptop* to the cert PEM (from cert-sign)
+#     key_src:    path on the *operator laptop* to the key PEM (from cert-sign)
+#     middlewares: optional list of middleware names to attach to this
+#                 router. Each name MUST be a key in `traefik_middlewares`
+#                 below or the rendered dynamic.yml references an
+#                 undefined middleware and Traefik 503s the route.
+#                 The role's pre-flight task fails fast on this class.
+#
+# Example:
+#   traefik_services:
+#     - name: mgmt-a
+#       hosts: ["mgmt.<site>.netbird.example.net", "198.18.0.1", "127.0.0.1"]
+#       backend: "http://management-a:80"
+#       cert_src: "{{ lookup('env', 'HOME') }}/.goat/state/<site>/mgmt-a-cert.pem"
+#       key_src:  "{{ lookup('env', 'HOME') }}/.goat/state/<site>/mgmt-a-key.pem"
+traefik_services: []
+
+# traefik_middlewares — optional dict-of-dicts. Each entry is a Traefik
+# middleware definition rendered verbatim into `http.middlewares.<name>`
+# of the dynamic config. Sites enable a middleware by listing its name
+# in `svc.middlewares` (above).
+#
+# Schema is passthrough — the value of each key is the middleware-type
+# dict that Traefik consumes (e.g. `redirectRegex: {regex, replacement,
+# permanent}`). See https://doc.traefik.io/traefik/middlewares/http/overview/
+# for the full middleware-type catalog.
+#
+# Built-in: `dashboard-root-to-access-control` closes F-080 by
+# redirecting the bare `/` URL to `/access-control` at the Traefik
+# tier. The upstream netbirdio/dashboard SPA's `/` route does not
+# hydrate post-OIDC-callback (the React tree silently fails to mount);
+# `/access-control` does. Doing the redirect at Traefik means the
+# workaround survives every dashboard container churn — the prior
+# in-container nginx patch did not.
+traefik_middlewares:
+  dashboard-root-to-access-control:
+    redirectRegex:
+      # Match URLs that are exactly the bare host (with optional
+      # scheme + optional trailing slash, no path). Traefik's
+      # redirectRegex operates on the full request URL string.
+      # `/peers`, `/access-control`, `/static/*` etc. must pass
+      # through unchanged — those routes work; only bare `/` hangs.
+      regex: "^(https?://[^/]+)?/?$"
+      replacement: "${1}/access-control"
+      # 302 (not 301) so the redirect is non-cached. If upstream
+      # netbirdio/dashboard fixes the `/`-route hydration in a future
+      # release we want to be able to drop this middleware without
+      # operators needing to clear browser caches first.
+      permanent: false
+
+# Compose project directory on the host. Where docker-compose.yml lives.
+# The traefik service is part of the main mgmt-host compose; this role
+# does NOT spin up its own compose project.
+mgmt_host_compose_dir: /opt/mgmt-host
+
+# F-473 — converge the cert store to what `traefik_services` declares, removing
+# leaf/key pairs for services that are no longer declared. Without this the
+# store only grows, and a host keeps the private keys of goatnets that stopped
+# existing long ago because no play ever removes them.
+#
+# Set false only on a host that keeps unrelated material under
+# `traefik_tls_root`. Nothing does; a host that needs to should use its own
+# directory.
+traefik_prune_undeclared_certs: true

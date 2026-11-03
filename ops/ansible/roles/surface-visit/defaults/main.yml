@@ -1,0 +1,64 @@
+---
+# surface-visit — one visit emitter per fenced door (ADR 1163).
+#
+# Tails an oauth2-proxy door's request log, keeps the AUTHENTICATED requests,
+# and publishes each as an age-encrypted SurfaceVisitV1 onto
+# ops/audit/surface/<surface>/<actor>, where the audit-subscriber persists it
+# and microscope's surface-visits adapter reads it back.
+#
+# ONE CONTAINER PER DOOR. Each door writes its own log, so each needs its own
+# tail. They are cheap (a log reader and a zenoh client) and keeping them
+# separate means one surface's emitter failing cannot silently take another
+# surface's history with it.
+
+surface_visit_enabled: false
+
+# Which doors to emit for. Each entry needs `name` (the surface, equal to its
+# Hydra client_id and to the ACL/key segment) — the door container is derived
+# as oauth2-proxy-<name>.
+surface_visit_surfaces: []
+
+# Multi-arch index digest, identical under both GHCR namespaces.
+surface_visit_image: "ghcr.io/{{ ghcr_org }}/goat-surface-visit:sha-6c47976@sha256:3ee36a9d077254a504580f1a41780b4636c494d06bb41f725fc51dbe804283f6"
+surface_visit_image_platform: "linux/{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+
+surface_visit_compose_root: "/opt/surface-visit"
+surface_visit_cert_dir: "/opt/surface-visit/certs"
+
+# Infra-class leaf minted offline with Subject CN=goat-surface-visit-trial-peer
+# — the CN is the Zenoh ACL subject match, because Zenoh 1.9.0 has no URI-SAN
+# matcher, so a leaf whose CN changes is a silent denial, not an error.
+# Staged by the operator; this role does NOT mint.
+surface_visit_cert_file: "{{ surface_visit_cert_dir }}/surface-visit-cert.pem"
+surface_visit_key_file: "{{ surface_visit_cert_dir }}/surface-visit-key.pem"
+surface_visit_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+surface_visit_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+surface_visit_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+
+# age RECIPIENTS — public keys of the operator roster. The emitter encrypts to
+# these and holds no identity, so it cannot read back what it writes. An empty
+# file makes the binary refuse to start rather than publish a browsing trail in
+# the clear.
+surface_visit_age_recipients: []
+surface_visit_age_recipients_file: "{{ surface_visit_compose_root }}/age-recipients.txt"
+
+# Where the doors write their request logs — one directory per door, owned by
+# uid 65532 so the door (writer) and this emitter (reader) can both use it.
+# Set by the oauth2-proxy-surface role; must match its
+# oauth2_proxy_surface_log_dir.
+#
+# This replaced mounting Docker's own container-log directory, which is
+# root:root 0710: an unprivileged emitter cannot read it, and the alternatives
+# were running as root or granting read access to EVERY container's output on
+# the host. One file per door is the least-privilege shape.
+surface_visit_door_log_dir: "/opt/oauth2-proxy-logs"
+
+# Start at the end of the log. On a restart the door's whole retained log would
+# otherwise be republished as if those visits had just happened.
+surface_visit_tail_only: true
+
+# Emit nothing; log what would be published. For a first look at a new surface.
+surface_visit_dry_run: false
+
+surface_visit_rust_log: "goat_surface_visit=info"

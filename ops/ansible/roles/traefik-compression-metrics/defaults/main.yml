@@ -1,0 +1,43 @@
+---
+# traefik-compression-metrics — publish the compression effect as Prometheus
+# series, because Traefik's own metrics cannot see it.
+#
+# `traefik_service_responses_bytes_total` counts what the BACKEND produced, not
+# what Traefik put on the wire, so it moves identically whether or not
+# goat-compress is attached. The access log is
+# the only place both numbers exist per request. See ADR 1139 and
+# docs/design/surface-overload-protection.md §4.1.
+
+# Default-OFF, like every other guard on this fleet: a site opts in.
+# `false` here means TEAR DOWN, not "skip" — the tasks remove the unit, timer,
+# env file, script and stale .prom so a disabled site cannot keep publishing a
+# frozen series that reads as healthy.
+traefik_compression_metrics_enabled: false
+
+traefik_compression_metrics_container: "traefik"
+
+# Seconds of access log read per run. Wider than the timer interval on purpose:
+# overlapping windows double-count within a run's own delta, so keep them equal
+# unless you have measured the alternative.
+traefik_compression_metrics_window_s: 300
+traefik_compression_metrics_interval: "5min"
+
+# Cap on log bytes pulled per run. A busy access log runs tens of MB/hour, so an
+# unbounded read on a wedged timer is a memory event, not a slow run.
+traefik_compression_metrics_max_bytes: 67108864
+
+# node_exporter textfile collector directory. This differs per goatnet — do not
+# assume; read the site's own group_vars.
+traefik_compression_metrics_textfile_dir: "/var/lib/node_exporter/textfile"
+traefik_compression_metrics_prom_file: "traefik-compression.prom"
+
+# Prometheus rules. Rendered only where the site declares a rules directory.
+traefik_compression_metrics_rules_dir: ""
+
+# Alert thresholds. `min_saved_ratio` is deliberately low: the point is to catch
+# compression FALLING OFF (middleware detached, entrypoint flag lost on a
+# Traefik recreate), not to police a target. Mesh-client saving is typically
+# 71-81%, so 0.35 fires only on a real regression.
+traefik_compression_metrics_min_saved_ratio: 0.35
+# Below this many origin bytes in the window the ratio is noise, not signal.
+traefik_compression_metrics_min_bytes_for_alert: 2000000

@@ -1,0 +1,110 @@
+# {{ ansible_managed }}
+#
+# goat-consistency-console for {{ consistency_console_site }}. Rendered by
+# ops/ansible/roles/consistency-console/ (consistency-foundation.md §7,
+# ADR 1110 D5). Fence chain: Traefik (mesh-only middleware, defense in depth)
+# -> oauth2-proxy-consistency-console:4180 (PLATFORM-ADMIN gate) ->
+# consistency-console:9760. The console is a read-only mTLS Zenoh client of
+# the router; it publishes nothing, stores nothing, executes nothing.
+
+services:
+  consistency-console:
+    image: "{{ consistency_console_image }}"
+    container_name: consistency-console
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      - "{{ consistency_console_traefik_network }}"
+{% if consistency_console_join_zenoh_network | bool %}
+      - zenoh
+{% endif %}
+    expose:
+      - "9760"
+    environment:
+      GCC_ENDPOINT: "{{ consistency_console_zenoh_endpoint }}"
+      GCC_SITE: "{{ consistency_console_site }}"
+      GCC_LISTEN: "0.0.0.0:9760"
+      GCC_INTENT_FILE: "/intent/intent.json"
+      # CF-5: the .sig sits beside the artifact on the same read-only mount;
+      # the SPKI trust root is the committed public-keys set placed by the
+      # role. Unverifiable => the page refuses the grid and says why.
+      GCC_PUBKEY_DIR: "/intent/public-keys"
+      # release-graduation.md §8: the ladder document, derived at deploy time by the role
+      # and read fresh on every /release render. Absent => the page refuses
+      # and names this path; it never renders an empty ladder.
+      GCC_RELEASE_FILE: "/intent/release-readiness.json"
+      GCC_ROLLUP_STALE_AFTER_MS: "{{ consistency_console_rollup_stale_after_ms }}"
+      RUST_LOG: "{{ consistency_console_rust_log }}"
+{% if consistency_console_sibling_panoscope_url | length > 0 %}
+      CONSISTENCY_SIBLING_PANOSCOPE_URL: "{{ consistency_console_sibling_panoscope_url }}"
+{% endif %}
+{% if consistency_console_sibling_stethoscope_url | length > 0 %}
+      CONSISTENCY_SIBLING_STETHOSCOPE_URL: "{{ consistency_console_sibling_stethoscope_url }}"
+{% endif %}
+{% if consistency_console_sibling_flashlight_url | length > 0 %}
+      CONSISTENCY_SIBLING_FLASHLIGHT_URL: "{{ consistency_console_sibling_flashlight_url }}"
+{% endif %}
+{% if consistency_console_sibling_portal_url | length > 0 %}
+      CONSISTENCY_SIBLING_PORTAL_URL: "{{ consistency_console_sibling_portal_url }}"
+{% endif %}
+{# Block 94 sibling: this site page -> the cross-env comparison page. Its OWN
+   conditional — it was first written inside the portal block above, and since
+   portal is empty on zagros the whole block was skipped and this env var never
+   rendered. The container came up on the right image serving no link, and the
+   ansible recap said changed=7 either way. Each sibling gates independently. #}
+{% if consistency_console_sibling_crossenv_url | length > 0 %}
+      CONSISTENCY_SIBLING_CROSSENV_URL: "{{ consistency_console_sibling_crossenv_url }}"
+{% endif %}
+{% if consistency_console_zenoh_endpoint.startswith('tls/') %}
+      GCC_CERT: "/certs/consistency-console-cert.pem"
+      GCC_KEY_FILE: "/certs/consistency-console-key.pem"
+      GCC_ROOT_CA: "/ca/ca-root.pem"
+{% endif %}
+    volumes:
+      # Read-only, all of them: the console owns no state (§7.3).
+      - "{{ consistency_console_intent_dir }}:/intent:ro"
+{% if consistency_console_zenoh_endpoint.startswith('tls/') %}
+      - "{{ consistency_console_cert_dir }}:/certs:ro"
+      - "{{ consistency_console_ca_root_src }}:/ca/ca-root.pem:ro"
+{% endif %}
+    labels:
+      - "traefik.enable=false"
+
+{% if consistency_console_oauth2_proxy_enabled | bool %}
+  oauth2-proxy-consistency-console:
+    image: "{{ consistency_console_oauth2_proxy_image }}"
+    container_name: oauth2-proxy-consistency-console
+    # Memory ceiling: 4x the 7-day peak working set, floor 512M. An unbounded
+    # leak on a shared host takes the identity plane down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      - "{{ consistency_console_traefik_network }}"
+    expose:
+      - "4180"
+    # OIDC discovery hits the issuer's mesh-DNS name — pin it.
+    extra_hosts:
+      - "{{ consistency_console_oauth2_proxy_oidc_host_entry }}"
+    env_file:
+      - oauth2-proxy-consistency-console.env
+    labels:
+      - "traefik.enable=false"
+{% endif %}
+
+networks:
+  "{{ consistency_console_traefik_network }}":
+    external: true
+    name: "{{ consistency_console_traefik_network }}"
+{% if consistency_console_join_zenoh_network | bool %}
+  zenoh:
+    name: "{{ consistency_console_zenoh_network }}"
+    external: true
+{% endif %}

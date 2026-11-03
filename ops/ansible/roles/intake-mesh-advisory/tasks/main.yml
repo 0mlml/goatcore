@@ -1,0 +1,114 @@
+---
+# intake-mesh-advisory - deploy static on-mesh advisory page for
+# public enrollment hostnames that resolve to the host's mesh-facing
+# Traefik.
+
+- name: intake-mesh-advisory - skip when disabled
+  ansible.builtin.debug:
+    msg: "intake-mesh-advisory disabled (intake_mesh_advisory_enabled=false) - nothing to do"
+  when: not intake_mesh_advisory_enabled
+
+- name: intake-mesh-advisory - require hostnames when enabled
+  ansible.builtin.assert:
+    that:
+      - intake_mesh_advisory_hostnames is defined
+      - intake_mesh_advisory_hostnames | length > 0
+    fail_msg: "intake_mesh_advisory_enabled is true but intake_mesh_advisory_hostnames is empty"
+  when: intake_mesh_advisory_enabled
+
+- name: intake-mesh-advisory - deploy static advisory page
+  when: intake_mesh_advisory_enabled
+  block:
+    - name: intake-mesh-advisory - compose dir
+      ansible.builtin.file:
+        path: "{{ intake_mesh_advisory_compose_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: intake-mesh-advisory - render nginx config
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: "{{ intake_mesh_advisory_compose_dir }}/nginx.conf"
+        mode: "0644"
+      register: _intake_mesh_nginx
+
+    - name: intake-mesh-advisory - render advisory HTML
+      ansible.builtin.template:
+        src: index.html.j2
+        dest: "{{ intake_mesh_advisory_compose_dir }}/index.html"
+        mode: "0644"
+      register: _intake_mesh_html
+
+    - name: intake-mesh-advisory - render docker-compose.yml
+      ansible.builtin.template:
+        src: docker-compose.yml.j2
+        dest: "{{ intake_mesh_advisory_compose_dir }}/docker-compose.yml"
+        mode: "0644"
+
+    - name: intake-mesh-advisory - render Traefik dynamic route
+      ansible.builtin.template:
+        src: traefik-intake-mesh-advisory.yml.j2
+        dest: "{{ intake_mesh_advisory_traefik_dynamic_dir }}/{{ intake_mesh_advisory_traefik_dynamic_filename }}"
+        mode: "0644"
+      # Traefik file-provider watch picks up changes automatically.
+
+    - name: intake-mesh-advisory - pull image
+      community.docker.docker_compose_v2_pull:
+        project_src: "{{ intake_mesh_advisory_compose_dir }}"
+      changed_when: false
+
+    - name: intake-mesh-advisory - bring up advisory container
+      community.docker.docker_compose_v2:
+        project_src: "{{ intake_mesh_advisory_compose_dir }}"
+        state: present
+      register: _intake_mesh_up
+
+    # A bind-mounted FILE that Ansible replaced (template writes a temp
+    # then renames) is not seen by a running container; the mount still
+    # points at the old inode. Recreate the container on nginx.conf or
+    # index.html change so the bind-mount re-resolves to the new file.
+    - name: intake-mesh-advisory - recreate container on config change
+      community.docker.docker_compose_v2:
+        project_src: "{{ intake_mesh_advisory_compose_dir }}"
+        state: present
+        recreate: always
+      when: (_intake_mesh_nginx is changed or _intake_mesh_html is changed) and _intake_mesh_up is not changed
+
+    - name: intake-mesh-advisory - wait for healthz
+      ansible.builtin.command:
+        cmd: "docker exec {{ intake_mesh_advisory_container_name }} wget -qO- http://127.0.0.1:{{ intake_mesh_advisory_internal_port }}/healthz"
+      register: _intake_mesh_health
+      retries: 10
+      delay: 2
+      until: _intake_mesh_health.rc == 0
+      changed_when: false
+      # Under --check nothing was brought up, so there is no container to exec into.
+      when: not ansible_check_mode
+
+# Teardown. `intake_mesh_advisory_enabled: false` previously just skipped
+# every task, leaving the container running and the Traefik router file in
+# place — so the page would outlive the toggle, and so would its cert anchor
+# without the tls.domains fix. This matters more than usual here: the role is
+# temporary and retires once the DNS TTL window has passed, and "edit it off
+# the host by hand" is not available — every file it writes is marked do-not-edit-on-host.
+#
+- name: intake-mesh-advisory - remove when disabled
+  when: not intake_mesh_advisory_enabled
+  block:
+    - name: intake-mesh-advisory - remove Traefik dynamic route
+      ansible.builtin.file:
+        path: "{{ intake_mesh_advisory_traefik_dynamic_dir }}/{{ intake_mesh_advisory_traefik_dynamic_filename }}"
+        state: absent
+      # Traefik file-provider watch drops the router automatically.
+
+    - name: intake-mesh-advisory - stop and remove the container
+      community.docker.docker_compose_v2:
+        project_src: "{{ intake_mesh_advisory_compose_dir }}"
+        state: absent
+      failed_when: false
+      # Best-effort: the compose dir is gone on a host that never ran this.
+
+    - name: intake-mesh-advisory - remove compose dir
+      ansible.builtin.file:
+        path: "{{ intake_mesh_advisory_compose_dir }}"
+        state: absent

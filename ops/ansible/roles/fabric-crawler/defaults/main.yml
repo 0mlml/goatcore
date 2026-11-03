@@ -1,0 +1,147 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the fabric-crawler role — deploys goat-fabric-crawler, the
+# SINGLE lazy crawler (docs/design/zenoh-cardinality-budget-and-lazy-crawler.md
+# §4). One sequential, bounded, self-costed crawl replaces the N tools that
+# each walk the key tree; everyone reads its published rollup:
+#   ops/fabric/cardinality/<site>  (FabricCardinalityV1 protobuf — budget sensor)
+#   ops/fabric/census/<site>       (JSON byte-faithful adminspace census mirror)
+# Optionally also writes the router-health band's zenoh-fabric.json (superset
+# of the retired shell sampler's contract) into the relay-health ingest dir.
+# Persists nothing else.
+#
+# Turnkey for any goatnet: set `zenoh_stack` (already required by the router role)
+# and deploy. Every other value derives from it; per-instance overrides are the
+# exception, not the setup step.
+
+# Image — pinned per ADR 0859 (easy rollback); multi-arch INDEX digest.
+# Built by .github/workflows/fabric-crawler-image.yml (sha-b625ab0 = PR #1973
+# merge, the tier-ladder revision: starting block 100 / sponsor 1,000 as
+# binary defaults, matching the role env plumbing). To bump: resolve the
+# new index digest with
+#   docker buildx imagetools inspect ghcr.io/{{ ghcr_org }}/goat-fabric-crawler:sha-<short> --format '{{.Manifest.Digest}}'
+# and append a matching deploy-history row.
+fabric_crawler_image: "ghcr.io/{{ ghcr_org }}/goat-fabric-crawler:sha-ba05f72@sha256:90de680e421b3c059c562fc03af7e8766997a6169b109011714eddffeab538ca"
+
+# ---------------------------------------------------------------------------
+# Instance parameterization — ONE required input, everything else derives.
+# Fail-closed per the instance-variability model Tier 1: NO home-instance
+# fallback. A `| default('goat-zenoh')` here would silently point a new
+# goatnet's crawler at another instance's stack name (the class of fail-open
+# default ADR 0219 / instance-variability-model.md §"fail-closed principle"
+# exists to remove). `mandatory` is lazy — it raises only when the role is
+# actually used, so unrelated plays are unaffected.
+# ---------------------------------------------------------------------------
+fabric_crawler_zenoh_stack: "{{ zenoh_stack | mandatory }}"
+
+# Site identifier — the `<site>` segment of ops/fabric/cardinality/<site>.
+# Derives from the stack name (`<site>-zenoh` -> `<site>`), which is the
+# fleet-wide convention; override per instance where the published site label
+# differs from the stack prefix.
+fabric_crawler_site: "{{ fabric_crawler_zenoh_stack | regex_replace('-zenoh$', '') }}"
+
+# Zenoh router endpoint + network (internal docker, container-name resolution).
+fabric_crawler_zenoh_endpoint: "tls/{{ fabric_crawler_zenoh_stack }}-router:7447"
+fabric_crawler_zenoh_network: "{{ fabric_crawler_zenoh_stack }}_default"
+
+# Crawl cadence + bounds. The crawler is sequential + single-flight by
+# construction; these bound its read cost (the whole point — the instrument
+# must never become the wedge it measures):
+#   lazy_threshold — per-owner enumeration stops here (budget exception tier);
+#   crawl_budget_ms — total wall budget per cycle, overflow owners reported
+#     skipped (honest), crawled first next cycle;
+#   owner_pause_ms — breather between per-owner queries so writers can take
+#     the routing lock between our reads.
+fabric_crawler_interval_ms: 60000
+fabric_crawler_lazy_threshold: 100
+fabric_crawler_crawl_budget_ms: 20000
+fabric_crawler_owner_pause_ms: 250
+
+# Budget tier ladder (labels; the allowance itself comes from the budget
+# source). Design §2, revised (was 10/100): starting block 100
+# absorbs a healthy multi-system tenant; sponsor tier to 1,000; platform
+# beyond. Must track zenoh_topic_budget_self_block where a grant record is
+# in force so the automatic block labels "self", not "request".
+fabric_crawler_self_tier: 100
+fabric_crawler_request_tier: 1000
+
+# Budget-source selector (layer 2b). `file` = the ansible-rendered projection
+# file from zenoh_topic_budget_grants (registry-projection interim; the
+# default, byte-identical to the pre-knob behavior). `registry` = the portal's
+# /api/budget-projection resolver endpoint (the ADR 1075 grant store) —
+# requires the projection URL + an operator bearer token below; the role
+# refuses a registry flip with either missing (fail-closed). Rollback = flip
+# back to `file` + redeploy (the projection file keeps rendering either way).
+zenoh_topic_budget_source: file
+# Portal projection URL as reachable from the crawler container (compose-
+# network DNS, e.g. http://goat-zenoh-portal:8090/api/budget-projection).
+fabric_crawler_budget_projection_url: ""
+# Operator bearer for the projection endpoint. Set via group_vars env lookup
+# (local-secrets-pattern.md), never a committed literal.
+fabric_crawler_budget_token: ""
+
+# Band JSON: when non-empty, the crawler also writes the zenoh-fabric.json
+# contract to this HOST path (bind-mounted), superseding the shell sampler's
+# full `**` walk. Point it at the relay-health ingest dir on hosts running the
+# router-health band; leave empty to disable the file output.
+fabric_crawler_json_out_host_path: ""
+
+# Host-side cert directory. Two identity paths (F-177: any mismatch = silent
+# denial, so read this carefully):
+#
+#   FULL (the target): a dedicated leaf, CN=goat-fabric-crawler-trial-peer —
+#   subject `infra-fabric-crawler`, whose policy row grants writes on
+#   ops/fabric/{cardinality,census}/** AND the admin census selectors
+#   (trial-peer-r-admin-census). Requires the leaf minted (offline-CA
+#   cert-sign ceremony) + the router config re-rendered + a router restart
+#.
+#
+#   DEGRADED (bring-up fallback, the shipped default): reuse the
+#   fabric-health infra leaf. Its rule already covers the two publish keys
+#   (ops/fabric/**), BUT its policy row has NO admin-census grant — the
+#   census queries return ZERO replies silently, so owner discovery falls
+#   back to seed_owners + previously-seen owners only, and the census mirror
+#   publishes empty. Fine for smoke, not for production.
+fabric_crawler_cert_dir: "/opt/fabric-health/certs"
+fabric_crawler_cert_file: "fabric-health-cert.pem"
+fabric_crawler_key_file: "fabric-health-key.pem"
+
+# CA root the client uses to verify the router (same file the router uses).
+fabric_crawler_ca_root_src: "/etc/{{ fabric_crawler_zenoh_stack }}/tls/ca-root-cert.pem"
+
+# rocksdb-direct census — the PREFERRED source on router
+# hosts: the router's per-owner store dirs, mounted READ-ONLY into the crawler
+# (secondary-mode opens never take the live router's lock; zero router
+# involvement, exact counts). Matches goat_zenoh_storage_path. Set empty
+# to disable and fall back to the bounded zenoh walk (non-router hosts).
+fabric_crawler_rocksdb_dir: "/var/lib/{{ fabric_crawler_zenoh_stack }}/rocksdb"
+
+fabric_crawler_compose_dir: "/opt/fabric-crawler"
+fabric_crawler_rust_log: "goat_fabric_crawler=info,zenoh=warn"
+
+# -- Secondary-dir LOG reaper -------------------------------------------------
+# RocksDB renames LOG -> LOG.old.<ts> on every DB *open*. The crawler opens one
+# secondary instance per store per cycle, so each store dir accrues one 37 KB
+# LOG.old every fabric_crawler_interval_ms, forever — nothing in RocksDB's
+# keep_log_file_num path prunes them in secondary mode.
+#
+# Left alone the tree reaches millions of LOG.old files and hundreds of GiB,
+# with zero bytes of anything else, and becomes the largest consumer on the
+# filesystem.
+#
+# This reaper is the ops-side bound on that growth; capping LOG retention on the
+# secondary open, or reusing the secondary handle across cycles, is the
+# crawler-side alternative. Age-based rather than count-based
+# because "one per cycle" makes age the honest unit: at the 60 s default,
+# 60 minutes of history is ~60 files per store, ~2.2 GiB fleet-steady-state.
+fabric_crawler_logprune_enabled: true
+fabric_crawler_logprune_max_age_min: 60
+fabric_crawler_logprune_oncalendar: "hourly"
+
+# node_exporter textfile dir for the reaper's reclaim metric. EMPTY = no metric
+# (the reaper still runs). Set per goatnet: the scraped dir is NOT the same on
+# every host — a node-exporter may mount an obs-stack directory, and a file
+# written to /var/lib/node_exporter/textfile there is real, writable, and never
+# scraped.
+fabric_crawler_logprune_textfile_dir: ""

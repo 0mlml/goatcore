@@ -1,0 +1,87 @@
+---
+# Defaults for the pubsub-state-repo role (Block 86; design at
+# docs/design/pubsub-state-as-code.md).
+#
+# This role is the "durable mirror" half of the substrate: it provisions
+# a per-site Forgejo repo to hold the pub/sub state-of-record + drops a
+# systemd timer that mirrors the live portal into that repo every
+# pubsub_state_mirror_interval seconds.
+
+# Forgejo target. Defaults to the same Orin-C the forgejo role brings
+# up; override when running against a different per-site Forgejo.
+pubsub_state_forgejo_url: "{{ lookup('env', 'FORGEJO_URL') | default('http://' + ansible_host + ':3030', true) }}"
+
+# Forgejo org + repo. One repo per site; the org is shared across all
+# sites in the same domain so cross-site discovery is `gh repo list
+# <org>` (or its Forgejo equivalent).
+pubsub_state_org: goat-pubsub-state
+pubsub_state_repo: "{{ pubsub_state_site_id | mandatory }}"
+
+# Forgejo service-account credentials. Operator generates a personal
+# access token (Forgejo Web UI → Settings → Applications) scoped to
+# read:org + write:repository, stores it in 1Password, exports as
+# FORGEJO_PUBSUB_TOKEN in .envrc.local.
+pubsub_state_forgejo_user: pubsub-state-mirror
+pubsub_state_forgejo_token: "{{ lookup('env', 'FORGEJO_PUBSUB_TOKEN') | default('', true) }}"
+
+# Portal target. Defaults to the local portal container's HTTP listen.
+pubsub_state_portal_url: "{{ lookup('env', 'PORTAL_URL') | default('http://127.0.0.1:8090', true) }}"
+pubsub_state_portal_api_key: "{{ lookup('env', (site_id | upper | replace('-', '_')) ~ '_PORTAL_OPERATOR_API_KEY') | default('', true) }}"
+
+# Portal-by-container resolve mode (opt-in; default off).
+#
+# A single-host site publishes the portal's 8090 to the host, so the mirror reaches it at
+# pubsub_state_portal_url (127.0.0.1:8090). On the three-Orin topology the
+# portal's 8090 is NOT host-published — it is reachable only by container name
+# on a docker network (mgmt), and its container IP is not stable across a
+# portal redeploy. Set pubsub_state_portal_container to the portal container
+# name to have the mirror script re-resolve that container's IP on the named
+# network at the top of EVERY cycle and build the portal URL from it. Empty
+# (the default) leaves pubsub_state_portal_url used verbatim.
+pubsub_state_portal_container: ""
+pubsub_state_portal_network: mgmt
+pubsub_state_portal_port: 8090
+
+# Snapshot timer cadence. 300s (5min) matches the trial-fabric's
+# expected mutation rate (sub-mutation-per-minute typical). Tighten to
+# 60s in active onboarding sessions; loosen to 1800s on stable fabrics.
+pubsub_state_mirror_interval_sec: 300
+
+# Local working dir for the mirror script's git clone.
+pubsub_state_workdir: /var/lib/pubsub-state-mirror
+
+# MinIO snapshot bucket. Tarballs land at
+# pubsub-state-snapshots/<ts>.tar.gz and pubsub-state-snapshots/latest.tar.gz
+# on every successful mirror cycle. Empty = skip MinIO push (Forgejo-only
+# mode). Real default at the trial fabric is "pubsub-state-snapshots".
+pubsub_state_minio_bucket: "pubsub-state-snapshots"
+
+# MinIO alias the local `mc` binary already knows about. The minio role
+# sets up `mc alias set local-nova http://127.0.0.1:9000 ...` at first run;
+# this role's script references that alias. Empty = skip MinIO push.
+pubsub_state_minio_alias: "local-nova"
+
+# Git author identity baked into commits. Distinguishes mirror-generated
+# commits from operator-authored ones in the log.
+pubsub_state_git_author_name: "pubsub-state-mirror"
+pubsub_state_git_author_email: "pubsub-state-mirror@goat.local"
+
+# --- Turnkey generalization (site-agnostic deploy play) --------------------
+# The generic pubsub-state-mirror-deploy.yml reads these so ONE play serves
+# every goatnet; per-site group_vars (e.g. group_vars/<site>_hosts/
+# pubsub-state.yml) override only what differs.
+
+# F-207 service operator key: handle + on-host operator-keys dir. The deploy
+# play drops "<handle>:<pubsub_state_portal_api_key>" here so the portal
+# attributes the mirror's snapshot reads to a named machine (reloaded live).
+pubsub_state_service_key_handle: "pubsub-state-mirror-{{ site_id | mandatory }}"
+pubsub_state_portal_keys_dir: /opt/goat-zenoh-portal/operator-keys.d
+
+# MinIO backup tier: names of the env vars carrying this goatnet's MinIO root
+# creds (per-site, like the minio role's own convention). Empty = the deploy
+# play skips host-mc setup and the mirror runs Forgejo-only. When set, the play
+# installs host mc, configures the pubsub_state_minio_alias for root, and
+# creates the pubsub_state_minio_bucket.
+pubsub_state_minio_root_user_envvar: ""
+pubsub_state_minio_root_pass_envvar: ""
+pubsub_state_minio_endpoint: "http://127.0.0.1:9000"

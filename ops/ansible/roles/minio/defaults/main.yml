@@ -1,0 +1,232 @@
+---
+# defaults for ops/ansible/roles/minio
+#
+# Anchor: ADR 0811 (audit-log integrity — Object Lock storage layer) +
+# ADR 0822 (wide-event observability — telemetry-otlp bucket on the same
+# substrate). Single MinIO instance per site, two buckets, one role.
+#
+# Why one role for both consumers: F-009 anchors MinIO as the per-site
+# object-storage substrate; running two MinIOs (one for audit, one for
+# telemetry) would carry an operational tax — two backup paths, two
+# access-control surfaces, two upgrade cadences — that doesn't pay for
+# itself. Block 27 status snapshot in implementation-plan.md and Block
+# 27A.1 spec both call this out: don't author two MinIO roles.
+
+# -- Storage layout ----------------------------------------------------------
+# /opt/docker-data is the LUKS-mounted NVMe (per ADR 0826). Single data
+# dir holds both buckets — MinIO segregates by bucket internally.
+minio_data_root: "/opt/docker-data/minio"
+minio_compose_dir: "/opt/minio"
+
+# Container UID. The official minio/minio image runs as `minio-user`
+# (UID 1000:1000) since the 2023 hardening release. Verify with
+# `docker run --rm minio/minio id -u`. Host-path owner
+# must match container UID or the container crash-loops on permission
+# denied.
+minio_uid: 1000
+minio_gid: 1000
+
+# -- Image pin ---------------------------------------------------------------
+# Upstream minio/minio for v1. Chainguard alternative `cgr.dev/chainguard/minio`
+# tracked under Block 13C supply-chain migration; not a Block 27 concern.
+# Pin to a digest in group_vars when promoting to production-shape.
+minio_image: "minio/minio:RELEASE.2024-10-29T16-01-48Z"
+minio_mc_image: "minio/mc:RELEASE.2024-10-29T15-34-59Z"
+
+# -- API + Console exposure --------------------------------------------------
+# Port 9000 is the S3 API; port 9001 is the web Console UI. Both bind on
+# host. Cross-service comms (OpenObserve → MinIO) uses host.docker.internal:9000
+# rather than container DNS so each service stays in its own compose project
+# and lifecycles independently. Mesh-internal exposure follows in 27D when
+# Traefik on Orin-C lands.
+minio_api_port: 9000
+minio_console_port: 9001
+
+# -- Console OIDC (operator-IdP / Ory) --------------------------------------
+# MinIO console SSO via Ory Hydra. The compose template gates the
+# MINIO_IDENTITY_OPENID_* env on `minio_operator_idp_enabled`, which
+# defaults to the broad `operator_idp_enabled` so existing sites are
+# unchanged — but a site can enable MinIO's OIDC independently (without
+# also flipping openobserve / obs-host, which read operator_idp_enabled)
+# by setting minio_operator_idp_enabled: true in group_vars.
+minio_operator_idp_enabled: "{{ operator_idp_enabled | default(false) }}"
+
+# Hydra issuer base URL (no trailing slash; /.well-known/openid-configuration
+# is appended in the template). Default is the `oauth2.ops.<site>`
+# shape; sites whose Hydra is at a different host (e.g. `oauth2.<site>`)
+# override this in group_vars. This is also the var the minio-oidc-client
+# role reads, so the two stay in lockstep.
+minio_oidc_issuer_url: "https://oauth2.ops.{{ site_id }}.{{ site_dns_zone }}"
+
+# External base URL the console advertises so it builds correct login /
+# redirect links when fronted by Traefik (vs bare localhost:9001).
+minio_oidc_browser_redirect_url: "https://minio.{{ site_id }}.{{ site_dns_zone }}"
+
+# OIDC group -> MinIO policy mapping. MinIO matches each value in the JWT
+# `groups` claim to a MinIO policy of the SAME name (case-sensitive). These
+# lists name the policies mc-init creates: admin groups get consoleAdmin-
+# equivalent (admin:* + s3:*), readonly groups get GetObject/ListBucket. They
+# MUST match the site's real Ory group names — override per site. Defaults
+# track the original lowercase operator-IdP aliases; a site with uppercase
+# `PLATFORM-ADMIN`/`OBS-ADMIN` groups (the same groups that gate the
+# other consoles) overrides them.
+minio_oidc_admin_policy_groups: [obs-admin, minio-admin]
+minio_oidc_readonly_policy_groups: [obs-readonly, minio-readonly]
+
+# Static container host-map for the OIDC issuer hostname (F-126 — Docker's
+# embedded resolver can't reach mesh CoreDNS on :5353). Format "<host>:<ip>".
+# Empty = no entry. CAUTION: do NOT point this at the wt0 mesh IP — MinIO
+# initializes OIDC ONCE at startup, and the mesh-IP route isn't up that early
+# in boot, so it fails ("no route to host") and silently disables the SSO
+# provider for the whole process life.
+# Use the docker bridge gateway (`host-gateway`) instead: link-local, up the
+# instant docker starts, and Traefik's :443 is published on 0.0.0.0 (routed by
+# SNI). For example "oauth2.<site>.<zone>:host-gateway".
+minio_oidc_host_entry: ""
+
+# -- Console Traefik exposure (mesh-internal) -------------------------------
+# When true, the role renders a Traefik file-provider dynamic overlay that
+# routes minio_console_traefik_host → the console. Default off.
+# Upstream is the console host-port on the mesh IP — the same
+# `http://{{ mesh_ip_a }}:<port>` pattern panoscope/stethoscope already use
+# to reach the MinIO API, so Traefik needs no minio-net join.
+minio_console_traefik_enabled: false
+minio_console_traefik_host: "minio.{{ site_id }}.{{ site_dns_zone }}"
+minio_console_traefik_router_name: "minio-console-{{ site_id }}"
+minio_console_traefik_cert_resolver: "le"
+minio_console_traefik_mesh_only_middleware: ""
+# Per-source browsing rate ceiling (goat-ratelimit, 50 r/s / burst 100),
+# attached per router — surface-overload-protection.md §3.1.
+# Set to "" to disable.
+minio_console_traefik_ratelimit_middleware: "goat-ratelimit@file"
+minio_console_traefik_dynamic_dir: "/etc/traefik/dynamic"
+minio_console_traefik_dynamic_filename: "minio-console-{{ site_id }}.yml"
+minio_console_traefik_upstream: "http://{{ mesh_ip_a | default('127.0.0.1') }}:{{ minio_console_port }}"
+
+# -- Root credentials --------------------------------------------------------
+# MUST be set via env vars at deploy time. .envrc.local convention is one
+# pair per site; the env-var NAMES are parameterized so per-site group_vars
+# can flip which tier this role reads:
+#   <SITE>_MINIO_ROOT_USER / <SITE>_MINIO_ROOT_PASSWORD
+# Override `minio_root_user_envvar` + `minio_root_password_envvar` in the
+# site's group_vars/<group>/minio.yml to point at the right pair.
+# No plaintext default. Pre-flight assertion in tasks/main.yml fails the
+# play if either env var is empty, with the configured env-var name
+# surfaced in the fail message.
+minio_root_user_envvar: "MINIO_ROOT_USER"
+minio_root_password_envvar: "MINIO_ROOT_PASSWORD"
+minio_root_user: "{{ lookup('env', minio_root_user_envvar) | default('', true) }}"
+minio_root_password: "{{ lookup('env', minio_root_password_envvar) | default('', true) }}"
+
+# -- Bucket: audit-integrity (per ADR 0811 + Block 95) -----------------------
+# Lock mode per Block 95 (docs/design/audit-cold-storage-offload.md):
+#
+#   GOVERNANCE on the middle tier — locked by default from casual delete
+#   (every PUT carries N-day retention), but an identity with
+#   s3:BypassGovernanceRetention can release oldest-first for
+#   quota-relief FIFO-eviction. The COMPLIANCE-grade evidence preservation
+#   lives in the cold-storage tier (1y trial / 7y prod COMPLIANCE).
+#
+#   The substrate shape rationale: optimizing for the common case
+#   ("real audit overflow — keep new, drop oldest which is presumably
+#   cold-archived") matters more than the rare case ("attacker fills bucket
+#   with garbage") which is handled by layered defenses (audit-subscriber
+#   S3 user is bucket-scoped append-only; cold-archive is COMPLIANCE).
+#
+# Production deployments WITHOUT a cold-archive offload cadence can
+# override to COMPLIANCE to keep the original ADR 0811 posture; production
+# WITH cold-archive uses GOVERNANCE here too.
+minio_audit_bucket: "audit-integrity"
+minio_audit_object_lock_mode: "GOVERNANCE"
+# Default retention: 30d per Block 95 middle-tier canon. The original
+# ADR 0811 "1y online + 6y archive" decomposes into:
+#   online   = 30d MinIO (this tier),
+#   archive  = <dataset-id>-cold-storage bucket with COMPLIANCE per NIST AU-11.
+# Production sites without a cold-archive cadence override to 365 to keep
+# the original posture (one tier doing both jobs).
+minio_audit_retention_days: 30
+
+# Optional lifecycle expiration on the audit bucket. Object-Lock
+# retention prevents delete during the retention period but does NOT
+# auto-delete objects when retention expires; without an expiration
+# rule, audit objects sit on disk forever after they're unlockable.
+#
+# Production posture (allocated storage): unset → no auto-expiration;
+# manual archival lifecycle is operational work per ADR 0811 "+6y archive" tier.
+#
+# Disk-constrained sites (e.g., a trial fabric on a single host)
+# should override this to a value equal to or slightly greater than
+# `minio_audit_retention_days` so objects roll off as soon as the
+# retention lock lifts. MinIO's lifecycle engine won't delete a
+# still-locked object, so expiration ≤ retention is safe.
+#
+# Set to an integer (days) to enable; leave unset (or set to null /
+# 0) to disable.
+minio_audit_expiration_days: null
+
+# -- Bucket: telemetry-otlp (per ADR 0822) -----------------------------------
+# No Object Lock (wide events are best-effort operational telemetry, NOT
+# evidence — ADR 0822 §"Assessor view" explicitly rules out using this
+# bucket for non-repudiation). TTL via lifecycle expiration.
+minio_telemetry_bucket: "telemetry-otlp"
+minio_telemetry_retention_days: 90
+
+# -- Bucket: runtime-detection-archive (per Block 18G) -----------------------
+# Reserved namespace for the Block 18G runtime-detection archive (Falco
+# container-runtime events, osquery host-state snapshots, auditd syscall
+# logs). The bucket exists ahead of Block 18G's emitter agents so the substrate
+# is ready and the bucket boundary matches the Block 27 §"Storage substrate"
+# three-bucket table.
+#
+# Object Lock = COMPLIANCE (same posture as audit-integrity — Falco /
+# osquery / auditd records ARE evidence-grade for incident response, per
+# the comparative-posture artifact). Retention shorter than audit:
+# 90 days online (typical IR window) + Block 18G owns its own archive
+# tier when that lands.
+minio_runtime_detection_bucket: "runtime-detection-archive"
+minio_runtime_detection_object_lock_mode: "COMPLIANCE"
+minio_runtime_detection_retention_days: 90
+
+# -- Per-bucket hard size cap (quota) ----------------------------------------
+# MinIO bucket quotas reject new PutObject once the bucket's stored size
+# crosses the cap. Combined with the lifecycle expiration knobs above
+# this gives "rolling rotation under a hard ceiling" — even if a producer
+# misbehaves the disk does not fill. On a trial fabric on a single host (no
+# dedicated storage tier) all three buckets get a cap; on
+# production with allocated storage no cap is set (room is sized for
+# the retention window). Set to an integer (GiB) to enable; leave unset
+# or null to disable.
+#
+# Important: when the quota is hit, audit-subscriber's
+# goat_audit_write_errors_total starts incrementing (S3 returns
+# QuotaExceeded). That is the alertable signal — locked audit data
+# remains intact, only new writes are refused.
+minio_audit_bucket_quota_gib: null
+minio_telemetry_bucket_quota_gib: null
+minio_runtime_detection_bucket_quota_gib: null
+
+# -- Healthcheck timing ------------------------------------------------------
+minio_health_retries: 30
+minio_health_delay_seconds: 2
+
+# -- Extra service users -----------------------------------------------------
+# Per-bucket service identities minted alongside the root creds. Each entry
+# creates a named MinIO IAM policy from a controller-side JSON file, mints
+# the user, and attaches the policy. Use in place of operator-side
+# `mc admin user add` ceremonies so credential provisioning lives in code.
+#
+# Idempotent: re-running with the same secret is a no-op; changing the
+# secret rotates the user's credential atomically. `mc admin policy attach`
+# error-traps the already-attached case.
+#
+# Each entry shape:
+#   name:           mc user name (doubles as the access key)
+#   policy_name:    IAM policy name to create + attach
+#   policy_src:     path to the JSON policy file on the controller
+#                   (relative to the playbook dir or absolute)
+#   secret_envvar:  env var the role reads for the user's secret key
+#                   (REQUIRED; pre-flight asserts non-empty)
+#
+# Production posture: empty. Per-site group_vars opt in (for example
+# goat-portal-audit-read for Block 88, in group_vars/<site>_hosts/minio.yml).
+minio_extra_users: []

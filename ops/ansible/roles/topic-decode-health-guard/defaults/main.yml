@@ -1,0 +1,140 @@
+---
+# topic-decode-health-guard — scheduled run of the topic decode-health check.
+# Conforms to the contract in docs/design/live-state-guard-scheduling.md §4.
+# Canon: docs/design/topic-decode-health.md.
+#
+# What it grades: for every topic in the portal registry, do the bytes actually
+# on the key match the format the registry says they are? OK / UNDECODABLE /
+# DOUBLE-ENCODED / STALE / NO-SAMPLE / UNGRADED, plus an advisory UNREGISTERED
+# axis for keys on the fabric with no registry row.
+#
+# Why it is a background process rather than a hand-run check: a device can publish
+# the BASE64 TEXT of its real payloads for weeks while every surface reports
+# green. Zenoh `put` is fire-and-forget and denial is silent, so the publisher
+# learns nothing; the only thing that catches it is a check that actually runs
+# on a schedule.
+#
+# THIS IS THE THIRD GUARD, and the contract's "fold at three" therefore fires.
+# The fold is NOT done here — see docs/design/topic-decode-health.md §5 for the
+# decision and its reasoning. This role conforms to the contract so the fold
+# stays mechanical.
+
+# Master gate. false = full TEARDOWN (units, script, env and the stale metric),
+# never "skip the install tasks". A role that only skips leaves a timer running
+# on a host with nothing in the repo admitting it exists.
+topic_decode_health_guard_enabled: true
+
+# --- credentials: ONE plane -------------------------------------------------
+# Simpler than the provenance guard deliberately: this reads the portal and the
+# goatnet's own zenoh router, both mesh-internal, and needs no NetBird PAT.
+
+# The goatnet's own portal. MESH-INTERNAL — the leg that makes a GitHub-hosted
+# runner structurally unable to run this, per the contract §1.
+topic_decode_health_guard_portal_url: ""
+
+# Portal operator key. A SERVICE key, minted and registered in the portal's
+# hot-reload key directory by ops/scripts/create-decode-health-identity.sh —
+# never a per-person op_ key, because a guard that stops when somebody
+# offboards is not a guard, and never as a playbook side effect.
+topic_decode_health_guard_portal_key: ""
+
+# The zenoh router's REST endpoint. Read-only GETs; the router takes no auth
+# header on this path. Model on portal_zenoh_rest_url in the same group_vars.
+topic_decode_health_guard_router_url: ""
+
+# --- posture ----------------------------------------------------------------
+# WHICH GRADES FAIL THE UNIT. This is the contract's "never fail on a backlog"
+# rule, and it is the whole reason this variable exists rather than passing the
+# check's exit code straight through.
+#
+# The check exits 1 on UNDECODABLE, DOUBLE-ENCODED, NO-SAMPLE **or** STALE,
+# which is right for a hand-run tool and wrong for an unattended one. A
+# powered-off sensor makes its topics legitimately NO-SAMPLE; a unit that fails hourly for a switched-off
+# sensor is muted within a week, and a muted guard is the thing this role exists
+# to stop being.
+#
+# UNDECODABLE and DOUBLE-ENCODED are the encoding-contract regression — bytes
+# that do not match their declared format. Those are never "standing debt".
+# NO-SAMPLE and STALE are operational state: reported, counted, graphed, and not
+# a reason to fail. Widen this list on a goatnet where silence IS a regression.
+topic_decode_health_guard_fail_on:
+  - UNDECODABLE
+  - DOUBLE-ENCODED
+
+# KNOWN-BAD TOPICS THAT MUST NOT FAIL THIS UNIT.
+#
+# fail_on alone still fails forever on a topic that is ALREADY broken, which is
+# the muted-unit ending by a slower road, and a first deploy onto a goatnet with
+# bad topics walks straight into it. The
+# contract says gate on the regression, not on standing debt; this is how that
+# is expressed for a per-topic guard.
+#
+# Entries are reported, counted in their own metric, and excluded from the exit
+# code. Anything NOT listed still fails, so a new bad topic is caught the hour
+# it appears.
+#
+# Two things stop this becoming where bugs go to die: it is rendered from
+# group_vars so an entry costs a reviewed commit stating why, and an entry past
+# its clear_by STOPS suppressing and fails again. A baseline with no expiry is
+# just deleting the check.
+#
+#   - key: <slot>/<topic path>
+#     verdict: UNDECODABLE          # must match the grade exactly
+#     clear_by: ""
+#     why: one sentence a reviewer can check
+topic_decode_health_guard_baseline: []
+
+# Seconds before a decodable topic grades STALE. Passed through to the check.
+# 0 disables staleness grading entirely. Left at the check's own default; raise
+# it on goatnets whose publishers are intermittent by design.
+topic_decode_health_guard_stale_after: 3600
+
+# --- schedule ---------------------------------------------------------------
+# Hourly at :43. The bug this catches can stand for WEEKS, so detection
+# latency of an hour versus six is not the deciding factor — offset from the
+# host's other timers is. Taken: mesh-membership-reconcile at 06:41,
+# machine-provenance-guard at :17.
+topic_decode_health_guard_oncalendar: "*-*-* *:43:00"
+
+# Spread over five minutes — the contract's floor.
+topic_decode_health_guard_jitter_sec: 300
+
+# Hard ceiling on one run. This makes one GET per registered topic against the
+# portal and the router, so it scales with topic count; 300s is generous for
+# today's tens and will need revisiting long before it becomes thousands.
+# A hung unit holding a systemd job slot is worse than a failed one.
+topic_decode_health_guard_timeout_sec: 300
+
+# --- where things land ------------------------------------------------------
+# node_exporter textfile-collector directory. EMPTY BY DEFAULT, DELIBERATELY.
+#
+# node_exporter's textfile directory differs per goatnet, and each one's obvious-
+# looking path can be another's void. node_exporter may run containerised
+# reading /opt/<site_id>-obs/expected-vendors/textfile while
+# /var/lib/node_exporter/textfile also exists, is writable, and is read by
+# NOTHING; elsewhere the obvious path IS the live one.
+#
+# A wrong path fails silently forever; an unset one fails once, loudly, at
+# deploy time. Find the real value with:
+#   ps -o args= -C node_exporter | tr ' ' '\n' | grep textfile.directory
+# and then confirm the SERIES IS IN PROMETHEUS, not merely that a file is on disk.
+topic_decode_health_guard_textfile_dir: ""
+
+# Human-readable last run. Evidence, not state — teardown leaves it behind.
+topic_decode_health_guard_report_dir: /var/lib/goat/topic-decode-health-guard
+
+# Where the check itself is installed. The check is self-contained Python with
+# no repo-relative path resolution, so unlike the provenance guard this can be
+# a flat path rather than a mirror of the repo layout.
+topic_decode_health_guard_lib_dir: /usr/local/lib/goat/decode-health
+
+# Prometheus rules go here IF the directory exists. Rules ship from the ROLE,
+# not the shared obs tree, so the absent() alert exists only where the timer
+# does — in the shared tree it would fire forever on every goatnet that has not
+# deployed this. NOTE: where the obs stack runs on a DIFFERENT host, this
+# directory does not exist and the systemd unit is the only alarm.
+topic_decode_health_guard_rules_dir: "/opt/{{ site_id }}-obs/prometheus/rules"
+
+# Run once inline at deploy, with somebody watching, rather than discovering at
+# :43 unattended that a credential was wrong.
+topic_decode_health_guard_run_now: true

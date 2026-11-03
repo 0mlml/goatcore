@@ -1,0 +1,188 @@
+---
+# icam-mtls-proxy — card sign-in from any sovereign PKI (ADR 1209). Default-OFF: a
+# clean no-op unless icam_mtls_proxy_enabled. The PKIs come from the registry
+# ops/identity/sovereign-pkis.yaml through the sovereign_pki_* filters
+# (ops/ansible/filter_plugins/sovereign_pki.py); nothing PKI-specific is written here.
+
+- name: icam-mtls-proxy disabled — no-op
+  ansible.builtin.debug:
+    msg: "icam-mtls-proxy disabled — sovereign PKI card sign-in not deployed."
+  when: not (icam_mtls_proxy_enabled | bool)
+
+- name: Deploy the sovereign PKI card sign-in proxy
+  when: icam_mtls_proxy_enabled | bool
+  block:
+    - name: Select the enabled PKI profiles from the registry (fails on a sketch or unknown id)
+      ansible.builtin.set_fact:
+        icam_sovereign_pkis: "{{ lookup('ansible.builtin.file', icam_mtls_proxy_registry) | from_yaml | sovereign_pki_select(icam_mtls_proxy_pkis) }}"
+
+    - name: Each enabled profile has its CA bundle staged
+      ansible.builtin.stat:
+        path: "{{ icam_mtls_proxy_pki_dir }}/{{ item.id }}/ca-bundle.pem"
+      loop: "{{ icam_sovereign_pkis }}"
+      loop_control:
+        label: "{{ item.id }}"
+      register: _icam_pki_bundles
+
+    - name: Refuse to deploy with a missing trust anchor
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: >-
+          {{ icam_mtls_proxy_pki_dir }}/{{ item.item.id }}/ca-bundle.pem is missing. Build the
+          directory with `ops/identity/sovereign-pkis-render.py openbao-dir --out <dir>
+          --bundle {{ item.item.id }}=<pem>` (the profile's trust_anchor says where the PEM
+          comes from and how to verify it) and stage it on this host.
+      loop: "{{ _icam_pki_bundles.results }}"
+      loop_control:
+        label: "{{ item.item.id }}"
+
+    - name: Create compose + certs dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ icam_mtls_proxy_compose_dir }}"
+        - "{{ icam_mtls_proxy_compose_dir }}/certs"
+
+    - name: Read each enabled profile's CA bundle
+      ansible.builtin.slurp:
+        src: "{{ icam_mtls_proxy_pki_dir }}/{{ item.id }}/ca-bundle.pem"
+      loop: "{{ icam_sovereign_pkis }}"
+      loop_control:
+        label: "{{ item.id }}"
+      register: _icam_pki_pems
+
+    - name: Write the one client-certificate trust file nginx reads (all enabled profiles)
+      ansible.builtin.copy:
+        content: "{{ _icam_pki_pems.results | map(attribute='content') | map('b64decode') | join('\n') }}"
+        dest: "{{ icam_mtls_proxy_compose_dir }}/certs/ca-bundle.pem"
+        mode: "0644"
+      notify: Restart icam-mtls-proxy
+
+    - name: icam_mtls_proxy_tls names a server-certificate mode this role has
+      ansible.builtin.assert:
+        that: icam_mtls_proxy_tls in ['self-signed', 'traefik-acme']
+        fail_msg: "icam_mtls_proxy_tls must be self-signed or traefik-acme (got {{ icam_mtls_proxy_tls }})"
+
+    # Server TLS, mode self-signed: a proof's certificate. Nothing trusts it.
+    - name: Generate the proxy server TLS cert (self-signed; a goatnet uses traefik-acme)
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -x509 -newkey rsa:2048 -nodes
+          -keyout {{ icam_mtls_proxy_compose_dir }}/certs/server.key
+          -out {{ icam_mtls_proxy_compose_dir }}/certs/server.crt -days 825
+          -subj "/CN={{ icam_mtls_proxy_hostname }}"
+          -addext "subjectAltName=DNS:{{ icam_mtls_proxy_hostname }}"
+        creates: "{{ icam_mtls_proxy_compose_dir }}/certs/server.crt"
+      when: icam_mtls_proxy_tls == 'self-signed'
+
+    # Server TLS, mode traefik-acme: the site certificate Traefik already holds, and a
+    # Traefik TCP router that passes this hostname's SNI through to nginx untouched.
+    - name: Server TLS from Traefik's acme.json (traefik-acme)
+      when: icam_mtls_proxy_tls == 'traefik-acme'
+      block:
+        - name: Traefik must be able to reach the proxy (a loopback bind cannot be routed to)
+          ansible.builtin.assert:
+            that: icam_mtls_proxy_bind_ip not in ['127.0.0.1', 'localhost', '::1']
+            fail_msg: >-
+              icam_mtls_proxy_tls is traefik-acme but icam_mtls_proxy_bind_ip is loopback.
+              Bind the mgmt host's mesh address (icam_mtls_proxy_bind_ip: "{{ '{{' }} mesh_ip_a {{ '}}' }}").
+
+        - name: Stage the certificate sync script
+          ansible.builtin.copy:
+            src: acme-cert-sync.py
+            dest: "{{ icam_mtls_proxy_compose_dir }}/acme-cert-sync.py"
+            mode: "0750"
+
+        - name: Copy the site certificate for {{ icam_mtls_proxy_hostname }} out of acme.json
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/python3
+              - "{{ icam_mtls_proxy_compose_dir }}/acme-cert-sync.py"
+              - --acme
+              - "{{ icam_mtls_proxy_acme_json }}"
+              - --resolver
+              - "{{ icam_mtls_proxy_acme_resolver }}"
+              - --hostname
+              - "{{ icam_mtls_proxy_hostname }}"
+              - --out-dir
+              - "{{ icam_mtls_proxy_compose_dir }}/certs"
+          register: _icam_cert_sync
+          changed_when: _icam_cert_sync.rc == 3
+          failed_when: _icam_cert_sync.rc not in [0, 3]
+          notify: Restart icam-mtls-proxy
+
+        - name: Install the daily certificate refresh (service + timer)
+          ansible.builtin.template:
+            src: "{{ item.src }}"
+            dest: "/etc/systemd/system/{{ item.dest }}"
+            mode: "0644"
+          loop:
+            - { src: acme-cert-sync.service.j2, dest: icam-mtls-proxy-cert-sync.service }
+            - { src: acme-cert-sync.timer.j2, dest: icam-mtls-proxy-cert-sync.timer }
+          register: _icam_cert_units
+
+        - name: Enable the certificate refresh timer
+          ansible.builtin.systemd:
+            name: icam-mtls-proxy-cert-sync.timer
+            enabled: true
+            state: started
+            daemon_reload: "{{ _icam_cert_units.changed }}"
+
+        - name: Render the Traefik TCP passthrough router for {{ icam_mtls_proxy_hostname }}
+          ansible.builtin.template:
+            src: traefik-passthrough.yml.j2
+            dest: "{{ icam_mtls_proxy_traefik_dynamic_dir }}/icam-mtls-proxy.yml"
+            mode: "0644"
+
+    - name: Stage the SAN reader (njs)
+      ansible.builtin.copy:
+        src: pki.js
+        dest: "{{ icam_mtls_proxy_compose_dir }}/pki.js"
+        mode: "0644"
+      notify: Restart icam-mtls-proxy
+
+    - name: Stage the per-profile njs wrappers (only when a profile reads a SAN otherName)
+      ansible.builtin.copy:
+        content: "{{ icam_sovereign_pkis | sovereign_pki_nginx_profiles_js }}"
+        dest: "{{ icam_mtls_proxy_compose_dir }}/pki-profiles.js"
+        mode: "0644"
+      when: (icam_sovereign_pkis | sovereign_pki_nginx_profiles_js) | length > 0
+      notify: Restart icam-mtls-proxy
+
+    # dex.yaml is world-readable: Dex runs as a non-root user inside its image and
+    # must read it, and it holds no secret (the client secret arrives as an env var).
+    - name: Render compose + nginx + dex
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ icam_mtls_proxy_compose_dir }}/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: docker-compose.yml.j2, dest: docker-compose.yml, mode: "0640" }
+        - { src: nginx.conf.j2, dest: nginx.conf, mode: "0640" }
+        - { src: dex.yaml.j2, dest: dex.yaml, mode: "0644" }
+      notify: Restart icam-mtls-proxy
+
+    - name: The Dex <-> Kratos client secret is in the deploy environment (ICAM_MTLS_KRATOS_CLIENT_SECRET)
+      ansible.builtin.assert:
+        that: (lookup('env', 'ICAM_MTLS_KRATOS_CLIENT_SECRET') | length) >= 16
+        fail_msg: >-
+          ICAM_MTLS_KRATOS_CLIENT_SECRET is unset or shorter than 16 characters. It is the
+          shared secret between the proxy's Dex static client and Kratos's card-local
+          provider (ICAM_OIDC_CARD_LOCAL_CLIENT_SECRET on the ory side): one 1Password
+          item, two references, resolved by ops/scripts/with-secrets at deploy time.
+      no_log: true
+
+    - name: Write the proxy's .env (0600; compose hands the secret to Dex as an env var)
+      ansible.builtin.copy:
+        content: "ICAM_MTLS_KRATOS_CLIENT_SECRET={{ lookup('env', 'ICAM_MTLS_KRATOS_CLIENT_SECRET') }}\n"
+        dest: "{{ icam_mtls_proxy_compose_dir }}/.env"
+        mode: "0600"
+      no_log: true
+      notify: Restart icam-mtls-proxy
+
+    - name: Bring up the mTLS proxy + Dex
+      community.docker.docker_compose_v2:
+        project_src: "{{ icam_mtls_proxy_compose_dir }}"
+        state: present

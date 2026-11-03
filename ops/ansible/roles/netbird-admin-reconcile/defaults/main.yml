@@ -1,0 +1,52 @@
+---
+# netbird-admin-reconcile — continuous Kratos groups -> netbird role sync.
+#
+# See the role README and files/netbird-admin-reconcile.sh for why this is a
+# timer rather than an onboarding step (short version: NetBird user rows cannot
+# exist until the person's own first dashboard sign-in, so there is nothing to
+# promote at onboarding time — F-238).
+
+# Kratos group strings that entitle a person to the netbird-mgmt `admin` role.
+# Overridden per-goatnet in group_vars. Deliberately NOT defaulted to the union
+# of every admin-ish group: netbird admin is real authority over the mesh, so a
+# goatnet opts its groups in explicitly.
+netbird_mgmt_admin_groups:
+  - PLATFORM-ADMIN
+
+# Ory group -> NetBird role, an ORDERED list of {group, role}, role one of
+# user | auditor | admin (docs/design/mesh-change-control.md §2). A person's
+# role is the HIGHEST any of their groups maps to; the reconcile only ever
+# raises a role (user < auditor < admin) and never touches `owner` or service
+# users. Lowering is ops/ansible/netbird-role-realign.yml, run on purpose.
+#
+# The default is derived from netbird_mgmt_admin_groups — every listed group
+# maps to admin — so a goatnet that sets neither, or only the older list,
+# behaves exactly as it did before the map existed. A governed goatnet sets
+# the map in group_vars:
+#   netbird_mgmt_role_map:
+#     - { group: NETBIRD-ADMIN,  role: admin }
+#     - { group: PLATFORM-ADMIN, role: auditor }
+#     - { group: IAM-ADMIN,      role: auditor }
+netbird_mgmt_role_map: "{{ dict(netbird_mgmt_admin_groups | zip_longest([], fillvalue='admin')) | dict2items(key_name='group', value_name='role') }}"
+
+# How often the reconcile runs. A newly-signed-in admin waits at most this long
+# for their rights. Cheap: one Kratos GET + one indexed SELECT per entitled
+# person.
+netbird_admin_reconcile_interval: "5min"
+
+# Master gate. Off leaves no unit installed at all.
+netbird_admin_reconcile_enabled: true
+
+kratos_admin_host_port: 4434
+
+# node_exporter textfile-collector drop directory. The reconcile publishes
+# `netbird_admin_reconcile_pending_first_login` here so the one state nobody can
+# fix by deploying — an entitled person who has never signed in — is visible on
+# the normal metrics surface instead of only in this host's journal.
+# Best-effort: if the directory does not exist the metric is skipped and the
+# reconcile still succeeds.
+netbird_admin_reconcile_textfile_dir: /var/lib/node_exporter/textfile
+
+# The map as the script reads it: GROUP=role,GROUP=role, order kept. Derived;
+# do not set it directly.
+netbird_mgmt_role_map_env: "{{ netbird_mgmt_role_map | map(attribute='group') | zip(netbird_mgmt_role_map | map(attribute='role')) | map('join', '=') | join(',') }}"

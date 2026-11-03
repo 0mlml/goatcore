@@ -1,0 +1,193 @@
+---
+# ops/ansible/roles/ntp-hygiene/defaults/main.yml
+#
+# Defaults for the ntp-hygiene role. Override per-play or per-host as
+# needed, in ops/ansible/group_vars/<site>_hosts/vars.yml.
+
+# -- NTS sources (NO plain NTP) ---------------------------------------------
+# All four are public NTS (RFC 8915) servers. Chrony 4.0+ (shipped in
+# Ubuntu 22.04 as 4.2-2ubuntu2) speaks NTS natively. Each source uses
+# the `nts` directive in the rendered chrony.conf — if NTS key-exchange
+# fails the source is refused and chrony logs the error (fail-closed
+# per universal-ntp-hygiene.md §7).
+chrony_nts_sources:
+  - "time.cloudflare.com"
+  - "nts.ntp.rnl.se"
+  - "ptbtime1.ptb.de"
+  - "ohio.time.system76.com"
+
+# Plain (non-NTS) NTP servers — a DECLARED DEVIATION from the NTS-only policy,
+# empty by default. Set this ONLY for a site whose network blocks NTS-KE /
+# public NTP so no NTS source is reachable and unauthenticated NTP is the only
+# time available. Record the deviation in the site's docs. See
+# docs/design/universal-ntp-hygiene.md §7 and F-411.
+chrony_plain_ntp_sources: []
+
+# -- Local thresholds -------------------------------------------------------
+# Alert thresholds match ops/compose/mgmt-host/monitoring/rules/ntp.yml.
+# Preflight threshold (chrony_preflight_offset_ms) is the "refuse to
+# proceed" gate — tighter than the alerting threshold on purpose so we
+# never kick off a multi-step upgrade with a host that's already drifting.
+chrony_max_offset_ms: 500       # alerting threshold (>500ms for 2m -> warn)
+chrony_max_drift_ppm: 50        # alerting threshold (>50 ppm for 10m -> warn)
+chrony_preflight_offset_ms: 200 # preflight gate — stricter than alerting
+chrony_preflight_min_sources: 1 # must have >=1 selected source before we proceed
+chrony_smoketest_offset_s: 0.1  # post-deploy smoke-test ceiling
+
+# -- chrony_exporter ---------------------------------------------------------
+# Upstream: github.com/SuperQ/chrony_exporter — pinned binary install.
+# Bumping the version: update both fields; the role re-downloads
+# idempotently on checksum mismatch.
+chrony_exporter_version: "0.13.3"
+# Bind all interfaces so the Prometheus container (in the docker
+# bridge network, connecting via host-gateway → 172.17.0.1) can reach
+# us. EC2 SG / host firewall blocks external 9123. The old 127.0.0.1
+# bind caused ChronyDaemonDown because the scrape from 172.17.0.1
+# connection-refused.
+chrony_exporter_listen_addr: "0.0.0.0:9123"
+# Read chrony state via the Unix control socket — fastest path, doesn't
+# require opening chrony's UDP command socket to the host network.
+chrony_exporter_chrony_address: "unix:///run/chrony/chronyd.sock"
+
+# 0 = read chronyd over the Unix socket (default, unchanged fleet-wide). Set to
+# a port (e.g. 323) ONLY on a host where the Unix-socket client hangs — the
+# STIG'd Jetson's AppArmor-confined chronyd cannot reply to the exporter's temp
+# client socket, so /metrics hangs. Then chronyd binds a loopback
+# command port and the exporter reads 127.0.0.1:<port>. See F-411.
+chrony_exporter_cmdport: 0
+# Collectors to enable. Over the loopback command port the sources/sourcestats/
+# serverstats collectors hang; use ["tracking"] there (carries chrony_up +
+# stratum + offset, which is what the ChronyDaemonDown alert needs).
+chrony_exporter_collectors:
+  - tracking
+  - sources
+  - sourcestats
+  - serverstats
+chrony_exporter_install_dir: "/usr/local/bin"
+# Run the exporter AS the chrony daemon's own user so chronyd's RPC
+# authorization (which checks effective UID, not just group
+# membership) accepts it unconditionally. Ubuntu/Debian chrony
+# packages use `_chrony`; RHEL/Rocky use `chrony`. Override per-host.
+chrony_group: "_chrony"
+chrony_exporter_user: "_chrony"
+
+# -- chrony drift / log config ---------------------------------------------
+chrony_driftfile: "/var/lib/chrony/chrony.drift"
+chrony_logdir: "/var/log/chrony"
+
+# -- chrony pre-sync (closes F-096; F-165 relocation/late-WAN hardening) -----
+# When the host clock is implausibly old at boot (year < min), do a
+# one-shot non-NTS NTP step BEFORE chrony.service + docker.service start.
+# Closes the chicken-and-egg on a host without a live RTC: NTS-KE rides
+# TLS, TLS validates the cert against local clock, and a Tegra Orin
+# without RTC battery boots at epoch 0 (1970) — no NTS source can ever
+# validate. Without this pre-sync, chrony stays in stratum 10 orphan
+# mode and time-bound containers (registry mirrors, etc.) crash-loop.
+#
+# `chrony_presync_enabled` defaults true — single-disk dev envs
+# are reached by this too, but they have RTC and the script
+# no-ops on healthy clocks. No harm enabling fleet-wide.
+chrony_presync_enabled: true
+# fake-hwclock — the OFFLINE cold-boot companion to chrony-presync:
+# persists the wall clock to disk so an RTC-less board (Tegra AGX) that
+# cold-boots with no network starts at last-known-good instead of 1970,
+# keeping mTLS valid before any time source is reachable. Defaults true —
+# safe fleet-wide (`fake-hwclock load` only advances, never regresses, so it
+# no-ops on RTC-equipped hosts). Set false only to opt a host out.
+ntp_fake_hwclock_enabled: true
+# Year floor below which the pre-sync fires. 2025 is a reasonable
+# "anything before this is implausible" threshold — far enough back
+# that a normal warm reboot sails through, close enough that 1970 /
+# pre-2024 clocks trigger the pre-sync. Bump as time advances.
+chrony_presync_min_year: 2025
+# Wall-time budget for ONE invocation of the pre-sync (systemd
+# TimeoutStartSec). Must comfortably exceed the internal retry loop:
+# max_attempts × (sources × per_source_timeout + retry_delay). With the
+# defaults below (2 × (4 × 8 + 10) = 84s) 120s leaves headroom.
+chrony_presync_timeout_sec: 120
+# Per-source one-shot `chronyd -q` timeout (seconds).
+chrony_presync_per_source_timeout_sec: 8
+# How many full passes over the source list one invocation makes before
+# giving up (and letting the retry timer try again later). Keep small —
+# the timer provides the unbounded long-tail retries across time.
+chrony_presync_max_attempts: 2
+# Seconds to sleep between passes within a single invocation.
+chrony_presync_retry_delay_sec: 10
+# Try the DHCP default gateway as a LOCAL non-NTS source BEFORE the
+# public pools. Most edge/travel routers (incl. GL.iNet) serve NTP and
+# carry plausible time even when the public internet is unreachable —
+# this is what lets a relocated host bootstrap with no WAN. Set false to
+# go straight to public pools.
+chrony_presync_use_gateway: true
+# F-165: re-fire chrony-presync.service via a monotonic timer until it
+# succeeds, so a host powered on before its WAN was up self-heals once
+# the network becomes reachable. Default on fleet-wide (no-op once the
+# clock is sane; the script stops the timer on success).
+chrony_presync_retry_timer_enabled: true
+# Interval (seconds) between retry-timer firings while the clock is
+# still implausible. 60s converges within ~1-2 min of the WAN coming up
+# without hammering an unreachable network.
+chrony_presync_retry_interval_sec: 60
+# Plain (non-NTS) NTP pools tried in order, AFTER the gateway. Public
+# pools — fine to query without authentication once and only at boot.
+# The trust posture stays NTS-only for steady-state (chrony.conf has
+# only NTS sources); this list is exclusively for the bootstrap step.
+chrony_presync_fallback_pools:
+  - "2.pool.ntp.org"
+  - "pool.ntp.org"
+  - "time.cloudflare.com"
+
+# -- NTS server tier (Block 12G / ADR 0834) ---------------------------------
+# Default off. Flip to true on each mgmt-host (Orin-A/B/C per ADR 0826)
+# that should fan out time to in-mesh clients. Stays off on relay
+# VPSes and validation envs (those are pure NTS clients).
+#
+# When true, the role:
+#   1. Asserts the offline-CA-signed server cert + key exist at the
+#      configured paths (operator runs `cert-sign --eku serverAuth`
+#      against the host BEFORE flipping this flag).
+#   2. Renders chrony.conf with the server stanza (ntsserverkey,
+#      ntsservercert, ntsdumpdir, ntsport, allow CIDRs, port 123,
+#      orphan-mode local stratum 10).
+#   3. Restarts chrony.
+chrony_serve_nts: false
+
+# Cert paths. Operators issue via:
+#   cert-sign --eku serverAuth \
+#     --cn ntp.<site>.netbird.legacy.example \
+#     --san <wg-cp0-ip> --san <lan-ip> \
+#     --validity 8760h \
+#     --out-cert /etc/chrony/server-cert.pem \
+#     --out-key  /etc/chrony/server-key.pem
+chrony_serve_nts_cert_path: "/etc/chrony/server-cert.pem"
+chrony_serve_nts_key_path:  "/etc/chrony/server-key.pem"
+chrony_serve_nts_dump_dir:  "/var/lib/chrony"
+chrony_serve_nts_port:      4460   # standard NTS-KE port (RFC 8915)
+
+# Allow-list of CIDRs permitted to sync against this server.
+# Defaults: same-site canonical LAN + wg-cp0 silent control plane.
+# Override per-host to add per-VLAN sensor subnets etc.
+chrony_serve_nts_allow_cidrs:
+  - "192.168.1.0/24"   # canonical LAN — primary (sub-ms RTT)
+  - "198.18.0.0/24"    # wg-cp0 — cross-site fallback
+
+# -- chrony plain-NTP server (Block 82, trial fabrics only) -----------------
+# Plain-NTP server tier for a small trial fabric. Lighter
+# sibling of chrony_serve_nts: serves unauthenticated NTP on port 123 to
+# the configured LAN CIDRs without the NTS-KE setup overhead.
+#
+# Use cases (trial only):
+#   - Trial fabric: visiting laptops arrive with arbitrary clocks; they
+#     need a local NTP reference to validate leaf-cert `notBefore` /
+#     `notAfter` at TLS handshake.
+#   - Other small-scope offline LAB deploys where NTS setup is overkill.
+#
+# Mutually exclusive with chrony_serve_nts; the chrony.conf.j2 elif gate
+# prioritizes NTS when both are set, but production deploys MUST flip
+# chrony_serve_nts (Block 12G / ADR 0834) and leave this off.
+chrony_serve_plain_ntp: false
+
+# Allow-list of CIDRs permitted to sync against the plain-NTP server.
+# Default to a common LAN subnet. Override per-site.
+chrony_serve_plain_ntp_allow_cidrs:
+  - "192.168.1.0/24"

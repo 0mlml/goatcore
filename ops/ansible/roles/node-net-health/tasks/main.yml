@@ -1,0 +1,230 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the node-net-health collector + publisher on a goatnet node
+# (docs/design/node-net-health.md, ADR 1036 net domain).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router Healthy on the same docker network with the
+#      infra-node-net-health subject + infra-w-net-health rule LIVE in its
+#      config (router restart required after the template change — F-156),
+#      else the ops/net/health/<node> writes are silently denied.
+#   2. netbird daemon enrolled + running (the collector's F-098 socket guard
+#      skips the mesh plane honestly when absent).
+#   3. Infra leaf cert + key minted via offline-CA cert-sign with Subject
+#      CN=goat-node-net-health-trial-peer at
+#      {{ node_net_health_cert_dir }}/node-net-health-{cert,key}.pem.
+#
+# Persists only its own state dir (undeclared first/last-seen + NDJSON tail).
+
+- name: node-net-health | require enablement + a PINNED image (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - node_net_health_enabled | bool
+      - "'@sha256:' in node_net_health_image"
+      - "'PENDING' not in node_net_health_image"
+      - node_net_health_node_class != 'unknown'
+    fail_msg: >-
+      node-net-health requires node_net_health_enabled, a digest-pinned
+      node_net_health_image (no PENDING sentinel), and a declared
+      node_net_health_node_class + baseline rules (the egress contract).
+
+- name: node-net-health | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ node_net_health_cert_dir }}/node-net-health-cert.pem"
+  register: nnh_cert_stat
+  when: node_net_health_zenoh_endpoint is match('^tls/')
+
+- name: node-net-health | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      node-net-health: leaf cert missing at
+      {{ node_net_health_cert_dir }}/node-net-health-cert.pem. Mint one via the
+      offline-CA cert-sign ceremony (Subject CN=goat-node-net-health-trial-peer)
+      before re-running (see docs/operations/dev-ca-cert-sign.md).
+  when:
+    - node_net_health_zenoh_endpoint is match('^tls/')
+    - nnh_cert_stat is not skipped
+    - not (nnh_cert_stat.stat.exists | default(false))
+
+- name: node-net-health | normalize cert dir ownership for non-root container uid 65532
+  ansible.builtin.file:
+    path: "{{ node_net_health_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: node_net_health_zenoh_endpoint is match('^tls/')
+
+- name: node-net-health | dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ node_net_health_compose_dir }}"
+    - "{{ node_net_health_state_dir }}"
+    - "{{ node_net_health_etc_dir }}"
+
+- name: node-net-health | install the classifying collector
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../node-net-health/nnh-snapshot.py"
+    dest: /usr/local/bin/nnh-snapshot.py
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: node-net-health | render the baseline registry (the egress contract)
+  ansible.builtin.template:
+    src: baseline.json.j2
+    dest: "{{ node_net_health_etc_dir }}/baseline.json"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: node-net-health | install snapshot systemd service + timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - node-net-health-snapshot.service
+    - node-net-health-snapshot.timer
+  notify: node-net-health | reload systemd
+
+- name: node-net-health | flush handlers before enabling the timer
+  ansible.builtin.meta: flush_handlers
+
+- name: node-net-health | enable + start the snapshot timer
+  ansible.builtin.systemd:
+    name: node-net-health-snapshot.timer
+    enabled: true
+    state: started
+
+- name: node-net-health | run one snapshot now (grounded first tick)
+  ansible.builtin.systemd:
+    name: node-net-health-snapshot.service
+    state: started
+
+# --- bandwidth attribution (ADR 1128) ---------------------------------------
+
+- name: node-net-health | ensure the node-exporter textfile dir exists
+  # The node-exporter role creates this, but the two roles can be applied in
+  # either order and a missing dir would make the first --fast run report a
+  # write failure that looks like a collector fault rather than an ordering
+  # one. Cheap to guarantee here.
+  ansible.builtin.file:
+    path: "{{ node_net_health_textfile_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: node_net_health_attribution_enabled | bool
+
+- name: node-net-health | install attribution systemd service + timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - node-net-health-attribution.service
+    - node-net-health-attribution.timer
+  notify: node-net-health | reload systemd
+  when: node_net_health_attribution_enabled | bool
+
+- name: node-net-health | flush handlers before enabling the attribution timer
+  ansible.builtin.meta: flush_handlers
+
+- name: node-net-health | enable + start the attribution timer
+  ansible.builtin.systemd:
+    name: node-net-health-attribution.timer
+    enabled: true
+    state: started
+  when: node_net_health_attribution_enabled | bool
+
+- name: node-net-health | take two attribution samples (the first has no delta)
+  # A single run establishes the baseline and emits zeros — which reads exactly
+  # like "no traffic" on the dashboard. Taking two, spaced, means the deploy
+  # leaves behind a REAL first reading instead of a plausible-looking false one.
+  ansible.builtin.shell: |
+    systemctl start node-net-health-attribution.service
+    sleep {{ node_net_health_attribution_verify_gap_s }}
+    systemctl start node-net-health-attribution.service
+  changed_when: true
+  when: node_net_health_attribution_enabled | bool
+
+- name: node-net-health | prove the textfile is being written
+  # Verification, not hope — the same discipline the node-exporter role adopted
+  # after F-289 (a declared target with nothing behind it).
+  ansible.builtin.command: "grep -c '^goat_net_' {{ node_net_health_textfile_path }}"
+  register: _nnh_attr_lines
+  changed_when: false
+  failed_when: _nnh_attr_lines.rc != 0 or (_nnh_attr_lines.stdout | int) < 1
+  when: node_net_health_attribution_enabled | bool
+
+- name: node-net-health | rollup www subdir (container uid 65532)
+  ansible.builtin.file:
+    path: "{{ node_net_health_rollup_www_dir }}/net"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0755"
+  when: node_net_health_rollup_enabled | bool
+
+- name: node-net-health | install the node-list page beside relay-health
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../relay/health/node-net-health.html"
+    dest: "{{ node_net_health_rollup_www_dir }}/node-net-health.html"
+    owner: root
+    group: root
+    mode: "0644"
+  when: node_net_health_rollup_enabled | bool
+
+- name: node-net-health | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ node_net_health_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: node-net-health | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ node_net_health_compose_dir }}"
+  changed_when: true
+
+- name: node-net-health | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ node_net_health_compose_dir }}"
+  register: nnh_up
+  changed_when:
+    - "'Started' in nnh_up.stderr or 'Created' in nnh_up.stderr or 'Recreated' in nnh_up.stderr"
+
+- name: node-net-health | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ node_net_health_compose_dir }}"
+  register: nnh_ps
+  changed_when: false
+
+- name: node-net-health | show
+  ansible.builtin.debug:
+    msg: "{{ nnh_ps.stdout_lines }}"
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: node-net-health | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "node-net-health"
+    rollback_ref: "{{ node_net_health_image }}"

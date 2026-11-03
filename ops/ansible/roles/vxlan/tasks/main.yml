@@ -1,0 +1,231 @@
+---
+# ops/ansible/roles/vxlan/tasks/main.yml
+#
+# Block 14 — VXLAN-over-WireGuard L2 segment role (bash + iproute2 model).
+# Design: docs/design/l2-vxlan-networking.md
+#
+# Architecture: bash + iproute2 directly, NOT systemd-networkd .netdev files.
+# Reason: F-051 — systemd-networkd 249 (Ubuntu 22.04) silently loads VXLAN
+# .netdev files but never instantiates the kernel netdev when Local= depends
+# on a DHCP-configured underlay interface. Replaced with /usr/local/sbin/
+# vxlan-runtime-state.sh which uses iproute2 directly. Idempotent, debuggable,
+# avoids the networkd quirk entirely. Same code path runs at boot (via the
+# vxlan-runtime-state.service oneshot) and at Ansible-apply time (via
+# `notify: restart vxlan-runtime-state` on config / script / unit changes).
+#
+# Pipeline:
+#   1. No-op cleanly when vxlan_segments is empty.
+#   2. Validate transport (only vxlan in v1; gretap reserved).
+#   3. Read this host's underlay IP (wt0 by default; override via
+#      vxlan_underlay_override_ip for lab use over a non-WG underlay).
+#   4. Compute orphan netdevs (live links matching managed prefix not in
+#      current segment list); remove them when vxlan_remove_orphans=true.
+#   5. Render /etc/vxlan/segments.conf, the apply script, the systemd unit.
+#   6. Enable + restart vxlan-runtime-state.service. Service runs the script,
+#      which reads the config and applies kernel state idempotently.
+
+- name: Skip when no segments AND orphan cleanup not requested (role no-op for this host)
+  ansible.builtin.meta: end_host
+  when:
+    - vxlan_segments | length == 0
+    - not (vxlan_remove_orphans | default(false) | bool)
+
+- name: Assert supported transport
+  ansible.builtin.assert:
+    that:
+      - vxlan_transport in ['vxlan']
+    fail_msg: >-
+      vxlan_transport={{ vxlan_transport }} not supported in v1.
+      Only 'vxlan' is wired. 'gretap' is reserved (Block 14B follow-up).
+
+- name: Install iproute2 + iptables + bridge tooling
+  ansible.builtin.apt:
+    name:
+      - iproute2
+      - iptables
+      - bridge-utils
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# One-time migration: prior versions of this role used systemd-networkd
+# .netdev/.network files. F-051 captured why we moved off that path. Clean
+# up any leftover files so a fresh apply / teardown leaves no residue.
+- name: Find legacy systemd-networkd files (one-time migration cleanup)
+  ansible.builtin.find:
+    paths: /etc/systemd/network
+    patterns:
+      - "25-vxlan-*.netdev"
+      - "25-vxlan-*.network"
+      - "25-br-l2*.netdev"
+      - "25-br-l2*.network"
+      - "25-br-l2*-iface-*.network"
+    file_type: file
+  register: vxlan_legacy_networkd_files
+
+- name: Remove legacy systemd-networkd files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ vxlan_legacy_networkd_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+# ---- Underlay IP discovery ------------------------------------------------
+
+- name: Probe netbird interface ({{ vxlan_netbird_interface }}) presence
+  ansible.builtin.command:
+    cmd: "ip -4 -o addr show dev {{ vxlan_netbird_interface }}"
+  register: vxlan_nb_probe
+  changed_when: false
+  failed_when: false
+  when: vxlan_underlay_override_ip | length == 0
+
+- name: Fail clearly if neither override nor netbird interface available
+  ansible.builtin.assert:
+    that:
+      - vxlan_nb_probe.rc == 0
+      - vxlan_nb_probe.stdout | length > 0
+    fail_msg: >-
+      Interface {{ vxlan_netbird_interface }} not found or has no IPv4 address.
+      VXLAN-over-WG requires netbird to be up first (sudo netbird up). If the
+      mesh interface name differs on this host, override vxlan_netbird_interface.
+      For lab use over a non-WG underlay, set vxlan_underlay_override_ip.
+  when: vxlan_underlay_override_ip | length == 0
+
+- name: Extract this host's underlay IP (netbird interface)
+  ansible.builtin.set_fact:
+    vxlan_local_mesh_ip: "{{ vxlan_nb_probe.stdout | regex_search('inet ([0-9.]+)/', '\\1') | first }}"
+  when: vxlan_underlay_override_ip | length == 0
+
+- name: Use vxlan_underlay_override_ip as this host's VXLAN local IP
+  ansible.builtin.set_fact:
+    vxlan_local_mesh_ip: "{{ vxlan_underlay_override_ip }}"
+  when: vxlan_underlay_override_ip | length > 0
+
+- name: Show resolved local underlay IP
+  ansible.builtin.debug:
+    msg: "vxlan: this host's underlay IP is {{ vxlan_local_mesh_ip }} (override={{ vxlan_underlay_override_ip | length > 0 }})"
+
+# ---- Live-orphan cleanup (when vxlan_remove_orphans=true) ----------------
+#
+# Lists current br-l2*/vxlan* netdevs and computes the set our config wants
+# to keep. Anything not in the desired set gets `ip link del`'d. Off by
+# default; flip on for the validation env or hosts where this role owns its
+# bridges exclusively. Keeps blast radius narrow.
+
+- name: List live bridges matching managed prefix
+  ansible.builtin.shell: |
+    set -o pipefail
+    ip -o link show 2>/dev/null \
+      | awk -F': ' '/^[0-9]+: {{ vxlan_managed_bridge_prefix }}/{print $2}' \
+      | awk '{print $1}'
+  args:
+    executable: /bin/bash
+  register: vxlan_live_bridges
+  changed_when: false
+  when: vxlan_remove_orphans | bool
+
+- name: List live VXLAN netdevs
+  ansible.builtin.shell: |
+    set -o pipefail
+    ip -o link show type vxlan 2>/dev/null \
+      | awk -F': ' '{print $2}' \
+      | awk '{print $1}'
+  args:
+    executable: /bin/bash
+  register: vxlan_live_vxlans
+  changed_when: false
+  when: vxlan_remove_orphans | bool
+
+- name: Compute desired-keep set (bridges + vxlans this run)
+  ansible.builtin.set_fact:
+    vxlan_desired_bridges: "{{ vxlan_segments | map(attribute='bridge') | list }}"
+    vxlan_desired_vxlans:  "{{ vxlan_segments | map(attribute='vni') | map('regex_replace', '^', 'vxlan') | list }}"
+  when: vxlan_remove_orphans | bool
+
+- name: Delete orphan bridges (managed prefix, not in current config)
+  ansible.builtin.command:
+    cmd: "ip link del {{ item }}"
+  loop: "{{ (vxlan_live_bridges.stdout_lines | default([])) | difference(vxlan_desired_bridges | default([])) }}"
+  when: vxlan_remove_orphans | bool
+  register: vxlan_orphan_bridge_del
+  changed_when: vxlan_orphan_bridge_del.rc == 0
+  failed_when: false
+
+- name: Delete orphan VXLAN netdevs
+  ansible.builtin.command:
+    cmd: "ip link del {{ item }}"
+  loop: "{{ (vxlan_live_vxlans.stdout_lines | default([])) | difference(vxlan_desired_vxlans | default([])) }}"
+  when: vxlan_remove_orphans | bool
+  register: vxlan_orphan_vxlan_del
+  changed_when: vxlan_orphan_vxlan_del.rc == 0
+  failed_when: false
+
+# ---- Render runtime-state pieces (single source of truth) ----------------
+
+- name: Ensure /etc/vxlan/ exists
+  ansible.builtin.file:
+    path: /etc/vxlan
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render runtime-state config (segments.conf)
+  ansible.builtin.template:
+    src: segments.conf.j2
+    dest: /etc/vxlan/segments.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart vxlan-runtime-state
+
+- name: Install vxlan-runtime-state.sh
+  ansible.builtin.template:
+    src: vxlan-runtime-state.sh.j2
+    dest: /usr/local/sbin/vxlan-runtime-state.sh
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart vxlan-runtime-state
+
+- name: Install vxlan-runtime-state.service unit
+  ansible.builtin.template:
+    src: vxlan-runtime-state.service.j2
+    dest: /etc/systemd/system/vxlan-runtime-state.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - daemon-reload
+    - restart vxlan-runtime-state
+
+- name: Enable vxlan-runtime-state.service (so it runs on boot)
+  ansible.builtin.systemd:
+    name: vxlan-runtime-state.service
+    enabled: true
+
+- name: Apply runtime state now (flush handlers — service runs the script)
+  ansible.builtin.meta: flush_handlers
+
+# Belt-and-suspenders: even when nothing changed (handler not notified),
+# trigger the script on every role run so the role is reliably idempotent
+# at end-state, not just on diff.
+- name: Force apply (trigger the runtime-state script regardless of diff)
+  ansible.builtin.systemd:
+    name: vxlan-runtime-state.service
+    state: restarted
+
+- name: Wait for VXLAN netdevs to appear
+  ansible.builtin.command:
+    cmd: "ip -o link show dev vxlan{{ segment.vni }}"
+  loop: "{{ vxlan_segments }}"
+  loop_control:
+    loop_var: segment
+    label: "vxlan{{ segment.vni }}"
+  register: vxlan_netdev_check
+  retries: 5
+  delay: 1
+  until: vxlan_netdev_check.rc == 0
+  changed_when: false

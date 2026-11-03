@@ -1,0 +1,30 @@
+---
+# docker-engine handlers — fired when daemon.json changes.
+#
+# `restart docker` is intentionally heavy: it stops every running
+# container on the host. The role's pre-flight assertion above is
+# designed to fail BEFORE this handler fires if data-root is
+# misconfigured (operator runs migration ceremony first), so this
+# handler should only fire on first-time configuration of a fresh
+# host or on log-driver bounds change (negligible).
+#
+# A change to data-root with non-empty existing /var/lib/docker will
+# cause Docker to lose track of all containers/images/volumes — they
+# stay on disk at the old path but are invisible to the new daemon.
+# That's why the pre-flight asserts the running daemon's data-root
+# matches BEFORE this handler can fire on a populated host.
+
+- name: restart docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+
+# `restart containerd` cascades to docker (Docker depends on
+# containerd). Operators expect Docker to come back up too — the
+# notify wires both, but restarting containerd alone is enough to
+# pick up the new root path because docker.service is `Requires=`-
+# linked to containerd.service and gets restarted automatically.
+- name: restart containerd
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted

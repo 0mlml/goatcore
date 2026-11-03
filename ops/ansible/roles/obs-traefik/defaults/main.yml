@@ -1,0 +1,73 @@
+---
+# Defaults for the `obs-traefik` role.
+#
+# Block 21H.3 prereq — Traefik on Orin-C, fronting the operator IdP
+# (Kratos + Hydra) and every obs/utility consumer (Grafana, MinIO,
+# OpenObserve, Forgejo, Ollama, Prom, Alertmanager).
+#
+# Distinct from the existing `traefik` role on Orin-A — that role
+# joins the mgmt-host compose project and does NOT manage its own
+# compose. obs-traefik DOES manage its own compose at
+# /opt/obs-traefik/ because Orin-C has no equivalent project.
+#
+# Required vars:
+#   site_id              site identifier (e.g. "vega")
+#   site_dns_zone        DNS zone (e.g. "netbird-prod.goat.example")
+#   obs_traefik_routes   list of route dicts (see schema below)
+# Optional:
+#   obs_traefik_image    pinned image (default tag below)
+
+obs_traefik_image: "traefik:v3.7.16@sha256:1336e85aaed293bd63d005086e0dd013b04078b26aaeb1c18b26a2f928af7e65"
+
+obs_traefik_compose_dir: "/opt/obs-traefik"
+obs_traefik_data_root: "/opt/docker-data/obs-traefik"
+
+# TLS root — same convention as the Orin-A traefik role. Operator
+# delivers the cert + key under <tls_root>/operator-idp/ (single
+# multi-SAN cert covers auth.ops.<site> + oauth2.ops.<site> + future
+# obs hostnames).
+obs_traefik_tls_root: "/etc/goat/tls"
+obs_traefik_dynamic_dir: "/etc/goat/traefik-dynamic"
+
+# Listen ports. :443 is the public-facing TLS terminator (reachable
+# via the Orin-C wg-cp0 IP 198.18.0.9 + the LAN IP). :8080 is the
+# Traefik admin/dashboard, bound to LOOPBACK only.
+obs_traefik_https_port: 443
+obs_traefik_admin_port: 8080
+
+# Routes — list of dicts, each rendered into a Traefik dynamic-config
+# file at /etc/goat/traefik-dynamic/<name>.yml. Schema:
+#
+#   - name: route identifier (becomes <name>.yml + tls/<name>/cert.pem)
+#     hosts: list of Host header rules
+#     backend: backend URL (typically host.docker.internal:<port>)
+#     cert_src: operator-laptop path to cert PEM (cert-sign output)
+#     key_src:  operator-laptop path to key PEM
+#     middlewares: optional list of middleware names from the static
+#                  middleware catalog (forwardauth-operator-idp, etc.)
+#
+# Default empty — per-site group_vars populates this. Operator-IdP
+# routes (auth.ops.<site> + oauth2.ops.<site>) are always present
+# when operator_idp_enabled is true.
+obs_traefik_routes: []
+
+# Static middleware catalog. Each entry rendered into the
+# obs-traefik-middlewares.yml dynamic config. The forwardauth-operator-idp
+# middleware exists for consumers that don't speak OIDC natively
+# (Prometheus, Alertmanager, Ollama UI) — they sit behind Traefik
+# which forwards the request to operator-IdP Hydra's introspection
+# endpoint, blocks unauthenticated, passes through with the JWT for
+# authenticated.
+obs_traefik_middlewares:
+  forwardauth-operator-idp:
+    forwardAuth:
+      # Hydra's userinfo endpoint validates the bearer token AND
+      # returns the identity's groups[] claim. Consumers that ride
+      # this middleware enforce authn at Traefik; authz remains
+      # consumer-side (each must check the X-Forwarded-Groups header
+      # for the right group string).
+      address: "http://host.docker.internal:{{ operator_idp_hydra_public_host_port | default(4446) }}/userinfo"
+      authResponseHeaders:
+        - X-User-Email
+        - X-User-Groups
+      trustForwardHeader: true

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Rendered by ops/ansible/roles/docker-registry-mirror on {{ ansible_date_time.iso8601 }}.
+#
+# Operator-runnable self-test. Verifies each upstream mirror's
+# /v2/ endpoint returns 200 and the container is in a running state.
+
+set -euo pipefail
+
+PASS=0
+FAIL=0
+
+check() {
+    local name=$1
+    shift
+    if "$@" >/dev/null 2>&1; then
+        printf '  [ok]   %s\n' "$name"
+        PASS=$((PASS + 1))
+    else
+        printf '  [FAIL] %s (cmd: %s)\n' "$name" "$*" >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+printf 'docker-registry-mirror self-test (host: %s)\n\n' "$(hostname)"
+
+{% for item in docker_registry_mirror_upstreams %}
+check "container running:    registry-{{ item.name }}" \
+    bash -c "docker ps --filter name=registry-{{ item.name }} --filter status=running --format '{% raw %}{{.Names}}{% endraw %}' | grep -q '^registry-{{ item.name }}\$'"
+check "v2 endpoint up:       :{{ item.host_port }}" \
+    curl -sf "http://127.0.0.1:{{ item.host_port }}/v2/" -o /dev/null
+{% endfor %}
+
+printf '\nresult: %d pass, %d fail\n' "$PASS" "$FAIL"
+exit $((FAIL > 0 ? 1 : 0))

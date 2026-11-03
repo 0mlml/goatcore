@@ -1,0 +1,275 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy goat-fabric-crawler on a mgmt-host
+# (docs/design/zenoh-cardinality-budget-and-lazy-crawler.md §4).
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. zenoh-router container Healthy on the same docker network.
+#   2. Leaf cert + key present at {{ fabric_crawler_cert_dir }} — default is
+#      the fabric-health infra leaf (rule infra-w-fabric-health already grants
+#      ops/fabric/** ingress put; no ACL change, no router restart). The
+#      dedicated CN=goat-fabric-crawler-trial-peer identity is pre-cut inert in
+#      the router ACL template for the next cert ceremony (wrong CN = silent
+#      denial, F-177).
+#   3. CA root present at {{ fabric_crawler_ca_root_src }}.
+#   4. If fabric_crawler_json_out_host_path is set: the relay-health ingest dir
+#      exists (the role creates the dir but the band is deployed separately),
+#      and the relay-health role's shell sampler timer is disabled
+#      (relay_health_fabric_sampler_enabled: false) so exactly ONE walker runs.
+#
+# Persists nothing but the optional band JSON — no secrets, no .env.
+
+- name: fabric-crawler | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ fabric_crawler_cert_dir }}/{{ fabric_crawler_cert_file }}"
+  register: fabric_crawler_cert_stat
+  when: fabric_crawler_zenoh_endpoint is match('^tls/')
+
+- name: fabric-crawler | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      fabric-crawler: leaf cert missing at
+      {{ fabric_crawler_cert_dir }}/{{ fabric_crawler_cert_file }}. Default reuses
+      the fabric-health infra leaf (deploy the fabric-health role first), or mint
+      a dedicated CN=goat-fabric-crawler-trial-peer leaf via the offline-CA
+      cert-sign ceremony (see docs/operations/dev-ca-cert-sign.md) and point
+      fabric_crawler_cert_dir/_file at it.
+  when:
+    - fabric_crawler_zenoh_endpoint is match('^tls/')
+    - fabric_crawler_cert_stat is not skipped
+    - not (fabric_crawler_cert_stat.stat.exists | default(false))
+
+- name: fabric-crawler | pre-flight CA root exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ fabric_crawler_ca_root_src }}"
+  register: fabric_crawler_ca_root_stat
+  when: fabric_crawler_zenoh_endpoint is match('^tls/')
+
+- name: fabric-crawler | fail on missing CA root
+  ansible.builtin.fail:
+    msg: >-
+      fabric-crawler: CA root cert missing at {{ fabric_crawler_ca_root_src }} —
+      same file zenoh-router uses, so its absence means the router itself isn't
+      deployed.
+  when:
+    - fabric_crawler_zenoh_endpoint is match('^tls/')
+    - fabric_crawler_ca_root_stat is not skipped
+    - not (fabric_crawler_ca_root_stat.stat.exists | default(false))
+
+# The crawler container runs as the non-root chainguard uid 65532; the mounted
+# /certs is read-only, so the leaf key (mode 0400) must be OWNED by 65532 or the
+# container hits "Invalid TLS private key file: Permission denied" and can never
+# open a router session (the census/rollup facets go silently unpublished). The
+# mint stages the leaf root-owned, so normalize here — mirrors node-net-health's
+# "normalize cert dir ownership" task. Idempotent; skip when not a tls/ endpoint.
+- name: fabric-crawler | normalize cert dir ownership for non-root container uid 65532
+  ansible.builtin.file:
+    path: "{{ fabric_crawler_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: fabric_crawler_zenoh_endpoint is match('^tls/')
+
+- name: fabric-crawler | ensure band-json out dir (when enabled)
+  ansible.builtin.file:
+    path: "{{ fabric_crawler_json_out_host_path | dirname }}"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0755"
+  when: fabric_crawler_json_out_host_path | length > 0
+
+- name: fabric-crawler | ensure compose project dir
+  ansible.builtin.file:
+    path: "{{ fabric_crawler_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: fabric-crawler | ensure rocksdb secondary scratch dir (container uid 65532)
+  ansible.builtin.file:
+    path: "{{ fabric_crawler_compose_dir }}/secondary"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0755"
+  when: fabric_crawler_rocksdb_dir | default('') | length > 0
+
+# Topic-budget allowance projection (layer 2b — the allocation half).
+# Registry-projection interim, stated per the tee-up: the SoT is the
+# per-goatnet group_vars grant record (zenoh_topic_budget_grants — F-272:
+# knobs live in group_vars, fail-closed), rendered here and re-read by the
+# crawler EVERY cycle, so a grant change lands via this role run with no
+# crawler restart. The registry grant store (ADR 1075, live in the portal) is
+# the named follow-up home; when the topic-budget attribute lands there the
+# source flips to the resolver endpoint and this render retires. The DIR (not
+# the file) is bind-mounted so the atomic template replace is visible
+# Fail-closed: a registry budget-source flip with a missing URL or token
+# would deploy a crawler whose source never loads (every owner unmeasured) —
+# refuse instead.
+- name: fabric-crawler | registry budget-source preconditions
+  ansible.builtin.assert:
+    that:
+      - fabric_crawler_budget_projection_url | length > 0
+      - fabric_crawler_budget_token | length > 0
+    fail_msg: >-
+      zenoh_topic_budget_source=registry requires
+      fabric_crawler_budget_projection_url + fabric_crawler_budget_token
+      (operator bearer, via env lookup in group_vars).
+  when: (zenoh_topic_budget_source | default('file')) == 'registry'
+
+# in-container despite the inode change.
+- name: fabric-crawler | ensure budgets dir (when allocation in force)
+  ansible.builtin.file:
+    path: "{{ fabric_crawler_compose_dir }}/budgets"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: zenoh_topic_budget_grants is defined
+
+# Single-expression render on purpose: a vars-dict here would re-template
+# each value to a STRING ("10", not 10) and the crawler's fail-closed parse
+# would read the whole projection as malformed. Inside one expression the
+# int filter keeps real numbers and to_nice_json emits them as JSON numbers.
+- name: fabric-crawler | render topic-budget allowance projection
+  ansible.builtin.copy:
+    content: >-
+      {{ {
+        'source': 'ansible group_vars zenoh_topic_budget_grants (registry-projection interim; SoT follow-up = ADR 1075 grant store)',
+        'self_service_block': (zenoh_topic_budget_self_block | default(10) | int),
+        'auto_self_service_anchors': (zenoh_active_slot_anchors | default([])),
+        'grants': zenoh_topic_budget_grants,
+      } | to_nice_json }}
+    dest: "{{ fabric_crawler_compose_dir }}/budgets/topic-budgets.json"
+    owner: root
+    group: root
+    mode: "0644"
+  when: zenoh_topic_budget_grants is defined
+
+- name: fabric-crawler | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ fabric_crawler_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: fabric-crawler | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ fabric_crawler_compose_dir }}"
+  changed_when: true
+
+- name: fabric-crawler | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ fabric_crawler_compose_dir }}"
+  register: fabric_crawler_up
+  changed_when:
+    - "'Started' in fabric_crawler_up.stderr or 'Created' in fabric_crawler_up.stderr or 'Recreated' in fabric_crawler_up.stderr"
+
+- name: fabric-crawler | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ fabric_crawler_compose_dir }}"
+  register: fabric_crawler_ps
+  changed_when: false
+
+- name: fabric-crawler | show
+  ansible.builtin.debug:
+    msg: "{{ fabric_crawler_ps.stdout_lines }}"
+
+# ---------------------------------------------------------------------------
+# Secondary-dir LOG reaper.
+#
+# Not part of the container: the debris is on the HOST scratch bind, the
+# crawler image is a shell-less chainguard base, and the reaper must keep
+# running when the container is down (that is exactly when nobody is watching
+# the tree). See the defaults block for the measurement that motivated it.
+# ---------------------------------------------------------------------------
+- name: fabric-crawler | logprune teardown
+  when: not (fabric_crawler_logprune_enabled | bool)
+  block:
+    - name: fabric-crawler | logprune | stop + disable timer and service
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - fabric-crawler-logprune.timer
+        - fabric-crawler-logprune.service
+      failed_when: false
+
+    - name: fabric-crawler | logprune | remove units and script
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/fabric-crawler-logprune.timer
+        - /etc/systemd/system/fabric-crawler-logprune.service
+        - /usr/local/sbin/fabric-crawler-logprune.sh
+
+    # A textfile the exporter keeps serving after the reaper is gone reads as
+    # "debris under control" forever, which is the opposite of true. Guarded on
+    # the dir being set: with the default empty value the path would collapse to
+    # /fabric-crawler-logprune.prom, which is not ours to delete.
+    - name: fabric-crawler | logprune | remove stale metric
+      ansible.builtin.file:
+        path: "{{ fabric_crawler_logprune_textfile_dir }}/fabric-crawler-logprune.prom"
+        state: absent
+      when: fabric_crawler_logprune_textfile_dir | length > 0
+
+    - name: fabric-crawler | logprune | reload systemd after removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: fabric-crawler | logprune | say what was removed
+      ansible.builtin.debug:
+        msg:
+          - "fabric-crawler-logprune is TORN DOWN on this host."
+          - "The secondary tree at {{ fabric_crawler_compose_dir }}/secondary will now"
+          - "grow by one ~37 KB LOG.old per store per crawl cycle, unbounded."
+
+- name: fabric-crawler | logprune install
+  when: fabric_crawler_logprune_enabled | bool
+  block:
+    - name: fabric-crawler | logprune | install reaper script
+      ansible.builtin.template:
+        src: fabric-crawler-logprune.sh.j2
+        dest: /usr/local/sbin/fabric-crawler-logprune.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: fabric-crawler | logprune | install units
+      ansible.builtin.template:
+        src: "fabric-crawler-logprune.{{ item }}.j2"
+        dest: "/etc/systemd/system/fabric-crawler-logprune.{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - service
+        - timer
+      register: fabric_crawler_logprune_units
+
+    - name: fabric-crawler | logprune | reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: fabric_crawler_logprune_units is changed
+
+    - name: fabric-crawler | logprune | enable + start timer
+      ansible.builtin.systemd:
+        name: fabric-crawler-logprune.timer
+        state: started
+        enabled: true
+
+    # Run once at deploy so a host that has been accruing debris since its last
+    # deploy is not left waiting up to an hour for the first sweep.
+    - name: fabric-crawler | logprune | first sweep now
+      ansible.builtin.command:
+        cmd: systemctl start --no-block fabric-crawler-logprune.service
+      changed_when: true

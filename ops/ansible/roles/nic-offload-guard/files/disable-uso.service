@@ -1,0 +1,27 @@
+[Unit]
+# F-300 (docs/findings/F-300-nvethernet-uso-emits-malformed-segments-under-udp-gso.md):
+# the Tegra nvethernet hardware UDP segmentation engine emits MALFORMED
+# segments (short lengths, impossible TTLs, duplicate IP IDs) with VALID
+# checksums recomputed over the wrong payload. wireguard-go batches outbound
+# packets via UDP_SEGMENT, so ~20% of tunnel packets are corrupted, fail
+# Poly1305 at the far end, and are dropped silently -- no counter anywhere
+# records it. TCP sees 13-20% loss, cwnd pinned at 2, ~3 Mbps.
+# Disabling USO raises throughput about 250x.
+# ethtool settings do NOT survive reboot, hence this unit.
+#
+# Kernel WireGuard is NOT affected — this guard protects the
+# userspace-fallback path after a kernel bump outruns the module artifacts.
+# Managed by ops/ansible/roles/nic-offload-guard/ — edit there, not here.
+Description=Disable broken hardware UDP segmentation offload
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Resolve the WAN NIC at runtime rather than hardcoding: eno1 today, but the
+# unit should not silently no-op if the interface is ever renamed.
+ExecStart=/bin/bash -c 'N=$(ip route show default | grep -oE "dev [a-z0-9]+" | head -1 | cut -d" " -f2); test -n "$N" && /sbin/ethtool -K "$N" tx-udp-segmentation off'
+
+[Install]
+WantedBy=multi-user.target

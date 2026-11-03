@@ -1,0 +1,60 @@
+---
+# icam-keycloak-cac — Keycloak CAC front-end (toggle-switch path #3).
+# Real, proven role (ops/identity/keycloak-cac-proof/). Default-OFF: a clean no-op
+# unless icam_keycloak_cac_enabled. Flipping that one flag stands the path up.
+
+- name: icam-keycloak-cac disabled — no-op
+  ansible.builtin.debug:
+    msg: "icam-keycloak-cac disabled — CAC path #3 not deployed."
+  when: not (icam_keycloak_cac_enabled | bool)
+
+- name: Deploy Keycloak CAC front-end
+  when: icam_keycloak_cac_enabled | bool
+  block:
+    - name: Require a client-cert trust anchor (DoD PKI bundle)
+      ansible.builtin.assert:
+        that: icam_keycloak_cac_ca_bundle | length > 0
+        fail_msg: >-
+          icam_keycloak_cac_enabled but icam_keycloak_cac_ca_bundle is empty. Set it to
+          the DoD PKI root/intermediate PEM bundle staged on the mgmt-host (the CAC trust
+          anchor). Enable CRL/OCSP for production revocation.
+
+    - name: Create compose + certs dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ icam_keycloak_cac_compose_dir }}"
+        - "{{ icam_keycloak_cac_compose_dir }}/certs"
+
+    - name: Stage the client-cert trust anchor (CA bundle)
+      ansible.builtin.copy:
+        src: "{{ icam_keycloak_cac_ca_bundle }}"
+        dest: "{{ icam_keycloak_cac_compose_dir }}/certs/ca-bundle.pem"
+        remote_src: true
+        mode: "0644"
+
+    - name: Generate the Keycloak server TLS cert (self-signed; swap for the mesh CA cert in prod)
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -x509 -newkey rsa:2048 -nodes
+          -keyout {{ icam_keycloak_cac_compose_dir }}/certs/server.key
+          -out {{ icam_keycloak_cac_compose_dir }}/certs/server.crt -days 825
+          -subj "/CN=keycloak.{{ site_id }}.{{ site_dns_zone }}"
+          -addext "subjectAltName=DNS:keycloak.{{ site_id }}.{{ site_dns_zone }},DNS:keycloak"
+        creates: "{{ icam_keycloak_cac_compose_dir }}/certs/server.crt"
+
+    - name: Render compose + realm
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ icam_keycloak_cac_compose_dir }}/{{ item.dest }}"
+        mode: "0640"
+      loop:
+        - { src: docker-compose.yml.j2, dest: docker-compose.yml }
+        - { src: realm-goat.json.j2, dest: realm-goat.json }
+
+    - name: Bring up Keycloak CAC front-end
+      community.docker.docker_compose_v2:
+        project_src: "{{ icam_keycloak_cac_compose_dir }}"
+        state: present

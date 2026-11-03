@@ -1,0 +1,318 @@
+---
+# Defaults for the `relay-health` role — hosts the relay-fleet health
+# dashboard (ops/relay/health) mesh-internal + Ory-admin-gated.
+#
+# Shape: a static nginx serves the dashboard + a host systemd timer runs
+# the prober (FAST probes only — credential-free, no SSM/aws-vault; --deep
+# stays the laptop-operator tool). An oauth2-proxy sidecar gates the whole
+# surface on the admin Ory group, exactly mirroring oauth2-proxy-id-console
+# (ADR 0860): Traefik router (mesh-only middleware) → oauth2-proxy-relay-
+# health:4180 → (ADMINS gate) → relay-health:80.
+#
+# Inputs (set in group_vars/<site>_hosts/vars.yml):
+#   - relay_health_enabled: true                     master gate
+#   - relay_health_oauth2_proxy_client_secret        env-sourced, 32+ chars
+#   - relay_health_oauth2_proxy_cookie_secret        env-sourced, 16/24/32 b64
+#   - site_id, site_dns_zone, public_mgmt_fqdn, mesh_ip_a   per-site identity
+
+# --- on-host layout (standalone compose project, goat-get style) ---
+relay_health_dir: /opt/relay-health
+relay_health_www_dir: /opt/relay-health/www
+relay_health_compose_file: /opt/mgmt-host/docker-compose.relay-health.yml
+
+# --- zenoh-fabric-sampler timer (wedge instrument) ---
+# Set false when goat-fabric-crawler owns zenoh-fabric.json on this host
+# (fabric_crawler_json_out_host_path) so exactly ONE walker runs —
+# zenoh-cardinality-budget-and-lazy-crawler.md §4. Flip both in the SAME
+# group_vars change.
+relay_health_fabric_sampler_enabled: true
+
+# --- iperf3 capacity-probe target (the stable endpoint hosts speed-test to) ---
+# Enabled on the always-on cloud box (per-goatnet group_vars). Binds ONLY
+# the mesh IP — reachable by mesh peers (WireGuard = the trust boundary), never
+# the public interface (no SG change; no open public port). Hosts run
+# capacity-probe.sh against this to measure real WAN mesh capacity.
+relay_health_iperf3_target_enabled: false
+relay_health_iperf3_bind: "{{ mesh_ip_a | default('') }}"
+relay_health_iperf3_port: 5201
+
+# --- standalone mode (ADR 1061 — cloud-resident host) ---
+# false (default) = the Thor path: overlay on the mgmt-host base compose, fronted
+# by the oauth2-proxy/Ory admin gate (unchanged, byte-identical).
+# true = a bare cloud host: a SELF-CONTAINED compose (own
+# network, nginx publishes a host port), NO oauth2-proxy/Hydra/Ory gate (PHASE 1
+# is mesh-only behind an egress-only SG — the gate is the gated PHASE 2 flip),
+# NO mgmt-host base compose. The prober runs EXTERNAL-vantage
+# (relay_health_tunnel_endpoint=false) — the honest peer-eye view (fixes F-213).
+relay_health_standalone: false
+relay_health_standalone_compose_file: /opt/relay-health/docker-compose.standalone.yml
+# Host port the standalone nginx publishes (mesh-reachable; the egress-only SG
+# blocks the public internet in PHASE 1).
+relay_health_listen_port: 8888
+
+# --- PHASE 2: public break-glass gate (ADR 1061) ---
+# Only meaningful with standalone=true. When true, the host ADDS a PUBLIC,
+# Dex-gated surface: a self-contained Traefik (:80/:443, LE via Cloudflare
+# DNS-01) + oauth2-proxy (login at the public Dex) → nginx. nginx
+# ALSO keeps publishing the mesh host port (:8888), so the dashboard is reachable
+# BOTH ways: Dex-gated from the public internet + unauthenticated from the
+# private mesh (the SG opens only :443/:80, so :8888 stays mesh-only). The SG
+# must open :443 (terraform public_enabled) — deploy this gate BEFORE opening
+# the SG so :443 never serves the dashboard unauthenticated.
+relay_health_public_enabled: false
+relay_health_public_compose_file: /opt/relay-health/docker-compose.public.yml
+relay_health_le_dir: /opt/relay-health/letsencrypt
+relay_health_traefik_dynamic_dir: /opt/relay-health/traefik-dynamic
+relay_health_acme_email: "{{ acme_email | default('admin@' ~ (relay_health_fqdn | default('') | regex_replace('^[^.]+\\.', ''))) }}"
+# Public Dex (the compliance-stack broker, Kanidm-backed) — public off-mesh.
+# Reuses the SHARED `oauth2-proxy` Dex static client (the one every satellite
+# oauth2-proxy already uses); Phase 2 just adds this host's redirect URI to it
+# in usareur-af-infra. A dedicated per-app client is a future fleet hardening.
+relay_health_public_oidc_issuer: ""   # REQUIRED per goatnet; a shared role must not default to one
+relay_health_public_oidc_client_id: "oauth2-proxy"
+# Secrets — env-sourced in group_vars (the shared Dex oauth2-proxy client secret
+# + an oauth2-proxy cookie secret + the goatnet zone's Cloudflare DNS-01 token).
+relay_health_public_oidc_client_secret: ""
+relay_health_public_cookie_secret: ""
+relay_health_public_cloudflare_dns_api_token: ""
+
+# PUBLIC gate authorization (the door-close). The public Dex broker emits no
+# `groups` claim today, so the public oauth2-proxy cannot mirror the mesh
+# gate's ALLOWED_GROUPS=PLATFORM-ADMIN,IAM-ADMIN. Instead the public gate is an
+# EXPLICIT email allowlist (oauth2-proxy AUTHENTICATED_EMAILS_FILE): only these
+# addresses pass, whichever upstream (Google/Microsoft/Kanidm) authenticated
+# them. Set in group_vars to the intended relay-health viewers — operators /
+# admins, NOT the whole mesh roster (relay topology is recon-sensitive,
+# ADR 1066). FAIL-CLOSED: public_enabled with an empty list refuses to deploy
+# (see the assert in tasks/main.yml) — we never render a wide-open public gate.
+# The durable form (a RELAY-HEALTH group claim once Dex carries groups) is the
+# public-plane follow-on; until then this file is the source of truth.
+relay_health_public_allowed_emails: []
+relay_health_public_authenticated_emails_file: /opt/relay-health/authenticated-emails.txt
+
+# Compose invocation differs by mode; computed here so the handler + bring-up +
+# smoke share one source of truth (Thor default renders the identical command).
+# Precedence: public (implies standalone) → standalone → Thor.
+relay_health_compose_args: "{% if relay_health_standalone | bool and relay_health_public_enabled | bool %}-f {{ relay_health_public_compose_file }}{% elif relay_health_standalone | bool %}-f {{ relay_health_standalone_compose_file }}{% else %}-f /opt/mgmt-host/docker-compose.yml -f {{ relay_health_compose_file }}{% endif %}"
+relay_health_compose_chdir: "{% if relay_health_standalone | bool %}{{ relay_health_dir }}{% else %}/opt/mgmt-host{% endif %}"
+relay_health_up_services: "{% if relay_health_standalone | bool and relay_health_public_enabled | bool %}traefik oauth2-proxy relay-health{% if ntfy_enabled | default(false) | bool %} ntfy{% endif %}{% elif relay_health_standalone | bool %}relay-health{% else %}relay-health oauth2-proxy-relay-health{% endif %}"
+
+# Source artifacts in-repo (committed at ops/relay/health, PR #1203).
+relay_health_src_dir: "{{ playbook_dir }}/../relay/health"
+
+# Which relay fleet this vantage probes — a filename under relay_health_src_dir,
+# copied to a fixed on-host `relays.conf`. One conf per goatnet: relay short
+# names are reused across fleets, so a
+# shared conf would emit duplicate Prometheus series and render one fleet's
+# numbers under the other's name. Override in group_vars for every goatnet;
+# leaving the default on a new goatnet probes another goatnet's relays and
+# labels them with the local vantage.
+relay_health_relays_conf: relays.conf
+
+# --- cross-goatnet overview (the level ABOVE the fleet page) ----------------
+# One row per goatnet on goatnets.html. Each entry:
+#   id:    short goatnet id; a sibling's summary is read from
+#          ingest/goatnet-<id>.json, so it must match what that goatnet publishes
+#   label: display name
+#   role:  free text; "production" gets a highlighted chip
+#   url:   that goatnet's own fleet dashboard (level 1) — click-through target.
+#          Empty renders the row unlinked with "no dashboard URL configured"
+#          rather than a dead <a href="#">
+#   mesh_only: OPTIONAL bool. True when the surface is reachable only from its
+#          OWN goatnet's mesh — its name is served by that goatnet's CoreDNS to
+#          that goatnet's peers and resolves nowhere else. Such a row links on
+#          its own dashboard (every viewer is on that mesh) and renders as plain
+#          TEXT on a sibling's, where a click could only ever fail. The address
+#          is printed either way.
+#   access: OPTIONAL free text rendered under the url. For a link that is real
+#          but conditional — a gateless standalone dashboard on a mesh-only name
+#          answers only for a reader on that goatnet's mesh. Say so on the card;
+#          an unexplained timeout reads as
+#          a dead surface. Omit when the url works from anywhere the page does.
+#   local: true for THIS box's own goatnet, which is read live from
+#          relay-health.json instead of from a published summary
+# Empty (the default) means the page renders an explicit "siblings not declared"
+# note rather than an empty screen — the same absence-is-not-health rule the
+# page applies to a missing summary.
+# --- reduced-detail view (ADR 1066) ----------------------------------------
+# Groups that receive the FULL document (IPs, coordinates, per-peer identities).
+# Everyone else gets the reduced one. Matched against oauth2-proxy's
+# X-Auth-Request-Groups; absent header ⇒ reduced, which is the fail-closed
+# direction and what the PUBLIC (Dex) gate always hits since Dex emits no groups.
+# Full, unredacted relay detail: PLATFORM-ADMIN only. IAM-ADMIN administers
+# identities and has no operational need for relay internals — giving it the
+# full view was breadth for its own sake. Everyone else authenticated gets
+# the reduced document, which is the nginx map's fail-closed default.
+relay_health_full_view_groups: "PLATFORM-ADMIN"
+
+relay_health_goatnets: []
+
+# The publish half of the same feature: this box POSTs its own rollup to the
+# siblings listed here, so THEIR overview can show this goatnet. Empty = off,
+# which is the honest default — a box with no siblings publishes nothing and
+# every overview simply renders it locally.
+#   targets: comma-separated ingest bases, e.g.
+#            "https://relay-health.<other>.goat.example/goatnet-summary-ingest"
+#   token:   the CROSS-FLEET credential, NOT this box's own ingest token. It
+#            authorizes exactly a six-field rollup, so a sibling never holds a
+#            credential that could write anything else here.
+relay_health_summary_targets: ""
+relay_health_cross_fleet_token: ""
+relay_health_summary_goatnet_id: "{{ site_id | mandatory }}"
+relay_health_summary_interval: "1min"
+relay_health_summary_stale_after_s: 300
+# Receive half: which sibling goatnet ids may POST a rollup to THIS box.
+relay_health_cross_fleet_allowed: ""
+
+# --- static server ---
+# nginx pin lives in the compose overlay default (digest-pinned, ADR 0703);
+# not a role `*_image` var so the deploy-history ledger tracks only the
+# rollback-relevant oauth2-proxy gate image.
+relay_health_container_name: "relay-health"
+relay_health_internal_port: 80
+
+# --- prober timer (fast, credential-free) ---
+relay_health_probe_interval: "15s"
+# Grafana bridge (optional): when set to a node-exporter textfile path, the
+# prober's ExecStartPost converts relay-health.json -> goat_relay_* metrics so
+# the relay-fleet-health Grafana dashboard renders the prober's own signals
+# (STUN / enroll ok-ratio / deep) at near-parity with the single-file dash.
+# Empty = bridge off. On a co-resident obs host point at its node-exporter
+# textfile dir, e.g. /opt/<obs>/expected-vendors/textfile/relay-health.prom.
+# See docs/design/grafana-dashboard-suite.md.
+relay_health_textfile_out: ""
+# This prober runs ON the Thor = the rathole tunnel endpoint, so relay:443
+# probes hairpin. true → dashboard treats :443/STUN as
+# informational + health = :2333 control reachability. Set false only if the
+# prober ever runs from a non-endpoint vantage.
+relay_health_tunnel_endpoint: true
+relay_health_vantage: "{{ site_id }}-thor"
+
+# --- public FQDN (mesh-only; CoreDNS, not Cloudflare) ---
+relay_health_fqdn: "relay-health.{{ site_id }}.{{ public_mgmt_fqdn | default(site_dns_zone) }}"
+
+# --- oauth2-proxy admin gate (mirror oauth2-proxy-id-console / ADR 0860) ---
+relay_health_oauth2_proxy_image: "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0@sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d"
+relay_health_oauth2_proxy_envfile: /opt/mgmt-host/oauth2-proxy-relay-health.env
+relay_health_oauth2_proxy_host_port: 4183   # loopback diag port (id-console uses 4182)
+
+relay_health_oauth2_proxy_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ public_mgmt_fqdn | default(site_dns_zone) }}/"
+relay_health_oauth2_proxy_oidc_client_id: "oauth2-proxy-relay-health"
+relay_health_oauth2_proxy_cookie_domain: "{{ relay_health_fqdn }}"
+
+# CASE-SENSITIVE — must equal the real Ory groups (the F-198 MinIO gotcha)
+# AND the groups ops/permissions/group-permissions.yml grants relay-health
+# (ADR 1073; CI-checked by ops/ci/check-group-permissions-parity.sh).
+# Empty = any authenticated identity may reach the page. Authorization is
+# the DOCUMENT (relay_health_full_view_groups), not the door.
+relay_health_oauth2_proxy_allowed_groups: ""
+
+# On-host DNS override for OIDC discovery.
+relay_health_oauth2_proxy_oidc_host_entry: "oauth2.{{ site_id }}.{{ public_mgmt_fqdn | default(site_dns_zone) }}:{{ mesh_ip_a }}"
+
+# Hydra admin endpoint for client provisioning (usually :4445).
+relay_health_oidc_hydra_admin: "http://127.0.0.1:{{ operator_idp_hydra_admin_host_port | default(hydra_admin_host_port | default(4445)) }}"
+relay_health_oidc_redirect_uri: "https://{{ relay_health_fqdn }}/oauth2/callback"
+relay_health_oidc_scopes: [openid, profile, email, groups, offline_access]
+
+# --- relay-metrics self-publish → ingest (ADR 1058) ---
+# Relays POST their own host metrics to the token-gated ingest container; the
+# prober folds them in so throughput auto-populates without SSM. The token +
+# the known relay-name allowlist MUST be set in group_vars (token env-sourced);
+# the compose `:?` fails the bring-up loudly if unset (fail-closed).
+relay_metrics_ingest_enabled: true
+# The ingest image pin lives in the compose overlay default
+# (RELAY_METRICS_INGEST_IMAGE, python:3.12-alpine multi-arch INDEX digest) — NOT
+# a role `*_image` var, mirroring the nginx pin, so the deploy-history ledger
+# (ADR 0859) tracks only the rollback-relevant oauth2-proxy gate image.
+relay_metrics_bearer_token: ""        # REQUIRED in group_vars (env-sourced) when ingest enabled
+relay_metrics_allowed_names: ""       # REQUIRED comma-separated known relay names
+
+# --- ADR 1093 Phase 1 — gate-allowlist auto-sync publisher (Thor-only) -------
+# When relay_health_allowlist_publish_url is set (group_vars), the Thor POSTs
+# the active Kratos roster to that box's allowlist ingest on a timer, so the
+# public dashboard door follows membership. Extra targets publish the SAME
+# roster to additional boxes, each authenticated by that box's own ingest
+# bearer — used to make a sibling goatnet's off-mesh door follow THIS
+# goatnet's roster (list of {url, token} maps; rendered as url|token pairs).
+relay_health_allowlist_publish_url: ""
+relay_health_allowlist_publish_extra_targets: []
+
+# --- relay-disk paging (the F-229 detection gap; ADR 1058 data + ADR 1059 vendor) ---
+# When set, the hosted prober timer pushes Alertmanager-v2 alerts
+# (RelayDiskUsageHigh / RelayContainerLogLarge / RelayProbeUnreachable) for each
+# relay's self-published deep block. Default-OFF (empty -> the timer stays
+# pure-render, exactly as before). The alerts only PAGE once the Alertmanager
+# receiver is un-nooped (PAGERDUTY_INTEGRATION_KEY; ADR 1059). Point this at the
+# site Alertmanager base URL, e.g. http://alertmanager:9093 (mgmt compose net) —
+# set it in group_vars when ready to turn relay-disk paging on.
+relay_health_alert_sink: ""
+
+# --- ADR 1055 — relay per-peer NAME resolution (Thor-only) -------------------
+# The relay per-peer stats key each peer by a one-way hash of its WireGuard
+# pubkey, so the dashboard can only show hex unless something holds the
+# pubkey->name preimage. Only the Thor can (the NetBird mgmt store). This resolver
+# runs there, computes hex("sha-")+sha256(pubkey), and publishes a {hex:name} map
+# locally + to the cloud ingest so both dashboards render names (hex on hover).
+# Gated to the Thor path (standalone/cloud box has no store) — override per site.
+relay_peer_names_enabled: "{{ not (relay_health_standalone | default(false) | bool) }}"
+relay_peer_names_pg_container: postgres-a
+relay_peer_names_pg_db: netbird
+relay_peer_names_pg_user: postgres
+relay_peer_names_interval: "5min"
+# Remote ingest base URL(s) to push the map to (the cloud dashboard box). Comma-
+# separated …/relay-metrics-ingest URLs; empty = local-only (Thor dashboard only).
+# Set in the goatnet's group_vars to the cloud relay-health ingest.
+relay_peer_names_ingest_urls: ""
+# Peer→person deep-link (peer-identity-resolution.md, Option B). When all three are
+# set (Thor only — the id-console is mesh-internal), the resolver batch-asks the
+# portal to map each peer to its owning Ory identity and bakes the id so the card
+# deep-links the id-admin-console person page. Empty = no deep-link (org via portal).
+relay_peer_names_portal_url: ""       # explicit portal base (wins if set); usually unset — mesh hostname doesn't resolve from the Thor
+relay_peer_names_portal_key: ""       # operator api key for the server-to-server resolver call
+relay_peer_names_id_console_url: ""   # id-admin-console base, e.g. https://admin.auth.<site>.<zone>
+relay_peer_names_portal_container: "" # when portal_url unset: docker-inspect this container's IP on the net below (e.g. goat-zenoh-portal)
+relay_peer_names_portal_net: "mgmt"   # docker network the portal app listens on
+relay_peer_names_portal_port: "8090"  # portal app port (not the oauth2/ADMINS gate)
+
+# --- Host-net health ingest (site-uplink diagnosis) --------------
+# Comma-separated site network hosts (mgmt-hosts/Thors) allowed to POST
+# HostNetHealthV1 to /host-net-ingest/<host> on this box's ingest. Empty (the
+# default) keeps the feature off: the route isn't rendered and the ingest 404s.
+# The publisher side lives in the host-net-publish role (runs ON the site hosts).
+host_net_allowed_names: ""
+
+# --- Zenoh router service-health -------------------------------
+# The ingest side: comma-separated router names allowed to POST to
+# /zenoh-health-ingest/<router>. Empty (default) keeps the route dark. Set on
+# BOTH the Thor and the cloud box so both dashboards store the band's history.
+zenoh_health_allowed_names: ""
+# The probe side (Thor-only — runs where the router lives). Off by default;
+# enable in group_vars for the host that runs the router. When enabled,
+# zenoh_health_ingest_urls is REQUIRED (comma-separated: both dashboards).
+zenoh_health_probe_enabled: false
+zenoh_health_ingest_urls: ""
+zenoh_health_interval_s: 30
+# Optional probe inputs (null/empty renders the affected dimension "unmeasured",
+# honestly — the rest of the band still works):
+#   zenoh_health_client_cert / _key   mTLS leaf for the new-session OPEN probe
+#   zenoh_health_fips_attest          router FIPS attestation file (role-written)
+#   zenoh_health_storage_dir          rocksdb storages dir (enables storage count)
+#   zenoh_health_router_container     defaults to "{{ zenoh_stack }}-router"
+#   zenoh_health_router_name          dashboard label; defaults to goatnet/site_id
+
+# -- ntfy pager (ADR 1168, amends ADR 1059) -------------------------------------
+# Runs ONLY on a standalone + public relay-health box — the pager must live in a
+# failure domain other than the hosts it pages about. Off by default; a goatnet
+# opts in from group_vars/<env>_relay_health/. Topics are goat-<goatnet>-<tier>;
+# ntfy topic names cannot contain "/", which is why this is not goat/<goatnet>/<tier>.
+ntfy_enabled: false
+ntfy_fqdn: ""                                   # e.g. ntfy.example.net — needs an A record to this box's EIP
+ntfy_goatnet: "{{ site_id | default('goat') }}"
+ntfy_dir: /opt/relay-health/ntfy
+ntfy_cache_duration: "72h"
+ntfy_topics: ["critical", "warning"]           # rendered as goat-{{ ntfy_goatnet }}-<topic>
+ntfy_admin_user: admin
+ntfy_admin_password: ""                         # env-sourced in group_vars; 24+ chars
+ntfy_alertmanager_user: alertmanager            # write-only publisher; Alertmanager's basic_auth
+ntfy_alertmanager_password: ""                  # env-sourced in group_vars; 24+ chars

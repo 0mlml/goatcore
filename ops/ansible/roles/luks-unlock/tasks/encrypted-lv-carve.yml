@@ -1,0 +1,218 @@
+---
+# encrypted-lv-carve.yml — carve a data LV out of the free space in an EXISTING
+# encrypted volume group and mount it, so Docker + containerd can put their
+# data-root on it. The encryption is INHERITED: the VG's physical
+# volume sits on the installer's full-disk LUKS partition (see
+# installer-luks.yml), so an LV inside it is encrypted at rest with no new LUKS
+# header and no separate unlock mode.
+#
+# CONTRAST WITH luks_volumes' format_if_unformatted: that path puts a NEW LUKS
+# header on a blank SECOND disk. This path adds NO LUKS layer — it only asks LVM
+# for space that is already inside the encrypted container. On a single-NVMe
+# host (root + data on one full-disk-LUKS NVMe) this is how Tier-3
+# data lands on encrypted storage without a second disk.
+#
+# Fail-closed. The only data-destroying operation is mkfs, and it is guarded
+# three ways: (1) the LV must be one this role created or one with no filesystem
+# already, (2) the LV must not currently carry a mounted filesystem, (3) the VG
+# must have enough free space to create the LV in the first place.
+#
+# ---------------------------------------------------------------------------
+# CERTIFIED by a real cold boot — the docker-data LV is carved (90%FREE, ext4,
+# /opt/docker-data) and mounted when the node comes back.
+# ---------------------------------------------------------------------------
+
+- name: "lv-carve | read volume groups + free space (pipe-separated for clean parsing)"
+  ansible.builtin.command:
+    cmd: "vgs --noheadings --nosuffix --units b --separator '|' -o vg_name,vg_free"
+  register: lvcarve_vgs
+  changed_when: false
+
+- name: "lv-carve | build vg -> free-bytes map"
+  ansible.builtin.set_fact:
+    lvcarve_vg_free: "{{ lvcarve_vg_free | default({}) | combine({ (line.split('|')[0] | trim): (line.split('|')[1] | trim | int) }) }}"
+  loop: "{{ lvcarve_vgs.stdout_lines | map('trim') | reject('equalto', '') | list }}"
+  loop_control:
+    loop_var: line
+    label: "{{ line }}"
+
+# Fail-closed: the target VG must exist. installer-luks.yml already refuses when
+# the expected VG is absent, but this task file can run on its own, so re-assert.
+- name: "lv-carve | REFUSE when the target volume group is absent"
+  ansible.builtin.fail:
+    msg: >-
+      REFUSED: volume group '{{ item.vg }}' (declared for LV '{{ item.name }}')
+      is not present. VGs seen: {{ lvcarve_vg_free.keys() | list | join(', ') | default('(none)') }}.
+      This path carves an LV out of an EXISTING encrypted VG; it does not create
+      the VG. Fix the vg name in group_vars.
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }} (vg={{ item.vg }})"
+  when: item.vg not in (lvcarve_vg_free.keys() | list)
+
+- name: "lv-carve | probe whether each LV already exists"
+  ansible.builtin.command:
+    cmd: "lvs --noheadings -o lv_name {{ item.vg }}"
+  register: lvcarve_lv_probe
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }} (vg={{ item.vg }})"
+
+- name: "lv-carve | build name -> exists (bool) map"
+  ansible.builtin.set_fact:
+    lvcarve_lv_exists: "{{ lvcarve_lv_exists | default({}) | combine({ res.item.name: (res.item.name in (res.stdout_lines | default([]) | map('trim') | list)) }) }}"
+  loop: "{{ lvcarve_lv_probe.results }}"
+  loop_control:
+    loop_var: res
+    label: "{{ res.item.name }}"
+
+# Free-space assertion for LVs created with an explicit size (`size:` -> -L).
+# LVs sized by percent-of-free (`size_percent_free:` -> -l NN%FREE) skip the
+# numeric check because "90%FREE" is meaningful only relative to whatever is
+# free at run time. Refuses to even attempt lvcreate without room.
+- name: "lv-carve | REFUSE when an explicitly-sized LV will not fit in VG free space"
+  ansible.builtin.fail:
+    msg: >-
+      REFUSED: LV '{{ item.name }}' requests {{ item.size }} but VG
+      '{{ item.vg }}' has only {{ (lvcarve_vg_free[item.vg] | int / 1024 / 1024 / 1024) | round(1) }} GiB free.
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+  when:
+    - (item.size | default('')) | length > 0
+    - not (lvcarve_lv_exists[item.name] | default(false))
+    - (item.size | regex_search('^[0-9.]+[GgTt]$')) is not none
+    - >-
+      ((item.size | regex_replace('[GgTt]$', '') | float)
+        * (1073741824 if (item.size | upper).endswith('G') else 1099511627776))
+      > (lvcarve_vg_free[item.vg] | int)
+
+# NON-DESTRUCTIVE to existing LVs: lvcreate only consumes free extents. Skipped
+# entirely when the LV already exists. Uses -l <pct>%FREE when size_percent_free
+# is set, else -L <size>.
+- name: "lv-carve | create the LV (only when absent)"
+  ansible.builtin.command:
+    cmd: >-
+      lvcreate {{ ('-l ' ~ item.size_percent_free ~ '%FREE') if (item.size_percent_free | default('')) | string | length > 0 else ('-L ' ~ item.size) }}
+      -n {{ item.name }} {{ item.vg }}
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }} (vg={{ item.vg }})"
+  when: not (lvcarve_lv_exists[item.name] | default(false))
+
+- name: "lv-carve | probe filesystem type on each LV device"
+  ansible.builtin.command:
+    cmd: "blkid -s TYPE -o value /dev/{{ item.vg }}/{{ item.name }}"
+  register: lvcarve_fs_probe
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+- name: "lv-carve | probe whether each LV device currently carries a mounted filesystem"
+  ansible.builtin.command:
+    cmd: "lsblk -n -o MOUNTPOINT /dev/{{ item.vg }}/{{ item.name }}"
+  register: lvcarve_mount_probe
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }}"
+
+# F-392-style refusal: never mkfs over a device that has something mounted on
+# it. This fires ONLY when a mkfs would actually run — i.e. the LV carries a
+# mounted filesystem AND blkid reports no filesystem on it (the genuinely
+# dangerous inconsistent state). On an already-carved node the LV is both
+# formatted and mounted, and the mkfs below is gated off by the same blkid
+# probe; without the second condition here this guard fails every idempotent
+# re-run of a node whose docker-data LV already exists (goat-standup re-runs
+# the host baseline, now phase 2, every invocation). The fs- and
+# mount-probes loop over the same luks_encrypted_lvs in the same order, so they
+# are correlated by loop index.
+- name: "lv-carve | REFUSE to mkfs an LV that carries a mounted filesystem (only when a mkfs would run)"
+  ansible.builtin.fail:
+    msg: >-
+      REFUSED: /dev/{{ item.item.vg }}/{{ item.item.name }} carries a mounted
+      filesystem ({{ item.stdout_lines | reject('equalto', '') | list | join(', ') }})
+      but has no filesystem header — a mkfs here would reformat over live data.
+      Unmount it first if you truly mean to reformat — there is no override flag.
+  loop: "{{ lvcarve_mount_probe.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+    index_var: lvcarve_idx
+  when:
+    - (item.stdout_lines | default([]) | reject('equalto', '') | list | length) > 0
+    - (lvcarve_fs_probe.results[lvcarve_idx].stdout | default('')) | length == 0
+
+- name: "lv-carve | make the filesystem (only when the LV has none)"
+  ansible.builtin.command:
+    cmd: "mkfs.{{ item.item.filesystem }} -L {{ item.item.name }} /dev/{{ item.item.vg }}/{{ item.item.name }}"
+  loop: "{{ lvcarve_fs_probe.results }}"
+  loop_control:
+    label: "{{ item.item.name }} (fs={{ item.stdout | default('none') }})"
+  when: (item.stdout | default('')) | length == 0
+
+- name: "lv-carve | ensure mount point exists"
+  ansible.builtin.file:
+    path: "{{ item.mount_point }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }} -> {{ item.mount_point }}"
+
+- name: "lv-carve | fstab entry for each carved LV (own marker, distinct from luks_volumes)"
+  ansible.builtin.blockinfile:
+    path: /etc/fstab
+    marker: "# {mark} LUKS-UNLOCK ROLE encrypted-lv-carve (managed)"
+    block: |
+      {% for lv in luks_encrypted_lvs %}
+      /dev/{{ lv.vg }}/{{ lv.name }} {{ lv.mount_point }} {{ lv.filesystem }} defaults 0 2
+      {% endfor %}
+
+- name: "lv-carve | detect already-mounted LVs"
+  ansible.builtin.command:
+    cmd: "mountpoint -q {{ item.mount_point }}"
+  register: lvcarve_mounted
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_encrypted_lvs }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.name }} -> {{ item.mount_point }}"
+
+- name: "lv-carve | mount each carved LV now"
+  ansible.builtin.command:
+    cmd: "mount {{ item.item.mount_point }}"
+  loop: "{{ lvcarve_mounted.results }}"
+  loop_control:
+    label: "{{ item.item.name }} (mounted={{ item.rc == 0 }})"
+  when: item.rc != 0
+
+# Docker's daemon.json data-root and containerd's config.toml root are wired by
+# the docker-engine role (docker_engine_data_root / docker_engine_containerd_root
+# in group_vars) — this role only guarantees the encrypted mount exists first.
+# Create the two subdirectories the F-093 layout expects so the daemons land on
+# the encrypted LV cleanly on first start.
+- name: "lv-carve | pre-create F-093 data-root subdirectories on the encrypted mount"
+  ansible.builtin.file:
+    path: "{{ item.1 }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0711"
+  loop: "{{ luks_encrypted_lvs | subelements('data_root_subdirs', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1 }}"

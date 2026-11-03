@@ -1,0 +1,564 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# `spire` role — Phase A. Provisions the spire logical DB on postgres-a,
+# renders server/agent configs + the overlay env file, brings up the
+# co-located SPIRE server + agent (mgmt-host compose overlay), runs the
+# one-time join-token node attestation, and reconciles declarative
+# registration entries (CN-bearing X509-SVIDs so the CN-only Zenoh ACL
+# admits them).
+#
+# Operator-deployed via spire-deploy.yml -e target=<site>_hosts.
+
+- name: spire | refuse to run on a node not designated as the SPIRE server
+  ansible.builtin.assert:
+    that:
+      - (spire_enabled | default(false) | bool) or (spire_agent_only | default(false) | bool)
+      - not ((spire_enabled | default(false) | bool) and (spire_agent_only | default(false) | bool))
+    fail_msg: >-
+      spire: neither `spire_enabled` nor `spire_agent_only` is true for
+      {{ inventory_hostname }} (or BOTH are, which is a contradiction — a node
+      is either the goatnet's server or an agent attesting to someone else's,
+      never both). This node is therefore not a SPIRE node and the role refuses.
+      spire_enabled means this host RUNS THE SERVER and holds the CA;
+      spire_agent_only means it runs an AGENT against a remote server so that a
+      workload here can obtain an SVID — the Workload API socket is local by
+      construction, so a workload can only ever be served by an agent on its own
+      host. The original message follows because the server case is still the
+      one that bites hardest:
+      `spire_enabled` is not true for {{ inventory_hostname }}, so this
+      node is not the designated SPIRE server for its goatnet and the role
+      refuses to run.
+      WHY THIS GUARD EXISTS (2026-08-17): the role stands up a SERVER on every
+      host it is invoked against, and a server mints its own CA. Two servers in
+      one trust domain means two CAs issuing SVIDs that do not chain to each
+      other — a split-brain identity plane that looks healthy on both nodes.
+      ZAGROS never hit this because zagros_hosts and zagros_b_hosts hold ONE host
+      each; zagros_prod_hosts holds the Orin PAIR, so `-e target=zagros_prod_hosts`
+      would have done exactly that. It was avoided by a hand-typed --limit,
+      which is not a mitigation.
+      Set `spire_enabled: true` in host_vars for the ONE node that should run
+      the server (host_vars outranks group_vars — the documented mechanism for
+      values where Orin-A and Orin-B genuinely differ), and leave every other
+      member false. Passive/standby nodes stay false by design: `spire` is a
+      cutover_gated singleton in ops/standby/service-classes.yaml.
+  # Fail-closed on purpose: an UNSET signal is a refusal, not a default-yes.
+  # A default-yes here is how a standby node acquires a second CA silently.
+
+- name: spire | fail loud if images unpinned
+  ansible.builtin.fail:
+    msg: >-
+      spire: spire_server_image / spire_agent_image still placeholder. Pin
+      real SHA digests in group_vars/zagros_hosts/spire.yml (confirm SPIRE
+      license posture first — ADR 0412 revisit trigger).
+  when: >-
+    (spire_server_image | default('TODO_PIN_unset')) is search('TODO_PIN') or
+    (spire_agent_image | default('TODO_PIN_unset')) is search('TODO_PIN')
+
+# AGENT-ONLY (ADR 0412 Phase B) takes an entirely separate path: no server, no
+# logical DB, no registration entries — those belong to the CA holder. Kept in
+# its own file rather than threaded through this one as `when:` clauses, so the
+# co-located path stays byte-for-byte unchanged.
+- name: spire | agent-only path (remote server; this host holds no CA)
+  ansible.builtin.include_tasks: agent-only.yml
+  when: spire_agent_only | default(false) | bool
+
+- name: spire | stop here on an agent-only node
+  ansible.builtin.meta: end_host
+  when: spire_agent_only | default(false) | bool
+
+- name: spire | ensure config dir (root — holds read-only-mounted server.conf/agent.conf)
+  ansible.builtin.file:
+    path: "{{ spire_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The upstream ghcr.io/spiffe/spire-{server,agent} images run as nonroot
+# UID:GID 1000:1000. The server writes keys.json +
+# datastore artefacts under data/server, the agent persists its SVID under
+# data/agent, and the agent creates its Workload API socket under the socket
+# dir — all must be owned by the container UID or the process crash-loops with
+# "permission denied". (First-boot fix: the dirs were root-owned, UID 1000 EACCES.)
+- name: spire | ensure data dirs (owned by the SPIRE nonroot UID, private)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ spire_container_uid }}"
+    group: "{{ spire_container_uid }}"
+    mode: "0750"
+  loop:
+    - "{{ spire_data_dir }}/server"
+    - "{{ spire_data_dir }}/agent"
+
+# The Workload API socket dir must be WORLD-TRAVERSABLE (0755): the socket
+# itself is 0777 (any local UID may connect — attestation is by workload
+# selector, not socket perms), but a sidecar running as a non-1000 UID (e.g. the
+# fabric-health spiffe-helper at 65532) can only reach the socket if it can
+# traverse this dir. Owner stays the agent UID so the agent creates the socket.
+- name: spire | ensure Workload API socket dir (world-traversable for non-1000 sidecars)
+  ansible.builtin.file:
+    path: "{{ spire_socket_dir }}"
+    state: directory
+    owner: "{{ spire_container_uid }}"
+    group: "{{ spire_container_uid }}"
+    mode: "0755"
+
+# --- Datastore: own logical DB + role on postgres-a (idempotent) -----------
+# Refuse an empty datastore password before it reaches the database. Without
+# this the CREATE ROLE below succeeds with no password at all (no_log hides
+# it), and the run fails five minutes later in docker compose with "required
+# variable SPIRE_DB_PASSWORD is missing a value" -- which names the symptom
+# and not the cause. The variable is bound in the goatnet's group_vars so
+# `secrets init` generates it; the role default here computes the name, which
+# ops/scripts/deploy-secrets-needed.py cannot read.
+- name: spire | assert the datastore password is present
+  ansible.builtin.assert:
+    that:
+      - spire_db_password | default('') | length > 0
+    fail_msg: >-
+      spire_db_password is empty, so the SPIRE datastore has no password. It
+      reads ${{ site_id_upper | default('ZAGROS') }}_SPIRE_DB_PASS from the
+      environment. Re-run standup phase 3 to create it (values that already
+      exist are kept), or on an env-file store run: goatbuilder secrets init
+      --env {{ site_id | default('<goatnet>') }}. Then resume the standup
+      from this phase.
+    quiet: true
+
+- name: spire | check spire db role exists
+  ansible.builtin.command:
+    argv: ["docker", "exec", "-e", "PGPASSWORD={{ postgres_superuser_password }}",
+           "postgres-a", "psql", "-U", "postgres", "-d", "postgres", "-tAc",
+           "SELECT 1 FROM pg_roles WHERE rolname='{{ spire_db_user }}'"]
+  register: spire_role_check
+  changed_when: false
+
+- name: spire | create spire db role
+  ansible.builtin.command:
+    argv: ["docker", "exec", "-e", "PGPASSWORD={{ postgres_superuser_password }}",
+           "postgres-a", "psql", "-U", "postgres", "-d", "postgres", "-c",
+           "CREATE ROLE {{ spire_db_user }} LOGIN PASSWORD '{{ spire_db_password }}'"]
+  when: spire_role_check.stdout | trim != "1"
+  no_log: true
+  changed_when: true
+
+# A password is write-only: it cannot be read back and compared, so the only
+# way to make this phase idempotent is to set it every run. Without this a
+# role created once -- including one created with an empty password by a run
+# that predates the assert above -- keeps that password forever, and SPIRE
+# fails to authenticate against its own datastore with no way to recover but
+# psql by hand.
+- name: spire | reconcile the spire db role's password
+  ansible.builtin.command:
+    argv: ["docker", "exec", "-e", "PGPASSWORD={{ postgres_superuser_password }}",
+           "postgres-a", "psql", "-U", "postgres", "-d", "postgres", "-c",
+           "ALTER ROLE {{ spire_db_user }} LOGIN PASSWORD '{{ spire_db_password }}'"]
+  when: spire_role_check.stdout | trim == "1"
+  no_log: true
+  changed_when: false
+
+- name: spire | check spire database exists
+  ansible.builtin.command:
+    argv: ["docker", "exec", "-e", "PGPASSWORD={{ postgres_superuser_password }}",
+           "postgres-a", "psql", "-U", "postgres", "-d", "postgres", "-tAc",
+           "SELECT 1 FROM pg_database WHERE datname='{{ spire_db_name }}'"]
+  register: spire_db_check
+  changed_when: false
+
+- name: spire | create spire database
+  ansible.builtin.command:
+    argv: ["docker", "exec", "-e", "PGPASSWORD={{ postgres_superuser_password }}",
+           "postgres-a", "psql", "-U", "postgres", "-d", "postgres", "-c",
+           "CREATE DATABASE {{ spire_db_name }} OWNER {{ spire_db_user }}"]
+  when: spire_db_check.stdout | trim != "1"
+  changed_when: true
+
+# postgres-a's pg_hba.conf is per-user scram (baked in ops/postgres/spock/conf/
+# + appended at runtime by each consumer role — same pattern as admit-audit).
+# Without a `spire` line the server connects from the docker net and gets
+# "no pg_hba.conf entry for host ... user spire" → crash-loop. grep-then-append
+# is idempotent; pg_reload_conf picks it up with no postgres restart.
+- name: spire | ensure pg_hba.conf admits the spire DB user
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      if ! docker exec postgres-a grep -qE '^host[[:space:]]+all[[:space:]]+{{ spire_db_user }}[[:space:]]' /etc/postgresql/pg_hba.conf; then
+        docker exec -u 0 postgres-a sh -c \
+          "echo 'host all {{ spire_db_user }} 0.0.0.0/0 scram-sha-256' >> /etc/postgresql/pg_hba.conf"
+        docker exec postgres-a psql -U postgres -c 'SELECT pg_reload_conf();'
+        echo spire_hba_changed
+      fi
+  register: spire_hba
+  changed_when: "'spire_hba_changed' in spire_hba.stdout"
+
+# --- Render config + env ---------------------------------------------------
+- name: spire | render server.conf
+  ansible.builtin.template:
+    src: server.conf.j2
+    dest: "{{ spire_config_dir }}/server.conf"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: spire | render agent.conf
+  ansible.builtin.template:
+    src: agent.conf.j2
+    dest: "{{ spire_config_dir }}/agent.conf"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: spire | render overlay env file (images + db pass; token filled later)
+  ansible.builtin.template:
+    src: env.spire.j2
+    dest: "{{ spire_compose_dir }}/.env.spire"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  # First pass: spire_join_token is undefined, so env.spire.j2's `| default('')`
+  # renders SPIRE_JOIN_TOKEN empty. The token is generated + set_fact'd below,
+  # then this template re-renders carrying it. Do NOT add a self-referencing
+  # `vars: spire_join_token: "{{ spire_join_token | default('') }}"` here —
+  # Jinja treats it as a recursive definition and fails (max recursion depth).
+
+# --- Bring up server, then attest agent ------------------------------------
+- name: spire | up spire-server
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file .env --env-file .env.spire
+      -f docker-compose.yml -f docker-compose.spire.yml up -d spire-server
+    chdir: "{{ spire_compose_dir }}"
+  changed_when: true
+
+- name: spire | wait for spire-server healthcheck
+  ansible.builtin.command:
+    cmd: "docker exec spire-server {{ spire_bin_dir }}/spire-server healthcheck"
+  register: spire_srv_health
+  retries: 10
+  delay: 6
+  until: spire_srv_health.rc == 0
+  changed_when: false
+
+- name: spire | export trust-bundle (CA) to host for the router to trust
+  # The SPIRE image is distroless — no `sh` inside, so the redirect must run on
+  # the HOST shell (ansible.builtin.shell), invoking the binary directly via
+  # docker exec. The host path is the bind-mounted data dir, so the file lands
+  # at {{ spire_data_dir }}/server/spire-ca.pem either way.
+  ansible.builtin.shell:
+    cmd: >-
+      docker exec spire-server {{ spire_bin_dir }}/spire-server bundle show -format pem
+      > {{ spire_data_dir }}/server/spire-ca.pem
+  changed_when: false
+  # goat_zenoh_extra_ca_paths points the router CA bundle at it.
+
+# --- Federation (Phase C, recognition layer; docs/design/federated-trust-model.md) -----
+# One-time out-of-band bootstrap: import each declared partner's PUBLIC bundle so
+# the https_spiffe endpoint can verify the partner and self-refresh thereafter.
+# Idempotent — `bundle set` upserts. Only partners that supply `bundle_b64` are
+# bootstrapped here (others are expected pre-seeded or reachable). trust-sync
+# then folds the federated bundles into the router trust every tick.
+- name: spire | bootstrap federated partner bundles (one-time bundle set)
+  when:
+    - spire_federation_enabled | default(false)
+    - item.bundle_b64 is defined and item.bundle_b64 | length > 0
+  loop: "{{ spire_federates_with | default([]) }}"
+  loop_control:
+    label: "{{ item.trust_domain }}"
+  ansible.builtin.shell:
+    cmd: >-
+      echo '{{ item.bundle_b64 }}' | base64 -d |
+      docker exec -i spire-server {{ spire_bin_dir }}/spire-server
+      bundle set -format pem -id spiffe://{{ item.trust_domain }}
+  changed_when: false
+
+- name: spire | drop a retired partner's bundle from the SPIRE datastore
+  # Defence in depth behind the edge trust file. The file is what a router reads,
+  # and the trust-sync retired pass has already converged it; this removes the
+  # partner's authority from SPIRE itself so it cannot be handed back out.
+  #
+  # NOT fatal, deliberately. `bundle delete` defaults to mode=restrict: it
+  # REFUSES while any registration entry still federates with that domain. That
+  # refusal is information — the peering is not finished being dismantled — and
+  # it must not stop a deploy that has already done the part that matters. rc and
+  # stderr are reported so the operator sees which of the two happened.
+  when:
+    - spire_federation_enabled | default(false)
+    - item.trust_domain is defined
+    - (item.trust_domain | regex_replace('^spiffe://', '') | length) > 0
+  loop: "{{ spire_trust_sync_federated_edges_retired | default([]) }}"
+  loop_control:
+    label: "{{ item.trust_domain }}"
+  ansible.builtin.command:
+    cmd: >-
+      docker exec spire-server {{ spire_bin_dir }}/spire-server
+      bundle delete -id spiffe://{{ item.trust_domain | regex_replace('^spiffe://', '') }}
+  register: spire_bundle_delete
+  failed_when: false
+  changed_when: spire_bundle_delete.rc == 0
+
+- name: spire | report the retired-bundle delete outcome
+  when:
+    - spire_federation_enabled | default(false)
+    - spire_bundle_delete is defined
+    - spire_bundle_delete.results is defined
+  # Skipped loop items carry no rc; only report the ones that actually ran.
+  ansible.builtin.debug:
+    msg: >-
+      spire: retired bundle {{ item.item.trust_domain }} —
+      {{ 'removed from the SPIRE datastore' if item.rc == 0
+         else 'NOT removed (' ~ (item.stderr | default(item.stdout | default('no output'))) ~ ') — the edge trust file is still converged, but the authority remains in SPIRE' }}
+  loop: "{{ spire_bundle_delete.results | default([]) | selectattr('rc', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item.trust_domain | default('?') }}"
+
+- name: spire | is the agent already attested? (persisted SVID on disk)
+  ansible.builtin.stat:
+    path: "{{ spire_data_dir }}/agent/agent_svid.der"
+  register: spire_agent_svid
+
+- name: spire | generate one-time join token (only when agent not yet attested)
+  ansible.builtin.command:
+    cmd: >-
+      docker exec spire-server {{ spire_bin_dir }}/spire-server token generate
+      -spiffeID spiffe://{{ spire_trust_domain }}/{{ spire_agent_node_path }}
+  register: spire_token_gen
+  when: not spire_agent_svid.stat.exists
+  changed_when: true
+
+- name: spire | extract token + re-render .env.spire with it
+  when: not spire_agent_svid.stat.exists
+  block:
+    - name: spire | parse token
+      ansible.builtin.set_fact:
+        spire_join_token: "{{ spire_token_gen.stdout | regex_search('Token:\\s*(\\S+)', '\\1') | first }}"
+      no_log: true
+
+    - name: spire | re-render .env.spire carrying the join token
+      ansible.builtin.template:
+        src: env.spire.j2
+        dest: "{{ spire_compose_dir }}/.env.spire"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+- name: spire | up spire-agent
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file .env --env-file .env.spire
+      -f docker-compose.yml -f docker-compose.spire.yml up -d spire-agent
+    chdir: "{{ spire_compose_dir }}"
+  changed_when: true
+
+# --- Fold in PLATFORM workload entries (ADR 1098 stage 4, Option B) ---------
+# `spire_platform_workload_entries` is generated from the portal's recorded
+# PLATFORM workload declarations by ops/identity/gen-platform-spire-entries.py.
+# Each entry's CN is the platform's slot anchor (compose-by-CN) and its spiffe_id
+# is <platform>/<function>. The `selector` is deploy-time: the generator emits it
+# null (NEEDS_DEPLOY_SELECTOR); the operator fills it in the group_var per
+# deployment. We register ONLY the entries whose selector is filled, and warn
+# (never silently drop) about the rest — a half-declared platform is visible.
+- name: spire | fold in PLATFORM workload entries that have a deploy selector
+  ansible.builtin.set_fact:
+    spire_registration_entries: >-
+      {{ spire_registration_entries
+         + (spire_platform_workload_entries | default([]) | selectattr('selector', 'string') | list) }}
+
+- name: spire | warn on PLATFORM workloads still awaiting a deploy selector
+  ansible.builtin.debug:
+    msg: >-
+      spire: PLATFORM workload {{ item.spiffe_id }} (platform {{ item.platform | default('?') }})
+      has no selector yet — NOT registered. Fill its selector in
+      spire_platform_workload_entries (ADR 1098).
+  loop: "{{ spire_platform_workload_entries | default([]) | rejectattr('selector', 'string') | list }}"
+  loop_control:
+    label: "{{ item.spiffe_id }}"
+
+# --- Reconcile declarative registration entries (create-if-missing) --------
+- name: spire | check which registration entries exist
+  ansible.builtin.command:
+    cmd: >-
+      docker exec spire-server {{ spire_bin_dir }}/spire-server entry show
+      -spiffeID spiffe://{{ spire_trust_domain }}/{{ item.spiffe_id }}
+    chdir: "{{ spire_compose_dir }}"
+  register: spire_entry_show
+  changed_when: false
+  loop: "{{ spire_registration_entries }}"
+  loop_control:
+    label: "{{ item.spiffe_id }}"
+
+- name: spire | create missing registration entries (CN-bearing via dns_name)
+  # SPIRE 1.11 flag is `-dns` (not `-dnsName`); the FIRST -dns becomes the SVID
+  # Subject CN — which is how the CN-only Zenoh ACL admits the SVID.
+  # -x509SVIDTTL takes integer SECONDS (the server.conf duration-string form
+  # like "1h" does NOT apply here — passing a stripped "1" would mint 1-second
+  # SVIDs). spire_*_ttl_seconds carries the seconds value.
+  ansible.builtin.command:
+    cmd: >-
+      docker exec spire-server {{ spire_bin_dir }}/spire-server entry create
+      -parentID spiffe://{{ spire_trust_domain }}/{{ spire_agent_node_path }}
+      -spiffeID spiffe://{{ spire_trust_domain }}/{{ item.item.spiffe_id }}
+      -selector {{ item.item.selector }}
+      -dns {{ item.item.cn_dns_name }}
+      -x509SVIDTTL {{ item.item.x509_svid_ttl_seconds | default(spire_default_svid_ttl_seconds) }}
+  loop: "{{ spire_entry_show.results }}"
+  loop_control:
+    label: "{{ item.item.spiffe_id }}"
+  when: "'Found 0 entries' in item.stdout"
+  changed_when: true
+
+# --- spire-trust-sync timer
+- name: spire | refuse the deprecated flat federated trust-file list
+  # spire_trust_sync_federated_trust_files was a LIST OF FILES with no way to say
+  # which partner's bundle belonged in which file, so the trust-sync script wrote
+  # EVERY federated authority into EVERY edge trust file. It is superseded by
+  # spire_trust_sync_federated_edges, which binds one trust file to one trust
+  # domain. Nothing reads the old key any more.
+  #
+  # This FAILS rather than warns on purpose. A silently-ignored variable that an
+  # operator set in order to grant trust is worse than a stopped deploy: the run
+  # would go green and the edge trust file would never be written at all.
+  ansible.builtin.assert:
+    that:
+      - (spire_trust_sync_federated_trust_files | default([]) | length) == 0
+    fail_msg: >-
+      spire: `spire_trust_sync_federated_trust_files` is set on
+      {{ inventory_hostname }} and is no longer honoured. It was a flat list, so
+      every federated partner bundle was written into every file it named — with
+      two partners, the edge facing B also trusted A's certificate authority, and
+      because the Zenoh ACL matches a Common Name and cannot see the issuer
+      , A could mint B's agreed peering CN and be admitted at B's edge.
+      Replace it with `spire_trust_sync_federated_edges`, one entry per peering:
+      `- trust_file: <edge router trust file>` / `trust_domain: <partner trust
+      domain>`. See roles/spire/defaults/main.yml and
+      ops/ci/check-per-partner-trust-isolation.sh.
+
+- name: spire | every federated edge names exactly one partner trust domain
+  # The CI guard checks the DECLARATION in group_vars; this checks the value that
+  # actually reached this host, which may have come from -e, host_vars or an
+  # inventory the guard never reads.
+  when: spire_federation_enabled | default(false)
+  ansible.builtin.assert:
+    that:
+      - item.trust_file is defined and (item.trust_file | length) > 0
+      - item.trust_domain is defined and (item.trust_domain | length) > 0
+      - item.trust_file != (spire_trust_sync_router_trust_file | default(''))
+    fail_msg: >-
+      spire: federated edge entry {{ item }} is not a complete peering. Each
+      entry needs BOTH a trust_file and the ONE trust_domain whose bundle belongs
+      in it, and the trust_file must never be
+      spire_trust_sync_router_trust_file — a partner authority on the CORE router
+      can mint any name the core ACL recognises.
+  loop: "{{ spire_trust_sync_federated_edges | default([]) }}"
+  loop_control:
+    label: "{{ item.trust_domain | default('<no trust_domain>') }}"
+
+- name: spire | a retired partner is not still declared as a federation peer
+  # The edge trust file is the enforcement point and converges regardless, but a
+  # trust domain left in spire_federates_with keeps server.conf federating with
+  # it and keeps the one-time `bundle set` bootstrap re-importing its bundle —
+  # so the authority stays live in the SPIRE datastore and one edit to the edges
+  # list puts it straight back on an edge. Retire it in both places.
+  when: spire_federation_enabled | default(false)
+  ansible.builtin.assert:
+    that:
+      - (item.trust_domain | default('') | regex_replace('^spiffe://', ''))
+        not in (spire_federates_with | default([]) | map(attribute='trust_domain') | list)
+    fail_msg: >-
+      spire: {{ item.trust_domain | default('<no trust_domain>') }} is declared
+      RETIRED in spire_trust_sync_federated_edges_retired but is still listed in
+      spire_federates_with. Remove it there too, or the server keeps federating
+      with it and keeps re-importing its bundle.
+  loop: "{{ spire_trust_sync_federated_edges_retired | default([]) }}"
+  loop_control:
+    label: "{{ item.trust_domain | default('<no trust_domain>') }}"
+
+- name: spire | a retired federated edge is declared, not deleted
+  # Retiring a peering means MOVING the entry to
+  # spire_trust_sync_federated_edges_retired. These asserts catch the two ways
+  # that goes wrong on a host, both of which remove trust from somewhere it is
+  # still needed:
+  #   - the same trust_file in BOTH lists: the active pass would put the partner
+  #     authority back every tick and the retired pass would take it out again,
+  #     restarting the edge router each time.
+  #   - a retired trust_file that is the CORE router's: the retired pass writes
+  #     our own bundle ALONE, which would strip every other CA the core carries.
+  when: spire_federation_enabled | default(false)
+  ansible.builtin.assert:
+    that:
+      - item.trust_file is defined and (item.trust_file | length) > 0
+      - item.trust_file != (spire_trust_sync_router_trust_file | default(''))
+      - item.trust_file not in (spire_trust_sync_federated_edges | default([]) | map(attribute='trust_file') | list)
+    fail_msg: >-
+      spire: retired federated edge {{ item }} is not usable. Each entry needs a
+      trust_file; it must not be spire_trust_sync_router_trust_file (the retired
+      pass writes our own bundle ALONE, which would strip every other CA the core
+      carries); and it must not still appear in
+      spire_trust_sync_federated_edges — a file in both lists is added and
+      removed on every tick, restarting the edge router each time.
+  loop: "{{ spire_trust_sync_federated_edges_retired | default([]) }}"
+  loop_control:
+    label: "{{ item.trust_domain | default('<no trust_domain>') }}"
+
+- name: spire | warn when trust reconciliation is disabled with retirements declared
+  # Not an assert. Turning reconciliation off is a legitimate escape hatch, but
+  # with a retirement declared it means the partner authority stays on that edge,
+  # and a deploy that says nothing is how that becomes permanent.
+  when:
+    - spire_federation_enabled | default(false)
+    - not (spire_trust_sync_prune_enabled | default(true))
+    - (spire_trust_sync_federated_edges_retired | default([]) | length) > 0
+  ansible.builtin.debug:
+    msg: >-
+      spire: WARNING — spire_trust_sync_prune_enabled is false on
+      {{ inventory_hostname }} while
+      {{ spire_trust_sync_federated_edges_retired | length }} peering(s) are
+      declared retired. Nothing will remove those partner certificate
+      authorities from their edge trust files; the retirement is declared but
+      NOT in effect. Re-enable reconciliation, or remove the authority by hand
+      and restart that edge router.
+
+- name: spire | install spire-trust-sync script
+  ansible.builtin.template:
+    src: spire-trust-sync.sh.j2
+    dest: /usr/local/sbin/spire-trust-sync.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: spire_trust_sync_enabled
+
+- name: spire | install spire-trust-sync systemd units
+  ansible.builtin.template:
+    src: "spire-trust-sync.{{ item }}.j2"
+    dest: "/etc/systemd/system/spire-trust-sync.{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [service, timer]
+  when: spire_trust_sync_enabled
+
+- name: spire | enable + start spire-trust-sync.timer
+  ansible.builtin.systemd:
+    name: spire-trust-sync.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: spire_trust_sync_enabled
+
+- name: spire | run trust-sync once now (converge immediately, not at next tick)
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/spire-trust-sync.sh
+  register: spire_trust_sync_now
+  changed_when: "'restarted' in spire_trust_sync_now.stdout or 'recreated' in spire_trust_sync_now.stdout"
+  when: spire_trust_sync_enabled
+
+- name: spire | summary
+  ansible.builtin.debug:
+    msg: >-
+      SPIRE up on {{ inventory_hostname }} — trust domain
+      spiffe://{{ spire_trust_domain }} ; entries:
+      {{ spire_registration_entries | map(attribute='spiffe_id') | list }}.
+      Verify fabric-health SVID + live publish per the impl plan (NOT
+      storage read-back — F-177).

@@ -1,0 +1,64 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the cold-storage-bucket role — provisions a per-dataset
+# COMPLIANCE-locked bucket on a MinIO instance, ready to receive an
+# `offload-to-cold.sh` mirror. See
+# docs/design/audit-cold-storage-offload.md (Block 95) for the substrate.
+#
+# This role does NOT do the mirror — it just creates the empty bucket
+# with the right Object Lock posture. The offload script is the
+# operator-fired step that fills it + emits the manifest.
+
+# Required — the dataset name. Becomes the bucket prefix.
+# Bucket name = "{{ cold_storage_dataset_id }}{{ cold_storage_bucket_suffix }}".
+# Operator-supplied at apply time (typically via `-e cold_storage_dataset_id=...`).
+cold_storage_dataset_id: ""
+
+# Bucket name suffix. The default suffix gives e.g.
+# "trial-1.0-cold-storage" for dataset_id "trial-1.0".
+cold_storage_bucket_suffix: "-cold-storage"
+
+# Composed bucket name. Override only if the dataset_id-plus-suffix
+# convention doesn't work for some reason (operator can pass the full
+# bucket name explicitly).
+cold_storage_bucket_name: "{{ cold_storage_dataset_id }}{{ cold_storage_bucket_suffix }}"
+
+# `mc` alias of the destination MinIO. The role assumes the alias is
+# already configured INSIDE the minio container (the standard
+# minio role configures `local` pointing at
+# http://localhost:9000 with root creds).
+cold_storage_target_alias: "local"
+
+# Container name that hosts the `mc` binary. The role runs `mc` via
+# `docker exec`, not from the ansible host directly, because the mc
+# alias `local` is container-local and the root creds are container-env.
+cold_storage_minio_container: "minio"
+
+# Object Lock mode for the bucket. COMPLIANCE = locked-by-anyone-incl-root
+# until retention expires. GOVERNANCE = retention can be released by
+# users with bypass-governance permission. Per ADR 0811's audit-integrity
+# bar and the Block 95 design, COMPLIANCE is the canonical posture for
+# all audit-data cold-storage; lower postures need an explicit reason.
+cold_storage_object_lock: "COMPLIANCE"
+
+# Default object retention (days). Cold-storage retention reflects the
+# horizon the operator wants the data preserved at — usually longer
+# than the source MinIO tier's retention.
+#
+# Block 95 design canonical values:
+#   trial fabrics:           365  (1 year — bounded learning-data horizon)
+#   production sites:       2555  (7 years — matches NIST 800-53 AU-11)
+#   forensic incident-tied:  -1  (retention-extend until incident closes)
+#
+# Default targets the trial-fabric value. Per-deployment overrides
+# in `group_vars/<env>/cold_storage.yml`.
+cold_storage_retention_days: 365
+
+# Optional: human-readable description of the dataset. Becomes a
+# bucket tag (key=description) so `mc ls --tags` surfaces it.
+cold_storage_description: ""
+
+# Optional: operator handle of the operator who issued the offload.
+# Becomes a bucket tag.
+cold_storage_operator: ""

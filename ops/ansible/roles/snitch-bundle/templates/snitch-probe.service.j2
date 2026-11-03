@@ -1,0 +1,38 @@
+[Unit]
+Description=SNITCH mesh performance probe (Block 61, bundle-onboarded)
+After=network-online.target netbird.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/snitch-probe.env
+# --collector + --interval + --cycle-budget read from EnvironmentFile via flag
+# substitution; --probe-key sourced from SNITCH_PROBE_KEY env var.
+ExecStart=/usr/local/bin/snitch probe \
+  --collector ${SNITCH_COLLECTOR} \
+  --interval ${SNITCH_INTERVAL} \
+  --cycle-budget ${SNITCH_CYCLE_BUDGET}
+Restart=always
+RestartSec=30
+
+# Hardening per Block 50 production-readiness lane shape
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log
+# Least-privilege per do-no-harm review (2026-05-04). The probe needs:
+#   - CAP_NET_RAW: for ICMP ping (latency probe + path-MTU detection)
+# It explicitly does NOT need:
+#   - CAP_NET_ADMIN: probe uses `ss -Hnt` / `ss -Hnu` (no `-p` flag)
+#     which works as any user. Active UDP reachability via `nc -zu`
+#     was removed in favor of socket-count-derived UDPReachable; no
+#     unsolicited UDP probes are sent into the relay's QUIC listener.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

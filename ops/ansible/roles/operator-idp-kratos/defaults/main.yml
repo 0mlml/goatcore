@@ -1,0 +1,45 @@
+---
+# Defaults for the `operator-idp-kratos` role.
+#
+# Block 21H.1b — Ory Kratos serving the per-site operator IdP per
+# ADR 0842. Independent of the site Kratos on Orin-A. Connects to the
+# operator-idp-postgres on the same Orin-C via host.docker.internal:5436
+# (the role at ops/ansible/roles/operator-idp-postgres/ stands up that DB).
+#
+# Required env vars (per-site, resolved at runtime via group_vars):
+#   - operator_idp_kratos_cookie_secret  (32+ bytes; FRESH per site, NOT cluster-shared)
+#   - operator_idp_kratos_cipher_secret  (exactly 32 bytes; FRESH per site)
+#   - operator_idp_pg_app_password       (DSN password; defined by 21H.1a postgres role)
+#
+# Cluster-shared secrets DO NOT apply here. The site-Hydra ADR 1009/1010
+# discipline is for the Spock-replicated kratos.* / hydra.* schemas on
+# Orin-A. The operator IdP runs on its own Postgres with no replication
+# and no other site's Kratos reads its tables, so secrets can be (and
+# should be) site-fresh per ADR 0842 §"Decision."
+
+operator_idp_kratos_image: "oryd/kratos:v1.3.1"
+
+operator_idp_kratos_container_name: "operator-idp-kratos"
+operator_idp_kratos_compose_dir: "/opt/operator-idp-kratos"
+operator_idp_kratos_config_subdir: "config"
+
+# Exposed listen ports — bound to localhost only. Traefik on Orin-C
+# reverse-proxies the public-facing routes (auth.ops.<site>... → 4433
+# public, the admin port stays loopback-only).
+operator_idp_kratos_public_host_port: 4435    # +2 from site Kratos's 4433 to keep ports unambiguous
+operator_idp_kratos_admin_host_port: 4436     # +2 from site Kratos's 4434
+
+# DSN to the operator-idp-postgres role's DB. host.docker.internal
+# resolves to the host's docker bridge, which the postgres role
+# exposes 127.0.0.1:5436 on. Same pattern as obs-host → minio.
+operator_idp_kratos_dsn: >-
+  postgres://operator_idp:{{ operator_idp_pg_app_password }}@host.docker.internal:5436/kratos?sslmode=disable
+
+# site_dns_zone is shared with other Orin-C roles. Default matches the
+# production-mesh zone; per-site group_vars override.
+site_dns_zone: ""   # REQUIRED per goatnet; a shared role must not default to one
+# WebAuthn / FIDO2 RP ID. Per ADR 0842, distinct from the site Kratos's
+# RP ID so a credential issued for the site IdP is NOT replayable
+# against the operator IdP (and vice versa). The `ops` subdomain
+# matches the operator-IdP framing semantically.
+operator_idp_kratos_webauthn_rp_id_prefix: "ops"

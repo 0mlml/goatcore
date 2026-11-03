@@ -1,0 +1,39 @@
+{# Rendered by ops/ansible/roles/node-exporter — ADR 1128 §3.
+
+   THE DENOMINATOR. Before this file, nothing in the repository declared how
+   big any host's pipe was: link_capacity / uplink_mbps / bandwidth_mbps /
+   capacity_bps all returned zero hits across ops/ and docs/design/, so
+   "percent of available pipe" had nothing to divide by.
+
+   Values are BYTES per second, not bits: Prometheus convention is base units
+   and promtool lints the bits form. Operators declare mbps in group_vars
+   (which is how links are sold and specced) and the conversion happens here,
+   once. Every consumer multiplies by 8 for display.
+
+   It is a DECLARED fact and says so. `source` is the honesty carrier:
+     measured  — someone ran a throughput test and wrote the result down
+     declared  — the number a contract, ISP plan or NIC spec says
+     unknown   — nobody has said. The dashboard then shows raw bytes/s and the
+                 words "capacity not declared" rather than a fabricated %.
+
+   Deriving capacity from observed peak was rejected: peak observed is a FLOOR
+   on capacity, not a measure of it, and a link never driven hard would report
+   a small pipe and then show 95% utilisation under a trivial load. #}
+# HELP goat_link_capacity_bytes_per_second Declared link capacity in bytes per second. Declared, not measured, unless the source label says measured. See ADR 1128.
+# TYPE goat_link_capacity_bytes_per_second gauge
+{% set cap = node_exporter_link_capacity %}
+{% set src = cap.source | default('unknown') %}
+{% if src != 'unknown' and (cap.down_mbps | default(0) | float) > 0 %}
+goat_link_capacity_bytes_per_second{direction="rx",source="{{ src }}"} {{ (cap.down_mbps | float * 1000000 / 8) | int }}
+{% endif %}
+{% if src != 'unknown' and (cap.up_mbps | default(0) | float) > 0 %}
+goat_link_capacity_bytes_per_second{direction="tx",source="{{ src }}"} {{ (cap.up_mbps | float * 1000000 / 8) | int }}
+{% endif %}
+# HELP goat_link_capacity_declared 1 when this host has a usable capacity declaration. 0 means every percent-of-link panel must refuse to render a number for this host rather than assume a default pipe.
+# TYPE goat_link_capacity_declared gauge
+goat_link_capacity_declared{source="{{ src }}"} {{ 1 if src != 'unknown' and ((cap.down_mbps | default(0) | float) > 0 or (cap.up_mbps | default(0) | float) > 0) else 0 }}
+{% if cap.asserted_on is defined and cap.asserted_on %}
+# HELP goat_link_capacity_asserted_timestamp_seconds When the declaration was last affirmed. A capacity nobody has re-checked in a year is a stale claim, and the dashboard ages it visibly rather than trusting it forever.
+# TYPE goat_link_capacity_asserted_timestamp_seconds gauge
+goat_link_capacity_asserted_timestamp_seconds {{ (cap.asserted_on | to_datetime('%Y-%m-%d')).timestamp() | int }}
+{% endif %}

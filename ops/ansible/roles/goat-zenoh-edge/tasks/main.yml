@@ -1,0 +1,305 @@
+---
+# goat-zenoh-edge — one dedicated router per federated sovereign partner.
+# ADR 1157. Everything here is opt-in and fails loud rather than guessing.
+
+- name: edge | skip entirely unless explicitly enabled for this host
+  ansible.builtin.meta: end_host
+  when: not (goat_zenoh_edge_enabled | default(false))
+
+# --- Fail loud on anything unset -------------------------------------------
+# An edge that silently comes up half-configured is worse than one that refuses:
+# a missing ingress list renders an ALLOW rule with an empty key_exprs, and a
+# missing partner CN renders a subject that matches nobody. Both fail closed on
+# the fabric, but both look "deployed" to an operator. Refuse instead.
+- name: edge | every peering parameter must be set
+  ansible.builtin.assert:
+    that:
+      - goat_zenoh_edge_partner_id | length > 0
+      - goat_zenoh_edge_partner_cn | length > 0
+      - goat_zenoh_edge_partner_ca_path | length > 0
+      - goat_zenoh_edge_outward_cert | length > 0
+      - goat_zenoh_edge_outward_key | length > 0
+      - goat_zenoh_edge_inward_cert | length > 0
+      - goat_zenoh_edge_inward_key | length > 0
+      - goat_zenoh_edge_core_endpoints | length > 0
+      - goat_zenoh_edge_ingress_key_exprs | length > 0
+      - goat_zenoh_edge_image | length > 0
+    fail_msg: >-
+      goat-zenoh-edge is missing required peering parameters. See
+      docs/operations/sovereign-federation-runbook.md step 3. Nothing is
+      defaulted on purpose — a half-configured edge looks deployed and is not.
+
+# Without a per-endpoint trust override on the inward
+# dial, the edge cannot verify our own core's server certificate — because
+# root_ca_certificate is global to the process and holds the PARTNER's CA — and
+# every dial fails UnknownCA. It is the first thing that breaks, so refuse it here.
+- name: edge | inward endpoints must carry a per-endpoint trust override
+  ansible.builtin.assert:
+    that:
+      - goat_zenoh_edge_trust_mode != 'fragment'
+        or (goat_zenoh_edge_core_endpoints | select('search', 'root_ca_certificate_file=') | list | length
+            == goat_zenoh_edge_core_endpoints | length)
+    fail_msg: >-
+      Every entry in goat_zenoh_edge_core_endpoints must carry
+      '#root_ca_certificate_file=<our CA>'. The edge's global trust anchor is the
+      PARTNER's CA, so without the override it cannot verify our own core and the
+      dial fails UnknownCA. See docs/design/cross-sovereign-federation.md §1.
+
+- name: edge | image must be digest-pinned (ADR 0703)
+  ansible.builtin.assert:
+    that: ["'@sha256:' in goat_zenoh_edge_image"]
+    fail_msg: >-
+      goat_zenoh_edge_image must be pinned by digest, not by tag. A mutable tag
+      means the thing you tested is not necessarily the thing serving a
+      partner-facing port.
+
+# --- The partner's trust anchors must not be a core router's file -----------
+# This is the single most damaging mistake available in this procedure: point an
+# edge at the core's trust file and the partner's CA lands on the machine that
+# holds everything.
+- name: edge | partner CA path must not be a core router trust file
+  ansible.builtin.assert:
+    that:
+      - "'/tls/ca-root-cert.pem' not in goat_zenoh_edge_partner_ca_path"
+    fail_msg: >-
+      goat_zenoh_edge_partner_ca_path points at what looks like a CORE router's
+      trust file. The partner's CA must live in this edge process's own store
+      and nowhere else.
+
+- name: edge | a key-bundle scope must name a release set, never the whole topic
+  ansible.builtin.assert:
+    that:
+      - goat_zenoh_edge_key_bundle_key_exprs | select('match', '^keys/\\*') | list | length == 0
+      - goat_zenoh_edge_key_bundle_key_exprs | reject('match', '^keys/.+/') | list | length == 0
+    fail_msg: >-
+      goat_zenoh_edge_key_bundle_key_exprs must be scoped per release set —
+      "keys/<set>/**" — and never "keys/**". A member belongs to the audiences it
+      produces to or reads from and to no others; a blanket grant hands this
+      partner every audience's bundle (ADR 1169 decision 3). Given:
+      {{ goat_zenoh_edge_key_bundle_key_exprs }}
+    success_msg: "key-bundle scope is per release set"
+  when: goat_zenoh_edge_key_bundle_key_exprs | default([]) | length > 0
+
+- name: edge | read the core's key storages, to compare against what we grant
+  # A queryable declared WIDER than the lane this edge grants is refused, and
+  # SILENTLY. The bundle is served
+  # by a storage on the core, so a core storing "keys/**" against a per-set grant
+  # means the declaration never reaches the partner and their fetch returns an
+  # empty result that reads as "nothing was published".
+  #
+  # Read-only, and never fatal on its own: the core may legitimately be a host
+  # this play cannot reach, and a check that cannot run must not be reported as
+  # a check that passed.
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    docker exec {{ goat_zenoh_edge_core_container | default('goat-zenoh') }}
+    cat /etc/zenoh/config.json5 2>/dev/null
+    | grep -oE '"keys/[^"]*"' | sort -u | tr '\n' ' '
+  args: { executable: /bin/bash }
+  register: _edge_core_key_storages
+  changed_when: false
+  failed_when: false
+  when: goat_zenoh_edge_key_bundle_key_exprs | default([]) | length > 0
+
+- name: edge | warn when the core's key storage is wider than the grant
+  ansible.builtin.fail:
+    msg: >-
+      The core stores {{ _edge_core_key_storages.stdout | trim }}, which is WIDER
+      than the {{ goat_zenoh_edge_key_bundle_key_exprs | join(', ') }} this edge
+      grants. A queryable declared wider than the granted lane is refused
+      silently, so the partner's fetch will return an empty result that reads as
+      "no bundle published". Narrow the core's key storage to the
+      released set(s), or set goat_zenoh_edge_key_scope_check=false if you have
+      deliberately accepted this.
+  when:
+    - goat_zenoh_edge_key_bundle_key_exprs | default([]) | length > 0
+    - goat_zenoh_edge_key_scope_check | default(true)
+    - _edge_core_key_storages.stdout | default('') is search('"keys/\\*\\*"')
+
+- name: edge | directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0750"
+  loop:
+    - "/etc/{{ goat_zenoh_edge_stack }}"
+    - "/etc/{{ goat_zenoh_edge_stack }}/tls"
+    - "/opt/{{ goat_zenoh_edge_stack }}"
+
+# --- F-601: bind each subject to the interface its link arrives on -------------
+- name: edge | the interface the core link leaves by
+  ansible.builtin.shell: |
+    set -eo pipefail
+    core=$(printf '%s' {{ (goat_zenoh_edge_core_endpoints | first) | quote }} | sed -E 's#^[a-z]+/([^:/]+):.*#\1#')
+    addr=$(getent ahostsv4 "$core" | awk '{print $1; exit}')
+    src=$(ip -o route get "${addr:-$core}" | grep -oE 'src [0-9.]+' | awk '{print $2}')
+    ip -o -4 addr show to "$src" | awk '{print $2; exit}'
+  args: { executable: /bin/bash }
+  register: _ze_core_if
+  changed_when: false
+  when:
+    - goat_zenoh_edge_network_mode == 'host'
+    - goat_zenoh_edge_core_interface | length == 0
+
+- name: edge | the interface the partner link arrives on
+  ansible.builtin.shell: |
+    set -eo pipefail
+    ip -o route get {{ goat_zenoh_edge_partner_link_ip | quote }} | grep -oE 'dev [^ ]+' | awk '{print $2}'
+  args: { executable: /bin/bash }
+  register: _ze_partner_if
+  changed_when: false
+  when:
+    - goat_zenoh_edge_network_mode == 'host'
+    - goat_zenoh_edge_partner_interface | length == 0
+    - goat_zenoh_edge_partner_link_ip | length > 0
+
+- name: edge | settle the two interfaces
+  ansible.builtin.set_fact:
+    goat_zenoh_edge_core_interface: "{{ goat_zenoh_edge_core_interface if goat_zenoh_edge_core_interface | length > 0 else (_ze_core_if.stdout | default('') | trim) }}"
+    goat_zenoh_edge_partner_interface: "{{ goat_zenoh_edge_partner_interface if goat_zenoh_edge_partner_interface | length > 0 else (_ze_partner_if.stdout | default('') | trim) }}"
+  when: goat_zenoh_edge_network_mode == 'host'
+
+- name: edge | the core link and the partner link arrive on different interfaces
+  ansible.builtin.assert:
+    that:
+      - goat_zenoh_edge_core_interface | length > 0
+      - goat_zenoh_edge_partner_interface | length > 0
+      - goat_zenoh_edge_core_interface != goat_zenoh_edge_partner_interface
+    fail_msg: >-
+      goat-zenoh-edge refuses: the core link reads interface
+      '{{ goat_zenoh_edge_core_interface }}' and the partner link
+      '{{ goat_zenoh_edge_partner_interface }}'. The our-core subject is bound to
+      the core link's interface so that a certificate the partner mints with our
+      core's name, arriving over the partner link, matches nothing. With one
+      interface for both, that binding separates nothing. Bring the transport up
+      first (phase 11), or set both interfaces explicitly.
+  when: goat_zenoh_edge_network_mode == 'host'
+
+- name: edge | render the edge config
+  ansible.builtin.template:
+    src: config.json5.j2
+    dest: "/etc/{{ goat_zenoh_edge_stack }}/config.json5"
+    mode: "0640"
+  notify: Restart goat zenoh edge
+
+- name: edge | compose project
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "/opt/{{ goat_zenoh_edge_stack }}/docker-compose.yml"
+    mode: "0640"
+  notify: Restart goat zenoh edge
+
+- name: edge | every core endpoint's CA override must point at the MOUNTED path
+  ansible.builtin.assert:
+    that:
+      - goat_zenoh_edge_core_endpoints
+        | select('search', 'root_ca_certificate_file=')
+        | reject('search', 'root_ca_certificate_file=' ~ (goat_zenoh_edge_bundle_path if goat_zenoh_edge_trust_mode == 'bundle' else goat_zenoh_edge_our_ca_path))
+        | list | length == 0
+    fail_msg: >-
+      A core endpoint names a CA file this container will not have. Every path is
+      mounted at ITSELF ({{ '{{ path }}:{{ path }}:ro' }}), so the override must be the
+      same string as
+      {{ 'goat_zenoh_edge_bundle_path' if goat_zenoh_edge_trust_mode == 'bundle' else 'goat_zenoh_edge_our_ca_path' }}
+      ({{ goat_zenoh_edge_bundle_path if goat_zenoh_edge_trust_mode == 'bundle' else goat_zenoh_edge_our_ca_path }}).
+      An override pointing anywhere else is DISCARDED SILENTLY — the edge
+      comes up, the partner connects, and the inward link never forms. Endpoints
+      given: {{ goat_zenoh_edge_core_endpoints }}
+    success_msg: "core endpoint CA overrides point at the mounted path"
+
+- name: edge | our CA must be given, in BOTH trust modes
+  ansible.builtin.assert:
+    that:
+      - goat_zenoh_edge_our_ca_path | length > 0
+    fail_msg: >-
+      goat_zenoh_edge_our_ca_path is unset. BOTH trust modes need it: `bundle`
+      concatenates it with the partner's, and `fragment` names it in the
+      per-endpoint override AND MOUNTS IT -- an override pointing at a path the
+      container cannot read is discarded, and the edge never dials.
+
+- name: edge | read our CA
+  ansible.builtin.slurp:
+    src: "{{ goat_zenoh_edge_our_ca_path }}"
+  register: _ze_our_ca
+  when: goat_zenoh_edge_trust_mode == 'bundle'
+
+- name: edge | read the partner CA
+  ansible.builtin.slurp:
+    src: "{{ goat_zenoh_edge_partner_ca_path }}"
+  register: _ze_partner_ca
+  when: goat_zenoh_edge_trust_mode == 'bundle'
+
+- name: edge | assemble the per-edge trust bundle
+  # PER EDGE, never shared. Each partner's container gets our CA and THAT
+  # partner's, so partner A's authority never enters partner B's edge -- the
+  # isolation the per-partner process exists for is not spent by the bundle.
+  ansible.builtin.copy:
+    content: "{{ (_ze_our_ca.content | b64decode) ~ (_ze_partner_ca.content | b64decode) }}"
+    dest: "{{ goat_zenoh_edge_bundle_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: goat_zenoh_edge_trust_mode == 'bundle'
+  notify: Restart goat zenoh edge
+
+- name: edge | up
+  community.docker.docker_compose_v2:
+    project_src: "/opt/{{ goat_zenoh_edge_stack }}"
+    state: present
+
+- name: edge | flush handlers so the inward-link check sees the running container
+  ansible.builtin.meta: flush_handlers
+
+- name: edge | give the edge a moment to dial the core
+  ansible.builtin.wait_for:
+    timeout: "{{ goat_zenoh_edge_inward_settle_seconds }}"
+
+- name: edge | read the edge container's own connections
+  # From INSIDE the container's network namespace. `ss` on the host cannot see
+  # them -- the edge runs in its own compose network, so a host-side check reads
+  # empty for a healthy edge and a dead one alike.
+  ansible.builtin.shell: |
+    set -o pipefail
+    pid=$(docker inspect -f '{{ "{{" }}.State.Pid{{ "}}" }}' {{ goat_zenoh_edge_stack }})
+    nsenter -t "$pid" -n ss -tan 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  register: _ze_conns
+  changed_when: false
+  failed_when: false
+
+- name: edge | refuse an edge that never reached the core
+  # THE CHECK F-474 EXISTS FOR. The edge can be Up, accept the partner's session
+  # and answer every health question affirmatively while its inward link was
+  # never dialled -- upstream zenoh silently discards a connect endpoint carrying
+  # per-link config, which is the syntax this role asserts. Nothing is logged.
+  # A partner reporting "connected and sending" is then telling the truth while
+  # the data goes nowhere, so the only honest check is whether the connection
+  # exists.
+  ansible.builtin.fail:
+    msg: >-
+      goat-zenoh-edge refuses: the edge container is running but has NO connection
+      to any core endpoint {{ goat_zenoh_edge_core_endpoints }}. The inward link is
+      dead and nothing will reach the fabric, however healthy the partner side
+      looks. See F-474: upstream zenoh silently discards a connect endpoint
+      carrying per-link configuration, which is the syntax asserted above -- check
+      whether this image honours it. Connections seen inside the container:
+      {{ _ze_conns.stdout_lines | default([]) | reject('search', 'State') | list }}
+  when:
+    - goat_zenoh_edge_verify_inward_link | bool
+    - _ze_conns.rc | default(1) == 0
+    - _ze_conns.stdout_lines | default([])
+      | select('search', ':' ~ (goat_zenoh_edge_core_endpoints | first | regex_search(':([0-9]+)', '\\1') | first | default('7447')))
+      | select('search', 'ESTAB')
+      | list | length == 0
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: goat-zenoh-edge | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "goat-zenoh-edge"
+    rollback_ref: "{{ goat_zenoh_edge_image }}"

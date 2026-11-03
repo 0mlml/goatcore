@@ -1,0 +1,70 @@
+---
+# defaults for ops/ansible/roles/node-exporter
+#
+# A standalone node_exporter for hosts that are SCRAPED but do not run an obs
+# stack of their own — the mgmt pair, the breakglass node, anything an obs host
+# points at.
+#
+# WHY THIS ROLE EXISTS: a scrape target declared with no exporter behind it sits
+# down, then pages continuously once alerting goes live, and it looks like a stale
+# address or a hung sensor until probing shows no exporter on the host at all. An
+# address must not be written ahead of the thing it names. This role is the thing it names.
+#
+# The obs-host role ships its OWN node_exporter for the obs host itself; this
+# role is for everyone else. Keep the two service definitions in step.
+
+node_exporter_image: "prom/node-exporter:v1.8.2"
+node_exporter_compose_dir: "/opt/node-exporter"
+node_exporter_port: 9100
+
+# Collectors to disable.
+#
+# thermal_zone is disabled BY DEFAULT and that default is deliberate. On Jetson
+# Orin, /sys/class/thermal/thermal_zone{1..4}/temp never returns; the collector
+# blocks, each scrape holds one of node_exporter's 40 request slots, and once
+# they fill EVERY scrape answers:
+#
+#   Limit of concurrent requests reached (40), try again later.
+#
+# The exporter then reports nothing at all, and that reads as an ordinary
+# "target down". Every other collector returns in 0.002-0.21s; with thermal_zone
+# "target down". Every other collector returns in 0.002-0.21s; with thermal_zone
+# off, a full scrape completes in 0.36s.
+#
+# The trade is deliberate: losing thermal metrics costs one dimension, whereas
+# the hang costs EVERY metric on the host. On x86 hosts the collector is safe
+# and useful — override to [] there. Defaulting to safe means a new Jetson does
+# not hang on its first boot.
+node_exporter_disabled_collectors:
+  - thermal_zone
+
+# Textfile collector — lets host-side probes publish metrics Prometheus can
+# alert on without each probe becoming its own scrape target. Same contract as
+# the obs-host exporter so a probe can move between hosts unchanged.
+node_exporter_textfile_host_dir: "/var/lib/node_exporter/textfile"
+node_exporter_textfile_dir: "/textfile"
+
+# Bind address. Empty = all interfaces, which is the behaviour every existing
+# deployment has, so it stays the default — silently rebinding a live exporter
+# would take its scrape down. Set it to the host's MESH IP on new coverage so
+# the exporter is reachable from the obs host and not from the LAN (the
+# obs-host role's own exporter binds the docker bridge gateway for the same
+# reason). Reachability is still governed by the mesh ACL underneath.
+node_exporter_listen_addr: ""
+
+# --- declared link capacity (ADR 1128 §3) -----------------------------------
+# THE DENOMINATOR for every percent-of-pipe panel. Nothing in the repo declared
+# this before; without it, utilisation cannot be computed honestly.
+#
+#   source: measured  -> a throughput test was run and written down
+#           declared  -> the number the contract / ISP plan / NIC spec says
+#           unknown   -> nobody has said. Dashboard shows raw bytes/s and
+#                        "capacity not declared", NEVER a fabricated percent.
+#
+# Default is unknown ON PURPOSE and fail-closed: a host nobody has characterised
+# must not silently inherit someone else's pipe size.
+node_exporter_link_capacity:
+  down_mbps: 0
+  up_mbps: 0
+  source: unknown
+  asserted_on: ""

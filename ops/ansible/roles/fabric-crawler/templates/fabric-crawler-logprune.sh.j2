@@ -1,0 +1,66 @@
+#!/bin/bash
+# {{ ansible_managed }}
+#
+# Reap RocksDB LOG.old.* debris from the fabric-crawler secondary scratch dir.
+#
+# The crawler opens one RocksDB secondary instance per store per cycle. Every
+# open renames LOG -> LOG.old.<ts>, and nothing prunes them, so the tree grows to
+# millions of files with zero bytes of non-LOG content.
+#
+# STRICTLY LOG.old.* — never LOG, CURRENT, MANIFEST-*, OPTIONS-*, *.sst, *.log.
+# Those are live database state; the pattern below must not be widened.
+set -uo pipefail
+
+SECONDARY_DIR="{{ fabric_crawler_compose_dir }}/secondary"
+MAX_AGE_MIN="{{ fabric_crawler_logprune_max_age_min }}"
+TEXTFILE_DIR="{{ fabric_crawler_logprune_textfile_dir }}"
+
+if [ ! -d "$SECONDARY_DIR" ]; then
+  echo "fabric-crawler-logprune: $SECONDARY_DIR absent, nothing to do"
+  exit 0
+fi
+
+# Measure before deleting so the metric reports what this run actually freed
+# rather than what is left over.
+# %.0f, not %d. The byte total routinely exceeds 2^31, and mawk's %d saturates
+# at INT32_MAX on aarch64 but NOT on x86_64 — same mawk, same expression,
+# different answer per architecture: an arm64 host reports exactly 2147483647
+# bytes for a larger reap while an amd64 host prints it correctly, so the capped
+# gauge stays invisible from amd64.
+# mawk holds the accumulator as a double either way, so %.0f is right on both.
+read -r before_files before_bytes < <(
+  find "$SECONDARY_DIR" -xdev -type f -name 'LOG.old.*' -mmin "+${MAX_AGE_MIN}" \
+    -printf '%s\n' 2>/dev/null |
+    awk '{n++; s+=$1} END {printf "%.0f %.0f\n", n+0, s+0}'
+)
+
+find "$SECONDARY_DIR" -xdev -type f -name 'LOG.old.*' -mmin "+${MAX_AGE_MIN}" \
+  -delete 2>/dev/null
+rc=$?
+
+remaining=$(find "$SECONDARY_DIR" -xdev -type f -name 'LOG.old.*' 2>/dev/null | wc -l)
+
+echo "fabric-crawler-logprune: reaped ${before_files} files / ${before_bytes} bytes" \
+     "older than ${MAX_AGE_MIN}m; ${remaining} LOG.old remain; rc=${rc}"
+
+# Reveal-only metric. Absence of the textfile dir is not an error: the reaping
+# is the job, the metric is the report.
+if [ -n "$TEXTFILE_DIR" ] && [ -d "$TEXTFILE_DIR" ]; then
+  tmp="${TEXTFILE_DIR}/.fabric-crawler-logprune.prom.$$"
+  {
+    echo "# HELP goat_fabric_crawler_logprune_reaped_bytes Bytes of RocksDB LOG.old debris removed on the last run."
+    echo "# TYPE goat_fabric_crawler_logprune_reaped_bytes gauge"
+    echo "goat_fabric_crawler_logprune_reaped_bytes ${before_bytes}"
+    echo "# HELP goat_fabric_crawler_logprune_reaped_files Files of RocksDB LOG.old debris removed on the last run."
+    echo "# TYPE goat_fabric_crawler_logprune_reaped_files gauge"
+    echo "goat_fabric_crawler_logprune_reaped_files ${before_files}"
+    echo "# HELP goat_fabric_crawler_logprune_remaining_files LOG.old files left in the secondary tree after the last run."
+    echo "# TYPE goat_fabric_crawler_logprune_remaining_files gauge"
+    echo "goat_fabric_crawler_logprune_remaining_files ${remaining}"
+    echo "# HELP goat_fabric_crawler_logprune_last_success_timestamp_seconds Unix time of the last completed run."
+    echo "# TYPE goat_fabric_crawler_logprune_last_success_timestamp_seconds gauge"
+    echo "goat_fabric_crawler_logprune_last_success_timestamp_seconds $(date +%s)"
+  } > "$tmp" && mv -f "$tmp" "${TEXTFILE_DIR}/fabric-crawler-logprune.prom"
+fi
+
+exit 0

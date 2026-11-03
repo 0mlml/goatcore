@@ -1,0 +1,150 @@
+{#- isitup-rows.json.j2 — the ONE list of rows this goatnet's status page carries.
+
+   Read by tasks/main.yml into the `isitup_rows` fact, which two files render
+   from: services.env (what check.sh probes) and data/meta.json (what the page
+   knows about each row beyond its probe result — lifecycle, owner, where it
+   came from). Built once so the probe list and the page can never disagree
+   about which rows exist.
+
+   Three inputs, in precedence order. A row whose id is already on the list is
+   skipped, so the first home wins:
+
+     1. isitup_services           — this goatnet's own services       source: core
+                                    (a row with category: external is off-mesh,
+                                    source: offmesh)
+     2. isitup_external_services  — the shared off-mesh catalog       source: offmesh
+     3. external_service_* decls  — ADR 1178, one row per hostname    source: external
+
+   Until #1518 the first two were concatenated with no dedup, and zagros and
+   zagros-prod carried the seven catalog rows inline as well, so every one of
+   them rendered twice.
+
+   Per-row display state (#1518), on isitup_services rows and on an external
+   declaration's `status:` (and per hostname under `status.hostnames`):
+
+     lifecycle: live (default) | planned | retiring
+         planned  — declared, not yet up. Shown with a "planned" pill, never
+                    counted in the banner, never a blackbox target.
+         retiring — on its way out. Shown muted, never counted in the banner,
+                    never a blackbox target.
+     listed: false            (external declarations: `status.list: false`,
+                               or per hostname `status.hostnames.<h>.list`)
+         Not on the page and not probed. DISPLAY-ONLY: the row's DNS record,
+         certificate name and gym link are untouched, because those read
+         isitup_services / the declaration directly, not this list.
+     retire_after: YYYY-MM-DD
+         Past the date, the row is dropped here. The page drops it too, from
+         meta.json, so a row does not outlive its date just because nobody
+         re-ran the play.
+
+   A hidden row (listed: false, or past retire_after) still CLAIMS its id and
+   hostname, so a catalog row or declaration with the same id or name stays
+   off the page too. Otherwise hiding one of zagros's inline off-mesh rows would
+   bring the catalog's copy back in its place.
+
+   Rows are dicts; services.env.j2 owns the pipe-delimited shape. -#}
+{%- set _today = now(utc=True, fmt='%Y-%m-%d') -%}
+{%- set _rows = [] -%}
+{%- set _ids = [] -%}
+{%- set _claimed_fqdns = [] -%}
+{%- for svc in isitup_services + (isitup_external_services | default([])) -%}
+{%-   set _retire = (svc.retire_after | default('')) | string -%}
+{%-   if svc.id not in _ids -%}
+{%-     set _ = _ids.append(svc.id) -%}
+{%-     set _ = _claimed_fqdns.append(svc.fqdn) -%}
+{%-     if (svc.listed | default(true) | bool) and not (_retire and _retire < _today) -%}
+{%-     set _ = _rows.append({
+          'id': svc.id,
+          'name': svc.name,
+          'fqdn': svc.fqdn,
+          'type': svc.type | default('container'),
+          'container': svc.container | default(''),
+          'port': svc.port | default('') | string,
+          'health_path': svc.health_path | default('/'),
+          'kind': svc.kind | default('ui'),
+          'access': svc.access | default(''),
+          'category': svc.category | default('app'),
+          'icon': svc.icon | default(''),
+          'desc': svc.desc | default(''),
+          'link_path': svc.link_path | default(''),
+          'probe_front_door': svc.probe_front_door | default(svc.probe_gate | default(true)) | bool,
+          'expect_codes': svc.expect_codes | default('2|3'),
+          'lifecycle': svc.lifecycle | default('live'),
+          'source': 'offmesh' if (svc.category | default('app')) == 'external' else 'core',
+          'owner': svc.owner | default(''),
+          'retire_after': _retire,
+        }) -%}
+{%-     endif -%}
+{%-   endif -%}
+{%- endfor -%}
+{#- External-service declarations (ADR 1178): one `type: external` row per
+    hostname, probed through the front door like any off-box row. A hostname an
+    earlier row already names is skipped — that row is the one on the page.
+
+    Past the first hostname, the row id and name take the label as a suffix so
+    they stay unique. A NESTED label (`api.org16x`) drops the service name it
+    hangs under before the suffix is built, because "org16x-api-org16x" says the
+    same thing twice; what is left has its dots hyphenated, because an id ends
+    up in page anchors and CSS selectors and a dot there is a class separator.
+
+    `hostnames:` itself stays a plain list — the playbook, the mesh DNS
+    generator, the certificate and the footprint check all read it. Whether
+    each hostname is LISTED is a status-page question, so it lives under
+    `status:`, which only this template reads:
+
+      status:
+        list: true                 # default for every hostname below
+        hostnames:
+          api.org16x: { list: false }
+          heartbeat.org16x: { health_path: /health, desc: "…" }
+
+    The service owner decides this in their declaration, in
+    usareur-af/hello-galaxy-external-service. -#}
+{#- external_service_wildcard_cert matches the prefix too; only mappings are services. -#}
+{%- for _ext_var in (lookup('varnames', '^external_service_', wantlist=True) | sort) if lookup('vars', _ext_var) is mapping -%}
+{%-   set _ext = lookup('vars', _ext_var) -%}
+{%-   set _st = _ext.status | default({}) -%}
+{%-   set _per = _st.hostnames | default({}) -%}
+{%-   set _hosts = _ext.hostnames | default([_ext.name]) -%}
+{%-   set _front = _hosts[0] -%}
+{%-   set _retire = (_ext.retire_after | default('')) | string -%}
+{%-   for _h in _hosts -%}
+{%-     set _fqdn = _h ~ '.' ~ site_id ~ '.' ~ site_dns_zone -%}
+{%-     set _ho = _per[_h] | default({}) -%}
+{%-     set _first = (_h == _front) -%}
+{%-     set _leaf = _h[:-(_ext.name | length + 1)] if (not _first and _h.endswith('.' ~ _ext.name)) else _h -%}
+{%-     set _base_id = _st.id | default(_ext.name) -%}
+{%-     set _base_name = _st.name | default(_ext.name) -%}
+{%-     set _id = _base_id if _first else _base_id ~ '-' ~ (_leaf | replace('.', '-')) -%}
+{%-     if (_ext.enabled | default(true) | bool)
+          and (_fqdn not in _claimed_fqdns)
+          and (_id not in _ids) -%}
+{%-       set _ = _ids.append(_id) -%}
+{%-       set _ = _claimed_fqdns.append(_fqdn) -%}
+{%-       if (_ho.list | default(_st.list | default(true)) | bool) and not (_retire and _retire < _today) -%}
+{%-       set _ = _rows.append({
+            'id': _id,
+            'name': _ho.name | default(_base_name if _first else _base_name ~ ' (' ~ _leaf ~ ')'),
+            'fqdn': _fqdn,
+            'type': 'external',
+            'container': '',
+            'port': '',
+            'health_path': _ho.health_path | default(_ext.health_path | default('/')),
+            'kind': _ho.kind | default(_st.kind | default('ui')),
+            'access': _st.access | default('public'),
+            'category': _st.category | default('app'),
+            'icon': _st.icon | default(''),
+            'desc': _ho.desc | default(_st.desc | default('')),
+            'link_path': _ho.link_path | default(_st.link_path | default('')),
+            'probe_front_door': _st.probe_front_door | default(true) | bool,
+            'expect_codes': _ho.expect_codes | default(_st.expect_codes | default('2|3')),
+            'lifecycle': _ho.lifecycle | default(_st.lifecycle | default('live')),
+            'source': 'external',
+            'owner': _ext.owner | default(''),
+            'retire_after': _retire,
+          }) -%}
+{%-       endif -%}
+{%-     endif -%}
+{%-   endfor -%}
+{%- endfor -%}
+{{ _rows | to_json }}

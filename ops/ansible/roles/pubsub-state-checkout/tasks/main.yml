@@ -1,0 +1,78 @@
+---
+# ops/ansible/roles/pubsub-state-checkout/tasks/main.yml
+#
+# Warm standby checkout of the per-site pubsub-state Forgejo repo + a staged
+# pubsub-apply binary, refreshed by a systemd timer. Recovery side of Block 86.
+
+- name: Pre-flight — Forgejo read credential present
+  ansible.builtin.assert:
+    that:
+      - pubsub_state_checkout_token | length > 0
+    fail_msg: |
+      FORGEJO_PUBSUB_TOKEN must be set in the environment (the mirror bot PAT
+      is reused for the read-only pull). See
+      docs/design/pubsub-state-as-code.md.
+
+- name: Pre-flight — Forgejo reachable
+  ansible.builtin.uri:
+    url: "{{ pubsub_state_checkout_forgejo_url }}/api/v1/version"
+    return_content: true
+    status_code: [200]
+  changed_when: false
+
+- name: Ensure checkout + bin dirs exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0750"
+  loop:
+    - "{{ pubsub_state_checkout_dir }}"
+    - "{{ pubsub_state_checkout_dir }}/bin"
+
+- name: Stage the pubsub-apply binary
+  ansible.builtin.copy:
+    src: "{{ pubsub_state_apply_binary_src }}"
+    dest: "{{ pubsub_state_apply_binary_dest }}"
+    mode: "0755"
+  when: pubsub_state_apply_binary_src | length > 0
+
+- name: Drop pull script
+  ansible.builtin.template:
+    src: pubsub-state-pull.sh.j2
+    dest: /usr/local/bin/pubsub-state-pull.sh
+    mode: "0750"
+
+- name: Drop RECOVERY.md (failover one-liner)
+  ansible.builtin.template:
+    src: RECOVERY.md.j2
+    dest: "{{ pubsub_state_checkout_dir }}/RECOVERY.md"
+    mode: "0644"
+
+- name: Drop systemd unit
+  ansible.builtin.template:
+    src: pubsub-state-pull.service.j2
+    dest: /etc/systemd/system/pubsub-state-pull.service
+    mode: "0644"
+  notify: reload systemd
+
+- name: Drop systemd timer
+  ansible.builtin.template:
+    src: pubsub-state-pull.timer.j2
+    dest: /etc/systemd/system/pubsub-state-pull.timer
+    mode: "0644"
+  notify: reload systemd
+
+- name: Flush handlers (pick up unit + timer changes)
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable + start timer
+  ansible.builtin.systemd:
+    name: pubsub-state-pull.timer
+    enabled: true
+    state: started
+
+- name: First-run pull — populate the checkout now
+  ansible.builtin.command: /usr/local/bin/pubsub-state-pull.sh
+  register: _first_pull
+  changed_when: "'pulled' in _first_pull.stdout"
+  failed_when: _first_pull.rc not in [0]

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }} — edit the role (ops/ansible/roles/disk-spool-cap), not this file.
+#
+# Trim each declared spool oldest-first until it fits under its byte ceiling.
+# Prints one line per spool to stdout, which systemd puts in the journal; the
+# unit runs often, so silence on the normal path matters as much as the trim.
+set -uo pipefail
+
+trim_spool() {
+  local dir="$1" glob="$2" cap="$3" min_age="$4" why="$5"
+  local total deleted=0 freed=0
+
+  if [[ ! -d "$dir" ]]; then
+    echo "spool-cap: ${dir} absent, nothing to do"
+    return 0
+  fi
+
+  # -maxdepth 1 and -type f: a spool is a flat directory of regular files, and
+  # a symlink or subdirectory in it is not this role's business.
+  mapfile -t files < <(find "$dir" -maxdepth 1 -type f -name "$glob" -printf '%T@ %s %p\n' 2>/dev/null | sort -n)
+  # Counted in a loop rather than with bash's array-length syntax: that
+  # syntax opens with the two characters Jinja reads as a comment, and the
+  # template render fails on it.
+  local nfiles=0
+  for _ in "${files[@]}"; do nfiles=$(( nfiles + 1 )); done
+  if [[ $nfiles -eq 0 ]]; then
+    echo "spool-cap: ${dir} has no files matching ${glob}"
+    return 0
+  fi
+
+  total=0
+  for line in "${files[@]}"; do
+    total=$(( total + $(awk '{print $2}' <<<"$line") ))
+  done
+
+  if [[ $total -le $cap ]]; then
+    printf 'spool-cap: %s ok — %d MiB of %d MiB cap (%s)\n' \
+      "$dir" $(( total / 1048576 )) $(( cap / 1048576 )) "$why"
+    return 0
+  fi
+
+  # Oldest first. Stop as soon as the spool fits: the goal is a ceiling, not a
+  # target size, so a spool one byte over loses exactly one file.
+  for line in "${files[@]}"; do
+    [[ $total -le $cap ]] && break
+    local mtime size path age_min
+    mtime=$(awk '{print $1}' <<<"$line")
+    size=$(awk '{print $2}' <<<"$line")
+    path=$(cut -d' ' -f3- <<<"$line")
+    age_min=$(( ( $(date +%s) - ${mtime%.*} ) / 60 ))
+
+    # The newest file is the one being appended right now, and a recent file
+    # may still be waiting to ship. Leaving them is how this stays a cap on
+    # cold bytes rather than a race with the writer.
+    if [[ $age_min -lt $min_age ]]; then
+      printf 'spool-cap: %s OVER CAP but the next candidate %s is %dm old (< %dm) — not deleting\n' \
+        "$dir" "$path" "$age_min" "$min_age"
+      break
+    fi
+
+    if rm -f -- "$path"; then
+      total=$(( total - size ))
+      deleted=$(( deleted + 1 ))
+      freed=$(( freed + size ))
+      printf 'spool-cap: deleted %s (%d MiB, %dm old)\n' "$path" $(( size / 1048576 )) "$age_min"
+    else
+      printf 'spool-cap: FAILED to delete %s\n' "$path"
+      break
+    fi
+  done
+
+  printf 'spool-cap: %s trimmed %d file(s), freed %d MiB, now %d MiB of %d MiB cap\n' \
+    "$dir" "$deleted" $(( freed / 1048576 )) $(( total / 1048576 )) $(( cap / 1048576 ))
+}
+
+{% for s in disk_spool_cap_spools %}
+trim_spool '{{ s.dir }}' '{{ s.glob }}' '{{ s.max_bytes }}' '{{ s.min_age_minutes | default(120) }}' '{{ s.why }}'
+{% endfor %}

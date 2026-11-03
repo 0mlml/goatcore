@@ -1,0 +1,123 @@
+---
+# ops/ansible/roles/oci-substrate-t2-sync/tasks/main.yml
+#
+# Per-site Orin-C cron that syncs T1 → T2 on the configured interval.
+# Scaffolded; execution gated on oci_t2_sync_enabled (default false).
+
+- name: oci-substrate-t2-sync | early-exit when not enabled (T1 not yet wired)
+  when: not oci_t2_sync_enabled
+  ansible.builtin.debug:
+    msg: |
+      oci-substrate-t2-sync is disabled (oci_t2_sync_enabled=false).
+      The role is scaffolded but execution-deferred; will run when
+      Block 75A T0→T1 fan-out lands and operator flips this var to
+      true in group_vars/<site>_obs_hosts/vars.yml.
+
+- name: oci-substrate-t2-sync | apply when enabled
+  when: oci_t2_sync_enabled
+  block:
+    - name: oci-substrate-t2-sync | sanity-check inputs
+      ansible.builtin.assert:
+        that:
+          - oci_t1_r2_endpoint | length > 0 or oci_t1_ecr_endpoint | length > 0
+          - oci_t2_forgejo_endpoint | length > 0
+          - oci_canonical_set_path | length > 0
+        quiet: true
+        msg: |
+          oci-substrate-t2-sync requires at least one T1 endpoint
+          (R2 or ECR) to be configured; the canonical-set path; and
+          the Forgejo T2 endpoint.
+
+    # The R2 credential is account-scoped (R2_ACCESS_KEY_ID /
+    # R2_SECRET_ACCESS_KEY, resolved in group_vars/all.yml via
+    # lookup('env')), so an unset pair means the operator's shell is
+    # missing it — not that this site is special. Assert rather than
+    # deploy a cron that authenticates against nothing and then logs
+    # "no T1 reachable" every 48h.
+    #
+    # DELIVERY GAP, deliberately not papered over: this asserts the
+    # credential is present at DEPLOY time, on the controller. The sync
+    # script reads T1_R2_USER / T1_R2_TOKEN at CRON time, on the Orin-C,
+    # where that environment does not exist. Closing that hop by writing
+    # an env file would put the token on disk in plaintext, which
+    # oci-goat-substrate.md §"Confidentiality" forbids — the design's
+    # answer is delivery via an offline-enrollment bundle field, and that
+    # field does not exist yet. Tracked in rapid-site-bringup.md §5
+    # "What the light-up still needs"; it is one of the reasons
+    # oci_t2_sync_enabled is still false.
+    - name: oci-substrate-t2-sync | require the R2 credential when T1A is the source
+      when: oci_t1_r2_endpoint | length > 0
+      ansible.builtin.assert:
+        that:
+          - oci_t1_r2_access_key_id | length > 0
+          - oci_t1_r2_secret_access_key | length > 0
+        quiet: true
+        msg: |
+          oci_t1_r2_endpoint is set but the R2 credential is empty.
+          Export R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY (account-scoped,
+          NOT <SITE>_-prefixed) in .envrc.local.d/10-cloud-and-thirdparty.envrc
+          before running this role. See group_vars/all.yml.
+
+    - name: oci-substrate-t2-sync | install crane (single static binary)
+      ansible.builtin.shell: |
+        set -e
+        if ! command -v crane >/dev/null 2>&1; then
+          ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+          curl -sSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_${ARCH}.tar.gz" \
+            | tar -xz -C /usr/local/bin/ crane
+          chmod +x /usr/local/bin/crane
+        fi
+      args:
+        creates: /usr/local/bin/crane
+
+    - name: oci-substrate-t2-sync | ensure /etc/oci-goat exists
+      ansible.builtin.file:
+        path: /etc/oci-goat
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: oci-substrate-t2-sync | deploy canonical-set.yaml from controller
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../oci-substrate/canonical-set.yaml"
+        dest: "{{ oci_canonical_set_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: oci-substrate-t2-sync | render sync script
+      ansible.builtin.template:
+        src: oci-goat-sync.sh.j2
+        dest: "{{ oci_sync_script_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: oci-substrate-t2-sync | compute per-site stagger offset
+      ansible.builtin.set_fact:
+        oci_t2_sync_effective_offset: >-
+          {{ oci_t2_sync_offset_hours
+             if (oci_t2_sync_offset_hours | length > 0)
+             else (inventory_hostname | hash('sha256') | int(base=16) % (oci_t2_sync_interval_hours | int)) }}
+
+    - name: oci-substrate-t2-sync | install cron entry
+      ansible.builtin.cron:
+        name: "oci-goat-sync"
+        user: "{{ oci_sync_cron_user }}"
+        hour: "{{ oci_t2_sync_effective_offset }}/{{ oci_t2_sync_interval_hours }}"
+        minute: "{{ 60 * (inventory_hostname | hash('sha256') | int(base=16) % 60) // 60 }}"
+        job: "{{ oci_sync_script_path }} >>{{ oci_sync_log_path }} 2>&1"
+        state: present
+
+    - name: oci-substrate-t2-sync | log effective config
+      ansible.builtin.debug:
+        msg: |
+          OCI substrate t2-sync configured:
+            T2 Forgejo endpoint:    {{ oci_t2_forgejo_endpoint }}
+            T1 R2 endpoint:         {{ oci_t1_r2_endpoint | default('(not configured)') }}
+            T1 ECR endpoint:        {{ oci_t1_ecr_endpoint | default('(not configured)') }}
+            Sync interval:          every {{ oci_t2_sync_interval_hours }}h
+            Per-site stagger:       offset {{ oci_t2_sync_effective_offset }}h
+            Canonical-set path:     {{ oci_canonical_set_path }}
+            Sync log path:          {{ oci_sync_log_path }}

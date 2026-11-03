@@ -1,0 +1,46 @@
+---
+# Defaults for the `operator-idp-hydra` role.
+#
+# Block 21H.1c — Ory Hydra serving OAuth2 / OIDC for the per-site
+# operator IdP per ADR 0842. Independent of the site Hydra on Orin-A.
+# Connects to the operator-idp-postgres on the same Orin-C; uses the
+# operator-idp-kratos on the same Orin-C as login/consent UI host.
+#
+# Required env vars (per-site, resolved at runtime via group_vars):
+#   - operator_idp_hydra_secrets_system  (32+ bytes; FRESH per site)
+#   - operator_idp_hydra_secrets_cookie  (32+ bytes; FRESH per site)
+#   - operator_idp_pg_app_password       (DSN; defined by 21H.1a postgres role)
+
+operator_idp_hydra_image: "oryd/hydra:v2.3.0"
+
+operator_idp_hydra_container_name: "operator-idp-hydra"
+operator_idp_hydra_compose_dir: "/opt/operator-idp-hydra"
+operator_idp_hydra_config_subdir: "config"
+
+# Loopback ports — Traefik on Orin-C reverse-proxies oauth2.ops.<site>...
+# to the public listener; admin stays loopback-only.
+operator_idp_hydra_public_host_port: 4446    # +2 from site Hydra's 4444
+operator_idp_hydra_admin_host_port: 4447     # +2 from site Hydra's 4445
+
+# DSN to operator-idp-postgres (same Orin-C). host.docker.internal
+# matches the kratos role's connectivity pattern.
+operator_idp_hydra_dsn: >-
+  postgres://operator_idp:{{ operator_idp_pg_app_password }}@host.docker.internal:5436/hydra?sslmode=disable
+
+site_dns_zone: ""   # REQUIRED per goatnet; a shared role must not default to one
+# This default is why a freshly built zagros-dev advertised
+# https://oauth2.nova.netbird.nova.example/ as its OIDC issuer: the
+# hydra template renders oauth2.{{ site_id }}.{{ site_dns_zone }}, and any
+# goatnet not setting site_dns_zone silently inherited ANOTHER goatnet's.
+# WebAuthn / FIDO2 RP ID prefix shared with operator-idp-kratos role.
+# Hydra renders login_url + consent_url + logout_url at this prefix
+# pointing at Kratos's UI surface.
+operator_idp_kratos_webauthn_rp_id_prefix: "ops"
+
+# Default access-token strategy: JWT. Block 21D dashboard wire-up
+# surfaced F-078 — Hydra defaults to opaque ory_at_* tokens, which
+# don't work with consumers that JWKS-validate JWTs only (Grafana,
+# Prometheus, etc.). Operator IdP is greenfield + every consumer is a
+# JWT-validating service, so default to JWT at the issuer level. Kills
+# the per-client trap from F-078 by construction.
+operator_idp_hydra_access_token_strategy: "jwt"

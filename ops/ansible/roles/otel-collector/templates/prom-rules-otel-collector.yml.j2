@@ -1,0 +1,55 @@
+# Rendered by ops/ansible/roles/otel-collector on {{ ansible_date_time.iso8601 }}
+# Anchor: ADR 0822. Alerts for OTel Collector on Orin-C.
+
+groups:
+  - name: otel_collector
+    interval: 30s
+    rules:
+
+      - alert: OtelCollectorDown
+        expr: up{job="otel_collector"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: otel_collector
+          site: "{{ site_id }}"
+        annotations:
+          summary: "OTel Collector down on {{ '{{' }} $labels.target_name {{ '}}' }}"
+          description: |
+            OTel Collector unreachable for 5+ minutes. All goat producer
+            services (signal-server, gatewatch, db-policy-engine, ...)
+            are emitting OTLP into the void or buffering locally with
+            bounded retry. Investigate before producer buffers fill.
+
+      - alert: OtelCollectorExportFailing
+        # Exporter retry rate spike means OpenObserve is rejecting,
+        # unreachable, or auth-broken. The receiver still accepts OTLP
+        # so producers don't see backpressure immediately, but data is
+        # lost once retry queue fills.
+        expr: rate(otelcol_exporter_send_failed_log_records[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: otel_collector
+          site: "{{ site_id }}"
+        annotations:
+          summary: "OTel Collector exporter to OpenObserve failing"
+          description: |
+            otlphttp/openobserve exporter reporting send failures.
+            Check OpenObserve /healthz, basicauth credentials, and
+            MinIO downstream (a stalled OO write path manifests as
+            slow exports here).
+
+      - alert: OtelCollectorMemoryLimiterTrips
+        expr: rate(otelcol_processor_refused_log_records{processor="memory_limiter"}[5m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: otel_collector
+          site: "{{ site_id }}"
+        annotations:
+          summary: "OTel Collector memory_limiter dropping records"
+          description: |
+            Sustained ingest rate exceeds the 384 MiB soft memory
+            limit. Either raise the limit (limit_mib in
+            otel-config.yaml) or tighten upstream sampling.

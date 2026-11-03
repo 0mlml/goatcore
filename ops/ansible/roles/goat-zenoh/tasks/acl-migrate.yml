@@ -1,0 +1,193 @@
+---
+# roles/goat-zenoh/tasks/acl-migrate.yml — F-258 one-time migration of a
+# LIVE per-vendor router to the seed + org-fragment model. Run via
+# ops/ansible/goat-zenoh-acl-migrate.yml (import_role tasks_from=acl-migrate)
+# so the role defaults + group_vars resolve at the correct precedence and the
+# seed renders with the SAME context as a real deploy.
+#
+# NON-DISRUPTIVE + self-verifying: renders the role-owned seed, extracts the live
+# config's per-vendor content into the org fragment, and BYTE-VERIFIES that
+# assemble(seed, fragment) reproduces the current live config EXACTLY before
+# installing the fragment. The live config the router loads is never changed. If
+# the byte-verify fails, nothing is installed and the play aborts with the diff
+# (the live BASE has drifted from the template; reconcile first).
+
+- name: F-258 migrate | refuse slot-pool mode (fragment split is per-vendor only)
+  ansible.builtin.assert:
+    that: "zenoh_identity_model | default('per-vendor') != 'per-uuid-slot-pool'"
+    fail_msg: >-
+      {{ inventory_hostname }} is per-uuid-slot-pool; its ACL is template-rendered,
+      not fragment-managed. Migration does not apply.
+
+- name: F-258 migrate | stat live config + existing fragment
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ goat_zenoh_config_path }}"
+    - "{{ goat_zenoh_acl_org_path }}"
+  register: jz_mig_stat
+
+- name: F-258 migrate | fail if there is no live config to migrate
+  ansible.builtin.assert:
+    that: jz_mig_stat.results[0].stat.exists
+    fail_msg: "No live config at {{ goat_zenoh_config_path }} — nothing to migrate (a fresh standup bootstraps its own fragment)."
+
+- name: F-258 migrate | already migrated — fragment exists, skip
+  ansible.builtin.debug:
+    msg: "Fragment already present at {{ goat_zenoh_acl_org_path }} — already migrated; nothing to do."
+  when: jz_mig_stat.results[1].stat.exists
+
+- name: F-258 migrate | perform migration (only when no fragment yet)
+  when: not jz_mig_stat.results[1].stat.exists
+  block:
+    - name: F-258 migrate | back up the live config (host-side, once)
+      ansible.builtin.copy:
+        src: "{{ goat_zenoh_config_path }}"
+        dest: "{{ goat_zenoh_config_path }}.pre-f258-migrate.bak"
+        remote_src: true
+        mode: "0644"
+        force: false
+
+    - name: F-258 migrate | install acl-assemble.py reconciler on host
+      ansible.builtin.copy:
+        src: "acl-assemble.py"
+        dest: "{{ goat_zenoh_acl_assemble_path }}"
+        mode: "0755"
+
+    # CAPTURE MODE (goat_zenoh_acl_migrate_capture=true): for a router whose
+    # live BASE has drifted from the current template (e.g. nova-a, deployed from an
+    # older template — missing the ADR-1041/1040 blocks). Strict mode verifies
+    # assemble(TEMPLATE-seed, org) == live and aborts on drift. Capture mode
+    # verifies against the EXTRACTED seed instead — assemble(EXTRACTED-seed, org)
+    # == live, which is lossless by construction — and installs the extracted
+    # seed (the router's CURRENT base) + the new fragment-mode helpers. That fixes
+    # the clobber NON-DISRUPTIVELY (live untouched, no restart) and locks the
+    # runtime vendors into the fragment. Catching the base up to the current
+    # template is then a SEPARATE, deliberate role deploy that preserves them.
+    - name: F-258 migrate | resolve capture mode + the seed to verify against
+      ansible.builtin.set_fact:
+        jz_capture: "{{ goat_zenoh_acl_migrate_capture | default(false) | bool }}"
+        jz_verify_seed: "{{ '/tmp/jz-mig-seed-extracted-' ~ zenoh_stack ~ '.json5' if (goat_zenoh_acl_migrate_capture | default(false) | bool) else goat_zenoh_acl_seed_path }}"
+
+    - name: F-258 migrate | render the role-owned SEED (strict mode only)
+      ansible.builtin.template:
+        src: "config.json5.j2"
+        dest: "{{ goat_zenoh_acl_seed_path }}"
+        mode: "0644"
+      when: not jz_capture
+
+    - name: F-258 migrate | extract the live config into (throwaway seed) + org fragment
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ goat_zenoh_acl_assemble_path }} extract
+          --live {{ goat_zenoh_config_path }}
+          --seed /tmp/jz-mig-seed-extracted-{{ zenoh_stack }}.json5
+          --org /tmp/jz-mig-org-{{ zenoh_stack }}.frag
+      changed_when: false
+      check_mode: false
+
+    - name: F-258 migrate | reassemble seed (rendered=strict / extracted=capture) + org
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ goat_zenoh_acl_assemble_path }} assemble
+          --seed {{ jz_verify_seed }}
+          --org /tmp/jz-mig-org-{{ zenoh_stack }}.frag
+          --out /tmp/jz-mig-reassembled-{{ zenoh_stack }}.json5
+      changed_when: false
+      check_mode: false
+
+    - name: F-258 migrate | BYTE-VERIFY reassembled == live
+      ansible.builtin.command:
+        cmd: "cmp -s {{ goat_zenoh_config_path }} /tmp/jz-mig-reassembled-{{ zenoh_stack }}.json5"
+      register: jz_mig_verify
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: F-258 migrate | capture the drift diff if verify failed
+      ansible.builtin.command:
+        cmd: "diff {{ goat_zenoh_config_path }} /tmp/jz-mig-reassembled-{{ zenoh_stack }}.json5"
+      register: jz_mig_drift
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: jz_mig_verify.rc != 0
+
+    - name: F-258 migrate | abort on drift (install nothing, live untouched)
+      when: jz_mig_verify.rc != 0
+      block:
+        - name: F-258 migrate | remove scratch (no fragment installed)
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "/tmp/jz-mig-seed-extracted-{{ zenoh_stack }}.json5"
+            - "/tmp/jz-mig-org-{{ zenoh_stack }}.frag"
+            - "/tmp/jz-mig-reassembled-{{ zenoh_stack }}.json5"
+        - name: F-258 migrate | fail with the drift diff
+          ansible.builtin.fail:
+            msg: >-
+              F-258 migration ABORTED on {{ inventory_hostname }}: assemble(seed,
+              fragment) does NOT reproduce the live config byte-for-byte. NOTHING
+              installed, live config untouched.
+              {{ '(strict mode) the live BASE has drifted from the current template — re-run with -e goat_zenoh_acl_migrate_capture=true to migrate against the current base non-disruptively, OR reconcile the template first.' if not jz_capture else '(capture mode) the lossless split did not round-trip — this is unexpected (assembler bug or a hand-edited live config); do NOT proceed.' }}
+              Diff (truncated): {{ jz_mig_drift.stdout | default('(unavailable)') | truncate(1500) }}
+
+    - name: F-258 migrate | install the byte-verified org fragment (portal-owned)
+      ansible.builtin.copy:
+        src: "/tmp/jz-mig-org-{{ zenoh_stack }}.frag"
+        dest: "{{ goat_zenoh_acl_org_path }}"
+        remote_src: true
+        owner: root
+        group: "65532"
+        mode: "0664"
+      when: jz_mig_verify.rc == 0
+
+    # Capture mode installs the router's CURRENT base as the seed + the new
+    # fragment-mode helpers + assembler, so every subsequent vendor op (portal or
+    # operator) goes through the fragment and preserves the runtime vendors. The
+    # live config is NOT touched (assemble(extracted_seed, org) == live), so no
+    # restart. A future deliberate role deploy re-renders the seed from the
+    # current template (base catch-up) and still preserves the fragment.
+    - name: F-258 migrate | (capture) install the extracted current base as the seed
+      ansible.builtin.copy:
+        src: "/tmp/jz-mig-seed-extracted-{{ zenoh_stack }}.json5"
+        dest: "{{ goat_zenoh_acl_seed_path }}"
+        remote_src: true
+        mode: "0644"
+      when:
+        - jz_mig_verify.rc == 0
+        - jz_capture
+
+    - name: F-258 migrate | (capture) install the fragment-mode add/delete helpers
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "0755"
+      loop:
+        - { src: "add-vendor.sh", dest: "{{ goat_zenoh_helper_path }}" }
+        - { src: "delete-vendor.sh", dest: "{{ goat_zenoh_delete_helper_path }}" }
+      when:
+        - jz_mig_verify.rc == 0
+        - jz_capture
+
+    - name: F-258 migrate | clean up scratch (success)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/jz-mig-seed-extracted-{{ zenoh_stack }}.json5"
+        - "/tmp/jz-mig-org-{{ zenoh_stack }}.frag"
+        - "/tmp/jz-mig-reassembled-{{ zenoh_stack }}.json5"
+      when: jz_mig_verify.rc == 0
+
+    - name: F-258 migrate | report success
+      ansible.builtin.debug:
+        msg: >-
+          F-258 migration COMPLETE on {{ inventory_hostname }}
+          ({{ 'CAPTURE' if jz_capture else 'strict' }} mode): fragment installed at
+          {{ goat_zenoh_acl_org_path }}; live config untouched (router
+          undisturbed).
+          {{ '(capture) current base installed as the seed + fragment-mode helpers installed — vendor ops now go through the fragment; catch the base up with a deliberate role deploy.' if jz_capture else 'Future role deploys preserve runtime vendors.' }}
+          Backup: {{ goat_zenoh_config_path }}.pre-f258-migrate.bak.
+      when: jz_mig_verify.rc == 0

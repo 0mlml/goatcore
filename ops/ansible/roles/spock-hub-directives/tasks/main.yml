@@ -1,0 +1,58 @@
+---
+# spock-hub-directives (ADR 1205). Idempotent.
+
+- name: Refuse to run without the goatnet's hub
+  ansible.builtin.assert:
+    that:
+      - goatnet_hub_site is defined
+      - goatnet_hub_site | length > 0
+    fail_msg: >-
+      goatnet_hub_site is not set for {{ inventory_hostname }}. Declare the Spock node
+      name of the goatnet's highest-echelon site in its group_vars (ADR 1205 D1).
+
+- name: Ensure jq and curl are present
+  ansible.builtin.apt:
+    name: [jq, curl]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+
+- name: Install spock-hub-directives.sh
+  ansible.builtin.copy:
+    src: spock-hub-directives.sh
+    dest: "{{ spock_hub_directives_install_dir }}/spock-hub-directives.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Render env file
+  ansible.builtin.template:
+    src: spock-hub-directives.env.j2
+    dest: "{{ spock_hub_directives_env_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Install systemd units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [spock-hub-directives.service, spock-hub-directives.timer]
+  become: true
+  notify: reload systemd
+
+- name: Flush systemd reload before enable
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable spock-hub-directives timer
+  ansible.builtin.systemd:
+    name: spock-hub-directives.timer
+    enabled: "{{ spock_hub_directives_enabled }}"
+    state: "{{ 'started' if spock_hub_directives_enabled else 'stopped' }}"
+  become: true

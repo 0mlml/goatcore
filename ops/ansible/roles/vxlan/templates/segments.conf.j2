@@ -1,0 +1,32 @@
+# {{ ansible_managed }}
+# Managed by ops/ansible/roles/vxlan — do not edit by hand.
+# Read by /usr/local/sbin/vxlan-runtime-state.sh at boot and on reload to
+# apply / re-apply the full segment state (bridge + vxlan + FDB + IP +
+# MSS clamp + tc tbf qdisc).
+#
+# Format: one section per segment, key=value lines, blank line between
+# sections. Required keys: vni, bridge, address, mtu, local_ip, peers (CSV
+# of remote underlay IPs — local IP filtered out by the script).
+# Optional keys: dstport (default 4789), mss_clamp (true/false, default true),
+# tbf_rate, tbf_burst, tbf_latency, bridge_interfaces (CSV of local NICs to
+# enslave to the bridge).
+{% for segment in vxlan_segments %}
+
+[segment_{{ segment.vni }}]
+vni={{ segment.vni }}
+bridge={{ segment.bridge }}
+address={{ segment.address }}
+mtu={{ segment.mtu | default(1370) }}
+local_ip={{ vxlan_local_mesh_ip }}
+peers={{ segment.peers | join(',') }}
+dstport={{ segment.dstport | default(4789) }}
+mss_clamp={{ 'true' if (segment.tcp_mss_clamp | default(true) | bool) else 'false' }}
+{% if segment.bum_rate_limit is defined and segment.bum_rate_limit | length > 0 %}
+tbf_rate={{ segment.bum_rate_limit.rate }}
+tbf_burst={{ segment.bum_rate_limit.burst }}
+tbf_latency={{ segment.bum_rate_limit.latency }}
+{% endif %}
+{% if segment.bridge_interfaces is defined and segment.bridge_interfaces | length > 0 %}
+bridge_interfaces={{ segment.bridge_interfaces | join(',') }}
+{% endif %}
+{% endfor %}

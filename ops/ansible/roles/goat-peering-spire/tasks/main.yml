@@ -1,0 +1,133 @@
+---
+# Phase 13. Import the partner's public bundle, name their endpoint, and forward the
+# bundle endpoint across the tunnel. Refreshing is proved by phase 14, from the side
+# doing the recognising: the far forward does not exist until the far side runs this.
+- name: peering-spire | no SPIRE server on this side
+  ansible.builtin.debug:
+    msg: >-
+      NOT DONE: peering_spire_enabled is false, so ADR 1157 step 2 has not been done on
+      this side and the partner's trust domain is not recognised here. This edge's mTLS
+      still works, anchored on the CA file phase 10 placed.
+  when: not (peering_spire_enabled | bool)
+
+- name: peering-spire | stop here on a side with no SPIRE server
+  ansible.builtin.meta: end_host
+  when: not (peering_spire_enabled | bool)
+
+- name: peering-spire | every value is here (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - peering_spire_server_host | length > 0
+      - peering_spire_server_addr | length > 0
+      - peering_spire_outbound_listen | length > 0
+      - peering_spire_partner_trust_domain is match('^spiffe://[^/]+$')
+      - peering_spire_local_link_ip | length > 0
+      - peering_spire_remote_link_ip | length > 0
+      - (peering_spire_bundle_port | int) in (peering_wg_extra_ports | default([]) | map('int') | list)
+    fail_msg: >-
+      goat-peering-spire needs the server's host and address, a listen address, the
+      rendered agreement values, and peering_wg_extra_ports naming
+      {{ peering_spire_bundle_port }}: the tunnel firewall drops every port it was not
+      told about, and a dropped bundle endpoint reads as a partner who never rotated.
+
+- name: peering-spire | read the bundle the exchange placed
+  ansible.builtin.set_fact:
+    _ps_their_bundle: "{{ lookup('ansible.builtin.file', peering_spire_their_bundle_file) }}"
+
+- name: peering-spire | import the partner's public bundle
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - "{{ peering_spire_container }}"
+      - "{{ peering_spire_bin }}"
+      - bundle
+      - set
+      - -format
+      - spiffe
+      - -id
+      - "{{ peering_spire_partner_trust_domain }}"
+    stdin: "{{ _ps_their_bundle }}"
+  delegate_to: "{{ peering_spire_server_host }}"
+  changed_when: false
+
+- name: peering-spire | is the relationship already declared?
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ peering_spire_container }}"
+      - "{{ peering_spire_bin }}"
+      - federation
+      - show
+      - -trustDomain
+      - "{{ peering_spire_partner_trust_domain | regex_replace('^spiffe://', '') }}"
+  delegate_to: "{{ peering_spire_server_host }}"
+  register: _ps_show
+  changed_when: false
+  failed_when: false
+
+- name: peering-spire | declare the relationship
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ peering_spire_container }}"
+      - "{{ peering_spire_bin }}"
+      - federation
+      - "{{ 'update' if _ps_show.rc == 0 else 'create' }}"
+      - -trustDomain
+      - "{{ peering_spire_partner_trust_domain | regex_replace('^spiffe://', '') }}"
+      - -bundleEndpointURL
+      - "https://{{ peering_spire_outbound_listen }}:{{ peering_spire_outbound_port }}"
+      - -bundleEndpointProfile
+      - https_spiffe
+      - -endpointSpiffeID
+      - "{{ peering_spire_partner_trust_domain }}/spire/server"
+  delegate_to: "{{ peering_spire_server_host }}"
+  changed_when: true
+
+- name: peering-spire | forward units
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: forward.socket.j2, name: goat-peering-bundle-in.socket, listen: "{{ peering_spire_local_link_ip }}:{{ peering_spire_bundle_port }}" }
+    - { src: forward.service.j2, name: goat-peering-bundle-in.service, target: "{{ peering_spire_server_addr }}:{{ peering_spire_bundle_port }}" }
+    - { src: forward.socket.j2, name: goat-peering-bundle-out.socket, listen: "{{ peering_spire_outbound_listen }}:{{ peering_spire_outbound_port }}" }
+    - { src: forward.service.j2, name: goat-peering-bundle-out.service, target: "{{ peering_spire_remote_link_ip }}:{{ peering_spire_bundle_port }}" }
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: peering-spire | start the forwards
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+    enabled: true
+    daemon_reload: true
+  loop:
+    - goat-peering-bundle-in.socket
+    - goat-peering-bundle-out.socket
+
+# TIER 1: our server holds the partner's bundle, read back from the server.
+- name: peering-spire | our server holds the partner's bundle
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ peering_spire_container }}"
+      - "{{ peering_spire_bin }}"
+      - bundle
+      - list
+      - -id
+      - "{{ peering_spire_partner_trust_domain }}"
+      - -format
+      - pem
+  delegate_to: "{{ peering_spire_server_host }}"
+  register: _ps_held
+  changed_when: false
+  failed_when: _ps_held.rc != 0 or 'BEGIN CERTIFICATE' not in _ps_held.stdout

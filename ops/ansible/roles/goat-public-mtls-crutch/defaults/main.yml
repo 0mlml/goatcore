@@ -1,0 +1,93 @@
+---
+# defaults for ops/ansible/roles/goat-public-mtls-crutch
+#
+# Block 80 / ADR 0843 — Public mTLS-gated crutch tier.
+# Design: docs/design/public-mtls-crutch-tier.md
+# Runbook: docs/operations/block-80-crutch-activate.md
+
+# Master gate. Default false = role is a substrate-as-code artifact only,
+# nothing applies on the host. Set true (via group_vars or -e) on the
+# three crutch VPSes (rla/rlb/rlc) to actually run Traefik with the mTLS
+# strict-required gate. Mirrors the terraform-prod `crutch_tier_enabled`
+# variable + ADR 0843 §D5 lifecycle.
+crutch_tier_enabled: false
+
+# Hostname this crutch terminator answers for (used by Traefik routers'
+# Host(...) rules). Per design §3:
+#   crutch_host_fqdn = "goat-public-{name}.netbird-prod.goat.example"
+# Set per-host in inventory or via -e.
+crutch_host_fqdn: ""
+
+# Per-route hostnames. Default derives from crutch_host_fqdn — set explicit
+# values to override.
+crutch_mgmt_host: "mgmt.{{ crutch_host_fqdn }}"
+crutch_signal_host: "signal.{{ crutch_host_fqdn }}"
+crutch_relay_host: "relay.{{ crutch_host_fqdn }}"
+
+# Server cert + key for the Traefik mTLS terminator. Minted out-of-band by
+# offline-CA cert-sign with SAN covering the three per-route hostnames + the
+# host's primary FQDN. Sub-directory per service mirroring the existing
+# `traefik` role's convention (traefik_tls_root pattern).
+crutch_tls_root: "/etc/goat/tls"
+crutch_server_cert_path: "{{ crutch_tls_root }}/goat-public-mtls-crutch/cert.pem"
+crutch_server_key_path: "{{ crutch_tls_root }}/goat-public-mtls-crutch/key.pem"
+
+# Offline-CA root cert (PEM). Bind-mounted into the Traefik container at
+# /etc/traefik/offline-ca-root.pem and named in the `clientAuth.caFiles`
+# list. This is the trust anchor for verifying inbound client certs.
+crutch_offline_ca_root_path_local: "{{ playbook_dir }}/../enrollment/ca/dev/root-cert.pem"
+crutch_offline_ca_root_path_host: "/etc/traefik/offline-ca-root.pem"
+
+# Offline-CA intermediate cert (optional). When the offline-CA mints leaf
+# certs via an intermediate (F-090 closure pattern — server certs for the
+# crutch tier are signed by the intermediate, per ADR 0407 §"intermediate
+# CA"), Traefik must trust the INTERMEDIATE as an anchor as well as the
+# root. Reason: today's root cert carries BasicConstraints `pathlen:0`,
+# which forbids chains longer than `root -> leaf`. A client cert minted as
+# `leaf -> intermediate -> root` trips this constraint at TLS-handshake
+# verification time (Go's x509 verifier rejects with "path length
+# constraint exceeded"). Trusting the intermediate as an anchor in Traefik
+# lets the verifier stop at the intermediate (no path-length check from
+# root). Leave empty to skip — appropriate only when leaves are signed
+# directly by the root (the legacy single-tier shape). Future fix would
+# re-mint the root with a larger pathlen + rotate it; that's a fleet-wide
+# CA rotation outside Block 80 scope.
+crutch_offline_ca_intermediate_path_local: "{{ playbook_dir }}/../enrollment/ca/dev/intermediate-cert.pem"
+crutch_offline_ca_intermediate_path_host: "/etc/traefik/offline-ca-intermediate.pem"
+
+# Inner-leg backends — reached over the wg-cp0-client interface that the
+# wg-cp0-client role (run before this role in the playbook) provisions.
+# Defaults match the vega-A primary mgmt-host topology from
+# docs/design/public-mtls-crutch-tier.md §4. Override per-site as needed.
+crutch_inner_mgmt_backend: "https://198.18.0.1:443"
+crutch_inner_signal_backend: "h2c://198.18.0.1:10000"
+crutch_inner_relay_backend: "http://198.18.0.1:33073"
+
+# Traefik image. Pinned via group_vars in production per the same pattern
+# as the existing `traefik` role. Default below is for ad-hoc dev only.
+crutch_traefik_image: "traefik:v3.7.16@sha256:1336e85aaed293bd63d005086e0dd013b04078b26aaeb1c18b26a2f928af7e65"
+
+# Data root for Traefik's persistent state (currently only the
+# rendered dynamic config + the CRL cache file).
+crutch_data_root: "/opt/docker-data/goat-public-mtls-crutch"
+
+# CRL refresh — pulls the offline-enrollment CRL on the cadence below and
+# writes atomically to {{ crutch_crl_path_host }}. Traefik's file-watcher
+# picks up the change without restart.
+crutch_crl_endpoint: ""  # e.g. https://mgmt.vega.internal/crl/mobile-revoked.pem
+crutch_crl_path_host: "/etc/traefik/crl.pem"
+crutch_crl_pull_interval_seconds: 300            # 5 min cadence (design §6)
+crutch_crl_stale_alarm_seconds: 3600             # 1 h alarm  (design §6)
+crutch_crl_stale_fail_closed_seconds: 21600      # 6 h fail-closed (design §6)
+
+# Post-deploy strict-required gate self-test. When true, the role attempts
+# a no-client-cert handshake against TCP 443 after deploy and FAILS the
+# play if the server responds with anything other than a TLS alert (the
+# strict-required gate must reject at the TLS layer, NOT pass through to
+# a backend 4xx). Per design §5 / §10.
+crutch_self_test_enabled: true
+
+# When true, skips host-level docker / systemd actions and renders templates
+# only — for role-level test fixtures (mirrors the wg-cp0-client role's
+# `wg_cp0_test_mode` convention).
+crutch_test_mode: false

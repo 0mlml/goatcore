@@ -1,0 +1,98 @@
+# Hydra config — rendered by the `ory` role per-site.
+#
+# SECRETS POLICY: Hydra secrets (HYDRA_SECRETS_SYSTEM, HYDRA_SECRETS_COOKIE)
+# are passed in via env vars from /opt/mgmt-host/.env (mode 0600). They
+# do NOT appear in this rendered file. See companion kratos.yaml.j2
+# header for the rationale (file mode 0644 needed for non-root container).
+#
+# Failover: single-active per ADR 1010 D1 (operator-fired same as
+# kratos). The auth_code TTL of 10m is the load-bearing race-window
+# budget — must exceed worst-case inter-site Spock replication lag AND
+# operator-fired intra-site failover window.
+serve:
+  public:
+    port: 4444
+    cors:
+      enabled: true
+      allowed_origins:
+        - "https://*.{{ site_id }}.{{ site_dns_zone }}"
+      allowed_methods:
+        - POST
+        - GET
+        - PUT
+      allowed_headers:
+        - Authorization
+        - Content-Type
+      exposed_headers:
+        - Content-Type
+  admin:
+    port: 4445
+
+dsn: "postgres://postgres@postgres-a:5432/hydra?sslmode=disable"
+# Note: the password is supplied via the docker-compose.ory.yml DSN
+# env var (which uses POSTGRES_SUPERUSER_PASSWORD from the .env file).
+# Hydra's `dsn` env override (DSN=…) takes precedence at parse time.
+
+urls:
+  self:
+    issuer: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}/"
+  # Login + consent UIs are per-consumer (Block 21D scope). Until the
+  # first consumer brings a UI, point at placeholders inside the mesh;
+  # client_credentials grant doesn't need them and is the only flow we
+  # exercise pre-21D.
+  login: "https://auth.{{ site_id }}.{{ site_dns_zone }}/login"
+  consent: "https://auth.{{ site_id }}.{{ site_dns_zone }}/consent"
+  logout: "https://auth.{{ site_id }}.{{ site_dns_zone }}/logout"
+  error: "https://auth.{{ site_id }}.{{ site_dns_zone }}/error"
+
+# Lifespan budgets per ADR 1010 D2 — auth_code budget must exceed
+# inter-site Spock replication lag AND operator-fired intra-site
+# failover window. access_token + id_token + refresh_token are
+# session-continuity tunables (no replication-lag dependency).
+ttl:
+  # access_token TTL drives the period after which the dashboard's
+  # @axa-fr/oidc-client tries silent renewal via /silent-auth. The
+  # /silent-auth route 404s in netbirdio/dashboard's static export
+  #; silent renewal can't actually succeed, so the library
+  # punts to a full re-auth redirect which forces the operator
+  # through the full ~10-12s OAuth dance. Bumping from 1h to 8h
+  # reduces the forced-re-auth cadence to once per workday without
+  # changing any other property. Trade-off: a leaked token lives 8×
+  # longer; mitigated by sessionStorage being tab-scoped + Kratos
+  # session cookie remaining the load-bearing real-auth lifespan
+  # control + admin-API revocation always available. See
+  # docs/project/dashboard-replacement-cba-2026-05-08.md §"Cheaper
+  # interim: access-token TTL bump."
+  access_token: 8h
+  refresh_token: 720h     # 30d
+  id_token: 1h
+  auth_code: 10m
+  login_consent_request: 10m
+
+oauth2:
+  expose_internal_errors: false
+  pkce:
+    enforced_for_public_clients: true
+
+oidc:
+  subject_identifiers:
+    supported_types:
+      - public
+      - pairwise
+    pairwise:
+      # Per-site salt — different from issuer secret. 32+ chars.
+      # Derived deterministically from site_name so this value is
+      # reproducible across re-renders without out-of-band custody.
+      salt: "{{ ('hydra-pairwise-' + site_name) | hash('sha256') | truncate(32, True, '') }}"
+
+# strategies.access_token: the default is opaque ("ory_at_…") tokens
+# validated only by introspection. Switch to "jwt" only when a service
+# needs offline validation. Per ADR 0411 spike addendum: start opaque,
+# revisit at 21D when policy-engine performance is measured.
+strategies:
+  access_token: opaque
+
+log:
+  level: info
+  format: json
+  leak_sensitive_values: false

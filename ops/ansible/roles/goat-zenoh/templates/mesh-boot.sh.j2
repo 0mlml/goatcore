@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Rendered by ops/ansible/roles/goat-zenoh/. Do not edit on host.
+#
+# Power-cycle boot-race healer for the Zenoh router.
+#
+# The router's host-port publish is pinned to the netbird mesh IP
+# ({{ goat_zenoh_listen_host }}:{{ goat_zenoh_listen_port }})
+# per ADR 0844 + F-140 — that pin is what makes mesh peers see the
+# router and keeps raw tcp/7447 off the LAN/public underlay. But at boot
+# the Docker daemon starts `unless-stopped` containers before the netbird
+# daemon has finished enrolling and assigned the mesh IP to {{ goat_zenoh_mesh_iface }}.
+# The port publish then fails with "cannot assign requested address" and
+# the container exits 255; `unless-stopped` does not reliably recover it,
+# and every mTLS client (panoscope, synth vendors, trashgoat, the
+# rest-pub-bridge sidecar) crash-loops against the dead router.
+#
+# Docker cannot simply be ordered after the mesh IP: the netbird daemon
+# enrolls against the netbird-mgmt *container*, so gating docker on the
+# mesh IP would deadlock. Instead this oneshot runs after docker is up,
+# waits (bounded) for the mesh IP to actually appear, then `compose up -d`
+# brings the router to its desired state. Idempotent: a no-op if the
+# router is already running, a start if docker's own attempt died on the
+# race. Dependents self-heal via their own restart loops once the router
+# answers.
+set -euo pipefail
+
+IFACE="{{ goat_zenoh_mesh_iface }}"
+EXPECT_IP="{{ goat_zenoh_listen_host }}"
+COMPOSE="{{ goat_zenoh_compose_path }}"
+TIMEOUT={{ goat_zenoh_mesh_boot_timeout }}
+
+log() { echo "{{ zenoh_stack }}-mesh-boot: $*"; }
+
+# If the listener is not pinned to a mesh IP (operator left the 0.0.0.0
+# default, or bound the LAN IP), there is no boot race to heal — the
+# address is present at boot regardless. Just converge and exit.
+case "$EXPECT_IP" in
+  0.0.0.0|127.0.0.1|"")
+    log "listen host '$EXPECT_IP' is not a mesh IP; no boot-race wait needed"
+    docker compose -f "$COMPOSE" up -d
+    exit 0
+    ;;
+esac
+
+deadline=$(( $(date +%s) + TIMEOUT ))
+while :; do
+  if ip -4 addr show "$IFACE" 2>/dev/null | grep -qw "$EXPECT_IP"; then
+    log "mesh IP $EXPECT_IP present on $IFACE; starting router"
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    log "WARNING: mesh IP $EXPECT_IP not on $IFACE after ${TIMEOUT}s; attempting start anyway"
+    break
+  fi
+  sleep 3
+done
+
+docker compose -f "$COMPOSE" up -d

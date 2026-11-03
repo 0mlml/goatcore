@@ -1,0 +1,361 @@
+---
+# Defaults for the `id-admin-console` role.
+#
+# Deploys the goat-id-console Go service — admin console for the Ory
+# Kratos + Hydra identity plane per ADR 0860. Sits on a mgmt-host stack
+# behind the `oauth2-proxy-id-console` sidecar (ADMINS-only gate) and
+# Traefik routes admin.auth.<site>.<zone>/ to that sidecar, which then
+# forwards to this container once ADMINS group membership is confirmed.
+#
+# State of record stays in Kratos; the console only persists invite
+# tokens + audit events (v1 in-memory; v2 Postgres + Zenoh per ADR 0860).
+#
+# Inputs (set in group_vars/<site>_hosts/vars.yml):
+#   - id_admin_console_enabled: true                      master gate
+#   - site_id, site_dns_zone                              standard per-site identity
+#   - mesh_ip_a                                           mesh IP of the first host, for the OIDC host entry
+#
+# What this role does:
+#   1. Renders /opt/mgmt-host/id-admin-console.env (mode 0600) with
+#      LISTEN_ADDR + IDP_TENANT_* + IDP_OPERATOR_* + PERMISSIONS_YAML_PATH
+#      pointing at the bind-mounted canonical permissions YAML.
+#   2. Lays down the compose overlay docker-compose.id-admin-console.yml.
+#   3. Bind-mounts ops/permissions/group-permissions.yml from the host
+#      (deployed via mgmt-host-baseline) to /etc/goat-id-console/
+#      inside the container.
+#   4. Sets ID_ADMIN_CONSOLE_IMAGE in /opt/mgmt-host/.env for compose-time
+#      substitution + easy rollback per ADR 0859.
+#   5. Brings the container up on the `mgmt` Docker network.
+
+id_admin_console_compose_file: /opt/mgmt-host/docker-compose.id-admin-console.yml
+id_admin_console_envfile: /opt/mgmt-host/id-admin-console.env
+
+# Image — digest-pinned per ADR 0859 (easy rollback). Bumps require an
+# append to deploy-history.yml (CI checks via deploy-history-check.yml).
+# `latest` is intentionally NOT pinned in this default; deploy_history.yml
+# carries the canonical pinned digest.
+#
+# WHO READS THIS DEFAULT: only goatnets ops/pins/fleet-pins.yaml does NOT
+# govern; a governed goatnet gets a generated pins.yml that overrides it. For
+# an ungoverned goatnet this line is load-bearing even though it reads like a
+# seed value, so bump it in lockstep with every fleet move. If it lags,
+# re-running that goatnet's deploy downgrades its console.
+id_admin_console_image: "ghcr.io/{{ ghcr_org }}/goat-id-console:sha-fc81c67@sha256:8b068c4857f09cbf0b94089a11d369db7d695ca4538d8dd465c49e75967b7571"
+
+# Platform selector for the multi-arch LIST-digest pin above. `docker
+# compose up` on a digest-pinned multi-arch reference does NOT reliably
+# select the host arch — on arm64 hosts it can resolve the list to the amd64
+# member and crash-loop (exec format error). The
+# role writes ID_ADMIN_CONSOLE_PLATFORM to /opt/mgmt-host/.env and the
+# compose overlay sets `platform:` from it, forcing the correct member
+# while the committed pin stays the multi-arch LIST digest (policy).
+# Derived from gathered facts: aarch64→arm64, everything else→amd64. F-245.
+# FAIL CLOSED ON MISSING FACTS. A `| default('x86_64')` here would silently
+# produce linux/amd64 whenever facts are absent — and the compose overlay then
+# DEMANDS that platform, so the arm64 binary dies with `exec format error` and
+# the console crash-loops, with no error in between. A play that cannot see the
+# host's architecture must not guess it.
+id_admin_console_image_platform: "linux/{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+
+# Public FQDN for the admin console. admin.auth.* deliberately sits as a
+# sibling of the existing auth.* (Kratos selfservice UI) per ADR 0860 —
+# admin tenant is a structural cousin of end-user-self-service, not a
+# subpath of vendor portal or netbird dashboard.
+#
+# TWO CONSUMERS COUPLE TO THIS FACT beyond this role (goat#247 defect 5 /
+# goat#252 review):
+#   - the ory role's kratos.yaml.j2 puts this origin in allowed_return_urls
+#     (it reads the same var name, with a matching default) — diverge and
+#     both step-up return legs die with self_service_flow_return_to_forbidden;
+#   - the console binary derives the auth.* origin by STRIPPING the leading
+#     "admin." label (stepup.go authOrigin), so any override MUST keep the
+#     admin.<auth-origin> shape.
+# Override per-goatnet in group_vars (visible to both roles), never in role
+# vars.
+id_admin_console_fqdn: "admin.auth.{{ site_id }}.{{ site_dns_zone }}"
+
+# Host path to the canonical permissions YAML. Bind-mounted read-only
+# into the container so the /permissions page renders the matrix
+# verbatim. Deployed to the host by mgmt-host-baseline.yml as part of
+# the standard repo sync.
+id_admin_console_permissions_yaml_host_path: /opt/goat/permissions/group-permissions.yml
+id_admin_console_permissions_yaml_container_path: /etc/goat-id-console/group-permissions.yml
+
+# Host path to the canonical coalition framework registry
+# (ops/identity/coalition-frameworks.yaml). Bind-mounted read-only, same pattern
+# as the permissions YAML above, so the identity-detail page can render a
+# person's COALITION STANDING. Standing is nation-derived and deliberately lives
+# in neither the cert nor the Ory claim (ADR 1077 / ADR 1051), so without this
+# mount the console cannot show it at all — the row then says "unresolved" and
+# names the missing file rather than guessing a standing.
+id_admin_console_coalition_frameworks_host_path: /opt/goat/identity/coalition-frameworks.yaml
+id_admin_console_coalition_frameworks_container_path: /etc/goat-id-console/coalition-frameworks.yaml
+# This goatnet's ACTIVE framework id. Empty = the registry's own
+# default_framework (nato today). Set it per-goatnet when the deployment is in
+# another AOR — a standing means nothing without naming what it is relative to.
+id_admin_console_coalition_framework: ""
+# ADR 1151: the nation operating this goatnet (ISO 3166-1 alpha-3), the other
+# half of the `organic` derivation. Deliberately EMPTY by default -- unknown is
+# a safe, visible state and a wrong sovereign is not. Set it per-goatnet in
+# group_vars when the deployment's operator is known.
+id_admin_console_operating_sovereign: ""
+
+# --- Onboarding GitHub repo-grants (docs/design/onboarding-github-repo-grants.md) ---
+# repo-access policy: role/identity -> GitHub repos to grant as a collaborator at
+# onboarding. The role writes this content to the host + bind-mounts it; the
+# console reads it fresh at each provision so editing it is an operator action, no
+# redeploy. Default = no rules (feature inert). A goatnet sets
+# id_admin_console_repo_access_content to its real policy (see group_vars).
+id_admin_console_repo_access_host_path: /opt/goat/repo-access/repo-access.yaml
+id_admin_console_repo_access_container_path: /etc/goat-id-console/repo-access.yaml
+id_admin_console_repo_access_content: |
+  # No repo-access policy declared for this goatnet — repo grants are inert.
+  version: 1
+  rules: []
+# The GitHub token (fine-grained PAT, Administration:write on the granted repos)
+# resolved from the controller env; empty = grants skipped (fail-open). Never
+# committed — set GITHUB_ONBOARD_TOKEN in the deploy environment.
+id_admin_console_github_onboard_token: "{{ lookup('env', 'GITHUB_ONBOARD_TOKEN') | default('', true) }}"
+
+# Per-IdP admin URLs (loopback on the mgmt-host since the console runs
+# on the same host as Kratos + Hydra).
+#
+# Tenant IdP is always present (every site has at least one Kratos for
+# site services). Operator IdP per ADR 0842 only lives on Orin-C in the
+# three-Orin topology; single-host sites don't have it.
+# The console treats operator IdP as OPTIONAL — if
+# id_admin_console_idp_operator_kratos_admin_url is empty, the env
+# template omits the IDP_OPERATOR_* lines and the console's config loader
+# skips the operator IdP entirely (no entry in the dropdown, no 502 on
+# selection). To enable on a three-Orin site: override these to the
+# real URLs in group_vars/<site>_hosts/vars.yml.
+id_admin_console_idp_tenant_kratos_admin_url: "http://kratos:4434"
+id_admin_console_idp_tenant_hydra_admin_url: "http://hydra-admin:4445"
+id_admin_console_idp_tenant_label: "Site users"
+id_admin_console_idp_operator_kratos_admin_url: ""
+id_admin_console_idp_operator_hydra_admin_url: ""
+id_admin_console_idp_operator_label: "Operators"
+
+# Onboarding engine (ADR 1062/1071 — the console OWNS the engine now, extracted
+# from the data-fabric portal per docs/design/onboarding-extraction-plan.md).
+# The proposal + invite store is a SQLite file on a persistent volume (the compose
+# overlay mounts id_admin_console_onboard_volume → this path).
+id_admin_console_onboard_db_path: "/var/lib/goat-id-console/onboard.db"
+# ADR 1112 increment 2 — onboard-time org match-or-create (fuzzy suggest +
+# review-page candidate panel). Default OFF fleet-wide: off = free-typed
+# intake, byte-identical behavior (the rollback lever). A goatnet opts in
+# per group_vars once its acceptance test passes.
+id_admin_console_org_match_enabled: false
+
+# ADR 1171 decision 7 — refuse an admin approval whose organisation is not
+# registered on this goatnet.
+#
+# FALSE, and it stays false until a goatnet's org registry actually holds the
+# organisations its manifests name. Set true over a sparse registry, this flag
+# refuses essentially every onboarding. Arm it per goatnet, after that
+# goatnet's registry is tidy, never as a fleet-wide flip.
+id_admin_console_require_registered_org: false
+# The org registry store (ADR 1112 increment 1) — its own SQLite file so
+# rollback stays file-level.
+id_admin_console_org_db_path: "/var/lib/goat-id-console/orgs.db"
+
+# The store engine (sqlite | postgres, ADR 1165 step A) and its Postgres
+# databases are the id-admin-console-store role's defaults; tasks/main.yml
+# includes that role before anything is rendered.
+
+# Per-handle machine keys ("handle:key,handle:key") for the runner + `goat admin
+# invite` CLI — F-207 per-person attribution. Set per-site from the environment;
+# MUST include the onboard-runner's key as "onboard-runner:<key>". Empty ⇒ the
+# machine realm 503s (unless PORTAL_INTERNAL_URL provides participant delegation).
+id_admin_console_onboard_operator_api_keys: ""
+# The mesh-internal data-fabric portal base for read-only participant-key
+# delegation (GET /api/whoami). Same mgmt network, by container name. Empty ⇒
+# participant-key mint unavailable (operator-key mint still works).
+id_admin_console_portal_internal_url: "http://goat-zenoh-portal:8090"
+# The console's OUTBOUND portal bearer, an OPERATOR key. Empty by default so a
+# goatnet that has not minted one still renders a valid env file; the console
+# then falls back to NOTIFY_TOKEN, which the portal accepts ONLY for the
+# self-gated sponsorship lookup. Every requireOperator call it makes — the
+# person->slot linkage stamp, fabric-credential collection — 401s in that state,
+# and both are best-effort, so the failure is SILENT. Set it per goatnet and
+# pair it with an `id-console:` entry in portal_operator_api_keys.
+id_admin_console_portal_lookup_token: ""
+# Public front-desk base for candidate one-time links (the collector's fqdn), and
+# the console's own mesh-side public base (nomination-link fallback).
+id_admin_console_intake_base_url: ""
+id_admin_console_portal_public_url: ""
+
+# SMTP (AWS SES) for onboarding invite emails. Empty host = email off. Secrets
+# come from the environment, never committed.
+id_admin_console_smtp_host: ""
+id_admin_console_smtp_port: "587"
+id_admin_console_smtp_username: ""
+id_admin_console_smtp_password: ""
+id_admin_console_smtp_from: ""
+# Monitored mailbox an invite's Reply-To points at. The From identity is
+# send-only (no MX on its zone); empty = no Reply-To, and the invite tells the
+# candidate a reply is not delivered.
+id_admin_console_smtp_reply_to: ""
+# SES v2 API creds for sandbox-aware invite email controls (empty = off).
+# Access key id = the same value as the SMTP username (both are the ses-smtp
+# IAM user's access key); the secret is the RAW secret access key (terraform
+# output ses_api_secret_access_key), NOT the derived SMTP password.
+id_admin_console_ses_api_region: ""
+id_admin_console_ses_api_access_key_id: ""
+id_admin_console_ses_api_secret_access_key: ""
+
+# Candidate stage-notification intake (onboarding-notifications.md increment
+# 3). Empty token = endpoint + portal channel off (default everywhere until a
+# goatnet wires it). URLs are the candidate-facing links in the final email.
+id_admin_console_notify_token: ""
+id_admin_console_notify_mgmt_url: ""
+# Where the NetBird management hostname in id_admin_console_notify_mgmt_url points INSIDE the container.
+# On a mgmt host `mesh-coredns` pins that name to 127.0.0.1 in /etc/hosts, and
+# Docker's embedded DNS hands the host resolver's answer to containers, where it
+# arrives as `CNAME localhost.` and glibc discards it. Inside a container
+# 127.0.0.1 would be the container anyway. So the name is pinned to
+# `host-gateway`, the host, where traefik publishes :443 for it. Without the pin
+# every NetBird read fails with `error sending request`. Never a bridge or mesh IP; ""
+# drops the pin for a host whose traefik does not serve the name.
+id_admin_console_notify_mgmt_host_addr: "host-gateway"
+id_admin_console_notify_get_url: ""
+# When true, the enrollment command the console/email hands new peers includes
+# --enable-rosenpass --rosenpass-permissive, PQ-securing their WireGuard sessions
+# (ADR 0602). Per-goatnet staged-rollout switch; default off. Permissive means
+# enabling it never breaks connectivity to not-yet-enabled peers. Requires a
+# console image that carries the NOTIFY_ROSENPASS support (PR #1576+). Goatnets
+# should drive this from the shared `rosenpass_enabled` group_var (all.yml) so
+# the console tracks the same one knob as every other enrollment surface — e.g.
+# a goatnet's group_vars sets `id_admin_console_notify_rosenpass: "{{ rosenpass_enabled }}"`.
+id_admin_console_notify_rosenpass: false
+id_admin_console_notify_portal_url: ""
+# Relay-fleet health dashboard, surfaced in the onboarding guide. Off-mesh by
+# design (see the env template). Empty default is honest: a goatnet that has no
+# dashboard says so instead of linking somewhere dead.
+# Path INSIDE the console container at which the portal's operator-key
+# directory is mounted. Empty disables the whole operator-key grant path: the
+# console still records requests, and the queue says plainly that approving one
+# would grant nothing. Set it and the compose file mounts
+# portal_operator_keys_dir here read-write.
+id_admin_console_operator_key_dir: "/var/lib/goat-portal/operator-keys.d"
+# The HOST path that mounts there — the portal's own key directory. Stated here
+# rather than read from the portal role's default because a role default is not
+# visible to another role's template: referencing portal_operator_keys_dir would
+# render empty on any playbook that does not also include the portal role, and
+# an empty mount source is a silently broken grant path. Both roles run on the
+# same mgmt host; if the portal's data dir ever moves, change it in both places
+# and the reconcile view will show the drift in the meantime.
+id_admin_console_operator_key_host_dir: "/opt/goat-zenoh-portal/operator-keys.d"
+id_admin_console_notify_relay_health_url: ""
+# Environment identity in onboarding email — which goatnet is this and what is
+# it FOR, so a person invited to one goatnet never confuses it with another
+# reverse). Tagline = short descriptor rendered in parentheses after the goatnet
+# name in subjects (e.g. "integration gateway"); purpose = a one-to-three
+# sentence paragraph rendered as an "About this environment" block in every
+# onboarding/welcome/access email body. Per-goatnet display values; blank =
+# name-only emails (no fabricated description). Set both for every goatnet that
+# onboards people (turnkey standup step).
+id_admin_console_notify_goatnet_tagline: ""
+id_admin_console_notify_goatnet_purpose: ""
+
+# Comma-separated addresses emailed when a candidate clears the sponsor gate and
+# is waiting on the ADMIN gate. Blank = off, and the admin queue stays pull-only.
+id_admin_console_onboard_admin_notify_emails: ""
+
+# Demand-gated non-governmental affiliation.sector cluster (ADR 1077). When true
+# the intake form offers + the engine stamps ngo/media/academic/commercial; the
+# governmental cluster (military/law-enforcement/civil-government/intelligence) is
+# always live regardless. Per-goatnet on-demand switch; default OFF fleet-wide.
+# Requires a console image carrying ONBOARD_SECTORS_NONGOV_ENABLED support.
+id_admin_console_onboard_sectors_nongov_enabled: false
+
+# SPIFFE mTLS on the mint-capable onboarding leg (runner → console). Default OFF.
+# When true the console env carries MTLS_ONBOARD_*, the console starts its :9443
+# mTLS listener, and the compose template adds the spiffe-helper sidecar + /svid
+# mount (the runner reaches :9443 container-to-container on the mgmt network — no
+# host publish). Also needs the SPIRE registration entries reconciled. SPIRE is
+# opt-in per goatnet. Staged rollout (docs/design/runner-console-mtls.md §Deploy): enable
+# the console side FIRST, then the runner (onboard_runner_mtls_enabled) — the
+# runner fails closed if the console listener isn't up yet.
+id_admin_console_mtls_onboard_enabled: false
+# spiffe-helper sidecar wiring (mirrors the fabric-health role). The helper runs
+# as the console's UID so the 0600 SVID key it writes is readable by the console.
+# The sidecar image is the digest-pinned fabric_health_spiffe_helper_image from
+# the goatnet's SPIRE group_vars (no unpinned role-default *_image — ADR 0703 +
+# the deploy-history CI fence); an operator MAY override the *_image below.
+id_admin_console_spire_socket_dir: "/run/spire/sockets"
+id_admin_console_svid_dir: "/var/lib/goat-id-console-svid"
+id_admin_console_spire_uid: 65532
+id_admin_console_compose_dir: "/opt/mgmt-host"
+
+# Directory on the mgmt host that holds the peerview state, including
+# hold-records.jsonl. Mounted read-only into the id-admin console so the
+# Access section can read hold records while leaving the ledger unreadable.
+id_admin_console_hold_records_host_dir: "{{ peerview_state_dir | default('/var/lib/peerview') }}"
+
+# Durable audit sink (ADR 0860 interim): file = ring + append-only JSONL that
+# survives container redeploys. The role default is "stderr"; a goatnet that
+# wants durable audit sets file.
+id_admin_console_audit_file_path: "/var/lib/goat-id-console/audit.jsonl"
+
+# Step-up freshness window — when sensitive mutations require AAL2, the
+# console refuses with 403 if the actor's AAL is not aal2 within this
+# many seconds. v1 doesn't implement the redirect-through-Kratos AAL2
+# flow; operator re-authenticates manually and retries. 300s default
+# matches the design doc.
+id_admin_console_aal2_fresh_window_sec: 300
+
+# Step-up return-to base — used to construct return_to URLs once the
+# AAL2 redirect flow lands (v1.1 hardening).
+id_admin_console_step_up_return_to_base: "https://{{ id_admin_console_fqdn }}"
+
+# Step-up enforcement policy (fail-closed default true). Leave true on any
+# accreditation-bound goatnet. Override to false ONLY on a declared sandbox
+# goatnet where no AAL2 signal is wired AND the admin population is not yet
+# second-factor-enrolled — there the gated actions (delete_identity,
+# revoke_sessions_of_admin, grant/revoke_PLATFORM-ADMIN, reset_2fa) would
+# otherwise 403 every admin. Prerequisite to flipping back true: enroll admins
+# in MFA + wire the real acr/step-up flow. docs/design/id-admin-console.md.
+id_admin_console_step_up_enforced: true
+
+# Log level: info | debug
+id_admin_console_log_level: "info"
+
+# Audit backend: stderr (v1; default) | zenoh (v2 once the publisher lands)
+id_admin_console_audit_backend: "stderr"
+
+# --- Enrollment watcher (internal/enrollwatch) -------------------------------
+# The one OBSERVED transition in the onboarding lifecycle: onboarded ->
+# enrolled, when the person actually uses the mesh setup key minted for them.
+# Without it `onboarded` is the terminal state and silently conflates "we
+# emailed credentials" with "the person is on the mesh".
+#
+# DEFAULT OFF (empty token) fleet-wide: a goatnet that has not wired a NetBird
+# PAT here keeps today's behaviour exactly.
+#
+# The watcher only ever GETs /api/setup-keys, but NetBird has NO role below
+# `admin` that can list setup keys, so this cannot be
+# scoped read-only at the API. Give it a DEDICATED SERVICE USER's token, never
+# a human's, so it is revocable on its own.
+# The goatnet this console serves; defaults to the site it is deployed onto, so
+# no per-goatnet override is needed (site_id is already Class-A per-site config).
+id_admin_console_notify_goatnet: "{{ site_id | mandatory }}"
+
+id_admin_console_enroll_watch_nb_token: ""
+id_admin_console_enroll_watch_interval: "5m"
+
+# Self-service sign-on setup codes (/setup-code, F-351) — the two Kanidm doors.
+#
+# All four EMPTY by default and that is deliberate: a goatnet with no collab
+# plane must not render a button that cannot work, and a wrong door address here
+# would mint codes on somebody else's identity plane. Each goatnet that has a
+# door states it.
+#
+# The password is idm_admin. Kanidm has no lesser right that can mint a
+# credential-update intent, so "least privilege" is not on offer here; what is
+# on offer is that this is the same credential the onboard-runner already holds
+# on this host, so no new secret reaches a new place.
+id_admin_console_collab_door_url: ""
+id_admin_console_collab_door_admin_pw: ""
+id_admin_console_public_door_url: ""
+id_admin_console_public_door_admin_pw: ""

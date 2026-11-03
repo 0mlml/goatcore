@@ -1,0 +1,133 @@
+# base-alerts.rules.yml — the obs-host role's fleet-wide base alert rules.
+#
+# THE GAP THIS CLOSES: the role mounts a rules dir into Prometheus and points
+# `rule_files` at it, so without a shipped rule file every goatnet's Prometheus
+# loads ZERO rules, and an outage goes unnoticed not because an alert is missed
+# but because the capability to alert is absent.
+# This file is the capability. Goatnet-agnostic; thresholds are overridable
+# group_vars with safe defaults.
+#
+# Rendered by the obs-host role into {{ obs_compose_dir }}/rules/ (mounted at
+# /etc/prometheus/rules, matched by rule_files: /etc/prometheus/rules/*.yml).
+groups:
+  - name: base-availability
+    rules:
+      # The single most important rule: a scrape target Prometheus cannot reach.
+      # This is exactly what an unnoticed node/service outage looks like.
+      - alert: TargetDown
+        expr: up == 0
+        for: {{ alert_target_down_for | default('5m') }}
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scrape target {% raw %}{{ $labels.job }}{% endraw %} down ({% raw %}{{ $labels.instance }}{% endraw %})"
+          description: "Prometheus has been unable to scrape {% raw %}{{ $labels.instance }}{% endraw %} (job {% raw %}{{ $labels.job }}{% endraw %}) for over {{ alert_target_down_for | default('5m') }}. A down target is indistinguishable from a down service — investigate both."
+
+      # Prometheus scraping a target but getting errors (e.g. the node-exporter
+      # concurrency-limit 503).
+      - alert: ScrapeErrors
+        expr: rate(prometheus_target_scrapes_sample_out_of_order_total[5m]) > 0 or up{job!=""} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus scrape problems for {% raw %}{{ $labels.instance }}{% endraw %}"
+          description: "Scrapes are failing or returning errors — a target that responds 5xx (concurrency limit, overloaded exporter) reads as down with no other signal."
+
+  - name: base-node-health
+    rules:
+      - alert: NodeFilesystemAlmostFull
+        expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) * 100 < {{ alert_disk_free_pct | default(10) }}
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Filesystem almost full on {% raw %}{{ $labels.instance }}{% endraw %} ({% raw %}{{ $labels.mountpoint }}{% endraw %})"
+          description: "Less than {{ alert_disk_free_pct | default(10) }}% free on {% raw %}{{ $labels.mountpoint }}{% endraw %} — a full data-root wedges Docker/Postgres."
+
+      # A disk that FILLS is caught by the rule above. A disk that VANISHES is
+      # not, even when it takes Docker's data-root and Prometheus's own TSDB with it.
+      #
+      # The reason is worth internalising: node_exporter stops EMITTING node_filesystem_*
+      # for a mount that is no longer mounted. The ratio above then has no data
+      # to evaluate, so it cannot fire. Absence of a metric is not a zero — it
+      # is nothing, and nothing is what a healthy fleet also looks like.
+      #
+      # `absent() and on() count_over_time(...) > 0` is the house idiom for
+      # this (grant-keyd, zenoh-wedge, budget-notify, scrape-health all use it):
+      # "it is gone NOW, and it was present recently." The second clause is
+      # load-bearing — a bare absent() fires forever on any host that never had
+      # the mount, and permanently-firing alerts are how alerting gets ignored.
+      - alert: NodeDataRootMissing
+        expr: |
+          absent(node_filesystem_size_bytes{mountpoint="{{ alert_data_root_mountpoint | default('/opt/docker-data') }}"})
+          and on() (count_over_time(node_filesystem_size_bytes{mountpoint="{{ alert_data_root_mountpoint | default('/opt/docker-data') }}"}[6h]) > 0)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Data-root {{ alert_data_root_mountpoint | default('/opt/docker-data') }} has disappeared"
+          description: "The encrypted NVMe data volume is no longer mounted, and it was present within the last 6h. Docker's data-root and containerd's live here, so every container on this host is affected — not just observability. Check the LUKS mapping and `dmesg | grep -i nvme` before restarting anything: a re-format on an unformatted device is silent and destroys the volume."
+
+      - alert: NodeMemoryHigh
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > {{ alert_mem_used_pct | default(92) }}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Memory pressure on {% raw %}{{ $labels.instance }}{% endraw %}"
+          description: "Available memory below {{ 100 - (alert_mem_used_pct | default(92)) }}% for 15m."
+
+      - alert: NodeClockSkew
+        expr: abs(node_timex_offset_seconds) > {{ alert_clock_skew_seconds | default('0.5') }}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Clock skew on {% raw %}{{ $labels.instance }}{% endraw %}"
+          description: "Time offset exceeds {{ alert_clock_skew_seconds | default('0.5') }}s — cert/TTL validity and fabric ordering depend on time hygiene (ADR 1037)."
+
+  - name: base-prometheus-self
+    rules:
+      # Prometheus watching itself: if it stops being able to talk to
+      # Alertmanager, no alert here can ever fire — the meta-blindness.
+      - alert: PrometheusNotConnectedToAlertmanager
+        expr: prometheus_notifications_alertmanagers_discovered < 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot reach any Alertmanager"
+          description: "No Alertmanager is discovered — every alert below would fire into the void. This is the capability-absent state F-289 describes, applied to delivery."
+
+  - name: base-deadman
+    rules:
+      # THE DEAD-MAN'S SWITCH. Every other rule in this file shares one fatal
+      # assumption: that Prometheus is running and evaluating rules. When it is
+      # not — crashed, OOM-killed, wedged, host powered off, config rejected at
+      # reload — every rule above goes silent, and silence is exactly what a
+      # healthy fleet looks like: not a missed alert, an absent capability that
+      # presents as calm.
+      #
+      # This alert fires unconditionally, forever, for as long as Prometheus is
+      # alive. It is not meant to tell anyone anything. Its ARRIVAL is the
+      # signal, and its ABSENCE is the alert — which means the thing that
+      # notices has to live somewhere else. The Alertmanager route sends it to
+      # `deadman_webhook_url` on a short repeat_interval; that endpoint is an
+      # external absence-detector (Dead Man's Snitch, healthchecks.io, a
+      # self-hosted ntfy topic with a "no message in N minutes" watch) which
+      # complains when the heartbeat stops arriving.
+      #
+      # Consequence worth stating plainly: with `deadman_webhook_url` unset this
+      # rule is decorative. It fires into webhook-noop and nothing anywhere
+      # notices a dead Prometheus. The acceptance suite asserts the wiring
+      # (`deadman-switch-has-external-receiver`) precisely so that the
+      # decorative state cannot pass for the working one.
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          deadman: "true"
+        annotations:
+          summary: "Alerting pipeline heartbeat"
+          description: "This alert always fires. It exists so an external watcher can detect the alerting pipeline going silent — if you are reading this in a UI, that is normal and expected. If it STOPS arriving at the external receiver, Prometheus or Alertmanager is down and no other alert can reach you."

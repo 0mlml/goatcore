@@ -1,0 +1,40 @@
+# {{ ansible_managed }}
+#
+# goat-crypto-posture publisher for {{ crypto_posture_site }}. Rendered by
+# ops/ansible/roles/crypto-posture/ (ADR 1079). One container, mTLS Zenoh
+# client peer of the router: probes the router's negotiated key exchange live,
+# reads the host FIPS attestation, publishes ops/fabric/crypto/<site>.
+# Persists nothing — no secrets, so no sibling .env.
+
+services:
+  crypto-posture:
+    image: {{ crypto_posture_image }}
+    container_name: crypto-posture
+    restart: unless-stopped
+    networks:
+      - zenoh
+    environment:
+      CRYPTO_POSTURE_PROBE_ADDR: "{{ crypto_posture_probe_addr }}"
+      CRYPTO_POSTURE_SNI: "{{ crypto_posture_sni }}"
+      CRYPTO_POSTURE_ENDPOINT: "{{ crypto_posture_endpoint }}"
+      CRYPTO_POSTURE_SITE: "{{ crypto_posture_site }}"
+      CRYPTO_POSTURE_CERT: "/certs/{{ crypto_posture_cert_file }}"
+      CRYPTO_POSTURE_KEY_FILE: "/certs/{{ crypto_posture_key_file }}"
+      CRYPTO_POSTURE_ROOT_CA: "/ca/ca-root.pem"
+      CRYPTO_POSTURE_REST_URL: "{{ crypto_posture_rest_url }}"
+      CRYPTO_POSTURE_ATTEST_FILE: "/attest/fips-attest.json"
+      CRYPTO_POSTURE_INTERVAL_MS: "{{ crypto_posture_interval_ms }}"
+      CRYPTO_POSTURE_ATTEST_MAX_AGE_MS: "{{ crypto_posture_attest_max_age_ms }}"
+      RUST_LOG: "{{ crypto_posture_rust_log }}"
+    volumes:
+      - "{{ crypto_posture_cert_dir }}:/certs:ro"
+      - "{{ crypto_posture_ca_root_src }}:/ca/ca-root.pem:ro"
+      # Host FIPS attestation (written by the goat-zenoh role on a
+      # fips-variant deploy). Mounted read-only; absent on a non-FIPS router,
+      # which the publisher renders as "no FIPS attestation" (grey), not green.
+      - "{{ crypto_posture_attest_file }}:/attest/fips-attest.json:ro"
+
+networks:
+  zenoh:
+    name: {{ crypto_posture_zenoh_network }}
+    external: true

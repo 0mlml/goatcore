@@ -1,0 +1,115 @@
+---
+# netbird-boot-selfheal — keep a mesh host's NetBird client from staying wedged
+# after a boot-time network race. If netbird starts before the network path to
+# mgmt/relays is usable, its engine can wedge with a fraction of its peers and
+# never recover until a manual restart.
+#
+# Two parts:
+#   1. A systemd drop-in that makes netbird.service wait for
+#      network-online.target (root-cause mitigation — the racy start).
+#   2. A timer-driven watchdog that bounces netbird ONCE (rate-limited, capped
+#      per boot) when the control plane is up but peers stay wedged-low, and
+#      emits a textfile metric so the wedge is visible off-host.
+#
+# Opt-in per host group. Enable on any host that runs netbird as a mesh peer
+# and whose reachability matters (mgmt-hosts/Thors). See
+# docs/design/netbird-boot-selfheal.md.
+
+netbird_selfheal_enabled: false
+
+# Boot-DNS fallback resolvers. On a site LAN that blocks public :53, netbird
+# cannot resolve its mgmt endpoint at boot (before mesh CoreDNS exists) and the
+# node stays islanded. Set this to a resolver the LAN permits (the site's ISP
+# resolver) and the role writes a systemd-resolved drop-in. Empty = skip.
+# e.g. ["192.0.2.53"].
+netbird_selfheal_bootstrap_dns: []
+
+# Committed artifact (rollback ref).
+netbird_selfheal_src: "{{ playbook_dir }}/../netbird/netbird-boot-selfheal.sh"
+
+netbird_selfheal_dir: /opt/netbird-boot-selfheal
+netbird_selfheal_state_dir: /var/lib/netbird-boot-selfheal
+
+# netbird binary on the host (usually /usr/bin/netbird).
+netbird_selfheal_nb_bin: netbird
+
+# Wedge floor: the watchdog only acts when the control plane (management +
+# signal) is Connected AND connected peers stay below this for
+# netbird_selfheal_sustained_checks consecutive samples. Set to roughly HALF
+# the host's healthy steady-state connected-peer count (healthy ~32 →
+# floor 15). Too high false-positives on a quiet-but-healthy node; too low
+# never catches the wedge. Per-site override in group_vars.
+netbird_selfheal_min_peers: 15
+
+netbird_selfheal_sustained_checks: 4      # consecutive low samples before acting
+netbird_selfheal_cooldown_s: 1800         # min seconds between restarts (30 min)
+netbird_selfheal_max_restarts_per_boot: 3 # past this: escalate, stop restarting
+
+# The cap above resets on a new boot_id — fine for the boot race it was written
+# for, wrong for a node that stays up for weeks: three legitimate saves on one
+# boot_id disarm the watchdog for the rest of that boot, and a later wedge only
+# hits "already restarted 3x, escalating to a human". That escalation is a
+# textfile metric, which reaches nobody unless something scrapes it.
+#
+# The budget therefore also decays: a restart older than this window no longer
+# counts against it. Anti-thrash is intact (3 inside the window still caps), but
+# a node saved once a month is not disarmed by its own successes.
+# 0 = previous per-boot-only behaviour.
+netbird_selfheal_restart_budget_window_s: 86400
+
+# Timer cadence. 4 checks x 90s ~ 6 min to confirm a wedge — fast enough to
+# spare a long lockout, slow enough not to thrash on a transient dip.
+netbird_selfheal_interval: "90s"
+netbird_selfheal_on_boot_sec: "120s"      # first check after boot
+
+# Install the network-online.target ordering drop-in on netbird.service.
+netbird_selfheal_install_ordering_dropin: true
+
+# --- second wedge signature: control-plane-DOWN-but-endpoint-REACHABLE -------
+# The peers-low signature above only fires when mgmt+signal read Connected, and
+# the watchdog deliberately refuses to act when the control plane is down —
+# correct for the boot race, wrong for a node whose mgmt+signal read Disconnected
+# for hours while BOTH its interfaces can TCP-reach the management endpoint, the
+# daemon holding a stale keepalive/read-timeout. One restart clears it.
+#
+# When the control plane reads down but its endpoint answers a TCP connect, the
+# daemon is stuck rather than the upstream being out — a restartable condition,
+# distinguishable with one connect. Shares the same cooldown / per-boot restart
+# budget as the peers-low signature.
+#
+# DEFAULT OFF. This adds a new reason to bounce netbird on hosts already running
+# this role; enable per group once it has proven itself.
+netbird_selfheal_cp_wedge_enabled: false
+
+# Endpoint to probe. Empty = derive from `netbird status --json` (.management.url),
+# which is correct for any profile. If it cannot be derived the signature is
+# skipped entirely — an unknown endpoint must never justify a restart.
+netbird_selfheal_mgmt_probe_url: ""
+netbird_selfheal_probe_timeout_s: 5
+
+# --- third wedge signature: EVERYTHING READS HEALTHY BUT NO DATA MOVES -------
+# Signatures 1 and 2 both key off the CONTROL plane. Neither can see the shape
+# of mgmt + signal Connected, `Peers count 5/10`, every peer listing
+# `Connected / P2P` — and the data plane dead in both directions. The daemon's
+# journal is empty, this timer runs every 90s, neither arm fires, and one restart
+# clears it.
+#
+# So probe the data plane directly. Success on ANY target = healthy.
+#
+# TCP ONLY, NEVER ICMP. F-067 documents a transport state where TCP forwarding
+# fails per-client while ping keeps working, and BREAKGLASS hosts are granted
+# `tcp 22` outbound ONLY (ADR 1114) — a ping probe from one reads broken
+# forever and would bounce netbird every cooldown.
+#
+# Targets are EXPLICIT, never derived: a guessed target the ACL does not permit
+# is indistinguishable from a wedge and would restart a healthy daemon. Empty
+# list = signature skipped entirely. Give it MORE THAN ONE target so a single
+# peer rebooting is not read as a wedge, and pick targets this host is actually
+# permitted to reach — for a BREAKGLASS node that means INFRA/NETWORK on :22.
+#
+# DEFAULT OFF, like the signature before it. Contract pinned by
+# ops/ci/test-netbird-selfheal-signatures.sh (10 cases, both directions).
+netbird_selfheal_data_wedge_enabled: false
+
+# List of "host:port". e.g. ["100.127.0.221:22", "100.127.0.206:22"]
+netbird_selfheal_data_probe_targets: []

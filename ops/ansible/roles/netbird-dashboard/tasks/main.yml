@@ -1,0 +1,344 @@
+---
+# Block 21D.1 — deploy per-site netbird-dashboard fronted by Ory Hydra OIDC.
+# Idempotent: re-runs are safe (OIDC client is upserted; compose restarts
+# only if config changed).
+#
+# Required vars:
+#   site_id                                  short site identifier
+#   site_dns_zone                            mesh-internal DNS suffix
+#   netbird_dashboard_oidc_client_secret     32+ chars, 1Password-backed
+#
+# Optional vars (with defaults in defaults/main.yml):
+#   netbird_dashboard_image
+#   netbird_dashboard_oidc_client_id (defaults to "netbird-dashboard")
+#   netbird_dashboard_oidc_scopes
+#   netbird_dashboard_oidc_token_endpoint_auth_method
+#   netbird_dashboard_hydra_admin_url
+
+- name: Require site_id + site_dns_zone + oidc_client_secret
+  ansible.builtin.assert:
+    that:
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+      - netbird_dashboard_oidc_client_secret is defined and (netbird_dashboard_oidc_client_secret | length) >= 16
+    fail_msg: |
+      Block 21D.1 prerequisites not met. Required:
+        - site_id (e.g. "vega")
+        - site_dns_zone (e.g. "netbird-prod.goat.example")
+        - netbird_dashboard_oidc_client_secret (sourced from
+          .envrc.local env var <SITE>_DASHBOARD_OIDC_CLIENT_SECRET,
+          1Password-backed; ≥16 chars)
+      See docs/operations/dashboard-bringup.md §"Pre-flight env vars".
+
+# -- F-566: say out loud when the render replaces another goatnet's --------
+# A host repurposed from one goatnet to another keeps its old dashboard.env until
+# something re-renders it, so the dashboard keeps pointing at the old goatnet's
+# mgmt and Hydra. The render below fixes that; this task makes the replacement visible
+# in the run log instead of silent. Reads only the two identity lines — the
+# file also holds the OIDC client secret.
+- name: "dashboard | read the site identity of the dashboard.env already on the host"
+  ansible.builtin.shell:
+    cmd: "grep -E '^(SITE_ID|NEXTAUTH_URL)=' {{ ory_compose_dir }}/dashboard.env || true"
+  register: netbird_dashboard_prior_identity
+  changed_when: false
+  failed_when: false
+
+- name: "dashboard | report a render that replaces another goatnet's"
+  ansible.builtin.debug:
+    msg: >-
+      {{ ory_compose_dir }}/dashboard.env on this host was rendered for a
+      different goatnet ({{ netbird_dashboard_prior_identity.stdout_lines | join(', ') }}).
+      Re-rendering it for SITE_ID={{ site_id }} ({{ netbird_dashboard_self_url }}).
+  when:
+    - netbird_dashboard_prior_identity.stdout_lines | default([]) | length > 0
+    - ('SITE_ID=' ~ site_id) not in netbird_dashboard_prior_identity.stdout_lines
+
+# -- Redirect URIs: the admin address rides the same SPA client -------------
+- name: "dashboard | effective OIDC redirect URIs (admin address added when split)"
+  ansible.builtin.set_fact:
+    netbird_dashboard_oidc_redirect_uris_effective: >-
+      {{ netbird_dashboard_oidc_redirect_uris
+         + (netbird_dashboard_admin_oidc_redirect_uris if (netbird_dashboard_split_enabled | bool) else []) }}
+    netbird_dashboard_post_logout_redirect_uris: >-
+      {{ [netbird_dashboard_self_url ~ '/']
+         + ([netbird_dashboard_admin_self_url ~ '/'] if (netbird_dashboard_split_enabled | bool) else []) }}
+
+# -- Render compose overlay + env into /opt/mgmt-host -----------------------
+
+- name: "dashboard | ensure compose dir exists"
+  ansible.builtin.file:
+    path: "{{ ory_compose_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: "dashboard | render dashboard.env (mode 0600 — contains OIDC client_secret)"
+  ansible.builtin.template:
+    src: dashboard.env.j2
+    dest: "{{ ory_compose_dir }}/dashboard.env"
+    mode: "0600"
+    owner: root
+    group: root
+  notify: restart dashboard
+
+- name: "dashboard | copy docker-compose.dashboard.yml overlay"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/mgmt-host/docker-compose.dashboard.yml"
+    dest: "{{ ory_compose_dir }}/docker-compose.dashboard.yml"
+    mode: "0644"
+  notify: restart dashboard
+
+# -- Provision OIDC client in Hydra (idempotent upsert) --------------------
+# Hydra admin API at 127.0.0.1:4445 (loopback only — bound by docker-compose.ory.yml).
+# Run only on Router-A (Ory primary site). The check uses HTTP status:
+# 404 means create; 200 means already exists, then PUT to ensure config matches.
+
+- name: "dashboard | check whether OIDC client already exists in Hydra"
+  ansible.builtin.uri:
+    url: "{{ netbird_dashboard_hydra_admin_url }}/admin/clients/{{ netbird_dashboard_oidc_client_id }}"
+    method: GET
+    status_code: [200, 404]
+  register: dashboard_oidc_client_check
+  when: router_role | lower == 'a'
+
+- name: "dashboard | create OIDC client in Hydra (first run)"
+  ansible.builtin.uri:
+    url: "{{ netbird_dashboard_hydra_admin_url }}/admin/clients"
+    method: POST
+    body_format: json
+    status_code: [200, 201]
+    body:
+      client_id: "{{ netbird_dashboard_oidc_client_id }}"
+      client_name: "netbird-dashboard ({{ site_id }})"
+      client_secret: "{{ netbird_dashboard_oidc_client_secret }}"
+      # `audience` whitelist — netbirdio/dashboard sends `audience` param
+      # in the auth request equal to AUTH_AUDIENCE (we set that to the
+      # client_id itself). Hydra rejects unknown audiences with
+      # "Requested audience '<value>' has not been whitelisted by the
+      # OAuth 2.0 Client" — see this task's commit message for the
+      # gotcha details.
+      audience:
+        - "{{ netbird_dashboard_oidc_client_id }}"
+      grant_types: "{{ netbird_dashboard_oidc_grant_types }}"
+      response_types: "{{ netbird_dashboard_oidc_response_types }}"
+      scope: "{{ netbird_dashboard_oidc_scopes | join(' ') }}"
+      redirect_uris: "{{ netbird_dashboard_oidc_redirect_uris_effective }}"
+      post_logout_redirect_uris: "{{ netbird_dashboard_post_logout_redirect_uris }}"
+      token_endpoint_auth_method: "{{ netbird_dashboard_oidc_token_endpoint_auth_method }}"
+      # F-077: Hydra's selfservice-ui-node consent UI shows scope
+      # checkboxes UNCHECKED by default; the "Allow" button accepts
+      # consent with grant_scope=[]. Hydra dutifully issues a token with
+      # scope:"" and no id_token, which the dashboard's OIDC client
+      # interprets as "loading" and hangs. Skip consent entirely for
+      # this first-party client (the dashboard IS the application Hydra
+      # protects, not a third-party — consent is redundant ceremony).
+      skip_consent: "{{ netbird_dashboard_oidc_skip_consent }}"
+      # F-078: by default Ory Hydra issues opaque ory_at_* access
+      # tokens. netbird-mgmt validates JWTs against Hydra's JWKS and
+      # rejects opaque tokens as "token invalid". Per-client `jwt`
+      # strategy makes Hydra mint RS256-signed JWT access tokens.
+      access_token_strategy: "{{ netbird_dashboard_oidc_access_token_strategy }}"
+  when:
+    - router_role | lower == 'a'
+    - dashboard_oidc_client_check is defined
+    - dashboard_oidc_client_check.status == 404
+  notify: restart management-a
+  # The body carries client_secret; without no_log the uri module writes
+  # it into the host journal.
+  no_log: true
+
+# Idempotency: compare load-bearing fields between current Hydra-side state
+# and our desired state; PUT only when they differ. Avoids spurious notify
+# of the restart-management-a handler on every play run (which would
+# bounce mgmt unnecessarily — production-impacting if frequent).
+- name: "dashboard | detect OIDC client config drift (current vs desired)"
+  vars:
+    cur: "{{ dashboard_oidc_client_check.json | default({}) }}"
+    desired_scope: "{{ netbird_dashboard_oidc_scopes | join(' ') }}"
+    desired_audience: ["{{ netbird_dashboard_oidc_client_id }}"]
+  ansible.builtin.set_fact:
+    dashboard_oidc_client_needs_update: >-
+      {{
+        (cur.scope | default('')) != desired_scope or
+        (cur.redirect_uris | default([]) | sort) != (netbird_dashboard_oidc_redirect_uris_effective | sort) or
+        (cur.audience | default([]) | sort) != (desired_audience | sort) or
+        (cur.grant_types | default([]) | sort) != (netbird_dashboard_oidc_grant_types | sort) or
+        (cur.response_types | default([]) | sort) != (netbird_dashboard_oidc_response_types | sort) or
+        (cur.token_endpoint_auth_method | default('')) != netbird_dashboard_oidc_token_endpoint_auth_method or
+        (cur.skip_consent | default(false)) != netbird_dashboard_oidc_skip_consent or
+        (cur.access_token_strategy | default('opaque')) != netbird_dashboard_oidc_access_token_strategy
+      }}
+  when:
+    - router_role | lower == 'a'
+    - dashboard_oidc_client_check is defined
+    - dashboard_oidc_client_check.status == 200
+
+- name: "dashboard | update OIDC client in Hydra (only when drift detected)"
+  ansible.builtin.uri:
+    url: "{{ netbird_dashboard_hydra_admin_url }}/admin/clients/{{ netbird_dashboard_oidc_client_id }}"
+    method: PUT
+    body_format: json
+    status_code: [200]
+    body:
+      client_id: "{{ netbird_dashboard_oidc_client_id }}"
+      client_name: "netbird-dashboard ({{ site_id }})"
+      client_secret: "{{ netbird_dashboard_oidc_client_secret }}"
+      audience:
+        - "{{ netbird_dashboard_oidc_client_id }}"
+      grant_types: "{{ netbird_dashboard_oidc_grant_types }}"
+      response_types: "{{ netbird_dashboard_oidc_response_types }}"
+      scope: "{{ netbird_dashboard_oidc_scopes | join(' ') }}"
+      redirect_uris: "{{ netbird_dashboard_oidc_redirect_uris_effective }}"
+      post_logout_redirect_uris: "{{ netbird_dashboard_post_logout_redirect_uris }}"
+      token_endpoint_auth_method: "{{ netbird_dashboard_oidc_token_endpoint_auth_method }}"
+      skip_consent: "{{ netbird_dashboard_oidc_skip_consent }}"
+      access_token_strategy: "{{ netbird_dashboard_oidc_access_token_strategy }}"
+  when:
+    - router_role | lower == 'a'
+    - dashboard_oidc_client_check is defined
+    - dashboard_oidc_client_check.status == 200
+    - dashboard_oidc_client_needs_update | default(false)
+  notify: restart management-a
+  # The body carries client_secret; without no_log the uri module writes
+  # it into the host journal.
+  no_log: true
+
+# Easy-rollback per ADR 0859 — drive NETBIRD_DASHBOARD_IMAGE via the
+# compose-time env mechanism. Compose's ${NETBIRD_DASHBOARD_IMAGE:-default}
+# picks this up from /opt/mgmt-host/.env. Bumps to
+# netbird_dashboard_image MUST append a row to deploy-history.yml (CI
+# checks via deploy-history-check.yml).
+- name: "dashboard | set NETBIRD_DASHBOARD_IMAGE in /opt/mgmt-host/.env (ADR 0859)"
+  ansible.builtin.lineinfile:
+    path: "{{ ory_compose_dir }}/.env"
+    regexp: "^NETBIRD_DASHBOARD_IMAGE="
+    line: "NETBIRD_DASHBOARD_IMAGE={{ netbird_dashboard_image }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+
+# -- Pull image + bring up service -----------------------------------------
+
+- name: "dashboard | pull image"
+  ansible.builtin.command:
+    cmd: docker compose -f docker-compose.yml -f docker-compose.dashboard.yml pull dashboard
+    chdir: "{{ ory_compose_dir }}"
+  changed_when: false
+
+- name: "dashboard | bring up service"
+  ansible.builtin.command:
+    cmd: docker compose -f docker-compose.yml -f docker-compose.dashboard.yml up -d dashboard
+    chdir: "{{ ory_compose_dir }}"
+  register: dashboard_up
+  changed_when: "'Started' in dashboard_up.stderr or 'Created' in dashboard_up.stderr or 'Recreated' in dashboard_up.stderr"
+
+# -- Smoke-test ------------------------------------------------------------
+# Loopback hit on the dashboard's own compose-mapped host port; verifies
+# the container is up and the React bundle loads. Full Hydra-OIDC
+# roundtrip validation lives in the operator runbook
+# (docs/operations/dashboard-bringup.md §Validation).
+#
+# Hits the compose-exposed loopback port directly, NOT 127.0.0.1:80 —
+# port 80 is unbound on the mgmt-host (only Traefik on 443 fronts the
+# dashboard with TLS). The compose file maps `127.0.0.1:${DASHBOARD_HOST_PORT:-3000}:80`
+# inside the container, so we hit that mapping for the bare-container
+# smoke check (no Traefik, no TLS, no Host header needed).
+
+- name: "dashboard | wait for dashboard to answer HTTP"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ netbird_dashboard_host_port | default(3000) }}/"
+    status_code: [200, 301, 302, 401, 403]
+  register: dashboard_smoke
+  retries: 30
+  delay: 2
+  until: dashboard_smoke.status in [200, 301, 302, 401, 403]
+
+# -- Admin dashboard (mesh-change-control.md §2) ----------------------------
+# Same pinned image as `dashboard`, full API on mgmt.<site> (mgmt-admin.<site>,
+# which refuses group writes, where warrant_membership_enabled), served at
+# admin-dashboard.<site> behind oauth2-proxy-dashboard-admin (NETBIRD-ADMIN
+# only; dashboard-fence-deploy.yml). Its env is the SAME template with two
+# values changed: the API endpoint and the self URL.
+- name: "dashboard-admin | render dashboard-admin.env (mode 0600 — contains OIDC client_secret)"
+  ansible.builtin.template:
+    src: dashboard.env.j2
+    dest: "{{ ory_compose_dir }}/dashboard-admin.env"
+    mode: "0600"
+    owner: root
+    group: root
+  vars:
+    netbird_dashboard_mgmt_api_endpoint: "{{ netbird_dashboard_admin_mgmt_api_endpoint }}"
+    netbird_dashboard_self_url: "{{ netbird_dashboard_admin_self_url }}"
+  when: netbird_dashboard_split_enabled | bool
+  register: netbird_dashboard_admin_env
+
+- name: "dashboard-admin | copy docker-compose.dashboard-admin.yml overlay"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/mgmt-host/docker-compose.dashboard-admin.yml"
+    dest: "{{ ory_compose_dir }}/docker-compose.dashboard-admin.yml"
+    mode: "0644"
+  when: netbird_dashboard_split_enabled | bool
+  register: netbird_dashboard_admin_overlay
+
+- name: "dashboard-admin | set DASHBOARD_ADMIN_HOST_PORT in /opt/mgmt-host/.env"
+  ansible.builtin.lineinfile:
+    path: "{{ ory_compose_dir }}/.env"
+    regexp: "^DASHBOARD_ADMIN_HOST_PORT="
+    line: "DASHBOARD_ADMIN_HOST_PORT={{ netbird_dashboard_admin_host_port }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  when: netbird_dashboard_split_enabled | bool
+
+- name: "dashboard-admin | bring up service (recreated when its env or overlay changed)"
+  ansible.builtin.command:
+    cmd: >-
+      docker compose -f docker-compose.yml -f docker-compose.dashboard-admin.yml
+      up -d {{ '--force-recreate' if (netbird_dashboard_admin_env.changed or netbird_dashboard_admin_overlay.changed) else '' }}
+      dashboard-admin
+    chdir: "{{ ory_compose_dir }}"
+  register: dashboard_admin_up
+  changed_when: "'Started' in dashboard_admin_up.stderr or 'Created' in dashboard_admin_up.stderr or 'Recreated' in dashboard_admin_up.stderr"
+  when: netbird_dashboard_split_enabled | bool
+
+- name: "dashboard-admin | wait for dashboard-admin to answer HTTP"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ netbird_dashboard_admin_host_port }}/"
+    status_code: [200, 301, 302, 401, 403]
+  register: dashboard_admin_smoke
+  retries: 30
+  delay: 2
+  until: dashboard_admin_smoke.status in [200, 301, 302, 401, 403]
+  when: netbird_dashboard_split_enabled | bool
+
+# Rollback path: flag off + re-run removes the admin container and its files.
+# Keyed on the overlay being present so a goatnet that never enabled the split
+# runs one stat and nothing else.
+- name: "dashboard-admin | is a previous admin overlay present (split now off)"
+  ansible.builtin.stat:
+    path: "{{ ory_compose_dir }}/docker-compose.dashboard-admin.yml"
+  register: netbird_dashboard_admin_overlay_stat
+  when: not (netbird_dashboard_split_enabled | bool)
+
+- name: "dashboard-admin | remove the admin container (split turned off)"
+  ansible.builtin.command:
+    cmd: docker compose -f docker-compose.yml -f docker-compose.dashboard-admin.yml rm --stop --force dashboard-admin
+    chdir: "{{ ory_compose_dir }}"
+  when:
+    - not (netbird_dashboard_split_enabled | bool)
+    - netbird_dashboard_admin_overlay_stat.stat.exists | default(false)
+
+- name: "dashboard-admin | remove the admin env + overlay (split turned off)"
+  ansible.builtin.file:
+    path: "{{ ory_compose_dir }}/{{ item }}"
+    state: absent
+  loop:
+    - dashboard-admin.env
+    - docker-compose.dashboard-admin.yml
+  when:
+    - not (netbird_dashboard_split_enabled | bool)
+    - netbird_dashboard_admin_overlay_stat.stat.exists | default(false)
+
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.

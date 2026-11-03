@@ -1,0 +1,414 @@
+---
+# installer-luks.yml — enroll an unattended-unlock mode onto a LUKS partition
+# the OS INSTALLER already created (full-disk encryption), WITHOUT reformatting
+# it and WITHOUT rewriting the root crypttab wholesale.
+#
+# This is the golden host-site node-class path (see
+# docs/design/host-site-node-disk-encryption.md). Two platform classes:
+#
+#   unlock_class: tpm2            x86 with a TPM 2.0 (OnLogic Karbon 801/802).
+#                                 Clevis binds a keyslot to the TPM (PCR 7);
+#                                 clevis-initramfs unlocks it before pivot and
+#                                 the box boots unattended. (NOT systemd-
+#                                 cryptenroll — Ubuntu's classic initramfs
+#                                 ignores its crypttab tpm2-device option.)
+#   unlock_class: tang_initramfs  headless arm64 with NO TPM (Raspberry Pi 5).
+#                                 Clevis binds a keyslot to a same-site Tang
+#                                 server; the initramfs brings up the network
+#                                 and unlocks before pivot — no console, no TPM.
+#
+# CONTRAST WITH luks_volumes: that path FORMATS a second, blank data disk and
+# owns its crypttab/fstab/mount lifecycle. THIS path never formats, never opens,
+# never mounts — the installer partition is already the running root. Every
+# operation here is additive (a new keyslot) or an in-place, add-only crypttab
+# edit. It is fail-closed: it asserts the expected installer shape
+# (crypto_LUKS -> dm-crypt -> LVM VG) and REFUSES rather than touch a device
+# that is not shaped as declared.
+#
+# ---------------------------------------------------------------------------
+# CERTIFICATION. This code governs disk encryption and the boot transaction;
+# offline lint and --syntax-check prove structure only. A path is trusted ONLY
+# after a power cycle that comes back to a mounted root with no console gesture.
+#   - tpm2 (Clevis)  : CERTIFIED — cold-boot proven on delta-core-a + delta-obs-a
+#                      (OnLogic Karbon 801, Ubuntu 24.04) .
+#   - tang_initramfs : NOT CERTIFIED — never run on a real Pi; the in-initramfs
+#                      Tang unlock and NIC bring-up are unproven (see design
+#                      doc §7 + §8). Prove on one Pi before trusting it.
+# ---------------------------------------------------------------------------
+
+- name: "installer-luks | assert each declared partition exists as a block device"
+  ansible.builtin.stat:
+    path: "{{ part.device }}"
+  register: installer_dev_stat
+  loop: "{{ luks_installer_partitions }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }} ({{ part.device }})"
+
+- name: "installer-luks | REFUSE when a declared partition device is absent"
+  ansible.builtin.fail:
+    msg: >-
+      Installer LUKS partition '{{ item.part.name }}' names device
+      {{ item.part.device }}, which is not a block device on this host.
+      Refusing to proceed — fix the device in this node's group_vars.
+  loop: "{{ installer_dev_stat.results }}"
+  loop_control:
+    label: "{{ item.part.name }} ({{ item.part.device }})"
+  when: not (item.stat.exists | default(false)) or not (item.stat.isblk | default(false))
+
+- name: "installer-luks | probe crypto_LUKS header on each declared partition"
+  ansible.builtin.command:
+    cmd: "cryptsetup isLuks {{ part.device }}"
+  register: installer_is_luks
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_installer_partitions }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }} ({{ part.device }})"
+
+# Fail-closed shape gate #1. The whole safety story of this task file is that
+# it only ever acts on a device that is genuinely an installer-made LUKS
+# container. `cryptsetup isLuks` returning non-zero means it is NOT LUKS — a
+# blank disk, a plain filesystem, the wrong device. We refuse rather than
+# enroll/edit against it. There is deliberately no override flag.
+- name: "installer-luks | REFUSE when a declared partition is not LUKS (wrong device / not installer-encrypted)"
+  ansible.builtin.fail:
+    msg: >-
+      REFUSED: {{ item.part.device }} (declared as installer LUKS partition
+      '{{ item.part.name }}') has no LUKS header. This path never formats — it
+      only enrolls an unlock mode onto a partition the installer ALREADY
+      encrypted. A non-LUKS device here means the wrong device is named, or the
+      box was not installed with full-disk encryption. Fix the device in
+      group_vars, or use the luks_volumes path if you intend to format a blank
+      data disk.
+  loop: "{{ installer_is_luks.results }}"
+  loop_control:
+    label: "{{ item.part.name }} ({{ item.part.device }})"
+  when: item.rc != 0
+
+- name: "installer-luks | read blkid TYPE for each declared partition"
+  ansible.builtin.command:
+    cmd: "blkid -s TYPE -o value {{ part.device }}"
+  register: installer_blkid_type
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_installer_partitions }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }} ({{ part.device }})"
+
+- name: "installer-luks | REFUSE when blkid TYPE is not crypto_LUKS"
+  ansible.builtin.fail:
+    msg: >-
+      REFUSED: {{ item.part.device }} reports blkid TYPE
+      '{{ item.stdout | default('') | trim }}', not 'crypto_LUKS'. Refusing to
+      touch a device that is not shaped as an installer LUKS container.
+  loop: "{{ installer_blkid_type.results }}"
+  loop_control:
+    label: "{{ item.part.name }} ({{ item.part.device }})"
+  when: (item.stdout | default('') | trim) != 'crypto_LUKS'
+
+- name: "installer-luks | list volume groups (confirm LVM-on-LUKS installer shape)"
+  ansible.builtin.command:
+    cmd: "vgs --noheadings -o vg_name"
+  register: installer_vgs
+  changed_when: false
+  failed_when: false
+
+# Fail-closed shape gate #2. The declared installer shape is
+# crypto_LUKS -> dm-crypt -> LVM PV -> VG (ubuntu-vg by default, as the Ubuntu
+# guided full-disk-encryption installer builds it). If the expected VG is not
+# present, the box is not shaped as declared and we do not proceed — the
+# docker-data LV carve (encrypted-lv-carve.yml) depends on this VG existing,
+# and enrolling an unlock mode onto a box whose layout we misread is exactly
+# the class of mistake this gate exists to stop.
+- name: "installer-luks | REFUSE when the expected LVM volume group is absent"
+  ansible.builtin.fail:
+    msg: >-
+      REFUSED: expected volume group '{{ item.expected_vg }}' (declared for
+      installer partition '{{ item.name }}') is not present. Volume groups seen:
+      {{ (installer_vgs.stdout_lines | default([]) | map('trim') | list) | join(', ') | default('(none)') }}.
+      The installer shape this path supports is crypto_LUKS -> dm-crypt -> LVM.
+      Refusing rather than acting on a host whose disk layout differs from what
+      group_vars declares.
+  loop: "{{ luks_installer_partitions }}"
+  loop_control:
+    label: "{{ item.name }} (expects vg={{ item.expected_vg }})"
+  when: item.expected_vg not in (installer_vgs.stdout_lines | default([]) | map('trim') | list)
+
+- name: "installer-luks | discover each installer partition's LUKS UUID (for the in-place crypttab edit)"
+  ansible.builtin.command:
+    cmd: "blkid -s UUID -o value {{ part.device }}"
+  register: installer_uuid_lookup
+  changed_when: false
+  loop: "{{ luks_installer_partitions }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }} ({{ part.device }})"
+
+- name: "installer-luks | build name -> LUKS-UUID map"
+  ansible.builtin.set_fact:
+    installer_part_uuids: >-
+      {{ dict(installer_uuid_lookup.results | map(attribute='part.name')
+              | zip(installer_uuid_lookup.results | map(attribute='stdout') | map('trim'))) }}
+
+# ===========================================================================
+# unlock_class: tpm2  (x86 with a TPM 2.0) — Clevis-bound, unlocked in initramfs
+# ===========================================================================
+# Ubuntu's initramfs-tools uses the classic scripts/local-top/cryptroot boot
+# script, NOT systemd-cryptsetup, so a systemd-cryptenroll TPM2 keyslot is
+# never consumed at boot — `update-initramfs` warns "ignoring unknown option
+# 'tpm2-device'" and the box falls back to a console passphrase prompt. Clevis
+# is the mechanism that works on Ubuntu: `clevis-initramfs` installs a
+# local-top hook that runs clevis-luks-askpass and unlocks the clevis-bound
+# keyslot before pivot, answering the installer's OWN plain `luks` crypttab
+# entry — so this class NEVER edits crypttab. This unifies the tpm2 and
+# tang_initramfs classes on one initramfs mechanism (Clevis).
+#
+# Proven by a real cold boot on delta-core-a + delta-obs-a (OnLogic Karbon 801,
+# Ubuntu 24.04, systemd 255) both returned to a mounted root with
+# no console gesture.
+
+- name: "installer-luks | tpm2 | install Clevis + TPM2 + initramfs unlock tooling"
+  ansible.builtin.apt:
+    name: "{{ luks_packages_tpm2_initramfs }}"
+    state: present
+    update_cache: true
+  when: (luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tpm2') | list | length) > 0
+
+- name: "installer-luks | tpm2 | probe for a usable TPM2 device"
+  ansible.builtin.command:
+    cmd: systemd-cryptenroll --tpm2-device=list
+  register: installer_tpm2_probe
+  changed_when: false
+  failed_when: false
+  when: (luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tpm2') | list | length) > 0
+
+# A stock Ubuntu full-disk-encryption install can report "TPM2 support is not
+# installed" here even with a TPM chip present, because one of the three libs
+# systemd dlopens (libtss2-rc, from libtss2-rc0t64) is not installed by
+# default. The clevis-tpm2 package pulls tpm2-tools, which is what clevis
+# actually uses to seal/unseal — so a clevis bind can succeed even when this
+# systemd probe is unhappy. The probe stays as a best-effort NOTICE, not a gate
+# that would wrongly skip a box whose TPM clevis can in fact use. `> 1` line
+# means a device row printed under the header.
+- name: "installer-luks | tpm2 | set fact — TPM2 device present"
+  ansible.builtin.set_fact:
+    installer_tpm2_present: >-
+      {{ (installer_tpm2_probe.rc | default(1)) == 0
+         and (installer_tpm2_probe.stdout_lines | default([]) | length) > 1 }}
+
+- name: "installer-luks | tpm2 | probe LUKS header for an existing Clevis tpm2 binding (idempotency)"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      if clevis luks list -d "{{ part.device }}" 2>/dev/null | grep -q 'tpm2'; then
+        echo present
+      else
+        echo absent
+      fi
+    executable: /bin/bash
+  register: installer_clevis_tpm2
+  changed_when: false
+  failed_when: false
+  loop: "{{ luks_installer_partitions }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }}"
+  when: part.unlock_class == 'tpm2'
+
+- name: "installer-luks | tpm2 | NOTICE — TPM2 enrollment requested but no TPM2 device present"
+  ansible.builtin.debug:
+    msg: >-
+      Installer partition '{{ item.part.name }}': unlock_class=tpm2 but no TPM2
+      device is visible to systemd-cryptenroll. Skipping Clevis bind — the
+      installer passphrase slot still unlocks at the console. On a box that is
+      meant to have a TPM (OnLogic Karbon 801/802), check firmware/Secure-Boot
+      before trusting unattended boot.
+  loop: "{{ installer_clevis_tpm2.results | default([]) }}"
+  loop_control:
+    label: "{{ item.part.name }}"
+  when:
+    - item is not skipped
+    - not (installer_tpm2_present | default(false))
+
+# NON-DESTRUCTIVE + idempotent: `clevis luks bind` ADDS a keyslot, authenticated
+# against the existing installer passphrase (fed on stdin, -k -); it cannot
+# destroy data. Skipped when a tpm2 pin is already bound to the device.
+#
+# PCR policy — `luks_clevis_tpm2_pcr_ids` defaults to "7" (Secure Boot policy
+# state), which is STABLE across kernel/initramfs updates. Binding kernel PCRs
+# (4) or firmware PCRs (0) would re-seal against a value that changes on every
+# OS update and break unattended unlock on a headless field box. Widen this
+# only where boot-chain integrity is worth re-binding after each update. On the
+# Karbon 801s Secure Boot is disabled; PCR 7 is a stable anchor either way.
+- name: "installer-luks | tpm2 | bind a Clevis TPM2 keyslot (idempotent, additive)"
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      printf '%s' "{{ item.part.passphrase | default('') }}"
+      | clevis luks bind -y -k - -d "{{ item.part.device }}"
+        tpm2 '{"pcr_bank":"{{ luks_clevis_tpm2_pcr_bank }}","pcr_ids":"{{ luks_clevis_tpm2_pcr_ids }}"}'
+    executable: /bin/bash
+  loop: "{{ installer_clevis_tpm2.results | default([]) }}"
+  loop_control:
+    label: "{{ item.part.name }}"
+  when:
+    - item is not skipped
+    - (item.stdout | default('present') | trim) == 'absent'
+    - installer_tpm2_present | default(false)
+    - (item.part.passphrase | default('')) | length > 0
+  no_log: true
+  notify: regenerate initramfs
+
+# NOTE: no crypttab edit for the tpm2 class. The installer's own crypttab entry
+# is a plain `luks` line; clevis-luks-askpass (from the local-top hook baked in
+# by clevis-initramfs above, via the `regenerate initramfs` handler) answers it
+# at boot. Removing the crypttab edit also removes the half-state failure mode
+# where crypttab claimed `tpm2-device=auto` while no keyslot was ever enrolled.
+
+# ===========================================================================
+# unlock_class: tang_initramfs  (headless arm64, NO TPM — Raspberry Pi 5)
+# ===========================================================================
+
+- name: "installer-luks | tang_initramfs | install Clevis + initramfs unlock tooling"
+  ansible.builtin.apt:
+    name: "{{ luks_packages_tang_initramfs }}"
+    state: present
+    update_cache: true
+  when: (luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tang_initramfs') | list | length) > 0
+
+# The initramfs must have working networking BEFORE clevis-luks-askpass can
+# reach Tang — exactly the same requirement the dropbear-initramfs role has.
+# initramfs-tools brings up the NIC from the `IP=` line in initramfs.conf
+# (a kernel-style ip= string, e.g. 192.168.1.50::192.168.1.1:255.255.255.0::eth0:off);
+# DHCP in the initramfs is unreliable, so a static config is expected.
+# `initramfs_kmods` seeds the NIC driver into the initrd (the RPi5 NIC module
+# is NOT guaranteed present by default — a live-box item).
+#
+# LIVE-BOX RISK: no box in this repo has ever unlocked LUKS via Tang IN THE
+# INITRAMFS. The only in-initramfs network precedent is dropbear-initramfs, and
+# its NIC handling is Tegra-specific. Prove the NIC comes up and Tang is
+# reachable in the initrd on ONE real Pi before trusting this.
+- name: "installer-luks | tang_initramfs | configure initramfs static networking (per partition initramfs_ip)"
+  ansible.builtin.lineinfile:
+    path: /etc/initramfs-tools/initramfs.conf
+    regexp: '^IP='
+    line: "IP={{ part.initramfs_ip }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tang_initramfs') | list }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }} (IP={{ part.initramfs_ip | default('UNSET') }})"
+  when: (part.initramfs_ip | default('')) | length > 0
+  notify: regenerate initramfs
+
+- name: "installer-luks | tang_initramfs | seed NIC driver modules into the initramfs"
+  ansible.builtin.lineinfile:
+    path: /etc/initramfs-tools/modules
+    regexp: '^{{ item.1 }}\b'
+    line: "{{ item.1 }}"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ (luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tang_initramfs') | list) | subelements('initramfs_kmods', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.name }} -> kmod {{ item.1 }}"
+  notify: regenerate initramfs
+
+- name: "installer-luks | tang_initramfs | NOTICE — initramfs networking not configured for a tang_initramfs partition"
+  ansible.builtin.debug:
+    msg: >-
+      Installer partition '{{ part.name }}' uses unlock_class=tang_initramfs but
+      no `initramfs_ip` is set. Tang unlock runs INSIDE the initramfs and cannot
+      reach the network without a static IP config there. Set `initramfs_ip`
+      (kernel-style ip= string) on this partition, or configure initramfs
+      networking via the dropbear-initramfs role — otherwise the box will fall
+      back to a console passphrase prompt at boot, which defeats headless
+      unattended unlock.
+  loop: "{{ luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tang_initramfs') | list }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }}"
+  when: (part.initramfs_ip | default('')) | length == 0
+
+# Same private-substrate invariant as the post-boot tang_client path
+# (ADR 0313 / ADR 0612): Tang must never be reachable from the public internet.
+# Accept wg-cp0-internal (198.18.0.0/24 or legacy 10.99.0.0/24) or an explicit
+# same-site LAN URL declared with `class: lan`.
+- name: "installer-luks | tang_initramfs | pre-flight — every Tang URL is on a private substrate"
+  ansible.builtin.fail:
+    msg: >-
+      Tang server {{ item.1.name }} url={{ item.1.url }} for installer partition
+      '{{ item.0.name }}' is not wg-cp0-internal (198.18.0.0/24 or legacy
+      10.99.0.0/24) AND class:lan is not set. Public Tang is rejected.
+  loop: "{{ (luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tang_initramfs') | list) | subelements('tang_servers', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.name }} -> {{ item.1.name }} ({{ item.1.url }})"
+  when:
+    - not (item.1.url is regex('^https?://198\\.18\\.0\\.[0-9]+(:[0-9]+)?(/.*)?$'))
+    - not (item.1.url is regex('^https?://10\\.99\\.0\\.[0-9]+(:[0-9]+)?(/.*)?$'))
+    - (item.1.class | default('wg-cp0')) != 'lan'
+
+# NON-DESTRUCTIVE + idempotent: clevis luks bind ADDS a keyslot, authenticated
+# against the installer passphrase. Skips a server already bound to this device.
+- name: "installer-luks | tang_initramfs | bind each Tang server as an additional keyslot (idempotent, additive)"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      if clevis luks list -d "{{ item.0.device }}" 2>/dev/null \
+         | grep -F '{{ item.1.url }}' > /dev/null; then
+        echo "ALREADY BOUND: {{ item.1.url }}"
+        exit 0
+      fi
+      printf '%s' "{{ item.0.passphrase | default('') }}" \
+        | clevis luks bind -y -k - \
+            -d "{{ item.0.device }}" \
+            tang '{"url":"{{ item.1.url }}"}'
+      echo "BOUND: {{ item.1.url }}"
+    executable: /bin/bash
+  register: installer_tang_bind
+  changed_when: "'ALREADY BOUND' not in (installer_tang_bind.stdout | default(''))"
+  no_log: true
+  loop: "{{ (luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tang_initramfs') | list) | subelements('tang_servers', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.name }} -> {{ item.1.name }} ({{ item.1.url }})"
+  when: (item.0.passphrase | default('')) | length > 0
+  notify: regenerate initramfs
+
+# BOOT-CRITICAL, add-only. `_netdev` makes the initramfs bring the network up
+# and run clevis-luks-askpass BEFORE it tries to unlock root — the mechanism by
+# which a headless, TPM-less box unlocks at boot with no console. Matched by
+# UUID; refuses if the installer entry is missing.
+#
+# NOTE (live-box check): the entry must NOT carry `headless`. `headless`
+# disables the systemd password query that clevis-luks-askpass answers, so it
+# blocks clevis unlock (the same F-285 reason the post-boot tang_client path
+# exists). The Ubuntu FDE installer does not add `headless`; this task does not
+# add it either. If a box carries it, remove it before trusting unattended boot.
+- name: "installer-luks | tang_initramfs | add _netdev to the existing crypttab entry (add-only, matched by UUID)"
+  ansible.builtin.shell:
+    cmd: "{{ lookup('template', 'crypttab-add-option.sh.j2') }}"
+    executable: /bin/bash
+  vars:
+    _ct_uuid: "{{ installer_part_uuids[part.name] }}"
+    _ct_opts: "_netdev"
+  register: installer_tang_crypttab
+  changed_when: "'CHANGED' in (installer_tang_crypttab.stdout | default(''))"
+  loop: "{{ luks_installer_partitions }}"
+  loop_control:
+    loop_var: part
+    label: "{{ part.name }}"
+  when: part.unlock_class == 'tang_initramfs'
+  notify: regenerate initramfs
+
+- name: "installer-luks | tang_initramfs | enable clevis-luks-askpass.path"
+  ansible.builtin.systemd:
+    name: clevis-luks-askpass.path
+    enabled: true
+  when: (luks_installer_partitions | selectattr('unlock_class', 'equalto', 'tang_initramfs') | list | length) > 0

@@ -1,0 +1,267 @@
+---
+# ops/ansible/roles/traefik
+#
+# Anchor: ADR 0407 — internal X.509 CA for service TLS.
+# Design:  docs/design/internal-tls-ca.md §6.
+# First consumer: the mgmt-API behind the wg-cp0 silent control plane (Block 22).
+#
+# Responsibilities:
+#   1. Ensure the host directory layout exists (cert root + dynamic dir).
+#   2. Push offline-CA-signed cert+key from operator laptop to host.
+#   3. Render dynamic config (TLS options + routers + services).
+#   4. Notify the traefik container to pick up changes (file-watcher does
+#      this without a restart for cert + config; container restart is
+#      needed only on image bump).
+#
+# Pre-flight: traefik_services list must be set (per group_vars), each
+# entry must point at PEM files that EXIST on the operator laptop. The
+# role fails fast with a clear message if not.
+
+- name: Pre-flight — traefik_services is set
+  ansible.builtin.assert:
+    that:
+      - traefik_services is defined
+      - traefik_services | length > 0
+    fail_msg: |
+      The traefik role requires `traefik_services` to be set
+      (typically in group_vars/<site>_hosts/vars.yml).
+      Each entry must declare {name, hosts, backend, cert_src, key_src}.
+      See ops/ansible/roles/traefik/defaults/main.yml for the format.
+
+- name: Pre-flight — cert + key files exist on operator laptop
+  delegate_to: localhost
+  become: false
+  ansible.builtin.stat:
+    path: "{{ item.0 }}"
+  loop: "{{ traefik_services | subelements(['cert_src','key_src']) | default([]) }}"
+  register: _traefik_src_files
+  ignore_errors: true
+  # Note: subelements would error on non-list keys; the simpler check
+  # below is more robust to operator typos. Ignore_errors keeps the
+  # pre-flight informative rather than catastrophic.
+  when: false  # disabled — the per-file check below is the durable form.
+
+- name: Pre-flight — each service's cert + key exist on operator laptop
+  delegate_to: localhost
+  become: false
+  ansible.builtin.stat:
+    path: "{{ src_path }}"
+  loop: >-
+    {{ traefik_services
+       | map(attribute='cert_src') | list
+       + traefik_services | map(attribute='key_src') | list }}
+  loop_control:
+    loop_var: src_path
+  register: _traefik_pem_stats
+
+- name: Fail loudly if any cert or key is missing on operator laptop
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | default(false)
+    fail_msg: |
+      Cert or key file missing on operator laptop:
+        {{ item.src_path }}
+      Run cert-sign first (ops/enrollment/cmd/cert-sign/) per
+      docs/design/internal-tls-ca.md §7.2. The output paths must match
+      the `cert_src` / `key_src` fields in `traefik_services`.
+  loop: "{{ _traefik_pem_stats.results }}"
+  loop_control:
+    label: "{{ item.src_path }}"
+
+- name: Pre-flight — every middleware referenced by a service is defined
+  ansible.builtin.assert:
+    that:
+      - mw in (traefik_middlewares | default({}))
+    fail_msg: |
+      traefik service `{{ item.0.name }}` references middleware
+      `{{ mw }}` but it is not defined in `traefik_middlewares`.
+      Either add a definition for `{{ mw }}` or remove it from
+      svc.middlewares. Defining nothing means Traefik 503s every
+      request to this router with no useful log line.
+  loop: "{{ traefik_services | subelements('middlewares', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.name }} → {{ mw }}"
+  vars:
+    mw: "{{ item.1 }}"
+
+# 1. Host filesystem layout
+
+- name: Ensure {{ traefik_tls_root }} exists with restrictive mode
+  ansible.builtin.file:
+    path: "{{ traefik_tls_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Ensure per-service TLS dirs exist
+  ansible.builtin.file:
+    path: "{{ traefik_tls_root }}/{{ item.name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop: "{{ traefik_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Ensure {{ traefik_dynamic_dir }} exists
+  ansible.builtin.file:
+    path: "{{ traefik_dynamic_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# 2. Cert + key delivery
+
+- name: Push leaf cert PEM (mode 0644 — public material)
+  ansible.builtin.copy:
+    src: "{{ item.cert_src }}"
+    dest: "{{ traefik_tls_root }}/{{ item.name }}/cert.pem.leaf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ traefik_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: traefik changed
+
+# Render leaf+intermediate fullchain so Traefik presents the full cert chain
+# to clients. Without this, clients (Go's crypto/tls, openssl, browsers) get
+# the leaf only and fail with "x509: certificate signed by unknown authority"
+# unless they have the intermediate trusted directly.
+#
+# Two-step: first copy the chain anchor cert from the controller to a
+# stable on-host location, then cat leaf + chain-anchor on the host. The
+# leaf-only form that cats on the host cannot reference a controller-side path:
+# operator-laptop paths don't exist on the host.
+- name: Copy chain-anchor cert (intermediate or root) to host
+  ansible.builtin.copy:
+    src: "{{ traefik_intermediate_cert }}"
+    dest: "{{ traefik_tls_root }}/chain-anchor.pem"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: traefik changed
+
+- name: Render fullchain (leaf + chain-anchor) for Traefik
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      cat "{{ traefik_tls_root }}/{{ item.name }}/cert.pem.leaf" "{{ traefik_tls_root }}/chain-anchor.pem" \
+        > "{{ traefik_tls_root }}/{{ item.name }}/cert.pem.new"
+      chmod 0644 "{{ traefik_tls_root }}/{{ item.name }}/cert.pem.new"
+      mv "{{ traefik_tls_root }}/{{ item.name }}/cert.pem.new" \
+         "{{ traefik_tls_root }}/{{ item.name }}/cert.pem"
+  args:
+    executable: /bin/bash
+  loop: "{{ traefik_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+  notify: traefik changed
+  changed_when: true
+
+- name: Push leaf key PEM (mode 0400 — secret material)
+  ansible.builtin.copy:
+    src: "{{ item.key_src }}"
+    dest: "{{ traefik_tls_root }}/{{ item.name }}/key.pem"
+    owner: root
+    group: root
+    mode: "0400"
+  loop: "{{ traefik_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  notify: traefik changed
+
+# 2.5 Converge the cert store to what is DECLARED
+#
+# Everything above delivers `traefik_services`. Without this step nothing removes
+# a service that stops being declared, so `traefik_tls_root` only ever grows — and
+# a host whose `traefik_services` becomes `[]` keeps every leaf and PRIVATE KEY it
+# was ever given, indefinitely, with no play that would ever touch them again.
+#
+# Retiring a goatnet revokes its identities on the mesh and in the ACL; it does
+# not remove its private keys from a machine that outlives it.
+#
+# Declared state converges in both directions from here. Turn it off with
+# `traefik_prune_undeclared_certs: false` on a host that stores unrelated
+# material under this root — nothing does today, and a host that needs to
+# should use its own directory rather than this one.
+- name: Find cert directories present under the TLS root
+  ansible.builtin.find:
+    paths: "{{ traefik_tls_root }}"
+    file_type: directory
+    recurse: false
+  register: _traefik_cert_dirs
+  when: traefik_prune_undeclared_certs | default(true) | bool
+
+- name: Remove cert directories no longer named in traefik_services
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ (_traefik_cert_dirs.files | default([]) | map(attribute='path') | list)
+       | reject('in', (traefik_services | map(attribute='name')
+                       | map('regex_replace', '^', traefik_tls_root ~ '/') | list))
+       | list }}
+  loop_control:
+    label: "{{ item | basename }}"
+  when: traefik_prune_undeclared_certs | default(true) | bool
+  notify: traefik changed
+
+# 3. Dynamic config
+
+- name: Render dynamic config
+  ansible.builtin.template:
+    src: dynamic.yml.j2
+    dest: "{{ traefik_dynamic_dir }}/dynamic.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: traefik changed
+
+# 4. Compose-service liveness — bring up traefik if not running
+#
+# RESIDUAL VECTOR: this fix protects only runs from checkouts that CONTAIN it.
+# ansible-preflight's stale-trunk guard is skipped for feature-branch worktrees.
+# Before running any traefik-touching play from an old worktree: rebase it, or
+# run from a fresh trunk checkout.
+#
+# OVERLAY-AWARE: sites that ran
+# traefik-acme.yml carry /opt/mgmt-host/docker-compose.acme.yml — a
+# compose OVERRIDE that re-defines traefik's command with the LE
+# certificatesResolvers flags. A bare `docker compose up -d traefik` uses
+# the BASE file only and silently RECREATES traefik WITHOUT the resolver
+# (traefik-acme.yml documents exactly that invocation as its ROLLBACK):
+# every vhost falls to TRAEFIK DEFAULT CERT, and any lane with an outer mTLS
+# breaks. The up must therefore include the
+# overlay whenever it exists on the host — never a base-file up on an
+# ACME-overlaid site.
+
+- name: Detect the ACME compose overlay (traefik-acme.yml)
+  ansible.builtin.stat:
+    path: "{{ mgmt_host_compose_dir }}/docker-compose.acme.yml"
+  register: _traefik_acme_overlay
+
+- name: Ensure traefik service is up via compose (overlay-aware)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      {% if _traefik_acme_overlay.stat.exists %}-f docker-compose.yml -f docker-compose.acme.yml{% endif %}
+      up -d traefik
+    chdir: "{{ mgmt_host_compose_dir }}"
+  register: _traefik_compose_up
+  changed_when: "'Started' in _traefik_compose_up.stderr or 'Created' in _traefik_compose_up.stderr or 'Recreated' in _traefik_compose_up.stderr"
+
+# Container-side trust bundle for the offline-CA chain is now baked into
+# the netbird-mgmt image at build time (Block 78A-(a) — see
+# ops/netbird-mgmt/Dockerfile + ca/ layer). The container's default trust
+# store includes the offline-CA root + intermediate, so JWKS-fetch from
+# https://oauth2.<site>.netbird-prod.goat.example/.well-known/jwks.json
+# validates without an SSL_CERT_FILE override. The previous host-side
+# render task + restart handler were retired together with the
+# docker-compose.yml override removal.
+#
+# F-101 → Closed by image-side fix.

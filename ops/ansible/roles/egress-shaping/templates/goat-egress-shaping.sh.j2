@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# ADR 1081 Layer 3 — host-local egress shaping for control-plane survivability.
+# docs/design/control-plane-storm-resilience.md §"Layer 3".
+#
+# host egress only — NOT fabric QoS (ADR 1033 boundary, ADR 1081 L3).
+# The DSCP marks set below are a host-local cake-tin selector; cake's `wash`
+# clears them on egress so nothing leaks onto the wire or the Zenoh fabric.
+#
+# Rendered by the egress-shaping Ansible role. Run at boot (systemd oneshot)
+# and on every deploy. Idempotent: `tc qdisc replace` and `nft -f` with a
+# flushed table both converge rather than accumulate.
+set -euo pipefail
+
+CAP_MBIT="{{ egress_shaping_bandwidth_mbit }}"
+CAKE_DIFFSERV="{{ egress_shaping_cake_diffserv }}"
+CTL_DSCP="{{ egress_shaping_ctl_dscp }}"
+RATHOLE_CTL_PORT="{{ egress_shaping_rathole_ctl_port }}"
+MGMT_PORT="{{ egress_shaping_mgmt_port }}"
+RATHOLE_CONF_DIR="{{ egress_shaping_rathole_config_dir }}"
+NFT_TABLE="goat_egress_shaping"
+
+log() { echo "[goat-egress-shaping] $*"; }
+
+# --- 1. Discover the WAN egress interface at runtime -----------------------
+# The default-route iface — never hard-coded, so this role is portable across
+# Thor hosts whose WAN NIC differs (eth0 / enP.. / the LAN uplink).
+IFACE="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')"
+if [[ -z "${IFACE}" ]]; then
+  log "no default-route interface found; nothing to shape"
+  exit 0
+fi
+
+if [[ -z "${CAP_MBIT}" ]]; then
+  log "ERROR: no bandwidth cap set (egress_shaping_bandwidth_mbit). Refusing to shape." >&2
+  exit 1
+fi
+
+# --- 2. cake qdisc on the WAN egress iface ---------------------------------
+# bandwidth cap keeps the queue on the Thor where cake manages it (not the
+# modem buffer). `wash` strips DSCP after cake uses it for tin selection, so
+# our host-local control-plane marks never reach the wire (ADR 1033 boundary).
+log "applying cake on ${IFACE} @ ${CAP_MBIT}mbit (${CAKE_DIFFSERV}, wash)"
+tc qdisc replace dev "${IFACE}" root cake bandwidth "${CAP_MBIT}mbit" "${CAKE_DIFFSERV}" wash
+
+# --- 3. Resolve relay IPs from the on-host rathole client configs ----------
+# Same source of truth the rathole-client playbooks template:
+# /etc/rathole/client-<relay>.toml carries `remote_addr = "<relay_ip>:2333"`.
+# Reading them here (rather than an Ansible var) keeps the mark table in sync
+# with whatever tunnels this host actually runs, and tolerates configs that
+# arrive after boot.
+declare -a RELAY_IPS=()
+if compgen -G "${RATHOLE_CONF_DIR}/client-*.toml" > /dev/null 2>&1; then
+  while IFS= read -r ip; do
+    [[ -n "${ip}" ]] && RELAY_IPS+=("${ip}")
+  done < <(grep -hoE 'remote_addr[[:space:]]*=[[:space:]]*"[^"]+"' "${RATHOLE_CONF_DIR}"/client-*.toml \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+fi
+log "relay IPs for mgmt/:${MGMT_PORT} priority: ${RELAY_IPS[*]:-<none found>}"
+
+# --- 4. Host-local DSCP-steering table (nftables) --------------------------
+# Mark (a) rathole control-channel (tcp dport 2333) and (b) mgmt/signal to the
+# known relay IPs (tcp dport 443) into the control-plane DSCP, which cake
+# diffserv3 maps to its top tin. Everything else stays best-effort. The whole
+# table is flushed and rebuilt each run → idempotent.
+RELAY_SET_V4=""
+if [[ ${#RELAY_IPS[@]} -gt 0 ]]; then
+  RELAY_SET_V4="$(IFS=,; echo "${RELAY_IPS[*]}")"
+fi
+
+{
+  echo "table inet ${NFT_TABLE} {"
+  echo "  chain output {"
+  echo "    type filter hook output priority mangle; policy accept;"
+  echo "    # (a) rathole tunnel control channel — the keepalive/registration path"
+  echo "    meta nfproto ipv4 tcp dport ${RATHOLE_CTL_PORT} ip dscp set ${CTL_DSCP} counter"
+  echo "    meta nfproto ipv6 tcp dport ${RATHOLE_CTL_PORT} ip6 dscp set ${CTL_DSCP} counter"
+  if [[ -n "${RELAY_SET_V4}" ]]; then
+    echo "    # (b) mgmt/signal-bound traffic to the relay public IPs on :${MGMT_PORT}"
+    echo "    ip daddr { ${RELAY_SET_V4} } tcp dport ${MGMT_PORT} ip dscp set ${CTL_DSCP} counter"
+  fi
+  echo "  }"
+  echo "}"
+} > /tmp/goat-egress-shaping.nft
+
+# Replace atomically: drop any prior instance of our table, then load fresh.
+nft "delete table inet ${NFT_TABLE}" 2>/dev/null || true
+nft -f /tmp/goat-egress-shaping.nft
+rm -f /tmp/goat-egress-shaping.nft
+
+log "applied. qdisc:"
+tc -s qdisc show dev "${IFACE}" | sed 's/^/[goat-egress-shaping]   /'

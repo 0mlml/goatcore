@@ -1,0 +1,161 @@
+---
+# Phase 11. The link the agreement describes, against the key the counterparty's
+# signed package offers. Fails closed on everything: a guessed value here is refused
+# in silence at the far end and reads as a broken link.
+- name: peering-wg | prepare (idempotent; a resumed run may not have prepared this host)
+  ansible.builtin.import_tasks: prepare.yml
+
+- name: peering-wg | this is the transport the agreement selected
+  ansible.builtin.assert:
+    that:
+      - peering_wg_kind == 'wireguard'
+    fail_msg: >-
+      goat-peering-wg refuses: the rendered agreement selects transport
+      '{{ peering_wg_kind }}'. Deploying WireGuard under any other agreement is the
+      drift between what two parties agreed and what got deployed that this flow exists
+      to prevent. An empty value means federation-<them>-transport.yml did not
+      reach this play: run it through the driver, or pass fed_work and fed_edge_group.
+
+- name: peering-wg | the agreement's link values are all here
+  ansible.builtin.assert:
+    that:
+      - peering_wg_our_sovereign | length > 0
+      - peering_wg_partner_sovereign | length > 0
+      - peering_wg_local_link_ip | length > 0
+      - peering_wg_remote_link_ip | length > 0
+      - peering_wg_local_link_ip != peering_wg_remote_link_ip
+      - (peering_wg_link_prefix_len | int) in [30, 31]
+      - (peering_wg_mtu | int) >= 1280
+      - peering_wg_counterparty_package | length > 0
+    fail_msg: "goat-peering-wg needs the rendered agreement values and the counterparty package. Nothing here is guessed."
+
+- name: peering-wg | read the counterparty's package
+  ansible.builtin.set_fact:
+    _pw_offer_doc: "{{ lookup('ansible.builtin.file', peering_wg_counterparty_package) | from_json }}"
+
+- name: peering-wg | the package is the partner's and carries an offer
+  ansible.builtin.assert:
+    that:
+      - _pw_offer_doc.sovereign_id == peering_wg_partner_sovereign
+      - _pw_offer_doc.transport_offer is defined
+      - _pw_offer_doc.transport_offer.public_key is match('^[A-Za-z0-9+/]{43}=$')
+    fail_msg: >-
+      {{ peering_wg_counterparty_package }} is not {{ peering_wg_partner_sovereign }}'s
+      package with a WireGuard offer. Phase 6 composed the agreement from this file, so
+      a mismatch means it changed after composition: compare it with what they sent.
+
+- name: peering-wg | the side that dials has somewhere to dial
+  ansible.builtin.assert:
+    that:
+      - _pw_offer_doc.transport_offer.endpoint is match('^[^:/\s]+:[0-9]+$')
+    fail_msg: >-
+      {{ peering_wg_partner_sovereign }} offers endpoint
+      '{{ _pw_offer_doc.transport_offer.endpoint }}', and this side has to dial it.
+      The endpoint has to be host:port.
+  when: not (peering_wg_we_listen | bool)
+
+- name: peering-wg | compose what the offer and the agreement say
+  ansible.builtin.set_fact:
+    _pw_peer_key: "{{ _pw_offer_doc.transport_offer.public_key }}"
+    _pw_peer_endpoint: "{{ _pw_offer_doc.transport_offer.endpoint }}"
+    # A literal address names who may reach the tunnel port. A name cannot be
+    # filtered on, and the rule below is then left out rather than guessed.
+    _pw_peer_addr: >-
+      {{ (_pw_offer_doc.transport_offer.endpoint.rsplit(':', 1) | first)
+         if (_pw_offer_doc.transport_offer.endpoint is match('^[0-9.]+:[0-9]+$')) else '' }}
+    _pw_decision: >-
+      {%- if not (peering_wg_fips_required | bool) -%}proceed-no-claim
+      {%- elif peering_wg_fips_waived_reason | length > 0 -%}proceed-waived
+      {%- else -%}refuse
+      {%- endif -%}
+
+- name: peering-wg | read the kernel's own FIPS claim
+  ansible.builtin.slurp:
+    src: /proc/sys/crypto/fips_enabled
+  register: _pw_kernel_fips_raw
+  failed_when: false
+
+# Written BEFORE the gate, so a refusal leaves the evidence of why on the host.
+- name: peering-wg | write the state file
+  ansible.builtin.template:
+    src: state.json.j2
+    dest: "{{ peering_wg_state_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: peering-wg | refuse WireGuard across a boundary with no recorded reason
+  ansible.builtin.fail:
+    msg: >-
+      goat-peering-wg refuses: peering_wg_fips_required is true and WireGuard's
+      primitives are not FIPS-approved, so no host can make the claim for this tunnel.
+      The claim belongs to the Zenoh TLS session inside it. Set
+      peering_wg_fips_waived_reason to the reason this link proceeds (waiver
+      DBB-WVR-001, docs/compliance/waivers/wireguard-fips-validation.md), or
+      peering_wg_fips_required=false to state this edge is outside the claim. A party
+      that needs a validated tunnel declares ipsec-fips and not wireguard. Observations
+      are recorded at {{ peering_wg_state_path }}.
+  when: _pw_decision == 'refuse'
+
+- name: peering-wg | RECORDED DEVIATION — no FIPS claim for this tunnel
+  ansible.builtin.debug:
+    msg:
+      - "================ FIPS DEVIATION ================"
+      - "peering:   {{ peering_wg_our_sovereign }} <-> {{ peering_wg_partner_sovereign }}"
+      - "reason:    {{ peering_wg_fips_waived_reason }}"
+      - "recorded:  {{ peering_wg_state_path }}"
+      - "The Zenoh TLS session inside the tunnel carries its own claim."
+      - "================================================"
+  when: _pw_decision == 'proceed-waived'
+
+- name: peering-wg | link environment
+  ansible.builtin.template:
+    src: link.env.j2
+    dest: "{{ peering_wg_env_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart goat peering wg
+
+- name: peering-wg | firewall
+  ansible.builtin.template:
+    src: peering-wg.nft.j2
+    dest: "{{ peering_wg_nft_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart goat peering wg
+
+- name: peering-wg | converge the link
+  ansible.builtin.meta: flush_handlers
+
+# TIER 1, read from the interface and not from this play's own report.
+- name: peering-wg | read the interface back
+  ansible.builtin.command: "wg show {{ peering_wg_interface }} dump"
+  register: _pw_dump
+  changed_when: false
+
+- name: peering-wg | read the link address back
+  ansible.builtin.command: "ip -o -4 addr show dev {{ peering_wg_interface }}"
+  register: _pw_addr
+  changed_when: false
+
+- name: peering-wg | the interface holds the agreed peer and the agreed address
+  ansible.builtin.assert:
+    that:
+      - _pw_peer_key in _pw_dump.stdout
+      - (peering_wg_remote_link_ip ~ '/32') in _pw_dump.stdout
+      - (peering_wg_local_link_ip ~ '/' ~ peering_wg_link_prefix_len) in _pw_addr.stdout
+    fail_msg: >-
+      The interface does not hold what the agreement says: peer {{ _pw_peer_key }},
+      allowed {{ peering_wg_remote_link_ip }}/32, address
+      {{ peering_wg_local_link_ip }}/{{ peering_wg_link_prefix_len }}. Read:
+      {{ _pw_dump.stdout_lines }} {{ _pw_addr.stdout_lines }}
+
+- name: peering-wg | record deploy convergence in the ledger after the checks
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "goat-peering-wg"
+    rollback_ref: "{{ peering_wg_interface }} {{ peering_wg_our_sovereign }}->{{ peering_wg_partner_sovereign }} mtu={{ peering_wg_mtu }}"

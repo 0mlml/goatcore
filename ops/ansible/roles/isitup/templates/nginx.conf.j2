@@ -1,0 +1,82 @@
+# Rendered by ops/ansible/roles/isitup/ — do not edit on host.
+#
+# Single nginx server: serves index.html + the JSON data dir from the writable
+# /usr/share/nginx/html/data mount (check.sh writes current.json + history.json).
+# Bound to :80 inside the container; Traefik fronts with TLS + oauth2-proxy
+# forwardAuth.
+
+server {
+    listen 80;
+    server_name _;
+
+    # Seatbelt, not the fix. nginx's default is
+    # `large_client_header_buffers 4 8k`, and the Cookie header is ONE header
+    # line carrying every cookie for this host. When oauth2-proxy's per-request
+    # CSRF cookies accumulated, that line passed 8k and nginx answered
+    # `400 Request Header Or Cookie Too Large` — before Traefik's forwardAuth,
+    # before oauth2-proxy, before anything that could explain itself. The
+    # operator's only recovery was clearing cookies by hand.
+    #
+    # The real fix is OAUTH2_PROXY_API_ROUTES in isitup.env.j2, which stops the
+    # cookies being minted. This raises the cliff so the same class of pile-up
+    # degrades slowly and visibly instead of locking someone out in minutes.
+    # Raising it is cheap: the buffers are allocated per-connection only when a
+    # request actually needs them.
+    large_client_header_buffers 8 32k;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # BOTH paths need no-store, and only /index.html had it. Nobody types
+    # /index.html — everyone opens `/`, which was served with no Cache-Control
+    # at all, so browsers fell back to heuristic freshness (a fraction of the
+    # file's age). A page that had sat unchanged for weeks therefore stayed
+    # "fresh" in cache for hours after a deploy.
+    #
+    # The failure that exposed this was not a cosmetically stale page. The SPA
+    # polls /data/current.json (no-store, so always current) but renders it
+    # through the section map in the HTML — so a browser holding yesterday's
+    # index.html fetched today's rows and silently dropped every row whose
+    # section that older page did not know about. Rows present in the data,
+    # invisible on the page, no error anywhere. Found 2026-08-13 when the
+    # Off-Mesh Services section did not appear after a verified deploy.
+    location = / {
+        add_header Cache-Control "no-store" always;
+        try_files /index.html =404;
+    }
+
+    location = /index.html {
+        add_header Cache-Control "no-store" always;
+    }
+
+    # External services (ADR 1178 declarations) have their own page (#1518):
+    # hosted by their owners, not by the goat core team, so they are not rows
+    # on the goatnet's home page. Same SPA, same data; the page picks its view
+    # from the path. A path, not a query string, so it can be bookmarked and
+    # linked as a place.
+    location ~ ^/external/?$ {
+        add_header Cache-Control "no-store" always;
+        try_files /index.html =404;
+    }
+
+    location /data/ {
+        # check.sh writes current.json + history.json here every 5 min.
+        # No cache — clients poll every 60s.
+        add_header Cache-Control "no-store" always;
+        try_files $uri =404;
+    }
+
+    location /icons/ {
+        # Per-service brand logos (bind-mounted from {{ isitup_dir }}/icons).
+        # The index.html SPA renders these as <img> for services whose
+        # `icon` field is a /icons/<name>.png path. Static + cacheable.
+        add_header Cache-Control "public, max-age=86400" always;
+        try_files $uri =404;
+    }
+
+    # health probe target — used by the compose healthcheck.
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+    }
+}

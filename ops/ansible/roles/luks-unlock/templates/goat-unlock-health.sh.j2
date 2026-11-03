@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Managed by the luks-unlock Ansible role. Do not edit on the host.
+#
+# Does this host's data volume survive a reboot unattended?
+#
+# A post-boot unlock that gives up after 5 minutes and exits 0 reads as success
+# to systemd, so a host can stay locked for days after a power cycle unless
+# something measures the three facts that decide whether an unattended boot
+# works:
+#   1. the volume is open and mounted,
+#   2. at least {{ luks_tang_min_reachable }} of the Tang servers it is bound to answer right now,
+#   3. this boot had no systemd ordering cycle (systemd breaks a cycle by deleting
+#      a job it picks — on 09-26 it picked tangd.socket on two of three Orins).
+#
+# Every run writes those as node_exporter textfile metrics, so the obs stack pages
+# on them (rules/luks-unlock.yml), and prints one line for the acceptance gate:
+#   unlock-health: PASS            or   unlock-health: FAIL <reason>; <reason>
+#
+# It also RESTORES: a volume found locked with its unlock unit not running gets
+# that unit restarted. Restoring declared state is not a decision, and without
+# a retry a locked volume stays locked after the first 5 minutes.
+set -uo pipefail
+
+TEXTFILE_DIR="{{ luks_health_textfile_dir }}"
+MIN_REACHABLE="{{ luks_tang_min_reachable }}"
+VOLUMES=({% for vol in luks_volumes if (vol.unlock_modes | default([]) | intersect(['tang_client', 'sss'])) | length > 0 %}"{{ vol.name }}|{{ vol.device }}|{{ vol.mount_point }}|{{ 1 if 'tang_client' in vol.unlock_modes else 0 }}" {% endfor %})
+
+{% raw %}
+fails=()
+metrics=""
+add() { metrics+="$1"$'\n'; }
+
+add "# HELP goat_luks_volume_unlocked 1 when the clevis-unlocked LUKS volume is open and mounted."
+add "# TYPE goat_luks_volume_unlocked gauge"
+add "# HELP goat_luks_tang_bound Tang servers this volume has a clevis binding to."
+add "# TYPE goat_luks_tang_bound gauge"
+add "# HELP goat_luks_tang_reachable Bound Tang servers answering /adv right now."
+add "# TYPE goat_luks_tang_reachable gauge"
+add "# HELP goat_luks_binding_read_ok 1 when clevis successfully read the volume bindings."
+add "# TYPE goat_luks_binding_read_ok gauge"
+add "# HELP goat_luks_tang_min_reachable Required Tang server count, zero for SSS without Tang."
+add "# TYPE goat_luks_tang_min_reachable gauge"
+
+for entry in "${VOLUMES[@]}"; do
+  IFS='|' read -r name dev mnt tang_required <<<"$entry"
+  unlocked=0
+  if [ -e "/dev/mapper/$name" ] && mountpoint -q "$mnt"; then unlocked=1; fi
+
+  # Capture the command status before parsing; process substitution hides it.
+  binding_read_ok=1
+  urls=()
+  if bindings=$(clevis luks list -d "$dev" 2>/dev/null); then
+    mapfile -t urls < <(printf '%s\n' "$bindings" | grep -o 'http[s]\?://[^"]*' | sort -u)
+  else
+    binding_read_ok=0
+    fails+=("$name: cannot read Clevis bindings")
+  fi
+  bound=${#urls[@]}
+  reachable=0
+  for u in "${urls[@]}"; do
+    if curl -sf -m 5 -o /dev/null "${u%/}/adv"; then reachable=$((reachable + 1)); fi
+  done
+
+  add "goat_luks_volume_unlocked{volume=\"$name\"} $unlocked"
+  add "goat_luks_tang_bound{volume=\"$name\"} $bound"
+  add "goat_luks_tang_reachable{volume=\"$name\"} $reachable"
+  add "goat_luks_binding_read_ok{volume=\"$name\"} $binding_read_ok"
+  minimum=0
+  if [ "$tang_required" -eq 1 ] || [ "$bound" -gt 0 ]; then minimum=$MIN_REACHABLE; fi
+  add "goat_luks_tang_min_reachable{volume=\"$name\"} $minimum"
+
+  [ "$unlocked" -eq 1 ] || fails+=("$name locked")
+  if [ "$binding_read_ok" -eq 1 ] && { [ "$tang_required" -eq 1 ] || [ "$bound" -gt 0 ]; } \
+       && [ "$reachable" -lt "$MIN_REACHABLE" ]; then
+    fails+=("$name: $reachable/$bound Tang servers answer (need $MIN_REACHABLE)")
+  fi
+
+  if [ "$unlocked" -eq 0 ]; then
+    # RemainAfterExit=yes leaves an exhausted oneshot active (exited).
+    # Retry it, but leave running jobs and state transitions alone. Failed
+    # state inspection must not become an instruction to restart a unit.
+    if state=$(systemctl show -p ActiveState --value "goat-unlock-$name.service") \
+         && substate=$(systemctl show -p SubState --value "goat-unlock-$name.service"); then
+      case "$state/$substate" in
+        active/exited|inactive/*|failed/*)
+          logger -t goat-unlock-health "$name locked and its unlock unit is idle; restarting goat-unlock-$name.service"
+          systemctl restart --no-block "goat-unlock-$name.service" || fails+=("$name: unlock restart failed")
+          ;;
+      esac
+    else
+      fails+=("$name: cannot read unlock unit state")
+    fi
+  fi
+done
+
+# Ordering cycles, two readings: what this boot actually did (kernel log), and
+# what the NEXT boot would do with the units on disk now. Either non-zero means a
+# reboot deletes jobs chosen by systemd, not by us.
+boot_cycles=$(journalctl -b -k --no-pager 2>/dev/null | grep -c "deleted to break ordering cycle" || true)
+next_cycles=$(systemd-analyze verify default.target 2>&1 | grep -c "ordering cycle" || true)
+add "# HELP goat_boot_ordering_cycles systemd ordering-cycle job deletions: boot=this boot's kernel log, next=systemd-analyze verify of the units on disk."
+add "# TYPE goat_boot_ordering_cycles gauge"
+add "goat_boot_ordering_cycles{reading=\"boot\"} ${boot_cycles:-0}"
+add "goat_boot_ordering_cycles{reading=\"next\"} ${next_cycles:-0}"
+[ "${next_cycles:-0}" -eq 0 ] || fails+=("$next_cycles ordering cycle(s) in the unit graph the next boot will load")
+
+if systemctl is-enabled --quiet tangd.socket 2>/dev/null; then
+  tang_up=0; systemctl is-active --quiet tangd.socket && tang_up=1
+  add "# HELP goat_tang_server_up 1 when this host's enabled tangd.socket is listening."
+  add "# TYPE goat_tang_server_up gauge"
+  add "goat_tang_server_up $tang_up"
+  [ "$tang_up" -eq 1 ] || fails+=("tangd.socket enabled but not active")
+fi
+
+if [ -d "$TEXTFILE_DIR" ]; then
+  tmp="$TEXTFILE_DIR/.goat_luks_unlock.prom.$$"
+  printf '%s' "$metrics" > "$tmp" && chmod 644 "$tmp" && mv "$tmp" "$TEXTFILE_DIR/goat_luks_unlock.prom"
+fi
+
+if [ ${#fails[@]} -eq 0 ]; then
+  echo "unlock-health: PASS"
+else
+  ( IFS='; '; echo "unlock-health: FAIL ${fails[*]}" )
+  exit 1
+fi
+{% endraw %}

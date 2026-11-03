@@ -1,0 +1,28 @@
+# icam-mtls-proxy — Traefik hands this hostname's TLS to the card sign-in proxy untouched
+# (ADR 1209; rendered by roles/icam-mtls-proxy when icam_mtls_proxy_tls is traefik-acme).
+# nginx terminates the mutual TLS itself (it must see the client certificate), serving
+# the site certificate acme-cert-sync.py copied out of Traefik's acme.json. The SNI match
+# is exact: every other name on :443 keeps its HTTP router.
+tcp:
+  routers:
+    icam-mtls-proxy:
+      entryPoints:
+        - {{ icam_mtls_proxy_traefik_entrypoint }}
+      rule: "HostSNI(`{{ icam_mtls_proxy_hostname }}`)"
+      service: icam-mtls-proxy
+      middlewares:
+        - icam-mtls-proxy-mesh-only
+      tls:
+        passthrough: true
+  middlewares:
+    icam-mtls-proxy-mesh-only:
+      ipAllowList:
+        sourceRange:
+{% for cidr in icam_mtls_proxy_allow_cidrs %}
+          - "{{ cidr }}"
+{% endfor %}
+  services:
+    icam-mtls-proxy:
+      loadBalancer:
+        servers:
+          - address: "{{ icam_mtls_proxy_bind_ip }}:{{ icam_mtls_proxy_https_port }}"

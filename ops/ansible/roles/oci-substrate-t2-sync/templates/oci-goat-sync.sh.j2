@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+#
+# OCI substrate T1 → T2 sync — fires on cron from /etc/cron.d/oci-goat-sync.
+# Per ADR 0838 + docs/design/oci-goat-substrate.md §6.2.
+#
+# Iterates over the canonical-set, copies each image from T1 (R2 preferred,
+# ECR fallback) into T2 (this Orin-C's Forgejo). crane copy short-circuits
+# when the digest is already present at the destination.
+#
+# Emits per-image JSONL evidence to {{ oci_sync_log_path }}.
+
+set -euo pipefail
+
+CANONICAL_SET="{{ oci_canonical_set_path }}"
+T1_R2="{{ oci_t1_r2_endpoint }}"
+T1_ECR="{{ oci_t1_ecr_endpoint }}"
+T2="{{ oci_t2_forgejo_endpoint }}"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+
+emit() {
+  printf '{"ts":"%s","run":"%s","image":"%s","action":"%s","duration_ms":%s,"detail":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_ID" "${1:-}" "${2:-}" "${3:-0}" "${4:-}"
+}
+
+# Auth crane against T1 endpoints (creds from env, never on disk).
+if [[ -n "$T1_R2" && -n "${T1_R2_TOKEN:-}" ]]; then
+  echo "$T1_R2_TOKEN" | crane auth login "$T1_R2" -u "${T1_R2_USER:-}" --password-stdin >/dev/null 2>&1 || true
+fi
+if [[ -n "$T1_ECR" && -n "${ECR_PASSWORD:-}" ]]; then
+  echo "$ECR_PASSWORD" | crane auth login "$T1_ECR" -u AWS --password-stdin >/dev/null 2>&1 || true
+fi
+
+# Iterate canonical-set entries via yq (must be installed on Orin-C).
+yq -o=json '.canonical_set[]' "$CANONICAL_SET" | jq -c '.' | while read -r entry; do
+  CANONICAL=$(echo "$entry" | jq -r '.canonical_name')
+  DIGEST=$(echo "$entry" | jq -r '.digest')
+  UPSTREAM=$(echo "$entry" | jq -r '.upstream_name')
+
+  # First-party (oci.goat/<service>): map to T2 path /goat/<service>
+  if [[ "$CANONICAL" == oci.goat/* ]]; then
+    T2_REF="$T2/goat/$(basename "$CANONICAL")@$DIGEST"
+  else
+    # Third-party: keep upstream name as repo path
+    T2_REF="$T2/$CANONICAL@$DIGEST"
+  fi
+
+  # Try R2 first
+  STARTED=$(date +%s%3N)
+  if [[ -n "$T1_R2" ]]; then
+    SOURCE_REF="$T1_R2/oci-goat/$(echo "$UPSTREAM" | sed 's|.*/||')@$DIGEST"
+    if crane copy --include-referrers "$SOURCE_REF" "$T2_REF" 2>/dev/null; then
+      ELAPSED=$(($(date +%s%3N) - STARTED))
+      emit "$CANONICAL" "synced_r2" "$ELAPSED" "ok"
+      continue
+    fi
+  fi
+
+  # Fallback to ECR
+  STARTED=$(date +%s%3N)
+  if [[ -n "$T1_ECR" ]]; then
+    SOURCE_REF="$T1_ECR/$(echo "$UPSTREAM" | sed 's|^[^/]*/||')@$DIGEST"
+    if crane copy --include-referrers "$SOURCE_REF" "$T2_REF" 2>/dev/null; then
+      ELAPSED=$(($(date +%s%3N) - STARTED))
+      emit "$CANONICAL" "synced_ecr" "$ELAPSED" "ok"
+      continue
+    fi
+  fi
+
+  ELAPSED=$(($(date +%s%3N) - STARTED))
+  emit "$CANONICAL" "failed" "$ELAPSED" "no T1 reachable"
+done
+
+emit "" "run_complete" 0 "$RUN_ID"

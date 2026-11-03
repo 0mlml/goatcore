@@ -1,0 +1,47 @@
+{#- F-258 fresh-standup bootstrap of the portal-owned ORG FRAGMENT (per-vendor
+    mode only). Reproduces, BYTE-IDENTICALLY, the seed-vendor content that used
+    to render inline between the per-vendor markers in config.json5.j2, under the
+    ##ACL-ORG-REGION headers acl-assemble.py splices back. Rendered ONCE by the
+    role when no fragment exists yet; a re-render never overwrites a fragment
+    that already holds vendors (acl-assemble init-org / the role guard). The
+    storages section is intentionally empty: seed-vendor storages render in the
+    seed ABOVE the markers (config.json5.j2), so they are role-owned, not here.
+    The write-rules comment + the three loops are copied verbatim from the old
+    config.json5.j2 render — see the byte-faithfulness test in tests/. -#}
+##ACL-ORG-REGION storages
+##ACL-ORG-REGION write-rules
+      // INGRESS-only after the ADR 1020 split — this is the ONLY thing
+      // that lets a vendor PUBLISH, and only into its own namespace.
+      // Egress delivery is universal via trial-peer-deliver-all.
+      //
+      // One grant per peer, two prefixes (ADR 1032): the persisted
+      // <vendor>/** namespace + the non-persisted volatile/<vendor>/**
+      // class. Same identity boundary; volatile/<vendor>/** has NO
+      // storage entry (so nothing reaches rocksdb) and is excluded by the
+      // audit subscriber (--exclude-key volatile/**), so it routes live
+      // but is never persisted. Granting this write WITHOUT the audit
+      // exclude active would route the firehose into the locked audit
+      // bucket — keep them in lockstep.
+{% for vendor in nova_seed_vendors %}
+      {
+        id: "trial-peer-w-{{ vendor }}",
+        messages: ["put", "delete", "liveliness_token"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["{{ vendor }}/**", "volatile/{{ vendor }}/**", "{{ vendor }}/**/@adv/**"],
+      },
+{% endfor %}
+##ACL-ORG-REGION subjects
+{% for vendor in nova_seed_vendors %}
+      {
+        id: "vendor-{{ vendor }}",
+        cert_common_names: ["{{ vendor }}-trial-peer"],
+      },
+{% endfor %}
+##ACL-ORG-REGION policies
+{% for vendor in nova_seed_vendors %}
+      {
+        rules: ["trial-peer-w-{{ vendor }}", "trial-peer-w-attest-schema"],
+        subjects: ["vendor-{{ vendor }}"],
+      },
+{% endfor %}

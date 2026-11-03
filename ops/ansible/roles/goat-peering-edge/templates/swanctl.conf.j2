@@ -1,0 +1,75 @@
+# {{ ansible_managed }}
+#
+# Cross-sovereign peering edge — IKEv2, certificate authentication.
+# Rendered by ops/ansible/roles/goat-peering-edge from the peering declaration
+# (docs/design/cross-sovereign-peering-transport.md §5).
+#
+# This file is IDENTICAL in shape on a FIPS host and a non-FIPS one. The FIPS
+# posture is an assertion the role makes about the host, not a difference in
+# what is configured — see the role README.
+#
+# NO ML-KEM transform here, deliberately. See defaults/main.yml, cipher suite.
+
+connections {
+
+    {{ peering_edge_name }} {
+        version = 2
+        local_addrs  = {{ peering_edge_local_addr }}
+        remote_addrs = {{ peering_edge_remote_addr }}
+        remote_port  = {{ peering_edge_ike_port }}
+
+        proposals = {{ peering_edge_ike_proposals }}
+
+        # Route-based. The CHILD_SA is bound to the xfrm interface created by
+        # {{ peering_edge_link_service }}, so the link subnet lives on a real
+        # interface with a real MTU ({{ peering_edge_mtu }}) instead of a
+        # policy the fabric cannot see or measure.
+        if_id_in  = {{ peering_edge_xfrm_if_id }}
+        if_id_out = {{ peering_edge_xfrm_if_id }}
+
+        rekey_time = {{ peering_edge_ike_rekey_time }}
+        over_time  = {{ peering_edge_ike_over_time }}
+        rand_time  = {{ peering_edge_ike_rand_time }}
+
+        dpd_delay   = {{ peering_edge_dpd_delay }}
+        dpd_timeout = {{ peering_edge_dpd_timeout }}
+
+        # Certificate authentication. No PSK: a shared secret is a secret two
+        # organisations have to exchange and neither can revoke unilaterally,
+        # which is the property the whole bootstrap order exists to avoid.
+        local {
+            auth  = pubkey
+            id    = {{ peering_edge_local_id }}
+            certs = {{ peering_edge_cert_path | basename }}
+        }
+
+        remote {
+            auth = pubkey
+            id   = {{ peering_edge_remote_id }}
+            # Only the partner CA delivered for THIS peering. Per-peering, so
+            # revoking one partner does not disturb another, and so no foreign
+            # root is ever reachable from anything but this connection.
+            cacerts = {{ peering_edge_remote_ca_path | basename }}
+        }
+
+        children {
+            fabric {
+                local_ts  = {{ peering_edge_local_ts }}
+                remote_ts = {{ peering_edge_remote_ts }}
+
+                esp_proposals = {{ peering_edge_esp_proposals }}
+                mode = tunnel
+
+                rekey_time = {{ peering_edge_child_rekey_time }}
+                rand_time  = {{ peering_edge_child_rand_time }}
+
+                start_action = {{ peering_edge_start_action }}
+                dpd_action   = {{ peering_edge_dpd_action }}
+                close_action = {{ peering_edge_close_action }}
+            }
+        }
+    }
+}
+
+# No `secrets` block. The private key is loaded from
+# {{ peering_edge_key_path }}, which this role asserts exists and never writes.

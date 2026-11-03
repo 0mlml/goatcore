@@ -1,0 +1,39 @@
+[Unit]
+Description=Watch mgmt-host docker compose stack and revive exited services
+Documentation=https://github.com/usareur-af/goatcore/blob/main/docs/findings/F-013-docker-kill-no-auto-restart-on-29.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/mgmt-host-compose-watch.sh
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+
+# Hardening — service runs as root because docker.sock requires root or
+# docker-group membership; on this host root is the simplest grant.
+# The script only invokes `docker compose` against the on-disk compose
+# files; no other privileged operations.
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+# Rendered by the role, NOT a static file, because the metrics directory is now
+# configurable and ProtectSystem=strict makes everything outside
+# ReadWritePaths read-only. Pointing MGMT_HOST_COMPOSE_WATCH_METRICS_DIR at a
+# directory missing from this list does not fall back or warn — emit_metrics
+# fails with "Read-only file system" every poll and the metric goes from
+# landing-somewhere-unread to landing nowhere at all, which is worse.
+ReadWritePaths=/opt/mgmt-host /var/run/docker.sock {{ mgmt_host_compose_watch_metrics_dir }}
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# journald captures the script's own log lines via stdout/stderr
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

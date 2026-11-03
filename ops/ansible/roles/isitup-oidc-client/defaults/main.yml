@@ -1,0 +1,41 @@
+---
+# Defaults for the `isitup-oidc-client` role.
+#
+# Provisions an OAuth2 client at the site Hydra (NOT operator-IdP Hydra —
+# isitup is gated by the same site IdP the dashboard consumes). Mirrors the
+# netbird-dashboard 21D.1.c idempotent GET-then-POST-or-PUT pattern. Does
+# NOT manage the isitup container itself — that's the `isitup` role.
+#
+# Required at deploy time:
+#   - isitup_oidc_client_secret  (32+ chars; fresh per site, env-sourced)
+#   - site_id, site_dns_zone     (per-site identity)
+
+isitup_oidc_client_id: "isitup"
+isitup_oidc_client_name: "isitup ({{ site_id }})"
+
+# Issuer + redirect URI built from the site Hydra (oauth2.<site>.<zone>,
+# the same hostname the dashboard role uses). Redirect path is the canonical
+# oauth2-proxy callback.
+isitup_oidc_issuer_url: "https://oauth2.{{ site_id }}.{{ site_dns_zone }}"
+isitup_oidc_redirect_uri: "https://isitup.{{ site_id }}.{{ site_dns_zone }}/oauth2/callback"
+
+# Scopes oauth2-proxy requests during the auth-code flow. Same baseline as
+# grafana/forgejo: openid mandatory; profile + email surface display name +
+# identifier; groups carries the authorization claim (passed through to
+# isitup as X-Forwarded-Groups — wired in if/when isitup gains per-group
+# UI controls; today it's authn-only, not authz-aware). `offline_access`
+# makes Hydra issue a refresh_token alongside the access_token so
+# oauth2-proxy can silently refresh at the COOKIE_REFRESH=1h boundary
+# without bouncing the user back through Hydra/Kratos; grant_types in
+# tasks/main.yml already permits refresh_token, this scope is the
+# matching request-side half.
+isitup_oidc_scopes:
+  - openid
+  - profile
+  - email
+  - groups
+  - offline_access
+
+# Hydra admin endpoint for client provisioning. Loopback on the mgmt-host
+# (this role runs against the same host that runs Hydra).
+isitup_oidc_hydra_admin: "http://127.0.0.1:{{ hydra_admin_host_port | default(4445) }}"

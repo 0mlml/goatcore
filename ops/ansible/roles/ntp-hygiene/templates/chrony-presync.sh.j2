@@ -1,0 +1,135 @@
+#!/bin/bash
+# Managed by ops/ansible/roles/ntp-hygiene — do not hand-edit.
+#
+# chrony-presync — bootstrap the system clock via PLAIN (non-NTS) NTP
+# when the host boots with an implausibly old clock. Closes the
+# chicken-and-egg surfaced 2026-05-09 on Orin-C: chrony.conf
+# uses NTS sources only (per docs/design/ntp-strategy.md §"NTS-only ZTOL
+# ingestion"), but NTS-KE rides TLS, and TLS validates the server cert
+# against the local clock. If the local clock is at epoch 0 (1970) —
+# the default state on a Tegra Orin/AGX after a power loss because the
+# board has no RTC battery — every NTS-KE handshake fails because the
+# cert isn't valid yet. chrony stays in stratum 10 orphan mode. Time-
+# bound containers (registry mirrors, openobserve, the zenoh router's
+# tls/:7447 listener, netbird's Signal TLS, etc.) fail cert validation
+# and crash-loop.
+#
+# RELOCATION HARDENING: the original presync ran
+# ONCE at boot with a fixed ~60s budget and then exited 0 + touched the
+# /run/chrony-presync.done sentinel UNCONDITIONALLY — so a host powered
+# on before its uplink was reachable (relocation, travel router with a
+# cold satellite/WAN link, hotel network) burned the whole budget while
+# the network was still down, gave up silently, and NEVER retried even
+# after the WAN came up minutes later. The clock stayed at 1970 and the
+# entire TLS-dependent stack stayed down until an operator hand-stepped
+# it. Three changes close that:
+#   1. Try the DHCP default gateway as a LOCAL non-NTS source first —
+#      most edge routers (incl. GL.iNet travel routers) serve NTP and
+#      have plausible time even when the public internet is unreachable.
+#   2. Only write the .done sentinel on GENUINE success (clock actually
+#      stepped into the plausible window). Failure exits non-zero.
+#   3. A companion timer (chrony-presync-retry.timer) re-runs this
+#      script every {{ chrony_presync_retry_interval_sec }}s until it
+#      succeeds — so however late the network shows up, the host self-
+#      heals with no operator action. This script handles being invoked
+#      both at boot (chrony not yet started) and later (chrony already
+#      running at a bad time — it cycles chrony around the one-shot step).
+#
+# We do NOT add a non-NTS source to the steady-state chrony.conf — that
+# would weaken the trust posture. The pre-sync is bootstrap-only; the
+# moment the clock is sane, NTS is the only steady-state authority.
+
+set -uo pipefail
+
+LOG_PREFIX="chrony-presync:"
+DONE_SENTINEL="/run/chrony-presync.done"
+RETRY_TIMER="chrony-presync-retry.timer"
+
+MIN_YEAR={{ chrony_presync_min_year }}
+MAX_ATTEMPTS={{ chrony_presync_max_attempts }}
+RETRY_DELAY={{ chrony_presync_retry_delay_sec }}
+PER_SRC_TIMEOUT={{ chrony_presync_per_source_timeout_sec }}
+
+clock_plausible() { [ "$(date -u +%Y)" -ge "$MIN_YEAR" ]; }
+
+# A clock with year >= threshold means the RTC survived / a warm reboot —
+# no bootstrap needed. The threshold is configurable via the role default
+# `chrony_presync_min_year`. Defaults to 2025.
+if clock_plausible; then
+  echo "$LOG_PREFIX clock plausible (year=$(date -u +%Y) >= $MIN_YEAR); marking done, no pre-sync needed."
+  touch "$DONE_SENTINEL"
+  systemctl stop "$RETRY_TIMER" 2>/dev/null || true
+  exit 0
+fi
+
+echo "$LOG_PREFIX clock implausible (year=$(date -u +%Y) < $MIN_YEAR); bootstrapping via plain NTP..."
+
+# Build the ordered source list: DHCP default gateway first (local,
+# reachable even when the public internet isn't), then the configured
+# public plain-NTP pools.
+SOURCES=()
+{% if chrony_presync_use_gateway | default(true) | bool %}
+GW=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+if [ -n "${GW:-}" ]; then
+  echo "$LOG_PREFIX default gateway detected: $GW (will try as local NTP source first)"
+  SOURCES+=("server $GW iburst")
+fi
+{% endif %}
+{% for pool in chrony_presync_fallback_pools %}
+SOURCES+=("pool {{ pool }} iburst")
+{% endfor %}
+
+# If chrony is already running (timer-driven re-run after a bad-clock
+# boot), stop it so `chronyd -q` can grab the cmd socket. On the very
+# first boot run (Before=chrony.service) chrony is inactive, so we skip
+# the stop AND leave the restart to systemd's ordering.
+CHRONY_WAS_ACTIVE=0
+if systemctl is-active --quiet chrony 2>/dev/null; then
+  CHRONY_WAS_ACTIVE=1
+  echo "$LOG_PREFIX chrony is running at a bad clock; stopping it for the one-shot step."
+  systemctl stop chrony 2>/dev/null || true
+  sleep 1
+  rm -f /run/chrony/chronyd.pid 2>/dev/null || true
+fi
+
+success=0
+for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+  echo "$LOG_PREFIX attempt $attempt/$MAX_ATTEMPTS..."
+  for SRC in "${SOURCES[@]}"; do
+    echo "$LOG_PREFIX one-shot sync via '$SRC'..."
+    # `chronyd -q` runs once and exits after the first measurement+step.
+    timeout "$PER_SRC_TIMEOUT" chronyd -q "$SRC" 2>&1 | tee /var/log/chrony-presync.log || true
+    if clock_plausible; then
+      echo "$LOG_PREFIX pre-sync SUCCEEDED via '$SRC' (year now $(date -u +%Y))."
+      success=1
+      break
+    fi
+    echo "$LOG_PREFIX '$SRC' did not produce a usable step; trying next source..."
+  done
+  [ "$success" = 1 ] && break
+  if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+    echo "$LOG_PREFIX all sources failed this pass; sleeping ${RETRY_DELAY}s before retry..."
+    sleep "$RETRY_DELAY"
+  fi
+done
+
+# Restore chrony if we stopped it (timer-driven case). On a first-boot
+# run we leave chrony inactive — systemd starts it after us per Before=.
+if [ "$CHRONY_WAS_ACTIVE" = 1 ]; then
+  echo "$LOG_PREFIX restarting chrony."
+  systemctl start chrony 2>/dev/null || true
+fi
+
+if [ "$success" = 1 ]; then
+  touch "$DONE_SENTINEL"
+  systemctl stop "$RETRY_TIMER" 2>/dev/null || true
+  echo "$LOG_PREFIX done. Steady-state NTS chrony takes over."
+  exit 0
+fi
+
+# Failure: do NOT write the sentinel. Exit non-zero so the unit is
+# marked failed and chrony-presync-retry.timer re-fires us in
+# {{ chrony_presync_retry_interval_sec }}s. The host self-heals the
+# moment the network becomes reachable — no operator action required.
+echo "$LOG_PREFIX WARNING: all sources unreachable (network not up yet?). Will retry via $RETRY_TIMER until the clock is sane."
+exit 1

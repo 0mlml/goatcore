@@ -1,0 +1,61 @@
+---
+# ops/ansible/roles/apt-cacher-ng/defaults/main.yml
+#
+# Caching forward-proxy for apt repositories. Speeds up repeated apt
+# pulls across the fleet (every host grabs the same Ubuntu / NVIDIA
+# packages) and keeps the cluster operable when upstream apt mirrors
+# are unreachable (sat link dropped, isolated network, etc.).
+
+# Listen port. 3142 is upstream default + universally documented.
+apt_cacher_ng_port: 3142
+
+# Listen addresses. Empty list = bind to all interfaces (default daemon
+# behavior). Populate with the LAN IP + wg-cp0 IP once known to keep the
+# listener off any NAT-traversed public path. The role does not enforce
+# this — your firewall does — but the binding helps belt-and-suspenders.
+#
+# Recommended once wg-cp0 is up:
+#   apt_cacher_ng_bind_addresses: ["192.168.1.253", "198.18.0.3"]
+apt_cacher_ng_bind_addresses: []
+
+# Cache root. Lives on the NVMe per ADR 0826. Apt cache can grow large
+# (Linux kernel + NVIDIA driver tarballs) so / would fill quickly.
+apt_cacher_ng_cache_dir: /opt/docker-data/apt-cacher-ng/cache
+apt_cacher_ng_log_dir: /opt/docker-data/apt-cacher-ng/log
+
+# How many days to keep unreferenced packages before the daily cleanup
+# expires them. 30d means a package that nobody asks for in 30 days
+# falls out of cache. Keep generous since storage is cheap.
+apt_cacher_ng_expire_days: 30
+
+# Verbosity for the daemon log. 7 = upstream default; 4 trims most
+# routine I/O lines if you want a quieter log.
+apt_cacher_ng_verbosity: 7
+
+# Allow upstream repositories. Each entry is a remap rule that the
+# daemon uses to know which upstream URLs to cache. Defaults cover the
+# debian / ubuntu / Tegra repositories the fleet actually pulls from.
+# Override per-host to add custom repos.
+apt_cacher_ng_remap:
+  - name: debian
+    backends_url: "http://deb.debian.org/debian"
+    aliases:
+      - "deb.debian.org/debian"
+      - "ftp.debian.org/debian"
+      - "security.debian.org"
+  - name: ubuntu
+    backends_url: "http://archive.ubuntu.com/ubuntu"
+    aliases:
+      - "archive.ubuntu.com/ubuntu"
+      - "security.ubuntu.com/ubuntu"
+      - "ports.ubuntu.com/ubuntu-ports"
+  - name: nvidia-tegra
+    backends_url: "https://repo.download.nvidia.com/jetson"
+    aliases:
+      - "repo.download.nvidia.com/jetson"
+
+# Prometheus metrics — apt-cacher-ng has a built-in /acng-report.html
+# but no Prometheus endpoint. We expose a small textfile-collector job
+# that node_exporter scrapes, populated by the cleanup cron.
+# True = render the metric collector script + cron.
+apt_cacher_ng_emit_node_exporter_metrics: true

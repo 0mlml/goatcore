@@ -1,0 +1,81 @@
+---
+# ops/ansible/roles/vxlan/defaults/main.yml
+#
+# VXLAN-over-WireGuard L2 segment role (Block 14).
+# Design: docs/design/l2-vxlan-networking.md
+# Plan:   docs/design/l2-vxlan-multi-transport-plan.md
+#
+# Default is empty list — the role no-ops cleanly unless an operator
+# defines vxlan_segments at host or group level. Production hosts are
+# never touched unless the segment is explicitly declared in inventory.
+
+# Empty list = role skips cleanly. Override per-host or per-group.
+#
+# Schema:
+#   vxlan_segments:
+#     - vni: 100                       # required, unique per segment (1..16777215)
+#       bridge: br-l2seg0              # required, the Linux bridge name; must start
+#                                      #   with vxlan_managed_bridge_prefix for orphan
+#                                      #   cleanup to consider it ours
+#       address: "10.248.0.1/24"       # required, this host's IP on the bridge
+#       mtu: 1370                      # optional, default 1370 (WG 1420 - VXLAN 50)
+#       peers:                         # required, ALL peer mesh IPs in the segment
+#                                      #   including this host's; the role filters
+#                                      #   self out before rendering FDB
+#         - "100.104.x.y"
+#         - "100.104.x.z"
+#       bridge_interfaces: []          # optional, local physical interfaces to bridge
+#       dstport: 4789                  # optional, default 4789 (standard VXLAN UDP port)
+#       tcp_mss_clamp: true            # optional, default true. Adds an iptables MSS
+#                                      #   clamp rule on FORWARD out the bridge so TCP
+#                                      #   sessions PMTU-discover gracefully.
+#       bum_rate_limit:                # optional. Adds a tc tbf qdisc at the bridge
+#         rate: 1mbit                  #   root. v1 caveat: this caps ALL bridge traffic,
+#         burst: 32kbit                #   not just BUM — use only when broadcast traffic
+#         latency: 50ms                #   dominates and you've sized rate to allow normal
+#                                      #   unicast. v2 follow-up adds ebtables-based per-
+#                                      #   source-MAC BUM-only rate-limiting.
+vxlan_segments: []
+
+# Netbird interface to read this host's mesh IP from. Default matches the
+# netbird-installed interface name on Ubuntu 22.04 / 24.04. Override per-host
+# in inventory if the mesh interface name differs.
+vxlan_netbird_interface: wt0
+
+# Underlay IP override — when set, the role uses this IP as VXLAN's `Local=`
+# instead of probing vxlan_netbird_interface. Use cases:
+#   (a) the underlay is something other than netbird (lab validation on
+#       direct VPC underlay; see ops/ansible/integdev-vxlan-validate.yml),
+#   (b) the host has multiple addresses and you want to pin VXLAN to a
+#       specific one rather than the first one found on wt0.
+# Production deployments leave this empty; the WG-as-underlay path is the
+# load-bearing shape and wt0 auto-detection is correct.
+vxlan_underlay_override_ip: ""
+
+# Where systemd-networkd reads its drop-ins. Standard path; override only if
+# someone has a custom layout.
+vxlan_networkd_dir: /etc/systemd/network
+
+# File-name prefix used for orphan cleanup. The role manages files matching
+# {prefix}-vxlan-*.netdev / .network and {prefix}-{bridge}.netdev / .network.
+# Lower numeric prefix = applied earlier in networkd's lexical ordering.
+vxlan_file_prefix: "25"
+
+# Bridge-name prefix the role considers "managed by us" for orphan cleanup.
+# Bridges with names not starting with this prefix will not be cleaned up
+# automatically — operator must remove them by hand. Keeps blast radius
+# narrow; the role won't accidentally delete an unrelated bridge config.
+vxlan_managed_bridge_prefix: "br-l2"
+
+# When true, also remove .netdev/.network files from a previous run that
+# correspond to segments no longer in vxlan_segments. Off by default to
+# avoid surprises on shared hosts; flip on for the validation env or any
+# host where this role owns its bridges exclusively.
+vxlan_remove_orphans: false
+
+# Pluggable transport — reserved for a future GRE-tap path (12B less
+# overhead per packet, kernel-native, but point-to-point so it needs a
+# different template + N interfaces per host instead of one). v1 ships
+# vxlan only; gretap lands behind a measured trigger per the design's
+# net-positive principle.
+vxlan_transport: vxlan

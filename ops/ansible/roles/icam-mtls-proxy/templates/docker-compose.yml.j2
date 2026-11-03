@@ -1,0 +1,37 @@
+# icam-mtls-proxy — card sign-in from any sovereign PKI (ADR 1209). Rendered by the
+# role when icam_mtls_proxy_enabled. Mesh-only: the https port binds the netbird mesh
+# IP (no public plane); with icam_mtls_proxy_tls traefik-acme, Traefik passes the
+# hostname's SNI through to it on :443.
+services:
+  dex:
+    image: {{ icam_mtls_proxy_dex_ref }}
+    command: ["dex", "serve", "/dex.yaml"]
+    environment:
+      # The Kratos static client's secret; the role writes it to ./.env (0600).
+      ICAM_MTLS_KRATOS_CLIENT_SECRET: "${ICAM_MTLS_KRATOS_CLIENT_SECRET:?set by roles/icam-mtls-proxy in .env}"
+    volumes:
+      - ./dex.yaml:/dex.yaml:ro
+    restart: unless-stopped
+    networks: [mtls]
+
+  nginx:
+    image: {{ icam_mtls_proxy_nginx_image }}
+    depends_on: [dex]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./pki.js:/etc/nginx/pki.js:ro
+{% if (icam_sovereign_pkis | sovereign_pki_nginx_profiles_js) | length > 0 %}
+      - ./pki-profiles.js:/etc/nginx/pki-profiles.js:ro
+{% endif %}
+      - ./certs/server.crt:/certs/proxy.crt:ro
+      - ./certs/server.key:/certs/proxy.key:ro
+      - ./certs/ca-bundle.pem:/certs/ca.crt:ro
+    ports:
+      - "{{ icam_mtls_proxy_bind_ip | default('127.0.0.1') }}:{{ icam_mtls_proxy_https_port }}:8443"
+    restart: unless-stopped
+    networks:
+      mtls:
+        aliases: ["{{ icam_mtls_proxy_issuer_url | regex_replace('^https?://([^/:]+).*$', '\\1') }}"]
+
+networks:
+  mtls: {}

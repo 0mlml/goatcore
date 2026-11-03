@@ -1,0 +1,31 @@
+#!/bin/sh
+# Rendered by ops/ansible/roles/operator-idp-postgres on {{ ansible_date_time.iso8601 }}.
+#
+# Runs once on first container start (postgres:alpine entrypoint
+# convention: scripts in /docker-entrypoint-initdb.d/ execute against
+# the freshly-initialized cluster). After the first run the host
+# volume is non-empty and the entrypoint skips this directory entirely
+# — re-running this role does NOT re-execute the script.
+#
+# This is the ONLY place the operator_idp app user is created. Subsequent
+# password rotations are operator-fired via:
+#   docker exec operator-idp-postgres psql -U postgres -c \
+#     "ALTER ROLE operator_idp WITH PASSWORD '<new>';"
+# followed by a Kratos + Hydra restart (they read DSN at startup).
+
+set -eu
+
+# Create the application user. Password sourced from env (entrypoint
+# exports POSTGRES_* but not OPERATOR_IDP_PG_APP_PASSWORD by default —
+# the compose service env block must include it explicitly; see the
+# `env_file: .env` pattern in the role's docker-compose.yml.j2).
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<-EOSQL
+  CREATE ROLE {{ operator_idp_pg_app_user }} WITH LOGIN PASSWORD '${OPERATOR_IDP_PG_APP_PASSWORD}';
+EOSQL
+
+{% for db in operator_idp_pg_databases %}
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<-EOSQL
+  CREATE DATABASE {{ db }} OWNER {{ operator_idp_pg_app_user }};
+EOSQL
+
+{% endfor %}

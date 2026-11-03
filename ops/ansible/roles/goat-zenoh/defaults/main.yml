@@ -1,0 +1,645 @@
+# ops/ansible/roles/goat-zenoh/defaults/main.yml
+# zenoh_stack — single deployment-target parameter that names every deployed
+# artifact (compose project, container_name, docker network, /etc + /opt dirs,
+# systemd mesh-boot unit). A goatnet sets it from its instance id.
+# This value names a directory that exists on the hosts — /opt/<zenoh_stack>/ —
+# and the deploy ledger and render manifest key off the same string. Changing it
+# here does not move anything on a host; it just stops the role finding what is
+# already there. Renaming it is a live-state migration with a cutover.
+zenoh_stack: "{{ site_id }}-zenoh"   # a shared role must not name a goatnet
+
+# Extra trust roots to fold into the router's root_ca bundle, IN ADDITION to
+# the offline CA. Target-side host paths (read on the mgmt-host, not
+# the controller). Empty by default. A goatnet using SPIRE sets this to the SPIRE
+# CA so the router admits SPIRE-issued client SVIDs.
+goat_zenoh_extra_ca_paths: []
+
+# Repo-side trust roots to DELIVER to the host, each {src, dest}. Distinct from
+# goat_zenoh_extra_ca_paths above, which names paths ALREADY on the host (the
+# SPIRE CA the server exports at runtime). List the delivered dest there too —
+# delivery puts the file in place, the append folds it into the router bundle.
+# Used for the additive half of a CA migration: a router can trust an old root
+# and a new one at once, so leaves move one at a time instead of all at once.
+goat_zenoh_extra_ca_deliver: []
+
+#
+# Zenoh router for the trial fabric — single router, mTLS-required transport,
+# per-vendor URI-SAN ACL, wide-open reads + vendor-scoped writes.
+#
+# Canonical design: docs/design/zenoh-trial-fabric.md (§"Plugins enabled
+# at trial" + §"Trial-mode dial settings" + §"Concrete ACL config sketch")
+
+# ---- Image -----------------------------------------------------------------
+# Default = the patched zenoh-pqc build (NOT bare upstream). Rationale: the
+# bare eclipse/zenoh:1.9.0 accept loop carries the F-253 admission-seizure
+# defect (a 100ms throttle firing on per-connection handshake failures
+# serializes all admission to ~10/s under an mTLS reconnect storm — see
+# docs/findings/F-253). We cannot patch upstream's image, so the standard
+# default is our from-source rebuild that carries the fix. zenoh-pqc is
+# built from the same 1.9.0 tag (dynamic musl, so the role's bind-mounted
+# musl rocksdb .so still loads) and additionally offers X25519MLKEM768
+# hybrid-PQC TLS — classical-only clients down-negotiate transparently
+# (wire-proven, M-081), so this is backward-compatible for every existing
+# peer. Digest-pinned per docs/design/zenoh-version-pinning.md; multi-arch
+# LIST digest. ADR 0858 (image pivot) + ADR 1079 (PQC-as-default).
+# FIPS goatnets override this to ghcr.io/{{ ghcr_org }}/zenoh-pqc-fips + set
+# goat_zenoh_fips_variant: true (see below). Prior bare-upstream base:
+# eclipse/zenoh:1.9.0@sha256:157965d7 (kept in the deploy-history ledger).
+nova_zenoh_image: "ghcr.io/{{ ghcr_org }}/zenoh-pqc@sha256:372de39d2e8b64fe7157194173f1b7ac6eac2700ff04c49cce2ce3c284a6fdb2"
+
+# ---- File-descriptor bulkhead --------------------------------------
+# nofile ulimit for the router container. The per-uuid slot pool spawns one
+# rocksdb storage per slot (per zenoh_slot_pool_size), and each rocksdb instance
+# holds many open FDs — steady-state idle is already ~9k FDs before a single client
+# connects. With no ulimit the container inherits the ~16k default and, once
+# reconnecting peers push it over, every TLS handshake fails ("increase the
+# system open file limit") and the router goes Up-but-unhealthy (port dead).
+# 1M gives the FD-heavy storage manager real headroom.
+goat_zenoh_nofile: 1048576
+
+# ---- Transmit-queue policy: how long ONE slow consumer may stall the router -
+# Measured on an isolated local rig, M-119 (docs/measurements/). A subscriber
+# that stops draining its socket makes the router's tx queue for that link fill.
+# Every NON-DROPPABLE message bound for it - replies, declarations, and any
+# publisher that asked for CongestionControl::Block, which several goat health
+# publishers do - is then pushed with a SYNCHRONOUS wait on the SOURCE face's rx
+# task, up to `wait_before_close`. zenoh 1.9.0 gives the rx runtime 2 worker
+# threads, so TWO such waits park every ingress the router has and delivery
+# stops fabric-wide for peers that are perfectly healthy.
+#
+# Worst delivery gap for an UNRELATED victim pub/sub pair while one `**`
+# subscriber froze for 60 s (zenoh 1.9.0 stock = 59-119 s, 0-27% loss):
+#   rx 2, queue 2, 5 s (stock)   59-119 s   0-27% loss, 33-41 transport closes
+#   rx 8, queue 2, 5 s            5-10 s    ~6% loss
+#   rx 2, any queue, 2 s or 0.5 s   42-59 s   and 3-7x the closes: harmful alone
+#   rx 4, queue 2, 2 s             4.2 s     0% loss, 10 closes
+#   rx 8, queue 2, 2 s             2.1 s     0% loss, 4 closes   <- SHIPPED
+#   rx 8, queue 8, 2 s             2.1-4.0 s 0% loss, 4 closes   (no better)
+#
+# WHAT EACH KNOB BUYS, and what it costs:
+#   rx worker threads  - buys the whole result. Costs THREADS AND STACK (a few
+#                        MiB total), not per-link buffers. The cheap knob.
+#   wait_before_close  - bounds the single worst wait. Worth nothing on its own
+#                        (it only multiplies evictions) and decisive once the
+#                        workers are raised. Costs nothing but eviction
+#                        sensitivity; stays ABOVE lease/4 (1250 ms at lease
+#                        5000) so a slow-but-alive link is not evicted between
+#                        its own keepalives.
+#   queue size         - buys NOTHING measurable at either worker count
+#                        (rx 8: 2.1 s at queue 2 and at queue 4; rx 4: 4.2 /
+#                        4.1 / 4.0 s at queue 2 / 4 / 8). Costs the most:
+#                        the per-link ceiling is 8 priorities x queue_size x
+#                        64 KiB, i.e. ~4 MiB per link at 8 against ~1 MiB at
+#                        the default 2. LEFT UNSET for that reason.
+#
+# The failure mode these choose is "evict a genuinely stuck peer sooner", never
+# silent data loss: the router still refuses to drop a non-droppable message, it
+# just stops letting one stuck link own an rx worker for five seconds at a time.
+# Measured, the shipped pair evicts LESS than stock (4 closes against 33-41),
+# because workers that are not parked drain the queue instead of reaching the
+# deadline. The rejected lever is a `qos.network` overwrite forcing put/delete
+# to Drop: it trades the stall for silent loss on a fabric where denial is
+# already silent, and it is not shipped.
+#
+# goat_zenoh_tx_queue_size is DELIBERATELY UNSET (null = render nothing, zenoh's
+# own default of 2 applies). A goatnet that wants it must first check the
+# router's memory headroom against the ceiling above:
+#     added ceiling = 8 x queue_size x 64 KiB x <sessions>
+# e.g. queue 8 on a router with 113 sessions is ~450 MiB of additional ceiling.
+# An OOM-killed router is a worse outage than the stall this bounds.
+# ENFORCED, not merely documented: ops/ci/check-zenoh-txqueue-pairing.py refuses
+# a tightened wait_before_close that is not accompanied by >= 4 rx workers (the
+# combination measured WORSE than stock), and refuses a deadline below lease/4.
+# It does not pin these values — a goatnet may sit at stock or choose 4 workers.
+goat_zenoh_rx_worker_threads: 8          # ZENOH_RUNTIME rx worker_threads (env-only knob)
+goat_zenoh_tx_block_wait_before_close_us: 2000000   # 2 s; zenoh default 5 s, floor lease/4
+goat_zenoh_tx_queue_size: ~              # unset -> zenoh default (2). See ceiling above.
+
+# ---- FIPS variant (zenoh-pqc-fips, ADR 1079 / zenoh-pqc-tls.md §5) ---------
+# When true, the image is expected to be ghcr.io/{{ ghcr_org }}/zenoh-pqc-fips —
+# glibc zenohd on the CMVP #5298/#5314-validated AWS-LC FIPS 3.1.0 module,
+# with its matched-pair plugins BAKED into the image (a glibc zenohd cannot
+# load the musl backend .so this role normally bind-mounts). Effects:
+#   * the upstream musl rocksdb backend fetch + bind-mount are skipped;
+#   * storage_manager.backend_search_dirs points at the baked path;
+#   * post-deploy the play asserts the "goat FIPS: AWS-LC FIPS module active"
+#     boot marker — a router that failed to enter FIPS mode fails the play.
+# Set alongside a zenoh-pqc-fips image pin in the goatnet's group_vars; never
+# flip it while leaving the upstream image pin in place (the baked path would
+# be empty and storages would not spawn).
+goat_zenoh_fips_variant: false
+goat_zenoh_backend_search_dir: "{{ '/opt/zenoh/plugins-baked' if goat_zenoh_fips_variant | bool else '/opt/zenoh/plugins' }}"
+
+# ---- Router ZID pinning (deterministic, per-host stable) -------------------
+# Pin the trial-fabric router's Zenoh ID so it survives container
+# recreates with one identity: routing-graph continuity, a stable audit-dedup
+# key `(src_zid, key_expr)` for the audit-subscriber + panoscope replay, and a
+# durable anchor for the (ZID, EntityId) source-info provenance consumers read.
+# Without it every restart mints a fresh random ZID and the same router reads
+# as a new origin. See ADR 1041 + docs/design/zenoh-capability-adoption.md.
+#
+# Derived, NOT baked into the image (cloneable-artifact collision trap) and
+# NOT from machine-id (VM clone-collision source). Seed = inventory hostname +
+# realm; hashed, truncated to 16 bytes, lowercase hex. The ZID stays opaque —
+# site lives in namespace + cert URI-SAN, not the ZID. Override per-host by
+# setting goat_zenoh_router_zid directly.
+#
+# LEADING-ZERO STRIP (regex_replace '^0+') — a zenoh ZID is a u128 rendered as
+# MINIMAL hex, so a leading-zero hex string is REJECTED at config load:
+#   "Invalid id: 0c21… - Leading 0s are not valid" (zenoh-protocol core/mod.rs)
+# ~1 host in 16 draws a seed-hash whose first nibble is 0 and would crash-loop
+# zenohd on startup. Stripping
+# leading zeros yields a valid shorter (still ≤16-byte) ZID and is a NO-OP for
+# every hash that does not start with 0 — so no already-running router's ZID
+# changes on its next redeploy (a leading-zero ZID could never have started, so
+# no live router carries one). Fixes the broken case only.
+goat_zenoh_zid_realm:  "{{ site_id | mandatory }}"
+goat_zenoh_zid_seed:   "{{ inventory_hostname }}|{{ goat_zenoh_zid_realm }}|zenoh-router"
+goat_zenoh_router_zid: "{{ (goat_zenoh_zid_seed | hash('sha256'))[:32] | regex_replace('^0+', '') }}"
+
+# ---- RocksDB backend artifact (upstream eclipse-zenoh release) -------------
+# Pinned in lockstep with nova_zenoh_image; see the parent zenoh role
+# defaults for the same shape. SHA256s come from the GitHub release-asset
+# API for eclipse-zenoh/zenoh-backend-rocksdb at the matching tag.
+goat_zenoh_rocksdb_backend_version: "1.9.0"
+goat_zenoh_rocksdb_backend_url_template: >-
+  https://github.com/eclipse-zenoh/zenoh-backend-rocksdb/releases/download/{version}/zenoh-backend-rocksdb-{version}-{arch}-unknown-linux-musl-standalone.zip
+goat_zenoh_rocksdb_backend_arch_map:
+  aarch64: "aarch64"
+  x86_64:  "x86_64"
+goat_zenoh_rocksdb_backend_sha256_map:
+  aarch64: "298734a4f50dfa12c27337cbafeb7d99949f4f3fda4c330ff6891d39fdd97112"
+  x86_64:  "88b13af5ddaadff9ec55c61765db6344666ae38731257877023b07c59a0c4bd1"
+
+# Host plugin dir — bind-mounted into the container at /opt/zenoh/plugins.
+# The rocksdb backend .so lands here; config.json5's
+# storage_manager.backend_search_dirs picks it up.
+goat_zenoh_plugin_dir: "/opt/{{ zenoh_stack }}/plugins"
+
+# ---- Trial identity --------------------------------------------------------
+# Trial fabric ID — appears in every metric label + audit emission so the
+# trial-fabric output is distinguishable from any production zenoh tier
+# evidence post-sunset.
+goat_zenoh_trial_id: "nova-trial-2026"
+
+# ---- Network bind ----------------------------------------------------------
+# Router listener — TLS-required by default. The trial design has vendors
+# connect "direct-on-LAN" using the per-vendor cert as the only credential.
+# Bind to the host's LAN IP, not 0.0.0.0 — the router is mesh-aware via
+# NetBird (per the architectural through-line in zenoh-trial-fabric.md
+# §"Zenoh deployment shape") but for a trial it ALSO listens
+# on the underlay LAN.
+goat_zenoh_listen_host: "0.0.0.0"        # operator overrides to LAN IP at deploy
+goat_zenoh_listen_port: 7447
+
+# ---- Router-to-router federation (ADR 0844 topology + ADR 1020 goat↔goat) ----
+# Peer router mesh endpoints this router DIALS, e.g. ["tls/<peer-mesh-ip>:7447"].
+# EMPTY by default: a single-router goatnet renders no connect: block, no
+# outbound-dial client cert, and no router-peer ACL subject — the config is
+# byte-identical to before this feature existed. Set per-goatnet in group_vars
+# only when two+ sites federate. Same-goatnet peering only (decision 1); third-
+# party peering goes through the ingress gateway (decisions 3-4), not this var.
+goat_zenoh_connect_endpoints: []
+
+# ---- QUIC transport (ADR 1086 / pqc-adoption-pattern.md §7) ----------------
+# Add a `quic/` listen endpoint ALONGSIDE the tls/ one. QUIC uses the SAME
+# TLS 1.3 handshake + the same transport/link/tls block below (server cert,
+# mTLS client_auth, offline-CA root) — so mTLS + the URI-SAN ACL apply
+# unchanged, and on the zenoh-pqc / zenoh-pqc-fips images the QUIC link
+# inherits X25519MLKEM768 from the same crypto provider with NO extra work
+#. Enabling QUIC is therefore a transport-
+# availability decision, not a PQC one.
+# Default false. A goatnet opts in via group_vars.
+# QUIC is UDP: the compose port-map publishes /udp on this port (distinct
+# from the TCP tls/ port so both can bind the host mesh IP).
+goat_zenoh_quic_enabled: false
+goat_zenoh_quic_port: 7448
+
+# REST plugin — operator-side admin + inspector backend. Bind to a specific
+# LAN address only; never 0.0.0.0 unless the operator deliberately accepts
+# the exposure for portal traffic.
+goat_zenoh_rest_host: "127.0.0.1"        # operator overrides to LAN IP for portal
+goat_zenoh_rest_port: 8000
+
+# ---- Boot-race healer ------------------------------------------------------
+# When goat_zenoh_listen_host is the netbird mesh IP (the ADR 0844 +
+# F-140 default the zenoh-deploy.yml playbook sets), the router's
+# host-port publish can't bind at boot until netbird has assigned that IP to
+# the mesh interface. Docker can't simply be ordered after the IP — the
+# netbird daemon enrolls against the netbird-mgmt *container*, so gating
+# docker on the mesh IP would deadlock. Instead the goat-zenoh-mesh-
+# boot.service oneshot runs after docker is up, waits (bounded) for the IP,
+# then `compose up -d`s the router. See mesh-boot.sh.j2 + F-182.
+#   iface   — netbird data-plane device (wt0 on the mgmt-hosts)
+#   timeout — bounds the wait so a never-enrolled host still attempts a
+#             start and logs why, rather than hanging the boot unit.
+goat_zenoh_mesh_iface: "wt0"
+goat_zenoh_mesh_boot_timeout: 180
+
+# ---- Plugins ---------------------------------------------------------------
+# Per zenoh-trial-fabric.md §"Plugins enabled at trial":
+#   - rest (HTTP admin + inspector backend)
+#   - storage_manager + rocksdb backend (replay + last-N for the inspector)
+#   - schema-enforcer (audit-mode) -- NOT IMPLEMENTED yet, see GAP below
+#   - access_control (per-vendor URI-SAN ACL — built-in 1.x module, not a plugin)
+#
+# Audit observation runs out-of-process in goat-audit-subscriber
+# (a normal mTLS Zenoh client peer), writing to the site MinIO
+# audit-integrity bucket (ADR 0858).
+#
+# GAP: schema-enforcer plugin does not yet exist in zenoh-plugins/.
+# Trial question #3 ("schema + format discipline under low pressure")
+# cannot be answered with audit-mode counts until the plugin lands;
+# Block 23 substrate is the natural home.
+nova_schema_enforcer_enabled: false       # see GAP above
+
+# ---- Storage ---------------------------------------------------------------
+# RocksDB retention applies to every registered <vendor>/** prefix. 7-day
+# default per zenoh-trial-fabric.md §"Trial-mode dial settings" Storage row.
+# Per-prefix storages get appended to config.json5 as vendors register;
+# the seed set covers operator (`ops/**`, `attest/schema/**`) plus the two
+# seed vendors (`community/**`, `caracal/**`).
+goat_zenoh_storage_path: "/var/lib/{{ zenoh_stack }}/rocksdb"
+goat_zenoh_retention_days: 7
+
+# Operator-action audit (`ops/audit/operator/**`, F-207) gets its OWN, much
+# longer retention than the 7-day fabric default: admin "who-did-what" is the
+# accountability record, so it must survive well past the operational replay
+# window. A dedicated rocksdb storage (see config.json5.j2) with this TTL sits
+# ALONGSIDE the `ops/**` store — Zenoh writes a matching sample to every storage
+# whose key_expr covers it, so `goat audit ops` (a GET on `ops/audit/operator/**`)
+# reads back the full window from here. Cheap on disk: operator actions are
+# small, infrequent, encrypted protobufs — a year of them is trivial.
+goat_zenoh_audit_retention_days: 365
+
+# Transitional grant for the DEPRECATED `system/` operator namespace
+# (ADR 1035). DEFAULT OFF — new deployments get a
+# clean `ops/`-only operator namespace. An instance with legacy `system/`
+# traffic still in flight opts in by setting this true in its
+# group_vars; when it adds `system/**` back alongside `ops/**` (storage +
+# operator write grant) so the live fabric doesn't flag-day during the
+# coordinated publisher+subscriber flip. Set false again once that instance
+# has fully migrated to `ops/`.
+goat_zenoh_legacy_system_namespace: false
+
+# ---- mTLS material ---------------------------------------------------------
+# The role needs these artifacts:
+#   1. Offline-CA root cert (for verifying every peer's client cert)
+#   2. Zenoh router's leaf cert + key (server-side mTLS material)
+# Paths are where the role expects to find them on the deploy controller;
+# the role copies them to the host at deploy time.
+#
+# The role refuses to deploy with a clear error if any are missing.
+# playbook_dir-anchored (absolute) so the controller-side stat resolves
+# regardless of the cwd ansible is launched from — the documented invocation
+# is `cd ops/ansible && ansible-playbook ...`, where a bare repo-root-relative
+# `ops/enrollment/...` would resolve to the nonexistent ops/ansible/ops/...
+# which makes the router pre-flight false-fail on certs that are present.
+# playbook_dir is the absolute ops/ansible dir.
+nova_ca_root_cert_path: "{{ playbook_dir }}/../enrollment/ca/{{ site_id }}/root-cert.pem"   # a shared role must not name a goatnet
+# The router leaf on the controller: the manifest out_dir (~/.goat/state/<site>-leaves)
+# first, the old in-checkout copy as a fallback (filter_plugins/goat_leaf.py, #2165). A site
+# that serves another site's router leaf sets goat_router_leaf_site.
+goat_router_leaf_site: "{{ site_id }}"
+nova_router_leaf_cert_path: "{{ 'router-cert.pem' | goat_leaf(goat_router_leaf_site) }}"
+nova_router_leaf_key_path:  "{{ 'router-key.pem' | goat_leaf(goat_router_leaf_site) }}"
+
+# Host-side install paths (inside the zenohd container's view).
+goat_zenoh_tls_dir: "/etc/{{ zenoh_stack }}/tls"
+
+# ---- ACL allowlist ---------------------------------------------------------
+# Per-vendor write rules + subjects + policies live inside the top-level
+# `access_control:` block in config.json5 (Zenoh 1.x built-in module;
+# NOT a dynamic plugin — F-124 item 4). The add-vendor.sh helper edits
+# config.json5 between the `// BEGIN: per-vendor *` / `// END: per-vendor *`
+# markers + SIGHUPs zenohd. The previous standalone access_control.json5
+# was retired in the same change-set.
+#
+# Today the role renders the seed set (operator + community + caracal +
+# universal-read + attest/schema) into config.json5 from the template;
+# the helper appends new vendors after that.
+
+# Seed vendors at deploy. Operator can extend at deploy time via
+# group_vars or extend post-deploy via the add-vendor.sh helper script.
+nova_seed_vendors:
+  - community
+  - caracal
+
+# ---- Identity model (ADR 1025) --------------------------------------------
+# Per-goatnet knob. "per-vendor" (default): the cert CN is
+# <vendor>-trial-peer and the write rule grants <vendor>/**, added/removed by
+# add-vendor.sh. "per-uuid-slot-pool" (greenfield): N pre-cut slots are
+# baked into the ACL at boot — each slot's cert CN is its own anchor <uuid>
+# and grants <uuid>/** only, so a system gets per-publisher isolation and
+# onboarding is pure cert-mint against a free slot (no ACL edit, no restart).
+# Set to per-uuid-slot-pool only in a NEW goatnet's group_vars; never flip a
+# running per-vendor goatnet (that would re-render the live ACL).
+zenoh_identity_model: "per-vendor"
+
+# Slot pool — only consulted when zenoh_identity_model == "per-uuid-slot-pool".
+# Modest sandbox pool sized to onboards-per-window; refilled by a planned
+# restart (ADR 1025). The salt MUST be set + distinct per goatnet so anchor
+# uuids are disjoint across federating goatnets — anchor = sha256(salt:k)[:32],
+# the SAME formula the portal uses to mint CN=<uuid> for slot k.
+zenoh_slot_pool_size: 256
+zenoh_slot_pool_salt: ""
+
+# Lazy slot-pool storage.
+# Default false = the historical pre-cut (one rocksdb store per POOL slot).
+# Set true to declare a store ONLY for the anchors in zenoh_active_slot_anchors
+# (live/onboarded slots) — the ACL write-rule pool stays full, so onboarding is
+# unchanged; this just stops pre-creating stores for empty pool slots (the O(N)
+# the adminspace_getter fan-out scales with). New slots get their store live via
+# the admin REST API at mint; this list is what's re-declared across restarts.
+# Path to the portal's slot registry, read READ-ONLY by the lazy-storage
+# pre-flight so a render cannot revert a live-added store. Mirrors
+# goat-zenoh-portal's portal_db_path; overridden per goatnet only if the portal
+# data dir moves.
+zenoh_lazy_registry_db: "/opt/goat-zenoh-portal/registry.db"
+# Which store holds that registry (ADR 1165 step A). Follows the goatnet's
+# portal_store: on postgres the pre-flight reads the slots table through
+# `docker exec <container> psql` (local socket, read-only session) and
+# zenoh_lazy_registry_db is unused.
+zenoh_lazy_registry_store: "{{ portal_store | default('sqlite') }}"
+zenoh_lazy_registry_pg_container: "{{ portal_db_container | default('postgres-a') }}"
+zenoh_lazy_registry_pg_db: "{{ portal_db_name | default('portal_registry') }}"
+zenoh_lazy_registry_pg_user: "{{ portal_db_user | default('portal') }}"
+zenoh_lazy_slot_storage: false
+zenoh_active_slot_anchors: []
+
+# ---- Partner read partition (B2.1, partner-read-partition.md) --------------
+# The ENFORCING read carve for partners (ADR 1027 tripwire mechanism). DEFAULT
+# OFF: when false the ACL renders byte-for-byte as today (universal read for
+# every TLS peer — trial-peer-read on link_protocols). Enabling is a fabric-wide
+# read-posture change: it narrows trial-peer-read off link_protocols to an
+# ENUMERATED non-partner population so partners match ONLY their own restricted
+# partner-<anchor> subject. Because the enumeration is population-dependent, an
+# omission LOSES read — so enabling MUST be live-fired on the goatnet
+# first (verify a partner reads only own+lanes, non-partners unchanged) and is
+# tripwire-gated. Only meaningful under zenoh_identity_model: per-uuid-slot-pool.
+zenoh_partner_read_partition: false
+# Key-bundle read for grant-keyed encryption. When true, each member's
+# read + delivery rules also carry "keys/<set>/**" for every release set in that
+# member's lanes, so it can fetch the bundle holding its own copy of the data key.
+# Without it grant-keyed encryption does not work end to end for anyone: the
+# fetch is default-denied, returns empty, and is indistinguishable from no data.
+#
+# Scoped per release set, never "keys/**". Read-only in effect: partner-r-* has
+# no put/delete and partner-deliver-* is egress (the router delivering), so this
+# adds no ability to publish a bundle. Member writes stay on slot-w-<anchor>.
+#
+# Set false to roll back; the rule disappears on the next converge + restart, and
+# grant-keyed sharing stops working for every member on that goatnet.
+zenoh_member_key_read_enabled: true
+
+# Partner anchor (cert CN = slot uuid) -> release lanes it may READ, e.g.
+#   { "ab12…": ["<lane>"] }  ⇒ reads own ab12…/** + release/<lane>/** and nothing
+# else; writes stay own-anchor-only. Empty ⇒ no partner is carved (flag inert).
+zenoh_partner_read_lanes: {}
+# When the partition is ON, non-partner slot anchors keep universal read
+# automatically (enumerated by skipping partner anchors); list here any OTHER
+# TLS read consumer CN that must keep universal read (playground / sandbox /
+# rest-bridge / non-slot service). Operator, infra, and the audit subscriber
+# keep read via their own dedicated subjects and need NOT be listed.
+zenoh_universal_read_cns: []
+
+# ---- Scoped peer read: `**` is a named grant -------
+# DEFAULT OFF, per goatnet, and the rollback is this flag.
+#
+# When false the ACL renders byte-for-byte as before: the universal read rule
+# grants the whole keyspace in one key-expression, so any mTLS peer can declare
+# ONE subscriber on `**` and have the entire fabric pushed at it.
+# A slow `**` subscriber then blocks the router ~5 s per push, stopping
+# fabric-wide delivery while every process-level signal reads healthy.
+#
+# When true, read REACH is unchanged and the SHAPE changes: the universal grant
+# becomes a per-namespace enumeration (every slot anchor, every seeded vendor
+# root, every shared root below), which by zenoh's inclusion rule REFUSES a
+# declared `**` or `*/**` while allowing every concrete key and sub-expression
+# under each namespace. Subscribing to the whole keyspace becomes a grant bound
+# to the named certs in zenoh_fabric_wide_read.
+#
+# ENABLING IS LIVE-FIRE GATED, for the same reason the partner partition is: a
+# denial is silent at both ends. Before flipping this on a goatnet, read
+# the router's own subscriber census through the evaluator and decide per name:
+#   files/acl-evaluate.py impact <rendered-config> trial-peer-read <census.json>
+# where census.json is `curl "http://127.0.0.1:8000/@/*/router/subscriber/**"`.
+# Anything it prints goes silently dead unless its peer is named below or its
+# subscriber is scoped first.
+zenoh_peer_read_scoped: false
+
+# THE GRANDFATHER LIST. Not a blessing — a list of who already held a
+# whole-fabric subscription when enforcement landed, named so that turning it on
+# breaks nobody on the day. Its purpose is to stop the NEXT one.
+#
+#   - cn: panoscope-trial-peer      # the certificate CN, exactly as minted
+#     owner: platform               # who is accountable for it
+#     reason: Data-COP renders every topic on the fabric
+#     until: # review date — see below
+#   - slot_idx: 20                  # or a pool slot; the template derives its CN
+#     owner: platform
+#     reason: synth glass-display (sink persona, subscribe_key **)
+#     until:
+#
+# AT `until:`, re-measure and SHRINK. Read the census, and for each row ask
+# whether that peer still declares `**`. If it does not, delete the row. If it
+# does, the question is whether it should — a consumer persona that subscribes to
+# everything so a demo looks busy is a subscription to fix, not a grant to renew.
+# A list that only ever grows is the failure mode this replaces.
+#
+# Infra that already holds its own dedicated subject (operator, audit-subscriber,
+# infra-*) keeps `**` through that subject and need NOT be listed. Empty means
+# nobody may subscribe fabric-wide, which is the fail-closed direction.
+zenoh_fabric_wide_read: []
+
+# Cross-tenant filter shapes any peer may declare once the scoped read is on.
+#
+# A subscription that starts with `**` — one vendor across tenants
+# (`**/<vendor>/**`), one topic across tenants (`**/airtracks/v1/*`) — is a
+# legitimate filter, not a fabric-wide fan-in, and the policy is that it keeps
+# working WITHOUT a named grant. It cannot be expressed as a rule pattern: the
+# rule that would cover all of them, `**/*/**`, is not a key expression (zenoh
+# canonizes `**/*` to `*/**`, so the router refuses the config), and a rule that
+# includes a `**`-leading declaration must itself start with `**`. So each shape
+# is enumerated, exactly as declared by the subscriber.
+#
+# THE COST, so nobody discovers it as a mystery: a shape that is not listed here
+# is DENIED, SILENTLY — the subscriber declares happily and then just
+# receives nothing, which reads as "that topic is quiet". Nothing errors, at
+# either end.
+#
+# HOW TO ADD ONE: append the shape exactly as the subscriber declares it to this
+# list, re-render, deploy the role, and restart the router (F-156 — SIGHUP does
+# not reload the ACL). Read what the fabric actually declares before editing:
+#   curl -s "http://127.0.0.1:8000/@/*/router/subscriber/**"
+#
+# NEVER list `**` (that is zenoh_fabric_wide_read's job) and never list an
+# expression made only of `*` chunks (`*/**`, `*/*/**`): those match everything
+# published and would re-open the fan-in this exists to close. The role refuses
+# both.
+zenoh_peer_cross_tenant_read: []
+
+# ---- ADR 1105 co-publish + multi-publisher topics (PUBSUB-ORG-ADMIN) -
+# Opt-in, fail-closed. Single-owner <uuid>/** roots stay INVIOLABLE — this never
+# adds a writer to one. It only renders (a) a rocksdb store per registered
+# MULTI-PUBLISHER TOPIC and (b) additive write allows for the publishers
+# granted onto those topics. Flag off / empty inputs ⇒ the render is
+# byte-identical to the pre-1104 config. Only meaningful under
+# zenoh_identity_model: per-uuid-slot-pool.
+zenoh_copublish_enabled: false
+# zenoh_multipub_topics — the registered key-BASES that persist, e.g.
+#   [ "multipub/1a2b3c4d/5e6f7a8b" ]
+# ⇒ a rocksdb store on multipub/1a2b3c4d/5e6f7a8b/**.
+# `multipub/<org-pool>/<topic>` is a distinct namespace (the reserved
+# `multipub/` class), never a single-owner
+# root; the org-pool is a stable opaque handle (org name resolved off-key via the
+# registry/alias layer). Empty ⇒ no multipub-topic store.
+zenoh_multipub_topics: []
+# zenoh_copublish_grants — publisher anchor (cert CN = slot uuid) -> list of
+# MULTI-PUBLISHER TOPIC key-bases it may `put` on, e.g.
+#   { "ab12…": ["multipub/1a2b3c4d/5e6f7a8b"] }
+# ⇒ ab12… may additionally publish multipub/1a2b3c4d/5e6f7a8b/** (with its
+# volatile/ and /@adv/ mirror). Every base MUST be a `multipub/<pool>/<topic>`
+# key — a single-owner root is never a valid target (the guardrail is enforced at
+# grant issuance in the portal; the render trusts the materialized map).
+# Materialize both inputs from the portal (GET /api/access/co-publish-grants +
+# the multipub-topic list); the registry is authoritative. Empty ⇒ no co-publish
+# rule. F-156: takes effect only on router restart. F-177: an un-granted key is
+# denied SILENTLY — live-fire by presence/absence at a subscriber.
+zenoh_copublish_grants: {}
+
+# ---- Compose --------------------------------------------------------------
+goat_zenoh_config_path: "/etc/{{ zenoh_stack }}/config.json5"
+goat_zenoh_compose_path: "/opt/{{ zenoh_stack }}/docker-compose.yml"
+
+# ---- F-258 seed/org split (per-vendor mode only) --------------------------
+# The durable fix for the runtime-ACL clobber: in per-vendor mode the role no
+# longer renders config.json5 directly. Instead it renders a role-owned SEED
+# (config.json5.j2, per-vendor regions empty), reconciles it with the
+# portal-owned ORG FRAGMENT (every seed + runtime vendor) via acl-assemble.py,
+# and writes the assembled result to goat_zenoh_config_path. A re-render
+# regenerates only the seed and re-splices the fragment, so runtime vendors can
+# no longer be dropped. Slot-pool mode is unaffected — its ACL is
+# template-rendered deterministically and keeps the direct-render + guard path.
+goat_zenoh_acl_seed_path: "/etc/{{ zenoh_stack }}/config.seed.json5"
+goat_zenoh_acl_org_path: "/etc/{{ zenoh_stack }}/acl-org-fragment.json5"
+goat_zenoh_acl_assemble_path: "/usr/local/sbin/{{ zenoh_stack }}-acl-assemble"
+
+# F-364 — host-side assert that narrowing the universal read (B2.1 partner
+# partition) leaves every live reader with a subject. Runs between the render
+# and the restart; see roles/goat-zenoh/files/assert-universal-read-coverage.py.
+goat_zenoh_read_coverage_check_path: "/usr/local/sbin/{{ zenoh_stack }}-read-coverage-check"
+# The ACL evaluator (files/acl-evaluate.py). Installed on every router host so
+# the "what would this narrowing refuse" question can be answered ON the host,
+# against the live census, without shipping the config off the box.
+goat_zenoh_acl_evaluate_path: "/usr/local/sbin/{{ zenoh_stack }}-acl-evaluate"
+
+# F-258 clobber-safety. The portal appends per-vendor ACL rules to the LIVE
+# config.json5 at runtime; this role's template carries only the seed. Fail
+# closed (below) if a re-render would drop live runtime rules. Set true ONLY to
+# deliberately overwrite the live ACL with the seed, and only after the runtime
+# rules have been captured back. Deploys that keep the live ACL use the surgical
+# image swap, not the role. See docs/findings/F-258.
+goat_zenoh_allow_acl_rerender: false
+goat_zenoh_helper_path: "/usr/local/bin/goat-zenoh-add-vendor"
+goat_zenoh_delete_helper_path: "/usr/local/bin/goat-zenoh-delete-vendor"
+
+# F-287 edge queryable lockdown. OFF by default, per-goatnet opt-in.
+# When true, the universal read subject loses `declare_queryable` and `query`
+# egress on `**` and keeps them only on `**/@adv/**` (the AdvancedPublisher
+# PublicationCache recovery path). Stops any CA-rooted device from advertising
+# itself as the queryable of record for the whole keyspace — a vector that can
+# wedge a router for hours.
+# Denials in zenoh are SILENT: live-fire each goatnet before enabling.
+zenoh_edge_queryable_lockdown: false
+
+# Re-grants that MUST accompany the lockdown. Not optional bookkeeping — the
+# narrowed rule is `trial-peer-r-all`, and EVERY service policy includes that
+# rule, so flipping the flag strips `declare_queryable` from every subject on
+# the fabric at once, not just from edge peers. Remote queryables go silently dead
+# (`keys/**`, `ops/**`, `attest/schema/**`, `ops/audit/operator/**`, and three
+# tenant slot roots). The one bare `**` queryable is router-LOCAL and is not
+# ACL-gated, so the universal answerer we want to keep was never at risk — the
+# ones we would have lost are services.
+#
+# Each entry hands the right to answer back to ONE subject on ONLY its own
+# namespace, which is the least-privilege shape the universal grant never had:
+#
+#   zenoh_edge_queryable_lockdown_grants:
+#     - subject: infra-keyd
+#       key_exprs: ["keys/**"]
+#     - subject: operator
+#       key_exprs: ["ops/**"]
+#
+# Build the list from the LIVE fabric, never from this file — the set is
+# per-goatnet and changes as services land:
+#   docker exec <router> sh -c 'wget -qO- "http://127.0.0.1:8000/@/*/router/**/queryable/**"'
+# Entries with clients>0 are remote and need a re-grant; routers-only entries
+# are the router's own storage and do not.
+#
+# The role REFUSES to render with the lockdown on and this list empty. That is
+# deliberate: the failure it prevents is invisible, so it cannot be left to
+# whoever flips the boolean remembering a comment.
+zenoh_edge_queryable_lockdown_grants: []
+
+# --- Peer-router reach across a federation link -----------
+# What a PEERED ROUTER may read and be delivered. Defaults reproduce the historic
+# grant exactly (`**`), so a same-CA, same-goatnet federation renders
+# semantically unchanged.
+#
+# ACROSS A CA BOUNDARY THESE MUST BE NARROWED. F-424: the Zenoh ACL cannot see
+# which CA issued a leaf, so a foreign root in the trust store can mint
+# CN=goat-zenoh-router and inherit whatever this grants. A cross-sovereign edge
+# profile sets both to the agreed release prefixes and nothing else.
+#
+# NEVER narrow these on a live goatnet without a live-fire test: ACL denial is
+# silent at both ends, so a wrong scope stops cross-site delivery with
+# nothing logged at the sender. Widen by measurement, not by guess.
+goat_zenoh_router_peer_read_key_exprs: ["**", "**/@adv/**"]
+goat_zenoh_router_peer_deliver_key_exprs: ["**", "**/@adv/**"]
+
+# Sovereign edge routers are a SEPARATE role: roles/goat-zenoh-edge/ (ADR 1157).
+# Deliberately not a branch of this role — an edge must not inherit the rocksdb
+# backend, the portal-group-writable config dir, or the ACL seed migration.
+
+# --- Sovereign peerings (ADR 1157 P2) --------------------------------------
+# One entry per SOVEREIGN peering. Each renders an ACL subject matching the CN
+# agreed with that sovereign, plus a rule granting INGRESS WRITE on
+# `from/<sov>/**` and nothing else.
+#
+#   - sovereign: svn              # their code; fixes the namespace from/svn/**
+#     cn: svn-peer-01             # the Subject CN on their peering SVID, agreed
+#                                 # out of band and set as the FIRST dns_name on
+#                                 # their SPIRE entry
+#     release_key_exprs: []       # what they may READ from us. Empty = nothing.
+#
+# DELIBERATELY NOT PRE-CUT, unlike zenoh_partner_slot_blocks (ADR 1138). A
+# partner slot's anchor is a hash, so subjects can exist before anyone holds the
+# cert and onboarding costs no restart. A sovereign peering cannot work that way:
+# `from/<sov>/` names a real sovereign, so the mapping must be declared before
+# the subject means anything. Adding a peering is therefore a config change AND A
+# ROUTER RESTART. Say so in the
+# runbook rather than implying parity with partner onboarding.
+#
+# Empty by default. A goatnet with no declared peering renders no peer subject,
+# no peer rule and no `from/**` store — byte-identical to today.
+zenoh_sovereign_peerings: []
+
+# Retention for the `from/**` ingress store. Separate from the fabric default
+# because partner data is the one class we did not generate and may be obliged
+# to delete on request or on peering termination. An unset horizon is how
+# "quarantine" becomes "keeps forever" -- ~0.5 GB/day/peering against a 30-day
+# MinIO window is the plan's own estimate, and it is unmeasured.
+zenoh_from_retention_days: 7
+
+# F-447 — undeclared ("orphaned") rocksdb store directories. A render that stops
+# declaring a storage leaves the directory and its samples on disk, still opened
+# by the fabric-crawler and covered by no retention rule. The role lists them on
+# every deploy and writes them to <storage_path>/.undeclared-stores; it NEVER
+# deletes, because a store the current render omits is not necessarily dead (an
+# unset zenoh_active_slot_anchors omits the entire slot pool).
+#
+# Set true on a goatnet whose store base has been cleaned, to ratchet the state
+# in place: a deploy then REFUSES while any undeclared directory remains.
+zenoh_orphan_stores_fail: false
+

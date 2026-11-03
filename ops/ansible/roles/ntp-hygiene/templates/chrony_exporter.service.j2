@@ -1,0 +1,42 @@
+{# systemd unit for SuperQ/chrony_exporter.
+   Runs as a dedicated user in the `chrony` group so it can read the
+   chronyd control socket at /run/chrony/chronyd.sock. #}
+[Unit]
+Description=chrony_exporter (Prometheus exporter for chronyd)
+Documentation=https://github.com/SuperQ/chrony_exporter
+Wants=network-online.target
+After=network-online.target chrony.service
+Requires=chrony.service
+
+[Service]
+Type=simple
+User={{ chrony_exporter_user }}
+Group={{ chrony_group }}
+# Bind per chrony_exporter_listen_addr (default 0.0.0.0:9123 so the
+# Prometheus container scrapes us via the docker host-gateway alias
+# at 172.17.0.1). External exposure blocked by the EC2 SG / host FW.
+{% set _addr = ('127.0.0.1:' ~ (chrony_exporter_cmdport | int)) if (chrony_exporter_cmdport | default(0) | int) > 0 else chrony_exporter_chrony_address %}
+ExecStart={{ chrony_exporter_install_dir }}/chrony_exporter \
+  --web.listen-address={{ chrony_exporter_listen_addr }} \
+  --chrony.address={{ _addr }}{% for c in chrony_exporter_collectors %} \
+  --collector.{{ c }}{% endfor %}
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

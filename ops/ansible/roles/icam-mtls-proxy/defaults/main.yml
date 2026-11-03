@@ -1,0 +1,55 @@
+---
+# icam-mtls-proxy defaults — card sign-in from any sovereign PKI (ADR 1209; the
+# `mtls_proxy` mode of ADR 1069). nginx terminates x509 mTLS against the enabled
+# PKIs' CA bundles, reads the identifier the PKI's profile says the card carries,
+# and hands Dex's authproxy connector X-Remote-User = "<pki>:<identifier>" plus
+# X-Remote-Pki = "<pki>". Kratos federates to Dex; the claim map
+# ops/identity/claim-maps/sovereign-pki.jsonnet records the binding.
+# Default-OFF: flipping icam_mtls_proxy_enabled to true stands the whole path up.
+
+icam_mtls_proxy_enabled: false             # <-- the single flag
+
+# Which PKI profiles this goatnet accepts: ids from ops/identity/sovereign-pkis.yaml.
+# Every id must be a `status: live` profile; the role fails closed on a sketch or an
+# unknown id. The registry is the only place a PKI is described.
+icam_mtls_proxy_pkis: ["us-dod"]
+icam_mtls_proxy_registry: "{{ playbook_dir }}/../identity/sovereign-pkis.yaml"
+
+# Trust anchors, one file per enabled profile: <dir>/<id>/ca-bundle.pem — the same
+# layout the store reads (OPENBAO_SOVEREIGN_PKI_DIR); build it with
+# ops/identity/sovereign-pkis-render.py openbao-dir and stage it on the mgmt-host.
+# Each bundle holds the CAs that issue the card's authentication certificate plus
+# the roots they chain to (the profile's trust_anchor says which).
+icam_mtls_proxy_pki_dir: /opt/mgmt-host/pki
+icam_mtls_proxy_verify_depth: 3
+
+icam_mtls_proxy_compose_dir: /opt/mgmt-host/icam-mtls-proxy
+icam_mtls_proxy_nginx_image: "nginx:1.27-alpine"   # ships ngx_http_js_module (njs) for SAN parsing
+icam_mtls_proxy_dex_ref: "ghcr.io/dexidp/dex:v2.41.1"
+icam_mtls_proxy_https_port: 8543           # mesh-only bind; card mTLS ingress
+icam_mtls_proxy_bind_ip: 127.0.0.1         # a real goatnet binds its mgmt host's mesh address (mesh_ip_a)
+
+# Server TLS — how a browser (and Kratos, fetching Dex discovery) come to trust the
+# proxy's OWN certificate; the client-certificate side is always nginx's.
+#   self-signed   the role mints one at deploy. Nothing trusts it: a proof, not a site.
+#   traefik-acme  the proxy serves the Let's Encrypt certificate Traefik already holds
+#                 for the site (its mesh-only wildcard covers card-proxy.<site>.<zone>),
+#                 read out of acme.json at deploy and daily by a timer; Traefik passes
+#                 this hostname's TLS through on :443 untouched (a TCP router, SNI match),
+#                 so nginx still sees the card. No second ACME client, no DNS-01 token on
+#                 the proxy, no port in the issuer URL.
+icam_mtls_proxy_tls: self-signed
+icam_mtls_proxy_acme_json: /opt/mgmt-host/letsencrypt/acme.json
+icam_mtls_proxy_acme_resolver: le
+icam_mtls_proxy_traefik_dynamic_dir: /etc/traefik/dynamic
+icam_mtls_proxy_traefik_entrypoint: websecure
+# Who may reach the proxy through Traefik: mesh peers + on-host containers (Kratos).
+icam_mtls_proxy_allow_cidrs: ["100.64.0.0/10", "172.16.0.0/12"]
+
+# The OIDC issuer Kratos's icam_federation provider points at (mtls_proxy mode). Must
+# match the proxy's externally-reachable name (Dex issuer + server cert SAN).
+icam_mtls_proxy_issuer_url: "https://card-proxy.{{ site_id }}.{{ site_dns_zone }}"
+# The browser-facing Kratos callback for the `card-local` provider (Kratos's public
+# base_url is https://auth.<site>.<zone>/ in roles/ory).
+icam_mtls_proxy_kratos_redirect: "https://auth.{{ site_id }}.{{ site_dns_zone }}/self-service/methods/oidc/callback/card-local"
+icam_mtls_proxy_hostname: "{{ icam_mtls_proxy_issuer_url | regex_replace('^https?://([^/:]+).*$', '\\1') }}"

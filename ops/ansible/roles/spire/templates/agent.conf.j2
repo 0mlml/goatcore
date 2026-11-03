@@ -1,0 +1,60 @@
+# {{ ansible_managed }}
+# SPIRE agent — ZAGROS Phase A. Rendered by ops/ansible/roles/spire/.
+# Started with `-expandEnv` so ${SPIRE_JOIN_TOKEN} resolves from the
+# container env (one-time, first attestation only). Sandbox single-node.
+
+agent {
+    data_dir       = "/opt/spire/data/agent"
+    log_level      = "{{ spire_log_level }}"
+{% if spire_agent_only | default(false) | bool %}
+    # Agent-only (ADR 0412 Phase B): attest to the REMOTE server. Set per-host;
+    # on a three-Orin site this is the internal inter-node substrate, not the
+    # mesh — node attestation should not be reachable by every mesh peer.
+    server_address = "{{ spire_agent_server_address }}"
+    server_port    = "{{ spire_agent_server_port }}"
+{% else %}
+    server_address = "spire-server"
+    server_port    = "8081"
+{% endif %}
+    trust_domain   = "{{ spire_trust_domain }}"
+
+    # Workload API socket — exposed on the host (bind-mounted dir) so a
+    # spiffe-helper sidecar in another compose project can fetch SVIDs.
+    socket_path = "/run/spire/sockets/agent.sock"
+
+{% if spire_agent_only | default(false) | bool %}
+    # PHASE B — the bundle is PINNED, fetched from the server host by the role
+    # and written here before the agent starts. insecure_bootstrap across hosts
+    # would let anything answering on server_address become the trust root, and
+    # first contact is exactly when there is no SVID to detect the swap with.
+    trust_bundle_path = "{{ spire_agent_trust_bundle_path }}"
+{% else %}
+    # Sandbox bootstrap: accept the co-located server's trust bundle on
+    # first contact (single trusted host, localhost mgmt network). Safe ONLY
+    # because server and agent share a host and a private compose network.
+    # The multi-host case pins trust_bundle_path above.
+    insecure_bootstrap = true
+{% endif %}
+
+    # One-time node-attestation token (rendered into .env.spire after
+    # `spire-server token generate`). Ignored once the agent holds an SVID.
+    join_token = "${SPIRE_JOIN_TOKEN}"
+}
+
+plugins {
+    NodeAttestor "join_token" {
+        plugin_data {}
+    }
+
+    KeyManager "disk" {
+        plugin_data {
+            directory = "/opt/spire/data/agent"
+        }
+    }
+
+    # Attest docker workloads by compose-service label / image. Needs the
+    # docker daemon socket (bind-mounted read-only in the overlay).
+    WorkloadAttestor "docker" {
+        plugin_data {}
+    }
+}

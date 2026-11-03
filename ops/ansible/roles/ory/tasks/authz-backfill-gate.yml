@@ -1,0 +1,32 @@
+---
+# F-572 / ADR 1188 lockstep gate: ory_authz_in_metadata may follow a READY
+# backfill, never lead it. The flag drops groups/org/aff from the traits schema,
+# but every reader still falls back to traits on an identity that has no
+# metadata_public.groups, so a flag flipped ahead of the backfill leaves a
+# self-granted traits.groups in force while the site looks fixed.
+#
+# Read-only: backfill-authz-traits-to-metadata.py --verify only lists
+# identities. Exit 0 = READY, 1 = not ready, 2 = Kratos admin unreachable.
+- name: authz-backfill-gate | Verify every identity is on metadata_public ({{ ory_authz_gate_stage }})
+  ansible.builtin.script:
+    cmd: >-
+      {{ role_path }}/../../../identity/backfill-authz-traits-to-metadata.py
+      --verify
+      --admin-url http://127.0.0.1:{{ kratos_admin_host_port | default(4434) }}
+    executable: python3
+  register: ory_authz_backfill_verify
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: authz-backfill-gate | Refuse ory_authz_in_metadata until the backfill reads READY
+  ansible.builtin.fail:
+    msg: |
+      ory_authz_in_metadata is true on {{ site_id }}, but the authz backfill is
+      not READY ({{ ory_authz_gate_stage }}):
+      {{ ory_authz_backfill_verify.stdout | default('') }}{{ ory_authz_backfill_verify.stderr | default('') }}
+      Per-site order: deploy the metadata-first readers and
+      writers with the flag false, run
+      ops/identity/backfill-authz-traits-to-metadata.py --apply on the mgmt host
+      until --verify prints READY, then set the flag and redeploy this role.
+  when: ory_authz_backfill_verify.rc != 0

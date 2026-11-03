@@ -1,0 +1,152 @@
+---
+# enrolment-watch. Gate false = TEARDOWN, per the live-state-guard contract:
+# a role that only skips its install tasks leaves a timer running on a host
+# with nothing in the repo admitting it exists.
+
+- name: enrolment-watch | teardown when disabled
+  when: not (enrolment_watch_enabled | bool)
+  become: true
+  block:
+    - name: enrolment-watch | stop + disable the timer
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        daemon_reload: true
+      loop:
+        - enrolment-watch.timer
+        - enrolment-watch.service
+      failed_when: false
+
+    - name: enrolment-watch | remove unit, script, env, baseline
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/enrolment-watch.timer
+        - /etc/systemd/system/enrolment-watch.service
+        - /usr/local/bin/enrolment-watch.sh
+        - /etc/goat/enrolment-watch.env
+        - /etc/goat/enrolment-watch-baseline
+
+    # A stale .prom is worse than none: node_exporter keeps serving the last
+    # values forever, so a disabled guard reports "0 stuck peers" indefinitely
+    # and reads exactly like a healthy one.
+    - name: enrolment-watch | remove the stale metric file
+      ansible.builtin.file:
+        path: "{{ enrolment_watch_textfile_dir }}/enrolment_watch.prom"
+        state: absent
+      when: enrolment_watch_textfile_dir | length > 0
+
+- name: enrolment-watch | install
+  when: enrolment_watch_enabled | bool
+  become: true
+  block:
+    - name: enrolment-watch | textfile dir must be declared and exist
+      ansible.builtin.assert:
+        that:
+          - enrolment_watch_textfile_dir | length > 0
+        fail_msg: >-
+          enrolment_watch_textfile_dir is unset. The node_exporter textfile
+          directory DIFFERS PER GOATNET and the wrong one is writable, silently
+          accepted, and scraped by nothing — the guard would run forever and
+          reach no dashboard. Set it in group_vars.
+
+    - name: enrolment-watch | ensure dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /etc/goat
+        - "{{ enrolment_watch_report | dirname }}"
+
+    - name: enrolment-watch | install the script
+      ansible.builtin.copy:
+        src: enrolment-watch.sh
+        dest: /usr/local/bin/enrolment-watch.sh
+        mode: "0755"
+
+    - name: enrolment-watch | render env
+      ansible.builtin.template:
+        src: enrolment-watch.env.j2
+        dest: /etc/goat/enrolment-watch.env
+        mode: "0644"
+      notify: restart enrolment-watch timer
+
+    - name: enrolment-watch | render baseline
+      ansible.builtin.template:
+        src: enrolment-watch-baseline.j2
+        dest: /etc/goat/enrolment-watch-baseline
+        mode: "0644"
+
+    - name: enrolment-watch | render units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - enrolment-watch.service
+        - enrolment-watch.timer
+      notify: restart enrolment-watch timer
+
+    - name: enrolment-watch | is there a prometheus rules dir to alert from?
+      ansible.builtin.stat:
+        path: "{{ enrolment_watch_rules_dir }}"
+      register: ew_rules_dir
+
+    - name: enrolment-watch | install alert rules
+      ansible.builtin.copy:
+        src: enrolment-watch.rules.yml
+        dest: "{{ enrolment_watch_rules_dir }}/enrolment-watch.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      when: ew_rules_dir.stat.exists | default(false)
+      notify: reload prometheus for enrolment-watch
+
+    # Metrics with no alert is the shape this guard exists to end: a number
+    # that is technically observable and that nobody is told about. Say it out
+    # loud rather than finishing green.
+    - name: enrolment-watch | say so when there is nowhere to alert from
+      ansible.builtin.debug:
+        msg: >-
+          NO ALERT INSTALLED — {{ enrolment_watch_rules_dir }} does not exist on
+          this host, so the metrics are written and scraped but nothing will
+          page on a stuck peer. That is the unread-signal failure this guard
+          exists to end. Point enrolment_watch_rules_dir at this goatnet's
+          prometheus rules directory.
+      when: not (ew_rules_dir.stat.exists | default(false))
+
+    - name: enrolment-watch | enable the timer
+      ansible.builtin.systemd:
+        name: enrolment-watch.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # Fire once now. A guard whose first run is up to an hour away is a guard
+    # nobody has seen work, and the deploy that installed it is the cheapest
+    # moment to find out it does not.
+    - name: enrolment-watch | first run
+      ansible.builtin.command: /usr/local/bin/enrolment-watch.sh
+      environment:
+        ENROLWATCH_CONTAINER: "{{ enrolment_watch_container }}"
+        ENROLWATCH_WINDOW: "{{ enrolment_watch_window }}"
+        ENROLWATCH_THRESHOLD: "{{ enrolment_watch_threshold | string }}"
+        ENROLWATCH_TEXTFILE_DIR: "{{ enrolment_watch_textfile_dir }}"
+        ENROLWATCH_REPORT: "{{ enrolment_watch_report }}"
+        ENROLWATCH_BASELINE_FILE: /etc/goat/enrolment-watch-baseline
+      register: enrolment_watch_first
+      # 0 = clean, 1 = a stuck peer was FOUND, which is a successful run of a
+      # guard doing its job and must not fail the play. 2 = the log could not be
+      # read, which is a real failure and does.
+      failed_when: enrolment_watch_first.rc not in [0, 1]
+      changed_when: false
+
+    - name: enrolment-watch | first-run verdict
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'STUCK PEER(S) FOUND — read ' ~ enrolment_watch_report
+             if enrolment_watch_first.rc == 1
+             else 'no peer stuck' }}

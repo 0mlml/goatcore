@@ -1,0 +1,312 @@
+---
+# Canonical isitup deploy onto a mgmt-host stack.
+#
+# Pre-reqs (operator-fired BEFORE this role):
+#   1. Site Hydra reachable on loopback (ory-deploy.yml ran).
+#   2. {{ isitup_fqdn }} is in the master Let's Encrypt tls.domains SAN list
+#      (traefik-acme.yml re-rendered with `isitup_enabled: true`).
+#   3. isitup_oidc_client_secret + isitup_cookie_secret env vars set
+#      (32+ chars each).
+#   4. isitup-oidc-client role has run (Hydra OAuth2 client `isitup` exists).
+
+- name: Require isitup inputs
+  ansible.builtin.assert:
+    that:
+      - isitup_enabled | default(false) | bool
+      - isitup_services | length > 0
+      - isitup_oidc_client_secret is defined and (isitup_oidc_client_secret | length) >= 32
+      - isitup_cookie_secret is defined and (isitup_cookie_secret | length) in [16, 24, 32]
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+    fail_msg: |
+      isitup role requires:
+        - isitup_enabled: true
+        - isitup_services: non-empty list (see role defaults for shape)
+        - isitup_oidc_client_secret (32+ chars; env-sourced)
+        - isitup_cookie_secret (16, 24, or 32 random bytes; env-sourced)
+        - site_id, site_dns_zone
+
+# Fail-closed on a half-configured off-mesh section. Two catalog rows resolve
+# their fqdn from isitup_relay_health_public_fqdn (this goatnet's own off-mesh
+# relay-health box); a site that opts into the section without naming its box
+# would otherwise render rows linking to `https:///` — a dead link on the page
+# whose whole job is telling people where to go.
+- name: Require every off-mesh service row to name a host
+  ansible.builtin.assert:
+    that:
+      - isitup_external_services | rejectattr('fqdn', 'defined') | list | length == 0
+      - isitup_external_services | selectattr('fqdn', 'defined') | selectattr('fqdn', 'equalto', '') | list | length == 0
+    fail_msg: >-
+      isitup_external_services contains {{ isitup_external_services
+      | selectattr('fqdn', 'defined') | selectattr('fqdn', 'equalto', '')
+      | map(attribute='id') | list | join(', ') }} with an empty fqdn.
+      The relay-health rows resolve isitup_relay_health_public_fqdn — set it in
+      this site's group_vars (e.g. relay-health.<site>.goat.example), or drop those
+      rows from the site's isitup_external_services.
+  when: isitup_external_services | length > 0
+
+- name: Ensure /opt/mgmt-host/isitup tree exists
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ isitup_dir }}"
+    - "{{ isitup_dir }}/data"
+
+- name: Render nginx.conf
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: "{{ isitup_dir }}/nginx.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart isitup container
+
+- name: Lay down check.sh
+  ansible.builtin.copy:
+    src: check.sh
+    dest: "{{ isitup_dir }}/check.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  # check.sh is single-file bind-mounted into the container; atomic-write
+  # `copy` creates a new inode the container can't see until recreate.
+  notify: reload isitup compose
+
+- name: Lay down index.html (shared SPA from ops/status/)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../status/index.html"
+    dest: "{{ isitup_dir }}/index.html"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart isitup container
+
+- name: Lay down per-service brand logos (served at /icons/)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../status/icons/"
+    dest: "{{ isitup_dir }}/icons/"
+    owner: root
+    group: root
+    mode: "0644"
+    directory_mode: "0755"
+  # Bind-mounted at /usr/share/nginx/html/icons (compose overlay). The SPA
+  # renders these as <img> for services whose `icon` is a /icons/<name>.png
+  # path; services with an inline-SVG icon key don't need a file here.
+  notify: restart isitup container
+
+# ONE row list for everything below that describes the page (#1518). Built from
+# isitup_services + the off-mesh catalog + the ADR 1178 declarations,
+# deduplicated by id, with unlisted and past-retire_after rows dropped. See the
+# template header for the precedence and the per-row display fields.
+- name: Build the status-page row list
+  ansible.builtin.set_fact:
+    isitup_rows: "{{ lookup('ansible.builtin.template', 'isitup-rows.json.j2') | from_json }}"
+
+- name: Require every row's lifecycle to be one the page understands
+  ansible.builtin.assert:
+    that:
+      - isitup_rows | rejectattr('lifecycle', 'in', ['live', 'planned', 'retiring']) | list | length == 0
+    fail_msg: >-
+      isitup rows {{ isitup_rows | rejectattr('lifecycle', 'in', ['live', 'planned', 'retiring'])
+      | map(attribute='id') | list | join(', ') }} declare a lifecycle other than
+      live / planned / retiring. The page would count an unknown state as live
+      and the obs host would keep probing it — a typo here is how a retired
+      service goes on paging.
+
+- name: Render services.env (per-site service list — drives page rows + health probe)
+  ansible.builtin.template:
+    src: services.env.j2
+    dest: "{{ isitup_dir }}/services.env"
+    owner: root
+    group: root
+    mode: "0644"
+  # services.env is single-file bind-mounted into the container; atomic-
+  # write template renders create a new inode the container can't see
+  # until recreate. Notify the same handler that the env_file template
+  # uses (compose --force-recreate).
+  notify: reload isitup compose
+
+# What the page knows about each row beyond its probe result: lifecycle,
+# where it came from (core / offmesh / external) and who owns it. Lives in the
+# data/ directory, which is a DIRECTORY bind mount — so unlike services.env and
+# check.sh it needs no container recreate to be seen, and it is served with the
+# same no-store header as current.json. The page reads both on every refresh.
+- name: Render data/meta.json (per-row lifecycle, source and owner for the page)
+  ansible.builtin.template:
+    src: meta.json.j2
+    dest: "{{ isitup_dir }}/data/meta.json"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render isitup.env (oauth2-proxy config; mode 0600)
+  ansible.builtin.template:
+    src: isitup.env.j2
+    dest: "{{ isitup_envfile }}"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reload isitup compose
+
+- name: Render Traefik dynamic config for isitup routers
+  ansible.builtin.template:
+    src: isitup-traefik-dynamic.yml.j2
+    dest: "/etc/traefik/dynamic/isitup-{{ site_id }}.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  # Traefik file-watcher reloads on change; no container restart needed.
+
+- name: Lay down compose overlay (templated for site-specific extra networks — F-165)
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../compose/mgmt-host/docker-compose.isitup.yml.j2"
+    dest: "{{ isitup_compose_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload isitup compose
+
+# On-host DNS override for the OIDC issuer hostname.
+# Docker's embedded resolver doesn't know about mesh CoreDNS (different port
+# 5353; embedded only forwards on :53), so oauth2-proxy can't resolve the
+# issuer URL from inside the container without this static host entry.
+# Closes F-126.
+- name: Set OAUTH2_PROXY_OIDC_HOST_ENTRY in /opt/mgmt-host/.env (compose-time substitution)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^OAUTH2_PROXY_OIDC_HOST_ENTRY="
+    line: "OAUTH2_PROXY_OIDC_HOST_ENTRY={{ isitup_oidc_host_entry }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  notify: reload isitup compose
+
+# Easy-rollback per ADR 0859 — drive ISITUP_IMAGE via the same compose-
+# time env mechanism. Compose's ${ISITUP_IMAGE:-default} picks this up
+# from /opt/mgmt-host/.env. Bumps to isitup_image MUST append a row to
+# deploy-history.yml (CI checks via deploy-history-check.yml).
+- name: Set ISITUP_IMAGE in /opt/mgmt-host/.env (ADR 0859 — easy rollback)
+  ansible.builtin.lineinfile:
+    path: /opt/mgmt-host/.env
+    regexp: "^ISITUP_IMAGE="
+    line: "ISITUP_IMAGE={{ isitup_image }}"
+    owner: root
+    group: root
+    mode: "0600"
+    create: true
+  notify: reload isitup compose
+
+# Self-heal an INTERRUPTED previous run. Every task above notifies the
+# recreate handler on change — but handlers do not run when a play is aborted,
+# and the next run then finds the host files already correct, reports `ok`,
+# notifies nothing, and leaves the container running the OLD inodes. These are
+# single-file bind mounts, so the container keeps the inode it was created
+# with; a converged host says nothing about what the checker is executing.
+#
+# That is not hypothetical. Both goatnets hit it — the deploy was
+# killed just after `services.env` was rendered, and the re-run came back
+# `changed=0` with the container still on the previous check.sh. Re-running the
+# play has to be enough to converge, so this compares what is RUNNING against
+# what is on disk rather than trusting the copy tasks' own verdict.
+- name: Detect bind-mounted files the running container has not picked up
+  ansible.builtin.shell: |
+    set -o pipefail
+    drift=0
+    for pair in "{{ isitup_dir }}/check.sh:/usr/local/bin/check.sh" \
+                "{{ isitup_dir }}/services.env:/etc/isitup/services.env" \
+                "{{ isitup_dir }}/index.html:/usr/share/nginx/html/index.html" \
+                "{{ isitup_dir }}/nginx.conf:/etc/nginx/conf.d/default.conf"; do
+      host_file="${pair%%:*}"
+      in_container="${pair##*:}"
+      [ -f "$host_file" ] || continue
+      want=$(md5sum "$host_file" | awk '{print $1}')
+      got=$(docker exec isitup md5sum "$in_container" 2>/dev/null | awk '{print $1}' || true)
+      # No container yet, or it cannot be read: the compose task below creates
+      # it, so say nothing rather than reporting drift that is really absence.
+      [ -n "$got" ] || continue
+      if [ "$want" != "$got" ]; then
+        echo "STALE ${in_container} (running ${got}, on disk ${want})"
+        drift=1
+      fi
+    done
+    exit 0
+  args:
+    executable: /bin/bash
+  register: isitup_bindmount_drift
+  changed_when: "'STALE' in isitup_bindmount_drift.stdout"
+  failed_when: false
+  notify: reload isitup compose
+
+- name: Report which files the container was still running
+  ansible.builtin.debug:
+    msg: "{{ isitup_bindmount_drift.stdout_lines }}"
+  when: "'STALE' in (isitup_bindmount_drift.stdout | default(''))"
+
+- name: Flush handlers so isitup is up before the cron and smoke fire
+  ansible.builtin.meta: flush_handlers
+
+- name: Bring up isitup + oauth2-proxy (idempotent)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose
+      -f /opt/mgmt-host/docker-compose.yml
+      -f {{ isitup_compose_file }}
+      up -d isitup oauth2-proxy-isitup
+    chdir: /opt/mgmt-host
+  register: isitup_compose_up
+  changed_when: >-
+    'Started' in (isitup_compose_up.stderr | default(''))
+    or 'Created' in (isitup_compose_up.stderr | default(''))
+    or 'Recreated' in (isitup_compose_up.stderr | default(''))
+
+- name: Install 5-minute cron job (runs check.sh inside the isitup container)
+  ansible.builtin.cron:
+    name: "isitup-check ({{ site_id }})"
+    minute: "*/5"
+    job: "docker exec isitup /usr/local/bin/check.sh 2>&1 | logger -t isitup-check"
+    user: root
+
+- name: Run check.sh once now to seed data/current.json
+  ansible.builtin.command:
+    cmd: docker exec isitup /usr/local/bin/check.sh
+  register: isitup_first_check
+  changed_when: false
+  retries: 5
+  delay: 4
+  until: isitup_first_check.rc == 0
+
+- name: Print deploy summary
+  ansible.builtin.debug:
+    msg: |
+      isitup deployed:
+        URL:        https://{{ isitup_fqdn }}/
+        Data dir:   {{ isitup_dir }}/data/
+        Cron:       every 5 minutes (root)
+        Rows:       {{ isitup_rows | selectattr('source', 'equalto', 'core') | list | length }} core
+                    + {{ isitup_rows | selectattr('source', 'equalto', 'offmesh') | list | length }} off-mesh
+                    + {{ isitup_rows | selectattr('source', 'equalto', 'external') | list | length }} external (on /external)
+                    = {{ isitup_rows | length }} probed; {{ isitup_rows | rejectattr('lifecycle', 'equalto', 'live') | list | length }} not live
+        OIDC gate:  Hydra at {{ isitup_oidc_issuer_url }} (client_id={{ isitup_oidc_client_id }})
+
+      Next: open the URL in a browser. oauth2-proxy will redirect through
+      auth.{{ site_id }}.{{ site_dns_zone }} (Kratos), Hydra issues the
+      authorization code, oauth2-proxy sets the session cookie, the page
+      renders with active links to each service in the list.
+# Deploy ledger now written by the shared `rollback-ledger`
+# meta-dependency (meta/main.yml) per ADR 1060 — no per-role task here.
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: isitup | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "isitup"
+    rollback_ref: "{{ isitup_image }}"

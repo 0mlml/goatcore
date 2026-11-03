@@ -1,0 +1,111 @@
+---
+# mesh-membership-reconcile — daily audit of NetBird peer group membership
+# against what each peer's setup key actually granted.
+#
+# This role installs a BACKGROUND PROCESS on a mgmt host. Everything below that
+# looks like over-specification is there because a background process nobody can
+# see the age of is a future incident with no evidence in it. Specifically:
+#
+#   * it publishes a last-run timestamp to the node_exporter textfile collector,
+#     so a timer that silently died is visible as a number that stopped moving
+#     rather than as nothing at all;
+#   * it is read-only against the mesh (four GETs) and systemd-confined against
+#     the host, so it cannot be the cause of a change you are investigating;
+#   * `mesh_membership_reconcile_enabled: false` TEARS DOWN — stops, disables and
+#     removes the units. It does not merely skip the install tasks, which would
+#     leave a previously-deployed timer running forever with nothing in the repo
+#     admitting it exists. (The sibling role netbird-admin-reconcile has exactly
+#     that gap today; see the design doc.)
+
+# Days a setup key may sit valid and unpresented before the audit prints it
+#. NOT zero: every key is legitimately unused between the mint and the
+# person sitting down at their machine, and a check that flags that is one
+# people learn to scroll past. Raise it on a goatnet that onboards in slow
+# cohorts; the alert applies its own, larger threshold on top.
+mesh_membership_reconcile_unused_key_days: 3
+
+# This goatnet's OWN group prefix, e.g. <SITE>-PROD. Feeds the ADR 1158 key-rung
+# axis: with it the audit can tell a goatnet-rung group from a site-rung one and
+# name a setup key that mints a machine class at the wrong rung — the defect
+# that survives every peer-level correction, because the next enrolment rebuilds
+# it. EMPTY IS SAFE AND HONEST: the axis is skipped and the run says so,
+# rather than guessing a prefix and reporting confidently about the wrong rung.
+mesh_membership_reconcile_goatnet_prefix: ""
+
+# Master gate. false = full teardown, not "skip".
+mesh_membership_reconcile_enabled: true
+
+# Management API for THIS goatnet. No default: a wrong value here audits the
+# wrong mesh and reports confidently about it, so every site states its own.
+mesh_membership_reconcile_api_url: ""
+
+# Token for the above. MUST be a dedicated service-user PAT, not a human's and
+# not one shared with netvis/microscope — so it can be revoked without taking
+# those down, and so its reads are attributable in the NetBird activity log as
+# something other than an anonymous admin uuid. It is the membership-reconcile
+# identity in ops/netbird/service-identities.yaml; mint it with
+# ops/scripts/netbird-service-identities.py <goatnet> --mint.
+#
+# NetBird has no read-only role that can list setup keys, and the setup key is
+# the entire baseline this check compares against, so this token is necessarily
+# `role: admin`. A dedicated credential does not reduce that privilege — it
+# scopes revocation and restores attribution. Both are worth having; neither is
+# containment. Stated here so nobody reads "service user" as "least privilege".
+mesh_membership_reconcile_token: ""
+
+# Daily. This is an audit of a slow-moving fact, not a monitor — a tighter
+# interval would add API load and host wakeups without shortening any real
+# detection window that matters.
+mesh_membership_reconcile_oncalendar: "*-*-* 06:41:00"
+
+# Spread across ten minutes. The mgmt host already runs several timers; landing
+# on the same second as one of them is how unrelated jobs end up in each other's
+# incident timelines.
+mesh_membership_reconcile_jitter_sec: 600
+
+# Hard ceiling on one run. Four HTTP GETs against a local-ish API; if it has not
+# finished in three minutes something is wrong and a hung unit holding a systemd
+# job slot is worse than a failed one.
+mesh_membership_reconcile_timeout_sec: 180
+
+# node_exporter textfile-collector drop directory. EMPTY BY DEFAULT AND THAT IS
+# DELIBERATE — set it per goatnet to the directory this host's node_exporter is
+# actually reading.
+#
+# node_exporter's textfile directory differs per host. It may run in a container
+# started with `--collector.textfile.directory=/textfile`, bind-mounted from
+# /opt/<site_id>-obs/expected-vendors/textfile. The obvious-looking path
+# /var/lib/node_exporter/textfile can ALSO EXIST on that host, be writable, and be
+# read by nothing, which makes every .prom file in it invisible.
+#
+# So the default is not a working path. A wrong path fails silently forever; an
+# unset one fails once, loudly, at deploy time. Find the right value with:
+#   ps -o args= -C node_exporter | tr ' ' '\n' | grep textfile.directory
+#   docker inspect <node-exporter> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+# and confirm afterwards that the series is in Prometheus, not merely on disk.
+mesh_membership_reconcile_textfile_dir: ""
+
+# Where the human-readable report of the last run lands. `last-run.txt` is
+# overwritten each run; `history/` keeps the last N and prunes itself.
+mesh_membership_reconcile_report_dir: /var/lib/goat/membership-reconcile
+
+# Retained runs under <report_dir>/history/. 30 daily runs of a ~4 KB report is
+# ~120 KB — a month of "when did this drift row first appear", for nothing.
+# Pruning happens inside the script, NOT via a logrotate drop-in: a missing
+# rotation config fails silently and grows forever, which is the same
+# looks-present-connected-to-nothing shape as F-335.
+mesh_membership_reconcile_history_keep: 30
+
+# Prometheus rules directory for this goatnet's obs stack. The role drops its
+# alert rules here IF the directory exists, and skips quietly if it does not —
+# a goatnet without a local Prometheus still gets the audit and the journal, it
+# just has nothing to alert with. Rules ship from the ROLE rather than the
+# shared ops/compose/goat-obs/prometheus/rules/ tree so the absent() alert
+# exists only where the timer does; in the shared tree it would fire forever on
+# every goatnet that has not deployed this.
+mesh_membership_reconcile_rules_dir: "/opt/{{ site_id }}-obs/prometheus/rules"
+
+# Run the audit once inline at deploy time. On by default: it proves the unit
+# works while an operator is watching, instead of the first real evidence being
+# a timer firing unattended at 06:41.
+mesh_membership_reconcile_run_now: true

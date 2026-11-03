@@ -1,0 +1,49 @@
+# Managed by ansible (roles/mesh-membership-reconcile). Do not edit on the host.
+#
+# Audits NetBird peer group membership against what each setup key granted.
+# READ-ONLY: four GETs against the management API, no writes to the mesh, no
+# writes to this host outside ReadWritePaths below. If you are chasing a change
+# on this goatnet, this unit did not make it.
+[Unit]
+Description=Audit NetBird peer group membership against the mint
+Documentation=https://github.com/usareur-af/goatcore/blob/main/docs/design/live-state-guard-scheduling.md
+# Not ordered After=docker.service: this talks to the management API over the
+# network and does not care whether local containers are up. Coupling it to
+# docker would make a docker restart look like an audit failure.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec={{ mesh_membership_reconcile_timeout_sec }}
+EnvironmentFile=/etc/goat/mesh-membership-reconcile.env
+ExecStart=/usr/local/sbin/mesh-membership-reconcile.sh
+
+# Confinement. This unit holds an admin-scoped mesh token, so the host-side
+# blast radius is pinned as small as the job allows: it can write its report
+# directory and its metrics file, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths={{ mesh_membership_reconcile_report_dir }} {{ mesh_membership_reconcile_textfile_dir }}
+
+# Politeness on a host that also carries the mesh control plane.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

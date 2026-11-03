@@ -1,0 +1,126 @@
+# {{ ansible_managed }}
+#
+# grant-keyd — E1 key-distribution daemon for {{ grant_keyd_site }}
+# (docs/design/grant-keyed-encryption.md). A native mTLS Zenoh client peer that
+# publishes signed key bundles on keys/<rs>/<gen>. Identity from a SPIRE SVID
+# (spiffe-helper sidecar); the SVID is both the mTLS client cert and the bundle
+# signing key, and its CN admits it through the router's keys/** write-ACL carve.
+
+services:
+  grant-keyd:
+    image: {{ grant_keyd_image }}
+    container_name: grant-keyd
+    restart: "{{ 'no' if '--once' in grant_keyd_args else 'unless-stopped' }}"
+    user: "{{ grant_keyd_spire_uid }}:{{ grant_keyd_spire_uid }}"
+    command: {{ (['/config/config.json'] + grant_keyd_args) | to_json }}
+    networks:
+      - zenoh
+{% if grant_keyd_metrics_scrape_enabled | default(false) and '--once' not in grant_keyd_args %}
+      # The daemon's /metrics + /healthz listener (config `metrics_listen`,
+      # serde-default 0.0.0.0:9464) is useless until something can reach it:
+      # on the zenoh network alone there is no route from the obs stack, which
+      # is why the metrics shipped scrapable-by-nobody.
+      #
+      # Joining `mgmt` — where Prometheus lives, and where this service's own
+      # spiffe-helper sidecar already sits — rather than host-publishing 9464.
+      # The surface is unauthenticated plaintext by design (no key material;
+      # release-set names are the only identifiers), so keeping it on a docker
+      # network instead of a host port is the smaller exposure: no listener on
+      # the Thor's interfaces, nothing for the mesh or LAN to find.
+      #
+      # No `ports:` stanza for the same reason — Prometheus addresses it as
+      # grant-keyd:9464 by container name.
+      - mgmt
+{% endif %}
+    environment:
+      RUST_LOG: "{{ grant_keyd_rust_log }}"
+    volumes:
+      - "{{ grant_keyd_compose_dir }}/config.json:/config/config.json:ro"
+      # SVID (cert+key+bundle) written by the spiffe-helper sidecar.
+      - "{{ grant_keyd_svid_dir }}:/svid:ro"
+      # router server-cert verification — offline-CA root.
+      - "{{ grant_keyd_ca_root_src }}:/ca/ca-root.pem:ro"
+      # per-member recipient certs (the audience's keys). Read-WRITE: in
+      # grant-row mode the daemon syncs each member's current public leaf from
+      # the portal's recipient-cert store into this dir (U7 publish-my-key
+      # distribution) and falls back to the cached copy when the portal is
+      # unreachable. Hand-staged certs still work; everything is validated
+      # against the offline-CA root at resolve time regardless of how it landed.
+      - "{{ grant_keyd_members_dir }}:/members"
+{% if grant_keyd_healthcheck_enabled | default(false) and '--once' not in grant_keyd_args %}
+    # Container healthcheck (2026-08-01 identity fragility audit, item 5 — the
+    # audit's "grant-keyd: zero observability" finding: no metric, no
+    # healthcheck, no alert, stderr only).
+    #
+    # DEFAULT-OFF ON PURPOSE. Runtime is cgr.dev/chainguard/glibc-dynamic
+    # (ops/grant-crypto/keyd/Dockerfile) — no shell, no curl/wget — so a
+    # wget-style probe is unrunnable and would pin the container
+    # `Up (unhealthy)` forever, which now PAGES: grant-keyd is in the
+    # CriticalServiceUnhealthy set (rules/container-health.yml).
+    #
+    # The daemon now serves `GET /healthz` on its metrics listener, returning
+    # 503 once no sweep has completed for three poll intervals (floor 90s),
+    # counted from process start so a hang before the first sweep also reads
+    # unhealthy. That is the right SEMANTICS for a container healthcheck, but
+    # it is HTTP, and this image has no HTTP client — so docker still cannot
+    # probe it. The gap is the last mile, not the health definition.
+    #
+    # The probe below therefore depends on the daemon gaining a `--healthcheck`
+    # argv mode that makes one loopback request to its own /healthz and maps
+    # 200/503 to exit 0/non-zero. That reuses the staleness rule already
+    # implemented rather than inventing a second definition of "working", and
+    # needs no new dependency (std::net::TcpStream). Requested from the lane
+    # that owns the daemon.
+    #
+    # To turn on: confirm with
+    #   docker exec grant-keyd /usr/local/bin/grant-keyd --healthcheck
+    # then set grant_keyd_healthcheck_enabled: true in group_vars.
+    #
+    # Until then grant-keyd's liveness comes from the scrape instead —
+    # GrantKeydTargetDown / GrantKeydSweepStale (rules/grant-keyd.yml), which
+    # also cover the stopped-container case a healthcheck structurally cannot.
+    #
+    # Suppressed in `--once` mode: the container is expected to exit, so a
+    # healthcheck would only ever describe a corpse.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grant-keyd", "--healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+{% endif %}
+
+  # Fetch + rotate the CN-bearing SVID from the SPIRE agent Workload API and
+  # write cert+key+bundle into the shared `svid` volume grant-keyd reads. Runs
+  # as the same nonroot UID as grant-keyd so the 0600 key it writes is readable.
+  grant-keyd-spiffe-helper:
+    image: {{ spire_spiffe_helper_image | default('ghcr.io/spiffe/spiffe-helper:0.10.1') }}
+    container_name: grant-keyd-spiffe-helper
+    restart: unless-stopped
+    user: "{{ grant_keyd_spire_uid }}:{{ grant_keyd_spire_uid }}"
+    command: ["-config", "/etc/spiffe-helper/helper.conf"]
+    volumes:
+      - "{{ grant_keyd_spire_socket_dir }}:/run/spire/sockets:ro"
+      - "{{ grant_keyd_compose_dir }}/spiffe-helper.conf:/etc/spiffe-helper/helper.conf:ro"
+      - "{{ grant_keyd_svid_dir }}:/svid"
+    # No healthcheck: spiffe-helper 0.10.1 ships distroless (the reason this
+    # role's spiffe-helper.conf.j2 notes it cannot run a chmod hook), so there
+    # is no shell, no curl and no self-probe subcommand to run. `NONE` is
+    # explicit rather than absent so nobody "fixes" it with an unrunnable wget
+    # probe — the F-173 pattern this repo already ate twice on distroless
+    # oauth2-proxy images. This sidecar's real failure mode is a STALE SVID,
+    # which is observable to grant-keyd (its mTLS session and bundle signing
+    # both break) — surface it there, in the grant-keyd healthcheck/metric,
+    # not here.
+    healthcheck:
+      test: ["NONE"]
+    networks:
+      - mgmt
+
+networks:
+  zenoh:
+    name: {{ grant_keyd_zenoh_network }}
+    external: true
+  mgmt:
+    name: mgmt
+    external: true

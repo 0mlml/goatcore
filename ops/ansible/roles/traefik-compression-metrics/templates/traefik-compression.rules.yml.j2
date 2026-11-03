@@ -1,0 +1,75 @@
+# {{ ansible_managed }}
+#
+# Alerts on the compression effect. These read goat_traefik_* from the
+# textfile collector, NOT traefik_service_responses_bytes_total — that counter
+# reports what the backend produced and is blind to compression, so an alert
+# built on it stays green after compression stops. See ADR 1139.
+groups:
+  - name: traefik-compression
+    rules:
+      # The one that matters. goat-compress rides the websecure ENTRYPOINT, so
+      # it is lost wholesale by a Traefik recreate that drops the
+      # `--entrypoints.websecure.http.middlewares` flag — which is exactly what
+      # happens if the base compose is applied without the ACME overlay. That
+      # failure is silent: every surface still answers 200, just three times
+      # fatter.
+      #
+      # Scoped to client_class="mesh" deliberately. Probe traffic never
+      # negotiates compression, so a combined ratio sits near zero at all times
+      # and can neither alert nor recover.
+      - alert: TraefikCompressionRegressed
+        expr: |
+          (
+            sum(rate(goat_traefik_origin_bytes_total{client_class="mesh"}[30m]))
+            - sum(rate(goat_traefik_wire_bytes_total{client_class="mesh"}[30m]))
+          )
+          /
+          clamp_min(sum(rate(goat_traefik_origin_bytes_total{client_class="mesh"}[30m])), 1)
+            < {{ traefik_compression_metrics_min_saved_ratio }}
+          and
+          sum(increase(goat_traefik_origin_bytes_total{client_class="mesh"}[30m]))
+            > {{ traefik_compression_metrics_min_bytes_for_alert }}
+        for: 20m
+        labels:
+          severity: warning
+          domain: traefik
+        annotations:
+          summary: "Response compression has stopped working for real clients"
+          description: >-
+            Mesh-client traffic is only {{ '{{' }} $value | humanizePercentage {{ '}}' }}
+            smaller on the wire than at origin, against a measured baseline of
+            71-81% when goat-compress shipped. The usual cause is the
+            `--entrypoints.websecure.http.middlewares=goat-entrypoint-ceiling@file,goat-compress@file`
+            flag being lost by a Traefik recreate from the base compose without
+            the ACME overlay. Check that flag first, then that goat-compress is
+            still defined in the mgmt route file.
+
+      # The exporter going blind must not look like compression working. If it
+      # cannot read the log it publishes up 0 and freezes its counters, which
+      # would otherwise present as a flat, healthy ratio forever.
+      - alert: TraefikCompressionExporterDown
+        expr: goat_traefik_compression_exporter_up == 0
+        for: 20m
+        labels:
+          severity: warning
+          domain: traefik
+        annotations:
+          summary: "Compression exporter cannot read the Traefik access log"
+          description: >-
+            Counters are frozen at their last good values, so every compression
+            panel is stale rather than wrong. Check the traefik container name
+            and that `docker logs` works on this host.
+
+      # Same shape as the stale-metric class the fleet already guards: a
+      # textfile that stops being rewritten keeps serving its last value.
+      - alert: TraefikCompressionMetricsStale
+        expr: time() - node_textfile_mtime_seconds{file="{{ traefik_compression_metrics_prom_file }}"} > 3600
+        for: 15m
+        labels:
+          severity: warning
+          domain: traefik
+        annotations:
+          summary: "Compression metrics have not been refreshed for an hour"
+          description: >-
+            The timer is not firing. Everything downstream is showing an hour-old
+            number that looks current.

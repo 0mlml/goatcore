@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Rendered by ops/ansible/roles/compliance-proxy/ to
+# /etc/traefik/dynamic/compliance.yml — do not edit on host.
+#
+# Stage-2 mesh route for the cloud compliance dashboard (ADR 1029). Mirrors the
+# brief / dashboard pattern: file-provider router, mesh-only-allowlist
+# middleware (defined in mgmt-dynamic.yml.j2), le cert resolver. Upstream is
+# oauth2-proxy-compliance (OIDC / COMPLIANCE-group gate) -> aws-sigv4-proxy ->
+# AWS_IAM Function URL -> compliance dashboard Lambda.
+#
+# The hostname must also appear in the mesh-only cert SAN anchor (the
+# dashboard router's tls.domains.sans in mgmt-dynamic.yml.j2), gated by
+# compliance_proxy_enabled, so Traefik mints/serves a cert covering it.
+http:
+  routers:
+    compliance:
+      rule: "Host(`{{ compliance_proxy_fqdn }}`)"
+      entryPoints:
+        - websecure
+      service: compliance
+      middlewares:
+        - "mesh-only-allowlist@file"
+      tls:
+        certResolver: le
+  services:
+    compliance:
+      loadBalancer:
+        servers:
+          - url: "http://oauth2-proxy-compliance:4180"

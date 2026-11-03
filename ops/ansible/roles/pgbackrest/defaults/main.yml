@@ -1,0 +1,85 @@
+---
+# ops/ansible/roles/pgbackrest/defaults/main.yml
+#
+# Defaults for the pgbackrest role. Override per-play or per-host as needed.
+# Secrets (cipher pass) have NO default — MUST be supplied from the
+# environment / 1Password at play invocation time.
+
+# Where the mgmt-host compose stack lives (matches ops/ansible/mgmt-host.yml).
+compose_dir: /opt/mgmt-host
+
+# pgBackRest binary / config / log paths on the host (bind-mounted into
+# containers by docker-compose.pgbackrest.yml).
+pgbackrest_conf_dir: /etc/pgbackrest
+pgbackrest_conf_path: /etc/pgbackrest/pgbackrest.conf
+pgbackrest_repo1_dir: /opt/docker-data/pgbackrest
+pgbackrest_log_dir: /var/log/pgbackrest
+pgbackrest_spool_dir: /var/spool/pgbackrest
+
+# PGDATA path INSIDE the postgres container — matches Red Hat / pgedge
+# layout (NOT the Debian /var/lib/postgresql/data path). See
+# ops/compose/mgmt-host/docker-compose.yml volume comment.
+pgbackrest_pg1_path: /var/lib/pgsql/16/data
+
+# Stanza naming convention — "<site>-netbird". site_name per host is
+# "<cluster>-a" on Router-A and "<cluster>-b" on Router-B, so stanzas
+# end up as e.g. vega-a-netbird + vega-b-netbird — distinct per host so
+# pgBackRest tracks two independent histories on the paired hosts.
+pgbackrest_stanza: "{{ site_name }}-netbird"
+
+# Which Postgres container this stanza targets. Router-A runs the role
+# with the default "postgres-a". Router-B overrides to "postgres-b" (and
+# also sets pgbackrest_archive_mode=always, pgbackrest_repo1_dir to a
+# distinct host path, and points site_name at the B-side suffix). When
+# Router-A and Router-B are on separate hosts the default paths are fine;
+# the override matters only when both containers share one host (Wave 1.8
+# single-host smoke test, docker-compose.phase2.yml topology).
+postgres_container_name: "postgres-a"
+
+# Postgres archive_mode. pgBackRest rejects `always` (error [067] —
+# Wave 1.8 finding). In a streaming-replica topology, use
+# "on" on BOTH primary and replica and offload backup I/O to the
+# replica via `--backup-standby` on the backup command itself, not via
+# archive_mode. See design §4.1.
+pgbackrest_archive_mode: "on"
+
+# Container image pin for any future sidecar use. The pgBackRest project
+# itself does NOT publish a runtime docker image (only test/build images
+# under pgbackrest/test:*). woblerr/pgbackrest is the active community
+# runtime image; matches pgbackrest upstream version tags. Pinned by digest
+# per ADR 0703; bump tag + digest together. Index digest captured ;
+# matches the default in ops/compose/mgmt-host/docker-compose.pgbackrest.yml.
+pgbackrest_image: "woblerr/pgbackrest:2.53.1@sha256:6e79a47273146cdb4a4a60c7736664697c473aad25689c815071248a633ba622"
+
+# RPM spec for the in-container install. pgedge base is RHEL/UBI; pgbackrest
+# comes from the PGDG repo. Version wildcard pulls whatever's current —
+# pin in a future iteration once we've run through one upgrade cycle.
+pgbackrest_rpm_spec: "pgbackrest"
+
+# Retention — starting points from docs/design/pgbackrest.md §3.
+# Single local repo per host. No repo2.
+pgbackrest_repo1_retention_full: 4       # 4 weekly fulls
+pgbackrest_repo1_retention_diff: 7       # 7 days of dailies
+pgbackrest_repo1_retention_archive: 4    # 4 weeks of WAL archive
+
+# CPU parallelism. t3.small / hadev = 2 vCPU, so 2 is safe. Orin production
+# (12 cores) or Beelink SER7 (8 cores) can go to 4. Override per-host.
+pgbackrest_process_max: 2
+
+# Schedule — matches docs/design/pgbackrest.md §4.
+#   - Weekly full on Sundays 02:00 UTC
+#   - Daily diff at 02:00 UTC (skipped Sundays to avoid colliding with full)
+#   - Incremental every 6 hours (08:00, 14:00, 20:00)
+# Kept as vars so per-host schedules can be jittered for metadata-cadence
+# blurring (design §4.2) if operationally relevant.
+pgbackrest_cron_full_minute: "0"
+pgbackrest_cron_full_hour: "2"
+pgbackrest_cron_full_weekday: "0"   # Sunday
+
+pgbackrest_cron_diff_minute: "0"
+pgbackrest_cron_diff_hour: "2"
+pgbackrest_cron_diff_weekday: "1-6" # Mon-Sat (Sunday = full)
+
+pgbackrest_cron_incr_minute: "0"
+pgbackrest_cron_incr_hour: "8,14,20"  # Three extra wake-ups per day
+pgbackrest_cron_incr_weekday: "*"

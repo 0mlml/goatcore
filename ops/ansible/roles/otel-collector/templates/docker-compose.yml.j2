@@ -1,0 +1,39 @@
+# Rendered by ops/ansible/roles/otel-collector on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/otel-collector/templates/docker-compose.yml.j2
+# Anchor: ADR 0822 — wide-event observability via OTLP + OpenObserve.
+
+services:
+  otel-collector:
+    image: {{ otel_image }}
+    container_name: otel-collector
+    restart: unless-stopped
+    user: "{{ otel_uid }}:{{ otel_gid }}"
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+        reservations: { memory: 128M }
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+    environment:
+      OPENOBSERVE_USER: "${OPENOBSERVE_USER}"
+      OPENOBSERVE_PASS: "${OPENOBSERVE_PASS}"
+    volumes:
+      - {{ otel_compose_dir }}/otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - {{ otel_data_root }}:/var/lib/otel
+    ports:
+      - "{{ otel_otlp_grpc_port }}:{{ otel_otlp_grpc_port }}"
+      - "{{ otel_otlp_http_port }}:{{ otel_otlp_http_port }}"
+      - "{{ otel_metrics_port }}:{{ otel_metrics_port }}"
+    # No docker-level healthcheck (F-097-class — distroless image lacks
+    # wget/curl/sh). Prometheus scrapes the metrics endpoint at
+    # http://otel-collector:{{ otel_metrics_port }}/metrics for actual
+    # health observation; OtelCollectorDown alert in the role's rules
+    # covers the operator-facing visibility.
+    networks:
+      - otel-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  otel-net:
+    name: otel-net

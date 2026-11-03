@@ -1,0 +1,225 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Deploy the consistency collector + publisher (+ optionally the goatnet's one
+# rollup) on a node. Canon: docs/design/consistency-foundation.md §5,
+# ADR 1110 / ADR 1036.
+#
+# Pre-flight (operator-side, NOT this role):
+#   1. The zenoh router must carry the `infra-consistency-health` subject and
+#      the ops/consistency/** write rules LIVE in its config. A router restart
+#      is required after the template change (F-156: zenohd 1.9.0 SIGHUP is a
+#      no-op), and until then the writes are SILENTLY denied — the
+#      publisher logs a happy "published" either way.
+#   2. Infra leaf cert + key minted via the offline-CA cert-sign ceremony with
+#      Subject CN=goat-consistency-health-trial-peer.
+#   3. The node has been deployed at least once by a checkout carrying the
+#      applied-intent stamp. Before that it publishes honestly with empty intent
+#      fields and grades `indeterminate` — nothing to read, which is correct and
+#      is NOT `unaccountable`.
+#
+# VERIFY WITH A LIVE SUBSCRIBER, never a storage read-back: a default-deny
+# storage read returns empty and looks identical to success.
+#   goat sub --context <goatnet> 'ops/consistency/report/**' --take 2
+
+- name: consistency-health | require enablement + a PINNED image (fail-closed)
+  ansible.builtin.assert:
+    that:
+      - consistency_health_enabled | bool
+      - "'@sha256:' in consistency_health_image"
+      - "'PENDING' not in consistency_health_image"
+    fail_msg: >-
+      consistency-health requires consistency_health_enabled and a digest-pinned
+      consistency_health_image (no PENDING sentinel). The image builds on main
+      via .github/workflows/consistency-health-image.yml; pin the multi-arch
+      INDEX digest, never a per-arch manifest leaf.
+
+- name: consistency-health | the rollup must know which site it publishes for
+  ansible.builtin.assert:
+    that:
+      - consistency_health_site | length > 0
+    fail_msg: >-
+      consistency_health_rollup_enabled requires consistency_health_site — it is
+      the <site> segment of ops/consistency/health/<site>. An empty scope would
+      publish an envelope nobody can address.
+  when: consistency_health_rollup_enabled | bool
+
+- name: consistency-health | pre-flight leaf cert exists (when tls/ endpoint)
+  ansible.builtin.stat:
+    path: "{{ consistency_health_cert_dir }}/consistency-health-cert.pem"
+  register: gch_cert_stat
+  when: consistency_health_zenoh_endpoint is match('^tls/')
+
+- name: consistency-health | fail on missing leaf cert
+  ansible.builtin.fail:
+    msg: >-
+      consistency-health: leaf cert missing at
+      {{ consistency_health_cert_dir }}/consistency-health-cert.pem. Mint one via
+      the offline-CA cert-sign ceremony (Subject
+      CN=goat-consistency-health-trial-peer) before re-running (see
+      docs/operations/dev-ca-cert-sign.md).
+  when:
+    - consistency_health_zenoh_endpoint is match('^tls/')
+    - gch_cert_stat is not skipped
+    - not (gch_cert_stat.stat.exists | default(false))
+
+# The publisher's zenoh trust root is placed by the goat-zenoh ROLE, which a
+# non-router host does not run. When it is absent, docker does not fail the
+# bind-mount — it CREATES THE PATH AS A DIRECTORY, and the container then
+# crash-loops on "Error processing PEM certificates: Is a directory (os error
+# 21)" with the compose file and the cert both correct. Refuse before compose runs, and
+# say where the file comes from, rather than hand back a restart loop whose
+# message names neither the file nor the role that owns it.
+- name: consistency-health | pre-flight the zenoh trust root is a FILE
+  ansible.builtin.stat:
+    path: "{{ consistency_health_ca_root_src }}"
+  register: gch_ca_stat
+  when: consistency_health_zenoh_endpoint is match('^tls/')
+
+- name: consistency-health | fail on a missing or directory trust root
+  ansible.builtin.fail:
+    msg: >-
+      consistency-health: {{ consistency_health_ca_root_src }} is
+      {{ 'a DIRECTORY (docker created it for an absent bind-mount source)'
+         if (gch_ca_stat.stat.isdir | default(false)) else 'missing' }}.
+      The publisher mounts it as its zenoh trust root and will crash-loop on
+      "Is a directory (os error 21)". On a router host the goat-zenoh role
+      places it; on a NON-router host nothing does — copy this goatnet's
+      ops/enrollment/ca/<goatnet>/root-cert.pem there (mode 0644, root:root)
+      and remove the directory docker left behind.
+  when:
+    - consistency_health_zenoh_endpoint is match('^tls/')
+    - gch_ca_stat is not skipped
+    - (not (gch_ca_stat.stat.exists | default(false)))
+      or (gch_ca_stat.stat.isdir | default(false))
+
+- name: consistency-health | normalize cert dir ownership for non-root container uid 65532
+  ansible.builtin.file:
+    path: "{{ consistency_health_cert_dir }}"
+    owner: "65532"
+    group: "65532"
+    recurse: true
+  when: consistency_health_zenoh_endpoint is match('^tls/')
+
+- name: consistency-health | dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ consistency_health_compose_dir }}"
+    - "{{ consistency_health_state_dir }}"
+    - "{{ consistency_health_intent_dir }}"
+
+- name: consistency-health | install the fact collector
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../consistency/collect/consistency-snapshot.py"
+    dest: /usr/local/bin/consistency-snapshot.py
+    owner: root
+    group: root
+    mode: "0755"
+
+# The rollup grades against the goatnet's COMMITTED artifact. Copying it from
+# the deploying checkout is the CF-3 distribution story; ADR 1109 FM-2 later
+# gives a node its own fetch from a site-local replica. Since CF-5 the copy is
+# signed (intent.json.sig, the ADR 1082 offline-CA scheme) and the meter
+# verifies signature + content hash on EVERY beat regardless of how the file
+# arrived — the transport, this role included, is untrusted by construction.
+# The verification keys are the committed SPKI set, deployed beside the
+# artifact; the artifact's ca_id resolves there or the rollup refuses to grade.
+- name: consistency-health | place the goatnet's committed intent artifact + signature
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../consistency/intent/{{ consistency_goatnet }}/{{ item }}"
+    dest: "{{ consistency_health_intent_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - intent.json
+    - intent.json.sig
+  when:
+    - consistency_health_rollup_enabled | bool
+    - consistency_goatnet | default('') | length > 0
+
+- name: consistency-health | place the offline-CA public keys (the CF-5 trust root)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../enrollment/public-keys/"
+    dest: "{{ consistency_health_intent_dir }}/public-keys/"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - consistency_health_rollup_enabled | bool
+    - consistency_goatnet | default('') | length > 0
+
+- name: consistency-health | install snapshot systemd service + timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - consistency-snapshot.service
+    - consistency-snapshot.timer
+  notify: consistency-health | reload systemd
+
+- name: consistency-health | flush handlers before enabling the timer
+  ansible.builtin.meta: flush_handlers
+
+- name: consistency-health | enable + start the snapshot timer
+  ansible.builtin.systemd:
+    name: consistency-snapshot.timer
+    enabled: true
+    state: started
+
+- name: consistency-health | run one snapshot now (grounded first beat)
+  ansible.builtin.systemd:
+    name: consistency-snapshot.service
+    state: started
+
+- name: consistency-health | render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ consistency_health_compose_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: consistency-health | pull image
+  ansible.builtin.command:
+    cmd: "docker compose pull"
+    chdir: "{{ consistency_health_compose_dir }}"
+  changed_when: true
+
+- name: consistency-health | bring up (or refresh) the project
+  ansible.builtin.command:
+    cmd: "docker compose up -d --remove-orphans"
+    chdir: "{{ consistency_health_compose_dir }}"
+  register: gch_up
+  changed_when:
+    - "'Started' in gch_up.stderr or 'Created' in gch_up.stderr or 'Recreated' in gch_up.stderr"
+
+- name: consistency-health | running container summary
+  ansible.builtin.command:
+    cmd: "docker compose ps --format json"
+    chdir: "{{ consistency_health_compose_dir }}"
+  register: gch_ps
+  changed_when: false
+
+- name: consistency-health | show
+  ansible.builtin.debug:
+    msg: "{{ gch_ps.stdout_lines }}"
+
+# F-530 fix 2: this role runs `meta: flush_handlers` before its own health/smoke,
+# so it is rollback_promote_mode: explicit (meta/main.yml) — the pending ledger row
+# is promoted here, as the LAST deploy step, only once the gates above have passed.
+- name: consistency-health | record deploy convergence in the ledger after health/smoke
+  ansible.builtin.include_role:
+    name: rollback-ledger
+    tasks_from: promote
+  vars:
+    rollback_component: "consistency-health"
+    rollback_ref: "{{ consistency_health_image }}"

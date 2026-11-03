@@ -1,0 +1,185 @@
+---
+# Install (or fully remove) the daily door-credential audit timer. Idempotent.
+
+# ---------------------------------------------------------------------------
+# Teardown branch. Runs FIRST and unconditionally when disabled, so turning the
+# gate off actually removes the background process instead of merely declining
+# to redeploy it.
+# ---------------------------------------------------------------------------
+- name: door-credential-audit | teardown when disabled
+  when: not (door_credential_audit_enabled | bool)
+  block:
+    - name: door-credential-audit | stop + disable timer and service
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - door-credential-audit.timer
+        - door-credential-audit.service
+      failed_when: false
+
+    - name: door-credential-audit | remove unit files, script and env
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/door-credential-audit.timer
+        - /etc/systemd/system/door-credential-audit.service
+        - /usr/local/sbin/kanidm-door-audit.sh
+        - /etc/goat/door-credential-audit.env
+
+    # The stale metric and the alert rule go too, and they are a SEPARATE task
+    # because both paths are built from variables that may be empty. Folded into
+    # the loop above, an unset textfile dir would resolve to the plausible-
+    # looking path `/door_credential_audit.prom` and the task would cheerfully
+    # remove the wrong thing at the filesystem root.
+    #
+    # A textfile the exporter keeps serving after the job is gone reads as a
+    # healthy audit that simply stopped changing — the precise failure this role
+    # exists to prevent, so leaving it behind would be self-defeating.
+    - name: door-credential-audit | remove metric and alert rule
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ (door_credential_audit_textfile_dir | default('', true)) ~ '/door_credential_audit.prom' }}"
+        - "{{ (door_credential_audit_rules_dir | default('', true)) ~ '/door-credential-audit.rules.yml' }}"
+      when: item | dirname | length > 1
+
+    - name: door-credential-audit | reload systemd after removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: door-credential-audit | say what was removed
+      ansible.builtin.debug:
+        msg:
+          - "door-credential-audit is TORN DOWN on this host."
+          - "The report directory {{ door_credential_audit_report_dir }} is left in"
+          - "place deliberately — it is evidence, not state. Remove it by hand if"
+          - "you mean to."
+
+# ---------------------------------------------------------------------------
+# Install branch.
+# ---------------------------------------------------------------------------
+- name: door-credential-audit | install
+  when: door_credential_audit_enabled | bool
+  block:
+    # Refuse rather than install something that cannot work. A unit that fails
+    # every night is noise people mute, and a muted guard is no guard.
+    - name: door-credential-audit | refuse to install unconfigured
+      ansible.builtin.assert:
+        that:
+          - door_credential_audit_plane in ['public', 'collab']
+          - (door_credential_audit_token | length > 0)
+            or (door_credential_audit_admin_password | length > 0)
+          - door_credential_audit_textfile_dir | length > 0
+        fail_msg: >-
+          door-credential-audit needs a valid plane (public|collab), a credential
+          (door_credential_audit_token — mint with
+          ops/scripts/create-door-audit-identity.sh — or, worse,
+          door_credential_audit_admin_password), and an explicit
+          door_credential_audit_textfile_dir. The textfile dir has no working
+          default on purpose: a wrong path publishes metrics nothing
+          reads, forever.
+
+    - name: door-credential-audit | warn when deploying the full-admin fallback
+      ansible.builtin.debug:
+        msg: >-
+          door-credential-audit is deploying with the idm_admin PASSWORD, not a
+          read-scoped token. That places a full-admin identity-plane credential
+          on this host. Mint the scoped one and re-deploy:
+          ops/scripts/create-door-audit-identity.sh --plane {{ door_credential_audit_plane }}
+      when: door_credential_audit_token | length == 0
+
+    - name: door-credential-audit | directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      loop:
+        - /etc/goat
+        - "{{ door_credential_audit_report_dir }}"
+        - "{{ door_credential_audit_report_dir }}/history"
+
+    - name: door-credential-audit | install the audit script
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../scripts/kanidm-door-audit.sh"
+        dest: /usr/local/sbin/kanidm-door-audit.sh
+        owner: root
+        group: root
+        mode: "0755"
+      notify: restart door-credential-audit timer
+
+    # 0600: this file carries a door credential.
+    - name: door-credential-audit | render env
+      ansible.builtin.template:
+        src: door-credential-audit.env.j2
+        dest: /etc/goat/door-credential-audit.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: restart door-credential-audit timer
+
+    - name: door-credential-audit | install unit + timer
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - door-credential-audit.service
+        - door-credential-audit.timer
+      notify: restart door-credential-audit timer
+
+    - name: door-credential-audit | reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: door-credential-audit | enable + start timer
+      ansible.builtin.systemd:
+        name: door-credential-audit.timer
+        enabled: true
+        state: started
+
+    # Rules ship only where the obs stack exists; a goatnet without local
+    # Prometheus still gets the audit, the report and the journal.
+    - name: door-credential-audit | does this host have a Prometheus rules dir
+      ansible.builtin.stat:
+        path: "{{ door_credential_audit_rules_dir }}"
+      register: _dca_rules_dir
+
+    - name: door-credential-audit | drop alert rules
+      ansible.builtin.template:
+        src: door-credential-audit.rules.yml.j2
+        dest: "{{ door_credential_audit_rules_dir }}/door-credential-audit.rules.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      when: _dca_rules_dir.stat.exists | default(false)
+      notify: reload prometheus rules
+
+    # Prove the unit works while somebody is watching, rather than letting the
+    # first real evidence be an unattended 07:23 firing.
+    - name: door-credential-audit | run once now
+      ansible.builtin.command: systemctl start --wait door-credential-audit.service
+      changed_when: true
+      when: door_credential_audit_run_now | bool
+
+    - name: door-credential-audit | read back the report
+      ansible.builtin.slurp:
+        src: "{{ door_credential_audit_report_dir }}/last-run.txt"
+      register: _dca_report
+      when: door_credential_audit_run_now | bool
+      failed_when: false
+
+    - name: door-credential-audit | show what the door actually looks like
+      ansible.builtin.debug:
+        msg: "{{ (_dca_report.content | b64decode).split('\n') }}"
+      when:
+        - door_credential_audit_run_now | bool
+        - _dca_report.content is defined

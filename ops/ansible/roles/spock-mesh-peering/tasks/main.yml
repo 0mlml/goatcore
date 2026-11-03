@@ -1,0 +1,231 @@
+---
+# spock-mesh-peering — wire inter-site Spock subscriptions for the local
+# site against every participating peer. Two-pass: local-side subs +
+# delegate_to peer-side subs in the same role run, so a single
+# site-bootstrap.yml invocation against a NEW site brings it fully into
+# the mesh without operator follow-up against the existing peers.
+#
+# Idempotent: existing nodes + subscriptions are detected via
+# `spock.node` / `spock.subscription` catalog tables and skipped.
+#
+# Block 64Q.2. See:
+#   docs/design/ha-multi-site.md §"Inter-site Spock auto-mesh"
+#   docs/project/implementation-plan.md Block 64Q
+#
+# Convention:
+#   Spock node name:
+#     intra_site_pair=true  → <site_id_underscored>_a    (site-a → site_a_a)
+#     intra_site_pair=false → <site_id_underscored>      (site-b → site_b)
+#     Reflects ADR 0833: only Orin-A participates in inter-site Spock at
+#     A/B-pair sites; B holds intra-site streaming replica only.
+#   Subscription name:
+#     sub_<provider_node>_to_<subscriber_node>
+#     Created ON the subscriber, pulls FROM the provider.
+
+- name: "spock-mesh | short-circuit when topology=='none' or site doesn't participate"
+  ansible.builtin.meta: end_play
+  when: >-
+    not (participates_in_spock | default(false) | bool)
+    or spock_mesh_topology == 'none'
+
+- name: "spock-mesh | refuse unknown topology values"
+  ansible.builtin.assert:
+    that:
+      - spock_mesh_topology in ['full_mesh', 'explicit']
+    fail_msg: >-
+      inter_site_spock_topology={{ spock_mesh_topology }} is not recognized.
+      Accepted values: none | full_mesh | explicit. Set to `none` to
+      skip Phase 7B; set to `full_mesh` to auto-discover; set to
+      `explicit` and provide `inter_site_spock_peers` for staged rollouts.
+
+# ----------------------------------------------------------------------
+# Pre-flight — secrets + role
+# ----------------------------------------------------------------------
+
+- name: "spock-mesh | resolve cluster-shared replicator password from env"
+  ansible.builtin.set_fact:
+    spock_mesh_replicator_password: >-
+      {{ lookup('env', (site_id | upper | replace('-', '_')) ~ '_REPLICATOR_PASS') }}
+  no_log: true
+
+- name: "spock-mesh | refuse to start without {{ (site_id | upper | replace('-', '_')) ~ '_REPLICATOR_PASS' }}"
+  ansible.builtin.assert:
+    that:
+      - spock_mesh_replicator_password | length > 0
+    fail_msg: >-
+      {{ (site_id | upper | replace('-', '_')) ~ '_REPLICATOR_PASS' }} is empty.
+      The cluster-shared replicator password MUST be set in operator env
+      (.envrc.local; cluster-wide value == VEGA_REPLICATOR_PASS).
+      Without it the subscription DSN fails authentication.
+
+- name: "spock-mesh | ensure local replicator role exists with cluster-shared password"
+  # Idempotent: CREATE ... IF NOT EXISTS or ALTER on existing. Same
+  # pattern as ops/ansible/roles/postgres-streaming-replication. Needed
+  # here because postgres-spock-only profile sites do NOT run that role
+  # (Phase 6A is gated on intra_site_pair). On full-profile A/B sites
+  # this is a no-op — Phase 6A already created the role with the same
+  # value.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ spock_mesh_postgres_container }}"
+      - psql
+      - -U
+      - postgres
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ spock_mesh_replicator_user }}') THEN
+            CREATE ROLE {{ spock_mesh_replicator_user }} WITH REPLICATION LOGIN PASSWORD '{{ spock_mesh_replicator_password }}';
+          ELSE
+            ALTER ROLE {{ spock_mesh_replicator_user }} WITH PASSWORD '{{ spock_mesh_replicator_password }}';
+          END IF;
+        END $$;
+  no_log: true
+  changed_when: true
+
+
+# ----------------------------------------------------------------------
+# Discovery — local node identity + peer-site set
+# ----------------------------------------------------------------------
+
+- name: "spock-mesh | derive local Spock node name from site shape"
+  # Publisher host precedence: explicit `spock_mesh_publisher_host`
+  # (host/group var) > signal_uri host > ansible_host. The explicit
+  # override exists because signal_uri is NOT always a valid replication
+  # endpoint — on some goatnets it is the PUBLIC enrollment DNS
+  # (relay round-robin → rathole, forwards :443 only); postgres :5432
+  # must ride the goatnet's own mesh IP instead (ADR 1084 §transport).
+  ansible.builtin.set_fact:
+    spock_mesh_local_node_name: >-
+      {{ (site_id | replace('-', '_')) ~ ('_a' if (intra_site_pair | default(false) | bool) else '') }}
+    spock_mesh_local_publisher_host: >-
+      {{ spock_mesh_publisher_host | default((signal_uri | default(ansible_host ~ ':10000')).split(':')[0], true) }}
+
+- name: "spock-mesh | walk inventory and capture each peer site's primary host"
+  # For each host in mgmt_hosts: keep only those (a) participating in Spock,
+  # (b) not the local site, (c) the primary side per site (router_role=A or
+  # absent → single-Orin). Reduces by site_id so an A/B pair contributes
+  # exactly one peer entry (Orin-A, per ADR 0833).
+  ansible.builtin.set_fact:
+    spock_mesh_peer_registry: >-
+      {{ spock_mesh_peer_registry | default({}) | combine({
+           hostvars[item].site_id: {
+             'inventory_hostname': item,
+             'site_id': hostvars[item].site_id,
+             'intra_site_pair': hostvars[item].intra_site_pair | default(false) | bool,
+             'publisher_host': hostvars[item].spock_mesh_publisher_host | default((hostvars[item].signal_uri | default(hostvars[item].ansible_host ~ ':10000')).split(':')[0], true),
+             'node_name': (hostvars[item].site_id | replace('-', '_')) ~ ('_a' if (hostvars[item].intra_site_pair | default(false) | bool) else '')
+           }
+         }) }}
+  loop: "{{ groups['mgmt_hosts'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].site_id | default(item) }} ({{ item }})"
+  when:
+    - hostvars[item].participates_in_spock | default(false) | bool
+    - hostvars[item].site_id is defined
+    - hostvars[item].site_id != site_id
+    - (hostvars[item].router_role | default('A')) == 'A'
+
+- name: "spock-mesh | filter peer registry by topology mode"
+  ansible.builtin.set_fact:
+    spock_mesh_target_peers: >-
+      {%- if spock_mesh_topology == 'full_mesh' -%}
+      {{ (spock_mesh_peer_registry | default({})).values() | list }}
+      {%- else -%}
+      {{ (spock_mesh_peer_registry | default({})).values()
+         | selectattr('site_id', 'in', spock_mesh_explicit_peers)
+         | list }}
+      {%- endif -%}
+
+- name: "spock-mesh | refuse an unresolved mesh-IP placeholder in any publisher host"
+  # A publisher host still reading `TBD_..._MESH_IP` means the site's mesh_ip_a/b
+  # group_var was not filled in after enrolment. Creating a Spock node with that
+  # placeholder makes every later sub_create die on "could not translate host
+  # name". Fail closed HERE — at wiring time, with a clear message — instead of
+  # deep inside a censored sub_create. Covers the local host and every peer.
+  ansible.builtin.assert:
+    that:
+      - "'TBD' not in spock_mesh_local_publisher_host"
+      - "spock_mesh_target_peers | selectattr('publisher_host', 'search', 'TBD') | list | length == 0"
+    fail_msg: >-
+      Unresolved mesh-IP placeholder in a Spock publisher host
+      (local={{ spock_mesh_local_publisher_host }};
+      peers={{ spock_mesh_target_peers | map(attribute='publisher_host') | list }}).
+      Fill mesh_ip_a / mesh_ip_b in the relevant group_vars/<site>_hosts/vars.yml
+      with the real post-enrolment wt0 IP before wiring Spock.
+    quiet: true
+
+- name: "spock-mesh | summary of computed mesh wiring"
+  ansible.builtin.debug:
+    msg: |
+      spock-mesh-peering for {{ site_id }}:
+        topology:        {{ spock_mesh_topology }}
+        local node:      {{ spock_mesh_local_node_name }}
+        local publisher: {{ spock_mesh_local_publisher_host }}
+        peers:           {{ spock_mesh_target_peers | map(attribute='site_id') | list | join(', ') | default('(none)', true) }}
+        edges to wire:   {{ spock_mesh_target_peers | length * 2 }} directional ({{ spock_mesh_target_peers | length }} bidirectional)
+
+
+# Remote-side precondition — the local subscriptions dial each peer's
+# postgres as `replicator` at sub_create time. On an established peer its
+# own bootstrap already created the role (no-op here); on a cold-start
+# peer that has never run this role (harness; a brand-new two-site
+# goatnet wired from one side) the role must exist FIRST or sub_create
+# fails password auth. Cluster-shared password invariant makes the local
+# value valid on every peer.
+- name: "spock-mesh | remote-side: ensure replicator role exists on each peer"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -u
+      - postgres
+      - "{{ hostvars[item.inventory_hostname].spock_mesh_postgres_container | default(spock_mesh_postgres_container) }}"
+      - psql
+      - -U
+      - postgres
+      - -v
+      - "ON_ERROR_STOP=1"
+      - -c
+      - >-
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ spock_mesh_replicator_user }}') THEN
+            CREATE ROLE {{ spock_mesh_replicator_user }} WITH REPLICATION LOGIN PASSWORD '{{ spock_mesh_replicator_password }}';
+          ELSE
+            ALTER ROLE {{ spock_mesh_replicator_user }} WITH PASSWORD '{{ spock_mesh_replicator_password }}';
+          END IF;
+        END $$;
+  no_log: true
+  changed_when: true
+  delegate_to: "{{ item.inventory_hostname }}"
+  loop: "{{ spock_mesh_target_peers }}"
+  loop_control:
+    label: "replicator on {{ item.inventory_hostname }}"
+
+# ----------------------------------------------------------------------
+# Per-database pass — grants + repset + node + subs + verify
+# (Block 64R, ADR 1084: loops spock_mesh_databases; the default single-
+# entry list preserves the pre-64R single-database behavior exactly.)
+# ----------------------------------------------------------------------
+
+- name: "spock-mesh | run the full peering pass for each federated database"
+  ansible.builtin.include_tasks: per-database.yml
+  loop: "{{ spock_mesh_databases }}"
+  loop_control:
+    loop_var: spock_db
+    label: "{{ spock_db.name }} (repsets: {{ spock_db.replication_sets | join(',') }})"
+
+- name: "spock-mesh | mesh closure summary"
+  ansible.builtin.debug:
+    msg: |
+      spock-mesh-peering for {{ site_id }}: PASS
+        local node:    {{ spock_mesh_local_node_name }} ({{ spock_mesh_local_publisher_host }})
+        databases:     {{ spock_mesh_databases | map(attribute='name') | list | join(', ') }}
+        peers wired:   {{ spock_mesh_target_peers | length }}
+        directional edges replicating: {{ spock_mesh_target_peers | length * 2 * (spock_mesh_databases | length) }}

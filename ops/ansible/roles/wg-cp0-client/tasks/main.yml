@@ -1,0 +1,365 @@
+---
+# wg-cp0-client — install + configure wg-cp0 on the network host (Orin-A,
+# Orin-B, etc.). Idempotent.
+#
+# Two flows, branched on wg_cp0_bundle_path:
+#
+#   1. BUNDLE-ROOTED (default, Block 22K / F-053 closure).
+#      Set wg_cp0_bundle_path=/path/to/bundle.cbor on the controller +
+#      wg_cp0_ca_pubkey_local_path=/path/to/ca.pub. The role builds
+#      wg-cp0-bundle-apply from ops/enrollment/, ships it to the target
+#      with the bundle + CA pubkey, and invokes it to render the conf
+#      + write the privkey. The bundle is shredded post-apply.
+#
+#   2. LEGACY local-keygen (gated by wg_cp0_legacy_local_keygen=true;
+#      DEPRECATED — emits a warning per F-053). Generates a wg keypair
+#      locally on the target and renders the conf from inventory facts.
+#      Trust roots in operator-laptop + repo write access, NOT the
+#      offline CA. Kept ONLY for backward compat during the cutover
+#      window; remove the flag once the fleet has rotated to bundles.
+#
+# Pre-requisites for bundle flow (per-host inventory or extra-vars):
+#   - wg_cp0_bundle_path           controller-side path to the issued bundle.cbor
+#   - wg_cp0_ca_pubkey_local_path  controller-side path to the CA's PEM pubkey
+#
+# Pre-requisites for legacy flow (per-host inventory):
+#   - wg_cp0_legacy_local_keygen   must be set true (explicit opt-in)
+#   - wg_cp0_client_address        e.g. 198.18.0.1
+#   - wg_cp0_relays                list of {name, endpoint, pubkey, allowed_ips}
+
+- name: Determine wg-cp0 enrollment flow (bundle-rooted vs legacy)
+  ansible.builtin.set_fact:
+    wg_cp0_use_bundle: "{{ wg_cp0_bundle_path | default('', true) | length > 0 }}"
+
+- name: Assert vars for bundle-rooted flow
+  ansible.builtin.assert:
+    that:
+      - wg_cp0_bundle_path | length > 0
+      - wg_cp0_ca_pubkey_local_path | default('', true) | length > 0
+    fail_msg: >-
+      Bundle-rooted flow requires wg_cp0_bundle_path (path on the
+      controller to the offline-CA-signed bundle.cbor) and
+      wg_cp0_ca_pubkey_local_path (path to the CA's PEM pubkey).
+  when: wg_cp0_use_bundle
+
+- name: Assert vars for legacy local-keygen flow (DEPRECATED — F-053)
+  ansible.builtin.assert:
+    that:
+      - wg_cp0_legacy_local_keygen | default(false) | bool
+      - wg_cp0_client_address | length > 0
+      - wg_cp0_relays | length > 0
+    fail_msg: >-
+      Legacy local-keygen flow is deprecated per F-053 / Block 22K. Use
+      bundle-rooted flow (set wg_cp0_bundle_path). To explicitly opt in
+      to the legacy flow during the cutover window, set
+      wg_cp0_legacy_local_keygen=true.
+  when: not wg_cp0_use_bundle
+
+- name: Emit deprecation warning for legacy local-keygen flow
+  ansible.builtin.debug:
+    msg: |
+      DEPRECATION: wg-cp0-client is running in
+      LEGACY LOCAL-KEYGEN mode. Trust here roots in operator-laptop +
+      repo write access, NOT the offline CA. The supported path is
+      wg_cp0_bundle_path-driven enrollment (offline-CA-signed bundle).
+      Plan to retire wg_cp0_legacy_local_keygen=true on this host.
+  when: not wg_cp0_use_bundle
+
+- name: Install WireGuard
+  ansible.builtin.apt:
+    name:
+      - wireguard
+      - wireguard-tools
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: not (wg_cp0_test_mode | default(false) | bool)
+
+# NVIDIA Tegra L4T kernels (e.g. JetPack 6.x's 5.15.x-tegra) are NOT
+# compiled with the upstream wireguard kernel module. `ip link add ...
+# type wireguard` returns "Unknown device type" and wg-quick fails.
+# wg-quick has a userspace fallback path that invokes a binary named by
+# `WG_QUICK_USERSPACE_IMPLEMENTATION` when the kernel module is missing.
+# Ubuntu's `wireguard-go` package ships the binary as `/usr/bin/wireguard`
+# (NOT `wireguard-go` — the upstream-conventional name) so the env var
+# must be set to `wireguard`, not the wg-quick default `wireguard-go`.
+# See finding F-NNN (Tegra wireguard kernel module + Ubuntu wireguard-go
+# binary-name divergence).
+- name: Detect WireGuard kernel module availability (load on-demand if present)
+  ansible.builtin.shell: |
+    set -e
+    modprobe wireguard 2>/dev/null || true
+    if [ -e /sys/module/wireguard ]; then echo "kmod_present"; else echo "kmod_missing"; fi
+  register: wg_kmod_probe
+  changed_when: false
+  failed_when: false
+  when: not (wg_cp0_test_mode | default(false) | bool)
+
+- name: Install wireguard-go userspace fallback (Tegra / kernel-without-module)
+  ansible.builtin.apt:
+    name: wireguard-go
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when:
+    - not (wg_cp0_test_mode | default(false) | bool)
+    - wg_kmod_probe.stdout is defined and wg_kmod_probe.stdout == 'kmod_missing'
+
+- name: Ensure systemd drop-in directory exists for wg-quick service (parent of userspace.conf)
+  ansible.builtin.file:
+    path: "/etc/systemd/system/wg-quick@{{ wg_cp0_interface_name }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - not (wg_cp0_test_mode | default(false) | bool)
+    - wg_kmod_probe.stdout is defined and wg_kmod_probe.stdout == 'kmod_missing'
+
+- name: Drop-in to point wg-quick at userspace wireguard-go (Ubuntu binary name = 'wireguard')
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/wg-quick@{{ wg_cp0_interface_name }}.service.d/userspace.conf"
+    content: |
+      [Service]
+      Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=wireguard
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - not (wg_cp0_test_mode | default(false) | bool)
+    - wg_kmod_probe.stdout is defined and wg_kmod_probe.stdout == 'kmod_missing'
+  notify: restart wg-cp0
+
+- name: Remove userspace drop-in if kernel module is now available (idempotent)
+  ansible.builtin.file:
+    path: "/etc/systemd/system/wg-quick@{{ wg_cp0_interface_name }}.service.d/userspace.conf"
+    state: absent
+  when:
+    - not (wg_cp0_test_mode | default(false) | bool)
+    - wg_kmod_probe.stdout is defined and wg_kmod_probe.stdout == 'kmod_present'
+  notify: restart wg-cp0
+
+# ===========================================================================
+# Bundle-rooted flow (Block 22K — default; closes F-053)
+# ===========================================================================
+
+- name: Bundle-rooted wg-cp0 enrollment
+  when: wg_cp0_use_bundle
+  block:
+    - name: Resolve wg-cp0-bundle-apply binary path
+      # When wg_cp0_bundle_apply_binary is set (test harness, pre-built
+      # release artifact, etc.), use it verbatim. Otherwise default to
+      # {{ playbook_dir }}/.cache/<binary> + build below.
+      ansible.builtin.set_fact:
+        _wg_cp0_bundle_apply_binary: "{{ wg_cp0_bundle_apply_binary | default(playbook_dir + '/.cache/wg-cp0-bundle-apply', true) }}"
+        _wg_cp0_bundle_apply_build: "{{ wg_cp0_bundle_apply_binary | default('', true) | length == 0 }}"
+
+    - name: Map target architecture for Go cross-compile
+      # ansible_architecture on Linux returns "aarch64" / "x86_64"; Go
+      # wants "arm64" / "amd64". Mapping is per-host so a mixed-arch
+      # fleet (Orins arm64 + future x86 mgmt-hosts) works without a
+      # central registry.
+      ansible.builtin.set_fact:
+        _wg_cp0_bundle_apply_goarch: >-
+          {%- if ansible_architecture in ['aarch64', 'arm64'] -%}arm64
+          {%- elif ansible_architecture in ['x86_64', 'amd64'] -%}amd64
+          {%- else -%}{{ ansible_architecture }}
+          {%- endif %}
+
+    - name: Per-target binary cache path (cross-compile output)
+      # `go build` on a darwin controller produces a darwin binary by
+      # default — it errno-8 ENOEXECs when shipped to a Linux target.
+      # Cache + build per-arch so a darwin operator + a Linux operator
+      # share the same cache layout.
+      ansible.builtin.set_fact:
+        _wg_cp0_bundle_apply_binary_per_arch: "{{ _wg_cp0_bundle_apply_binary }}.linux-{{ _wg_cp0_bundle_apply_goarch }}"
+
+    - name: Build wg-cp0-bundle-apply binary on controller (linux cross-compile per target arch)
+      ansible.builtin.command:
+        cmd: >-
+          go build -o {{ _wg_cp0_bundle_apply_binary_per_arch }}
+          ./cmd/wg-cp0-bundle-apply
+        chdir: "{{ playbook_dir }}/../enrollment"
+        creates: "{{ _wg_cp0_bundle_apply_binary_per_arch }}"
+      environment:
+        # Force Linux target — wg-cp0-client only deploys to Linux.
+        # Without this, a darwin or windows operator's controller-side
+        # `go build` produces a host-arch binary that errno-8 ENOEXECs
+        # on the target. Surfaced during Block 22K.4 cutover
+        # of vega-A from a darwin/arm64 controller. Block 22K.7
+        # follow-on; minimal change to unblock fleet-wide cutover.
+        GOOS: linux
+        GOARCH: "{{ _wg_cp0_bundle_apply_goarch }}"
+        # CGO disabled — wg-cp0-bundle-apply is pure-Go (no cgo deps),
+        # CGO-on can leak host-libc dependencies into the cross-compile.
+        CGO_ENABLED: "0"
+      delegate_to: localhost
+      run_once: false
+      become: false
+      changed_when: false
+      when: _wg_cp0_bundle_apply_build | bool
+
+    - name: Adopt the per-arch binary as the canonical path for the rest of the role
+      ansible.builtin.set_fact:
+        _wg_cp0_bundle_apply_binary: "{{ _wg_cp0_bundle_apply_binary_per_arch }}"
+      when: _wg_cp0_bundle_apply_build | bool
+
+    - name: Ensure /etc/goat directory exists (bundle staging)
+      ansible.builtin.file:
+        path: /etc/goat
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Ensure /etc/wireguard directory exists (apply target)
+      # In production the wireguard-tools apt package creates this. In
+      # test mode where we skip apt, the dir doesn't exist and the
+      # atomic-write inside wg-cp0-bundle-apply fails. Create it
+      # explicitly — idempotent + harmless even when apt-already-created
+      # (mode + ownership match what apt installs).
+      ansible.builtin.file:
+        path: /etc/wireguard
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ship wg-cp0-bundle-apply binary to target
+      ansible.builtin.copy:
+        src: "{{ _wg_cp0_bundle_apply_binary }}"
+        dest: /usr/local/bin/wg-cp0-bundle-apply
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ship CA pubkey to target
+      ansible.builtin.copy:
+        src: "{{ wg_cp0_ca_pubkey_local_path }}"
+        dest: /etc/goat/ca.pub
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Ship bundle.cbor to target (sensitive — shred after apply)
+      ansible.builtin.copy:
+        src: "{{ wg_cp0_bundle_path }}"
+        dest: /etc/goat/bundle.cbor
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Apply bundle (renders wg-cp0.conf + writes wg-cp0-priv.key)
+      ansible.builtin.command:
+        cmd: >-
+          /usr/local/bin/wg-cp0-bundle-apply
+          --in /etc/goat/bundle.cbor
+          --ca-pubkey /etc/goat/ca.pub
+          --out-conf /etc/wireguard/{{ wg_cp0_interface_name }}.conf
+          --out-privkey {{ wg_cp0_local_secret_path }}
+          --interface-name {{ wg_cp0_interface_name }}
+          --persistent-keepalive {{ wg_cp0_persistent_keepalive }}
+      register: wg_cp0_apply
+      changed_when: wg_cp0_apply.rc == 0
+      failed_when: wg_cp0_apply.rc != 0
+      no_log: true
+      notify: restart wg-cp0
+
+    - name: Shred bundle.cbor after apply (sensitive material discipline)
+      ansible.builtin.command:
+        cmd: shred -u /etc/goat/bundle.cbor
+      changed_when: true
+      args:
+        removes: /etc/goat/bundle.cbor
+
+    # cp_device_pubkey for relay-side allowlist registration is surfaced
+    # by bundle-create at issuance time (its stderr summary). Operators
+    # register it in each relay's wg-cp0 peer list per
+    # docs/operations/wg-cp0-bundle-ceremony.md before this role runs.
+
+# ===========================================================================
+# Legacy local-keygen flow (DEPRECATED, gated by opt-in flag)
+# ===========================================================================
+
+- name: Legacy local-keygen wg-cp0 enrollment
+  when: not wg_cp0_use_bundle
+  block:
+    - name: Generate fresh wg-cp0 keypair (only if no on-disk key)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 077
+        wg genkey > {{ wg_cp0_local_secret_path }}
+      args:
+        creates: "{{ wg_cp0_local_secret_path }}"
+        # /bin/sh on Ubuntu is dash; 'set -o pipefail' is bash-only.
+        executable: /bin/bash
+      no_log: true
+
+    - name: Lock down privkey file
+      ansible.builtin.file:
+        path: "{{ wg_cp0_local_secret_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Read on-disk privkey
+      ansible.builtin.command:
+        cmd: "cat {{ wg_cp0_local_secret_path }}"
+      register: wg_cp0_privkey_read
+      changed_when: false
+      no_log: true
+
+    - name: Derive pubkey from privkey
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo -n "{{ wg_cp0_privkey_read.stdout }}" | wg pubkey
+      args:
+        executable: /bin/bash
+      register: wg_cp0_pubkey_derive
+      changed_when: false
+      no_log: true
+
+    - name: Set wg-cp0 key facts
+      ansible.builtin.set_fact:
+        wg_cp0_privkey_b64: "{{ wg_cp0_privkey_read.stdout }}"
+        wg_cp0_pubkey_b64: "{{ wg_cp0_pubkey_derive.stdout }}"
+      no_log: true
+
+    - name: Show this client's wg-cp0 PUBLIC key (record it for relay-side allowlist)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} wg-cp0 PUBLIC key: {{ wg_cp0_pubkey_b64 }}"
+
+    - name: Render /etc/wireguard/{{ wg_cp0_interface_name }}.conf (legacy template)
+      ansible.builtin.template:
+        src: wg-cp0.conf.j2
+        dest: "/etc/wireguard/{{ wg_cp0_interface_name }}.conf"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: restart wg-cp0
+
+# ===========================================================================
+# Shared finish: enable + smoke
+# ===========================================================================
+
+- name: Enable + start wg-quick@{{ wg_cp0_interface_name }}
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ wg_cp0_interface_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not (wg_cp0_test_mode | default(false) | bool)
+
+- name: Smoke — wg show {{ wg_cp0_interface_name }}
+  ansible.builtin.command:
+    cmd: "wg show {{ wg_cp0_interface_name }}"
+  register: wg_cp0_show
+  changed_when: false
+  when: not (wg_cp0_test_mode | default(false) | bool)
+
+- name: Print wg-cp0 status
+  ansible.builtin.debug:
+    msg: "{{ wg_cp0_show.stdout_lines }}"
+  when: not (wg_cp0_test_mode | default(false) | bool)

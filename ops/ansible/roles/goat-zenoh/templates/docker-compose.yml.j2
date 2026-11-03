@@ -1,0 +1,101 @@
+# Rendered by ops/ansible/roles/goat-zenoh/. Do not edit on host.
+
+services:
+  {{ zenoh_stack }}-router:
+    image: {{ nova_zenoh_image }}
+    container_name: {{ zenoh_stack }}-router
+    restart: unless-stopped
+    # The per-uuid slot pool spawns one rocksdb storage per slot
+    # (per zenoh_slot_pool_size), each holding many open FDs (~9k at idle).
+    # Without a nofile ulimit the container inherits the ~16k default and hangs
+    # (Up-but-unhealthy, port dead) once reconnecting peers tip it over.
+    ulimits:
+      nofile:
+        soft: {{ goat_zenoh_nofile }}
+        hard: {{ goat_zenoh_nofile }}
+    # Bulkhead — same pattern as the parent zenoh role. A 1G cap sits 80-99%
+    # occupied by zenohd's steady-state working set and invites a kernel OOM kill
+    # (full fabric restart: every peer session dropped). 4G keeps the bulkhead
+    # property while leaving the workload real headroom.
+    deploy:
+      resources:
+        limits:
+          # Storage-manager adminspace deadlock mitigation: the deadlock needs
+          # worker-pool starvation to tip. A 1.0-CPU cap makes that trivial to hit under
+          # load; giving the tokio worker pool real cores keeps the block_in_place
+          # GetStatus fan-out draining so parked workers don't starve. The code patch
+          # (zenohd-adminspace-getter-deadlock) is the real fix; this is a seatbelt.
+          # Sized under the host core count.
+          # Sizing (#309): hosts with 6+ vCPUs keep the 6.0 seatbelt unchanged;
+          # smaller hosts, where a 6.0 limit makes Docker refuse the container,
+          # get host vCPUs minus one (floor 1.0) so the host keeps a core.
+          # Every host that could start the router before this change renders
+          # byte-identical text, so no router restarts. Missing facts render 6.0.
+          # Only the derived default is formatted, so explicit overrides keep
+          # their existing compose text.
+          cpus: "{{ goat_zenoh_cpus | default('%.1f' | format(((ansible_processor_vcpus | default(6) | int) >= 6) | ternary(6, [(ansible_processor_vcpus | default(6) | int) - 1, 1] | max))) }}"
+          # Per-goatnet, like goat_zenoh_cpus above. 4G is the fleet default. A router
+          # sitting at its cap during a wedge lacks headroom, so a large host can raise it.
+          # A live raise uses `docker update --memory 8g` (no restart) and must be declared
+          # here so a redeploy carries it.
+          memory: "{{ goat_zenoh_memory | default('4G') }}"
+        reservations:
+          memory: 512M
+    command:
+      - --config
+      - /etc/zenoh/config.json5
+    environment:
+      RUST_LOG: "info"
+      # rx worker threads — the ONLY way to set them is this env var (RON
+      # syntax, parsed once at process start; zenoh-runtime/src/lib.rs). The
+      # default is 2, and a non-droppable message to a stuck peer parks one of
+      # them for the whole `wait_before_close`, so two stuck peers freeze every
+      # ingress this router has. Measured M-119: raising it to 8 cut a healthy
+      # pair's worst delivery gap from 118.8 s to 10.1 s during one subscriber's
+      # 60 s freeze, and to 0.6 s together with the config.json5 queue policy.
+      ZENOH_RUNTIME: "(rx: (worker_threads: {{ goat_zenoh_rx_worker_threads }}))"
+    ports:
+      - "{{ goat_zenoh_listen_host }}:{{ goat_zenoh_listen_port }}:{{ goat_zenoh_listen_port }}"
+{% if goat_zenoh_quic_enabled | bool %}
+      # QUIC is UDP — publish the quic/ listen port as /udp on the same host
+      # mesh IP. mTLS + ACL are identical to the tls/ link (shared config).
+      - "{{ goat_zenoh_listen_host }}:{{ goat_zenoh_quic_port }}:{{ goat_zenoh_quic_port }}/udp"
+{% endif %}
+      # REST plugin — explicit per-IP bind to avoid 0.0.0.0 publish.
+      - "{{ goat_zenoh_rest_host }}:{{ goat_zenoh_rest_port }}:{{ goat_zenoh_rest_port }}"
+    volumes:
+      # F-124 item 4: ACL is inline in config.json5 now; the separate
+      # access_control.json5 bind mount was retired in the same change-set.
+      # add-vendor.sh edits the host-side config + SIGHUPs zenohd; the
+      # container sees the new bytes through this bind mount. Container
+      # never writes the config — :ro is safe.
+      - "{{ goat_zenoh_config_path }}:/etc/zenoh/config.json5:ro"
+{% if not goat_zenoh_fips_variant | bool %}
+      # Host plugin dir carries libzenoh_backend_rocksdb.so (not shipped
+      # by upstream eclipse/zenoh; installed by the role per ADR 0858).
+      # config.json5's storage_manager.backend_search_dirs picks it up.
+      # (FIPS variant: omitted — the glibc image bakes its matched-pair
+      # backend at /opt/zenoh/plugins-baked; see role defaults.)
+      - "{{ goat_zenoh_plugin_dir }}:/opt/zenoh/plugins:ro"
+{% endif %}
+      - "{{ goat_zenoh_tls_dir }}:{{ goat_zenoh_tls_dir }}:ro"
+      - "{{ goat_zenoh_storage_path }}:{{ goat_zenoh_storage_path }}"
+    healthcheck:
+      # REST admin endpoint. mTLS-required transport means we can't probe
+      # tcp/7447 without a client cert; the REST plugin admin tree is the
+      # cleanest liveness signal. `GET /` returns 400 by design (Zenoh
+      # 1.x); probe an admin endpoint that returns 200 instead. The
+      # healthcheck runs inside the container, so 127.0.0.1 here = the
+      # REST plugin bound on 0.0.0.0:8000 inside the container (not the
+      # host-side port-map narrowed to the mesh IP).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:{{ goat_zenoh_rest_port }}/@/local/router/config"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Restart-re-wedge seatbelt: reopening ~1000
+      # rocksdb storages after a restart takes minutes; without a grace period
+      # the healthcheck flips unhealthy mid-startup and the watchdog restarts the
+      # router back into load before it finishes opening -> it re-wedges. Cover
+      # the reopen window. The healthcheck GETs /config (fast, does NOT fan out
+      # to the storages), so it is a valid liveness signal, not a wedge trigger.
+      start_period: 180s

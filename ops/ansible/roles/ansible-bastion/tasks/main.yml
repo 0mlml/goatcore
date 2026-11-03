@@ -1,0 +1,133 @@
+---
+# ops/ansible/roles/ansible-bastion/tasks/main.yml
+#
+# In-theater Ansible bastion + git workspace. Idempotent. Designed for
+# Orin-C (the per-site obs/storage Orin per ADR 0826) so an operator
+# physically present at the site can pull trunk and run Ansible against
+# the local fleet without depending on out-of-theater workstations.
+#
+# Composes with ca-signing-host on the same host (operator accounts
+# may overlap; the `goat-ops` group here is parallel to the
+# `goat-ca-operators` group there — different access surfaces).
+#
+# Pre-flight: ansible_bastion_workspace's parent must exist (we own it
+# under /opt which is always present).
+
+# 1. Apt baseline ------------------------------------------------------------
+
+- name: Install operator baseline packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ ansible_bastion_apt_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# 2. Operator group + workspace ----------------------------------------------
+
+- name: Ensure operator group exists
+  become: true
+  ansible.builtin.group:
+    name: "{{ ansible_bastion_group }}"
+    state: present
+    system: true
+
+- name: Ensure workspace root exists with group ownership
+  become: true
+  ansible.builtin.file:
+    path: "{{ ansible_bastion_workspace }}"
+    state: directory
+    owner: root
+    group: "{{ ansible_bastion_group }}"
+    # 2775 = rwx for owner + rwx + setgid for group (so new files inherit
+    # the group) + rx for other. Setgid means an operator's `git clone`
+    # produces files owned by goat-ops automatically.
+    mode: "2775"
+
+# 3. Operator accounts -------------------------------------------------------
+
+- name: Ensure each operator account exists
+  become: true
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    state: present
+    shell: /bin/bash
+    groups:
+      - "{{ ansible_bastion_group }}"
+    append: true
+    create_home: true
+    comment: "{{ item.comment | default('goat ops bastion operator') }}"
+  loop: "{{ ansible_bastion_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Install operator authorized_keys
+  become: true
+  ansible.posix.authorized_key:
+    user: "{{ item.name }}"
+    key: "{{ item.ssh_pubkey }}"
+    state: present
+  loop: "{{ ansible_bastion_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Render per-operator git config
+  become: true
+  ansible.builtin.template:
+    src: gitconfig.j2
+    dest: "/home/{{ item.name }}/.gitconfig"
+    owner: "{{ item.name }}"
+    group: "{{ item.name }}"
+    mode: "0644"
+  loop: "{{ ansible_bastion_operators }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# 4. SSH known_hosts pre-population (optional) -------------------------------
+# Skip cleanly when ansible_bastion_known_hosts is empty (default).
+
+- name: Render fleet known_hosts (per-operator)
+  become: true
+  ansible.builtin.template:
+    src: known_hosts.j2
+    dest: "/home/{{ item.0.name }}/.ssh/known_hosts"
+    owner: "{{ item.0.name }}"
+    group: "{{ item.0.name }}"
+    mode: "0644"
+  loop: "{{ ansible_bastion_operators | product(ansible_bastion_known_hosts) | list }}"
+  loop_control:
+    label: "{{ item.0.name }} ← {{ item.1.name }}"
+  when: ansible_bastion_known_hosts | length > 0
+
+# 5. Pre-clone trunk repo (optional) -----------------------------------------
+# Skip cleanly when ansible_bastion_trunk_repo_url is "".
+
+- name: Check whether trunk clone already exists
+  ansible.builtin.stat:
+    path: "{{ ansible_bastion_workspace }}/{{ ansible_bastion_trunk_repo_dir }}/.git"
+  register: _bastion_trunk_stat
+  when: ansible_bastion_trunk_repo_url | length > 0
+
+- name: Clone trunk into workspace (first time only — operators pull thereafter)
+  become: true
+  become_user: "{{ ansible_bastion_operators[0].name }}"
+  ansible.builtin.git:
+    repo: "{{ ansible_bastion_trunk_repo_url }}"
+    dest: "{{ ansible_bastion_workspace }}/{{ ansible_bastion_trunk_repo_dir }}"
+    version: "{{ ansible_bastion_trunk_repo_branch }}"
+    update: false  # operators control their own pulls
+  when:
+    - ansible_bastion_trunk_repo_url | length > 0
+    - ansible_bastion_operators | length > 0
+    - not (_bastion_trunk_stat.stat.exists | default(false))
+
+# 6. Self-test marker --------------------------------------------------------
+
+- name: Render self-test marker
+  become: true
+  ansible.builtin.template:
+    src: self-test.sh.j2
+    dest: "{{ ansible_bastion_workspace }}/self-test.sh"
+    owner: root
+    group: "{{ ansible_bastion_group }}"
+    mode: "0755"

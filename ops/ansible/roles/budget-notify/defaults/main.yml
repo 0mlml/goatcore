@@ -1,0 +1,88 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# budget-notify — tenant-facing half of topic-budget reconciliation
+# (docs/design/zenoh-cardinality-budget-and-lazy-crawler.md §2c, ADR 1104
+# tone rules). A systemd timer on the router host runs the stdlib-only
+# reconciler against the crawler's band JSON: three one-time stages per
+# (owner, grant-generation) — approaching (warn fraction), at-cap, over —
+# emailed via the site's SES SMTP to owners that resolve to a real tenant
+# with an email; everything else logs one line. No zenoh client, no fabric
+# identity, no image: the crawler already lands the whole surface on disk.
+#
+# Fail-closed inputs (instance-variability model Tier 1): the band JSON
+# path + SMTP env come from the site, no home-instance fallback. SMTP
+# secrets ride the standing credentials flow (env -> root-only env file,
+# never committed).
+
+budget_notify_dir: /opt/budget-notify
+
+# The crawler's band JSON (fabric_crawler_json_out_host_path on this host).
+budget_notify_fabric_json: "{{ fabric_crawler_json_out_host_path | mandatory }}"
+
+# Portal registry (read-only) for anchor -> handle (+ lifecycle_class when
+# the ADR 1104 column lands).
+budget_notify_registry_db: /opt/goat-zenoh-portal/registry.db
+# Which store the portal registry is on (ADR 1165 step A). Follows the goatnet's
+# portal_store; on postgres the notifier reads the slots table through
+# `docker exec <container> psql` (local socket, read-only session) and
+# budget_notify_registry_db is unused.
+budget_notify_registry_store: "{{ portal_store | default('sqlite') }}"
+budget_notify_pg_container: "{{ portal_db_container | default('postgres-a') }}"
+budget_notify_pg_db: "{{ portal_db_name | default('portal_registry') }}"
+budget_notify_pg_user: "{{ portal_db_user | default('portal') }}"
+
+# handle -> email projection, rendered from the operator manifests
+# (ops/operators/<env>/*.yml) — registry-projection interim, the same pattern
+# as the grant record; the ADR 1075 fold-in supersedes both. The manifests are
+# gitignored, so they must be present in the CONTROLLER tree the deploy runs
+# from; reading zero of them fails the deploy rather than blanking the live
+# projection.
+budget_notify_manifest_glob: "{{ playbook_dir }}/../operators/zagros/*.yml"
+
+# Escape hatch for a goatnet that genuinely has no operator manifests yet.
+# Everywhere else, zero manifests means the controller tree is missing them.
+budget_notify_allow_empty_emails: false
+
+budget_notify_site: "{{ site_id | mandatory }}"
+budget_notify_best_practices_url: "https://portal.{{ site_id }}.{{ site_dns_zone }}/peering/best-practices.html"
+budget_notify_warn_fraction: "0.3"
+
+# Second email tier: Kratos identity whose email local-part == the handle
+# (unique match required; ambiguity = honest skip). "docker:<container>:<port>"
+# resolves the container IP at each run (Kratos' compose IP is not stable).
+# Empty disables the tier (the pre-tier behavior, byte-identical).
+budget_notify_kratos_admin_url: ""
+
+# Cadence: the crawler cycles at 60 s; notifications are one-time per
+# stage, so a relaxed timer is plenty.
+budget_notify_interval: "15min"
+
+# Decline the run when the band JSON's sampled_at is older than this many
+# seconds. Same threshold as the ZenohFabricSamplerStale rule, deliberately:
+# a frozen band file keeps budget_source_state=="live", so sample age is the
+# only thing standing between a dead crawler and week-old verdicts mailed to
+# tenants. 0 disables the check.
+budget_notify_max_sample_age: "600"
+
+# Node-exporter textfile dir for the run-outcome metrics (and the OnFailure
+# unit's up=0). Derived from the relay-health bridge's path rather than a
+# second group_var, because both land in the one directory the co-resident
+# goat-obs node-exporter mounts on this host. Empty (relay-health bridge not
+# configured) disables the metrics and the OnFailure wiring — the notifier
+# itself is unaffected.
+budget_notify_textfile_dir: "{{ (relay_health_textfile_out | default('')) | dirname }}"
+budget_notify_metrics_out: "{{ (budget_notify_textfile_dir ~ '/budget-notify.prom') if budget_notify_textfile_dir | length > 0 else '' }}"
+
+# SMTP (SES) — the same SES account the id-console onboarding mailer uses
+# (verified against the live console). Host/port/from are
+# non-secret config; the credentials ride the standing envrc entries
+# (ZAGROS_SES_SMTP_* in 30-site-services) and land in a root-only env file
+# on the host, never in the repo.
+budget_notify_smtp_host: "email-smtp.eu-central-1.amazonaws.com"
+budget_notify_smtp_port: "587"
+budget_notify_smtp_username: "{{ lookup('env', 'ZAGROS_SES_SMTP_USERNAME') }}"
+budget_notify_smtp_password: "{{ lookup('env', 'ZAGROS_SES_SMTP_PASSWORD') }}"
+# The sender is the site's onboarding mailer address, so one fact has one home.
+# Empty refuses at deploy: budget-notify.py will not run without a sender.
+budget_notify_smtp_from: "{{ id_admin_console_smtp_from | default('') }}"

@@ -1,0 +1,90 @@
+# Rendered by ops/ansible/roles/otel-collector on {{ ansible_date_time.iso8601 }}
+# Source: ops/ansible/roles/otel-collector/templates/otel-config.yaml.j2
+# Anchor: ADR 0822 §"Sampling" + design/observability-wide-events.md
+# §"OTLP attribute mapping".
+#
+# v1 pipelines (Block 27B.1):
+#   - logs:    OTLP receivers → resource enrichment → batch → otlphttp → OpenObserve
+#   - traces:  OTLP receivers → resource enrichment → batch → otlphttp → OpenObserve
+#   - metrics: OTLP receivers → resource enrichment → batch → otlphttp → OpenObserve
+#
+# Tail-based sampling (ADR 0822 §"Sampling") is reserved for Block 27D's
+# per-site deployment shape — adds a moving piece that needs tuning data
+# to set well; not a v1 substrate concern.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:{{ otel_otlp_grpc_port }}"
+      http:
+        endpoint: "0.0.0.0:{{ otel_otlp_http_port }}"
+
+processors:
+  # Auto-stamp site identity onto every record so downstream queries can
+  # group by site without producers having to remember.
+  resource:
+    attributes:
+      - key: service.namespace
+        value: "{{ otel_site_id }}"
+        action: upsert
+      - key: dbb.site_role
+        value: "{{ otel_site_role }}"
+        action: upsert
+
+  batch:
+    # 1s timeout + 8192 batch size matches OpenObserve ingest tuning
+    # documented at github.com/openobserve/openobserve docs/ingestion/.
+    timeout: 1s
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 384
+    spike_limit_mib: 96
+
+exporters:
+  otlphttp/openobserve:
+    # OpenObserve accepts OTLP/HTTP under /api/<org>. Streams (logs,
+    # traces, metrics) are auto-routed by signal type.
+    endpoint: "{{ otel_openobserve_endpoint }}"
+    auth:
+      authenticator: basicauth/openobserve
+    tls:
+      insecure: true   # mesh-internal HTTP for v1; Block 27D fronts
+                       # OpenObserve with Traefik + TLS.
+
+  # Self-debug exporter — useful during the spike, costs nothing in
+  # production; remove if it becomes a noise source.
+  debug:
+    verbosity: basic
+
+extensions:
+  basicauth/openobserve:
+    client_auth:
+      username: "${OPENOBSERVE_USER}"
+      password: "${OPENOBSERVE_PASS}"
+
+service:
+  extensions: [basicauth/openobserve]
+
+  telemetry:
+    metrics:
+      address: "0.0.0.0:{{ otel_metrics_port }}"
+    logs:
+      level: info
+
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/openobserve, debug]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/openobserve, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/openobserve, debug]

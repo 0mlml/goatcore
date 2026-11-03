@@ -1,0 +1,349 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+#
+# Defaults for the goat-get role — a mesh-internal download surface that
+# re-serves the goat-cli release binaries at `get.<site>.<zone>` so on-mesh
+# vendors can install `goat` without reaching the private GitHub
+# release page (which they cannot download from). Mirrors the `brief`
+# role shape: nginx:alpine + Traefik file-provider + mesh-only gating.
+# Per-goatnet: the hostname is site-templated below, so each
+# goatnet that runs the role gets its own surface.
+#
+# Provenance: the binaries are pulled from the goat-cli GitHub release
+# (tag `goat_get_release_tag`) onto the host at deploy time, then served
+# read-only. The host (not the operator laptop) does the download so no
+# multi-MB artifact crosses the mesh via scp (see the no-large-scp rule).
+
+# Public hostname for on-mesh access. `get.<site>.<zone>` by convention.
+goat_get_hostname: "get.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }}"
+
+# Which goat-cli release to serve + the asset names the release attaches
+# (one binary per target + a sibling per-asset `.sha256` + the aggregate
+# checksum file). Bump the tag here when a newer goat-cli ships; re-run the
+# deploy playbook to refresh the served binaries.
+#
+# The per-asset `goat-<os>-<arch>.sha256` files are load-bearing: `goat
+# update` verifies each downloaded binary against `<asset>.sha256` on THIS
+# surface before replacing the installed binary (crates/goat-cli/src/cmd/
+# update.rs). Omitting them 404s the checksum fetch and breaks `goat update`
+# for every installed client even though the manual-install path works
+# (which reads the binary directly, not the per-asset checksum). The
+# aggregate SHA256SUMS is served too, but the CLI does not read it.
+# bump v0.5.5 -> v0.5.6. Release step 4, deliberately SEPARATE from
+# the version bump: check-release-asset-parity.sh refuses a pin naming a
+# release that does not exist yet ("the pin names nothing"), and the release is
+# created by the tag pushed AFTER the version bump merges. Collapsing steps 3
+# and 4 into one PR therefore fails by construction — it did, on #482.
+#
+# What 0.5.6 gives an operator who upgrades:
+#   - `goat sub` stops looking broken when it is working. It streams instead of
+#     exiting after one event, mutes the one benign TLS WARN that was the first
+#     thing printed above an otherwise silent tail, and after five quiet seconds
+#     says whether it is attached — naming the router — so a quiet topic, a
+#     session attached to no router and a `--literal` on what is really
+#     a slot alias stop being one indistinguishable silence. `--for` bounds the
+#     wait so a runbook check fails red instead of hanging, and the
+#     `ops/<domain>/health/**` commands in the health runbooks run as written
+#     (#1237).
+#   - `goat flow` and `goat ui` name a partial read instead of rendering it as
+#     a complete one (#1238).
+#   - `goat admin platform-admin` re-reads the Ory plane before reporting a
+#     landed change as failed; a failed console offboard row no
+#     longer skips the rows after it (#1201); `goat admin rotate` prints a
+#     bundle URL you can paste (#1198).
+#   - No command exits 0 having failed — 56 defects from a full-surface audit,
+#     including the missing-cert error that named the build machine's own paths
+#     instead of "re-run `goat profile init`" (#1153).
+# Verify 13 assets in BOTH repos before deploying — goat_get_release_repo is
+# self-referential ({{ source_repo }}) and resolves to whichever repo the
+# deploy runs from, and the tag builds twice with non-matching bytes,
+# so parity is repaired by COPYING from the primary, never by rebuilding.
+# goat-cli-v0.5.8: `goat warrant apply --membership`, the ADR 1189
+#   membership converger (#1450). Bumping this default moves no goatnet: each
+#   serves the new release only when goat-get-deploy.yml runs there.
+# goat-cli-v0.5.9: `goat warrant pause`/`resume`; a scope is governed
+#   only when its membership file says `converge: enforce` (#1464).
+# goat-cli-v0.5.10: membership rules are a directory per goatnet,
+#   default groups from operator manifests (#1478). Hosts must run it before the
+#   warrant-membership role installs the directory: 0.5.9 reads one file only.
+# goat-cli-v0.5.11: operator-key self request/collect (#1373); a
+#   deferred onboard reuses the person's live slot instead of 409, and an
+#   existing login gets its org/name refreshed (#1580). The onboard-runner
+#   runs the host binary, so restoring an archived person needs this on the host.
+# goat-cli-v0.5.12: a failed native onboard revokes the setup keys
+#   it minted instead of leaving them valid and unheld (#1587).
+# goat-cli-v0.5.13: goat doctor names control-only connectivity
+#   (registered, 0 peers, relays unreachable: the site blocks data ports).
+# goat-cli-v0.5.14: patched P-256 for RUSTSEC-2026-0387; a key
+#   reissue accepts a legacy -rosenpass-reissue key name (#2036); platform-admin
+#   revoke reports SSH removal evidence, which the offboarding driver needs
+#   (#1976); native onboarding derives the affiliation kind (#1870).
+goat_get_release_tag: "goat-cli-v0.5.14"
+# Self-referential — resolves to whichever repo the deploy runs from
+# (group_vars/all.yml `source_repo`). Both repos carry these releases
+# byte-identically; ops/ci/check-release-asset-parity.sh keeps it that way.
+goat_get_release_repo: "{{ source_repo }}"
+goat_get_assets:
+  - goat-linux-amd64
+  - goat-linux-amd64.sha256
+  - goat-linux-arm64
+  - goat-linux-arm64.sha256
+  - goat-darwin-amd64
+  - goat-darwin-amd64.sha256
+  - goat-darwin-arm64
+  - goat-darwin-arm64.sha256
+  # goat-cli-v0.2.0 is the first release built with the Windows leg
+  # (ADR 1019 revisit). The served-asset assertion fail-closes
+  # if a listed asset is absent from the release, and the index page
+  # auto-shows a Windows install block when this is present.
+  - goat-windows-amd64.exe
+  - goat-windows-amd64.exe.sha256
+  - SHA256SUMS
+
+# GitHub token used to read the PRIVATE repo's release assets at download
+# time. Needs `contents:read` on the repo (classic `repo` scope, or a
+# fine-grained PAT). Sourced from the operator's env; passed transiently
+# to the host download task (no_log) and never persisted on the host.
+goat_get_github_token: "{{ lookup('env', 'GOAT_CLI_RELEASE_TOKEN') | default(lookup('env', 'GH_TOKEN'), true) | default(lookup('env', 'GHCR_READ_TOKEN'), true) }}"
+
+# ---------------------------------------------------------------------------
+# grant-crypto SDK assets (ADR 1106) — a PARALLEL, opt-in payload served at
+# `get.<site>/sdk/` from the SAME host, cert, DNS record, and mesh-only gate as
+# the goat-cli binaries above. Because it re-uses the existing hostname (just a
+# subdir), there is NO new LE SAN and NO new DNS record — flipping the flag on a
+# host already running goat-get is sufficient. Fail-closed: the SDK fetch/render
+# tasks are guarded by goat_get_sdk_enabled and default OFF, so a site that
+# hasn't opted in serves exactly the goat-cli surface it always did.
+#
+# The served payload is the grant-crypto-sdk-v* release (built by
+# .github/workflows/grant-crypto-sdk-release.yml): one source tarball (the SDK
+# workspace + shared conformance vectors + wire spec, re-rooted so it builds
+# standalone) + four prebuilt C ABI library tarballs (linux/darwin × amd64/arm64)
+# + per-asset .sha256 + the aggregate SHA256SUMS. See
+# docs/design/goat-cli-mesh-download.md §"SDK assets (grant-crypto)".
+goat_get_sdk_enabled: false
+goat_get_sdk_release_tag: "grant-crypto-sdk-v0.1.0"
+goat_get_sdk_release_repo: "{{ goat_get_release_repo }}"
+
+# The version string embedded in the source-tarball asset name, derived from the
+# SAME tag that pins the served assets (mirrors version.json.j2's derivation) —
+# so a bump is one line (goat_get_sdk_release_tag) with no second point to sync.
+goat_get_sdk_version: "{{ goat_get_sdk_release_tag | regex_replace('^grant-crypto-sdk-v', '') }}"
+
+# The exact asset set the release attaches. Named from the tag/version vars so a
+# tag bump updates every name at once. The set-equality assert in tasks/main.yml
+# fail-closes if any listed asset is absent from the release (same discipline as
+# goat_get_assets).
+goat_get_sdk_assets:
+  - "grant-crypto-sdk-{{ goat_get_sdk_version }}-src.tar.gz"
+  - "grant-crypto-sdk-{{ goat_get_sdk_version }}-src.tar.gz.sha256"
+  # The SDK's own documentation site (hand-authored static HTML at
+  # sdk/docs/site), re-rooted to docs/ so it unpacks straight into www/sdk/docs/.
+  # Same bytes ride inside the source tarball; this standalone asset is what the
+  # web surface serves. Unpacked by the "sdk | unarchive docs" task below.
+  - "grant-crypto-sdk-docs-{{ goat_get_sdk_version }}.tar.gz"
+  - "grant-crypto-sdk-docs-{{ goat_get_sdk_version }}.tar.gz.sha256"
+  - grant-crypto-capi-linux-amd64.tar.gz
+  - grant-crypto-capi-linux-amd64.tar.gz.sha256
+  - grant-crypto-capi-linux-arm64.tar.gz
+  - grant-crypto-capi-linux-arm64.tar.gz.sha256
+  - grant-crypto-capi-darwin-amd64.tar.gz
+  - grant-crypto-capi-darwin-amd64.tar.gz.sha256
+  - grant-crypto-capi-darwin-arm64.tar.gz
+  - grant-crypto-capi-darwin-arm64.tar.gz.sha256
+  - SHA256SUMS
+
+# On-host subdir the SDK assets land in (served at get.<site>/sdk/). nginx
+# serves the whole www tree, so a subdir just works — no nginx config change.
+goat_get_sdk_www_subdir: "sdk"
+
+# ---------------------------------------------------------------------------
+# CA roots (`goat ca add`) — served at get.<site>/ca-roots/.
+#
+# goat-cli 0.4.45 onward compiles in NO goatnet CA. Before that, one CA public
+# key was baked into the binary, so a release could only verify bundles from
+# whichever goatnet the build knew about. Verification roots are now
+# operator-supplied, which is what makes one binary work against any goatnet —
+# and it makes THIS surface load-bearing: without somewhere to get a root, the
+# new binary verifies nothing.
+#
+# Default ON, unlike the sdk/kmod/octo-pod payloads. Those are optional extras;
+# this is the other half of the goat-cli download that already ships here. A
+# site serving the binary but not its roots hands out a tool that cannot
+# install a profile.
+#
+# The PEMs are PUBLIC keys, already committed at ops/enrollment/public-keys/,
+# and carry an RFC-1421 `CA-ID:` header that names the CA — `goat ca add` reads
+# it, so the trust entry is named by the issuer rather than by whatever the
+# downloader called the file. Copied from the repo checkout, not a GitHub
+# release: they are in the tree, and a trust root should not depend on a
+# release-asset fetch that can 404.
+#
+# Serving a root is not asserting it: `goat ca add` prints a fingerprint and
+# tells the operator to check it out of band before relying on it.
+goat_get_ca_roots_enabled: true
+goat_get_ca_roots_www_subdir: "ca-roots"
+# Source dir in the repo checkout, relative to ops/ansible (playbook_dir).
+goat_get_ca_roots_src_dir: "{{ playbook_dir }}/../enrollment/public-keys"
+
+# nginx static server. SHA-pin per ADR 0859 (easy rollback).
+goat_get_image: "nginx:1.27-alpine"
+goat_get_container_name: "goat-get"
+goat_get_internal_port: 80
+
+# On-host paths.
+goat_get_compose_dir: "/opt/goat-get"
+goat_get_www_dir: "/opt/goat-get/www"
+
+# Traefik wiring — same pattern as brief/panoscope: file-provider
+# config in /etc/traefik/dynamic/, container on the `mgmt` Docker network,
+# `le` cert resolver (Let's Encrypt via Cloudflare DNS-01).
+goat_get_traefik_network: "mgmt"
+goat_get_traefik_dynamic_dir: "/etc/traefik/dynamic"
+goat_get_traefik_dynamic_filename: "goat-get.yml"
+
+# The pre-rename filename, removed from the host on deploy. Leaving it
+# behind would give Traefik two routers on the same Host() rule.
+goat_get_traefik_dynamic_filename_legacy: "nova-goat-get.yml"
+goat_get_traefik_cert_resolver: "le"
+goat_get_traefik_router_name: "goat-get"
+
+# Mesh-only gating — get.<site> is a goatnet-internal surface. Vendors are
+# on the netbird mesh (they enroll NetBird from the bundle first), so they
+# reach it; the wider internet does not. The download carries no app-layer
+# auth, so this middleware is the WHOLE auth surface — do NOT disable on
+# any goatnet fabric without a substitute gate.
+goat_get_traefik_mesh_only_middleware: "mesh-only-allowlist@file"
+
+# Cloudflare DNS publish — mirrors the brief/panoscope pattern. When true,
+# the role resolves the zone id and POSTs any missing A records. Auth via
+# CLOUDFLARE_API_TOKEN on the operator workstation (delegate_to: localhost).
+goat_get_publish_cloudflare_dns: false
+goat_get_cloudflare_zone: ""
+goat_get_cloudflare_a_record_ips: []
+
+# ---------------------------------------------------------------------------
+# jetson-wireguard-kmod assets — OPT-IN parallel payload at get.<site>/kmod/.
+# Same host/cert/DNS/mesh-gate as the goat-cli surface; the public sibling
+# repo's release (jetson-wireguard-kmod, ADR 1118) pinned by tag,
+# fetched host-side into a www/kmod/ subdir nginx already serves. Guarded by
+# goat_get_kmod_enabled, default OFF. Mirrors the SDK family exactly.
+# On-mesh Jetsons install kernelspace WireGuard without any GitHub reach:
+#   curl -LO https://get.<site>.<zone>/kmod/jetson-wireguard-kmod-$(uname -r).tar.gz
+goat_get_kmod_enabled: false
+goat_get_kmod_release_repo: "usareur-af/jetson-wireguard-kmod"
+goat_get_kmod_release_tag: "v1.0.0"
+goat_get_kmod_www_subdir: "kmod"
+goat_get_kmod_assets:
+  - jetson-wireguard-kmod-5.15.148-tegra.tar.gz
+  - jetson-wireguard-kmod-6.8.12-tegra.tar.gz
+  - SHA256SUMS
+
+# octo-pod appliance (octo-pod) — OPT-IN parallel payload at
+# get.<site>/octo-pod/. Same shape as the kmod family: sibling repo pinned by
+# tag, fetched host-side into a www subdir nginx already serves, default OFF.
+#
+# WHY A SUBDIR AND NOT THE ROOT: octo-pod publishes a file literally named
+# SHA256SUMS, as does goat-cli. Mirrored flat, whichever landed second would
+# silently replace the other's checksums and every verify on the surface would
+# fail against the wrong manifest.
+#
+# The point is a pod that never reaches GitHub. `octo-pod upgrade` reads
+# LATEST, then the artifact, then the signature over SHA256SUMS, all from
+# octo_repo_url — set that to https://get.<site>.<zone>/octo-pod and an edge
+# box takes new software over the mesh, which is the same reason this role
+# exists for goat-cli.
+#
+# Asset names carry the version (unlike kmod's stable names), so they are
+# templated off the tag the way the SDK family does — one variable to bump.
+goat_get_octopod_enabled: false
+goat_get_octopod_release_repo: "usareur-af/octo-pod"
+goat_get_octopod_release_tag: "octo-pod-v0.1.0"
+goat_get_octopod_version: "{{ goat_get_octopod_release_tag | regex_replace('^octo-pod-v', '') }}"
+goat_get_octopod_www_subdir: "octo-pod"
+# LATEST is not optional decoration: it is how `octo-pod upgrade` discovers
+# that a newer version exists. A mirror without it serves software nobody
+# upgrades to. SHA256SUMS.cosign-bundle is the signature the pod verifies
+# before it installs anything, and it refuses the release when absent.
+goat_get_octopod_assets:
+  - "octo-pod-{{ goat_get_octopod_version }}.tar.gz"
+  - "octo-pod-{{ goat_get_octopod_version }}.tar.gz.sha256"
+  - "octo-pod_{{ goat_get_octopod_version }}_all.deb"
+  - "octo-pod_{{ goat_get_octopod_version }}_all.deb.sha256"
+  - SHA256SUMS
+  - SHA256SUMS.cosign-bundle
+  - LATEST
+
+# Release-asset download mirror. A sovereign / partner site has no credential to
+# the GitHub org, so the same assets are published to R2 (`goat-downloads`,
+# fronted at a public download host) under `cli/<tag>/<asset>`. The role probes this first
+# and only reaches api.github.com when the mirror lacks the tag; the .sha256
+# sidecars are served either way, so this is a transport choice, not a trust one.
+# The provisioning tier is a deliberate cross-goatnet shared service — an endpoint
+# serving another goatnet's bringup is intentional, not config bleed.
+goat_get_mirror_base: "{{ goat_release_mirror_base | default('https://get.goat.example') }}"
+goat_get_mirror_prefix: "cli/{{ goat_get_release_tag }}"
+
+# Releases this surface must NOT serve, with the reason each is refused.
+#
+# A release is added here when it is published AND known to break something a
+# host would pick up by auto-sync. Removing an entry is a deliberate act: the
+# reason has to stop being true first.
+#
+# goat-cli-v0.5.0 (published 2026-09-07T10:54:31Z): carries the ENROLL fence
+# without the fix that teaches it to recognise the onboard-runner, so `goat
+# admin onboard --native` refuses the runner and onboarding stops on any goatnet
+# that serves it. It has never bitten because every live goatnet still runs
+# 0.4.44, which predates the fence — the exposure is one line in this file
+#. Superseded by v0.5.1.
+goat_get_refused_release_tags:
+  - "goat-cli-v0.5.0"
+
+goat_get_refused_release_reason:
+  "goat-cli-v0.5.0": >-
+    It carries the ENROLL fence without the fix that lets the onboard-runner
+    through, so onboarding refuses on any goatnet that serves it. Use
+    goat-cli-v0.5.1 or later.
+
+# ---------------------------------------------------------------------------
+# goatbuilder — OPT-IN parallel payload at get.<site>/goatbuilder/
+# (docs/design/goatbuilder-distribution.md). The build/release binary for a
+# goat environment, served to platform admins from inside the goatnet: the
+# SAME signed release assets the public GitHub Release carries, never a
+# rebuild. Same family shape as kmod/octo-pod: token-authz probe on the tag,
+# set-equality assert on assets, host-side fetch, fail-closed. The release is
+# cut by .github/workflows/goatbuilder-release.yml on a `goatbuilder/v<semver>`
+# tag; bump the tag here and re-run goat-get-deploy.yml to serve it. The docs
+# book for the same tag is served beside it by the goat-docs role
+# (goat_docs_goatbuilder_release_tag — keep the two tags coupled).
+#
+# The release repo is the source repository by name, not `source_repo`: the
+# release is cut and signed there (ADR 1195 direction — one release source).
+#
+# The tag is EMPTY until the first release is cut: the release-asset parity
+# guard (ops/ci/check-release-asset-parity.sh) refuses a pin that names a
+# release existing in neither repo, which is what a tag ahead of its release
+# would be. Bump path, once `goatbuilder/v<semver>` exists: set the tag here
+# (the first is goatbuilder/v0.1.0), flip the flag per goatnet in group_vars
+# (a test goatnet first), re-run goat-get-deploy.yml, record the served tag in
+# deploy-history.yml. The role refuses `enabled` with an empty tag.
+goat_get_goatbuilder_enabled: false
+goat_get_goatbuilder_release_repo: "USAREUR-AF/goatcore"
+goat_get_goatbuilder_release_tag: "goatbuilder/v0.4.1"
+goat_get_goatbuilder_version: "{{ goat_get_goatbuilder_release_tag | regex_replace('^goatbuilder/v', '') }}"
+goat_get_goatbuilder_www_subdir: "goatbuilder"
+# Set-equality: a release missing SHA256SUMS.cosign-bundle is not served — the
+# signature is what makes a copy from here equal to a copy from GitHub.
+goat_get_goatbuilder_assets:
+  - goatbuilder-linux-amd64
+  - goatbuilder-linux-amd64.sha256
+  - goatbuilder-linux-arm64
+  - goatbuilder-linux-arm64.sha256
+  - goatbuilder-darwin-amd64
+  - goatbuilder-darwin-amd64.sha256
+  - goatbuilder-darwin-arm64
+  - goatbuilder-darwin-arm64.sha256
+  - goatbuilder-docs.tar.gz
+  - goatbuilder-docs.tar.gz.sha256
+  - SHA256SUMS
+  - SHA256SUMS.cosign-bundle

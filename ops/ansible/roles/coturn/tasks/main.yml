@@ -1,0 +1,56 @@
+---
+# coturn STUN/TURN on the all-Rust goat-relay tier.
+# Gated by the caller (goat-relay-deploy.yml runs this role only when
+# deploy_coturn is true). Mirrors the legacy inline block in relay-server.yml,
+# extracted into a role so the Rust tier can carry it without the Go relay.
+
+- name: coturn — install
+  ansible.builtin.apt:
+    name: coturn
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# Resolve the static-auth-secret: explicit var > existing on-host > generated.
+# (STUN doesn't use it, but a valid coturn config requires one.)
+- name: coturn — read existing static-auth-secret (if any)
+  ansible.builtin.shell: |
+    set -o pipefail
+    grep -E '^static-auth-secret=' /etc/turnserver.conf | cut -d= -f2
+  args:
+    executable: /bin/bash
+  register: coturn_existing_secret
+  changed_when: false
+  failed_when: false
+
+- name: coturn — resolve TURN secret (explicit > existing > generated)
+  ansible.builtin.set_fact:
+    coturn_turn_secret_resolved: >-
+      {{ coturn_turn_secret | default('')
+         | ternary(coturn_turn_secret | default(''),
+             coturn_existing_secret.stdout | default('') | trim
+             | ternary(coturn_existing_secret.stdout | default('') | trim,
+                 lookup('pipe', 'openssl rand -hex 32'))) }}
+
+- name: coturn — write turnserver.conf
+  ansible.builtin.template:
+    src: turnserver.conf.j2
+    dest: /etc/turnserver.conf
+    mode: "0600"
+  notify: Restart coturn
+
+- name: coturn — enable daemon in /etc/default/coturn
+  ansible.builtin.lineinfile:
+    path: /etc/default/coturn
+    regexp: "^#?TURNSERVER_ENABLED="
+    line: "TURNSERVER_ENABLED=1"
+    create: true
+    mode: "0644"
+  notify: Restart coturn
+
+- name: coturn — enable + start
+  ansible.builtin.systemd:
+    name: coturn
+    enabled: true
+    state: started
+    daemon_reload: true

@@ -1,0 +1,62 @@
+---
+- name: Ensure usg is installed (via Pro service enabled in ubuntu-pro-fips role)
+  ansible.builtin.apt:
+    name: usg
+    state: present
+
+- name: Auto-select STIG profile by Ubuntu version
+  ansible.builtin.set_fact:
+    usg_profile: >-
+      {%- if ansible_distribution_version == '22.04' -%}disa_stig_ubuntu2204
+      {%- elif ansible_distribution_version == '24.04' -%}disa_stig_ubuntu2404
+      {%- else -%}unknown
+      {%- endif -%}
+  when: usg_profile is not defined
+
+- name: Refuse unknown Ubuntu version
+  ansible.builtin.assert:
+    that:
+      - usg_profile != 'unknown'
+    fail_msg: "No known USG STIG profile for Ubuntu {{ ansible_distribution_version }}."
+
+- name: Pre-remediation audit
+  ansible.builtin.command: "usg audit --profile {{ usg_profile }} --output {{ usg_audit_report_path_pre }}"
+  register: usg_audit_pre
+  changed_when: false
+  failed_when: false
+
+- name: Apply STIG remediation (usg fix)
+  ansible.builtin.command: "usg fix --profile {{ usg_profile }}"
+  register: usg_fix_result
+  when: usg_fix_enabled
+  changed_when: "'changed' in usg_fix_result.stdout | default('')"
+  failed_when:
+    - usg_fix_result.rc != 0
+    - "'failed' in usg_fix_result.stdout | default('')"
+
+- name: Post-remediation audit
+  ansible.builtin.command: "usg audit --profile {{ usg_profile }} --output {{ usg_audit_report_path_post }}"
+  register: usg_audit_post
+  changed_when: false
+  failed_when: false
+
+- name: Ensure exception file exists
+  ansible.builtin.copy:
+    content: |
+      # Site-specific STIG exceptions.
+      # Format:
+      #   - id: V-260xxx
+      #     reason: why auto-remediation could not or should not apply
+      #     compensating_control: what we do instead
+      #     owner: operator@site
+      #     date: YYYY-MM-DD
+    dest: "{{ usg_exception_path }}"
+    force: false  # only create if not present — preserve operator's curated entries
+    mode: "0644"
+
+- name: Summarize audit results
+  ansible.builtin.debug:
+    msg:
+      - "Pre-fix audit: {{ usg_audit_report_path_pre }}"
+      - "Post-fix audit: {{ usg_audit_report_path_post }}"
+      - "Exceptions file: {{ usg_exception_path }}"

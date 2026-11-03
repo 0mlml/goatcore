@@ -1,0 +1,132 @@
+---
+# Store-era gate (ADR 1165 step A). goat-zenoh-portal runs it before anything is
+# rendered, so a refusal leaves the host exactly as it was.
+#
+# Three facts must agree before the portal is (re)deployed:
+#   declared  portal_store in group_vars                      sqlite | postgres
+#   image     the image's org.usareur-af.goat-zenoh-portal.store label
+#             (absent = an image built before the Postgres server = sqlite)
+#   host      portal_store_marker, written by the cutover (postgres) and the
+#             rollback (sqlite); absent = never cut over = sqlite
+#
+# The one exception is a host with no rows anywhere — no marker and no SQLite
+# registry — declared postgres: a new goatnet starts on Postgres directly, and
+# the role provisions the database and writes the marker itself.
+
+- name: goat-zenoh-portal-store | gate — the declared store is one the role knows
+  ansible.builtin.assert:
+    that:
+      - portal_store in ['sqlite', 'postgres']
+    fail_msg: >-
+      portal_store is {{ portal_store | to_json }}; it must be sqlite or postgres.
+    quiet: true
+
+- name: goat-zenoh-portal-store | gate — is the image present on the host?
+  ansible.builtin.command:
+    argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ portal_image }}"]
+  register: gzps_image_labels
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Pulling is what `docker compose pull` would do next anyway; doing it first
+# lets the gate read the label before the image can start.
+- name: goat-zenoh-portal-store | gate — pull the pinned image to read its label
+  ansible.builtin.command:
+    argv: ["docker", "pull", "{{ portal_image }}"]
+  when: gzps_image_labels.rc != 0
+  changed_when: true
+  check_mode: false
+
+- name: goat-zenoh-portal-store | gate — read the image's store label
+  ansible.builtin.command:
+    argv: ["docker", "image", "inspect", "--format", !unsafe '{{json .Config.Labels}}', "{{ portal_image }}"]
+  register: gzps_image_labels_pulled
+  when: gzps_image_labels.rc != 0
+  changed_when: false
+  check_mode: false
+
+- name: goat-zenoh-portal-store | gate — read the host's store marker
+  ansible.builtin.slurp:
+    src: "{{ portal_store_marker }}"
+  register: gzps_store_marker
+  failed_when: false
+
+- name: goat-zenoh-portal-store | gate — is the SQLite registry present?
+  ansible.builtin.stat:
+    path: "{{ portal_db_path }}"
+    get_checksum: false
+  register: gzps_sqlite_file
+
+- name: goat-zenoh-portal-store | gate — derive image, host and fresh-host facts
+  ansible.builtin.set_fact:
+    gzps_image_store: >-
+      {{ ((gzps_image_labels_pulled.stdout if gzps_image_labels.rc != 0 else gzps_image_labels.stdout)
+          | default('null', true) | from_json | default({}, true))[portal_store_label]
+         | default('sqlite', true) }}
+    gzps_host_store: >-
+      {{ ((gzps_store_marker.content | b64decode).splitlines() | first | trim)
+         if (gzps_store_marker.content | default('') | length > 0) else '' }}
+    gzps_host_has_sqlite: "{{ gzps_sqlite_file.stat.exists }}"
+
+- name: goat-zenoh-portal-store | gate — the image's store matches the declared store
+  ansible.builtin.assert:
+    that:
+      - gzps_image_store == portal_store
+    fail_msg: >-
+      REFUSING: {{ portal_image }} is a {{ gzps_image_store }}-era portal image
+      ({{ portal_store_label }}={{ gzps_image_store }}), and this goatnet declares
+      portal_store: {{ portal_store }}.
+      {% if gzps_image_store == 'postgres' %}
+      Started here it would serve an empty Postgres registry while every org,
+      topic and slot is still in SQLite. Move this goatnet with
+      ops/ansible/portal-postgres-cutover.yml
+      (docs/operations/portal-postgres-cutover.md); a pin bump alone is not a
+      cutover.
+      {% else %}
+      Going back to a SQLite-era image is ops/ansible/portal-postgres-rollback.yml,
+      which exports Postgres to SQLite first
+      (docs/operations/portal-postgres-cutover.md).
+      {% endif %}
+    quiet: true
+
+- name: goat-zenoh-portal-store | gate — the host's rows are in the declared store
+  ansible.builtin.assert:
+    that:
+      - >-
+        (portal_store == 'sqlite' and gzps_host_store in ['', 'sqlite'])
+        or (portal_store == 'postgres' and gzps_host_store == 'postgres')
+        or (portal_store == 'postgres' and gzps_host_store == '' and not gzps_host_has_sqlite)
+    fail_msg: >-
+      REFUSING: this goatnet declares portal_store: {{ portal_store }}, but
+      {{ portal_store_marker }} on {{ inventory_hostname }} says
+      {{ gzps_host_store | default('', true) or 'nothing (never cut over)' }}{{ ' and the SQLite registry ' ~ portal_db_path ~ ' is present' if gzps_host_has_sqlite else '' }}.
+      {% if portal_store == 'postgres' %}
+      This host's rows are still in SQLite. Cut it over with
+      ops/ansible/portal-postgres-cutover.yml
+      (docs/operations/portal-postgres-cutover.md).
+      {% else %}
+      This host's rows are in Postgres. Going back to SQLite is
+      ops/ansible/portal-postgres-rollback.yml; a SQLite-era portal started here
+      would open the read-only cutover archive.
+      {% endif %}
+    quiet: true
+
+- name: goat-zenoh-portal-store | gate — a Postgres store needs its database password
+  ansible.builtin.assert:
+    that:
+      - portal_db_password | default('') | length > 0
+    fail_msg: >-
+      portal_store is postgres but {{ portal_db_password_env }} is empty in the
+      deploying environment. It is resolved from the secret store per command
+      (ADR 1186): run the deploy through ops/scripts/with-secrets, with a
+      reference for {{ portal_db_password_env }} in .envrc.local.d.
+    quiet: true
+  when: portal_store == 'postgres'
+
+- name: goat-zenoh-portal-store | gate — summary
+  ansible.builtin.debug:
+    msg: >-
+      store gate passed: declared={{ portal_store }}
+      image={{ gzps_image_store }} host={{ gzps_host_store or 'unmarked' }}
+      sqlite-file={{ gzps_host_has_sqlite }}

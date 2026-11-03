@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Rendered by ops/ansible/roles/apt-cacher-ng on {{ ansible_date_time.iso8601 }}.
+# Source: ops/ansible/roles/apt-cacher-ng/templates/emit-metrics.sh.j2
+#
+# Emit apt-cacher-ng cache metrics into node_exporter's textfile
+# collector dir. Prometheus picks them up on the next scrape.
+#
+# Metrics:
+#   apt_cacher_ng_cache_size_bytes  — total bytes in cache dir
+#   apt_cacher_ng_cache_files_total — file count in cache dir
+#   apt_cacher_ng_log_size_bytes    — log dir size
+#   apt_cacher_ng_systemd_active    — 1 if active, 0 if not
+#
+# Atomic write via temp+rename so node_exporter never reads a partial
+# file.
+
+set -euo pipefail
+
+CACHE_DIR="{{ apt_cacher_ng_cache_dir }}"
+LOG_DIR="{{ apt_cacher_ng_log_dir }}"
+TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+OUT="$TEXTFILE_DIR/apt-cacher-ng.prom"
+
+mkdir -p "$TEXTFILE_DIR"
+TMP=$(mktemp "$OUT.XXXXXX")
+
+cache_size=$(du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}' || echo 0)
+cache_files=$(find "$CACHE_DIR" -type f 2>/dev/null | wc -l)
+log_size=$(du -sb "$LOG_DIR" 2>/dev/null | awk '{print $1}' || echo 0)
+active=0
+if systemctl is-active --quiet apt-cacher-ng; then active=1; fi
+
+cat >"$TMP" <<EOF
+# HELP apt_cacher_ng_cache_size_bytes Total bytes in the apt-cacher-ng cache directory.
+# TYPE apt_cacher_ng_cache_size_bytes gauge
+apt_cacher_ng_cache_size_bytes $cache_size
+# HELP apt_cacher_ng_cache_files_total File count in the apt-cacher-ng cache directory.
+# TYPE apt_cacher_ng_cache_files_total gauge
+apt_cacher_ng_cache_files_total $cache_files
+# HELP apt_cacher_ng_log_size_bytes Total bytes in the apt-cacher-ng log directory.
+# TYPE apt_cacher_ng_log_size_bytes gauge
+apt_cacher_ng_log_size_bytes $log_size
+# HELP apt_cacher_ng_systemd_active 1 if the apt-cacher-ng systemd unit is active, 0 otherwise.
+# TYPE apt_cacher_ng_systemd_active gauge
+apt_cacher_ng_systemd_active $active
+EOF
+
+mv "$TMP" "$OUT"
+chmod 0644 "$OUT"

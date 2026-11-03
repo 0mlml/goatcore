@@ -1,0 +1,201 @@
+---
+# goat-zenoh-edge — ONE dedicated router per federated sovereign partner.
+#
+# Canon: docs/adr/1157-cross-sovereign-federation-edge-terminated.md
+#        docs/design/cross-sovereign-federation.md
+#        docs/operations/sovereign-federation-runbook.md
+#
+# This is a SEPARATE role from goat-zenoh on purpose. The core role does a great
+# deal an edge must not: a rocksdb storage backend, portal-group-writable config
+# dirs, ACL seed migration, per-vendor rule injection. An edge has none of that,
+# and the cheapest way to guarantee it stays that way is to not share the code
+# path at all.
+#
+# EVERY VALUE IS EMPTY BY DEFAULT. An edge is only ever stood up deliberately,
+# per partner, with all of these set. The role fails loud rather than guessing.
+
+goat_zenoh_edge_enabled: false            # opt-in per host, per partner
+
+# --- identity of the peering -----------------------------------------------
+goat_zenoh_edge_partner_id: ""            # short sovereign id, e.g. "svn"
+goat_zenoh_edge_partner_cn: ""            # AGREED Subject CN they present; exact match
+
+# --- trust ------------------------------------------------------------------
+# THE partner's anchors and nothing else. On a host also running SPIRE, point
+# spire_trust_sync_router_trust_file at THIS path — never at a core router's.
+goat_zenoh_edge_partner_ca_path: ""
+
+# --- our own identities, one per direction ----------------------------------
+goat_zenoh_edge_outward_cert: ""          # presented TO the partner
+goat_zenoh_edge_outward_key: ""
+goat_zenoh_edge_inward_cert: ""           # presented INWARD to our core
+goat_zenoh_edge_inward_key: ""
+
+# --- reachability -----------------------------------------------------------
+goat_zenoh_edge_listen_port: 7448         # the ONLY port facing the partner
+goat_zenoh_edge_core_endpoints: []        # inward dial target(s), e.g. tls/core:7447
+goat_zenoh_edge_bind_address: "0.0.0.0"   # narrow to the tunnel interface where possible
+# The far edge's link address, when the agreement says WE do not listen. Empty on
+# the listening side, which dials nothing toward the partner. `goat federate apply`
+# renders both this and the bind address from the agreement (federation-<them>-transport.yml).
+goat_zenoh_edge_partner_dial: ""
+
+# F-601: WHICH LINK A NAME ARRIVES ON. The partner's CA can mint any common name,
+# our core's included, and the access layer cannot see the issuer. So the
+# our-core subject is bound to the interface the core link uses, and the
+# partner-peer subject to the interface the partner link uses. A certificate
+# bearing our core's name that arrives from the partner matches no subject.
+#
+# This needs the edge on the host's network, so each link carries its real
+# interface: the partner link the tunnel interface, the core link the interface
+# routing to the core. In a bridge network both read as the container's eth0 and
+# the binding cannot separate them. Empty: detected at deploy from the routes, and
+# the role refuses when the two come out the same.
+goat_zenoh_edge_network_mode: host        # host | bridge (bridge cannot bind by interface)
+goat_zenoh_edge_core_interface: ""
+goat_zenoh_edge_partner_interface: ""
+# The far link address, for detecting the partner interface; rendered by apply.
+goat_zenoh_edge_partner_link_ip: "{{ goat_peering_remote_link_ip | default('') }}"
+goat_zenoh_edge_partner_port: "{{ goat_zenoh_edge_listen_port }}"
+
+# --- what may cross ---------------------------------------------------------
+goat_zenoh_edge_ingress_key_exprs: []     # where they may write, e.g. from/svn/**
+# What they may receive, named as it appears ON THE WIRE: `from/<our sovereign>/**`,
+# NEVER the `release/**` staging name. The republisher lifts the staging name onto
+# the wire name before anything reaches this edge and the fabric cannot rename a key
+# expression in transit, so a rule naming the staging name permits a key that
+# never crosses and forbids the one that does.
+goat_zenoh_edge_egress_key_exprs: []   # e.g. from/<sovereign>/**
+
+# Key-bundle read for grant-keyed encryption. Empty means this partner
+# exchanges UNSEALED only: it cannot obtain a DEK, so it can neither read sealed
+# data nor seal any of its own. Set it per release-set the partner belongs to:
+#   goat_zenoh_edge_key_bundle_key_exprs: ["keys/weather/**"]
+# NEVER "keys/**" -- that hands this partner every audience's bundle.
+# Read-only by construction: the rendered rule omits put and delete, because
+# publishing on keys/** means wrapping a DEK of your own choosing.
+# Refuse a deploy whose core key storage is wider than what this edge grants.
+# A wider queryable is refused silently, so the partner fetches nothing and it
+# reads as "no bundle published". Set false only to accept that
+# deliberately.
+goat_zenoh_edge_key_scope_check: true
+# The container name the core router runs as, read to make that comparison.
+goat_zenoh_edge_core_container: "goat-zenoh"
+
+goat_zenoh_edge_key_bundle_key_exprs: []
+
+# --- runtime ----------------------------------------------------------------
+# Digest-pinned, like every other image here (ADR 0703). No floating tag.
+goat_zenoh_edge_image: ""
+goat_zenoh_edge_stack: "goat-zenoh-edge-{{ goat_zenoh_edge_partner_id }}"
+
+# --- Ingress rate + size limits on the partner link (ADR 1157 P2) -----------
+# A partner link is the one place where load arrives that we do not control and
+# cannot ask to slow down. Zenoh has two interceptors for this and the edge is
+# where they belong -- applying them at the core would throttle our own traffic
+# too, and applying them nowhere means a partner's bug is our outage.
+#
+# Both are scoped to INGRESS only. Egress is our own release traffic, already
+# bounded by what we choose to publish; throttling it would silently degrade a
+# release set and look like a partner-side fault.
+#
+# Empty lists render no interceptor at all, which is the correct default for a
+# link that has never carried traffic: pick the numbers from the first live-fire
+# rather than inventing them here. F-446 note -- a partner publishing outside the
+# agreed prefix is refused silently, so an unexpectedly quiet link is more likely
+# a prefix mismatch than a rate limit.
+
+# Max publication frequency per key expression, in Hertz.
+#   - { key_expr: "from/svn/**", freq: 100.0 }
+goat_zenoh_edge_downsampling_rules: []
+
+# Max payload size in bytes for messages matching these key expressions.
+# A partner cannot be trusted to bound its own message size, and an unbounded
+# put on a link we do not control is a memory-pressure vector on the edge.
+goat_zenoh_edge_low_pass_key_exprs: []
+goat_zenoh_edge_low_pass_size_limit: 0
+
+# --- Prefix observer (docs/operations/peering-denial-observability.md) ------
+# Makes the F-177 silent failure loud: a partner publishing outside the agreed
+# `from/<sov>/**` prefix is refused, and today NOTHING at either end says so.
+# They see nothing delivered, we see nothing arrive, and two organisations debug
+# a network problem that is a naming problem.
+#
+# NO NEW SERVICE IS NEEDED. zenoh already logs every ACL decision, and the denial
+# message carries the ZID and the KEY EXPRESSION:
+#   "<zid> is unauthorized to <action> on <key_expr>"
+# It is emitted at trace! (access_control.rs:84,393,423), and zenoh initialises
+# its subscriber from RUST_LOG via EnvFilter, so the ACL module ALONE can be
+# raised without turning on trace for the whole router.
+#
+# HONEST COST, and why this is default-OFF: allows are logged at the SAME level,
+# so this is a log line per ACL decision on this link. It is bounded here in a way
+# it would not be on a core router -- one partner, and the ingress rate and size
+# limits above cap the traffic -- but it is not free.
+#
+# TWO WAYS TO READ IT. By hand, for a bringup or a link that has gone quiet:
+#   ops/scripts/edge-prefix-denials.sh <edge-stack-name>
+# Continuously, as the `peering` domain of the environment-health surface --
+# ops/peering-denials/pd-snapshot.py on a timer feeding goat-peering-health,
+# which publishes ops/peering/health/<edge>. That is the form the S4 G-6 gate
+# requires, because a refusal nobody is watching for is not observable.
+# Runbook: docs/operations/peering-denial-observability.md
+goat_zenoh_edge_acl_trace: false
+
+# Verify the inward link actually came up, rather than assuming the connect
+# endpoint was honoured. See F-474: upstream zenoh silently discards a connect
+# endpoint carrying per-link config -- the exact syntax this role asserts -- and
+# the edge then runs, accepts the partner and moves no data, with nothing logged.
+# Image-independent: whatever syntax an image accepts, a deployed edge that has
+# not reached the core is reported instead of running silently.
+goat_zenoh_edge_verify_inward_link: true
+goat_zenoh_edge_inward_settle_seconds: 8
+
+# HOW THE EDGE TRUSTS TWO AUTHORITIES AT ONCE.
+#
+# The edge talks to two parties signed by different CAs: the partner (their CA)
+# and our own core (ours). zenoh's `root_ca_certificate` is GLOBAL to the
+# process, so one of those links needs something extra.
+#
+#   fragment  each core endpoint carries #root_ca_certificate_file=<our CA>.
+#             Correct in principle and what this role asserted from the start --
+#             but upstream eclipse/zenoh 1.9.0 SILENTLY DISCARDS a connect
+#             endpoint carrying per-link config, so the edge never dials at all
+#             and nothing is logged. Measured with a control: '#' and '?'
+#             behave identically, and the same endpoint without the fragment
+#             dials immediately.
+#
+#   bundle    root_ca_certificate is our CA and the partner's CA concatenated,
+#             assembled per edge. Works on every image, because it uses no
+#             per-link configuration at all.
+#
+# WHAT THE BUNDLE COSTS, stated rather than glossed: the partner-facing listener
+# will then also complete TLS with a certificate signed by OUR CA. It does not
+# grant anything -- the ACL subject pins the partner's exact common name, and the
+# access layer matches the NAME, never the issuer -- but it removes one
+# layer of defence in depth, so an internal holder of our CA reaches the ACL
+# instead of being refused at the handshake.
+#
+# WHAT IT DOES NOT COST: isolation between partners. Each partner has its own
+# edge container with its own bundle, so partner A's authority never enters
+# partner B's edge. That property is what the per-partner process buys and the
+# bundle does not spend it.
+#
+# DEFAULT IS `fragment`, because the fleet image honours it and it is the tighter
+# of the two -- it widens no trust at all, where bundle puts our own CA into the
+# partner-facing listener's trust store. On the pinned fleet image the fragment
+# gets the inward link to ESTAB, and without it the link repeats TIME-WAIT.
+# Upstream eclipse/zenoh:1.9.0 is exactly inverted.
+#
+# Switch to `bundle` for an image that does not honour per-link config. The
+# inward-link check at the end of this role catches a wrong choice, so a mismatch
+# is reported rather than served silently.
+goat_zenoh_edge_trust_mode: fragment        # fragment | bundle
+goat_zenoh_edge_our_ca_path: ""             # required when trust_mode is bundle
+goat_zenoh_edge_bundle_path: "/etc/goat-zenoh-edge-{{ goat_zenoh_edge_partner_id }}/trust-bundle.pem"
+
+# The Common Name our OWN core presents on the inward link. Without it the edge
+# has one ACL subject -- the partner -- and its link to the core matches nothing,
+# so default_permission deny silently drops every message on it while the link
+# sits ESTABLISHED. Empty keeps the previous behaviour, which is that shape.
+goat_zenoh_edge_core_cn: ""

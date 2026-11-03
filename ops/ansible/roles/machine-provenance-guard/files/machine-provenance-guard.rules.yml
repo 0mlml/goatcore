@@ -1,0 +1,69 @@
+# Managed by ansible (roles/machine-provenance-guard). Do not edit on the host.
+#
+# Ships from the ROLE, not the shared ops/compose/goat-obs tree, so the absent()
+# alert below exists only on goatnets that actually deployed the timer. In the
+# shared tree it would fire forever everywhere that has not.
+#
+# NOTE the ordering of concerns: the first two alerts are about the GUARD, and
+# only the third is about the fleet. That is deliberate. A guard that stopped
+# running, or that is running blind, is a worse condition than a violation it
+# reports — because the violation is at least visible.
+groups:
+  - name: machine-provenance-guard
+    rules:
+      # The F-332 / ADR 1130 failure mode itself, now alertable: the audit
+      # stopped and nobody noticed. absent() covers "never arrived" — which is
+      # what F-335 found three publishers doing into a directory nothing reads.
+      - alert: MachineProvenanceGuardNotReporting
+        expr: absent(machine_provenance_guard_last_run_timestamp_seconds)
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The gear-provenance audit has published no metric at all"
+          description: >-
+            machine_provenance_guard_last_run_timestamp_seconds is absent from
+            Prometheus. Either the timer is not running, or it is writing its
+            textfile into a directory this host's node_exporter does not read
+            Check `systemctl list-timers machine-provenance-guard.timer`
+            first, then `ps -o args= -C node_exporter | grep textfile.directory`.
+            A guard nobody runs is indistinguishable from no guard.
+
+      # A stale timestamp is the OTHER half: the file is there, the series
+      # exists, and it stopped advancing. The wrapper deliberately does not
+      # stamp on exit 2, so a blind guard shows up here rather than as a
+      # cheerfully fresh timestamp over a run that saw nothing.
+      - alert: MachineProvenanceGuardStale
+        expr: time() - machine_provenance_guard_last_run_timestamp_seconds > 10800
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The gear-provenance audit has not completed a full read for 3h"
+          description: >-
+            Last successful read was {{ $value | humanizeDuration }} ago against an
+            hourly schedule. The guard only stamps this after reading BOTH the mesh
+            and the portal registry, so the usual cause is an unreachable portal —
+            exit 2, which says nothing about provenance and must not be read as
+            clean. See /var/lib/goat/machine-provenance-guard/last-run.txt.
+
+      # The fleet condition. Warning, not critical, and deliberately not gated
+      # on the report-only backlog: this fires on the count being non-zero,
+      # which under report-only posture is a backlog to work down rather than a
+      # regression to page on. The contract says never fail on a backlog; the
+      # same applies to paging.
+      - alert: MachineProvenanceViolations
+        expr: machine_provenance_guard_peers{grade="violation"} > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} gear peer(s) hold a gear class with no custody edge"
+          description: >-
+            A peer wearing a gear-class group that the machine registry has no record
+            of. READ THE REPORT BEFORE TREATING THIS AS A SIDE DOOR: the join key is
+            `peer name == machine handle`, so a peer renamed off its handle grades as
+            a violation with its paperwork perfectly intact, and the guard names the
+            unmatched handles when it can. Rename the peer to its handle — a
+            name-only change — rather than allowlisting it. Only a violation with no
+            unmatched handle is a real side door.

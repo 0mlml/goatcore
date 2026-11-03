@@ -1,0 +1,81 @@
+---
+# Defaults for the `consistency-health` role — the `consistency` domain of the
+# environment-health surface (docs/design/consistency-foundation.md §5,
+# ADR 1110 / ADR 1036).
+#
+# Shape (mirrors node-net-health exactly): a host systemd timer runs the
+# collector (ops/consistency/collect/consistency-snapshot.py) which assembles
+# this node's convergence facts into ONE atomic snapshot JSON; a single
+# unprivileged container (goat-consistency-health, an mTLS Zenoh client peer)
+# reads it and publishes ops/consistency/report/<host_id>.
+#
+# WHY THE SPLIT: reconciling a ledger tip against what is running needs the
+# docker socket. Handing that to a read-only observability meter would give it
+# control of every container on the host, which is not a trade this surface
+# needs to make to answer "what are you running". The collector is privileged
+# and writes a file; the publisher is not and reads one.
+#
+# Both halves are default-off. Nothing here contacts a host until a goatnet's
+# group_vars turns it on.
+
+consistency_health_enabled: false
+
+# Multi-arch INDEX digest from .github/workflows/consistency-health-image.yml.
+#   docker buildx imagetools inspect ghcr.io/{{ ghcr_org }}/goat-consistency-health:sha-<short> --format '{{.Manifest.Digest}}'
+# sha-7c9a662 = the first successful main build (#2108, CF-6 merge); digest
+# verified as the OCI image INDEX (amd64+arm64), never a per-arch leaf
+#, identical in both ghcr namespaces. For governed goatnets the
+# value of record renders from ops/pins/fleet-pins.yaml into the generated
+# group_vars pins.yml, which shadows this default; bump BOTH in lockstep.
+consistency_health_image: "ghcr.io/{{ ghcr_org }}/goat-consistency-health:sha-7c9a662@sha256:09d330069d1d812b06fcf1bfebc3555ac43e80ef14bd49e12988aa0ac02ac718"
+
+# --- on-host layout ---
+consistency_health_compose_dir: /opt/consistency-health
+consistency_health_state_dir: /var/lib/goat-consistency
+# Where the ADR 1060 ledgers and the applied-intent stamp already live. Read
+# only; this role writes nothing under it.
+consistency_health_ledger_root: /var/lib/goat
+
+# --- collector timer ---
+# Faster than node-net-health's hourly cadence because what it reads changes on
+# deploy, and a deploy is the event this surface exists to observe. Still cheap:
+# a directory walk, a tail per component, and one `docker ps`.
+consistency_health_snapshot_interval_s: 600
+consistency_health_snapshot_boot_delay_s: 90
+consistency_health_docker_bin: /usr/bin/docker
+# Set true only where the docker socket is genuinely unavailable. Every tip then
+# reports `unreconciled`, which a reader grades `unreadable` — honest, and never
+# green.
+consistency_health_no_reconcile: false
+
+# --- publisher (container) ---
+# <host_id> segment of ops/consistency/report/<host_id>.
+consistency_health_node: "{{ inventory_hostname_short | default(inventory_hostname) }}"
+consistency_health_zenoh_endpoint: "tls/{{ zenoh_stack | default('goat-zenoh') }}-router:7447"
+consistency_health_zenoh_network: "{{ zenoh_stack | default('goat-zenoh') }}_default"
+# Router hosts join the router's compose network. Non-router nodes set this
+# false and point the endpoint at the router host's MESH IP.
+consistency_health_join_zenoh_network: true
+consistency_health_interval_ms: 30000
+consistency_health_stale_after_ms: 1800000     # ~3 collector intervals -> empty record
+consistency_health_rust_log: "goat_consistency_health=info,zenoh=warn"
+
+# Leaf cert minted via the offline-CA ceremony with Subject
+# CN=goat-consistency-health-trial-peer (zenoh ACL subject
+# infra-consistency-health).
+consistency_health_cert_dir: /opt/consistency-health/certs
+consistency_health_ca_root_src: "/etc/{{ zenoh_stack | default('goat-zenoh') }}/tls/ca-root-cert.pem"
+
+# --- rollup reader (ONE host per goatnet) ---
+# Same image, --mode rollup: a passive subscriber of ops/consistency/report/**
+# that grades against the goatnet's committed intent artifact and publishes
+# ops/consistency/health/<site>. Reveal-only; no central poller — nodes
+# self-publish and this only listens.
+consistency_health_rollup_enabled: false
+consistency_health_site: "{{ site_id | mandatory }}"
+# The goatnet's committed IntentV1 artifact, copied to the host by this role and
+# mounted read-only. Re-read and integrity-checked on EVERY beat, so a
+# regenerated artifact takes effect without a restart and an artifact that
+# becomes unreadable stops being graded against immediately.
+consistency_health_intent_dir: /etc/consistency-health
+consistency_health_record_stale_after_ms: 900000

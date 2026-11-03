@@ -1,0 +1,80 @@
+---
+# Provisions the OAuth2 client `oauth2-proxy-id-console` at the site Hydra.
+# Idempotent upsert by client_id. Mirrors oauth2-proxy-dashboard-oidc-client.
+
+- name: Require oauth2-proxy-id-console OIDC client secret
+  ansible.builtin.assert:
+    that:
+      - oauth2_proxy_id_console_oidc_client_secret is defined
+      - (oauth2_proxy_id_console_oidc_client_secret | length) >= 32
+      - site_id is defined and (site_id | length) > 0
+      - site_dns_zone is defined and (site_dns_zone | length) > 0
+    fail_msg: |
+      Missing oauth2_proxy_id_console_oidc_client_secret (32+ chars) or
+      site_id/site_dns_zone. Generate fresh: openssl rand -hex 32
+
+- name: Pre-flight Hydra admin reachability
+  ansible.builtin.uri:
+    url: "{{ oauth2_proxy_id_console_oidc_hydra_admin }}/health/ready"
+    status_code: 200
+  retries: 5
+  delay: 2
+
+- name: Check whether oauth2-proxy-id-console OAuth2 client exists at Hydra
+  ansible.builtin.uri:
+    url: "{{ oauth2_proxy_id_console_oidc_hydra_admin }}/admin/clients/{{ oauth2_proxy_id_console_oidc_client_id }}"
+    status_code: [200, 404]
+    return_content: true
+  register: oauth2_proxy_id_console_client_get
+  no_log: true
+
+- name: Construct desired oauth2-proxy-id-console OAuth2 client config
+  ansible.builtin.set_fact:
+    oauth2_proxy_id_console_client_config:
+      client_id: "{{ oauth2_proxy_id_console_oidc_client_id }}"
+      client_name: "{{ oauth2_proxy_id_console_oidc_client_name }}"
+      client_secret: "{{ oauth2_proxy_id_console_oidc_client_secret }}"
+      grant_types: [authorization_code, refresh_token]
+      response_types: [code]
+      scope: "{{ oauth2_proxy_id_console_oidc_scopes | join(' ') }}"
+      redirect_uris: ["{{ oauth2_proxy_id_console_oidc_redirect_uri }}"]
+      token_endpoint_auth_method: client_secret_post
+      skip_consent: true
+      access_token_strategy: jwt
+      audience: ["{{ oauth2_proxy_id_console_oidc_client_id }}"]
+  no_log: true
+
+- name: Create oauth2-proxy-id-console OAuth2 client at Hydra (POST when not present)
+  ansible.builtin.uri:
+    url: "{{ oauth2_proxy_id_console_oidc_hydra_admin }}/admin/clients"
+    method: POST
+    body_format: json
+    body: "{{ oauth2_proxy_id_console_client_config }}"
+    status_code: 201
+  when: oauth2_proxy_id_console_client_get.status == 404
+  no_log: true
+
+- name: Detect drift on existing oauth2-proxy-id-console OAuth2 client at Hydra
+  # Hydra v2.x omits `client_secret` from GET responses; treat absence as
+  # "we don't know" and force PUT to re-sync. Same posture as
+  # oauth2-proxy-dashboard-oidc-client.
+  ansible.builtin.set_fact:
+    oauth2_proxy_id_console_client_drift: >-
+      {{ (oauth2_proxy_id_console_client_get.json.client_secret | default('')) != oauth2_proxy_id_console_oidc_client_secret
+         or (oauth2_proxy_id_console_client_get.json.redirect_uris | sort) != ([oauth2_proxy_id_console_oidc_redirect_uri] | sort)
+         or (oauth2_proxy_id_console_client_get.json.skip_consent | default(false)) != true
+         or (oauth2_proxy_id_console_client_get.json.access_token_strategy | default('')) != 'jwt' }}
+  when: oauth2_proxy_id_console_client_get.status == 200
+  no_log: true
+
+- name: Update oauth2-proxy-id-console OAuth2 client at Hydra (PUT on drift)
+  ansible.builtin.uri:
+    url: "{{ oauth2_proxy_id_console_oidc_hydra_admin }}/admin/clients/{{ oauth2_proxy_id_console_oidc_client_id }}"
+    method: PUT
+    body_format: json
+    body: "{{ oauth2_proxy_id_console_client_config }}"
+    status_code: 200
+  when:
+    - oauth2_proxy_id_console_client_get.status == 200
+    - oauth2_proxy_id_console_client_drift | default(false) | bool
+  no_log: true

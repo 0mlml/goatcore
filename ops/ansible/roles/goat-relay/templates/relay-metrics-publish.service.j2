@@ -1,0 +1,24 @@
+# relay-metrics-publish.service — ADR 1058. Reads this relay's OWN host metrics
+# locally (no SSM/creds) and POSTs them to the Thor ingest over the rathole :443
+# path, so the relay-health dashboard throughput panel auto-populates. oneshot;
+# driven by relay-metrics-publish.timer.
+[Unit]
+Description=goat relay — self-publish host metrics to the Thor (ADR 1058)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile={{ relay_metrics_dir }}/relay-metrics-publish.env
+{% if relay_metrics_publisher == 'binary' %}
+# Phase 3: the typed Go publisher — reads RELAY_STATS_URL + folds the
+# per-peer distribution into the deep block (ADR 1055 §2b). Rollback = set
+# relay_metrics_publisher=bash and re-run (metrics-publish.sh stays installed).
+ExecStart={{ relay_metrics_dir }}/relay-probe publish
+{% else %}
+ExecStart={{ relay_metrics_dir }}/metrics-publish.sh
+{% endif %}
+Nice=10
+# Failure here is non-fatal to the relay — the dashboard just stays
+# operator-deep-only for this relay until the next successful post.
+SuccessExitStatus=0 1
