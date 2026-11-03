@@ -222,7 +222,7 @@ The descriptor is a neutral document; each technology consumes the subset it und
 
 ## 10. Reference demonstration repo (cross-platform scenario)
 
-The standard's external value is best shown by a **runnable, multi-platform scenario** rather than prose: a sibling repo **`hello-galaxy-universal-id`** (pattern precedent: `goat-qos-demo`, `moon-pod`, `hello-galaxy-zagros-pod`) that demonstrates several heterogeneous "platforms" — standing in for how an arbitrary vendor stack might consume a **generalized, universally-enforced identity standard** — each ingesting the *same* identity descriptor and enforcing access/attribution consistently off it.
+The standard's external value is best shown by a **runnable, multi-platform scenario** rather than prose: a sibling repo **`hello-galaxy-universal-id`** (pattern precedent: `goat-qos-demo`, `USAREUR-AF/zagros-moon-pod`, `hello-galaxy-zagros-pod`) that demonstrates several heterogeneous "platforms" — standing in for how an arbitrary vendor stack might consume a **generalized, universally-enforced identity standard** — each ingesting the *same* identity descriptor and enforcing access/attribution consistently off it.
 
 Demonstration shape (skeleton — detail in the repo's own README):
 

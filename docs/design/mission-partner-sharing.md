@@ -136,7 +136,7 @@ The PRA still presumes engineering capacity at the partner side. For partners wh
 
 - **Contract** (the seven requirements any moon-pod must meet): [`partner-receiver-requirements.md`](partner-receiver-requirements.md).
 - **Abstract spec**: [`goat-moon-pod.md`](https://github.com/usareur-af/goatstuff/blob/main/docs/design/goat-moon-pod.md).
-- **Reference implementation**: `moon-pod` (separate repo, Apache 2.0 — private during MVP, public at GA, per [ADR 0223](../adr/0223-goat-moon-pod-repo-containment.md)).
+- **Reference implementation**: [`USAREUR-AF/zagros-moon-pod`](https://github.com/USAREUR-AF/zagros-moon-pod) (separate repo, Apache 2.0 — private during MVP, public at GA, per [ADR 0223](../adr/0223-goat-moon-pod-repo-containment.md)).
 - **Builder guide for vendors**: [`goat-moon-pod-builder-guide.md`](https://github.com/usareur-af/goatstuff/blob/main/docs/design/goat-moon-pod-builder-guide.md). Vendors explicitly invited to build their own conformant moon-pods. Per-vendor cookbooks at `../integrations/moon-pods/`.
 - **Conformance smoke-test**: [`../../tests/moon-pod-conformance/`](../../tests/moon-pod-conformance/).
 

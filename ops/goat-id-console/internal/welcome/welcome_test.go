@@ -308,7 +308,7 @@ func TestRender_githubSummaryAndRepoSection(t *testing.T) {
 	must := []string{
 		"| github: octocat", // summary line append
 		"Repository access", // the section heading
-		"usareur-af/zagros-moon-pod (pull) — https://github.com/usareur-af/zagros-moon-pod",
+		"USAREUR-AF/zagros-moon-pod (pull) — https://github.com/USAREUR-AF/zagros-moon-pod",
 		"usareur-af/hello-galaxy-access-mgmt (pull) — https://github.com/usareur-af/hello-galaxy-access-mgmt",
 	}
 	for _, m := range must {
@@ -328,7 +328,7 @@ func TestRender_repoGrantSourceTag(t *testing.T) {
 			}},
 		Artifacts{SetupKey: "K"})
 	must := []string{
-		"usareur-af/zagros-moon-pod (pull) (policy) — https://github.com/usareur-af/zagros-moon-pod",
+		"USAREUR-AF/zagros-moon-pod (pull) (policy) — https://github.com/USAREUR-AF/zagros-moon-pod",
 		"usareur-af/extra-repo (push) (audible) — https://github.com/usareur-af/extra-repo",
 	}
 	for _, m := range must {

@@ -73,6 +73,7 @@ To run goat for real on a single machine with no cloud account, start with [goat
 | [hello-galaxy-goatenv](https://github.com/usareur-af/hello-galaxy-goatenv) | A step-by-step walkthrough that builds that environment |
 | [goatstuff](https://github.com/usareur-af/goatstuff) | Inspection tools and demonstration applications |
 | [goatdocs](https://github.com/usareur-af/goatdocs) | Architecture, strategy, design system and integration guides |
+| [zagros-moon-pod](https://github.com/usareur-af/zagros-moon-pod) | A pod a partner runs to join a goat data fabric and share data under their own custody |
 
 ## Repository layout
 

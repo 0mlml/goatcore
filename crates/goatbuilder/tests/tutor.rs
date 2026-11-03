@@ -43,8 +43,21 @@ fn append_log(ws: &Path, line: &str) {
     writeln!(f, "{line}").unwrap();
 }
 
+
+/// Whether this checkout declares a deployment of its own. Lesson 1 runs
+/// `goatbuilder validate` and `doctor` against it; a public clone of goatcore
+/// declares none, by design, so these tests return early there.
+fn checkout_declares_a_deployment() -> bool {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ops/goatbuilder/goatbuilder.yaml")
+        .is_file()
+}
+
 #[test]
 fn a_learner_completes_every_available_lesson_by_typing_what_it_prints() {
+    if !checkout_declares_a_deployment() {
+        return; // a public clone of goatcore ships no deployment
+    }
     let ws = std::env::temp_dir().join(format!("goatbuilder-tutor-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
     let path = format!("{}:{}", bin().parent().unwrap().display(), std::env::var("PATH").unwrap_or_default());
@@ -121,6 +134,9 @@ fn run(cmd: &str, ws: &Path, path: &str) {
 /// and the tutor says where it should have run.
 #[test]
 fn a_command_run_outside_the_tutors_copy_does_not_count() {
+    if !checkout_declares_a_deployment() {
+        return; // a public clone of goatcore ships no deployment
+    }
     let ws = std::env::temp_dir().join(format!("goatbuilder-tutor-wrong-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
     let _ = tutor(&ws);
@@ -148,6 +164,9 @@ fn a_command_run_outside_the_tutors_copy_does_not_count() {
 /// so leaves the learner where they were.
 #[test]
 fn a_finished_lesson_opens_to_read_and_changes_nothing() {
+    if !checkout_declares_a_deployment() {
+        return; // a public clone of goatcore ships no deployment
+    }
     let ws = std::env::temp_dir().join(format!("goatbuilder-tutor-review-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
     let _ = tutor(&ws);

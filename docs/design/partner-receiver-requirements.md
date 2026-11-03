@@ -13,7 +13,7 @@ The **contract** for any system that wants to send and receive data across the g
 
 This document defines the **requirements**, not an implementation. There are several conformant paths:
 
-- **`moon-pod`** — our reference implementation. Apache 2.0 (private during MVP, public at GA), lives at `moon-pod` (separate repo per [ADR 0223](../adr/0223-goat-moon-pod-repo-containment.md)). Designed to deploy in 24 hours by a non-engineer.
+- **`moon-pod`** — our reference implementation. Apache 2.0 (private during MVP, public at GA), lives at [`USAREUR-AF/zagros-moon-pod`](https://github.com/USAREUR-AF/zagros-moon-pod) (separate repo per [ADR 0223](../adr/0223-goat-moon-pod-repo-containment.md)). Designed to deploy in 24 hours by a non-engineer.
 - **Vendor goat-moon-pods** — third-party products that conform to this contract. Naming convention: `goat-moon-<product>-pod`. Per-vendor cookbooks at `../integrations/moon-pods/`.
 - **Partner roll-your-own** — a partner with engineering capacity that prefers to build their own. We hold them to this contract; we do not provide implementation help.
 
