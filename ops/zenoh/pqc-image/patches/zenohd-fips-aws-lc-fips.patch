@@ -1,0 +1,42 @@
+diff --git a/zenohd/Cargo.toml b/zenohd/Cargo.toml
+index 9f9028c..b41c2d7 100644
+--- a/zenohd/Cargo.toml
++++ b/zenohd/Cargo.toml
+@@ -30,6 +30,12 @@ default = ["zenoh/default"]
+ shared-memory = ["zenoh/shared-memory"]
+
+ [dependencies]
++# goat FIPS-PQC: rustls on the aws-lc-rs FIPS backend (aws-lc-fips-sys, pinned
++# by the image build to =0.13.11 — the exact CMVP #5298/#5314-validated
++# AWS-LC FIPS 3.1.0 source) with X25519MLKEM768 preferred. aws-lc-rs is a
++# direct dep so main() can assert the module is really in FIPS mode.
++rustls = { workspace = true, features = ["fips", "prefer-post-quantum"] }
++aws-lc-rs = { version = "1", features = ["fips"] }
+ clap = { workspace = true, features = ["derive"] }
+ git-version = { workspace = true }
+ json5 = { workspace = true }
+diff --git a/zenohd/src/main.rs b/zenohd/src/main.rs
+index 17e52ec..8d20f3a 100644
+--- a/zenohd/src/main.rs
++++ b/zenohd/src/main.rs
+@@ -77,6 +77,20 @@ struct Args {
+ }
+
+ fn main() {
++    // goat FIPS-PQC: assert the AWS-LC FIPS module passed its power-on
++    // self-tests, then install the rustls FIPS CryptoProvider
++    // (X25519MLKEM768 preferred, fips=true via the SP 800-56C rev2 hybrid
++    // allowance; pure X25519 excluded — unmodified ring clients
++    // down-negotiate to P-256 with one extra HelloRetryRequest round trip)
++    // as the process default BEFORE any TLS/QUIC link initializes.
++    // Fail-closed: a zenohd that cannot enter FIPS mode must not serve.
++    aws_lc_rs::try_fips_mode()
++        .expect("goat FIPS: AWS-LC FIPS module power-on self test failed");
++    rustls::crypto::default_fips_provider()
++        .install_default()
++        .expect("goat FIPS: FIPS CryptoProvider install must be first");
++    eprintln!("goat FIPS: AWS-LC FIPS module active; X25519MLKEM768 preferred key exchange");
++
+     if let Err(e) = init_logging() {
+         eprintln!("{e}. Exiting...");
+         std::process::exit(-1);

@@ -1,0 +1,205 @@
+# zenoh-pqc-fips router image — the FIPS variant of the zenoh-pqc image
+# (docs/design/zenoh-pqc-tls.md §5). Differences vs Dockerfile (non-FIPS):
+#
+#   1. zenohd builds against the aws-lc-rs FIPS backend: rustls `fips` →
+#      aws-lc-rs `fips` → aws-lc-fips-sys pinned =0.13.11, which vendors
+#      EXACTLY the AWS-LC-FIPS-3.1.0 tag validated by CMVP #5298 (dynamic) /
+#      #5314 (static) with ML-KEM-512/768/1024 in-boundary. Later 0.13.x
+#      versions vendor 3.2.0/3.3.0/3.4.0 — still in the CMVP queue. Do NOT
+#      float the pin: the exact version string on the certificate matters.
+#      COUPLED PIN: aws-lc-rs and aws-lc-fips-sys
+#      move as a PAIR. Each aws-lc-rs release floors its aws-lc-fips-sys
+#      requirement, and aws-lc-rs 1.17.3 raised that floor to ^0.13.16 —
+#      which the frozen 0.13.11 can no longer satisfy, so `cargo update
+#      --precise 0.13.11` fails ("failed to select a version"). We therefore
+#      ALSO pin aws-lc-rs to =1.17.1, the newest release that COMPILES against
+#      0.13.11. The coupling is at the SOURCE-API level, not just semver:
+#      1.17.2 still *resolves* (its floor is ^0.13.1, which 0.13.11 satisfies)
+#      but its code calls `aws-lc-fips-sys::fips_version()`, an API absent from
+#      0.13.11, so it fails to BUILD — verify a pin by compiling, not just
+#      resolving. Pinning only the module (the compliance-named artifact) left
+#      the wrapper free to float the module out from under it — the drift this
+#      pin closes. Bump BOTH together only when moving to a newer CMVP-validated
+#      module. zenoh 1.9.0's rustls (0.23.37) built green on 1.17.1.
+#   2. glibc, not musl. The FIPS module build (cmake + Go + Perl, delocated
+#      shared objects) does not fit the alpine/musl shape, so the runtime is
+#      debian:bookworm-slim and the upstream image cannot be reused. That
+#      re-opens the plugin story as a MATCHED-PAIR build (the ADR 0858 cost
+#      the non-FIPS image avoids): rest + storage_manager + the rocksdb
+#      backend are all built here from the same tag + toolchain. zenohd still
+#      refuses mismatched plugins at startup — fail-closed, CI-smoked.
+#   3. Build-time verification gate: fips-probe/ asserts the module enters
+#      FIPS mode and X25519MLKEM768 is offered (fips=true, preferred) and
+#      negotiates, before the image can exist. The CI smoke re-asserts it
+#      live against the booted zenohd (fips-probe --connect).
+#
+# Plugin paths: libzenoh_plugin_rest.so + libzenoh_plugin_storage_manager.so
+# at / (upstream image convention, drop-in for search_dirs), the rocksdb
+# backend at /opt/zenoh/plugins-baked/ — deliberately NOT /opt/zenoh/plugins,
+# which the ansible roles bind-mount with the upstream MUSL backend .so; a
+# glibc zenohd cannot load that, so at adoption time the role must point
+# backend_search_dirs at the baked path instead of bind-mounting (recorded in
+# zenoh-pqc-tls-implementation.md).
+#
+# Vocabulary discipline (§5): this image is "built on the CMVP #5298-validated
+# module" — a FIPS 140-3 *claim* additionally needs the compliance-package
+# language (tested OEs are Amazon Linux 2023; our hosts ride user-affirmation).
+
+ARG ZENOH_TAG=1.9.0
+ARG ROCKSDB_BACKEND_TAG=1.9.0
+ARG AWS_LC_FIPS_SYS_VERSION=0.13.11
+# Coupled with AWS_LC_FIPS_SYS_VERSION — see note 1. Newest aws-lc-rs that
+# COMPILES against 0.13.11 (1.17.2+ resolve but call a fips-sys API absent from
+# 0.13.11); bump both together, never alone.
+ARG AWS_LC_RS_VERSION=1.17.1
+
+# Go toolchain for the FIPS module build (bookworm's packaged Go is too old).
+FROM golang:1.24-bookworm AS gosrc
+
+FROM rust:1.93.0-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake perl clang libclang-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=gosrc /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH
+
+ARG ZENOH_TAG
+ARG AWS_LC_FIPS_SYS_VERSION
+ARG AWS_LC_RS_VERSION
+RUN git clone --depth 1 --branch ${ZENOH_TAG} \
+    https://github.com/eclipse-zenoh/zenoh.git /src/zenoh
+
+COPY patches/zenohd-fips-aws-lc-fips.patch /tmp/
+# cargo fetch first: the tag's Cargo.lock predates the patch, so the new
+# aws-lc-fips-sys dep isn't in it yet and a bare `cargo update -p` errors
+# with "did not match any packages"; fetch syncs the lock minimally.
+#
+# ORDER MATTERS: pin aws-lc-rs DOWN first. The unpinned wrapper
+# resolves to its newest release, whose aws-lc-fips-sys floor may exceed the
+# frozen module (1.17.3 floors ^0.13.16) — then forcing the module fails.
+# Pinning aws-lc-rs=1.17.1 first relaxes that floor to ^0.13.1, so the module
+# pin to 0.13.11 then succeeds AND compiles (1.17.2+ resolve but call a
+# fips-sys API absent from 0.13.11). The two grep-asserts are fail-closed: a
+# resolution that lands on any other version aborts the build rather than
+# silently shipping an unvalidated module.
+RUN cd /src/zenoh && git apply /tmp/zenohd-fips-aws-lc-fips.patch \
+    && cargo fetch \
+    && cargo update --package aws-lc-rs --precise ${AWS_LC_RS_VERSION} \
+    && cargo update --package aws-lc-fips-sys --precise ${AWS_LC_FIPS_SYS_VERSION} \
+    && grep -A1 'name = "aws-lc-rs"' Cargo.lock \
+    && grep -A1 'name = "aws-lc-fips-sys"' Cargo.lock \
+    && grep -A1 'name = "aws-lc-rs"' Cargo.lock | grep -qx "version = \"${AWS_LC_RS_VERSION}\"" \
+    && grep -A1 'name = "aws-lc-fips-sys"' Cargo.lock | grep -qx "version = \"${AWS_LC_FIPS_SYS_VERSION}\""
+
+# goat F-253: throttle the TLS accept loop only on genuine listener-level (fd)
+# errors, not per-connection handshake failures — the unconditional 100ms
+# throttle serialized admission to ~10 opens/s under a reconnect storm.
+COPY patches/zenohd-f253-accept-throttle.patch /tmp/
+RUN cd /src/zenoh && git apply /tmp/zenohd-f253-accept-throttle.patch
+
+# goat fabric-wedge fix #1 — storage-manager adminspace_getter
+# deadlock (upstream issue #1094, open). The admin handler `adminspace_getter`
+# held the one global std::sync::Mutex<StorageRuntimeInner> across a
+# block_in_place GetStatus round-trip to every ~1000 storage, deadlocking under
+# concurrent admin walks + real peer traffic + worker pressure. This patch
+# snapshots the storage senders under the lock, drops the guard, then does the
+# blocking fan-out lock-free. Touches the storage-manager plugin crate.
+# Load-tested.
+COPY patches/zenohd-adminspace-getter-deadlock.patch /tmp/
+RUN cd /src/zenoh && git apply /tmp/zenohd-adminspace-getter-deadlock.patch
+
+# goat fabric-wedge fix #2 — upstream eclipse-zenoh#2635 (merged
+# post-1.9.0, so no release carries it — cherry-picked here).
+# Session::undeclare_querier_inner dropped a pending query's user callback while
+# holding the session `state` write lock; a completion callback that re-enters
+# the Session then re-acquires the non-reentrant lock → self-deadlock, and every
+# transport/admin thread that needs that lock piles up behind the blocked holder
+# (a distinct lock cycle from #1094, corroborated by frozen-process captures).
+# The fix drops the removed queries AFTER releasing the lock.
+COPY patches/zenohd-2635-querier-session-deadlock.patch /tmp/
+RUN cd /src/zenoh && git apply /tmp/zenohd-2635-querier-session-deadlock.patch
+
+# goat fabric-wedge fix #3 — admin-space reply under the tables lock.
+# `resources_data` (subscriber/publisher/queryable/querier/token census),
+# `linkstate_data` and the `route_successor` shortcut held the routing
+# `tables` read guard while sending each reply; the reply path
+# (`route_send_response`, the egress ACL's `MuxContext::prefix`) takes that
+# guard for read again. std's RwLock blocks a new reader behind a queued
+# writer, so a declaration arriving mid-walk deadlocks the router: one
+# `send_declare` writer, a reader inside `resources_data`, the rest queued.
+# Admin walks + declaration churn together wedge it within a minute; either
+# alone does not. On a bare router the gate
+# ops/zenoh/wedge-repro/ci-adminspace-deadlock.sh wedged the unpatched image
+# 3/3 (15-17 s) and the patched image answered 3/3 for 90 s.
+# The patch builds the replies under the guard and sends after it drops.
+COPY patches/zenohd-adminspace-reply-under-tables-lock.patch /tmp/
+RUN cd /src/zenoh && git apply /tmp/zenohd-adminspace-reply-under-tables-lock.patch
+
+# Matched-pair build: router binary + both plugin cdylibs, one toolchain,
+# one workspace, one lockfile.
+RUN cd /src/zenoh && cargo build --release \
+      -p zenohd -p zenoh-plugin-rest -p zenoh-plugin-storage-manager
+
+# Collect FIPS shared objects if the module linked dynamically (macOS always
+# does; Linux aws-lc-fips-sys links the module STATICALLY by default, so an
+# empty dir here is normal) and prove zenohd runs — `--version` aborts if a
+# needed .so is missing, which is the real assert.
+RUN mkdir -p /out/fips-libs \
+    && find /src/zenoh/target/release/build -name 'libaws_lc_fips_*.so' \
+         -exec cp {} /out/fips-libs/ \; \
+    && ls -la /out/fips-libs/ \
+    && LD_LIBRARY_PATH=/out/fips-libs /src/zenoh/target/release/zenohd --version
+
+# rocksdb storage backend, same tag, same toolchain (glibc matched pair for
+# the .so the musl upstream release cannot provide here).
+ARG ROCKSDB_BACKEND_TAG
+RUN git clone --depth 1 --branch ${ROCKSDB_BACKEND_TAG} \
+    https://github.com/eclipse-zenoh/zenoh-backend-rocksdb.git /src/rocksdb-backend
+# Matched-pair feature record: the zenoh workspace pins zenoh_backend_traits
+# with default-features = false, so the host storage_manager's compat record
+# has no `zenoh-backend-traits/default` token — but the rocksdb repo's dep
+# enables defaults, and zenohd refuses the mismatched record at load
+# (`default` is only a passthrough to zenoh/default, which both sides already
+# carry via their direct zenoh dep — the code is identical, only the record
+# token differs). Align the dep, fail loudly if the manifest shape moved.
+RUN cd /src/rocksdb-backend \
+    && sed -i "s|zenoh_backend_traits = { version = \"${ROCKSDB_BACKEND_TAG}\"}|zenoh_backend_traits = { version = \"${ROCKSDB_BACKEND_TAG}\", default-features = false }|" Cargo.toml \
+    && grep -q 'default-features = false' Cargo.toml \
+    && cargo build --release \
+    && ls target/release/libzenoh_backend_rocksdb.so
+
+# Build-time FIPS-PQC verification gate — the image cannot exist unless the
+# pinned module enters FIPS mode and X25519MLKEM768 is offered + negotiates.
+COPY fips-probe /src/fips-probe
+RUN cd /src/fips-probe && cargo build --release \
+    && LD_LIBRARY_PATH=/out/fips-libs ./target/release/fips-probe
+
+FROM debian:bookworm-slim AS runtime
+
+# wget: the fleet's compose healthcheck probes the REST plugin with wget
+# (the upstream alpine image ships busybox wget; bookworm-slim ships neither
+# (the upstream alpine image ships busybox wget; bookworm-slim ships neither
+# wget nor curl, and without one the healthcheck reads unhealthy on a healthy router).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/fips-libs/ /usr/local/lib/
+RUN ldconfig
+COPY --from=builder /src/zenoh/target/release/zenohd /zenohd
+COPY --from=builder /src/zenoh/target/release/libzenoh_plugin_rest.so /
+COPY --from=builder /src/zenoh/target/release/libzenoh_plugin_storage_manager.so /
+COPY --from=builder /src/rocksdb-backend/target/release/libzenoh_backend_rocksdb.so /opt/zenoh/plugins-baked/
+
+EXPOSE 7447
+ENTRYPOINT ["/zenohd"]
+
+# Sidecar stage for CI (and operators): the probe with the same FIPS libs, to
+# assert a LIVE listener negotiates X25519MLKEM768.
+#   docker run --network host <img-probe> --connect 127.0.0.1:7447 <sni> <ca.pem>
+FROM debian:bookworm-slim AS probe
+COPY --from=builder /out/fips-libs/ /usr/local/lib/
+RUN ldconfig
+COPY --from=builder /src/fips-probe/target/release/fips-probe /usr/local/bin/fips-probe
+ENTRYPOINT ["fips-probe"]

@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# goat-consistency-console — the CF-6 consistency console
+# (consistency-foundation.md §7, ADR 1110 D5).
+#
+# SAME BUILD CONTEXT as the meter's Dockerfile (ops/consistency/, not the
+# crate dir), for the same reason: the grading library compiles the committed
+# grammar in with `include_str!("../../../grammar.yaml")`, so the image
+# mirrors the repo layout and the relative path means the same thing in both
+# places. A deployed console provably renders the committed grammar it was
+# built from — no mount, no runtime file to go missing.
+#
+# Server-rendered frontend: the stylesheet is `include_str!`-ed into the
+# binary, so there is no node stage and no asset to embed — the whole surface
+# is one Rust binary (the §7.11 no-build-time-asset-fetch rule, which is also
+# what makes the island-mode page self-contained).
+#
+# Chainguard glibc-dynamic runtime per ADR 0700; non-root uid 65532 (the
+# ansible role chowns the cert dir to it).
+
+FROM cgr.dev/chainguard/rust:latest-dev AS rust-builder
+USER root
+WORKDIR /build/rust
+
+# Warm the dependency cache on the manifests alone, then build for real.
+COPY rust/Cargo.toml rust/Cargo.lock* ./
+COPY rust/goat-consistency/Cargo.toml goat-consistency/
+COPY rust/goat-consistency-wire/Cargo.toml goat-consistency-wire/
+COPY rust/goat-consistency-health/Cargo.toml goat-consistency-health/
+COPY rust/goat-consistency-console/Cargo.toml goat-consistency-console/
+RUN mkdir -p goat-consistency/src goat-consistency-wire/src goat-consistency-health/src goat-consistency-console/src \
+ && : > goat-consistency/src/lib.rs \
+ && : > goat-consistency-wire/src/lib.rs \
+ && echo "fn main() {}" > goat-consistency-health/src/main.rs \
+ && echo "fn main() {}" > goat-consistency-console/src/main.rs \
+ && cargo fetch \
+ && rm -rf goat-consistency/src goat-consistency-wire/src goat-consistency-health/src goat-consistency-console/src
+
+COPY grammar.yaml /build/grammar.yaml
+COPY rust/goat-consistency/ goat-consistency/
+COPY rust/goat-consistency-wire/ goat-consistency-wire/
+COPY rust/goat-consistency-health/ goat-consistency-health/
+COPY rust/goat-consistency-console/ goat-consistency-console/
+RUN cargo build --release --locked -p goat-consistency-console
+
+FROM cgr.dev/chainguard/glibc-dynamic:latest
+WORKDIR /
+COPY --from=rust-builder /build/rust/target/release/goat-consistency-console /usr/local/bin/goat-consistency-console
+EXPOSE 9760
+ENTRYPOINT ["/usr/local/bin/goat-consistency-console"]

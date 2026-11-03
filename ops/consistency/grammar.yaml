@@ -1,0 +1,283 @@
+---
+# ops/consistency/grammar.yaml — THE consistency grammar, versioned once.
+#
+# The six grades, their precedence, the closed set of remediation kinds, and the
+# grade -> environment-health colour mapping. Canon:
+# docs/design/consistency-foundation.md §4.2/§5.3/§6.2 (ADR 1110 D2/D4), which
+# amends docs/design/environment-parity.md §5 rule 2 to add `unaccountable`.
+#
+# THE RULE THIS FILE EXISTS TO ENFORCE: an implementation is permitted only if
+# it passes the shared golden corpus in ops/consistency/testdata/, and NO
+# implementation may define a grade. Two executions are required — Python
+# repo-side (this package, live) and Rust on-fabric (the CF-3 rollup meter and
+# the CF-6 console, not built) — and the thing that keeps them honest is this
+# file plus that corpus, not a promise that they agree.
+#
+# Pattern: ops/identity/grammar.yaml (ADR 1067) — a committed vocabulary SoT
+# with a CI reproduction gate, so the SoT can never silently drift from what
+# consumes it.
+#
+# A grade whose behaviour is not pinned by a corpus case is not part of the
+# grammar. A new grade needs: a row here, a corpus case, and an amendment to
+# environment-parity.md §5 — in that order and in one change.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# The grades
+# ---------------------------------------------------------------------------
+# color: the ADR 1036 five-state environment-health colour this grade renders
+#        as. `idle` and `unmetered` are the two ungrounded states — nothing
+#        ungrounded may ever render green.
+# needs_remediation: whether a row carrying this grade MUST carry a remediation
+#        pointer. The library refuses to emit a row that needs one and has none
+#        (§6.3) — the same fail-closed shape as "a deviation without a reason:
+#        is a schema error".
+grades:
+
+  - name: match
+    meaning: >-
+      Every member resolves to the same value, and every reporting node reports
+      that value.
+    color: green
+    needs_remediation: false
+
+  - name: declared
+    meaning: >-
+      Members or nodes differ, and a `reason:` in the authoring surface says
+      why.
+    color: green
+    badge: declared
+    needs_remediation: false
+    why_this_color: >-
+      A declared deviation is a CORRECT state. Colouring it amber trains
+      operators to ignore amber (ADR 1036 §3.4 tenet 3: posture is shown, not
+      coloured), so the deviation is carried as a badge instead.
+
+  - name: SKEW
+    meaning: >-
+      An undeclared difference, where every observed value is accounted for by
+      SOME generation in the tree. The node is behind, or two nodes disagree.
+    color: amber
+    needs_remediation: true
+
+  - name: unaccountable
+    meaning: >-
+      A node reports a ref, hash or render that no generation in the tree
+      explains. Not behind — unexplained.
+    color: red
+    needs_remediation: true
+    why_this_grade: >-
+      Added by ADR 1110 D2. It is distinct from SKEW because the two demand
+      opposite first actions: re-running the play fixes a node that is behind
+      and DESTROYS THE EVIDENCE on an unexplained one (the F-272 / F-258
+      runtime-mutation shape). It is also the observable the persistent-state
+      rule has always lacked — that rule bans out-of-SoT state and nothing
+      detected it.
+
+  - name: unreadable
+    meaning: >-
+      A value was read and could not be evaluated — templated, defaulted by
+      several roles with no single default to attribute, or an unverifiable
+      signature on a record. NEVER `match`.
+    color: idle
+    needs_remediation: true
+
+  - name: indeterminate
+    meaning: >-
+      Nothing to read — a key with no entry and no default, or a node that has
+      not reported. NEVER `match`.
+    color: idle
+    color_when_scope_empty: unmetered
+    needs_remediation: true
+    why_this_color: >-
+      ADR 1036 §6: absence of signal is `unmetered`, not green. A node that has
+      not reported is `indeterminate`/idle and never counts as compliant
+      (ADR 1109 P15); a whole scope where nothing reported (n=0) is unmetered.
+
+# Worst-first. A row's grade is the worst grade among its cells, and the two
+# ungrounded states outrank everything so nothing reaches `match` on the
+# strength of a value nobody could read.
+precedence:
+  - unreadable
+  - indeterminate
+  - unaccountable
+  - SKEW
+  - declared
+  - match
+
+# ---------------------------------------------------------------------------
+# Remediation — a closed set, emitted as data (§6.2, ADR 1110 D4)
+# ---------------------------------------------------------------------------
+# Every non-matching row carries one of these, and the pointer is ALWAYS
+# re-converge / regenerate / roll back / declare — never a bespoke mutation,
+# because engineering-baseline.md §2.2 already decided that drift is fixed by
+# re-running, not by hand. A surface that suggested a targeted fix would be
+# manufacturing the next `unaccountable` row with the authority of a dashboard.
+#
+# `pointer` is a template. `{}` placeholders are filled by the library from the
+# row's own scope; a renderer prints the result VERBATIM and never composes,
+# paraphrases, shortens or executes it (§6.4).
+remediation:
+
+  kinds:
+
+    reconverge:
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini {env}-refresh.yml -e target={member}"
+      refuses: false
+      fires_when: A node is behind the current generation — the ordinary SKEW.
+
+    regenerate:
+      pointer: "python3 ops/pins/generate-pins.py"
+      refuses: false
+      fires_when: >-
+        Repo-side drift: the artifact disagrees with its inputs. The artifact
+        IS the subject — `ops/pins/parity-report.md` was deleted by CF-3 (§5.4)
+        and its --check gate now sits on intent.json, where it belonged.
+
+    declare:
+      pointer: "add a `deviations:` stanza with a `reason:` to ops/pins/fleet-pins.yaml or ops/pins/parity-capabilities.yaml for `{name}`"
+      refuses: false
+      fires_when: >-
+        The difference is deliberate and undeclared — the pressure valve
+        (environment-parity.md §2 principle 2). Also the pointer for a row the
+        tree cannot decide, where declaring it or setting the key explicitly on
+        every member is what turns the row into an answer.
+
+    rollback:
+      pointer: "ops/scripts/rollback.sh {name}"
+      refuses: false
+      fires_when: "`unaccountable` on an artifact type where undo is real."
+
+    restore:
+      pointer: "the component's restore_pointer — rollback of `data` is a lie (ADR 0859 / ADR 1060)"
+      refuses: true
+      fires_when: "`unaccountable` on a `data` artifact."
+
+    rotate:
+      pointer: "goat admin rotate {name} — rollback of `cert` is a lie (ADR 0859 / ADR 1060)"
+      refuses: true
+      fires_when: "`unaccountable` on a `cert` artifact."
+
+    refuse:
+      pointer: "no undo path: `{name}` is forward-only (ADR 1060). Converge forward to the current generation and keep the finding — do not try to put the node back."
+      refuses: true
+      fires_when: "`unaccountable` on a `forward-only` artifact, where undo does not exist at all."
+
+    # -- coverage kinds (ADR 1125) -----------------------------------------
+    # The closed set grew by two, deliberately and in one change with the
+    # corpus cases that pin them. They exist because `reconverge` is the WRONG
+    # pointer for a fact nothing can observe: re-running the play does not
+    # create ledger coverage, and telling an operator to re-run is how a
+    # coverage gap gets mistaken for a transient.
+
+    instrument:
+      pointer: "nothing observes `{name}` on {member}: declare how a node proves it — `ledger_component:` in ops/pins/fleet-pins.yaml, or an `observe:` block in ops/pins/parity-capabilities.yaml"
+      refuses: false
+      fires_when: >-
+        `coverage: no-instrument` — the fact is governed and no mechanism
+        exists to see it. Re-running the play changes nothing, which is why
+        this is not `reconverge`.
+
+    enrol:
+      pointer: "no node claims member `{member}`: the member is governed and nothing reports for it — enrol/deploy a node in that group before treating any of its rows as an answer"
+      refuses: false
+      fires_when: >-
+        `coverage: unreported-scope` — intent names a member no node claims.
+        Distinct from `silent` (a node exists and has not reported): here the
+        denominator itself is unattended.
+
+  # Which kind a grade dispatches to. Keyed by VANTAGE first, because the same
+  # grade means a different action depending on whether the row was computed
+  # from the tree alone or from a live node's record:
+  #
+  #   repo — members of one goatnet compared inside the committed tree. Nothing
+  #          is behind, because nothing has been deployed in this view; a
+  #          difference is either deliberate (declare it) or a table edit.
+  #   live — an intent generation compared against node records (CF-3). Here a
+  #          difference usually means a node has not converged yet.
+  #
+  # `unaccountable` never appears repo-side: it needs a node reporting something
+  # the tree does not explain, and no repo-side row has a node. Its live row
+  # dispatches on the component's ADR 1060 artifact_type, which is why that type
+  # travels in IntentV1.
+  #
+  # `render` (CF-4) is the dispatch type of a config render row — a watched
+  # rendered FILE compared against what the last converge recorded, not a ledger
+  # tip compared against a generation. An unaccountable render dispatches to
+  # `reconverge`, NOT `rollback`, and the difference is load-bearing:
+  #   - rollback.sh targets the component's PRIOR ledger generation, but a
+  #     hand-edited file belongs to the CURRENT one — re-deploying the prior
+  #     image to fix a file the current generation owns is a category error;
+  #   - renders are not versioned artifacts with ledger history (the manifest
+  #     holds only the last converge), so there is no prior render to go back
+  #     to — the idempotent re-render IS the undo (engineering-baseline.md
+  #     §2.2: the next reconciliation overwrites anything not in git);
+  #   - the evidence is not destroyed by the re-run the way an unexplained
+  #     image ref's runtime state is: the hash pair (recorded vs on-disk) is
+  #     already on the wire and in the 7d/30d retention BEFORE the grade
+  #     exists, because the grade is computed from the published record.
+  dispatch:
+
+    repo:
+      SKEW: declare
+      indeterminate: declare
+      unreadable: declare
+
+    live:
+      SKEW: reconverge
+      indeterminate: reconverge
+      unreadable: reconverge
+      unaccountable:
+        by_artifact_type:
+          image: rollback
+          config: rollback
+          acl: rollback
+          data: restore
+          cert: rotate
+          forward-only: refuse
+          render: reconverge
+
+# ---------------------------------------------------------------------------
+# Coverage — is anything OBSERVING this declared fact? (ADR 1125)
+# ---------------------------------------------------------------------------
+# A grade answers "do the values agree". Coverage answers the prior question:
+# "is a comparison possible at all". They are orthogonal, and conflating them
+# is what let F-324 stand — a capability declared on three hosts, observed by
+# nothing, rendering as an absence rather than as a finding.
+#
+# `project_node` already reported `components_observed` of
+# `components_governed`, which is honest and is a NUMBER a reader skims past.
+# These states make each missing row a ROW, with the pointer that actually
+# fixes it. Every state carries its own remediation kind from the closed set
+# above; `observed` carries none because there is nothing to fix.
+#
+# NEVER GREEN BY OMISSION: a scope where nothing reports renders every row
+# `silent`, not `match`.
+coverage:
+
+  states:
+
+    - name: observed
+      meaning: A node reported this fact; the row is a real comparison.
+      remediation: null
+
+    - name: no-instrument
+      meaning: >-
+        Nothing declares how to see it — `ledger_component: null` (deployed
+        from a playbook, not a role carrying the ADR 1060 meta-dependency), or
+        a capability with no `observe:` block. The fact is still GOVERNED and
+        still counted; it simply cannot be checked.
+      remediation: instrument
+
+    - name: silent
+      meaning: >-
+        An instrument exists and the node has not reported through it. The
+        ordinary not-yet-converged / not-yet-deployed case.
+      remediation: reconverge
+
+    - name: unreported-scope
+      meaning: >-
+        Intent names this member and no node claims it. The denominator itself
+        is unattended, which is worse than any row inside it.
+      remediation: enrol

@@ -1,0 +1,138 @@
+diff --git a/zenoh/src/net/runtime/adminspace.rs b/zenoh/src/net/runtime/adminspace.rs
+index 6e6e23a..24f8cfd 100644
+--- a/zenoh/src/net/runtime/adminspace.rs
++++ b/zenoh/src/net/runtime/adminspace.rs
+@@ -736,20 +736,40 @@ fn resources_data<F>(prefix: &keyexpr, context: &AdminContext, query: Query, f:
+ where
+     F: Fn(&Tables) -> HashMap<Arc<Resource>, Sources>,
+ {
+-    let tables = &context.runtime.state.router.tables;
+-    let rtables = zread!(tables.tables);
+-    for res in f(&rtables) {
+-        let key = prefix / keyexpr::new(res.0.expr()).unwrap();
+-        if query.key_expr().intersects(&key) {
+-            let payload =
+-                ZBytes::from(serde_json::to_string(&res.1).unwrap_or_else(|_| "{}".to_string()));
+-            if let Err(e) = query
+-                .reply(key, payload)
+-                .encoding(Encoding::APPLICATION_JSON)
+-                .wait()
+-            {
+-                tracing::error!("Error sending AdminSpace reply: {:?}", e);
+-            }
++    // goat fix (wedge 2026-09-14): build the replies under the tables read
++    // guard, then DROP it before sending. `query.reply(..).wait()` routes the
++    // reply through `route_send_response` (and the egress ACL interceptor's
++    // `MuxContext::prefix`), which take this same `tables` RwLock for read
++    // again. std's RwLock blocks a new reader while a writer is queued, so a
++    // declaration (`send_declare` / `send_close` want the write lock) arriving
++    // mid-walk leaves this thread waiting on a read it already holds, the
++    // writer waiting on this thread, and every other reader (routing, REST,
++    // healthcheck) waiting behind the writer: the router wedges. Reproduced on
++    // zagros-dev: admin walks alone and declaration churn alone never wedge;
++    // both together wedge within 34 s with this exact stack.
++    let replies: Vec<(KeyExpr<'static>, ZBytes)> = {
++        let tables = &context.runtime.state.router.tables;
++        let rtables = zread!(tables.tables);
++        f(&rtables)
++            .into_iter()
++            .filter_map(|res| {
++                let key: KeyExpr<'static> = (prefix / keyexpr::new(res.0.expr()).unwrap()).into();
++                query.key_expr().intersects(&key).then(|| {
++                    let payload = ZBytes::from(
++                        serde_json::to_string(&res.1).unwrap_or_else(|_| "{}".to_string()),
++                    );
++                    (key, payload)
++                })
++            })
++            .collect()
++    };
++    for (key, payload) in replies {
++        if let Err(e) = query
++            .reply(key, payload)
++            .encoding(Encoding::APPLICATION_JSON)
++            .wait()
++        {
++            tracing::error!("Error sending AdminSpace reply: {:?}", e);
+         }
+     }
+ }
+@@ -783,24 +803,32 @@ fn tokens_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
+ 
+ #[tracing::instrument(level = "trace", skip_all)]
+ fn linkstate_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
+-    let tables = &context.runtime.state.router.tables;
+-    let rtables = zread!(tables.tables);
+-
+-    for (region, hat) in rtables
+-        .hats
+-        .iter()
+-        .filter(|(_, hat)| hat.mode().is_peer() || hat.mode().is_router())
+-    {
+-        let reply_key = prefix / &KeyExpr::try_from(format!("{region}")).unwrap();
+-
+-        if query.key_expr().intersects(&reply_key) {
+-            if let Err(e) = query
+-                .reply(reply_key, hat.info())
+-                .encoding(Encoding::TEXT_PLAIN)
+-                .wait()
+-            {
+-                tracing::error!("Error sending AdminSpace reply: {:?}", e);
+-            }
++    // goat fix (wedge 2026-09-14): same shape as `resources_data` — collect
++    // under the tables read guard, reply after dropping it.
++    let replies: Vec<(KeyExpr<'static>, String)> = {
++        let tables = &context.runtime.state.router.tables;
++        let rtables = zread!(tables.tables);
++        rtables
++            .hats
++            .iter()
++            .filter(|(_, hat)| hat.mode().is_peer() || hat.mode().is_router())
++            .filter_map(|(region, hat)| {
++                let reply_key: KeyExpr<'static> =
++                    (prefix / &KeyExpr::try_from(format!("{region}")).unwrap()).into();
++                query
++                    .key_expr()
++                    .intersects(&reply_key)
++                    .then(|| (reply_key, hat.info()))
++            })
++            .collect()
++    };
++    for (reply_key, info) in replies {
++        if let Err(e) = query
++            .reply(reply_key, info)
++            .encoding(Encoding::TEXT_PLAIN)
++            .wait()
++        {
++            tracing::error!("Error sending AdminSpace reply: {:?}", e);
+         }
+     }
+ }
+@@ -821,12 +849,16 @@ fn route_successor(prefix: &keyexpr, context: &AdminContext, query: Query) {
+ 
+     // Try to shortcut full successor retrieval if suffix matches 'src/<zid>/dst/<zid>' pattern.
+ 
++    // goat fix (wedge 2026-09-14): the shortcut replied while holding the
++    // tables read guard (see `resources_data`); collect first, reply after
++    // the guard is dropped below.
++    let mut shortcut: Vec<ZenohIdProto> = Vec::new();
+     let suffix = query.key_expr().as_str().strip_prefix(prefix.as_str());
+     if let Some((src, dst)) = suffix.and_then(|s| s.strip_prefix("/src/")?.split_once("/dst/")) {
+         if let (Ok(src_zid), Ok(dst_zid)) = (src.parse(), dst.parse()) {
+             for hat in rtables.hats.values().filter(|hat| hat.mode().is_router()) {
+                 if let Some(successor) = hat.route_successor(src_zid, dst_zid) {
+-                    reply(query.key_expr(), successor);
++                    shortcut.push(successor);
+                 }
+             }
+         }
+@@ -840,6 +872,9 @@ fn route_successor(prefix: &keyexpr, context: &AdminContext, query: Query) {
+         .flat_map(|hat| hat.route_successors())
+         .collect_vec();
+     drop(rtables);
++    for successor in shortcut {
++        reply(query.key_expr(), successor);
++    }
+     for entry in successors {
+         let ke = KeyExpr::new(format!(
+             "{prefix}/src/{src}/dst/{dst}",

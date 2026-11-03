@@ -1,0 +1,36 @@
+diff --git a/zenohd/Cargo.toml b/zenohd/Cargo.toml
+index 9f9028c..3c28be5 100644
+--- a/zenohd/Cargo.toml
++++ b/zenohd/Cargo.toml
+@@ -30,6 +30,10 @@ default = ["zenoh/default"]
+ shared-memory = ["zenoh/shared-memory"]
+ 
+ [dependencies]
++# goat PQC: pull in rustls with the aws-lc-rs provider + X25519MLKEM768
++# preferred, so main() can install it as the process-default CryptoProvider.
++# Additive with the workspace "ring" feature; the installed default wins.
++rustls = { workspace = true, features = ["aws-lc-rs", "prefer-post-quantum"] }
+ clap = { workspace = true, features = ["derive"] }
+ git-version = { workspace = true }
+ json5 = { workspace = true }
+diff --git a/zenohd/src/main.rs b/zenohd/src/main.rs
+index 17e52ec..497faa8 100644
+--- a/zenohd/src/main.rs
++++ b/zenohd/src/main.rs
+@@ -77,6 +77,16 @@ struct Args {
+ }
+ 
+ fn main() {
++    // goat PQC: install the aws-lc-rs CryptoProvider (X25519MLKEM768-capable)
++    // as the process default BEFORE any TLS/QUIC link initializes. zenoh's
++    // link crates call ring::default_provider().install_default().ok() and
++    // ignore the error when a provider is already installed, so this single
++    // call flips every rustls ClientConfig/ServerConfig built via builder()
++    // to the aws-lc-rs provider without touching any zenoh library crate.
++    rustls::crypto::aws_lc_rs::default_provider()
++        .install_default()
++        .expect("goat PQC: aws-lc-rs CryptoProvider install must be first");
++
+     if let Err(e) = init_logging() {
+         eprintln!("{e}. Exiting...");
+         std::process::exit(-1);

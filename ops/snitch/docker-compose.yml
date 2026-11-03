@@ -1,0 +1,73 @@
+# SNITCH — mesh network performance monitor.
+#
+# Traefik routes snitch.netbird.legacy.example to this container.
+# The Go binary serves the dashboard/API and collects probe reports.
+# Analytics stored in a dedicated PostgreSQL 16 container (snitch-db).
+#
+# Requires: same Docker network as Traefik
+
+services:
+  snitch-db:
+    container_name: snitch-db
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: snitch
+      POSTGRES_USER: snitch
+      POSTGRES_PASSWORD: ${SNITCH_DB_PASS}
+    volumes:
+      - snitch-db-data:/var/lib/postgresql/data
+    networks:
+      - traefik
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
+  snitch:
+    container_name: snitch
+    image: snitch:latest
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - snitch-db
+    command: >-
+      snitch serve
+      --addr :8080
+      --key-file /app/data/identity.key
+    environment:
+      - SNITCH_DB_URL=postgres://snitch:${SNITCH_DB_PASS}@snitch-db:5432/snitch?sslmode=disable
+    cap_add:
+      - NET_RAW
+    dns:
+      - 100.127.1.32
+      - 8.8.8.8
+    volumes:
+      - ./data:/app/data
+      - /usr/bin/netbird:/usr/bin/netbird:ro
+      - /var/run/netbird.sock:/var/run/netbird.sock
+      - /opt/goat/gate-status.json:/data/gate-status.json:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=netbird_netbird"
+      - "traefik.http.routers.snitch.rule=Host(`snitch.netbird.legacy.example`)"
+      - "traefik.http.routers.snitch.entrypoints=websecure"
+      - "traefik.http.routers.snitch.tls=true"
+      - "traefik.http.routers.snitch.middlewares=mesh-only"
+      - "traefik.http.services.snitch.loadbalancer.server.port=8080"
+    networks:
+      - traefik
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
+volumes:
+  snitch-db-data:
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-netbird_netbird}

@@ -1,0 +1,511 @@
+---
+# One row at a time: cells in, grade + remediation + `why` + grounding out.
+#
+# Pointers are pinned VERBATIM. "What does the surface tell an operator to do"
+# is reviewed as a diff here rather than written per surface — and every pointer
+# is re-converge / regenerate / declare / roll back, never a bespoke mutation,
+# because a consistency surface that suggested a targeted fix would manufacture
+# the next `unaccountable` row with the authority of a dashboard.
+
+- name: match-two-members
+  why_this_case: The ordinary green row, and the baseline every other case moves away from.
+  subject: capability
+  row_name: rosenpass_enabled
+  goatnet: zagros
+  vantage: repo
+  declared: false
+  cells:
+    zagros_hosts: {state: resolved, value: "true", source: "ops/ansible/group_vars/zagros_hosts/vars.yml"}
+    zagros_b_hosts: {state: resolved, value: "true", source: "ops/ansible/group_vars/zagros_b_hosts/vars.yml"}
+  expect:
+    grade: match
+    why: "zagros_b_hosts=true, zagros_hosts=true — all agree"
+    grounding: {n: 2, vantage: repo}
+    remediation: null
+
+- name: skew-undeclared-repo
+  why_this_case: >-
+    Two members differ and nothing says why. Repo-side the fix is not to
+    re-converge anything — nothing has been deployed in this view — it is to
+    declare the difference or make the members agree.
+  subject: capability
+  row_name: rosenpass_enabled
+  goatnet: zagros
+  vantage: repo
+  declared: false
+  cells:
+    zagros_hosts: {state: resolved, value: "true"}
+    zagros_b_hosts: {state: resolved, value: "false"}
+  expect:
+    grade: SKEW
+    why: "zagros_b_hosts=false, zagros_hosts=true — they differ and nothing declares why"
+    grounding: {n: 2, vantage: repo}
+    remediation:
+      kind: declare
+      refuses: false
+      pointer: "add a `deviations:` stanza with a `reason:` to ops/pins/fleet-pins.yaml or ops/pins/parity-capabilities.yaml for `rosenpass_enabled`"
+
+- name: skew-declared-is-green
+  why_this_case: >-
+    The same difference, declared. A declared deviation is a CORRECT state and
+    needs no pointer; colouring it amber would train operators to ignore amber.
+  subject: capability
+  row_name: name_snapshot_enabled
+  goatnet: zagros
+  vantage: repo
+  declared: true
+  cells:
+    zagros_hosts: {state: resolved, value: "true"}
+    zagros_b_hosts: {state: resolved, value: "false"}
+  expect:
+    grade: declared
+    why: "zagros_b_hosts=false, zagros_hosts=true — the difference is declared with a reason"
+    grounding: {n: 2, vantage: repo}
+    remediation: null
+
+- name: unreadable-outranks-the-difference
+  why_this_case: >-
+    A templated value is read-but-not-evaluable. The row cannot be graded on the
+    values, so it grades `unreadable` — never `match`, and never `SKEW` either,
+    because nobody knows whether it differs.
+  subject: capability
+  row_name: some_templated_flag
+  goatnet: zagros
+  vantage: repo
+  declared: false
+  cells:
+    zagros_hosts: {state: unreadable, detail: templated, source: "ops/ansible/group_vars/zagros_hosts/vars.yml"}
+    zagros_b_hosts: {state: resolved, value: "false"}
+  expect:
+    grade: unreadable
+    why: "zagros_b_hosts=false, zagros_hosts=unreadable (templated) — read, not evaluable"
+    grounding: {n: 2, vantage: repo}
+    remediation:
+      kind: declare
+      refuses: false
+      pointer: "add a `deviations:` stanza with a `reason:` to ops/pins/fleet-pins.yaml or ops/pins/parity-capabilities.yaml for `some_templated_flag`"
+
+- name: declared-cannot-rescue-unreadable
+  why_this_case: >-
+    THE case that keeps the honesty grammar honest. A `reason:` explains a
+    difference; it does not make an unreadable value readable. If a declaration
+    could turn this row green, every ungrounded row would be one stanza away
+    from a false green.
+  subject: capability
+  row_name: some_templated_flag
+  goatnet: zagros
+  vantage: repo
+  declared: true
+  cells:
+    zagros_hosts: {state: unreadable, detail: templated}
+    zagros_b_hosts: {state: resolved, value: "false"}
+  expect:
+    grade: unreadable
+    why: "zagros_b_hosts=false, zagros_hosts=unreadable (templated) — read, not evaluable"
+    grounding: {n: 2, vantage: repo}
+    remediation:
+      kind: declare
+      refuses: false
+      pointer: "add a `deviations:` stanza with a `reason:` to ops/pins/fleet-pins.yaml or ops/pins/parity-capabilities.yaml for `some_templated_flag`"
+
+- name: unset-is-indeterminate-not-false
+  why_this_case: >-
+    A key with no entry and no default is NOT `false`. The consuming role
+    supplies its own default, which no repo-side reader evaluates, so equality
+    cannot be judged and the row says so.
+  subject: capability
+  row_name: oci_t2_sync_enabled
+  goatnet: zagros
+  vantage: repo
+  declared: false
+  cells:
+    zagros_hosts: {state: resolved, value: "false"}
+    zagros_b_hosts: {state: unset, detail: "no group_vars entry, no role default"}
+  expect:
+    grade: indeterminate
+    why: "zagros_b_hosts=unset (no group_vars entry, no role default), zagros_hosts=false — there was nothing to read"
+    grounding: {n: 2, vantage: repo}
+    remediation:
+      kind: declare
+      refuses: false
+      pointer: "add a `deviations:` stanza with a `reason:` to ops/pins/fleet-pins.yaml or ops/pins/parity-capabilities.yaml for `oci_t2_sync_enabled`"
+
+- name: absent-members-agree
+  why_this_case: >-
+    Two members that both deliberately do not run a component agree. Absence is
+    only reachable through a declared deviation, so it is a state, not a gap.
+  subject: component
+  row_name: portal
+  goatnet: zagros
+  vantage: repo
+  declared: true
+  artifact_type: image
+  cells:
+    zagros_hosts: {state: absent, declared: {scope: zagros, reason: "not deployed in this goatnet"}}
+    zagros_b_hosts: {state: absent, declared: {scope: zagros_b_hosts, reason: "single-homed on zagros-a"}}
+  expect:
+    grade: match
+    why: "zagros_b_hosts=absent, zagros_hosts=absent — all agree"
+    grounding: {n: 2, vantage: repo}
+    remediation: null
+
+- name: absent-versus-present-is-declared
+  why_this_case: >-
+    The zagros portal row as it actually stands: present on zagros-a, declared absent
+    on zagros-b. A difference with a reason is green-with-a-badge, not a finding.
+  subject: component
+  row_name: portal
+  goatnet: zagros
+  vantage: repo
+  declared: true
+  artifact_type: image
+  cells:
+    zagros_hosts: {state: resolved, value: "ghcr.io/{{ ghcr_org }}/goat-zenoh-portal:sha-f33cb9d@sha256:c9f7"}
+    zagros_b_hosts: {state: absent, declared: {scope: zagros_b_hosts, reason: "admin mutation surfaces stay single-homed on zagros-a (ADR 1084 §D3)"}}
+  expect:
+    grade: declared
+    why: "zagros_b_hosts=absent, zagros_hosts=ghcr.io/{{ ghcr_org }}/goat-zenoh-portal:sha-f33cb9d@sha256:c9f7 — the difference is declared with a reason"
+    grounding: {n: 2, vantage: repo}
+    remediation: null
+
+- name: no-cells-is-indeterminate-with-n-zero
+  why_this_case: >-
+    ADR 1109 P15, structurally: a row with nothing in it grades `indeterminate`
+    with n=0, and no renderer may present it otherwise. "100% compliant" that is
+    really "0 nodes reported" is the failure this makes impossible.
+  subject: capability
+  row_name: snitch_enabled
+  goatnet: zagros
+  vantage: repo
+  declared: false
+  cells: {}
+  expect:
+    grade: indeterminate
+    why: "nothing reported"
+    grounding: {n: 0, vantage: repo}
+    remediation:
+      kind: declare
+      refuses: false
+      pointer: "add a `deviations:` stanza with a `reason:` to ops/pins/fleet-pins.yaml or ops/pins/parity-capabilities.yaml for `snitch_enabled`"
+
+# --- live vantage: no producer until CF-3, pinned here so CF-3 adds a producer
+# --- rather than a second opinion about what these states mean.
+
+- name: live-node-behind-points-at-its-refresh
+  why_this_case: >-
+    The ordinary live SKEW: two nodes on the current ref, one behind. The pointer
+    names THAT node's idempotent refresh play — re-run it, do not reach in.
+  subject: component
+  row_name: postgres-spock
+  goatnet: zagros_prod
+  vantage: live
+  declared: false
+  artifact_type: image
+  cells:
+    orin_a: {state: resolved, value: "sha256:78ee7423"}
+    orin_b: {state: resolved, value: "sha256:0830dd60"}
+    orin_c: {state: resolved, value: "sha256:78ee7423"}
+  expect:
+    grade: SKEW
+    why: "orin_a=sha256:78ee7423, orin_b=sha256:0830dd60, orin_c=sha256:78ee7423 — they differ and nothing declares why"
+    grounding: {n: 3, vantage: live}
+    remediation:
+      kind: reconverge
+      refuses: false
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zagros-prod-refresh.yml -e target=orin_b"
+
+- name: live-node-that-has-not-reported
+  why_this_case: >-
+    A node that has not published is `indeterminate`, never compliant, and it
+    occupies its column rather than vanishing from the row. Under P12 it counts
+    AGAINST promotion, never toward it.
+  subject: component
+  row_name: signal-server
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: image
+  cells:
+    zagros_a: {state: resolved, value: "sha256:83de114f"}
+    zagros_b: {state: unreported, detail: "no ConsistencyReportV1 seen"}
+  expect:
+    grade: indeterminate
+    why: "zagros_a=sha256:83de114f, zagros_b=unreported (no ConsistencyReportV1 seen) — there was nothing to read"
+    grounding: {n: 2, vantage: live}
+    remediation:
+      kind: reconverge
+      refuses: false
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zagros-refresh.yml -e target=zagros_b"
+
+- name: live-node-behind-a-known-generation
+  why_this_case: >-
+    The `behind` state (design doc §3.3a) arriving as a row cell: a node whose
+    generation the artifact's own history tail accounts for. It lifts to SKEW on
+    its own rather than by comparing values — three nodes agreeing with each
+    other on a superseded generation are not `match`, because the reference they
+    are behind is the artifact, not each other — and it earns the ordinary
+    reconverge pointer, which is the whole reason it must not be confused with
+    the row below.
+  subject: component
+  row_name: goat-zenoh-portal
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: image
+  cells:
+    zagros_a: {state: resolved, value: "sha256:83de114f"}
+    zagros_b: {state: behind, detail: "converged against serial 6 — 1 generation behind, 9-day-old intent"}
+  expect:
+    grade: SKEW
+    why: "zagros_a=sha256:83de114f, zagros_b=behind (converged against serial 6 — 1 generation behind, 9-day-old intent) — they differ and nothing declares why"
+    grounding: {n: 2, vantage: live}
+    remediation:
+      kind: reconverge
+      refuses: false
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zagros-refresh.yml -e target=zagros_b"
+
+- name: unaccountable-image-rolls-back
+  why_this_case: >-
+    A node running an image no generation explains — the F-272 / F-258 shape.
+    Rolling back is the honest verb for an image, and it is NOT re-running the
+    play, which would erase the evidence before anyone looked at it.
+  subject: component
+  row_name: zenoh-router
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: image
+  cells:
+    zagros_a: {state: unaccountable, detail: "ref matches no committed generation"}
+    zagros_b: {state: resolved, value: "sha256:27c4e9b1"}
+  expect:
+    grade: unaccountable
+    why: "zagros_a=unaccountable (ref matches no committed generation), zagros_b=sha256:27c4e9b1 — a reported value is explained by no generation in the tree"
+    grounding: {n: 2, vantage: live}
+    remediation:
+      kind: rollback
+      refuses: false
+      pointer: "ops/scripts/rollback.sh zenoh-router"
+
+- name: unaccountable-data-refuses-and-points-at-restore
+  why_this_case: >-
+    ADR 1060's artifact-type dispatch, surfaced. Rollback of `data` is a lie;
+    rendering one verb for all six artifact types would recreate that unsafe
+    impression at glance speed. The refusal is a rendered FACT, not a command
+    that fails when someone pastes it.
+  subject: component
+  row_name: registry-state
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: data
+  cells:
+    zagros_a: {state: unaccountable, detail: "row count matches no generation"}
+  expect:
+    grade: unaccountable
+    why: "zagros_a=unaccountable (row count matches no generation) — a reported value is explained by no generation in the tree"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: restore
+      refuses: true
+      pointer: "the component's restore_pointer — rollback of `data` is a lie (ADR 0859 / ADR 1060)"
+
+- name: unaccountable-cert-refuses-and-points-at-rotate
+  why_this_case: The cert arm of the same dispatch — undo is rotation, never rollback.
+  subject: component
+  row_name: router-leaf-cert
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: cert
+  cells:
+    zagros_a: {state: unaccountable, detail: "serial matches no issuance record"}
+  expect:
+    grade: unaccountable
+    why: "zagros_a=unaccountable (serial matches no issuance record) — a reported value is explained by no generation in the tree"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: rotate
+      refuses: true
+      pointer: "goat admin rotate router-leaf-cert — rollback of `cert` is a lie (ADR 0859 / ADR 1060)"
+
+- name: unaccountable-forward-only-refuses-outright
+  why_this_case: >-
+    Some artifacts have no undo at all. The pointer says so and offers converging
+    forward, rather than a command that would quietly do the wrong thing.
+  subject: component
+  row_name: schema-migration
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: forward-only
+  cells:
+    zagros_a: {state: unaccountable, detail: "migration version matches no generation"}
+  expect:
+    grade: unaccountable
+    why: "zagros_a=unaccountable (migration version matches no generation) — a reported value is explained by no generation in the tree"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: refuse
+      refuses: true
+      pointer: "no undo path: `schema-migration` is forward-only (ADR 1060). Converge forward to the current generation and keep the finding — do not try to put the node back."
+
+# -- render rows (CF-4) ------------------------------------------------------
+# A render row's dispatch type is `render`, not the component's ADR 1060
+# artifact type: the subject is a watched FILE against its own converge record,
+# not a ledger tip against a generation. Its unaccountable arm dispatches to
+# `reconverge` — the idempotent re-render is the undo, rollback would target
+# the PRIOR generation for a file the CURRENT one owns, and the evidence (the
+# hash pair) is on the wire before the grade exists. See grammar.yaml.
+
+- name: hand-edited-render-reconverges-and-does-not-roll-back
+  why_this_case: >-
+    The §9 CF-4 gate, as a row: a hand-edited rendered file grades
+    `unaccountable` and its pointer is the node's own idempotent refresh play —
+    the re-render restores the current generation's file. It must NOT be
+    `rollback`: rollback.sh targets the component's prior ledger generation,
+    which is not where a file owned by the current generation belongs.
+  subject: render
+  row_name: "zenoh-router:/opt/zagros-sandbox-zenoh/docker-compose.yml"
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: render
+  cells:
+    zagros-a: {state: unaccountable, value: "sha256:22", detail: "/opt/zagros-sandbox-zenoh/docker-compose.yml hashes to 222222222222 but the last converge rendered 111111111111 — no converge explains the bytes on disk"}
+  expect:
+    grade: unaccountable
+    why: "zagros-a=unaccountable (/opt/zagros-sandbox-zenoh/docker-compose.yml hashes to 222222222222 but the last converge rendered 111111111111 — no converge explains the bytes on disk) — a reported value is explained by no generation in the tree"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: reconverge
+      refuses: false
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zagros-refresh.yml -e target=zagros-a"
+
+- name: declared-render-set-with-nothing-recorded-is-indeterminate
+  why_this_case: >-
+    The intent declares a watch-set and the node has no render manifest for the
+    component — the recorder is default-off, so EVERY node is in this state
+    until a recording converge runs. That is nothing-to-read, `indeterminate`,
+    never a red: same posture as a node with no applied-intent stamp, and for
+    the same reason.
+  subject: render
+  row_name: zenoh-router
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: render
+  cells:
+    zagros-a: {state: unreported, detail: "1 declared path(s) to watch, none recorded — the deploying role has not written a render manifest"}
+  expect:
+    grade: indeterminate
+    why: "zagros-a=unreported (1 declared path(s) to watch, none recorded — the deploying role has not written a render manifest) — there was nothing to read"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: reconverge
+      refuses: false
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zagros-refresh.yml -e target=zagros-a"
+
+- name: untouched-render-is-green-with-no-pointer
+  why_this_case: >-
+    The file on disk is what the last converge rendered. Match earns no
+    pointer; whether that converge is against the current generation is the
+    generation row's finding, not this row's.
+  subject: render
+  row_name: "zenoh-router:/opt/zagros-sandbox-zenoh/docker-compose.yml"
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: render
+  cells:
+    zagros-a: {state: resolved, value: "sha256:1111111111111111111111111111111111111111111111111111111111111111"}
+  expect:
+    grade: match
+    why: "zagros-a=sha256:1111111111111111111111111111111111111111111111111111111111111111 — all agree"
+    grounding: {n: 1, vantage: live}
+    remediation: null
+
+# -- the generation row (CF-3) ---------------------------------------------
+# A node's GENERATION is the accountability unit (§3.3a): it is the only thing
+# a reader holding one artifact can place, because the history tail carries
+# identity triples rather than bodies. These three cases pin what the surface
+# tells an operator about it, and the first one is the case that made the
+# library's fail-closed rule earn its keep — a generation row with no artifact
+# type made grade_row REFUSE to emit an unaccountable row rather than emit one
+# with no pointer.
+
+- name: generation-unaccountable-refuses-and-converges-forward
+  why_this_case: >-
+    A node reporting a generation NO artifact explains. The pointer must not be
+    `rollback`: §3.3a decided that no generation other than the newest is
+    targetable ("the tail is evidence for grading, never a target for
+    converging"), so telling an operator to put the node back onto a generation
+    nobody can name is telling them to do something that does not exist. A
+    generation's artifact type is therefore `forward-only`, and the honest
+    advice is the one this pointer gives — converge forward and KEEP the
+    finding, because this is the F-272 / F-258 shape and re-running first erases
+    the evidence.
+  subject: generation
+  row_name: intent
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: forward-only
+  cells:
+    zagros-a: {state: unaccountable, detail: "matches neither serial 4 nor its history tail (serials 1-3)"}
+  expect:
+    grade: unaccountable
+    why: "zagros-a=unaccountable (matches neither serial 4 nor its history tail (serials 1-3)) — a reported value is explained by no generation in the tree"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: refuse
+      refuses: true
+      pointer: "no undo path: `intent` is forward-only (ADR 1060). Converge forward to the current generation and keep the finding — do not try to put the node back."
+
+- name: generation-behind-is-pointed-at-its-own-node
+  why_this_case: >-
+    The ordinary lagging node. The generation row's single cell is keyed by
+    HOST, so `{member}` in the reconverge pointer resolves to the host rather
+    than to a member group — which is the more useful target, and a valid
+    ansible host pattern. This pins that the pointer names the node that is
+    actually behind rather than its whole column.
+  subject: generation
+  row_name: intent
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: forward-only
+  cells:
+    zagros-a: {state: behind, value: "sha256:03", detail: "converged against serial 3 — 1 generation behind, 10-day-old intent"}
+  expect:
+    grade: SKEW
+    why: "zagros-a=behind (converged against serial 3 — 1 generation behind, 10-day-old intent) — they differ and nothing declares why"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: reconverge
+      refuses: false
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zagros-refresh.yml -e target=zagros-a"
+
+- name: generation-unreported-is-reconverged-not-rolled-back
+  why_this_case: >-
+    A node with no applied-intent stamp. Every node in the fleet is in this
+    state until a stamping checkout deploys it, so this must grade
+    `indeterminate` and earn the ORDINARY pointer. If it earned an
+    unaccountable-class pointer instead, landing CF-3 would point the entire
+    fleet at a refusal on day one.
+  subject: generation
+  row_name: intent
+  goatnet: zagros
+  vantage: live
+  declared: false
+  artifact_type: forward-only
+  cells:
+    zagros-a: {state: unreported, detail: "no applied-intent stamp"}
+  expect:
+    grade: indeterminate
+    why: "zagros-a=unreported (no applied-intent stamp) — there was nothing to read"
+    grounding: {n: 1, vantage: live}
+    remediation:
+      kind: reconverge
+      refuses: false
+      pointer: "ops/scripts/ansible-preflight.sh -i inventory/mgmt-hosts-mesh.ini zagros-refresh.yml -e target=zagros-a"

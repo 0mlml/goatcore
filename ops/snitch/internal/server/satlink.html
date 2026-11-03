@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNITCH — Satlink PoP Tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --green: #3fb950;
+    --yellow: #d29922; --red: #f85149; --blue: #58a6ff;
+    --purple: #bc8cff; --orange: #f0a030;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: var(--bg); color: var(--text); padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .subtitle a { color: var(--blue); text-decoration: none; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  .full { grid-column: 1 / -1; }
+
+  .pop-status { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+  .pop-field { }
+  .pop-label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+  .pop-value { font-size: 18px; font-weight: bold; }
+  .pop-value.satlink { color: var(--orange); }
+  .pop-value.commercial { color: var(--blue); }
+
+  .badge { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 3px; font-weight: bold; letter-spacing: 0.3px; vertical-align: middle; margin-left: 6px; }
+  .badge-satlink { background: var(--orange); color: #000; }
+  .badge-commercial { background: var(--blue); color: #000; }
+
+  .delta { font-size: 12px; margin-top: 2px; }
+  .delta-up { color: var(--red); }
+  .delta-down { color: var(--green); }
+  .delta-same { color: var(--muted); }
+
+  table.data { border-collapse: collapse; font-size: 13px; width: 100%; }
+  table.data th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 500; }
+  table.data td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  table.data td.num { text-align: right; font-family: monospace; }
+
+  .range-bar { display: flex; gap: 4px; margin-bottom: 16px; }
+  .range-bar button { font-size: 11px; padding: 4px 10px; }
+  button { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  button:hover { border-color: var(--blue); }
+  button.active { border-color: var(--blue); background: #1a1f2e; }
+
+  #chart-wrap { position: relative; height: 280px; }
+
+  .pop-timeline { margin-top: 12px; }
+  .pop-event { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .pop-event-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .pop-event-time { color: var(--muted); white-space: nowrap; min-width: 130px; }
+  .pop-event-time-local { color: var(--muted); white-space: nowrap; opacity: 0.5; min-width: 70px; }
+  .pop-event-msg { flex: 1; }
+
+  .refresh { font-size: 11px; color: var(--muted); text-align: right; margin-top: 8px; }
+
+  #login-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; display: flex; align-items: center; justify-content: center; }
+  #login-overlay .card { width: 380px; text-align: center; }
+  #login-overlay input { width: 100%; padding: 8px 12px; margin: 12px 0; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font-size: 14px; font-family: monospace; }
+  #login-error { color: var(--red); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div id="login-overlay" style="display:none">
+  <div class="card">
+    <h2>SNITCH — Satlink PoP Tracker</h2>
+    <p style="color:var(--muted);font-size:13px;margin-top:8px">Enter API key to continue</p>
+    <input id="key-input" type="password" placeholder="API key" autofocus>
+    <button onclick="doLogin()">Authenticate</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<h1>Satlink PoP Tracker</h1>
+<p class="subtitle"><a href="/">← Mesh Dashboard</a> · Egress ground station and relay latency monitoring</p>
+
+<div id="content" style="display:none">
+
+<div class="grid">
+  <!-- PoP Status Card -->
+  <div class="card">
+    <h2>Current Egress PoP</h2>
+    <div id="pop-status" class="pop-status">
+      <div style="color:var(--muted)">No data yet</div>
+    </div>
+    <div id="pop-timestamp" class="refresh"></div>
+  </div>
+
+  <!-- Day-over-Day Comparison -->
+  <div class="card">
+    <h2>Day-over-Day Change</h2>
+    <div id="pop-compare">
+      <div style="color:var(--muted)">Waiting for data...</div>
+    </div>
+  </div>
+
+  <!-- Latency Trend Chart -->
+  <div class="card full">
+    <h2>Latency Trend</h2>
+    <div class="range-bar">
+      <button onclick="setRange('7d')">7d</button>
+      <button onclick="setRange('14d')">14d</button>
+      <button onclick="setRange('30d')" class="active">30d</button>
+      <button onclick="setRange('90d')">90d</button>
+    </div>
+    <div id="chart-wrap"><canvas id="trend-chart"></canvas></div>
+  </div>
+
+  <!-- Measurements Table -->
+  <div class="card full">
+    <h2>Latest Measurements</h2>
+    <div id="measurements-table">
+      <div style="color:var(--muted)">Loading...</div>
+    </div>
+  </div>
+
+  <!-- PoP Change Timeline -->
+  <div class="card full">
+    <h2>PoP Change Timeline</h2>
+    <div id="pop-timeline" class="pop-timeline">
+      <div style="color:var(--muted)">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<div class="controls" style="display:flex;justify-content:space-between;align-items:center">
+  <button onclick="triggerProbe()" id="probe-btn">Run Probe Now</button>
+  <div class="refresh" id="last-refresh"></div>
+</div>
+
+</div><!-- /content -->
+
+<script>
+let apiKey = localStorage.getItem('snitch_key') || '';
+let currentRange = '30d';
+let trendChart = null;
+
+// --- Time helpers ---
+function zuluTime(d) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}Z`;
+}
+
+function zuluDateTime(d) {
+  const pad = n => String(n).padStart(2, '0');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${pad(d.getUTCDate())} ${months[d.getUTCMonth()]} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}Z`;
+}
+
+// --- Auth ---
+function headers() { return { 'Authorization': 'Bearer ' + apiKey }; }
+
+async function checkAuth() {
+  if (!apiKey) { showLogin(); return; }
+  try {
+    const r = await fetch('/api/satlink/latest', { headers: headers() });
+    if (r.status === 401 || r.status === 403) { showLogin(); return; }
+    document.getElementById('login-overlay').style.display = 'none';
+    document.getElementById('content').style.display = 'block';
+    loadAll();
+  } catch(e) { showLogin(); }
+}
+
+function showLogin() {
+  document.getElementById('login-overlay').style.display = 'flex';
+  document.getElementById('content').style.display = 'none';
+}
+
+function doLogin() {
+  apiKey = document.getElementById('key-input').value.trim();
+  if (!apiKey) return;
+  localStorage.setItem('snitch_key', apiKey);
+  checkAuth();
+}
+
+document.getElementById('key-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// --- Data Loading ---
+async function loadAll() {
+  await Promise.all([loadLatest(), loadTrend(), loadPops()]);
+  const now = new Date();
+  const local = now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  document.getElementById('last-refresh').textContent = `Updated ${zuluTime(now)} (${local} local)`;
+}
+
+async function loadLatest() {
+  try {
+    const r = await fetch('/api/satlink/latest', { headers: headers() });
+    const data = await r.json();
+    renderPopStatus(data.latest);
+    renderCompare(data.latest, data.previous);
+    renderMeasurements(data.latest);
+  } catch(e) {
+    console.error('loadLatest:', e);
+  }
+}
+
+async function loadTrend() {
+  try {
+    const r = await fetch('/api/satlink/trend?range=' + currentRange, { headers: headers() });
+    const data = await r.json();
+    renderTrendChart(data.points || []);
+  } catch(e) {
+    console.error('loadTrend:', e);
+  }
+}
+
+async function loadPops() {
+  try {
+    const r = await fetch('/api/satlink/pops?range=' + currentRange, { headers: headers() });
+    const data = await r.json();
+    renderPopTimeline(data.pops || []);
+  } catch(e) {
+    console.error('loadPops:', e);
+  }
+}
+
+function setRange(r) {
+  currentRange = r;
+  document.querySelectorAll('.range-bar button').forEach(b => b.classList.toggle('active', b.textContent === r));
+  loadTrend();
+  loadPops();
+}
+
+// --- Render: PoP Status ---
+function renderPopStatus(probe) {
+  const el = document.getElementById('pop-status');
+  const tsEl = document.getElementById('pop-timestamp');
+  if (!probe) { el.innerHTML = '<div style="color:var(--muted)">No probe data yet</div>'; return; }
+
+  const isSatlink = probe.in_satlink_range;
+
+  let cityClass = isSatlink ? 'satlink' : 'commercial';
+  let badge = '';
+  if (isSatlink) badge = '<span class="badge badge-satlink">PRIVATE RANGE</span>';
+  else badge = '<span class="badge badge-commercial">COMMERCIAL</span>';
+
+  el.innerHTML = `
+    <div class="pop-field"><div class="pop-label">City</div><div class="pop-value ${cityClass}">${probe.city || '—'}${badge}</div></div>
+    <div class="pop-field"><div class="pop-label">Country</div><div class="pop-value">${probe.country || '—'}</div></div>
+    <div class="pop-field"><div class="pop-label">ASN</div><div class="pop-value">${probe.asn || '—'}</div></div>
+    <div class="pop-field"><div class="pop-label">Egress IP</div><div class="pop-value" style="font-size:14px">${probe.egress_ip || '—'}</div></div>
+  `;
+  if (probe.ts) {
+    const d = new Date(probe.ts * 1000);
+    const local = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    tsEl.textContent = `${zuluDateTime(d)} (${local} local)`;
+  } else {
+    tsEl.textContent = '';
+  }
+}
+
+// --- Render: Day-over-Day ---
+function renderCompare(latest, previous) {
+  const el = document.getElementById('pop-compare');
+  if (!latest || !latest.measurements || !latest.measurements.length) {
+    el.innerHTML = '<div style="color:var(--muted)">Need at least one probe</div>';
+    return;
+  }
+  if (!previous || !previous.measurements || !previous.measurements.length) {
+    el.innerHTML = '<div style="color:var(--muted)">Need two probes for comparison</div>';
+    return;
+  }
+
+  let html = '<table class="data"><thead><tr><th>Target</th><th>Ping Avg</th><th>Ping P95</th><th>Jitter</th><th>TCP Avg</th></tr></thead><tbody>';
+  for (const m of latest.measurements) {
+    const prev = previous.measurements.find(p => p.target === m.target);
+    html += `<tr>
+      <td>${m.target}</td>
+      <td class="num">${fmtDelta(m.ping_avg_ms, prev?.ping_avg_ms)}</td>
+      <td class="num">${fmtDelta(m.ping_p95_ms, prev?.ping_p95_ms)}</td>
+      <td class="num">${fmtDelta(m.ping_jitter_ms, prev?.ping_jitter_ms)}</td>
+      <td class="num">${fmtDelta(m.tcp_avg_ms, prev?.tcp_avg_ms)}</td>
+    </tr>`;
+  }
+
+  // PoP change row
+  if (latest.egress_ip !== previous.egress_ip || latest.city !== previous.city) {
+    html += `<tr><td colspan="5" style="color:var(--orange)">PoP changed: ${previous.city || '?'} → ${latest.city || '?'} (${previous.egress_ip} → ${latest.egress_ip})</td></tr>`;
+  }
+
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function fmtDelta(curr, prev) {
+  if (curr == null) return '—';
+  const v = curr.toFixed(1) + 'ms';
+  if (prev == null) return v;
+  const d = curr - prev;
+  if (Math.abs(d) < 0.5) return `${v} <span class="delta delta-same">=</span>`;
+  const cls = d > 0 ? 'delta-up' : 'delta-down';
+  const sign = d > 0 ? '+' : '';
+  return `${v} <span class="delta ${cls}">${sign}${d.toFixed(1)}</span>`;
+}
+
+// --- Render: Measurements Table ---
+function renderMeasurements(probe) {
+  const el = document.getElementById('measurements-table');
+  if (!probe || !probe.measurements || !probe.measurements.length) {
+    el.innerHTML = '<div style="color:var(--muted)">No measurement data</div>';
+    return;
+  }
+
+  let html = `<table class="data"><thead><tr>
+    <th>Target</th><th>IP</th>
+    <th>Ping Avg</th><th>P50</th><th>P95</th><th>Jitter</th><th>Loss</th>
+    <th>TCP Avg</th><th>TCP P95</th>
+    <th>HTTP Connect</th><th>TLS</th><th>First Byte</th>
+    <th>Hops</th>
+  </tr></thead><tbody>`;
+
+  for (const m of probe.measurements) {
+    const lossColor = m.ping_loss_pct > 5 ? 'var(--red)' : (m.ping_loss_pct > 0 ? 'var(--yellow)' : 'var(--green)');
+    html += `<tr>
+      <td><strong>${m.target}</strong></td>
+      <td style="color:var(--muted)">${m.target_ip}</td>
+      <td class="num">${ms(m.ping_avg_ms)}</td>
+      <td class="num">${ms(m.ping_p50_ms)}</td>
+      <td class="num">${ms(m.ping_p95_ms)}</td>
+      <td class="num">${ms(m.ping_jitter_ms)}</td>
+      <td class="num" style="color:${lossColor}">${(m.ping_loss_pct||0).toFixed(1)}%</td>
+      <td class="num">${ms(m.tcp_avg_ms)}</td>
+      <td class="num">${ms(m.tcp_p95_ms)}</td>
+      <td class="num">${ms(m.http_connect_ms)}</td>
+      <td class="num">${ms(m.http_tls_ms)}</td>
+      <td class="num">${ms(m.http_firstbyte_ms)}</td>
+      <td class="num">${m.hop_count || '—'}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function ms(v) { return v != null && v > 0 ? v.toFixed(1) + 'ms' : '—'; }
+
+// --- Render: Trend Chart ---
+function renderTrendChart(points) {
+  if (trendChart) trendChart.destroy();
+  const ctx = document.getElementById('trend-chart').getContext('2d');
+
+  // Group by target
+  const targets = {};
+  for (const p of points) {
+    if (!targets[p.target]) targets[p.target] = [];
+    targets[p.target].push({ x: p.ts * 1000, y: p.ping_avg_ms });
+  }
+
+  const colors = ['#58a6ff', '#3fb950', '#f0a030', '#bc8cff', '#f85149'];
+  const datasets = Object.keys(targets).map((t, i) => ({
+    label: t + ' (ping avg)',
+    data: targets[t],
+    borderColor: colors[i % colors.length],
+    backgroundColor: colors[i % colors.length] + '20',
+    tension: 0.3,
+    pointRadius: 2,
+    borderWidth: 2,
+    fill: false,
+  }));
+
+  // Also add p95 as dashed lines
+  const targetsP95 = {};
+  for (const p of points) {
+    if (!targetsP95[p.target]) targetsP95[p.target] = [];
+    targetsP95[p.target].push({ x: p.ts * 1000, y: p.ping_p95_ms });
+  }
+  Object.keys(targetsP95).forEach((t, i) => {
+    datasets.push({
+      label: t + ' (p95)',
+      data: targetsP95[t],
+      borderColor: colors[i % colors.length] + '80',
+      borderDash: [4, 4],
+      tension: 0.3,
+      pointRadius: 0,
+      borderWidth: 1.5,
+      fill: false,
+    });
+  });
+
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: 'day' },
+          grid: { color: '#30363d40' },
+          ticks: { color: '#8b949e' },
+        },
+        y: {
+          title: { display: true, text: 'Latency (ms)', color: '#8b949e' },
+          grid: { color: '#30363d40' },
+          ticks: { color: '#8b949e' },
+          beginAtZero: true,
+        }
+      },
+      plugins: {
+        legend: { labels: { color: '#e6edf3', font: { size: 11 } } },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}ms`
+          }
+        }
+      }
+    }
+  });
+}
+
+// --- Render: PoP Timeline ---
+function renderPopTimeline(pops) {
+  const el = document.getElementById('pop-timeline');
+  if (!pops || !pops.length) {
+    el.innerHTML = '<div style="color:var(--muted)">No PoP observations yet</div>';
+    return;
+  }
+
+  // Show changes (consecutive different PoPs) and recent entries
+  let html = '';
+  let lastCity = '', lastIP = '';
+  for (let i = 0; i < pops.length; i++) {
+    const p = pops[i];
+    const changed = p.city !== lastCity || p.egress_ip !== lastIP;
+    const dotColor = changed ? 'var(--orange)' : 'var(--muted)';
+
+    if (changed || i === pops.length - 1) {
+      const ts = new Date(p.ts * 1000);
+      const tz = zuluDateTime(ts);
+      const tl = ts.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+      const badge = p.in_satlink_range ? '<span class="badge badge-satlink">PVT</span>' : '<span class="badge badge-commercial">COM</span>';
+
+      html += `<div class="pop-event">
+        <div class="pop-event-dot" style="background:${dotColor}"></div>
+        <div class="pop-event-time">${tz}</div><div class="pop-event-time-local">${tl}</div>
+        <div class="pop-event-msg">
+          ${changed && lastCity ? `<strong>${lastCity} → ${p.city}</strong>` : `<strong>${p.city}</strong>`}
+          · ${p.egress_ip} · ${p.asn || ''}
+          ${badge}
+        </div>
+      </div>`;
+    }
+    lastCity = p.city;
+    lastIP = p.egress_ip;
+  }
+
+  if (!html) html = '<div style="color:var(--muted)">No PoP changes detected</div>';
+  el.innerHTML = html;
+}
+
+// --- Trigger Probe ---
+async function triggerProbe() {
+  const btn = document.getElementById('probe-btn');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  try {
+    await fetch('/api/satlink/probe', { method: 'POST', headers: headers() });
+    btn.textContent = 'Probe started — results in ~5 min';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Run Probe Now'; loadAll(); }, 300000);
+  } catch(e) {
+    btn.textContent = 'Failed';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Run Probe Now'; }, 3000);
+  }
+}
+
+// --- Init ---
+checkAuth();
+setInterval(loadAll, 300000); // refresh every 5 min
+</script>
+</body>
+</html>

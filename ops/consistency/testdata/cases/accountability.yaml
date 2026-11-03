@@ -1,0 +1,163 @@
+---
+# Generation accountability: is a node BEHIND, or is it running something no
+# generation explains?
+#
+# These cases pin the one distinction §4.2 adds a grade for, FROM A READER'S
+# INPUTS ONLY — a committed generation and one observed content hash, no git
+# tree. That constraint is the whole point (design doc §3.3a): the rollup meter,
+# the console and an FM-2 node each hold exactly one artifact, and before the
+# history tail existed every non-matching observation looked identical to them.
+# The two answers demand opposite first actions — re-run the refresh play, or do
+# NOT re-run it because that erases the evidence — so a reader that cannot
+# separate them either loses the grade or points every ordinary lagging node at
+# rollback.sh.
+#
+# `now` is supplied per case because intent age is a read-time fact. Under §5.3
+# it is REPORTED on every cell and GRADED only when the node is not on the
+# current generation: a goatnet whose config has not changed in 90 days is
+# correct, not stale.
+#
+# Remediation is not pinned here. Which ROW carries the classification is CF-3's
+# to decide; what the grades it lifts to already tell an operator to do is
+# pinned in `rows.yaml`, where the live-vantage pointers live.
+
+- name: current-generation-is-accounted-for
+  why_this_case: >-
+    The baseline. A node holding the current content hash is `match`, and its
+    intent age is reported anyway — three days here — so a surface can say how
+    old the thing everyone agrees on is without that age colouring anything.
+  generation: accountable-tail
+  now: "2026-08-04T00:00:00Z"
+  observed:
+    node_a: "sha256:b8524860d3e52515114189f866711d746de6898913bdd90bd75348339d17409c"
+  expect:
+    cells:
+      node_a:
+        state: resolved
+        value: "sha256:b8524860d3e52515114189f866711d746de6898913bdd90bd75348339d17409c"
+        generation:
+          serial: 4
+          generated_at: "2026-08-01T00:00:00Z"
+          behind_by: 0
+          intent_age_seconds: 259200
+    grade: match
+
+- name: hash-in-the-tail-is-SKEW-with-an-age
+  why_this_case: >-
+    THE case the amendment was written for, first half. The observed hash is in
+    the tail, so the node is behind by a KNOWN count against a KNOWN generation,
+    which is exactly §4.2's `SKEW` — accounted for by some generation — and it
+    arrives with P7's intent-age clause already populated rather than as a bare
+    "not current".
+  generation: accountable-tail
+  now: "2026-08-04T00:00:00Z"
+  observed:
+    node_a: "sha256:0303030303030303030303030303030303030303030303030303030303030303"
+  expect:
+    cells:
+      node_a:
+        state: behind
+        value: "sha256:0303030303030303030303030303030303030303030303030303030303030303"
+        detail: "converged against serial 3 — 1 generation behind, 10-day-old intent"
+        generation:
+          serial: 3
+          generated_at: "2026-07-25T00:00:00Z"
+          behind_by: 1
+          intent_age_seconds: 864000
+    grade: SKEW
+
+- name: hash-nowhere-in-the-artifact-is-unaccountable
+  why_this_case: >-
+    Second half of the same distinction. The tail reaches serial 1, so nothing
+    has fallen off it and the answer is unambiguous: no generation this artifact
+    can see explains what the node is running. That is the F-272 / F-258 shape,
+    and it must NOT be graded `SKEW`, because re-running the play would erase
+    the evidence before anyone looked at it.
+  generation: accountable-tail
+  now: "2026-08-04T00:00:00Z"
+  observed:
+    node_a: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  expect:
+    cells:
+      node_a:
+        state: unaccountable
+        value: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        detail: "matches neither serial 4 nor its history tail (serials 1-3) — no generation in this artifact explains it"
+    grade: unaccountable
+
+- name: fell-off-the-tail-is-unaccountable-and-says-so
+  why_this_case: >-
+    A node so far behind that its generation dropped off the 10-deep tail. The
+    grade is still `unaccountable` — a reader honestly cannot account for it —
+    but the detail names the tail's reach so an operator can tell "nobody ever
+    committed this" from "this node has been gone a long time". Grading it
+    `SKEW` would be a guess; calling the finding lost would be worse.
+  generation: truncated-tail
+  now: "2026-08-04T00:00:00Z"
+  observed:
+    node_a: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  expect:
+    cells:
+      node_a:
+        state: unaccountable
+        value: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        detail: "matches neither serial 13 nor its history tail (serials 3-12) — no generation in this artifact explains it; a generation older than serial 3 has fallen off the 10-deep tail, which is unaccountable rather than lost"
+    grade: unaccountable
+
+- name: oldest-visible-generation-is-still-accountable
+  why_this_case: >-
+    The boundary between the two cases above, pinned so the cap is a cliff at a
+    known place rather than an approximate one. The last entry the tail still
+    carries is `behind`, ten generations and seventy-three days back — plural
+    count and all — and the entry one older than it is not.
+  generation: truncated-tail
+  now: "2026-08-04T00:00:00Z"
+  observed:
+    node_a: "sha256:0303030303030303030303030303030303030303030303030303030303030303"
+  expect:
+    cells:
+      node_a:
+        state: behind
+        value: "sha256:0303030303030303030303030303030303030303030303030303030303030303"
+        detail: "converged against serial 3 — 10 generations behind, 73-day-old intent"
+        generation:
+          serial: 3
+          generated_at: "2026-05-23T00:00:00Z"
+          behind_by: 10
+          intent_age_seconds: 6307200
+    grade: SKEW
+
+- name: an-artifact-with-no-tail-degrades-honestly
+  why_this_case: >-
+    `history` is optional, and a generation published before the amendment
+    carries none — `two-member` is one. A reader must not read that absence as
+    "explained by nothing"; it says so instead, which is the honest form of the
+    limitation the amendment exists to remove and the reason the field is worth
+    carrying at all.
+  generation: two-member
+  now: "2026-08-04T00:00:00Z"
+  observed:
+    node_a: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  expect:
+    cells:
+      node_a:
+        state: unaccountable
+        value: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        detail: "matches neither serial 3 nor a history tail (this generation carries none) — no generation in this artifact explains it"
+    grade: unaccountable
+
+- name: no-applied-intent-stamp-is-indeterminate-not-unaccountable
+  why_this_case: >-
+    A node that reported nothing about which generation it converged against has
+    not been caught running something unexplained — it has not been read at all.
+    ADR 1109 P15: never compliant, and never a red either.
+  generation: accountable-tail
+  now: "2026-08-04T00:00:00Z"
+  observed:
+    node_a: ""
+  expect:
+    cells:
+      node_a:
+        state: unreported
+        detail: "no applied-intent stamp"
+    grade: indeterminate

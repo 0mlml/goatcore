@@ -1,0 +1,39 @@
+--- a/io/zenoh-links/zenoh-link-tls/src/unicast.rs
++++ b/io/zenoh-links/zenoh-link-tls/src/unicast.rs
+@@ -565,14 +565,28 @@
+                         }
+                     }
+                     Err(e) => {
+-                        tracing::warn!("{}. Hint: increase the system open file limit.", e);
+-                        // Throttle the accept loop upon an error
+-                        // NOTE: This might be due to various factors. However, the most common case is that
+-                        //       the process has reached the maximum number of open files in the system. On
+-                        //       Linux systems this limit can be changed by using the "ulimit" command line
+-                        //       tool. In case of systemd-based systems, this can be changed by using the
+-                        //       "sysctl" command line tool.
+-                        tokio::time::sleep(Duration::from_micros(*TLS_ACCEPT_THROTTLE_TIME)).await;
++                        // goat F-253: only a *listener*-level error (the TCP
++                        // accept() itself failed — most commonly fd exhaustion)
++                        // may throttle the accept loop. A per-connection TLS
++                        // handshake failure — including a peer that abandons the
++                        // handshake mid-flight under a reconnect storm — must NOT
++                        // throttle: the original unconditional 100ms sleep
++                        // serialized ALL admission to ~10 opens/s (one sleep per
++                        // failed handshake), starving legitimate new sessions past
++                        // the 10s open_timeout while the acceptor sat idle. Drop
++                        // the failed handshake and keep admitting without delay.
++                        match e {
++                            tls_listener::Error::ListenerError(_) => {
++                                tracing::warn!("{}. Hint: increase the system open file limit.", e);
++                                // NOTE: most commonly the process has reached the
++                                //       max number of open files; raise via ulimit
++                                //       or sysctl. Throttle to avoid a hot loop.
++                                tokio::time::sleep(Duration::from_micros(*TLS_ACCEPT_THROTTLE_TIME)).await;
++                            }
++                            _ => {
++                                tracing::debug!("TLS handshake failed on accept: {}", e);
++                            }
++                        }
+                     }
+                 }
+             }

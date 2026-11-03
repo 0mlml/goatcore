@@ -1,0 +1,51 @@
+--- a/plugins/zenoh-plugin-storage-manager/src/lib.rs
++++ b/plugins/zenoh-plugin-storage-manager/src/lib.rs
+@@ -371,25 +371,39 @@
+                 });
+             }
+         });
++        // goat fix (upstream eclipse-zenoh#1094): snapshot the (key, storage
++        // sender) pairs under the lock, then DROP the guard BEFORE the blocking
++        // GetStatus fan-out. Holding the one global StorageRuntimeInner mutex
++        // across a block_in_place round-trip to every (~1000) storage is the
++        // deadlock (postmortem PM-2026-07-27 rev.3): a second admin walk parks a
++        // tokio worker on this same std Mutex while the routing Tables lock is
++        // contended by real peer traffic -> the runtime deadlocks under load.
++        // Collecting the senders is O(N) and cheap; the blocking round-trips
++        // then run lock-free.
++        let mut pending: Vec<(String, Sender<StorageMessage>)> = Vec::new();
+         with_extended_string(&mut key, &["/storages/"], |key| {
+             for storages in guard.storages.values() {
+                 for (storage, handle) in storages {
+                     with_extended_string(key, &[storage], |key| {
+                         if keyexpr::new(key.as_str()).unwrap().intersects(key_expr) {
+-                            if let Some(value) = tokio::task::block_in_place(|| {
+-                                TOKIO_RUNTIME.block_on(async {
+-                                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+-                                    let _ = handle.send(StorageMessage::GetStatus(tx));
+-                                    rx.recv().await
+-                                })
+-                            }) {
+-                                responses.push(Response::new(key.clone(), value))
+-                            }
++                            pending.push((key.clone(), handle.clone()));
+                         }
+                     })
+                 }
+             }
+         });
++        drop(guard);
++        for (key, handle) in pending {
++            if let Some(value) = tokio::task::block_in_place(|| {
++                TOKIO_RUNTIME.block_on(async {
++                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
++                    let _ = handle.send(StorageMessage::GetStatus(tx));
++                    rx.recv().await
++                })
++            }) {
++                responses.push(Response::new(key, value))
++            }
++        }
+         Ok(responses)
+     }
+ }

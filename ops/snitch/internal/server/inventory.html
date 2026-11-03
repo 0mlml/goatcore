@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNITCH — Inventory</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --green: #3fb950;
+    --yellow: #d29922; --red: #f85149; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: var(--bg); color: var(--text); padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+
+  table { border-collapse: collapse; font-size: 13px; width: 100%; }
+  th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 500; }
+  td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .registered { background: var(--green); }
+  .unregistered { background: var(--yellow); }
+  .online { background: var(--green); }
+  .offline { background: var(--red); }
+
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 3px; }
+  .badge-yes { background: #0d2818; color: var(--green); }
+  .badge-no { background: #2d1b1b; color: var(--yellow); }
+
+  button { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  button:hover { border-color: var(--blue); }
+  button.danger { border-color: var(--red); color: var(--red); }
+  button.danger:hover { background: #2d1b1b; }
+
+  input[type="text"] { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 4px; font-size: 12px; font-family: monospace; width: 160px; }
+  input[type="text"]:focus { border-color: var(--blue); outline: none; }
+
+  #login-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; display: flex; align-items: center; justify-content: center; }
+  #login-overlay .card { width: 380px; text-align: center; }
+  #login-overlay input { width: 100%; padding: 8px 12px; margin: 12px 0; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font-size: 14px; font-family: monospace; }
+  #login-error { color: var(--red); font-size: 12px; margin-top: 8px; }
+
+  .stats { display: flex; gap: 24px; margin-bottom: 16px; }
+  .stat { text-align: center; }
+  .stat-value { font-size: 28px; font-weight: bold; }
+  .stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+
+  .msg { font-size: 12px; margin-top: 8px; padding: 6px 10px; border-radius: 4px; display: none; }
+  .msg-ok { background: #0d2818; color: var(--green); }
+  .msg-err { background: #2d1b1b; color: var(--red); }
+</style>
+</head>
+<body>
+
+<div id="login-overlay" style="display:none;">
+  <div class="card">
+    <h2>SNITCH Access</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:8px;">Operator access required for inventory management</p>
+    <input type="password" id="key-input" placeholder="Enter API key" autofocus>
+    <button onclick="doLogin()" style="width:100%">Authenticate</button>
+    <p id="login-error" style="display:none"></p>
+  </div>
+</div>
+
+<h1>SNITCH Inventory</h1>
+<p class="subtitle"><a href="/">Dashboard</a> | Peer and gateway registration</p>
+
+<div class="stats" id="stats">
+  <div class="stat"><div class="stat-value" id="peer-total">-</div><div class="stat-label">Peers</div></div>
+  <div class="stat"><div class="stat-value" id="peer-registered">-</div><div class="stat-label">Registered</div></div>
+  <div class="stat"><div class="stat-value" id="gw-total">-</div><div class="stat-label">Gateways</div></div>
+  <div class="stat"><div class="stat-value" id="gw-registered">-</div><div class="stat-label">GW Registered</div></div>
+</div>
+
+<div class="card">
+  <h2>Peers</h2>
+  <p style="color:var(--muted);font-size:12px;margin-bottom:12px;">All peers discovered via netbird mesh. Set aliases to identify devices by name.</p>
+  <div id="peer-table"></div>
+</div>
+
+<div class="card">
+  <h2>Gateways</h2>
+  <p style="color:var(--muted);font-size:12px;margin-bottom:12px;">Network gateways detected by probes. Set aliases to identify locations/hardware.</p>
+  <div id="gw-table"></div>
+</div>
+
+<div id="status-msg" class="msg"></div>
+
+<script>
+let authKey = localStorage.getItem('snitch_key') || '';
+
+function showLogin() { document.getElementById('login-overlay').style.display = 'flex'; }
+function hideLogin() { document.getElementById('login-overlay').style.display = 'none'; }
+
+async function authFetch(url, opts = {}) {
+  if (authKey) opts.headers = Object.assign(opts.headers || {}, { 'Authorization': 'Bearer ' + authKey });
+  const resp = await fetch(url, opts);
+  if (resp.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  return resp;
+}
+
+async function doLogin() {
+  const key = document.getElementById('key-input').value.trim();
+  const errEl = document.getElementById('login-error');
+  try {
+    const resp = await fetch('/api/mesh', { headers: { 'Authorization': 'Bearer ' + key } });
+    if (resp.ok) {
+      authKey = key;
+      localStorage.setItem('snitch_key', key);
+      hideLogin();
+      errEl.style.display = 'none';
+      refresh();
+    } else {
+      errEl.textContent = 'Invalid key'; errEl.style.display = 'block';
+    }
+  } catch (e) { errEl.textContent = 'Connection error'; errEl.style.display = 'block'; }
+}
+document.getElementById('key-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+function showMsg(text, ok) {
+  const el = document.getElementById('status-msg');
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 4000);
+}
+
+function shortName(fqdn) { return fqdn ? fqdn.split('.')[0] : '?'; }
+function timeAgo(ts) {
+  const d = Date.now() - new Date(ts).getTime();
+  if (d < 60000) return Math.round(d/1000) + 's ago';
+  if (d < 3600000) return Math.round(d/60000) + 'm ago';
+  return Math.round(d/3600000) + 'h ago';
+}
+
+async function setAlias(entityType, entityKey, inputId) {
+  const alias = document.getElementById(inputId).value.trim();
+  if (!alias) return;
+  try {
+    const r = await authFetch('/api/aliases', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: entityType, entity_key: entityKey, alias: alias })
+    });
+    if (r.ok) { showMsg('Alias saved: ' + alias, true); refresh(); }
+    else showMsg('Failed: ' + await r.text(), false);
+  } catch (e) { if (e.message !== 'unauthorized') showMsg('Error: ' + e.message, false); }
+}
+
+async function removeAlias(entityType, entityKey) {
+  try {
+    const r = await authFetch('/api/aliases?type=' + entityType + '&key=' + encodeURIComponent(entityKey), { method: 'DELETE' });
+    if (r.ok) { showMsg('Alias removed', true); refresh(); }
+    else showMsg('Failed: ' + await r.text(), false);
+  } catch (e) { if (e.message !== 'unauthorized') showMsg('Error: ' + e.message, false); }
+}
+
+function renderPeers(state) {
+  const el = document.getElementById('peer-table');
+  const aliases = state.aliases || {};
+
+  // Collect all known peers: probes (reporting peers) + measurement targets
+  const peerMap = new Map();
+  for (const [ip, report] of Object.entries(state.probes || {})) {
+    peerMap.set(ip, { ip, name: report.peer_name, online: true, reporting: true, network: report.network, lastSeen: report.timestamp });
+  }
+  for (const report of Object.values(state.probes || {})) {
+    for (const m of (report.peers || [])) {
+      if (!peerMap.has(m.peer_ip)) {
+        peerMap.set(m.peer_ip, { ip: m.peer_ip, name: m.peer_name, online: m.connected, reporting: false, lastSeen: report.timestamp });
+      } else {
+        const existing = peerMap.get(m.peer_ip);
+        if (m.connected) existing.online = true;
+      }
+    }
+  }
+
+  const peers = [...peerMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+  let regCount = 0;
+
+  let h = '<table><thead><tr><th>Status</th><th>Peer FQDN</th><th>Mesh IP</th><th>Network</th><th>Alias</th><th>Registered</th><th>Action</th></tr></thead><tbody>';
+  for (const p of peers) {
+    const alias = aliases['peer:' + p.ip] || '';
+    const isReg = alias !== '';
+    if (isReg) regCount++;
+    const sn = shortName(p.name);
+    const netType = p.network ? (p.network.interface_type || '-') : '-';
+    const asn = p.network ? (p.network.asn_org || p.network.asn || '') : '';
+    const netLabel = netType + (asn ? ' (' + asn + ')' : '');
+    const inputId = 'alias-peer-' + p.ip.replace(/\./g, '-');
+    const statusDot = '<span class="status-dot ' + (p.online ? 'online' : 'offline') + '"></span>';
+    const probeBadge = p.reporting ? ' <span style="color:var(--blue);font-size:10px">[probe]</span>' : '';
+
+    h += '<tr>';
+    h += '<td>' + statusDot + (p.online ? 'Online' : 'Offline') + '</td>';
+    h += '<td title="' + p.name + '">' + sn + probeBadge + '</td>';
+    h += '<td style="font-family:monospace;font-size:12px">' + p.ip + '</td>';
+    h += '<td style="font-size:12px">' + netLabel + '</td>';
+    h += '<td><input type="text" id="' + inputId + '" value="' + alias + '" placeholder="e.g. AGX-Orin-1"></td>';
+    h += '<td>' + (isReg ? '<span class="badge badge-yes">Yes</span>' : '<span class="badge badge-no">No</span>') + '</td>';
+    h += '<td><button onclick="setAlias(\'peer\',\'' + p.ip + '\',\'' + inputId + '\')">Save</button>';
+    if (isReg) h += ' <button class="danger" onclick="removeAlias(\'peer\',\'' + p.ip + '\')">Remove</button>';
+    h += '</td></tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+
+  document.getElementById('peer-total').textContent = peers.length;
+  document.getElementById('peer-registered').textContent = regCount;
+}
+
+function renderGateways(state) {
+  const el = document.getElementById('gw-table');
+  const aliases = state.aliases || {};
+  const gateways = Object.values(state.gateways || {});
+
+  if (gateways.length === 0) {
+    el.innerHTML = '<p style="color:var(--muted)">No gateways detected yet. Run a probe to discover gateways.</p>';
+    document.getElementById('gw-total').textContent = '0';
+    document.getElementById('gw-registered').textContent = '0';
+    return;
+  }
+
+  let regCount = 0;
+  let h = '<table><thead><tr><th>Gateway IP</th><th>MAC</th><th>Auto-Detected</th><th>Subnet</th><th>Peers Behind</th><th>RTT</th><th>Alias</th><th>Registered</th><th>Action</th></tr></thead><tbody>';
+  for (const gw of gateways) {
+    const alias = aliases['gateway:' + gw.ip] || '';
+    const isReg = alias !== '';
+    if (isReg) regCount++;
+    const hw = [gw.manufacturer, gw.model].filter(Boolean).join(' ') || '-';
+    const peerNames = (gw.peers || []).map(ip => {
+      const p = (state.probes || {})[ip];
+      return p ? shortName(p.peer_name) : ip;
+    }).join(', ');
+    const inputId = 'alias-gw-' + gw.ip.replace(/\./g, '-');
+
+    h += '<tr>';
+    h += '<td style="font-family:monospace;font-size:12px">' + gw.ip + '</td>';
+    h += '<td style="font-family:monospace;font-size:11px;color:var(--muted)">' + (gw.mac || '-') + '</td>';
+    h += '<td>' + hw + '</td>';
+    h += '<td style="font-family:monospace;font-size:12px">' + (gw.subnet || '-') + '</td>';
+    h += '<td style="font-size:12px">' + (peerNames || '-') + '</td>';
+    h += '<td>' + (gw.avg_rtt_ms > 0 ? gw.avg_rtt_ms.toFixed(1) + 'ms' : '-') + '</td>';
+    h += '<td><input type="text" id="' + inputId + '" value="' + alias + '" placeholder="e.g. the satellite link"></td>';
+    h += '<td>' + (isReg ? '<span class="badge badge-yes">Yes</span>' : '<span class="badge badge-no">No</span>') + '</td>';
+    h += '<td><button onclick="setAlias(\'gateway\',\'' + gw.ip + '\',\'' + inputId + '\')">Save</button>';
+    if (isReg) h += ' <button class="danger" onclick="removeAlias(\'gateway\',\'' + gw.ip + '\')">Remove</button>';
+    h += '</td></tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+
+  document.getElementById('gw-total').textContent = gateways.length;
+  document.getElementById('gw-registered').textContent = regCount;
+}
+
+async function refresh() {
+  try {
+    const r = await authFetch('/api/mesh');
+    const state = await r.json();
+    renderPeers(state);
+    renderGateways(state);
+  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+}
+
+refresh();
+</script>
+</body>
+</html>

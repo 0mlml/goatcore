@@ -1,0 +1,71 @@
+# SNITCH — mesh network performance monitor (prod-tree variant for Orin-C).
+#
+# Different from docker-compose.yml (the dev-tree NETHOST variant) in three
+# ways:
+#
+#   1. No Traefik integration — wg-cp0 provides the encryption layer
+#      (silent control plane, ADR 0313). Probes connect via plain HTTP
+#      over wg-cp0; the WireGuard tunnel IS the TLS-equivalent.
+#   2. Port published directly on :8080 host:host so probes hit
+#      `http://198.18.0.9:8080` or `http://snitch.vega.netbird-prod.goat.example:8080`.
+#   3. No external Traefik network — uses an internal docker bridge.
+#
+# Same snitch image + same snitch-db postgres + same volume + cap_add
+# pattern as the dev-tree variant. Deploy via ops/ansible/vega-c-snitch.yml.
+
+services:
+  snitch-db:
+    container_name: snitch-db
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: snitch
+      POSTGRES_USER: snitch
+      POSTGRES_PASSWORD: ${SNITCH_DB_PASS}
+    volumes:
+      - snitch-db-data:/var/lib/postgresql/data
+    networks:
+      - snitch
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
+  snitch:
+    container_name: snitch
+    image: snitch:latest
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - snitch-db
+    command: >-
+      snitch serve
+      --addr :8080
+      --key-file /app/data/identity.key
+    environment:
+      - SNITCH_DB_URL=postgres://snitch:${SNITCH_DB_PASS}@snitch-db:5432/snitch?sslmode=disable
+    cap_add:
+      - NET_RAW
+    ports:
+      # Bind on all ifaces — wg-cp0 reach is the on-mesh path, but we
+      # don't need to scope tighter here because wg-cp0 IS the trust
+      # boundary (ADR 0313). LAN-side reach is fine too — same trust
+      # substrate as the rest of the obs+utility services on Orin-C.
+      - "0.0.0.0:8080:8080"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - snitch
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+
+volumes:
+  snitch-db-data:
+
+networks:
+  snitch:
+    driver: bridge

@@ -1,0 +1,116 @@
+---
+# Config render accountability (CF-4): is a watched rendered file what the last
+# converge rendered, or is it something no converge explains?
+#
+# These cases pin `account_for_render`, FROM A NODE'S OWN FACTS ONLY — one
+# render record: the file's hash now, and the hash the last converge recorded
+# after rendering it (/var/lib/goat/<component>/render-manifest.json, written
+# AFTER the templates land, so position rather than reconciliation makes it a
+# post-render fact). No generation appears here on purpose: a per-host render is
+# a function of host vars and env lookups no repo-side reader may evaluate, so
+# the intent artifact carries WHICH paths are a component's render identity
+# (`render_watch`) and the node's own last converge carries WHAT they hashed to.
+#
+# The distinction these cases exist for is the §9 CF-4 gate: a hand-edited
+# rendered file is `unaccountable` — no converge explains the bytes on disk —
+# and NEVER `SKEW`, because a render has no generation to be "behind". Its
+# remediation is pinned in rows.yaml: `reconverge`, not `rollback`, because
+# rollback targets the prior ledger generation while the file belongs to the
+# current one, and the idempotent re-render IS the undo (engineering-baseline.md
+# §2.2). The hash pair is already on the wire before the grade exists, so the
+# re-run does not destroy the evidence the way an unexplained image ref's
+# runtime state would be destroyed.
+
+- name: untouched-render-is-what-the-converge-rendered
+  why_this_case: >-
+    The baseline green. The file on disk hashes to exactly what the last
+    converge recorded, so the render is accounted for. Whether that converge is
+    against the CURRENT generation is the generation row's question — a render
+    row must not double-grade it.
+  record:
+    component: nova-zenoh
+    path: /opt/zagros-sandbox-zenoh/docker-compose.yml
+    sha256: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    recorded_sha256: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    note: ""
+  expect:
+    cell:
+      state: resolved
+      value: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    grade: match
+
+- name: hand-edited-render-is-unaccountable
+  why_this_case: >-
+    THE CF-4 gate case. The file hashes to something the last converge did not
+    render — a hand-edit, the exact out-of-SoT mutation the persistent-state
+    rule bans and nothing detected until this increment. It must grade
+    `unaccountable` (no converge explains the bytes) and never `SKEW` (a render
+    has no generation to be behind).
+  record:
+    component: nova-zenoh
+    path: /opt/zagros-sandbox-zenoh/docker-compose.yml
+    sha256: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    recorded_sha256: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    note: ""
+  expect:
+    cell:
+      state: unaccountable
+      value: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      detail: "/opt/zagros-sandbox-zenoh/docker-compose.yml hashes to 222222222222 but the last converge rendered 111111111111 — no converge explains the bytes on disk"
+    grade: unaccountable
+
+- name: deleted-render-is-unaccountable-not-merely-unreadable
+  why_this_case: >-
+    A watched file the converge rendered and that is now GONE is drift, not a
+    read failure: the collector distinguishes "missing" from "could not read",
+    and absence of a file the converge produced is explained by no converge.
+    Folding it into `unreadable` would let deletion hide behind a permissions
+    excuse.
+  record:
+    component: nova-zenoh
+    path: /opt/zagros-sandbox-zenoh/docker-compose.yml
+    sha256: ""
+    recorded_sha256: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    note: "missing"
+  expect:
+    cell:
+      state: unaccountable
+      detail: "/opt/zagros-sandbox-zenoh/docker-compose.yml is gone — the last converge rendered it (111111111111) and no converge explains its absence"
+    grade: unaccountable
+
+- name: unreadable-now-is-ungrounded-not-a-verdict
+  why_this_case: >-
+    The collector read the manifest but could not read the file (permissions,
+    I/O). That is read-and-not-evaluable — `unreadable`, idle, never green and
+    never red. A verdict fabricated from a failed read would be a guess wearing
+    a grade.
+  record:
+    component: nova-zenoh
+    path: /opt/zagros-sandbox-zenoh/docker-compose.yml
+    sha256: ""
+    recorded_sha256: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    note: "unreadable"
+  expect:
+    cell:
+      state: unreadable
+      detail: "/opt/zagros-sandbox-zenoh/docker-compose.yml could not be read at collection time (unreadable)"
+    grade: unreadable
+
+- name: unhashable-at-converge-has-no-baseline
+  why_this_case: >-
+    The deploying role recorded that it could NOT hash a declared file when it
+    rendered (the fail-closed arm of the recorder: a declared path that cannot
+    be hashed is recorded as such, never silently omitted). With no
+    converge-time baseline there is nothing to compare the current bytes
+    against, whatever they are — `unreadable`, not a coin-flip.
+  record:
+    component: nova-zenoh
+    path: /opt/zagros-sandbox-zenoh/docker-compose.yml
+    sha256: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    recorded_sha256: ""
+    note: "missing at converge"
+  expect:
+    cell:
+      state: unreadable
+      detail: "no converge-time hash for /opt/zagros-sandbox-zenoh/docker-compose.yml — the deploying role could not hash it when it rendered (missing at converge)"
+    grade: unreadable

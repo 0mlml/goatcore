@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNITCH — Mesh Performance</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --green: #3fb950;
+    --yellow: #d29922; --red: #f85149; --blue: #58a6ff;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: var(--bg); color: var(--text); padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  .full { grid-column: 1 / -1; }
+
+  table.matrix { border-collapse: collapse; font-size: 12px; width: 100%; }
+  table.matrix th, table.matrix td { padding: 6px 8px; border: 1px solid var(--border); text-align: center; white-space: nowrap; }
+  table.matrix th { background: var(--surface); color: var(--muted); font-weight: 500; }
+  table.matrix td.self { background: var(--border); color: var(--muted); }
+  .matrix-wrap { overflow-x: auto; }
+
+  .path-lan { background: #0d2818; color: var(--green); }
+  .path-5g { background: #0d2818; color: var(--green); }
+  .path-internet { background: #1a1f2e; color: var(--blue); }
+  .path-starlink { background: #2d1f0d; color: #f0a030; border: 1px dashed #f0a030; }
+  .path-starlink-badge { display:inline-block;font-size:8px;background:#f0a030;color:#000;padding:1px 3px;border-radius:2px;font-weight:bold;letter-spacing:0.3px; }
+  .path-relayed { background: #2d1b1b; color: var(--yellow); }
+  .path-unknown { background: var(--surface); color: var(--muted); }
+  .path-unreachable { background: #1c0d0d; color: var(--red); }
+
+  table.peers { border-collapse: collapse; font-size: 13px; width: 100%; }
+  table.peers th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 500; }
+  table.peers td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .online { background: var(--green); }
+  .offline { background: var(--red); }
+
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 4px; }
+  .legend-swatch { width: 12px; height: 12px; border-radius: 2px; }
+
+  .stats { display: flex; gap: 24px; margin-bottom: 16px; }
+  .stat { text-align: center; }
+  .stat-value { font-size: 28px; font-weight: bold; }
+  .stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+
+  .refresh { font-size: 11px; color: var(--muted); text-align: right; }
+  button { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  button:hover { border-color: var(--blue); }
+  button.active { border-color: var(--blue); background: #1a1f2e; }
+  .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+
+  .range-bar { display: flex; gap: 4px; margin-bottom: 16px; }
+  .range-bar button { font-size: 11px; padding: 4px 10px; }
+
+  #login-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; display: flex; align-items: center; justify-content: center; }
+  #login-overlay .card { width: 380px; text-align: center; }
+  #login-overlay input { width: 100%; padding: 8px 12px; margin: 12px 0; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 4px; font-size: 14px; font-family: monospace; }
+  #login-error { color: var(--red); font-size: 12px; margin-top: 8px; }
+
+  .event-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .event-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .event-time { color: var(--muted); white-space: nowrap; min-width: 80px; }
+  .event-time-local { color: var(--muted); white-space: nowrap; min-width: 70px; opacity: 0.5; }
+  .event-msg { flex: 1; }
+
+  .uptime-bar-wrap { width: 80px; height: 10px; background: var(--border); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 6px; }
+  .uptime-bar-fill { height: 100%; border-radius: 3px; }
+
+  #chart-wrap { position: relative; height: 200px; }
+
+  #link-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 90; display: none; align-items: flex-start; justify-content: center; padding-top: 60px; overflow-y: auto; }
+  #link-modal .modal-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; width: 640px; max-width: 95vw; position: relative; }
+  #link-modal .modal-close { position: absolute; top: 10px; right: 14px; background: none; border: none; color: var(--muted); font-size: 20px; cursor: pointer; padding: 4px 8px; }
+  #link-modal .modal-close:hover { color: var(--text); }
+  #link-modal h3 { font-size: 16px; margin-bottom: 16px; }
+  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .detail-section { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+  .detail-section h4 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .detail-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
+  .detail-row .label { color: var(--muted); }
+  .detail-row .value { font-family: monospace; }
+  .detail-full { grid-column: 1 / -1; }
+  .path-explain { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 16px; font-size: 12px; line-height: 1.6; }
+  .path-explain .path-title { font-weight: bold; margin-bottom: 6px; font-size: 13px; }
+  .path-explain-starlink { border-color: #f0a030; background: #1a1308; }
+  .path-diagram { font-family: monospace; font-size: 11px; color: var(--muted); white-space: pre; line-height: 1.4; margin: 8px 0; }
+  table.matrix td { cursor: pointer; }
+  table.matrix td.self { cursor: default; }
+  .gate-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; letter-spacing: .05em; vertical-align: middle; margin-left: 8px; cursor: pointer; position: relative; }
+  .gate-open { background: #0d2818; color: var(--green); border: 1px solid rgba(63,185,80,.25); }
+  .gate-closed { background: #3d1117; color: var(--red); border: 1px solid rgba(248,81,73,.25); }
+  .gate-unknown { background: #2d1f00; color: var(--yellow); border: 1px solid rgba(210,153,34,.25); }
+  .gate-info { display: none; position: absolute; top: calc(100% + 8px); left: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; width: 340px; font-size: 12px; font-weight: 400; letter-spacing: normal; text-transform: none; color: var(--text); z-index: 100; line-height: 1.5; box-shadow: 0 4px 12px rgba(0,0,0,.4); }
+  .gate-info.visible { display: block; }
+  .gate-info p { margin-bottom: 8px; }
+  .gate-info p:last-child { margin-bottom: 0; }
+  .gate-info strong { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .gate-info code { background: var(--bg); padding: 2px 5px; border-radius: 3px; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<div id="login-overlay" style="display:none;">
+  <div class="card">
+    <h2>SNITCH Access</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:8px;">Synthetic Network Inspection: Topology, Connectivity, Health</p>
+    <input type="password" id="key-input" placeholder="Enter API key" autofocus>
+    <button onclick="doLogin()" style="width:100%">Authenticate</button>
+    <p id="login-error" style="display:none"></p>
+  </div>
+</div>
+
+<h1>SNITCH <span id="gate-status" class="gate-badge gate-unknown" onclick="toggleGateInfo(event)"><span id="gate-label">GATE ?</span><div id="gate-info" class="gate-info"><p><strong>Bridge status</strong></p><p>Summarizes bridge-forwarded external access. See <a href="https://gatewatch.netbird.legacy.example/" target="_blank" style="color: var(--blue); text-decoration: underline;">gatewatch</a> for per-bridge authorized CIDRs, ports, and last-verified dates.</p><p><strong>Source</strong></p><p><code>ops/gatewatch/bridges.yaml</code> — hand-maintained, not live AWS SG state.</p></div></span></h1>
+<p class="subtitle">Synthetic Network Inspection: Topology, Connectivity, Health | <a href="/inventory" style="color:var(--blue);text-decoration:none">Inventory</a></p>
+
+<div class="controls">
+  <div class="stats" id="stats">
+    <div class="stat"><div class="stat-value" id="probe-count">-</div><div class="stat-label">Probes</div></div>
+    <div class="stat"><div class="stat-value" id="link-count">-</div><div class="stat-label">Links</div></div>
+    <div class="stat"><div class="stat-value" id="direct-pct">-</div><div class="stat-label">Direct</div></div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px;">
+    <button id="probe-btn" onclick="runProbe()">Run Probe</button>
+    <button onclick="refresh()">Refresh</button>
+    <span id="probe-status" style="font-size:12px;color:var(--muted);display:none;"></span>
+  </div>
+</div>
+
+<div class="range-bar" id="range-bar">
+  <button onclick="setRange('1h')">1h</button>
+  <button onclick="setRange('6h')">6h</button>
+  <button onclick="setRange('24h')" class="active">24h</button>
+  <button onclick="setRange('7d')">7d</button>
+  <button onclick="setRange('30d')">30d</button>
+</div>
+
+<div class="grid">
+  <div class="card full">
+    <h2>Latency Trend</h2>
+    <div id="chart-wrap"><canvas id="trend-chart"></canvas></div>
+    <div id="chart-fallback" style="display:none;color:var(--muted);font-size:12px;padding:20px 0;text-align:center;">Charts require internet access (Chart.js CDN)</div>
+  </div>
+
+  <div class="card full">
+    <h2>Mesh Matrix</h2>
+    <div class="matrix-wrap" id="matrix"></div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch path-lan"></div> LAN (&lt;2ms)</div>
+      <div class="legend-item"><div class="legend-swatch path-5g"></div> 5G (5-20ms)</div>
+      <div class="legend-item"><div class="legend-swatch path-internet"></div> Internet (20-80ms)</div>
+      <div class="legend-item"><div class="legend-swatch path-starlink"></div> Satellite (40-120ms+)</div>
+      <div class="legend-item"><div class="legend-swatch path-relayed"></div> Relayed (100-300ms)</div>
+      <div class="legend-item"><div class="legend-swatch path-unreachable"></div> Unreachable</div>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h2>Peer Measurements</h2>
+    <div id="peer-detail" style="overflow-x:auto;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Active Probes</h2>
+    <div id="peers"></div>
+  </div>
+
+  <div class="card">
+    <h2>Path Summary</h2>
+    <div id="path-summary"></div>
+  </div>
+
+  <div class="card full">
+    <h2>Gateways</h2>
+    <div id="gateways"></div>
+  </div>
+
+  <div class="card full">
+    <h2>Events</h2>
+    <div id="events"></div>
+  </div>
+</div>
+
+<div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;">
+  <p class="refresh">Auto-refreshes every 30s</p>
+  <p class="refresh">Dashboard updated: <span id="last-update">-</span> | Last probe: <span id="last-probe" style="font-weight:bold;">-</span></p>
+</div>
+
+<div id="link-modal">
+  <div class="modal-card">
+    <button class="modal-close" onclick="closeLinkModal()">&times;</button>
+    <div id="link-modal-content"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4" onerror="window._noChart=true"></script>
+<script>
+let authKey = localStorage.getItem('snitch_key') || '';
+let currentRange = '24h';
+let trendChart = null;
+let currentState = null; // global for drill-down access
+
+// --- Auth ---
+function showLogin() { document.getElementById('login-overlay').style.display = 'flex'; }
+function hideLogin() { document.getElementById('login-overlay').style.display = 'none'; }
+
+async function authFetch(url, opts = {}) {
+  if (authKey) {
+    opts.headers = Object.assign(opts.headers || {}, { 'Authorization': 'Bearer ' + authKey });
+  }
+  const resp = await fetch(url, opts);
+  if (resp.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  return resp;
+}
+
+async function doLogin() {
+  const key = document.getElementById('key-input').value.trim();
+  const errEl = document.getElementById('login-error');
+  try {
+    const resp = await fetch('/api/mesh', { headers: { 'Authorization': 'Bearer ' + key } });
+    if (resp.ok) {
+      authKey = key;
+      localStorage.setItem('snitch_key', key);
+      hideLogin();
+      errEl.style.display = 'none';
+      refresh();
+    } else {
+      errEl.textContent = 'Invalid key'; errEl.style.display = 'block';
+    }
+  } catch (e) { errEl.textContent = 'Connection error'; errEl.style.display = 'block'; }
+}
+document.getElementById('key-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// --- Data fetching ---
+async function fetchJSON(url) {
+  try { const r = await authFetch(url); return await r.json(); }
+  catch (e) { if (e.message !== 'unauthorized') console.error(url, e); return null; }
+}
+
+// --- Rendering helpers ---
+let meshAliases = {};
+function shortName(fqdn, ip) {
+  if (ip && meshAliases['peer:'+ip]) return meshAliases['peer:'+ip];
+  return fqdn ? fqdn.split('.')[0] : '?';
+}
+function gwAlias(ip) { return meshAliases['gateway:'+ip] || ''; }
+function pathClass(p) { return ({ lan:'path-lan','5g':'path-5g',internet:'path-internet',starlink:'path-starlink',relayed:'path-relayed' })[p] || 'path-unknown'; }
+function zuluTime(d) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}Z`;
+}
+function zuluDateTime(d) {
+  const pad = n => String(n).padStart(2, '0');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${pad(d.getUTCDate())} ${months[d.getUTCMonth()]} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}Z`;
+}
+function timeAgo(ts) {
+  const d = Date.now() - new Date(ts).getTime();
+  if (d < 60000) return Math.round(d/1000) + 's ago';
+  if (d < 3600000) return Math.round(d/60000) + 'm ago';
+  return Math.round(d/3600000) + 'h ago';
+}
+
+// --- Mesh Matrix ---
+function renderMatrix(state) {
+  const el = document.getElementById('matrix');
+  if (!state || !state.links || state.links.length === 0) {
+    el.innerHTML = '<p style="color:var(--muted)">No probe data yet.</p>'; return;
+  }
+  const pm = new Map();
+  for (const r of Object.values(state.probes || {})) {
+    pm.set(r.peer_ip, shortName(r.peer_name, r.peer_ip));
+    for (const m of r.peers || []) { if (!pm.has(m.peer_ip)) pm.set(m.peer_ip, shortName(m.peer_name, m.peer_ip)); }
+  }
+  const ips = [...pm.keys()].sort();
+  const lm = {};
+  for (const l of state.links) lm[l.from_ip+'>'+l.to_ip] = l;
+  let h = '<table class="matrix"><thead><tr><th></th>';
+  for (const ip of ips) h += '<th title="'+ip+'">'+pm.get(ip)+'</th>';
+  h += '</tr></thead><tbody>';
+  for (const fi of ips) {
+    h += '<tr><th title="'+fi+'">'+pm.get(fi)+'</th>';
+    for (const ti of ips) {
+      if (fi === ti) { h += '<td class="self">-</td>'; continue; }
+      const l = lm[fi+'>'+ti];
+      if (!l) { h += '<td class="path-unreachable" onclick="showLinkDetail(\''+fi+'\',\''+ti+'\')" title="No measurement — click for details">-</td>'; continue; }
+      const lat = l.latency_ms > 0 ? l.latency_ms.toFixed(1) : '-';
+      const transport = l.direct ? 'P2P' : 'Relay';
+      const pathLabel = l.path_type || 'unknown';
+      const isStar = l.path_type === 'starlink';
+      const starTitle = isStar ? 'SATELLITE — click for details | ' : '';
+      h += '<td class="'+pathClass(l.path_type)+'" onclick="showLinkDetail(\''+fi+'\',\''+ti+'\')" title="'+starTitle+pathLabel+' | '+transport+' | '+lat+'ms — click for details">'
+        +'<div style="font-size:11px;line-height:1.3">'+lat+'<span style="font-size:9px;opacity:0.7">ms</span></div>'
+        +'<div style="font-size:9px;opacity:0.7">'+transport+'</div>'
+        +(isStar?'<div class="path-starlink-badge">SAT</div>':'')+'</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+// --- Active Probes ---
+function renderPeers(state, uptimeData) {
+  const el = document.getElementById('peers');
+  if (!state || !state.probes || Object.keys(state.probes).length === 0) {
+    el.innerHTML = '<p style="color:var(--muted)">No probes reporting.</p>'; return;
+  }
+  const uptimeMap = {};
+  if (uptimeData) for (const u of uptimeData) uptimeMap[u.peer_name] = u.uptime_pct;
+
+  let h = '<table class="peers"><thead><tr><th>Peer</th><th>Network</th><th>Gateway</th><th>Uptime</th><th>Last</th></tr></thead><tbody>';
+  for (const r of Object.values(state.probes)) {
+    const name = shortName(r.peer_name, r.peer_ip);
+    const net = r.network || {};
+    const gw = net.gateway || {};
+    const gwAl = net.gateway_ip ? gwAlias(net.gateway_ip) : '';
+    const gwLabel = gwAl || (gw.manufacturer ? (gw.model ? gw.manufacturer+' '+gw.model : gw.manufacturer) : (net.gateway_ip || '-'));
+    const ago = timeAgo(r.timestamp);
+    const on = (Date.now() - new Date(r.timestamp).getTime()) < 120000;
+    const up = uptimeMap[r.peer_name];
+    const upStr = up !== undefined ? up.toFixed(0)+'%' : '-';
+    const upColor = up >= 95 ? 'var(--green)' : up >= 80 ? 'var(--yellow)' : 'var(--red)';
+    const upBar = up !== undefined ? '<div class="uptime-bar-wrap"><div class="uptime-bar-fill" style="width:'+up+'%;background:'+upColor+'"></div></div>'+upStr : '-';
+    h += '<tr><td><span class="status-dot '+(on?'online':'offline')+'"></span>'+name+'</td>';
+    h += '<td>'+( net.interface_type||'?')+(net.asn_org?' ('+net.asn_org+')':'')+'</td>';
+    h += '<td title="'+(gw.mac||'')+'" style="font-size:12px">'+gwLabel+'</td>';
+    h += '<td>'+upBar+'</td>';
+    h += '<td style="color:var(--muted)">'+ago+'</td></tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+// --- Path Summary ---
+function renderPathSummary(state) {
+  const el = document.getElementById('path-summary');
+  if (!state || !state.links || state.links.length === 0) { el.innerHTML = '<p style="color:var(--muted)">No path data.</p>'; return; }
+  const counts = {};
+  for (const l of state.links) counts[l.path_type||'unknown'] = (counts[l.path_type||'unknown']||0)+1;
+  let h = '<table class="peers"><thead><tr><th>Path</th><th>Count</th><th>Avg</th></tr></thead><tbody>';
+  for (const [t,c] of Object.entries(counts).sort((a,b)=>b[1]-a[1])) {
+    const ls = state.links.filter(l=>l.path_type===t && l.latency_ms>0);
+    const avg = ls.length ? (ls.reduce((s,l)=>s+l.latency_ms,0)/ls.length).toFixed(1)+'ms' : '-';
+    h += '<tr><td><span class="legend-swatch '+pathClass(t)+'" style="display:inline-block;vertical-align:middle;margin-right:6px"></span>'+t+'</td><td>'+c+'</td><td>'+avg+'</td></tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderPeerDetail(state) {
+  const el = document.getElementById('peer-detail');
+  if (!state || !state.probes || Object.keys(state.probes).length === 0) {
+    el.innerHTML = '<p style="color:var(--muted)">No measurements yet. Click Run Probe.</p>'; return;
+  }
+  let rows = [];
+  for (const report of Object.values(state.probes)) {
+    const from = shortName(report.peer_name, report.peer_ip);
+    for (const m of (report.peers || [])) {
+      // Find the link to get path_type
+      const link = (state.links || []).find(l => l.from_ip === report.peer_ip && l.to_ip === m.peer_ip);
+      rows.push({ from, to: shortName(m.peer_name, m.peer_ip), toIP: m.peer_ip, connected: m.connected, direct: m.direct,
+        latency: m.latency_ms, jitter: m.jitter_ms, loss: m.loss_pct, p95: m.p95_ms,
+        pathType: link ? link.path_type : (m.connected ? (m.direct ? 'internet' : 'relayed') : 'unknown'),
+        timestamp: report.timestamp });
+    }
+  }
+  // Sort: connected first, then by latency
+  rows.sort((a,b) => (b.connected - a.connected) || (a.latency - b.latency));
+
+  let h = '<table class="peers"><thead><tr><th>From</th><th>To</th><th>Status</th><th>Transport</th><th>Path</th><th>Latency</th><th>P95</th><th>Jitter</th><th>Loss</th></tr></thead><tbody>';
+  for (const r of rows) {
+    const st = r.connected ? '<span class="status-dot online"></span>Up' : '<span class="status-dot offline"></span>Down';
+    const transport = r.connected ? (r.direct ? '<span style="color:var(--green)">P2P</span>' : '<span style="color:var(--yellow)">Relayed</span>') : '<span style="color:var(--muted)">-</span>';
+    const pc = pathClass(r.pathType);
+    const isStar = r.pathType === 'starlink';
+    const pathLabel = r.connected ? '<span class="'+pc+'" style="padding:2px 6px;border-radius:3px;font-size:11px">'+r.pathType+'</span>'+(isStar?' <span class="path-starlink-badge">SAT</span>':'') : '-';
+    const lat = r.latency > 0 ? r.latency.toFixed(1)+'ms' : '-';
+    const p95 = r.p95 > 0 ? r.p95.toFixed(1)+'ms' : '-';
+    const jit = r.jitter > 0 ? r.jitter.toFixed(1)+'ms' : '-';
+    const loss = r.connected ? r.loss.toFixed(0)+'%' : '-';
+    const lossColor = r.loss > 5 ? 'var(--red)' : r.loss > 1 ? 'var(--yellow)' : 'var(--text)';
+    const rowStyle = isStar ? ' style="background:#1a1308"' : '';
+    h += '<tr'+rowStyle+'><td>'+r.from+'</td><td title="'+r.toIP+'">'+r.to+'</td><td>'+st+'</td><td>'+transport+'</td><td>'+pathLabel+'</td>';
+    h += '<td>'+lat+'</td><td>'+p95+'</td><td>'+jit+'</td><td style="color:'+lossColor+'">'+loss+'</td></tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderStats(state) {
+  const p = state && state.probes ? Object.keys(state.probes).length : 0;
+  const l = state && state.links ? state.links.length : 0;
+  const d = state && state.links ? state.links.filter(x=>x.direct).length : 0;
+  document.getElementById('probe-count').textContent = p;
+  document.getElementById('link-count').textContent = l;
+  document.getElementById('direct-pct').textContent = l > 0 ? Math.round(d/l*100)+'%' : '-';
+}
+
+function renderGateways(state) {
+  const el = document.getElementById('gateways');
+  if (!state || !state.gateways || Object.keys(state.gateways).length === 0) {
+    el.innerHTML = '<p style="color:var(--muted)">No gateway data.</p>'; return;
+  }
+  let h = '<table class="peers"><thead><tr><th>Gateway</th><th>Hardware</th><th>Subnet</th><th>Peers</th><th>RTT</th></tr></thead><tbody>';
+  for (const gw of Object.values(state.gateways)) {
+    const alias = gwAlias(gw.ip);
+    const gwLabel = alias ? alias + ' <span style="color:var(--muted);font-size:11px">('+gw.ip+')</span>' : '<span style="font-family:monospace;font-size:12px">'+gw.ip+'</span>';
+    const hw = [gw.manufacturer,gw.model].filter(Boolean).join(' ')||'-';
+    const mac = gw.mac ? ' <span style="color:var(--muted);font-size:11px">('+gw.mac+')</span>' : '';
+    const peers = (gw.peers||[]).map(ip => { const p = state.probes && state.probes[ip]; return p ? shortName(p.peer_name, ip) : ip; }).join(', ');
+    h += '<tr><td>'+gwLabel+'</td><td>'+hw+mac+'</td><td style="font-family:monospace;font-size:12px">'+(gw.subnet||'-')+'</td><td>'+(peers||'-')+'</td><td>'+(gw.avg_rtt_ms>0?gw.avg_rtt_ms.toFixed(1)+'ms':'-')+'</td></tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+// --- Trend Chart ---
+function renderTrend(data) {
+  if (window._noChart || typeof Chart === 'undefined') {
+    document.getElementById('chart-wrap').style.display = 'none';
+    document.getElementById('chart-fallback').style.display = 'block';
+    return;
+  }
+  const pts = (data && data.points) || [];
+  if (pts.length === 0) return;
+  const labels = pts.map(p => {
+    const d = new Date(p.ts * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    return currentRange === '7d' || currentRange === '30d'
+      ? zuluDateTime(d)
+      : `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}Z`;
+  });
+
+  const cfg = {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: 'Avg Latency (ms)', data: pts.map(p=>p.latency_avg), borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+        { label: 'P95 Latency (ms)', data: pts.map(p=>p.latency_p95), borderColor: '#bc8cff', backgroundColor: 'transparent', borderDash: [4,4], tension: 0.3, pointRadius: 0 },
+        { label: 'Loss %', data: pts.map(p=>p.loss), borderColor: '#f85149', backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, yAxisID: 'loss' }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { ticks: { color: '#8b949e', maxTicksLimit: 12 }, grid: { color: '#30363d' } },
+        y: { position: 'left', title: { display: true, text: 'ms', color: '#8b949e' }, ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+        loss: { position: 'right', min: 0, max: 100, title: { display: true, text: 'loss %', color: '#8b949e' }, ticks: { color: '#8b949e' }, grid: { drawOnChartArea: false } }
+      },
+      plugins: { legend: { labels: { color: '#e6edf3', boxWidth: 12, font: { size: 11 } } } }
+    }
+  };
+
+  if (trendChart) { trendChart.destroy(); }
+  trendChart = new Chart(document.getElementById('trend-chart'), cfg);
+}
+
+// --- Events ---
+
+// Netbird outage pairing: match _down events with their corresponding _up event
+// to compute outage durations.
+const outagePairs = {
+  netbird_mgmt_down: 'netbird_mgmt_up',
+  netbird_signal_down: 'netbird_signal_up',
+  netbird_relays_down: 'netbird_relays_up',
+};
+
+function pairOutages(evts) {
+  // For each peer+service, find the matching _up for each _down.
+  // Returns a map: event index → { endTs, durationSec }.
+  const durations = {};
+  const openOutages = {}; // key: "token:service" → down event index
+
+  // Walk chronologically (events come newest-first, so reverse).
+  const sorted = evts.map((e, i) => ({...e, _idx: i})).reverse();
+  for (const e of sorted) {
+    const service = e.event_type.replace(/_(down|up)$/, '');
+    const key = e.token + ':' + service;
+    if (e.event_type.endsWith('_down')) {
+      openOutages[key] = e;
+    } else if (e.event_type.endsWith('_up') && openOutages[key]) {
+      const down = openOutages[key];
+      const dur = e.ts - down.ts;
+      durations[down._idx] = { endTs: e.ts, durationSec: dur };
+      durations[e._idx] = { startTs: down.ts, durationSec: dur, isRecovery: true };
+      delete openOutages[key];
+    }
+  }
+  // Still-open outages (no _up yet).
+  for (const key in openOutages) {
+    const down = openOutages[key];
+    const dur = Math.floor(Date.now() / 1000) - down.ts;
+    durations[down._idx] = { endTs: null, durationSec: dur, ongoing: true };
+  }
+  return durations;
+}
+
+function fmtDuration(sec) {
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h + 'h ' + m + 'm';
+}
+
+function renderEvents(data) {
+  const el = document.getElementById('events');
+  const evts = (data && data.events) || [];
+  if (evts.length === 0) { el.innerHTML = '<p style="color:var(--muted)">No events in this range.</p>'; return; }
+
+  const colors = {
+    peer_online: 'var(--green)', peer_offline: 'var(--red)',
+    path_change: 'var(--yellow)', link_new: 'var(--blue)', link_lost: 'var(--red)',
+    netbird_mgmt_down: 'var(--red)', netbird_mgmt_up: 'var(--green)',
+    netbird_signal_down: 'var(--red)', netbird_signal_up: 'var(--green)',
+    netbird_relays_down: 'var(--red)', netbird_relays_up: 'var(--green)',
+  };
+  const labels = {
+    peer_online: 'online', peer_offline: 'offline',
+    path_change: 'path changed', link_new: 'new link', link_lost: 'link lost',
+    netbird_mgmt_down: 'management DOWN', netbird_mgmt_up: 'management recovered',
+    netbird_signal_down: 'signal DOWN', netbird_signal_up: 'signal recovered',
+    netbird_relays_down: 'all relays DOWN', netbird_relays_up: 'relays recovered',
+  };
+
+  const durations = pairOutages(evts);
+
+  let h = '';
+  for (let i = 0; i < Math.min(evts.length, 50); i++) {
+    const e = evts[i];
+    const ed = new Date(e.ts * 1000);
+    const tz = zuluTime(ed);
+    const tl = ed.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    const c = colors[e.event_type] || 'var(--muted)';
+    const peer = shortName(e.peer_name || e.token);
+    const target = e.target_name ? shortName(e.target_name) : '';
+    let msg = peer + ' ' + (labels[e.event_type]||e.event_type);
+    if (target) msg += ' \u2192 ' + target;
+    if (e.old_value && e.new_value) msg += ' (' + e.old_value + ' \u2192 ' + e.new_value + ')';
+
+    // Outage duration badge.
+    const dur = durations[i];
+    let badge = '';
+    if (dur && !dur.isRecovery) {
+      const durStr = fmtDuration(dur.durationSec);
+      if (dur.ongoing) {
+        badge = ' <span style="background:var(--red);color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold">ONGOING ' + durStr + '</span>';
+      } else {
+        const endDate = new Date(dur.endTs * 1000);
+        const endTz = zuluTime(endDate);
+        badge = ' <span style="background:#2d1b1b;color:var(--yellow);padding:1px 6px;border-radius:3px;font-size:10px">' + durStr + ' (until ' + endTz + ')</span>';
+      }
+    } else if (dur && dur.isRecovery) {
+      const durStr = fmtDuration(dur.durationSec);
+      badge = ' <span style="color:var(--muted);font-size:10px">outage was ' + durStr + '</span>';
+    }
+
+    const isOutage = e.event_type.endsWith('_down') || (dur && dur.ongoing);
+    const rowStyle = isOutage ? 'background:rgba(248,81,73,0.08);border-left:2px solid var(--red);padding-left:8px;' : '';
+
+    h += '<div class="event-row" style="'+rowStyle+'"><div class="event-dot" style="background:'+c+'"></div><div class="event-time">'+tz+'</div><div class="event-time-local">'+tl+'</div><div class="event-msg">'+msg+badge+'</div></div>';
+  }
+  el.innerHTML = h;
+}
+
+// --- Time range ---
+function setRange(r) {
+  currentRange = r;
+  document.querySelectorAll('.range-bar button').forEach(b => b.classList.toggle('active', b.textContent === r));
+  refreshAnalytics();
+}
+
+// --- Refresh ---
+async function refreshAnalytics() {
+  const [history, events, uptime] = await Promise.all([
+    fetchJSON('/api/history?range=' + currentRange),
+    fetchJSON('/api/events?range=' + currentRange),
+    fetchJSON('/api/uptime?range=' + currentRange)
+  ]);
+  renderTrend(history);
+  renderEvents(events);
+  return uptime;
+}
+
+async function refresh() {
+  const [state, uptimeResult] = await Promise.all([
+    fetchJSON('/api/mesh'),
+    refreshAnalytics()
+  ]);
+  if (state) {
+    currentState = state;
+    meshAliases = state.aliases || {};
+    renderMatrix(state);
+    renderPeerDetail(state);
+    renderPeers(state, uptimeResult && uptimeResult.uptime);
+    renderPathSummary(state);
+    renderGateways(state);
+    renderStats(state);
+    const now = new Date();
+    const local = now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    document.getElementById('last-update').textContent = `${zuluTime(now)} (${local} local)`;
+    // Show most recent probe timestamp
+    const probes = Object.values(state.probes || {});
+    if (probes.length > 0) {
+      const latest = probes.reduce((a, b) => new Date(a.timestamp) > new Date(b.timestamp) ? a : b);
+      document.getElementById('last-probe').textContent = timeAgo(latest.timestamp);
+    }
+  }
+}
+
+async function runProbe() {
+  const btn = document.getElementById('probe-btn');
+  const status = document.getElementById('probe-status');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  status.style.display = 'inline';
+  status.textContent = 'Pinging peers (~30-60s)...';
+  const start = Date.now();
+  const timer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    status.textContent = 'Pinging peers... ' + elapsed + 's';
+  }, 1000);
+  try {
+    const r = await authFetch('/api/run', { method: 'POST' });
+    clearInterval(timer);
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    if (r.ok) {
+      status.style.color = 'var(--green)';
+      status.textContent = 'Done in ' + elapsed + 's';
+      await refresh();
+    } else {
+      status.style.color = 'var(--red)';
+      status.textContent = 'Failed: ' + (await r.text()).slice(0, 80);
+    }
+  } catch (e) {
+    clearInterval(timer);
+    if (e.message !== 'unauthorized') {
+      status.style.color = 'var(--red)';
+      status.textContent = 'Error: ' + e.message;
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run Probe';
+    setTimeout(() => { status.style.color = 'var(--muted)'; status.style.display = 'none'; }, 8000);
+  }
+}
+
+// --- Link Drill-Down ---
+function closeLinkModal() { document.getElementById('link-modal').style.display = 'none'; }
+document.getElementById('link-modal').addEventListener('click', function(e) { if (e.target === this) closeLinkModal(); });
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeLinkModal(); });
+
+const pathExplanations = {
+  lan: {
+    title: 'LAN — Direct Local Network',
+    desc: 'Both peers are on the same physical network segment. Traffic stays entirely on the local switch/WiFi — never leaves the building. This is the fastest possible path.',
+    diagram: 'Peer A ——[switch/WiFi]—— Peer B',
+    color: 'var(--green)'
+  },
+  '5g': {
+    title: '5G / Private Network',
+    desc: 'Both peers share the same NAT / public IP, likely behind a private 5G gateway or shared router. Traffic stays within the local network infrastructure.',
+    diagram: 'Peer A ——[5G gateway]—— Peer B',
+    color: 'var(--green)'
+  },
+  internet: {
+    title: 'Internet — Direct P2P via NAT Punch',
+    desc: 'WireGuard NAT hole-punch succeeded. Traffic flows directly between peers over the public internet. No relay overhead, but latency depends on ISP routing.',
+    diagram: 'Peer A ——[NAT]——[internet]——[NAT]—— Peer B',
+    color: 'var(--blue)'
+  },
+  starlink: {
+    title: 'Satellite Path',
+    desc: 'One or both peers are on a satellite uplink. Traffic is carried through the provider\'s ground stations even when both endpoints are close together, which adds latency as packets travel to space, down to a distant ground station, across a backbone, and back.',
+    diagram: function(fromNet, toNet) {
+      const fromASN = fromNet.asn_org || fromNet.asn || '?';
+      const toASN = toNet.asn_org || toNet.asn || '?';
+      return ''
+        + 'SITE                       GROUND                        SITE\n'
+        + '  Peer A                  Ground Stn                   Peer B\n'
+        + '    |                         |                          |\n'
+        + '    |---[satellite uplink]--->|                          |\n'
+        + '    |                         |---[backbone]------+      |\n'
+        + '    |                         |                   |      |\n'
+        + '    |                         |<--[backbone]------+      |\n'
+        + '    |                         |---[satellite downlink]-->|\n'
+        + '    |                         |                          |\n'
+        + '  ('+fromASN+')\n'
+        + '                     (provider ground infra)\n'
+        + '                                                 ('+toASN+')';
+    },
+    color: '#f0a030'
+  },
+  relayed: {
+    title: 'Relayed — Via Netbird Relay Server',
+    desc: 'Direct P2P connection failed (NAT type incompatible, firewall, or CGNAT). Traffic routes through the nearest Netbird relay VPS. Single-hop relay adds latency but maintains connectivity.',
+    diagram: 'Peer A ——[NAT/FW]——[relay VPS]——[NAT/FW]—— Peer B',
+    color: 'var(--yellow)'
+  },
+  unknown: {
+    title: 'Unknown Path',
+    desc: 'Path type could not be determined. This typically means one or both endpoints did not report network fingerprint data.',
+    diagram: 'Peer A ——[?]—— Peer B',
+    color: 'var(--muted)'
+  }
+};
+
+function showLinkDetail(fromIP, toIP) {
+  if (!currentState) return;
+  const el = document.getElementById('link-modal-content');
+
+  // Find the link
+  const link = (currentState.links || []).find(l => l.from_ip === fromIP && l.to_ip === toIP);
+  // Find measurement from probe report
+  const fromReport = currentState.probes ? currentState.probes[fromIP] : null;
+  const toReport = currentState.probes ? currentState.probes[toIP] : null;
+  let measurement = null;
+  if (fromReport) {
+    measurement = (fromReport.peers || []).find(m => m.peer_ip === toIP);
+  }
+
+  const fromName = shortName(fromReport ? fromReport.peer_name : (link ? link.from_name : fromIP), fromIP);
+  const toName = shortName(toReport ? toReport.peer_name : (link ? link.to_name : toIP), toIP);
+  const fromNet = fromReport ? fromReport.network || {} : {};
+  const toNet = toReport ? toReport.network || {} : {};
+  const pathType = link ? (link.path_type || 'unknown') : (measurement && measurement.connected ? (measurement.direct ? 'internet' : 'relayed') : 'unknown');
+  const explain = pathExplanations[pathType] || pathExplanations.unknown;
+  const isStar = pathType === 'starlink';
+
+  let h = '<h3>' + fromName + ' &rarr; ' + toName + '</h3>';
+
+  // Path explanation
+  const explainClass = isStar ? 'path-explain path-explain-starlink' : 'path-explain';
+  h += '<div class="'+explainClass+'">';
+  h += '<div class="path-title" style="color:'+explain.color+'">' + explain.title;
+  if (isStar) h += ' <span class="path-starlink-badge">SAT</span>';
+  h += '</div>';
+  h += '<div>' + explain.desc + '</div>';
+  const diagramText = typeof explain.diagram === 'function' ? explain.diagram(fromNet, toNet) : explain.diagram;
+  h += '<div class="path-diagram">' + diagramText + '</div>';
+  h += '</div>';
+
+  // Metrics grid
+  h += '<div class="detail-grid">';
+
+  // Connection & metrics
+  h += '<div class="detail-section">';
+  h += '<h4>Connection</h4>';
+  if (measurement) {
+    h += row('Status', measurement.connected ? '<span style="color:var(--green)">Connected</span>' : '<span style="color:var(--red)">Disconnected</span>');
+    h += row('Transport', measurement.direct ? '<span style="color:var(--green)">P2P (direct)</span>' : '<span style="color:var(--yellow)">Relayed</span>');
+    h += row('Path Type', '<span class="'+pathClass(pathType)+'" style="padding:2px 6px;border-radius:3px">'+pathType+'</span>');
+  } else if (link) {
+    h += row('Transport', link.direct ? '<span style="color:var(--green)">P2P (direct)</span>' : '<span style="color:var(--yellow)">Relayed</span>');
+    h += row('Path Type', '<span class="'+pathClass(pathType)+'" style="padding:2px 6px;border-radius:3px">'+pathType+'</span>');
+    h += row('Last Seen', link.last_seen ? timeAgo(link.last_seen) : '-');
+  } else {
+    h += row('Status', '<span style="color:var(--red)">No measurement</span>');
+    h += '<div style="color:var(--muted);font-size:11px;margin-top:6px">This peer pair has no link data. The reporting probe may not have measured this target, or the target may be disconnected.</div>';
+  }
+  h += '</div>';
+
+  // Latency metrics
+  h += '<div class="detail-section">';
+  h += '<h4>Latency Metrics</h4>';
+  if (measurement && measurement.connected) {
+    h += row('Average', fmt(measurement.latency_ms));
+    h += row('P50 (median)', fmt(measurement.p50_ms));
+    h += row('P95', fmt(measurement.p95_ms));
+    h += row('Jitter', fmt(measurement.jitter_ms));
+    h += row('Packet Loss', measurement.loss_pct !== undefined ? measurement.loss_pct.toFixed(1) + '%' : '-');
+    h += row('Samples', measurement.samples || '-');
+  } else if (link && link.latency_ms > 0) {
+    h += row('Average', fmt(link.latency_ms));
+    h += row('Jitter', fmt(link.jitter_ms));
+    h += row('Loss', link.loss_pct !== undefined ? link.loss_pct.toFixed(1) + '%' : '-');
+  } else {
+    h += '<div style="color:var(--muted);font-size:12px">No latency data available</div>';
+  }
+  h += '</div>';
+
+  // From endpoint
+  h += '<div class="detail-section">';
+  h += '<h4>From: ' + fromName + '</h4>';
+  h += row('Mesh IP', fromIP);
+  if (fromReport) {
+    h += row('FQDN', fromReport.peer_name || '-');
+    h += row('Interface', (fromNet.interface || '-') + ' (' + (fromNet.interface_type || '?') + ')');
+    h += row('Gateway', fromNet.gateway_ip || '-');
+    if (fromNet.gateway && fromNet.gateway.manufacturer) h += row('Gateway HW', [fromNet.gateway.manufacturer, fromNet.gateway.model].filter(Boolean).join(' '));
+    h += row('Gateway RTT', fromNet.gateway_rtt_ms > 0 ? fromNet.gateway_rtt_ms.toFixed(1) + 'ms' : '-');
+    h += row('Public IP', fromNet.public_ip || '-');
+    h += row('ASN', (fromNet.asn || '-') + (fromNet.asn_org ? ' (' + fromNet.asn_org + ')' : ''));
+    h += row('Subnet', fromNet.subnet || '-');
+  } else {
+    h += '<div style="color:var(--muted);font-size:12px">Not a reporting probe — no network data</div>';
+  }
+  h += '</div>';
+
+  // To endpoint
+  h += '<div class="detail-section">';
+  h += '<h4>To: ' + toName + '</h4>';
+  h += row('Mesh IP', toIP);
+  if (toReport) {
+    h += row('FQDN', toReport.peer_name || '-');
+    h += row('Interface', (toNet.interface || '-') + ' (' + (toNet.interface_type || '?') + ')');
+    h += row('Gateway', toNet.gateway_ip || '-');
+    if (toNet.gateway && toNet.gateway.manufacturer) h += row('Gateway HW', [toNet.gateway.manufacturer, toNet.gateway.model].filter(Boolean).join(' '));
+    h += row('Gateway RTT', toNet.gateway_rtt_ms > 0 ? toNet.gateway_rtt_ms.toFixed(1) + 'ms' : '-');
+    h += row('Public IP', toNet.public_ip || '-');
+    h += row('ASN', (toNet.asn || '-') + (toNet.asn_org ? ' (' + toNet.asn_org + ')' : ''));
+    h += row('Subnet', toNet.subnet || '-');
+  } else {
+    h += '<div style="color:var(--muted);font-size:12px">Not a reporting probe — no network data</div>';
+  }
+  h += '</div>';
+
+  h += '</div>'; // close detail-grid
+
+  // Starlink operational note
+  if (isStar) {
+    h += '<div class="path-explain path-explain-starlink" style="font-size:11px">';
+    h += '<strong>Operational Impact:</strong> a satellite provider may carry traffic through distant ground stations regardless of endpoint proximity. ';
+    h += 'Two nearby peers that would otherwise have &lt;5ms LAN latency can instead see 200-600ms round trips. ';
+    h += 'This is a provider routing constraint, not a network configuration issue. ';
+    h += 'Mitigation: use a local network when available.';
+    h += '</div>';
+  }
+
+  el.innerHTML = h;
+  document.getElementById('link-modal').style.display = 'flex';
+}
+
+function row(label, value) {
+  return '<div class="detail-row"><span class="label">'+label+'</span><span class="value">'+value+'</span></div>';
+}
+function fmt(ms) { return ms > 0 ? ms.toFixed(1) + 'ms' : '-'; }
+
+function toggleGateInfo(e) {
+  e.stopPropagation();
+  document.getElementById('gate-info').classList.toggle('visible');
+}
+document.addEventListener('click', function() {
+  var info = document.getElementById('gate-info');
+  if (info) info.classList.remove('visible');
+});
+
+async function checkGate() {
+  const el = document.getElementById('gate-status');
+  const label = document.getElementById('gate-label');
+  try {
+    const r = await fetch('https://gatewatch.netbird.legacy.example/api/bridges');
+    const d = await r.json();
+    const activeBridges = (d.bridges || []).filter(b => b.status === 'active' && (b.authorized_cidrs || []).length > 0);
+    const widelyOpen = activeBridges.some(b => (b.authorized_cidrs || []).includes('0.0.0.0/0'));
+    if (widelyOpen) {
+      el.className = 'gate-badge gate-open';          // red — alert posture
+      label.textContent = 'BRIDGES: WIDE';
+    } else if (activeBridges.length > 0) {
+      el.className = 'gate-badge gate-closed';        // green — working as intended
+      label.textContent = 'BRIDGES: ACTIVE';
+    } else {
+      el.className = 'gate-badge gate-unknown';
+      label.textContent = 'BRIDGES: NONE';
+    }
+  } catch(e) {
+    el.className = 'gate-badge gate-unknown';
+    label.textContent = 'BRIDGES: ?';
+  }
+}
+
+// --- Init ---
+refresh();
+checkGate();
+setInterval(refresh, 30000);
+setInterval(checkGate, 60000);
+</script>
+</body>
+</html>

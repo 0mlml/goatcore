@@ -1,0 +1,259 @@
+{
+  "$id": "https://goat/schemas/intent-v1.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IntentV1 — the typed intent artifact for one goatnet",
+  "description": "One document per governed goatnet at ops/consistency/intent/<goatnet>/intent.json: the RESOLVED answer to 'what is this goatnet supposed to run', with the resolution state attached to every value. Generated as the second output of ops/pins/generate-pins.py from ops/pins/fleet-pins.yaml + ops/pins/parity-capabilities.yaml + the governed group_vars; committed and --check-gated in the `fleet-pins` CI job. YAML stays the authoring surface; no consumer other than the generator parses it. Canon: docs/design/consistency-foundation.md §3 (ADR 1110 D1). SERIALIZATION IS PART OF THE CONTRACT: UTF-8, keys sorted, two-space indent, one trailing newline — CF-5 signs SHA-256 over these exact bytes (ADR 1082's pattern), so a re-serialization that changes bytes invalidates a signature. NO SECRETS: anything resolved from lookup('env', ...) renders `unreadable` with its source named and never its value.",
+  "type": "object",
+  "required": [
+    "format",
+    "goatnet",
+    "members",
+    "serial",
+    "generated_at",
+    "ttl_seconds",
+    "ca_id",
+    "content_hash",
+    "sources",
+    "components",
+    "capabilities",
+    "node_shape",
+    "retired",
+    "ungoverned"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "const": "goat-intent-v1",
+      "description": "Format discriminator. A consumer that does not recognise it refuses the document rather than guessing."
+    },
+    "goatnet": {
+      "type": "string",
+      "description": "The goatnet this generation describes — a key under `goatnets:` in ops/pins/fleet-pins.yaml."
+    },
+    "members": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "The goatnet's member host-groups, in table order. These are the column keys of every `members` map below. Intent is per-goatnet with per-member columns — never per-host (design doc §3.7)."
+    },
+    "serial": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic human-facing name of this generation. Bumped by the generator ONLY when the body changes, so regeneration with no change is a byte-no-op and the committed file stays reviewable (the name-snapshot rule, ADR 1082 §3.1). It is NOT the comparison key — `content_hash` is."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp, moving only with `serial`. A timestamp that moved on every render would make the file drift against itself and break --check, which is exactly why the stage-1 report refuses to carry one."
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "How long a consumer may treat a fetched copy of this generation as fresh without re-fetching. Advisory: a node holding the current generation is `match` however old that generation is (design doc §5.3), so this bounds copy freshness, never correctness."
+    },
+    "ca_id": {
+      "type": ["string", "null"],
+      "description": "The per-goatnet offline CA that CF-5 will sign this artifact with, resolved from the group_vars key named by `ca_id_var:` in fleet-pins.yaml. Null when no key is declared, when nothing resolves, or when two members resolve it to DIFFERENT values — the last of which is a real finding and is left null rather than guessed."
+    },
+    "content_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 over the canonical serialization of this document MINUS `serial`, `generated_at` and `content_hash`. This is the comparison key: a deterministic function of the tree that both sides can compute. Comparing on git commit instead would grade every node diverged after every doc-only merge (design doc §3.3)."
+    },
+    "sources": {
+      "type": "object",
+      "description": "Repo-relative path -> sha256 of the exact bytes of every input file this generation was rendered from. Part of the hashed body, so an input edit is a new generation even when no resolved value moved.",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      }
+    },
+    "history": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "The generations this one succeeds, newest first — the IDENTITY TRIPLE only, never the bodies (design doc §3.3a, applied 2026-08-04). It exists so a reader holding ONE artifact can tell `SKEW` from `unaccountable`: a generation hash present here is behind by a known count and a known age, one present nowhere is explained by nothing the reader can see. Depth is capped at 10; a node so far behind that it fell off the tail is honestly unaccountable, which is the correct answer rather than a lost one. It sits INSIDE the hashed body, so `content_hash` and the CF-5 signature cover it. OPTIONAL: an artifact published before the amendment carries none, and a reader that finds none can still grade — it just cannot separate the two grades. It is NEVER a target: no generation other than the newest is targetable, or `converged` would stop having one meaning (design doc §3.3a).",
+      "items": {
+        "type": "object",
+        "required": ["serial", "content_hash", "generated_at"],
+        "additionalProperties": false,
+        "properties": {
+          "serial": { "type": "integer", "minimum": 1 },
+          "content_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "generated_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "components": {
+      "type": "array",
+      "description": "The governed deploy pins from ops/pins/fleet-pins.yaml, resolved per member.",
+      "items": {
+        "type": "object",
+        "required": ["name", "var", "artifact_type", "members"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "var": { "type": "string", "description": "The ansible var this component renders into group_vars/<member>/pins.yml." },
+          "artifact_type": {
+            "enum": ["image", "config", "acl", "data", "cert", "forward-only"],
+            "description": "ADR 1060's artifact-type dispatch, carried so a consumer can emit the RIGHT remediation pointer: image rolls back, data/cert refuse and point at restore/rotate. Declared per component in fleet-pins.yaml; defaults to `image`."
+          },
+          "ledger_component": {
+            "type": ["string", "null"],
+            "description": "The DECLARED join key between this component and a node's ADR 1060 deploy ledger at /var/lib/goat/<name>/deploy-history.jsonl — what the CF-3 live comparison joins on. Absent means the join key is the component `name`. Explicit null means this component has NO ledger coverage (it is deployed from a playbook rather than from a role carrying the rollback-ledger meta-dependency), so it can never be observed live; it still counts in the reported denominator, which is how that coverage gap stays visible instead of silently missing. Never inferred from `var`."
+          },
+          "render_watch": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 },
+            "description": "CF-4: the DECLARED set of rendered on-host files that are this component's config identity, from fleet-pins.yaml. Paths may embed {{ vars }} and stay LITERAL (the {{ ghcr_org }} rule) — only the deploying host resolves them, so a live reader joins render records at component granularity and uses this list's LENGTH as the coverage denominator. The expected hash is deliberately absent: a per-host render is a function of host vars and env lookups no repo-side reader may evaluate, so the node's own converge-time render manifest is the comparison baseline. The generator refuses this field on a component whose ledger_component is null — the manifest lives under /var/lib/goat/<ledger_component>/."
+          },
+          "note": { "type": "string" },
+          "members": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": { "$ref": "#/definitions/componentCell" }
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "description": "The curated per-goatnet capability flags from ops/pins/parity-capabilities.yaml, resolved per member. Graded rows: members of one goatnet are compared.",
+      "items": { "$ref": "#/definitions/varRow" }
+    },
+    "node_shape": {
+      "type": "array",
+      "description": "Per-node-by-design rows (ADR 1084). Carried so a consumer can explain which asymmetries are structural; NEVER graded.",
+      "items": { "$ref": "#/definitions/varRow" }
+    },
+    "retired": {
+      "type": "array",
+      "description": "Keys asserted ABSENT across every member. Retiring a key without carrying the assertion is how it comes back.",
+      "items": {
+        "type": "object",
+        "required": ["var", "why", "present_in"],
+        "additionalProperties": false,
+        "properties": {
+          "var": { "type": "string" },
+          "why": { "type": "string" },
+          "present_in": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Scopes where the retired key was found — empty is the compliant state. A non-empty list is a finding, not a comment."
+          }
+        }
+      }
+    },
+    "ungoverned": {
+      "type": "array",
+      "description": "Pin-shaped keys present in a member's group_vars but NOT rows in the fleet table. Named rather than omitted: an image the artifact stays silent about is exactly the drift it exists to prevent (design doc §3.1).",
+      "items": {
+        "type": "object",
+        "required": ["member", "var", "source", "allowlisted"],
+        "additionalProperties": false,
+        "properties": {
+          "member": { "type": "string" },
+          "var": { "type": "string" },
+          "source": { "type": "string", "description": "Repo-relative path of the file that defines it." },
+          "allowlisted": {
+            "type": "boolean",
+            "description": "Whether the row is declared in the shrink-only tail ops/pins/unmigrated-pins.txt. False means undeclared."
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "declared": {
+      "type": "object",
+      "required": ["scope", "reason"],
+      "additionalProperties": false,
+      "description": "A deviation declared in the authoring surface. Its presence is what lets a consumer grade `declared` instead of `SKEW`; a deviation without a `reason:` is a schema error at the authoring surface, so one can never arrive here.",
+      "properties": {
+        "scope": { "type": "string", "description": "The goatnet or member the deviation was keyed under." },
+        "reason": { "type": "string", "minLength": 1 },
+        "until": { "type": "string" }
+      }
+    },
+    "componentCell": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state", "value"],
+          "additionalProperties": false,
+          "properties": {
+            "state": { "const": "resolved" },
+            "value": {
+              "type": "string",
+              "description": "The pin as committed. `{{ ghcr_org }}` stays LITERAL: the same committed string must resolve to a different org depending on which checkout deploys, so it is carried un-evaluated rather than guessed (design doc §3.1)."
+            },
+            "declared": { "$ref": "#/definitions/declared" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["state", "declared"],
+          "additionalProperties": false,
+          "description": "The member deliberately does not run this component. Absence with a reason, never a missing key.",
+          "properties": {
+            "state": { "const": "absent" },
+            "declared": { "$ref": "#/definitions/declared" }
+          }
+        }
+      ]
+    },
+    "varCell": {
+      "description": "A group_vars value resolved for one member, with its resolution STATE attached. The three states are kept apart deliberately and a consumer holding only this artifact cannot recompute them: `unset` means there was nothing to read, `unreadable` means it was read and could not be evaluated. Collapsing them would let a missing key hide behind a templating excuse — and neither may ever reach `match`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state", "value", "source"],
+          "additionalProperties": false,
+          "properties": {
+            "state": { "const": "resolved" },
+            "value": { "type": "string", "description": "Normalised: booleans and boolean-ish strings render as `true`/`false`." },
+            "source": { "type": "string", "description": "Where the winning value came from — a group_vars path, `group_vars/all.yml`, or `role default: <role>`." }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["state", "detail"],
+          "additionalProperties": false,
+          "properties": {
+            "state": { "const": "unreadable" },
+            "detail": { "type": "string", "description": "Why it could not be evaluated — templated, resolved from the environment, or defaulted by several roles with no single default to attribute." },
+            "source": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["state", "detail"],
+          "additionalProperties": false,
+          "properties": {
+            "state": { "const": "unset" },
+            "detail": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "varRow": {
+      "type": "object",
+      "required": ["var", "why", "members"],
+      "additionalProperties": false,
+      "properties": {
+        "var": { "type": "string" },
+        "why": { "type": "string", "description": "Why this key earns a row, carried from the authoring surface so a consumer never has to invent the justification." },
+        "members": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/definitions/varCell" }
+        },
+        "declared": {
+          "type": "object",
+          "description": "Declared deviations for this row, keyed by the goatnet or member scope they were written against.",
+          "additionalProperties": { "$ref": "#/definitions/declared" }
+        }
+      }
+    }
+  }
+}
