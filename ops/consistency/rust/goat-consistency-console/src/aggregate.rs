@@ -134,7 +134,7 @@ mod tests {
     /// operator copies can never rot silently.
     #[test]
     fn the_committed_example_config_loads() {
-        if !std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aggregator/aggregator.example.yaml").is_file() {
+        if !std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../intent").is_dir() {
             return; // reads this deployment's own artifacts; a public clone has none
         }
         let example = Path::new(env!("CARGO_MANIFEST_DIR"))
