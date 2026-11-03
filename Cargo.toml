@@ -1,0 +1,43 @@
+# Workspace root for the goat-relay rewrite (Block 33).
+#
+# Members:
+# - goat-relay-protocol/ — wire-protocol library (33A; runtime-agnostic)
+# - goat-relay/         — relay server binary (33B+; tokio + tokio-uring)
+#
+# Architecture: ADR 0709 (D7-D13 firmed).
+# Working state: docs/project/block-33-progress.md.
+
+[workspace]
+members = [
+    "goat-relay-protocol",
+    "goat-relay",
+]
+resolver = "2"
+
+# Block 33C.1 lever H4 — release-profile optimization (the achievable
+# subset of PGO without an instrument-train-rebuild cycle).
+#
+#   - `lto = "fat"`         — link-time optimization across all crates;
+#                             cross-module inlining (rustc -> ring AEAD,
+#                             tokio-tungstenite, quinn, rustls).
+#                             Typical ~2-5% lift on data-plane hot paths.
+#   - `codegen-units = 1`   — disables codegen parallelism so LLVM sees
+#                             the entire crate at once. ~1-2% lift.
+#                             Trade-off: ~50% longer builds; acceptable
+#                             for production binary, painful for dev.
+#                             We keep `dev` profile defaults.
+#   - `panic = "abort"`     — drops unwind tables; smaller code, no per-
+#                             frame unwind-info CFI emission. ~0.5-1% lift
+#                             via reduced i-cache pressure.
+#   - `strip = true`        — strip debug symbols from release binary.
+#                             Marginal data-plane impact; smaller image.
+#
+# Full PGO (instrument-train-rebuild) costs ~2x build wall-clock and
+# needs a representative training bench; queued as Block 33C.2 follow-
+# up. The achievable-now subset above is what M-022 verifies vs the
+# M-018+H2 baseline.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,306 @@
+# goatbuilder changelog
+
+Each release is the tag `goatbuilder/v<semver>` on `main`, built and signed by
+`.github/workflows/goatbuilder-release.yml`. Design of record:
+`docs/design/goatbuilder.md`; conformance: `docs/design/goatbuilder-conformance.md`.
+
+## 0.4.1 — 2026-11-02
+
+goatbuilder names no deployment of its own: what a person reads uses
+placeholders, and `deploy` and `release` honour the checkout's values.
+
+**Upgrading from 0.4.0:** nothing changes for goat, whose values are declared in
+`ops/goatbuilder/goatbuilder.yaml`. Another project should declare `deploy:`
+(`aws_profile`, `ssh_user`, `state_dir`); with no `deploy.ssh_user`, a real
+`join-node` refuses. `fastlane` refuses a checkout with no `repo.source`.
+
+### Changed: goatbuilder names no deployment of its own
+
+Help text, error messages, the error catalog, the reference pages and the tutor
+use placeholders instead of goat's goatnets, profile and organisation; lessons
+that run against the checkout take their goatnet, site and component from it.
+`deploy`, `release`, `doctor`, `federate` and `standup` read the AWS profile
+and image organisation from the checkout, so `GOAT_AWS_PROFILE` and `GHCR_ORG`
+work on every verb. `deploy.state_dir` declares the local state directory
+(undeclared: `~/.goat/state`). See docs/design/goatbuilder-portability.md.
+
+## 0.4.0 — 2026-11-02
+
+Plain pages a person can act on, a `doctor` that prompts for nothing, an
+`env-file` default store, placeholder acks refused everywhere, and fastlane
+working again with identity and control-plane components refused.
+
+**Upgrading from 0.3.0:** `doctor` checks stored credentials only with
+`--credentials`; `fastlane --set` is gone; `--ack "<your name>"` is refused;
+a checkout that declares no secrets store now gets `env-file` (goat declares
+1Password in `ops/goatbuilder/posture.yml`, so goat is unchanged).
+
+### Added: a project declares how it is deployed
+
+An optional `deploy:` block in `goatbuilder.yaml` holds `aws_profile` and
+`ssh_user`. `join-node` reads both and refuses a real run with no SSH user
+declared; `adopt` takes the image organisation from `repo.image_namespace`, and
+`--env` completion offers the stage names of the checkout. See
+docs/design/goatbuilder-portability.md.
+
+### Changed — the human surface (#2341)
+
+A first operator walked `goatbuilder tutor` end to end; everything a person
+sees was rewritten against docs/design/goatbuilder-output.md. `-o json`,
+`-o yaml` keep their rows, with one addition: a check that did not run carries
+`"skipped": true`. Piped output is unchanged except that `doctor`, mock `status`
+and `federate` print their pages on a pipe too.
+
+- `doctor`: a summary page — how many checks passed, then one entry per problem
+  with its fix; `--all` prints every row. Secrets are judged by what this
+  machine holds, not what one command loaded, and no fix suggests
+  `aws-vault remove`.
+- `status` and `diff`: one table (COMPONENT, MACHINE, STATE, RUNNING,
+  DECLARED). Pending, drift and unknown are states, never `FAIL`.
+- `history`, `promote status`, `survey`, `endstate`, `assay --plan`,
+  `explain --list`: titled columns on a terminal.
+- `deploy`, `verify`, `rollback`, `release`, `fastlane`: titled checks in plain
+  English (stage, wait before prod, test version). A dry run counts its
+  commands, lists any secret that would stop a real run, and ends with what
+  actually happened. The page keeps one line per machine, and a failure names
+  the machine to fix.
+- `standup`, `teardown`, `join-node`, `federate`: a plan is a table plus the
+  steps you do yourself, laid out like tutor steps, and says up front that
+  nothing has run.
+- `tutor`: 18 lessons (the old lesson 11 split into three), `--lesson N`
+  reopens a finished lesson, each ticked step prints the next command, the
+  first page welcomes the learner (the ASCII banner and the progress line's
+  goat are gone), and all 29 locales moved with their lessons.
+- `completion` survives a closed pipe (`goatbuilder completion zsh | head`).
+
+### Fixed — fastlane works again (#2341)
+
+`fastlane` refused every component: it read the retired `goat-maintainer` GHCR org
+first (ADR 1195) and only the newest 40 image versions. It now reads every
+page of `ghcr.io/usareur-af` only, honours `deploy_playbook:` through the same
+resolver as `push`, refuses a component whose declared rollback is not a pin
+revert (ADR 1127), and drops `--set`, which claimed to ship a whole graduation
+set while moving one component.
+
+### Fixed — pages that claimed what they had not seen (#2341)
+
+An independent read of every verb's output, and of the diff, found pages that
+said things that were not so. Each is now what it observed.
+
+- `doctor` reported "All N checks passed" on a machine whose 1Password session
+  was closed and whose credential store was locked, and exited 0 where it used
+  to exit 1: not reading a credential (so that nothing prompts for a password)
+  had been recorded as a pass. Not checked is now its own state, counted
+  separately, named on the page, and shown as `skip` in `--all`. Its component
+  count counted rows, so one component on three goatnets read as three; a
+  variable templated twice was named twice inside its own count; and a play
+  that takes no argument printed a bare `:;`.
+- `update --check` answered an HTTP connect failure with an SSH diagnosis,
+  because the X-SSH-002 catalog entry matched the bare words "Connection
+  refused". Its patterns now carry the port ssh names.
+- A machines table counted only the machines it held, so a deploy where two of
+  five failed read "3 of 3 converged". A run with a failure in it reads as its
+  steps.
+- `federate --dry-run` printed "Nothing has run" and created the peering's work
+  directory.
+- An error document's `Why` listed every cause the error can have, which reads
+  as a claim about this one. It is `Causes`.
+- `promote review` cut the NEXT column mid-word, which is the only place a row
+  says what to do, and then explained a token the cut had removed.
+- `survey` ended without a newline, so a shell prompt landed on its last
+  command.
+
+### Changed — flags, rows and the tutor's log (#2341)
+
+- `--mock <dir>` is refused by the verbs that do not read a fixture
+  (`validate`, `doctor`, `release`, `fastlane`, `pins`, `promote`, `secrets`,
+  `endstate`, `assay`, `join-node`, `update`), which used to accept it and read
+  the real checkout. The refusal names the fourteen verbs that take one.
+- `promote readiness` prints a page on a terminal (how many components are at
+  the same version everywhere, how many are mid-release, what to do) instead of
+  the 400-line document. A pipe, a redirect and `-o json` still get the
+  document, unchanged.
+- The tutor's log is written 0600 in a 0700 directory and capped at a megabyte,
+  and `secrets exec -- <command>` is no longer logged at all: it carries
+  someone else's command line.
+- `assay --plan` calls its rows checks, as every other verb does, and prints
+  AREA, CHECK and EXPECT; how each check is made stays in `-o json`.
+
+## 0.3.0 — 2026-10-31
+
+Readiness and reversibility before a rollout, a boundary-node worked example,
+and `goat`-CLI parity on top of the 0.2.0 verb set.
+
+### Added — `preflight` (ADR 1211)
+
+`goatbuilder preflight <component> --env <env>` prints three facts before a
+rollout — State (stateless | stateful), Rollback (pin-revert |
+restore-required | none, with the restore pointer and retention window) and
+Scope (single | coupled) — and `deploy` runs it as its first (prep) phase. The
+facts are declared per component beside `artifact_type` in fleet-pins
+(`owns_state`, `rollback`, `restore_from`, `coupled_with`); coupling also
+derives from an open graduation set (ADR 1125). An undeclared component fails
+closed to stateful / rollback none and grades not-clean (GB-076) — a gap made
+visible, never guessed green. A declared rollback is trusted only where it
+agrees with the recorded artifact type (ADR 1127's safe-class rule); a
+`none`/`restore-required` rollout proceeds on `deploy` only with `--ack`,
+written into the deploy ledger row. Both avenues stay coherent (ADR 1201):
+`deploy-component.sh --preflight` and `ops/scripts/rollout-preflight.py` print
+the same facts.
+
+### Added — `federate --mock`; tutorial 3; in-tree fixture renamed
+
+`federate` now honours `--mock <dir>`, loading the fixture's flat
+`goatbuilder.yaml` the way `standup` does, so a worked-example peering is
+planned self-contained and an undeclared peering is refused (the plan's
+commands still name the repository's own federation scripts). Adds the
+boundary-node worked-example step and tutorial 3. The in-tree worked-example
+fixture directory is renamed `ops/goatbuilder/fixtures/hello-galaxy/` ->
+`ops/goatbuilder/fixtures/goatnet-from-scratch/` (and
+`sync-hello-galaxy.sh` -> `sync-goatnet-from-scratch.sh`): in-tree this is only
+the tutor's fixture, named for what it is; the standalone `hello-galaxy-*` demo
+repos and the tutorial cross-references are unchanged.
+
+### Added — CLI parity with `goat` (`completion`, `docs`, `--color`, `-v`, `--timeout`)
+
+`goatbuilder completion <shell>` prints a shell completion script; `goatbuilder
+_complete <site|component|env> <partial>` (hidden) feeds live candidates — the
+sites, components and goatnets this checkout declares — to a shell hook.
+`goatbuilder docs --markdown` emits the full command reference, walked from the
+live clap tree, so it can never drift from `--help`; the committed copy is
+`docs/reference/goatbuilder/command-reference.md` and a hermetic test
+regenerates it and refuses a diff. New globals: `--color auto|always|never`
+(honouring `NO_COLOR`/`CLICOLOR_FORCE`) colours the table's glyph and verdict
+only; `--verbose`/`-v` logs the external commands a run shells out to and
+`update`'s network phase to stderr (`RUST_LOG=goatbuilder=debug`); `--timeout`
+(`GOATBUILDER_TIMEOUT`) bounds the connect/reach phase so an unreachable surface
+fails fast, without capping a play or the stall-bounded binary download.
+
+### Added — `update`
+
+`goatbuilder update [--site <site>] [--check] [--force]` replaces the binary
+with the release `get.<site>.<zone>/goatbuilder/` serves, as `goat update`
+does: `.sha256`, `SHA256SUMS` and (with cosign on PATH) the signature checked
+before anything is touched, atomic swap, a 30 s stall bound on the download.
+`--check` exits 3 when behind. Other verbs print one behind-version line on a
+terminal at most once a day (`GOATBUILDER_NO_VERSION_CHECK=1` silences it);
+`doctor` adds a `goatbuilder version` row. New errors GB-072..GB-075. The
+platform, version-compare, checksum and replace code is shared with `goat` in
+`crates/goat-selfupdate`.
+
+### Changed — phase numbers (breaking for `--from`/`--to`)
+
+Every numbered sequence an operator sees is now whole numbers from 1 with no
+gaps and no letters, in both avenues (`goatbuilder` and the scripts).
+
+`standup` and `teardown` (and `goat-standup.sh`, `goat-teardown.sh`):
+
+| Old | New | What |
+|---|---|---|
+| 0 (gates, incl. 0b host preflight) | 1 | gates: config, inputs, ACL, door, hosts |
+| 0 (host baseline) | 2 | host baseline + LUKS |
+| 4 | 3 | per-instance secrets |
+| 5, 5b | 4 | leaf certs + name snapshot |
+| 6, 6b | 5 | mgmt stack, relay-connect |
+| 7, 7a, 7b, 7c | 6 | identity stack, re-run site-bootstrap, joiner seed + mirror |
+| 9, 9b, 9c | 7 | public TLS + relay tier |
+| 10 | 8 | mesh enrolment (MANUAL) |
+| 11, 11b | 9 | router + SPIRE |
+| 12 | 10 | dashboard + OIDC clients / LAN services |
+| 12m | 11 | first login + bootstrap NetBird token (MANUAL) |
+| 13 | 12 | declared ACL, service identities, services (the `--parallel` waves) |
+| 14 | 13 | acceptance gate (`assay`) |
+| 15 | 14 | rescue nodes + cross-goatnet surfaces |
+
+`--from`/`--to` take the new numbers only. A lettered id (`6b`, `7b`, `12m`, …)
+and `0` are refused (exit 2) with the phase they became; an old bare number is
+read as the new one, so check the table before resuming a run started on an
+older binary. The observability legs are named `host` and `stack` (were
+`O1O2`, `O3`); their logs are `standup-<site>-obs-host.log` and
+`-obs-stack.log`.
+
+`federate` (and `peering-standup.sh`): phases are 1..11 (were 0..10; every
+number moved up by one).
+
+### Added
+
+- `endstate <site>`: is the goatnet in its declared end state (ADR 1206)? The
+  end state is derived from the site's own declarations and the service catalog
+  (`ops/goatbuilder/endstate/catalog.yaml`), so a site without Grafana or the
+  sandbox, or on a single machine, says so in its group_vars. Every declared
+  service is graded deployed, active, healthy and functional (the assay's rows),
+  with its edges: served name and certificate, OIDC client, SPIRE entry; anything
+  running that nothing declares is an orphan. Exit 3 while anything is off
+  (GB-068), 1 when it cannot run (GB-066); `--facts`, `--assay-rows`,
+  `--no-assay`, `--strict`, `--root`. The script avenue is
+  `ops/scripts/goatnet-endstate.sh`; `parity-endstate.sh` holds the two alike.
+- `assay` runs its Python under the interpreter that has PyYAML (python3 when it
+  does, else Ansible's own), as the deploy path does since #2120.
+
+- `assay <site>`: prove a built goatnet layer by layer — every applicable row
+  of the acceptance manifest, including the goat CLI rows, graded per layer;
+  exit 3 while any row fails or cannot answer (GB-048), 1 when it cannot run
+  (GB-049). `--plan` lists the applicable rows; `--values` takes a fixture's
+  value set. Standup phase 13 (both avenues) prints the same per-layer table.
+
+### Changed
+
+- The long-running verbs (deploy, rollback, release, fastlane, standup,
+  join-node, federate, teardown, apply, assay) hold the Mac awake for their own
+  lifetime with `caffeinate -i -w <pid>`, as the shell drivers now do; one
+  assertion per run, `GOAT_NO_CAFFEINATE=1` opts out (#2122). `doctor` shows
+  whether `caffeinate` is on PATH on macOS.
+
+## 0.2.0 — 2026-10-29
+
+The release that runs the tutorials: every verb the design names is in it.
+
+### Added
+
+- **Sites:** `standup` (founder and joiner sites, `goat-standup.sh` phase for
+  phase, `--dry-run`, `--from`/`--to`, `--parallel` phase-13 waves, the
+  required-input scan as phase 0's gate), `join-node` (a machine joining a live
+  goatnet, node-addition.md as fifteen phases), `federate` (`peering-standup.sh`
+  phase for phase), `teardown` (fixture, and `--services` on real hosts).
+  `standup --mock` rehearses a site on a fixture.
+- **Release ladder as typed verbs:** `pins` (`generate-pins.py`'s resolution,
+  `--check`, the typed deviation edits) and `promote` (`graduate.py`
+  subcommand for subcommand). `release` and `fastlane` use them in process.
+- **Reading state:** `verify`, `diff`, `history`; `plan deploy|rollback` and
+  `apply <plan>`, which refuses when a planned fact moved; `adopt`, which
+  proposes pins for what hosts already run.
+- **Secrets posture (ADR 1204):** `secrets` — the declared store (1Password,
+  OpenBao, sops, git-crypt, env-file, env, custom) and `secrets init`, the
+  zero-SaaS quickstart.
+- **Errors:** `explain <code|text>` over the shared catalog
+  (`ops/errors/catalog.yaml`), including another tool's output embedded in an
+  error.
+- **Learning:** `tutor`, eleven lessons run with the real verbs on fixtures.
+- **Languages:** every string in 29 languages; `--lang` / `GOAT_LANG`.
+- **Speed:** SSH multiplexing for direct hosts (6.4 s → 1.5 s per Ansible
+  call, M-120) and per-phase timing.
+- **Tests:** contract clauses C1–C10 as tests; parity gates against the
+  scripts for deploy, verify, history, release, rollback, fastlane, pins,
+  promote, standup and teardown; the three-tier e2e harness (ADR 1200).
+
+### Changed
+
+- `deploy`, `rollback` and `standup` on a fixture (`--mock`) need
+  `--ack "<name>"`; without it they exit 1 with GB-047 before anything is
+  published. Every record names its actor (C4).
+- Published declarations on a fixture are sealed and ordered (C2, GB-045); a
+  fixture's local copy that is ahead of or diverged from its source is refused
+  (C3, GB-046).
+
+### Fixed
+
+- `rollback --list` prints one row per ledger entry under either `yq`
+  (#2066); a rollback whose target is another image is refused with exit 3.
+- `release --from dev` reuses preprod's open record for the same ref instead
+  of opening a second one (#2086); a re-declared deviation stays in place, so
+  a re-run lands nothing.
+
+## 0.1.0 — 2026-10-28
+
+First signed release: `validate`, `doctor`, `status`, `deploy`, `release`,
+`rollback`, `fastlane`.

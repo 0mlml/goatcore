@@ -1,0 +1,518 @@
+// Shared environment-health wire types + small pure display helpers.
+//
+// These hand-written prost-derive structs are the decode side of the
+// on-bus health signal (ADR 1034/1036/1042/1040 gap 3). They were first
+// written in `cmd/health.rs`; `goat top` (the live dashboard, ADR 1044)
+// consumes the same shapes, so the structs + the two clock-free display
+// helpers (`fmt_age`, `short_name`) live here as a single `pub(crate)`
+// source of truth rather than a second hand-copy. Tags MUST stay in
+// lock-step with:
+//   ops/zenoh-trial-peers/fabric-health/proto/fabric_health_v1.proto
+//   ops/zenoh-trial-peers/time-health/proto/env_health_v1.proto
+//
+// Line-oriented color rendering (`colorize`, `pad_state`) stays in
+// `cmd/health.rs` — it emits ANSI escapes for stdout, the wrong layer
+// for the ratatui dashboard (which styles via `Style::fg`).
+
+/// Health + footprint topics (`goat health` fabric weather + footprint).
+pub(crate) const HEALTH_KEY: &str = "ops/fabric/**";
+pub(crate) const HEALTH_PREFIX: &str = "ops/fabric/health/";
+pub(crate) const FOOTPRINT_PREFIX: &str = "ops/fabric/footprint/";
+/// `EnvHealthV1` board domains.
+pub(crate) const MESH_KEY: &str = "ops/mesh/health/**";
+pub(crate) const PRESENCE_KEY: &str = "ops/presence/health/**";
+pub(crate) const TIME_KEY: &str = "ops/time/health/**";
+pub(crate) const NET_KEY: &str = "ops/net/health/**";
+pub(crate) const CONSISTENCY_KEY: &str = "ops/consistency/health/**";
+/// Crypto posture — evidence-based (ADR 1079); see
+/// ops/zenoh-trial-peers/crypto-posture/proto/crypto_posture_v1.proto.
+pub(crate) const CRYPTO_KEY: &str = "ops/fabric/crypto/**";
+
+// --- crypto domain (ADR 1079) — every field is observed evidence ---
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct CryptoPostureV1 {
+    #[prost(string, tag = "1")]
+    pub site: String,
+    #[prost(int64, tag = "2")]
+    pub ts_unix_ms: i64,
+    #[prost(bool, tag = "3")]
+    pub kx_ok: bool,
+    #[prost(string, tag = "4")]
+    pub kx_group: String,
+    #[prost(bool, tag = "5")]
+    pub kx_group_fips: bool,
+    #[prost(bool, tag = "6")]
+    pub kx_pq: bool,
+    #[prost(int64, tag = "7")]
+    pub kx_probed_ms: i64,
+    #[prost(string, tag = "8")]
+    pub kx_error: String,
+    #[prost(string, tag = "9")]
+    pub router_version: String,
+    #[prost(bool, tag = "10")]
+    pub attest_present: bool,
+    #[prost(bool, tag = "11")]
+    pub attest_fips_marker: bool,
+    #[prost(string, tag = "12")]
+    pub attest_digest: String,
+    #[prost(int64, tag = "13")]
+    pub attest_at_ms: i64,
+    #[prost(string, tag = "14")]
+    pub attest_module: String,
+    #[prost(string, tag = "15")]
+    pub color: String,
+    #[prost(string, tag = "16")]
+    pub headline: String,
+}
+
+// --- fabric domain (ADR 1034) ---
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct ClassHealthV1 {
+    #[prost(string, tag = "1")]
+    pub class: String,
+    #[prost(double, tag = "2")]
+    pub sample_rate: f64,
+    #[prost(double, tag = "3")]
+    pub byte_rate: f64,
+    #[prost(double, tag = "4")]
+    pub target_sample_rate: f64,
+    #[prost(double, tag = "5")]
+    pub target_byte_rate: f64,
+    #[prost(double, tag = "6")]
+    pub headroom_pct: f64,
+    #[prost(string, tag = "7")]
+    pub color: String,
+    #[prost(uint64, tag = "8")]
+    pub sample_count: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct FabricHealthV1 {
+    #[prost(string, tag = "1")]
+    pub site: String,
+    #[prost(int64, tag = "2")]
+    pub ts_unix_ms: i64,
+    #[prost(message, repeated, tag = "3")]
+    pub classes: Vec<ClassHealthV1>,
+    #[prost(string, tag = "4")]
+    pub overall_color: String,
+    #[prost(uint32, tag = "5")]
+    pub active_producers: u32,
+    #[prost(uint32, tag = "6")]
+    pub window_secs: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct ClassShareV1 {
+    #[prost(string, tag = "1")]
+    pub class: String,
+    #[prost(double, tag = "2")]
+    pub sample_rate: f64,
+    #[prost(double, tag = "3")]
+    pub byte_rate: f64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct ProducerFootprintV1 {
+    #[prost(string, tag = "1")]
+    pub peer: String,
+    #[prost(int64, tag = "2")]
+    pub ts_unix_ms: i64,
+    #[prost(double, tag = "3")]
+    pub sample_rate: f64,
+    #[prost(double, tag = "4")]
+    pub byte_rate: f64,
+    #[prost(message, repeated, tag = "5")]
+    pub shares: Vec<ClassShareV1>,
+    #[prost(uint32, tag = "6")]
+    pub rank: u32,
+    #[prost(bool, tag = "7")]
+    pub near_limit: bool,
+}
+
+// --- EnvHealthV1 envelope + per-domain detail (ADR 1036) ---
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct MeshLinkHealthV1 {
+    #[prost(string, tag = "1")]
+    pub peer_fqdn: String,
+    #[prost(string, tag = "2")]
+    pub peer_ip: String,
+    #[prost(string, tag = "3")]
+    pub color: String,
+    #[prost(bool, tag = "4")]
+    pub connected: bool,
+    #[prost(bool, tag = "5")]
+    pub direct: bool,
+    #[prost(string, tag = "6")]
+    pub conn_type: String,
+    #[prost(double, tag = "7")]
+    pub latency_ms: f64,
+    #[prost(string, tag = "8")]
+    pub relay_address: String,
+    #[prost(int64, tag = "9")]
+    pub handshake_age_ms: i64,
+    #[prost(uint64, tag = "10")]
+    pub transition_count: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct MeshDetailV1 {
+    #[prost(message, repeated, tag = "1")]
+    pub links: Vec<MeshLinkHealthV1>,
+    #[prost(string, tag = "2")]
+    pub vantage_host: String,
+    #[prost(uint32, tag = "3")]
+    pub peers_total: u32,
+    #[prost(uint32, tag = "4")]
+    pub peers_connected: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct FabricDetailStub {}
+
+/// Per-host clock health (tag 11 detail). Mirrors HostClockHealthV1 in
+/// env_health_v1.proto — color is the 5-state honesty signal, attested=false
+/// reads idle (never a false green).
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct HostClockHealthV1 {
+    #[prost(string, tag = "1")]
+    pub host_id: String,
+    #[prost(string, tag = "2")]
+    pub color: String,
+    #[prost(string, tag = "3")]
+    pub verdict: String,
+    #[prost(string, repeated, tag = "4")]
+    pub verdict_reasons: Vec<String>,
+    #[prost(double, tag = "5")]
+    pub rms_offset_ms: f64,
+    #[prost(int32, tag = "6")]
+    pub stratum: i32,
+    #[prost(bool, tag = "7")]
+    pub gnss_present: bool,
+    #[prost(double, tag = "8")]
+    pub peer_median_offset_ms: f64,
+    #[prost(bool, tag = "9")]
+    pub divergence_detected: bool,
+    #[prost(int64, tag = "10")]
+    pub attestation_age_ms: i64,
+    #[prost(bool, tag = "11")]
+    pub attested: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct TimeDetailV1 {
+    #[prost(message, repeated, tag = "1")]
+    pub hosts: Vec<HostClockHealthV1>,
+}
+
+/// One liveliness presence token as seen by the presence-health watcher
+/// (tag 13 detail). Mirrors PresencePeerV1 in env_health_v1.proto.
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct PresencePeerV1 {
+    #[prost(string, tag = "1")]
+    pub token_key: String,
+    #[prost(string, tag = "2")]
+    pub write_root: String,
+    #[prost(string, tag = "3")]
+    pub label: String,
+    #[prost(bool, tag = "4")]
+    pub alive: bool,
+    #[prost(int64, tag = "5")]
+    pub since_unix_ms: i64,
+    #[prost(uint64, tag = "6")]
+    pub drop_count: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct PresenceDetailV1 {
+    #[prost(message, repeated, tag = "1")]
+    pub peers: Vec<PresencePeerV1>,
+    #[prost(uint32, tag = "2")]
+    pub alive_total: u32,
+    #[prost(uint32, tag = "3")]
+    pub dropped_recent: u32,
+}
+
+/// One WireGuard mesh peer as seen from a node's own vantage (tag 14 detail).
+/// Mirrors NodeMeshPeerV1 in env_health_v1.proto (node-net-health.md).
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct NodeMeshPeerV1 {
+    #[prost(string, tag = "1")]
+    pub peer_fqdn: String,
+    #[prost(string, tag = "2")]
+    pub peer_ip: String,
+    #[prost(bool, tag = "3")]
+    pub active: bool,
+    #[prost(int64, tag = "4")]
+    pub handshake_age_ms: i64,
+    #[prost(string, tag = "5")]
+    pub conn_type: String,
+    #[prost(uint64, tag = "6")]
+    pub rx_bytes_delta: u64,
+    #[prost(uint64, tag = "7")]
+    pub tx_bytes_delta: u64,
+    #[prost(double, tag = "8")]
+    pub latency_ms: f64,
+}
+
+/// One classified socket from the node's 4-bucket inventory
+/// (mesh|fabric|baseline|undeclared). Mirrors NodeConnV1.
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct NodeConnV1 {
+    #[prost(string, tag = "1")]
+    pub bucket: String,
+    #[prost(string, tag = "2")]
+    pub proto: String,
+    #[prost(string, tag = "3")]
+    pub state: String,
+    #[prost(string, tag = "4")]
+    pub local_addr: String,
+    #[prost(string, tag = "5")]
+    pub remote_addr: String,
+    #[prost(uint32, tag = "6")]
+    pub pid: u32,
+    #[prost(string, tag = "7")]
+    pub comm: String,
+    #[prost(string, tag = "8")]
+    pub container: String,
+    #[prost(string, tag = "9")]
+    pub baseline_rule: String,
+    #[prost(int64, tag = "10")]
+    pub first_seen_unix_ms: i64,
+    #[prost(int64, tag = "11")]
+    pub last_seen_unix_ms: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct NodeFabricSessionV1 {
+    #[prost(string, tag = "1")]
+    pub zid: String,
+    #[prost(string, tag = "2")]
+    pub whatami: String,
+    #[prost(uint32, tag = "3")]
+    pub links: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct NetDetailV1 {
+    #[prost(message, repeated, tag = "1")]
+    pub mesh_peers: Vec<NodeMeshPeerV1>,
+    #[prost(uint32, tag = "2")]
+    pub mesh_active: u32,
+    #[prost(uint32, tag = "3")]
+    pub mesh_stale: u32,
+    #[prost(message, repeated, tag = "4")]
+    pub fabric_sessions: Vec<NodeFabricSessionV1>,
+    #[prost(message, repeated, tag = "5")]
+    pub conns: Vec<NodeConnV1>,
+    #[prost(uint32, tag = "6")]
+    pub undeclared_count: u32,
+    #[prost(string, tag = "7")]
+    pub node_class: String,
+    #[prost(uint32, tag = "8")]
+    pub snapshot_gap_secs: u32,
+}
+
+// --- consistency domain (consistency-foundation.md §5, ADR 1110) ---
+// The convergence record, rolled: which generation of its goatnet's IntentV1
+// each node converged against, graded at READ TIME by the shared library and
+// stored nowhere. The remediation pointer rides as DATA on every non-matching
+// row (§6.3) — this CLI prints it VERBATIM and never composes, paraphrases,
+// shortens or executes it (§6.4). If a pointer is wrong, the bug is in
+// ops/consistency/grammar.yaml and its corpus, where one fix reaches every
+// surface.
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct ConsistencyRowV1 {
+    #[prost(string, tag = "1")]
+    pub subject: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(string, tag = "3")]
+    pub artifact_type: String,
+    #[prost(string, tag = "4")]
+    pub grade: String,
+    #[prost(string, tag = "5")]
+    pub color: String,
+    #[prost(string, tag = "6")]
+    pub why: String,
+    #[prost(string, tag = "7")]
+    pub observed: String,
+    #[prost(string, tag = "8")]
+    pub expected: String,
+    #[prost(string, tag = "9")]
+    pub remediation_kind: String,
+    #[prost(string, tag = "10")]
+    pub remediation: String,
+    #[prost(bool, tag = "11")]
+    pub remediation_refuses: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct NodeConsistencyV1 {
+    #[prost(string, tag = "1")]
+    pub host_id: String,
+    #[prost(string, tag = "2")]
+    pub member_group: String,
+    #[prost(string, tag = "3")]
+    pub color: String,
+    #[prost(string, tag = "4")]
+    pub grade: String,
+    #[prost(uint64, tag = "5")]
+    pub intent_serial: u64,
+    #[prost(string, tag = "6")]
+    pub intent_content_hash: String,
+    #[prost(uint32, tag = "7")]
+    pub behind_by: u32,
+    #[prost(int64, tag = "8")]
+    pub intent_age_seconds: i64,
+    #[prost(int64, tag = "9")]
+    pub report_age_ms: i64,
+    #[prost(bool, tag = "10")]
+    pub intent_verified: bool,
+    #[prost(message, repeated, tag = "11")]
+    pub rows: Vec<ConsistencyRowV1>,
+    #[prost(uint32, tag = "12")]
+    pub components_governed: u32,
+    #[prost(uint32, tag = "13")]
+    pub components_observed: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct ConsistencyDetailV1 {
+    #[prost(message, repeated, tag = "1")]
+    pub nodes: Vec<NodeConsistencyV1>,
+    #[prost(string, tag = "2")]
+    pub goatnet: String,
+    #[prost(uint64, tag = "3")]
+    pub current_serial: u64,
+    #[prost(string, tag = "4")]
+    pub current_content_hash: String,
+    #[prost(uint32, tag = "5")]
+    pub nodes_expected: u32,
+    #[prost(uint32, tag = "6")]
+    pub nodes_reporting: u32,
+    #[prost(uint32, tag = "7")]
+    pub skew_band_generations: u32,
+    #[prost(int64, tag = "8")]
+    pub skew_band_seconds: i64,
+    #[prost(bool, tag = "9")]
+    pub intent_readable: bool,
+    #[prost(string, tag = "10")]
+    pub intent_note: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct EnvHealthV1 {
+    #[prost(string, tag = "1")]
+    pub domain: String,
+    #[prost(string, tag = "2")]
+    pub scope: String,
+    #[prost(int64, tag = "3")]
+    pub ts_unix_ms: i64,
+    #[prost(string, tag = "4")]
+    pub overall_color: String,
+    #[prost(uint64, tag = "5")]
+    pub sample_count: u64,
+    #[prost(uint32, tag = "6")]
+    pub window_secs: u32,
+    #[prost(oneof = "EnvDetail", tags = "10, 11, 12, 13, 14, 15")]
+    pub detail: Option<EnvDetail>,
+}
+
+#[derive(Clone, PartialEq, prost::Oneof)]
+pub(crate) enum EnvDetail {
+    #[prost(message, tag = "10")]
+    Fabric(FabricDetailStub),
+    #[prost(message, tag = "11")]
+    Time(TimeDetailV1),
+    #[prost(message, tag = "12")]
+    Mesh(MeshDetailV1),
+    #[prost(message, tag = "13")]
+    Presence(PresenceDetailV1),
+    #[prost(message, tag = "14")]
+    Net(NetDetailV1),
+    #[prost(message, tag = "15")]
+    Consistency(ConsistencyDetailV1),
+}
+
+// --- small pure display helpers (clock-free, unit-testable) ---
+
+/// Humanize an age in ms: "44s ago" / "2m ago" / "2h ago"; negative → "—".
+pub(crate) fn fmt_age(ms: i64) -> String {
+    if ms < 0 {
+        return "—".to_string();
+    }
+    let s = ms / 1000;
+    if s < 90 {
+        format!("{s}s ago")
+    } else if s < 5400 {
+        format!("{}m ago", s / 60)
+    } else {
+        format!("{}h ago", s / 3600)
+    }
+}
+
+/// Short display label: first DNS label of a peer fqdn.
+pub(crate) fn short_name(fqdn: &str) -> &str {
+    fqdn.split('.').next().unwrap_or(fqdn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message as _;
+
+    #[test]
+    fn age_formats_by_magnitude() {
+        assert_eq!(fmt_age(-1), "—");
+        assert_eq!(fmt_age(44_000), "44s ago");
+        assert_eq!(fmt_age(120_000), "2m ago");
+        assert_eq!(fmt_age(7_200_000), "2h ago");
+    }
+
+    #[test]
+    fn short_name_takes_first_label() {
+        assert_eq!(short_name("thor.zagros.example.net"), "thor");
+        assert_eq!(short_name("nodot"), "nodot");
+    }
+
+    #[test]
+    fn envelope_round_trips_mesh_oneof() {
+        let env = EnvHealthV1 {
+            domain: "mesh".to_string(),
+            scope: "zagros-sandbox".to_string(),
+            ts_unix_ms: 1,
+            overall_color: "amber".to_string(),
+            sample_count: 2,
+            window_secs: 30,
+            detail: Some(EnvDetail::Mesh(MeshDetailV1 {
+                links: vec![MeshLinkHealthV1 {
+                    peer_fqdn: "a.x".to_string(),
+                    peer_ip: "100.127.0.9".to_string(),
+                    color: "amber".to_string(),
+                    connected: true,
+                    direct: false,
+                    conn_type: "Relayed".to_string(),
+                    latency_ms: 0.0,
+                    relay_address: "rels://relay-rla.x:33073".to_string(),
+                    handshake_age_ms: 5000,
+                    transition_count: 0,
+                }],
+                vantage_host: "thor.x".to_string(),
+                peers_total: 1,
+                peers_connected: 1,
+            })),
+        };
+        let bytes = env.encode_to_vec();
+        let back = EnvHealthV1::decode(bytes.as_slice()).expect("decode");
+        assert_eq!(back.domain, "mesh");
+        match back.detail {
+            Some(EnvDetail::Mesh(d)) => assert_eq!(d.links[0].peer_fqdn, "a.x"),
+            _ => panic!("expected mesh detail"),
+        }
+    }
+}

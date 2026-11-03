@@ -1,0 +1,59 @@
+[package]
+name = "panoscope-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Shared substrate for the panoscope/stethoscope/flashlight inspection-sibling cluster: peer registry + role taxonomy + Zenoh TLS config (flashlight Phase B) + portal HTTP client + audit-tail S3 NDJSON reader + AuditEvent shape (stethoscope Phase B)."
+repository = "https://github.com/usareur-af/goatcore"
+
+[dependencies]
+# Zenoh SDK — needed by the `tls` module's apply_tls_to_zenoh_config
+# helper. Pinned to the host image build per
+# docs/design/zenoh-version-pinning.md.
+zenoh = { version = "=1.9.0", features = ["unstable"] }
+# zenoh-ext — AdvancedSubscriber (history catch-up + sample-miss recovery)
+# behind the `advanced_sub` catch-up wrapper. A CLIENT-side construct run
+# by the stock router; `unstable` matches the zenoh pin.
+zenoh-ext = { version = "=1.9.0", features = ["unstable"] }
+# PQC chokepoint (ADR 1086 §4): the aws-lc-rs provider with prefer-post-quantum
+# so `tls::apply_tls_to_zenoh_config` can install X25519MLKEM768 as the process
+# default before zenoh opens the session — one change flips panoscope +
+# stethoscope + flashlight to post-quantum key exchange. Additive with zenoh's
+# own `ring` (first-installer-wins, F-247); down-negotiates against a classical
+# router. Pinned to the zenoh-resolved rustls (0.23.x) range.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "prefer-post-quantum", "tls12", "logging"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `aclcheck` compiles in netbird_acl_taxonomy.yml + netbird_acl_matrix.yml, so
+# the assertions are checked against the same declaration the playbooks apply.
+serde_yaml = "0.9"
+rusty-s3 = "0.10.2"
+quick-xml = { version = "0.42", features = ["serialize"] }
+url = "2"
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "test-util", "net", "io-util"] }
+# Builds a `reqwest::Response` from a canned body so the bounded error-body
+# read is tested without a server. Same major reqwest already resolves.
+http = "1"
+# #1309 — builds a gzip-encoded fixture body by hand so the
+# whoami_requests_gzip_and_decodes_a_gzip_response test can prove the
+# client both asks for gzip and transparently decodes it, without a
+# real portal. Already resolves transitively via reqwest's own gzip
+# feature; this just exposes it to the test.
+flate2 = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
