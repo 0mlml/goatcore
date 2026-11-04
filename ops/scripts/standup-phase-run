@@ -13,6 +13,10 @@
 #    or placed on this script's command line. Reference stores (1password, openbao,
 #    vaultwarden) are not loaded here: those values reach the drivers as they
 #    always have (with-secrets, direnv), and the play injector resolves the rest.
+#    Two phase-1 lines of a goatlite are run without loading the store: the render
+#    of the config surface and the creation of the env-file store itself (ADR 1213).
+#    Neither reads a value from the store, and on a first run the store does not
+#    exist until the second has run. Only those two exact command shapes qualify.
 # 2. Every `$(printenv NAME)` the command expands must be non-empty here, or the
 #    phase refuses before it runs and names each NAME, on every profile. An empty
 #    expansion handed Ansible an empty Postgres password, which is worse than a stop.
@@ -26,6 +30,9 @@ check_only=0
 if [ "${1:-}" = "--check" ]; then check_only=1; shift; fi
 [ $# -eq 1 ] || { echo "usage: standup-phase-run [--check] '<command>'" >&2; exit 2; }
 cmd="$1"
+
+before_store="^python3 '[^']*/ops/(scripts/goatlite-render\.py' --site|secrets/posture\.py' init --if-env-file --env) [A-Za-z0-9_-]+$"
+if [[ "$cmd" =~ $before_store ]]; then GOAT_STANDUP_PHASE_LOADED=before-store; fi
 
 if [ "$check_only" = 0 ] && [ -z "${GOAT_STANDUP_PHASE_LOADED:-}" ]; then
   store="${GOAT_SECRET_STORE:-$(python3 "$POSTURE" store 2>/dev/null || echo 1password)}"

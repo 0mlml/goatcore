@@ -149,11 +149,11 @@ func testRunner(t *testing.T, f *fakePortal) (*runner, *httptest.Server) {
 	}, srv
 }
 
-const testManifest = `{"identity":{"handle":"jane","email":"person-58@example.org"},"zenoh":{"enabled":true,"trial":{"org":"jane"}},"netbird":{"usage_limit":5}}`
+const testManifest = `{"identity":{"handle":"jane","email":"person-55@example.org"},"zenoh":{"enabled":true,"trial":{"org":"jane"}},"netbird":{"usage_limit":5}}`
 
 func TestRunOnce_HappyPath(t *testing.T) {
 	f := newFakePortal()
-	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-58@example.org", Status: "approved", ManifestJSON: testManifest})
+	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-55@example.org", Status: "approved", ManifestJSON: testManifest})
 	r, _ := testRunner(t, f)
 
 	var minted []string
@@ -181,8 +181,8 @@ func TestRunOnce_CollabWriteback(t *testing.T) {
 	// writeback and carries the account + one-time link + activated flag in it, so
 	// the console's welcome email includes collab access.
 	f := newFakePortal()
-	m := `{"identity":{"handle":"jane","email":"person-58@example.org"},"collab":{"enabled":true},"netbird":{"usage_limit":5}}`
-	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-58@example.org", Status: "approved", ManifestJSON: m})
+	m := `{"identity":{"handle":"jane","email":"person-55@example.org"},"collab":{"enabled":true},"netbird":{"usage_limit":5}}`
+	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-55@example.org", Status: "approved", ManifestJSON: m})
 	r, _ := testRunner(t, f)
 	r.mint = func(context.Context, proposal, string) (mintResult, error) {
 		return mintResult{SetupKey: "SETUP-KEY"}, nil
@@ -209,7 +209,7 @@ func TestRunOnce_CollabWriteback(t *testing.T) {
 func TestRunOnce_NoCollabWhenNotOptedIn(t *testing.T) {
 	// Provider configured, but the manifest didn't opt in → no collab in the writeback.
 	f := newFakePortal()
-	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-58@example.org", Status: "approved", ManifestJSON: testManifest})
+	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-55@example.org", Status: "approved", ManifestJSON: testManifest})
 	r, _ := testRunner(t, f)
 	r.mint = func(context.Context, proposal, string) (mintResult, error) { return mintResult{SetupKey: "K"}, nil }
 	r.collab = &stubCollab{}
@@ -223,7 +223,7 @@ func TestRunOnce_NoCollabWhenNotOptedIn(t *testing.T) {
 
 func TestRunOnce_DryRunTouchesNothing(t *testing.T) {
 	f := newFakePortal()
-	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-58@example.org", Status: "approved", ManifestJSON: testManifest})
+	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane", Email: "person-55@example.org", Status: "approved", ManifestJSON: testManifest})
 	r, _ := testRunner(t, f)
 	r.dryRun = true
 	minted := 0
@@ -261,8 +261,8 @@ func TestRunOnce_ClaimLostSkipsMint(t *testing.T) {
 
 func TestRunOnce_DuplicateEmailSkipsMint(t *testing.T) {
 	f := newFakePortal()
-	f.add(proposal{ID: "prop-old", Env: "zagros", Handle: "jane1", Email: "person-58@example.org", Status: "onboarded"})
-	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane2", Email: "person-58@example.org", Status: "approved", ManifestJSON: testManifest})
+	f.add(proposal{ID: "prop-old", Env: "zagros", Handle: "jane1", Email: "person-55@example.org", Status: "onboarded"})
+	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane2", Email: "person-55@example.org", Status: "approved", ManifestJSON: testManifest})
 	r, _ := testRunner(t, f)
 	minted := 0
 	r.mint = func(context.Context, proposal, string) (mintResult, error) { minted++; return mintResult{}, nil }
@@ -283,9 +283,9 @@ func TestRunOnce_DuplicateEmailSkipsMint(t *testing.T) {
 // welcome package points at the same enrollment — not a keyless onboarded row.
 func TestRunOnce_DuplicateEmailCopiesOriginalKey(t *testing.T) {
 	f := newFakePortal()
-	f.add(proposal{ID: "prop-old", Env: "zagros", Handle: "jane1", Email: "person-58@example.org",
+	f.add(proposal{ID: "prop-old", Env: "zagros", Handle: "jane1", Email: "person-55@example.org",
 		Status: "onboarded", SetupKey: "ORIG-KEY", BundlePath: "/api/org-bundle/abc/tok.tar.gz"})
-	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane2", Email: "person-58@example.org", Status: "approved", ManifestJSON: testManifest})
+	f.add(proposal{ID: "prop-1", Env: "zagros", Handle: "jane2", Email: "person-55@example.org", Status: "approved", ManifestJSON: testManifest})
 	r, _ := testRunner(t, f)
 	minted := 0
 	r.mint = func(context.Context, proposal, string) (mintResult, error) { minted++; return mintResult{}, nil }

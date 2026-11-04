@@ -1,0 +1,73 @@
+---
+# standup-image-pull.yml — pull every pinned image a site's hosts deploy, on those
+# hosts, in parallel, before the plays that run them (docs/design/goatlite.md §11,
+# measure 2). Both standup drivers start it in the background after phase 2 (the
+# container engine and the registry login are in place then) and wait for it
+# before phase 5.
+#
+#   ansible-playbook -i inventory/mgmt-hosts.ini standup-image-pull.yml -e target=<site>_hosts
+#
+# The list is ops/scripts/standup-images.py for the group: the merged pin table
+# (fleet-pins.yaml + lite-pins.yaml) the deploy reads, less every component declared
+# absent for it. At most standup_image_pull_concurrency pulls run at once per host
+# (default 4). An image that cannot be pulled fails the play by name, after every
+# pull has finished. A group no pin table governs pulls nothing here.
+#
+# Changes nothing but the host's image store; safe to re-run.
+- name: "standup: pull every pinned image for {{ target | default('?') }}, in parallel"
+  hosts: "{{ target | default('__no_target__') }}"
+  gather_facts: false
+  become: true
+  vars:
+    standup_image_pull_concurrency: 4
+  tasks:
+    - name: target names one site's host-group
+      ansible.builtin.assert:
+        that:
+          - target is defined
+          - target | length > 0
+        fail_msg: "Pass -e target=<site>_hosts (the group whose hosts pull the images)."
+      run_once: true
+
+    - name: the pinned images this group deploys (ops/scripts/standup-images.py)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../scripts/standup-images.py"
+          - --member
+          - "{{ target }}"
+          - --ghcr-org
+          - "{{ ghcr_org | default('usareur-af') }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      register: standup_images
+
+    - name: nothing to pull
+      ansible.builtin.debug:
+        msg: "{{ standup_images.stderr | default('', true) or ('no pinned image for ' ~ target) }}"
+      when: standup_images.stdout_lines | length == 0
+
+    - name: pull them on the host, at most {{ standup_image_pull_concurrency }} at a time
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../scripts/standup-image-pull.sh
+          --concurrency {{ standup_image_pull_concurrency | int }}
+          {{ standup_images.stdout_lines | map('quote') | join(' ') }}
+      register: standup_image_pull
+      changed_when: false
+      failed_when: false
+      when: standup_images.stdout_lines | length > 0
+
+    - name: report what was pulled
+      ansible.builtin.debug:
+        msg: "{{ standup_image_pull.stdout_lines | default([]) }}"
+      when: standup_image_pull.rc is defined
+
+    - name: every pinned image is present on the host
+      ansible.builtin.fail:
+        msg: "{{ ((standup_image_pull.stdout_lines | default([])) | select('search', 'could not') | list) | join('\n') or standup_image_pull.stderr | default('the pull script failed', true) }}"
+      when:
+        - standup_image_pull.rc is defined
+        - standup_image_pull.rc != 0

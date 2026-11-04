@@ -188,6 +188,53 @@
     - (idac_live_gh_token.stdout | trim | int) == 0
     - "'repo:' in (id_admin_console_repo_access_content | default(''))"
 
+# The token must be able to grant every repository the policy names. A
+# fine-grained token sees only the repositories chosen when it was made, so a
+# repository added to the policy later answers 404 and every grant to it fails
+# for everyone onboarded after (#2107: three repositories failed for months).
+# One read-only GET per policy repository with the token this deploy writes.
+# Override with -e id_admin_console_allow_token_short_of_policy=true.
+- name: Token coverage — can the incoming token see every policy repository?
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ playbook_dir }}/../scripts/repo-policy-token-coverage.py"
+      - --policy
+      - "-"
+    stdin: "{{ id_admin_console_repo_access_content }}"
+  environment:
+    GITHUB_ONBOARD_TOKEN: "{{ id_admin_console_github_onboard_token | default('') | trim }}"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  register: idac_token_coverage
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when:
+    - (id_admin_console_github_onboard_token | default('') | trim | length) > 0
+    - "'repo:' in (id_admin_console_repo_access_content | default(''))"
+
+- name: Token coverage — refuse a token that cannot grant the whole policy
+  ansible.builtin.assert:
+    that:
+      - idac_token_coverage.rc == 0
+        or (id_admin_console_allow_token_short_of_policy | default(false) | bool)
+    quiet: true
+    fail_msg: |
+      REFUSING: the GitHub token this deploy would write cannot see every
+      repository in this goatnet's repo-access policy, so every grant to the
+      repositories marked MISS would fail at onboarding:
+
+      {{ idac_token_coverage.stdout | default('') }}
+
+      Add them under Repository access on the token
+      (github.com/settings/personal-access-tokens), then re-run. Nothing on the
+      host has changed. If the gap is intended, re-run with
+        -e id_admin_console_allow_token_short_of_policy=true
+    success_msg: "{{ (idac_token_coverage.stdout_lines | default(['token coverage: skipped'])) | last }}"
+  when: idac_token_coverage is not skipped
+
 # --- Store engine (ADR 1165 step A) ---
 # Refuses before anything below is rendered or started unless the image's
 # store, the declared store and the host's record of where its rows are agree;

@@ -4,8 +4,8 @@
 #   ops/tutorials/check.sh <goatbuilder binary> [--record]
 #
 # For every tutorial under docs/tutorials/ that has a section headed
-# "Rehearse it on the fixture" (a leading step number such as "2." is
-# ignored), run that section's ```bash blocks exactly as
+# "Rehearse it on the fixture" or "Rehearse it on the worked example" (a
+# leading step number such as "2." is ignored), run that section's ```bash blocks exactly as
 # written (one shell, top to bottom, from the repository root, `goatbuilder`
 # resolved to the binary given), normalise what varies run to run (the
 # millisecond timing, the scratch directory), and compare the output with the
@@ -26,7 +26,7 @@ case "$GB" in /*) ;; *) GB="$(cd "$(dirname "$GB")" && pwd)/$(basename "$GB")" ;
 [ -x "$GB" ] || { echo "check.sh: $GB is not an executable goatbuilder" >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHECKPOINTS="$ROOT/ops/goatbuilder/fixtures/goatnet-from-scratch/checkpoints"
-SECTION="Rehearse it on the fixture"
+SECTION="Rehearse it on the fixture|Rehearse it on the worked example"
 fail=0; ran=0
 
 for page in "$ROOT"/docs/tutorials/[0-9][0-9]-*.md; do
@@ -35,11 +35,11 @@ for page in "$ROOT"/docs/tutorials/[0-9][0-9]-*.md; do
   script="$(python3 - "$page" "$SECTION" <<'PY'
 import re, sys
 text = open(sys.argv[1], encoding="utf-8").read().splitlines()
-want = sys.argv[2]
+want = sys.argv[2].split("|")
 start = level = None
 for i, l in enumerate(text):
     m = re.match(r"^(#+)\s+(.*)$", l)
-    if m and re.sub(r"^\d+\.\s*", "", m.group(2).strip()) == want:
+    if m and re.sub(r"^\d+\.\s*", "", m.group(2).strip()) in want:
         start, level = i, len(m.group(1)); break
 if start is None:
     sys.exit(0)

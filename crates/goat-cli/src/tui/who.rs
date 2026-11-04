@@ -2635,13 +2635,13 @@ mod tests {
             let mut s = WhoState::new(vec![], None, WhoSort::Name, true);
             s.apply_roster(vec![AccessRosterEntry {
                 id: C.into(),
-                label: "person-89@example.org".into(),
+                label: "person-85@example.org".into(),
                 kind: "person".into(),
                 ..Default::default()
             }]);
             s
         };
-        assert_eq!(s.resolved_name(&AliasRegistry::empty(), C), "person-89@example.org");
+        assert_eq!(s.resolved_name(&AliasRegistry::empty(), C), "person-85@example.org");
         // and it joins the roster universe even though it's not declared/live.
         assert!(s.identity_anchors(Instant::now()).contains(C));
     }

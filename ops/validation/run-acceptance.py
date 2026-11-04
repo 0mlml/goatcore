@@ -185,7 +185,7 @@ def run(argv=None):
     absent = declared_absent(args.endstate)
 
     if args.plan:
-        return plan(args, tests, values)
+        return plan(args, tests, values, absent)
 
     results = []
     # TWO PASSES, POSITIVES FIRST. A `must_refuse` row asserts that something is
@@ -308,13 +308,16 @@ def print_by_layer(results):
         print(f"  {layer:15s} " + "  ".join(f"{table[layer][k]:>7}" for k in order))
 
 
-def plan(args, tests, values):
+def plan(args, tests, values, absent=frozenset()):
     """--plan: what the assay would run on this goatnet, by layer, probing
     nothing. Deterministic for a given value set, so a rehearsal can keep it
-    as a checkpoint."""
+    as a checkpoint. A row whose `requires` names a service the end state
+    declares absent is N/A here too, as it is when the rows run (ADR 1206)."""
     applicable, na = {}, []
     for t in tests:
-        if truthy_applies(t.get("applies_when"), values):
+        if set(t.get("requires", [])) & absent:
+            na.append(t["id"])
+        elif truthy_applies(t.get("applies_when"), values):
             applicable.setdefault(layer_of(t), []).append(t)
         else:
             na.append(t["id"])
@@ -552,6 +555,17 @@ def self_test():
         # oidc-flow, bus-roundtrip and enroll-probe against stub services.
         for name, got, want in live_probe_self_test(Path(d)):
             check(name, got, want)
+
+    # --plan lists the rows the run grades: a row needing a declared-absent service
+    # is N/A in the plan as it is in the run (LP-015), and applicable without a model.
+    rows = [{"id": "prom-up", "aspect": "obs/prometheus", "requires": ["prometheus"]},
+            {"id": "mgmt-up", "aspect": "mgmt-stack/netbird", "requires": ["netbird-mgmt"]}]
+    for name, absent, want in (("plan: an absent service's row is N/A", {"prometheus"}, "N/A here: prom-up"),
+                               ("plan: with no model every row applies", set(), "2 applicable rows, 0 N/A")):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            plan(argparse.Namespace(env="selftest"), rows, {}, absent)
+        check(name, want in buf.getvalue(), True)
 
     print(f"\nself-test: {'ALL PROBES PROVEN RED-THEN-GREEN' if ok else 'FAILURES ABOVE'}")
     return 0 if ok else 1

@@ -222,7 +222,7 @@ OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES aws-vault exec legacy --no-session -- \
     -e cf_api_token="$CLOUDFLARE_API_TOKEN" \
     -e cloudflare_api_token="$CLOUDFLARE_API_TOKEN" \
     -e "mesh_only_allowlist_extra_cidrs=[\"$NATGW_IP/32\"]" \
-    -e assay_owner_email=person-85@example.org
+    -e assay_owner_email=person-81@example.org
 ```
 
 For the F-269 token-self-heal check (run-assay.sh check D), also pass

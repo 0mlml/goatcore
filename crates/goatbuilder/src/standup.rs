@@ -62,6 +62,11 @@ enum Event {
     Phase(Phase),
     LegStart { leg: &'static str, label: String, cmd: String, log: String },
     LegJoin { leg: &'static str, at: u32 },
+    /// Every pinned image pulled on the site's hosts in the background
+    /// (standup-image-pull.yml), started after phase 2 and joined before phase 5.
+    /// Its banners are `phase` rows, so the table prints them as section titles.
+    PullStart { label: String, cmd: String, log: String },
+    PullJoin { at: u32 },
     Skip { label: String, lines: Vec<String> },
 }
 
@@ -316,6 +321,10 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
         // — inventory group, group_vars, cert manifest, pins row, door entry — into
         // the checkout FIRST, then the unchanged phases run over it.
         ev.push(p(1, "GATE", "goatlite: render the config surface from goatlite.yaml (idempotent; an edited file is reported, never overwritten)".into(), format!("python3 '{r}/ops/scripts/goatlite-render.py' --site {site}")));
+        // Then the env-file store every later phase reads, created here rather than by
+        // hand: it needs the rendered groups, and the phases after it load it (LP-007).
+        // standup-phase-run runs these two lines without loading the store.
+        ev.push(p(1, "GATE", "goatlite: create the local secrets store (strong random values; a value already there is kept)".into(), format!("python3 '{r}/ops/secrets/posture.py' init --if-env-file --env {site}")));
     }
     ev.push(p(1, "GATE", "config preflight (fail-closed)".into(), format!("python3 '{r}/ops/scripts/standup-config-preflight.py' {g} {obs_arg}")));
     // Up to the manual step only: phase 11 issues the service token phase 12
@@ -336,6 +345,17 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     if s.obs {
         ev.push(Event::LegStart { leg: "host", label: "observability host: baseline + LUKS, then utility (Forgejo)".into(), cmd: format!("{leg_o1} && {leg_o2}"), log: format!("{}/standup-{site}-obs-host.log", s.state_dir) });
     }
+    // Every pinned image, pulled on the box in parallel with phases 3 and 4 and
+    // joined before phase 5 (goatlite.md §11 measure 2). Only when phase 5 is in
+    // range: a resume past it pulls inside its plays, as before.
+    let pull = o.from <= 5 && o.to >= 5;
+    if pull {
+        ev.push(Event::PullStart {
+            label: format!("every pinned image for {g}, pulled on its hosts in parallel (joined before phase 5)"),
+            cmd: format!("cd '{r}/ops/ansible' && {pre} {inv} standup-image-pull.yml -e target={g}"),
+            log: format!("{}/standup-{site}-images.log", s.state_dir),
+        });
+    }
     ev.push(p(3, "T", "generate per-instance secrets".into(), format!("'{r}/ops/scripts/newsite-secrets.sh' {site}")));
     // goatlite (goatlite.md §5 row 5): no CA root is handed out of band; phase 4
     // mints one when the manifest's root does not exist, then the leaves.
@@ -351,12 +371,14 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     } else {
         ev_bootstrap.clone()
     };
-    // Only the schema-wait stop is expected (site-bootstrap's rescue names it:
-    // "never had Ory"). Any other refusal, the NTP preflight for one, used to be
-    // swallowed by a bare `|| echo`, and phase 6 then failed on a compose file
-    // that was never written. The play's output is kept in a temp file
-    // for the one grep and removed.
-    ev.push(p(5, "A", "mgmt-stack (site-bootstrap) — first run STOPS at the schema wait (expected; phase 6 finishes it)".into(), format!("cd '{r}/ops/ansible' && ( log=$(mktemp); if {pre} {inv} site-bootstrap.yml {ev_p1} 2>&1 | tee \"$log\"; then rm -f \"$log\"; elif grep -q 'never had Ory' \"$log\"; then rm -f \"$log\"; echo '>> phase 5 stopped — expected on a first run (schema not ready until Ory is up). Continuing to phase 6, which re-runs this and must succeed.'; else rm -f \"$log\"; exit 1; fi )")));
+    if pull {
+        ev.push(Event::PullJoin { at: 5 });
+    }
+    // Phase 5 runs site-bootstrap's `stack` plays only. The account seed waits
+    // for the netbird schema, which management-a writes only once it can reach
+    // Hydra, so the seed and every play after it run in phase 6, after
+    // ory-deploy. Any refusal here is a real one and fails the phase.
+    ev.push(p(5, "A", "mgmt-stack (site-bootstrap up to the account seed; the seed needs Ory and runs in phase 6)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} site-bootstrap.yml {ev_p1} --skip-tags after-ory")));
     let internet = s.profile == "internet";
     if internet {
         ev.push(p(5, "A", "[internet] relay-connect (rathole-client)".into(), format!("cd '{r}/ops/ansible' && ( ls {site}-rathole-client.yml >/dev/null 2>&1 && {pre} -i inventory/hosts-{site}.ini {inv} {site}-rathole-client.yml -e rathole_client_target={g} || echo 'no {site}-rathole-client.yml — make it from nova-rathole-client.yml (handbook phase 5), then re-run --from 5' )")));
@@ -367,7 +389,14 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     if s.joiner {
         ev.push(p(6, "A", format!("[joiner] seed-from-peer (pass 2 — data-only copy from founder {}; guarded)", or_q(jfs)), format!("cd '{r}/ops/ansible' && {{ [ -n '{jfs}' ] || {{ echo 'joiner: group_vars/{g}/vars.yml must set join_founder_site (the founder site-id to seed from)'; exit 1; }}; }} && {{ ls {site}-seed-from-peer.yml >/dev/null 2>&1 || {{ echo 'missing {site}-seed-from-peer.yml — clone it from any site that has <site>-seed-from-peer.yml (node-addition.md §4)'; exit 1; }}; }} && {pre} {inv} {site}-seed-from-peer.yml -e site_id={site}")));
     }
-    ev.push(p(6, "A", "re-run site-bootstrap (completes phase 5; prints + saves the setup key)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} site-bootstrap.yml {ev_bootstrap}")));
+    // The rest of site-bootstrap, now that Ory is up: the seed's schema wait is
+    // bounded (netbird_schema_wait_seconds) and names its cause. A joiner runs
+    // the whole file again: its pass 3 turns Spock on, which the stack plays set.
+    if s.joiner {
+        ev.push(p(6, "A", "[joiner] re-run site-bootstrap with Spock on (pass 3; prints + saves the setup key)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} site-bootstrap.yml {ev_bootstrap}")));
+    } else {
+        ev.push(p(6, "A", "the rest of site-bootstrap: wait for the netbird schema, seed the account, print + save the setup key".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} site-bootstrap.yml {ev_bootstrap} --skip-tags stack")));
+    }
     if s.joiner {
         ev.push(p(6, "A", format!("[joiner] founder-side mirror (spock-mesh-wire on {}, peer={site} only — both-direction subscriptions)", or_q(jfg)), format!("cd '{r}/ops/ansible' && {{ [ -n '{jfg}' ] || {{ echo 'joiner: join_founder_site not set in group_vars/{g}/vars.yml'; exit 1; }}; }} && {pre} {inv} spock-mesh-wire.yml --limit {jfg} -e '{{\"inter_site_spock_peers\":[\"{site}\"]}}'")));
     }
@@ -437,7 +466,7 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     // `requires` names only services the site declares absent reads N/A, so a
     // one-box goatnet is graded against what it declares, not against the fleet.
     let sd = &s.state_dir;
-    ev.push(p(13, "GATE", "acceptance suite (values derived from config; all applicable rows green)".into(), format!("python3 '{r}/ops/goatbuilder/endstate/endstate.py' model {site} > '{sd}/endstate-{site}.json' && python3 '{r}/ops/validation/generate-values.py' {site} && python3 '{r}/ops/validation/run-acceptance.py' --env {site} --values '{r}/ops/validation/values-{site}.yaml' --endstate '{sd}/endstate-{site}.json' --all-eligible --by-layer")));
+    ev.push(p(13, "GATE", "acceptance suite (values derived from config; all applicable rows green)".into(), crate::assay::phase13(Path::new(r), site, sd).phase_line()));
 
     // Phase 14 — the two rescue classes (ADR 1183): declared-but-not-inventoried is a
     // real state and prints its reason outside the phase gate, as the script does.
@@ -709,6 +738,7 @@ pub fn standup(repo: &Path, o: &Options) -> Result<Report> {
     }
 
     let mut legs: BTreeMap<&'static str, (std::process::Child, String)> = BTreeMap::new();
+    let mut pulling: Option<(std::process::Child, String)> = None;
     let mut timings: Vec<(u32, String, u64)> = Vec::new();
     let dag = load_dag(repo);
     let mut queue: Vec<Queued> = Vec::new();
@@ -745,6 +775,40 @@ pub fn standup(repo: &Path, o: &Options) -> Result<Report> {
                 let f = std::fs::File::create(log)?;
                 let child = phase_command(repo, cmd).current_dir(repo).stdout(Stdio::from(f.try_clone()?)).stderr(Stdio::from(f)).spawn().context("bash")?;
                 legs.insert(leg, (child, log.clone()));
+            }
+            Event::PullStart { label, cmd, log } => {
+                checks.push(row("phase", format!("=== Image pull [A ∥] {label} ===")));
+                checks.push(row("cmd", cmd.clone()));
+                checks.push(row("note", format!("(log: {log})")));
+                if o.dry_run {
+                    continue;
+                }
+                if let Some(d) = Path::new(log).parent() {
+                    std::fs::create_dir_all(d)?;
+                }
+                let f = std::fs::File::create(log)?;
+                let child = phase_command(repo, cmd).current_dir(repo).stdout(Stdio::from(f.try_clone()?)).stderr(Stdio::from(f)).spawn().context("bash")?;
+                pulling = Some((child, log.clone()));
+            }
+            Event::PullJoin { at } => {
+                if o.dry_run {
+                    checks.push(row("phase", format!("=== join the image pull before phase {at} ===")));
+                    continue;
+                }
+                let Some((mut child, log)) = pulling.take() else { continue };
+                checks.push(row("phase", format!("=== join the image pull before phase {at} (waiting) ===")));
+                let status = child.wait()?;
+                let tail: Vec<String> = std::fs::read_to_string(&log).unwrap_or_default().lines().rev().take(25).map(String::from).collect::<Vec<_>>().into_iter().rev().collect();
+                for l in tail {
+                    checks.push(row("log", format!("| {l}")));
+                }
+                if !status.success() {
+                    let rc = status.code().unwrap_or(1);
+                    let prof = if s.profile != "lan" { format!(" --profile {}", s.profile) } else { String::new() };
+                    checks.push(Check { name: "failed".into(), ok: false, detail: format!("!! Image pull FAILED — exit {rc} (full log: {log}). Phase {at} and every later phase run these images, so the run stops here; the log names each image that could not be pulled."), fix: Some(format!("a private package needs GHCR_READ_TOKEN on the laptop (phase 2 logs the box in with it); a pin naming an image the registry no longer has needs a new pin in ops/pins/. Then resume: {resume} --from {at}{prof}")) });
+                    exit = EXIT_REFUSED;
+                    break 'run;
+                }
             }
             Event::LegJoin { leg, at } => {
                 if o.dry_run {
@@ -829,6 +893,10 @@ pub fn standup(repo: &Path, o: &Options) -> Result<Report> {
     }
     if !o.dry_run && !timings.is_empty() {
         checks.push(row("timings", timing_summary(&timings, run_started.elapsed().as_secs())));
+    }
+    if let Some((mut child, log)) = pulling {
+        let _ = child.try_wait();
+        checks.push(row("note", format!("the image pull is still running in the background (log: {log})")));
     }
     // A leg still running when the run stopped early is left to finish; its log names it.
     for (leg, (mut child, log)) in legs {
@@ -1202,7 +1270,7 @@ mod tests {
         assert_eq!(c.get_program(), "/r/ops/scripts/standup-phase-run");
         assert_eq!(c.get_args().collect::<Vec<_>>(), vec!["true"]);
         let sh = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/scripts/goat-standup.sh")).unwrap();
-        assert_eq!(sh.matches("ops/scripts/standup-phase-run\"").count(), 4, "the serial step (twice), the waves and the legs");
+        assert_eq!(sh.matches("ops/scripts/standup-phase-run\"").count(), 5, "the serial step (twice), the waves, the legs and the image pull");
     }
 
     fn repo_root() -> std::path::PathBuf {
@@ -1291,6 +1359,86 @@ mod tests {
         let failed = flush_waves(&root, &site, &mut q, &mut checks, &mut Vec::new()).unwrap();
         assert_eq!(failed, vec!["a (wave 1 of 2)".to_string()]);
         let _ = std::fs::remove_dir_all(&t);
+    }
+
+    fn test_site(joiner: bool) -> Site {
+        Site {
+            repo: "/r".into(), site: "zagros".into(), group: "zagros_hosts".into(), upper: "ZAGROS".into(), obs_group: String::new(),
+            state_dir: "/s".into(), ansible_pre: "PRE".into(), inv: "INV", profile: "lan".into(), joiner,
+            join_founder_site: if joiner { "alpha".into() } else { String::new() }, join_founder_group: if joiner { "alpha_hosts".into() } else { String::new() },
+            acl_site: "zagros".into(), mgmt_fqdn: String::new(), intra_pair: false, obs: false, obs_why: String::new(),
+            group_vars_exists: true, lite: false, nb_token_available: false, owner_email: "$OWNER_EMAIL".to_string(),
+        }
+    }
+
+    fn phase_lines(s: &Site, o: &Options) -> Vec<(u32, String, String)> {
+        plan(&repo_root(), s, o, "RESUME").into_iter().filter_map(|e| match e { Event::Phase(p) => Some((p.n, p.label, p.cmd)), _ => None }).collect()
+    }
+
+    /// Phase 5 no longer stops on purpose and phase 6 no longer re-runs the whole
+    /// mgmt stack: 5 runs site-bootstrap's `stack` plays, 6 deploys Ory and then
+    /// the `after-ory` plays, whose seed waits for the schema with Ory up.
+    #[test]
+    fn phase_5_runs_the_stack_and_phase_6_the_rest_after_ory() {
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let lines = phase_lines(&test_site(false), &o);
+        let sb: Vec<&(u32, String, String)> = lines.iter().filter(|l| l.2.contains("site-bootstrap.yml")).collect();
+        assert_eq!(sb.len(), 2, "{sb:?}");
+        assert_eq!(sb[0].0, 5);
+        assert!(sb[0].2.ends_with("--skip-tags after-ory"), "{}", sb[0].2);
+        assert!(!sb[0].2.contains("never had Ory") && !sb[0].2.contains("grep"), "no expected-stop wrapper: {}", sb[0].2);
+        assert_eq!(sb[1].0, 6);
+        assert!(sb[1].2.ends_with("--skip-tags stack"), "{}", sb[1].2);
+        let ory = lines.iter().position(|l| l.2.contains("ory-deploy.yml")).unwrap();
+        let rest = lines.iter().position(|l| l.2.ends_with("--skip-tags stack")).unwrap();
+        assert!(ory < rest, "Ory deploys before the account seed");
+        // A joiner's pass 3 turns Spock on, which the stack plays configure: the whole file again.
+        let j = phase_lines(&test_site(true), &o);
+        let jsb: Vec<&(u32, String, String)> = j.iter().filter(|l| l.2.contains("site-bootstrap.yml")).collect();
+        assert!(jsb[0].2.ends_with("--skip-tags after-ory"));
+        assert!(!jsb[1].2.contains("--skip-tags"), "{}", jsb[1].2);
+    }
+
+    /// The image pull starts after phase 2 and is joined before phase 5, and only
+    /// when phase 5 is in the run's range.
+    #[test]
+    fn the_image_pull_runs_between_phase_2_and_phase_5() {
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let at = |ev: &[Event]| -> Vec<String> { ev.iter().map(|e| match e {
+            Event::Phase(p) => format!("{}", p.n), Event::PullStart { .. } => "pull".into(), Event::PullJoin { at } => format!("join{at}"), _ => "other".into() }).collect() };
+        let ev = plan(&repo_root(), &test_site(false), &o, "RESUME");
+        let seq = at(&ev);
+        let start = seq.iter().position(|x| x == "pull").unwrap();
+        let join = seq.iter().position(|x| x == "join5").unwrap();
+        assert_eq!(seq[start - 1], "2", "{seq:?}");
+        assert_eq!(seq[join + 1], "5", "{seq:?}");
+        assert!(seq[start + 1..join].iter().all(|x| x == "3" || x == "4"), "{seq:?}");
+        let Event::PullStart { cmd, log, .. } = &ev.iter().find(|e| matches!(e, Event::PullStart { .. })).unwrap() else { unreachable!() };
+        assert!(cmd.ends_with("standup-image-pull.yml -e target=zagros_hosts"), "{cmd}");
+        assert_eq!(log, "/s/standup-zagros-images.log");
+        for (from, to) in [(6, 14), (1, 4)] {
+            let seq = at(&plan(&repo_root(), &test_site(false), &Options { from, to, ..o }, "RESUME"));
+            assert!(!seq.iter().any(|x| x == "pull" || x == "join5"), "--from {from} --to {to}: {seq:?}");
+        }
+    }
+
+    /// The two parts phases 5 and 6 select: every play but the untagged pre-flight
+    /// gate is `stack` or `after-ory`, the stack plays come first, and the account
+    /// seed (the one play that needs Ory) opens the after-ory part.
+    #[test]
+    fn site_bootstrap_plays_are_tagged_stack_then_after_ory() {
+        let text = std::fs::read_to_string(repo_root().join("ops/ansible/site-bootstrap.yml")).unwrap();
+        let plays: Vec<serde_yaml::Value> = serde_yaml::from_str(&text).unwrap();
+        let tags: Vec<(String, Vec<String>)> = plays.iter().map(|p| (
+            p.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+            p.get("tags").and_then(|t| t.as_sequence()).map(|s| s.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+        )).collect();
+        assert!(tags[0].1.is_empty(), "the pre-flight gate runs in both phases");
+        let part: Vec<&str> = tags[1..].iter().map(|(n, t)| { assert_eq!(t.len(), 1, "{n}: {t:?}"); t[0].as_str() }).collect();
+        let first_after = part.iter().position(|t| *t == "after-ory").unwrap();
+        assert!(part[..first_after].iter().all(|t| *t == "stack") && part[first_after..].iter().all(|t| *t == "after-ory"), "{part:?}");
+        assert!(tags[1 + first_after].0.contains("seed account"), "{}", tags[1 + first_after].0);
+        assert!(text.contains("netbird_schema_wait_seconds"), "the schema wait is bounded by a named variable");
     }
 
     /// A burn-down on the fixture: reverse phase order, every converged record
@@ -1465,7 +1613,10 @@ mod tests {
         let ph = phases_of(&ev);
         assert_eq!((ph[0].n, ph[0].kind, ph[0].label.as_str()), (1, "GATE", "goatlite: render the config surface from goatlite.yaml (idempotent; an edited file is reported, never overwritten)"));
         assert_eq!(ph[0].cmd, "python3 '/r/ops/scripts/goatlite-render.py' --site pasture");
-        assert_eq!(ph[1].label, "config preflight (fail-closed)", "the render comes before every other gate");
+        // LP-007: the env-file store is created by the run itself, after the render (it
+        // needs the rendered groups) and before the first gate that loads it.
+        assert_eq!(ph[1].cmd, "python3 '/r/ops/secrets/posture.py' init --if-env-file --env pasture");
+        assert_eq!(ph[2].label, "config preflight (fail-closed)", "the render and the store come before every other gate");
         let mint = ph.iter().find(|p| p.label == "mint leaf certs").unwrap();
         assert_eq!((mint.n, mint.cmd.as_str()), (4, "'/r/ops/scripts/mint-site-certs.sh' pasture --mint-ca-if-missing"));
         let login = ph.iter().find(|p| p.n == 11).expect("a LAN site without the token pauses at phase 11");

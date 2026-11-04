@@ -54,7 +54,7 @@ func TestSponsorshipLookup_EndToEnd(t *testing.T) {
 	seedPrincipal(t, reg, "sponsor-a", true, "developer")
 
 	// Grant with the email binding via the public lever (case-normalized).
-	w := postJSON(t, h, opKey, "/api/orgs/sponsor-a/sponsorship", `{"authorized":true,"max_tier":"developer","email":"person-62@example.org"}`)
+	w := postJSON(t, h, opKey, "/api/orgs/sponsor-a/sponsorship", `{"authorized":true,"max_tier":"developer","email":"Jeroen@Example.org"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("grant with email = %d; %s", w.Code, w.Body.String())
 	}

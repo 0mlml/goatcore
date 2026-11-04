@@ -39,7 +39,7 @@ zenoh:
 
 const manifestActiveUnrecorded = `identity:
   handle: grace-hopper
-  email: person-50@example.org
+  email: person-47@example.org
   name: Grace Hopper
   status: active
 zenoh:
@@ -48,7 +48,7 @@ zenoh:
 
 const manifestRevoked = `identity:
   handle: user8x-example
-  email: person-64@example.org
+  email: person-60@example.org
   name: Joshua Example
   status: revoked
 collab:
@@ -60,7 +60,7 @@ zenoh:
 
 const manifestDeclaredNoAccount = `identity:
   handle: alan-turing
-  email: person-12@example.org
+  email: person-11@example.org
   name: Alan Turing
   status: active
 collab:
@@ -71,7 +71,7 @@ zenoh:
 
 const manifestStaleRecord = `identity:
   handle: karen-sparck
-  email: person-66@example.org
+  email: person-62@example.org
   name: Karen Sparck
   status: active
 collab:
@@ -99,7 +99,7 @@ func fixtureRepo(t *testing.T) string {
 	writeFile(t, filepath.Join(root, "ops", "operators", "test-revoke", "notional.yml"), manifestActiveRecorded)
 	writeFile(t, filepath.Join(root, "docs", "operators", "roster.json"), `{"members":[
 	  {"handle":"ada-lovelace","type":"person","status":"active","email_hash":"`+emailHash("person-5@example.org")+`"},
-	  {"handle":"user167x","type":"person","status":"active","email_hash":"`+emailHash("person-61@example.org")+`"}
+	  {"handle":"user167x","type":"person","status":"active","email_hash":"`+emailHash("person-58@example.org")+`"}
 	]}`)
 	return root
 }
@@ -177,10 +177,10 @@ func reconcileFixture(t *testing.T, accts []CollabAccount) reconcileReport {
 func TestReconcileVerdicts(t *testing.T) {
 	rep := reconcileFixture(t, []CollabAccount{
 		{Handle: "ada-lovelace", Email: "person-5@example.org"}, // recorded + active
-		{Handle: "grace-hopper", Email: "person-50@example.org"},        // active, unrecorded
-		{Handle: "user8x-example", Email: "person-64@example.org"},     // revoked, live account
-		{Handle: "nobody-here", Email: "person-76@example.org"},        // no identity at all
-		{Handle: "jvanhay", Email: "person-61@example.org"},              // roster-only, matched by email
+		{Handle: "grace-hopper", Email: "person-47@example.org"},        // active, unrecorded
+		{Handle: "user8x-example", Email: "person-60@example.org"},     // revoked, live account
+		{Handle: "nobody-here", Email: "person-72@example.org"},        // no identity at all
+		{Handle: "jvanhay", Email: "person-58@example.org"},              // roster-only, matched by email
 	})
 	got := map[string]string{}
 	for _, r := range rep.Rows {
@@ -217,7 +217,7 @@ func TestReconcileVerdicts(t *testing.T) {
 }
 
 func TestReconcileEmitsNoEmailAddresses(t *testing.T) {
-	rep := reconcileFixture(t, []CollabAccount{{Handle: "grace-hopper", Email: "person-50@example.org"}})
+	rep := reconcileFixture(t, []CollabAccount{{Handle: "grace-hopper", Email: "person-47@example.org"}})
 	var sb strings.Builder
 	writeReport(&sb, rep)
 	if strings.Contains(sb.String(), "@") {
@@ -228,9 +228,9 @@ func TestReconcileEmitsNoEmailAddresses(t *testing.T) {
 func TestBuildBackfillSkipsAlreadyRecordedAndIdentityless(t *testing.T) {
 	rep := reconcileFixture(t, []CollabAccount{
 		{Handle: "ada-lovelace", Email: "person-5@example.org"},
-		{Handle: "grace-hopper", Email: "person-50@example.org"},
-		{Handle: "user8x-example", Email: "person-64@example.org"},
-		{Handle: "nobody-here", Email: "person-76@example.org"},
+		{Handle: "grace-hopper", Email: "person-47@example.org"},
+		{Handle: "user8x-example", Email: "person-60@example.org"},
+		{Handle: "nobody-here", Email: "person-72@example.org"},
 	})
 	doc := buildBackfill(rep, "2026-08-02T00:00:00Z")
 	handles := map[string]backfillPatch{}
@@ -300,7 +300,7 @@ func TestApplyBackfillWritesAndIsIdempotent(t *testing.T) {
 	if got.Collab.Account != "grace-hopper" || !got.Collab.Enabled || !got.Collab.Activated {
 		t.Errorf("collab block not written: %+v", got.Collab)
 	}
-	if got.Identity.Email != "person-50@example.org" || got.Identity.Status != "active" {
+	if got.Identity.Email != "person-47@example.org" || got.Identity.Status != "active" {
 		t.Errorf("patch clobbered the identity block: %+v", got.Identity)
 	}
 	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
@@ -378,8 +378,8 @@ func TestReadBackfillRejectsUnknownVersion(t *testing.T) {
 // and never needs a live service to be exercised.
 func TestRunCollabOpReconcileEmitsBackfill(t *testing.T) {
 	st := &fakeState{personStatus: 200, personBody: `[
-	  {"attrs":{"name":["grace-hopper"],"mail":["person-50@example.org"],"displayname":["Grace Hopper"]}},
-	  {"attrs":{"name":["user8x-example"],"mail":["person-64@example.org"],"displayname":["Joshua Example"]}}
+	  {"attrs":{"name":["grace-hopper"],"mail":["person-47@example.org"],"displayname":["Grace Hopper"]}},
+	  {"attrs":{"name":["user8x-example"],"mail":["person-60@example.org"],"displayname":["Joshua Example"]}}
 	]`, token: "T"}
 	srv := fakeKanidmSrv(t, st)
 	t.Setenv("COLLAB_PROVISION_ENABLED", "1")
@@ -441,7 +441,7 @@ func TestRunCollabOpReconcileRefusesEmptyIdentitySide(t *testing.T) {
 }
 
 func TestBackfillRoundTrip(t *testing.T) {
-	rep := reconcileFixture(t, []CollabAccount{{Handle: "grace-hopper", Email: "person-50@example.org"}})
+	rep := reconcileFixture(t, []CollabAccount{{Handle: "grace-hopper", Email: "person-47@example.org"}})
 	doc := buildBackfill(rep, "2026-08-02T00:00:00Z")
 	p := filepath.Join(t.TempDir(), "backfill.yaml")
 	if err := writeBackfill(p, doc); err != nil {

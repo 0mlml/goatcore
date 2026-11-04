@@ -24,7 +24,7 @@ func TestApiCollectOperatorKey_boundToCallingPrincipal(t *testing.T) {
 
 	// B's key is requested and approved by a third party, so it is Active with a
 	// live secret waiting to be collected exactly once.
-	rowB := seedOperatorKeyRequest(t, s, "beta-op", "person-23@example.org")
+	rowB := seedOperatorKeyRequest(t, s, "beta-op", "person-21@example.org")
 	if _, err := s.Onboard.ApproveOperatorKey(context.Background(), rowB.ID, "admin", []string{"admin"}); err != nil {
 		t.Fatalf("approve B: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestApiCollectOperatorKey_boundToCallingPrincipal(t *testing.T) {
 
 	// A collecting A's own key, both with and without an explicit matching
 	// handle, succeeds.
-	rowA := seedOperatorKeyRequest(t, s, "onboard-runner", "person-127@example.org")
+	rowA := seedOperatorKeyRequest(t, s, "onboard-runner", "person-123@example.org")
 	if _, err := s.Onboard.ApproveOperatorKey(context.Background(), rowA.ID, "admin", []string{"admin"}); err != nil {
 		t.Fatalf("approve A: %v", err)
 	}

@@ -235,7 +235,7 @@ func TestClaimedOrgIsAttachableEvenWhenTheNationScopeDropsIt(t *testing.T) {
 	s := newOnboardTestServer(t)
 	orgs := withOrgs(t, s, true)
 	registerClaimTestOrg(t, orgs, "demoforge", "Demoforge") // nation USA
-	id := seedOrgMatchProposal(t, s, "demoforge", "CAN")      // the candidate said CAN
+	id := seedOrgMatchProposal(t, s, "demoforge", "CAN")    // the candidate said CAN
 	p, err := s.Onboard.GetProposal(context.Background(), id)
 	if err != nil {
 		t.Fatalf("get proposal: %v", err)

@@ -73,12 +73,31 @@ gv.mkdir(parents=True, exist_ok=True)
     "peering_spire_outbound_listen": spire_listen,
 }, sort_keys=True))
 
+# This sovereign's goatbuilder config, written whole: one environment, its one founder
+# site with the core and the edge class, and the one peering. Nothing is taken from the
+# checkout's own config, which a public checkout does not carry (it is a deployment's
+# file): the run is the same from any clone.
 cfg_path = clone / "ops/goatbuilder/goatbuilder.yaml"
-cfg = yaml.safe_load(cfg_path.read_text())
-cfg["environments"].append({
-    "name": us,
-    "converger": "push-ansible",
-    "sites": [{"name": "home", "role": "founder", "classes": {"core": {}, "edge": {}}}],
-})
-cfg["peerings"] = [{"with": them, "environment": us, "site": "home", "edge_class": "edge"}]
-cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+cfg_path.parent.mkdir(parents=True, exist_ok=True)
+cfg = {
+    "schema": "goatbuilder/v1",
+    "preset": "full",
+    "repo": {"source": f"example-{us}/goat", "image_namespace": f"ghcr.io/example-{us}"},
+    "components": {
+        "goat-zenoh-edge": {"declared_in": f"ops/ansible/group_vars/{group}/deployment.yml", "var": "goat_zenoh_edge_image"},
+    },
+    "environments": [{
+        "name": us,
+        "converger": "push-ansible",
+        "sites": [{"name": "home", "role": "founder", "classes": {"core": {}, "edge": {}}}],
+    }],
+    "promotion": {"path": [{"name": us, "kind": "rung", "environment": us}]},
+    "peerings": [{"with": them, "environment": us, "site": "home", "edge_class": "edge"}],
+    # The run templates no credential: nothing to resolve, nothing to read from a file.
+    "secrets": {"store": "env"},
+}
+cfg_path.write_text(
+    f"# {us}: this sovereign's synthetic goatbuilder config for the federation e2e\n"
+    "# (ops/federation-e2e/overlay.py). Written whole on every run.\n"
+    + yaml.safe_dump(cfg, sort_keys=False)
+)

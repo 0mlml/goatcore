@@ -71,8 +71,8 @@ Why in-repo: an operator can `git log -p ops/ansible/roles/panoscope/deploy-hist
 `/var/lib/goat/<service>/deploy-history.jsonl`:
 
 ```jsonl
-{"ts":"2026-05-19T22:08:54Z","action":"deploy","image":"ghcr.io/usareur-af/panoscope@sha256:506421f8...","prev_image":"ghcr.io/usareur-af/panoscope@sha256:df60703e...","operator":"person-37@example.org","via":"ansible/panoscope.yml"}
-{"ts":"2026-05-19T22:11:32Z","action":"rollback","image":"ghcr.io/usareur-af/panoscope@sha256:01c84ecc...","prev_image":"ghcr.io/usareur-af/panoscope@sha256:506421f8...","operator":"person-37@example.org","via":"rollback.sh","reason":"data-cop deploy lost real peers"}
+{"ts":"2026-05-19T22:08:54Z","action":"deploy","image":"ghcr.io/usareur-af/panoscope@sha256:506421f8...","prev_image":"ghcr.io/usareur-af/panoscope@sha256:df60703e...","operator":"person-35@example.org","via":"ansible/panoscope.yml"}
+{"ts":"2026-05-19T22:11:32Z","action":"rollback","image":"ghcr.io/usareur-af/panoscope@sha256:01c84ecc...","prev_image":"ghcr.io/usareur-af/panoscope@sha256:506421f8...","operator":"person-35@example.org","via":"rollback.sh","reason":"data-cop deploy lost real peers"}
 ```
 
 Append-only NDJSON. Written by both the Ansible role (on every successful apply) and the rollback script (on every rollback). The host-side log is the source of truth for "what's actually running"; the in-repo ledger is the source of truth for "what we committed to shipping."

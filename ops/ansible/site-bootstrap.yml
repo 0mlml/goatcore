@@ -48,6 +48,18 @@
 # Failover at full-profile sites is operator-fired (`pg_ctl promote` on B
 # + DNS/bundle re-issue). See the postgres failover runbook. VRRP-on-Orins (the
 # keepalived-mgmt path) is removed; do not restore.
+#
+# Two parts, one file. Every play carries a play-level tag:
+#   stack      the plays up to and including Traefik: the host gates, the
+#              NTP baseline, the mgmt stack, Traefik. Nothing here needs Ory.
+#   after-ory  the account seed and every play after it. The seed waits for
+#              the netbird schema, which management-a only writes once it can
+#              reach Hydra (Ory), so on a new site these run after ory-deploy.
+# A run with no tag selection runs both, as it always has. The standup runs
+# `--skip-tags after-ory` in phase 5 and `--skip-tags stack` in phase 6 after
+# ory-deploy, so each play runs once on a new site and the seed's schema wait
+# happens with Ory up (docs/design/goatlite.md §"Standup time"). The pre-flight
+# gate below carries no tag and runs in both.
 
 # ============================================================================
 # Phase 0 — operator environment pre-flight gate
@@ -145,6 +157,7 @@
 # docs/operations/docker-data-root-migration.md, then re-run.
 # ============================================================================
 - name: "site-bootstrap: Docker data-root pre-flight"
+  tags: [stack]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -268,6 +281,7 @@
 # break audit timestamping.
 # ============================================================================
 - name: "site-bootstrap: NTP preflight + hygiene baseline"
+  tags: [stack]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: true
   become: true
@@ -297,6 +311,7 @@
 # unhealthy. Only meaningful when management-a is running (full profile).
 # ============================================================================
 - name: "site-bootstrap: NTP admit-fail-safe sidecar"
+  tags: [stack]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -319,6 +334,7 @@
 # the right channel.
 # ============================================================================
 - name: "site-bootstrap: full mgmt-stack (delegate, when has_mgmt_api)"
+  tags: [stack]
   ansible.builtin.import_playbook: mgmt-host.yml
   vars:
     phase2: false
@@ -338,6 +354,7 @@
 # safe. Per ADR 0827 §"Mgmt-stack scope expansion" decision (a).
 # ============================================================================
 - name: "site-bootstrap: postgres-spock only (when mgmt_stack_profile == postgres-spock-only)"
+  tags: [stack]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: true
   become: true
@@ -485,6 +502,7 @@
 # Skip with `-e skip_traefik=true` for envs that don't need TLS yet.
 # ============================================================================
 - name: "site-bootstrap: Traefik TLS terminator (when has_mgmt_api)"
+  tags: [stack]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -519,6 +537,7 @@
 # a new key (intentionally — fresh single-use bootstrap key per run).
 # ============================================================================
 - name: "site-bootstrap: seed account + bootstrap setup key (when has_mgmt_api)"
+  tags: [after-ory]
   # Run on the first host of the site's group (deterministic: that's
   # Router-A for A/B-pair sites, the only Orin for single-Orin sites).
   # `groups` magic var is known at parse time after inventory loads.
@@ -545,15 +564,14 @@
             that:
               - bootstrap_owner_email is defined
               - bootstrap_owner_email | length > 0
-            fail_msg: "Pass -e bootstrap_owner_email=<owner-email> (e.g. person-85@example.org)."
+            fail_msg: "Pass -e bootstrap_owner_email=<owner-email> (e.g. person-81@example.org)."
 
-        # The wait sits in a block so its FAILURE can name its cause (#383). On a
-        # fresh site management-a restart-loops dialing hydra:4444, because Ory
-        # deploys in a later phase, so the schema never appears and this task
-        # used to die on a bare "retries exhausted" after 150 s. That is the
-        # expected first-run stop (docs/operations/goatnet-standup.md, the
-        # `wait for the netbird schema` row); the rescue says so and gives the
-        # recovery. The success path is unchanged.
+        # The wait sits in a block so its FAILURE can name its cause (#383).
+        # management-a restart-loops dialing hydra:4444 until Ory is deployed,
+        # and writes the schema only after. The standup runs this play in phase
+        # 6, after ory-deploy (the after-ory tag), so the wait succeeds there.
+        # Run on a site that has never had Ory (the whole file before phase 6),
+        # the schema cannot appear; the rescue says so and gives the recovery.
         - name: wait for the netbird schema, and name the cause if it never appears
           block:
             - name: wait for the netbird schema (management-a migrations) before seeding
@@ -566,7 +584,11 @@
                 "SELECT to_regclass('public.accounts') IS NOT NULL"
               register: netbird_schema_ready
               changed_when: false
-              retries: 30
+              # Bounded and named: netbird_schema_wait_seconds (default 300 s,
+              # polled every 5 s). management-a writes the schema once Hydra
+              # answers; right after ory-deploy it may still be in a restart
+              # backoff of up to a minute, hence more than the old 150 s.
+              retries: "{{ ((netbird_schema_wait_seconds | default(300) | int) / 5) | round(0, 'ceil') | int }}"
               delay: 5
               until: "'t' in (netbird_schema_ready.stdout | default(''))"
           rescue:
@@ -602,21 +624,23 @@
                      ((schema_wait_mgmt_log.stdout | default('')) ~ (schema_wait_mgmt_log.stderr | default(''))) }}
                 schema_wait_hydra_deployed: "{{ (schema_wait_hydra_container.stdout | default('') | trim | length) > 0 }}"
 
-            - name: the identity stack is not deployed yet (the expected first-run stop)
+            - name: the identity stack is not deployed yet
               ansible.builtin.fail:
                 msg: |
                   The netbird schema never appeared because management-a cannot
                   reach Hydra (hydra:4444), and no Hydra container exists on this
-                  host. management-a needs the identity stack, and Ory deploys in
-                  the next phase, so on a site that has never had Ory this is the
-                  expected first-run stop.
+                  host. management-a needs the identity stack, which the standup
+                  deploys in phase 6 before this part of site-bootstrap runs
+                  (--skip-tags stack); this run reached the account seed on a
+                  site that has never had Ory.
 
                   Recover, from the repo root on the operator machine:
                     ops/scripts/goat-standup.sh {{ site_id }} --from 6 --to 6
 
                   Phase 6 deploys Ory under the preflight and aws-vault wrapper with
-                  the flags ory-deploy.yml needs, then its last step re-runs this
-                  play, which finds the schema and prints the setup-key banner.
+                  the flags ory-deploy.yml needs, then its last step runs this
+                  part of site-bootstrap, which finds the schema and prints the
+                  setup-key banner.
               when:
                 - schema_wait_hydra_dial_failed | bool
                 - not (schema_wait_hydra_deployed | bool)
@@ -639,7 +663,8 @@
             - name: the schema never appeared, and Hydra is not the reason
               ansible.builtin.fail:
                 msg: |
-                  The netbird schema (public.accounts) did not appear within 150 s,
+                  The netbird schema (public.accounts) did not appear within
+                  {{ netbird_schema_wait_seconds | default(300) }} s (netbird_schema_wait_seconds),
                   and management-a's log does not show the Hydra dial failure that
                   explains a first run. The log is not printed here because it can
                   carry the store DSN, which holds the Postgres superuser password.
@@ -702,6 +727,7 @@
 # when explicitly overridden via the legacy var).
 # ============================================================================
 - name: "site-bootstrap: observability MVP (legacy on-mgmt-host)"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -731,6 +757,7 @@
 # Design: docs/design/replication-consistency-observability.md §6.
 # ============================================================================
 - name: "site-bootstrap: Spock ACE drift-watch (when participates_in_spock)"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -767,6 +794,7 @@
 # false` is a site with NO durability at all.
 # ---------------------------------------------------------------------------
 - name: "site-bootstrap: backups pre-flight — no-backups requires a durability story"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: false
@@ -792,6 +820,7 @@
               else "an intra-site A->B streaming standby (phase 6A)") }}
 
 - name: "site-bootstrap: pgBackRest paired-stanza (when has_durable_independent_state)"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -811,6 +840,7 @@
 # Sits in front of management-a; only meaningful when has_mgmt_api.
 # ============================================================================
 - name: "site-bootstrap: admit-audit sidecar (when has_mgmt_api)"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -837,6 +867,7 @@
 # Phase 7 smoke.
 # ============================================================================
 - name: "site-bootstrap: intra-site Postgres streaming replication (when intra_site_pair)"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -868,6 +899,7 @@
 # below carry the appropriate `when:` clauses.
 # ============================================================================
 - name: "site-bootstrap: smoke test"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -1026,6 +1058,7 @@
 # router".
 # ============================================================================
 - name: "site-bootstrap: Zenoh router role-selection fence"
+  tags: [after-ory]
   hosts: "{{ groups[(site_id | replace('-', '_')) ~ '_hosts'][0] }}"
   gather_facts: false
   become: false
@@ -1046,6 +1079,7 @@
       when: zenoh_enabled is defined and (zenoh_enabled | bool)
 
 - name: "site-bootstrap: inter-site Spock auto-mesh (when participates_in_spock + topology set)"
+  tags: [after-ory]
   hosts: "{{ groups[(site_id | replace('-', '_')) ~ '_hosts'][0] }}"
   gather_facts: false
   become: true
@@ -1094,6 +1128,7 @@
 # sees the failure and fixes it; we don't silently swallow.
 # ============================================================================
 - name: "site-bootstrap: mgmt-host snitch probe (when snitch_enabled)"
+  tags: [after-ory]
   hosts: "{{ (site_id | replace('-', '_')) ~ '_hosts' }}"
   gather_facts: false
   become: true
@@ -1149,6 +1184,7 @@
 #   ops/ansible/roles/ory-narrow-repset/README.md
 # ============================================================================
 - name: "site-bootstrap: narrow Ory Spock repset (when ory_spock_enabled)"
+  tags: [after-ory]
   hosts: "{{ groups[(site_id | replace('-', '_')) ~ '_hosts'][0] }}"
   gather_facts: false
   become: true

@@ -23,7 +23,7 @@ import (
 // that's who the audit attributes.
 func TestRunOnce_OffboardRequested_RevokesAndWritesBack(t *testing.T) {
 	f := newFakePortal()
-	f.add(proposal{ID: "off-1", Env: "zagros", Handle: "jane", Email: "person-58@example.org",
+	f.add(proposal{ID: "off-1", Env: "zagros", Handle: "jane", Email: "person-55@example.org",
 		Status: "offboard-requested", OffboardRequestedBy: "adminbob"})
 	r, _ := testRunner(t, f)
 

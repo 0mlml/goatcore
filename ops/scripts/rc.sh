@@ -151,6 +151,11 @@ if [ "${GOAT_RC_ROLE_CHECK:-1}" != 0 ]; then
   ME="$(gh api user -q .login)"
   ROLE="$(gh api "repos/$REPO_SLUG/collaborators/$ME/permission" -q .role_name 2>/dev/null || echo unknown)"
   case "$ROLE" in admin) note "$ME holds $ROLE on $REPO_SLUG" ;; *) die "$ME holds '$ROLE' on $REPO_SLUG; only a repository admin may nominate a release candidate (the rule rc-validate.yml enforces)" ;; esac
+  # The repository this checkout's origin names must run rc-validate.yml, or the
+  # tag is pushed and the wait below dies on a 404 with a tag already cut
+  # (2026-11-03: a clone of the retired mirror tagged its own main). GB-077.
+  gh api "repos/$REPO_SLUG/actions/workflows/rc-validate.yml" -q .state >/dev/null 2>&1 \
+    || die "GB-077: $REPO_SLUG does not run rc-validate.yml, so it is not where release candidates are cut; run from a checkout whose origin is the primary repository (git remote get-url origin)"
 fi
 if [ -z "$TAG" ]; then
   if [ -z "$RCN" ]; then

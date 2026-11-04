@@ -84,6 +84,7 @@ missing=()
 for t in ssh git curl openssl python3 tar gzip; do command -v "$t" >/dev/null || missing+=("$t on this laptop"); done
 case "$GHCR_TOKEN_ENV" in ''|*[!A-Za-z0-9_]*) missing+=("--ghcr-token-env must name a variable") ;; esac
 [ "$DRY" = 1 ] || [ -n "${!GHCR_TOKEN_ENV:-}" ] || missing+=("\$$GHCR_TOKEN_ENV (a token that can read ghcr.io/usareur-af/zenoh-pqc; the image is private)")
+python3 -c 'import yaml' 2>/dev/null || missing+=("python PyYAML on this laptop (pip install pyyaml): the SPIRE pin is read from ops/pins/fleet-pins.yaml")
 [ "$DRY" = 1 ] || python3 -c 'import jsonschema' 2>/dev/null || missing+=("python jsonschema on this laptop (pip install jsonschema): the run record is validated")
 [ "${#missing[@]}" = 0 ] || die "missing: ${missing[*]}"
 [ "$DRY" = 1 ] || [ -z "$(git -C "$REPO" status --porcelain -- ops)" ] || die "ops/ has uncommitted changes; the run ships a commit, so commit first"
@@ -97,8 +98,8 @@ printf 'commit %s\npasture %s\nmeadow %s\nstarted %s\n' "$COMMIT" "$H_pasture" "
 
 # The same digests run.sh pins.
 ZENOH_IMAGE="ghcr.io/usareur-af/zenoh-pqc@sha256:372de39d2e8b64fe7157194173f1b7ac6eac2700ff04c49cce2ce3c284a6fdb2"
-SPIRE_IMAGE="$(grep -hoE 'ghcr\.io/spiffe/spire-server:[^"[:space:]]+@sha256:[0-9a-f]{64}' "$REPO"/ops/ansible/group_vars/*/pins.yml | head -1 || true)"
-case "$SPIRE_IMAGE" in *@sha256:*) ;; *) die "no digest-pinned SPIRE image found" ;; esac
+SPIRE_IMAGE="$(python3 -c 'import sys, yaml; print(((yaml.safe_load(open(sys.argv[1])).get("components") or {}).get("spire") or {}).get("fleet") or "")' "$REPO/ops/pins/fleet-pins.yaml" 2>/dev/null || true)"
+[[ "$SPIRE_IMAGE" =~ ^ghcr\.io/spiffe/spire-server:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || die "ops/pins/fleet-pins.yaml declares no digest-pinned SPIRE image (components.spire.fleet)"
 
 other() { [ "$1" = pasture ] && echo meadow || echo pasture; }
 core_addr() { [ "$1" = pasture ] && echo 10.77.1.10 || echo 10.77.2.10; }

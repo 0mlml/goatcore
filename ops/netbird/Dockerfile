@@ -23,7 +23,7 @@
 ARG NETBIRD_REF=0358be23136da50e829ba99a83e54ef555071a7f  # upstream v0.71.4
 
 # --- Stage 1: build the patched binary natively ---
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.26-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb AS builder
 ARG NETBIRD_REF
 
 RUN apt-get update \

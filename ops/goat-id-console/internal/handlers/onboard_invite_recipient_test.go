@@ -44,7 +44,7 @@ func TestInviteRecipientRefusesExistingProposal(t *testing.T) {
 					t.Fatal(err)
 				}
 				seedProposal(t, s, "existing", "admin@example.test", "browse", status)
-				w := inviteRecipientRequest(t, s, door, "person-45@example.org", id)
+				w := inviteRecipientRequest(t, s, door, "EXISTING@EXAMPLE.ORG", id)
 				if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "existing") || !strings.Contains(w.Body.String(), status) {
 					t.Fatalf("got %d %s; want conflict naming existing proposal and stage", w.Code, w.Body.String())
 				}

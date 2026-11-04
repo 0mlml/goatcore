@@ -517,8 +517,8 @@ pub fn peer_graph(subject: &BTreeSet<&str>, peers: &[NbPeer], policies: &[NbPoli
 ///    frame. These are different pictures and the types keep them different.
 /// 2. **The read ledger balances or the build fails.** `rendered + disabled +
 ///    not_group_addressable + denied + unread == total`, asserted here, so a
-/// rule can never fall out of the picture quietly. A rule that is enabled,
-/// accept and undrawable in group space still counts.
+///    rule can never fall out of the picture quietly. A rule that is enabled,
+///    accept and undrawable in group space still counts.
 /// 3. **Permitted is not observed.** [`Realization::Realized`] means both ends
 ///    have a connected peer. Nothing here watches a packet.
 ///

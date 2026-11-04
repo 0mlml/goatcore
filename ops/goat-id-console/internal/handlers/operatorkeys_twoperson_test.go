@@ -98,7 +98,7 @@ func TestOperatorKeyDecision_browserTwoPersonRule(t *testing.T) {
 	h := s.Routes()
 
 	// Email-matched own row.
-	rowEmail := seedOperatorKeyRequest(t, s, "handle-a", "person-11@example.org")
+	rowEmail := seedOperatorKeyRequest(t, s, "handle-a", "Admin@Example.org")
 	form := url.Values{"csrf": {s.csrfNonce}}
 	w := browserForm(t, h, "admin@example.org", "ADMINS", "/operator-keys/"+rowEmail.ID+"/approve", form)
 	if w.Code != http.StatusForbidden {

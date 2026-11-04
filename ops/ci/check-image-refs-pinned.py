@@ -46,6 +46,14 @@ NOT_A_REF = re.compile(
     r"_image_(platform|digest|label|tiers|pull_policy|pull|name|tag|repo|arch|id|build|src|dir|path)$"
 )
 DIGEST = "@sha256:"
+# A reviewed public copy of a file (ops/oss/export.py swaps it in for the
+# original on export) is judged as the original it replaces: it shares the
+# original's allow line and its dependabot directory, and adds neither.
+PUBLIC_COPY = "ops/oss/docs-public/"
+
+
+def original(p):
+    return p[len(PUBLIC_COPY):] if p.startswith(PUBLIC_COPY) else p
 
 
 def _tracked():
@@ -161,7 +169,7 @@ def unrefreshed_pins():
         with open(p, encoding="utf-8", errors="replace") as source_file:
             for n, ln in enumerate(source_file, 1):
                 if re.match(r"^\s*FROM\s", ln, re.I) and DIGEST in ln:
-                    d = "/" + os.path.dirname(p)
+                    d = "/" + os.path.dirname(original(p))
                     if d.rstrip("/") not in listed and (d.rstrip("/") or "/") not in listed:
                         out.append((p, n, d))
                     break
@@ -217,8 +225,8 @@ def main():
     seen = set()
     fail = 0
     for p, n, key, val, kind in found:
-        seen.add((p, key))
-        if (p, key) in allow:
+        seen.add((original(p), key))
+        if (original(p), key) in allow:
             continue
         fail += 1
         print(f"FLOATING {kind.upper():13} {p}:{n}")

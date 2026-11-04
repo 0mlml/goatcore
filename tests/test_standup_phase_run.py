@@ -2,6 +2,7 @@
 """ops/scripts/standup-phase-run: a phase whose $(printenv NAME) is empty refuses and
 names NAME; a value store's values reach the phase without being exported by hand."""
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -98,6 +99,112 @@ class KeepSecret(unittest.TestCase):
         f = Path(tempfile.mkdtemp()) / "secrets.env"
         self.assertEqual(self.keep("env-file", {"GOAT_SECRET_ENV_FILE": str(f)}).returncode, 1)
         self.assertFalse(f.exists(), "nothing written")
+
+
+ROOT = Path(__file__).resolve().parents[1]
+STUB_RENDER = r"""#!/usr/bin/env python3
+# Stands in for goatlite-render.py: writes the group the goatnet's plays template from.
+import os, sys
+repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if os.environ.get("STUB_RENDER_FAILS"):
+    sys.exit("goatlite-render: refusing: a file you edited differs from the render")
+d = os.path.join(repo, "ops/ansible/group_vars/cleanroom_hosts")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(d, "vars.yml"), "w") as fh:
+    fh.write("pg: \"{{ lookup('env', 'CLEANROOM_PG_PASS') }}\"\n"
+             "cookie: \"{{ lookup('env', 'CLEANROOM_UI_COOKIE_SECRET') }}\"\n")
+print("rendered cleanroom")
+"""
+
+
+class GoatliteFirstRun(unittest.TestCase):
+    """LP-007: phase 1 of a goatlite renders the config surface, creates the env-file
+    store itself, and only then runs what reads the store. A checkout with neither the
+    store nor the rendered group needs no manual step; a re-run keeps every value."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        for rel in ("ops/scripts/standup-phase-run", "ops/secrets/posture.py", "ops/scripts/deploy-secrets-needed.py"):
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / rel, self.repo / rel)
+        render = self.repo / "ops/scripts/goatlite-render.py"
+        render.write_text(STUB_RENDER)
+        render.chmod(0o755)
+        (self.repo / "goatlite.yaml").write_text(
+            "schema: goatbuilder/v1\npreset: lite\nlite:\n  name: cleanroom   # the goatnet\n  host: 192.0.2.50\n")
+        (self.repo / ".gitignore").write_text(".envrc.local.d/\n")
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        self.store = self.repo / ".envrc.local.d/secrets.env"
+        r = self.repo
+        # Phase 1's lines as the plan prints them (standup.rs, goat-standup.sh).
+        self.render = f"python3 '{r}/ops/scripts/goatlite-render.py' --site cleanroom"
+        self.init = f"python3 '{r}/ops/secrets/posture.py' init --if-env-file --env cleanroom"
+        self.consumer = 'test -n "$(printenv CLEANROOM_PG_PASS)" && test -n "$(printenv CLEANROOM_UI_COOKIE_SECRET)" && echo consumed'
+
+    def phase(self, cmd, extra=None):
+        env = {"PATH": os.environ["PATH"], "HOME": tempfile.mkdtemp()}
+        env.update(extra or {})
+        return subprocess.run([str(self.repo / "ops/scripts/standup-phase-run"), cmd],
+                              capture_output=True, text=True, env=env, cwd=self.repo)
+
+    def phase_one(self):
+        out = []
+        for cmd in (self.render, self.init, self.consumer):
+            r = self.phase(cmd)
+            out.append(r)
+            if r.returncode:
+                break
+        return out
+
+    def test_an_unseeded_checkout_renders_creates_the_store_then_reads_it(self):
+        self.assertFalse(self.store.exists())
+        self.assertFalse((self.repo / "ops/ansible/group_vars/cleanroom_hosts").exists())
+        runs = self.phase_one()
+        self.assertEqual([r.returncode for r in runs], [0, 0, 0], [r.stderr for r in runs])
+        self.assertEqual(runs[2].stdout.strip(), "consumed")
+        self.assertEqual(oct(self.store.stat().st_mode & 0o777), "0o600")
+        values = dict(l.split("=", 1) for l in self.store.read_text().splitlines() if l and not l.startswith("#"))
+        self.assertEqual(sorted(values), ["CLEANROOM_PG_PASS", "CLEANROOM_UI_COOKIE_SECRET"])
+        printed = "".join(r.stdout + r.stderr for r in runs)
+        for v in values.values():
+            self.assertTrue(v)
+            self.assertNotIn(v, printed, "no value is printed")
+
+    def test_a_re_run_keeps_every_value(self):
+        self.phase_one()
+        before = self.store.read_bytes()
+        runs = self.phase_one()
+        self.assertEqual([r.returncode for r in runs], [0, 0, 0], [r.stderr for r in runs])
+        self.assertEqual(self.store.read_bytes(), before, "a second phase 1 regenerates nothing")
+        self.assertIn("2 kept", runs[1].stdout)
+
+    def test_a_failing_render_still_fails_the_phase(self):
+        r = self.phase(self.render, {"STUB_RENDER_FAILS": "1"})
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("refusing", r.stderr)
+        self.assertFalse(self.store.exists())
+
+    def test_any_other_line_still_needs_the_store(self):
+        r = self.phase("echo ran")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("ran", r.stdout)
+        self.assertIn("goatbuilder standup cleanroom --to 1", r.stderr, "the refusal names the one command that fixes it")
+        chained = self.phase(self.render + " && echo ran")
+        self.assertEqual(chained.returncode, 1, "only the exact render line skips the store")
+
+    def test_secrets_init_before_the_render_names_phase_1(self):
+        env = {"PATH": os.environ["PATH"], "HOME": tempfile.mkdtemp()}
+        r = subprocess.run(["python3", str(self.repo / "ops/secrets/posture.py"), "init", "--env", "cleanroom"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("goatbuilder standup cleanroom --to 1", r.stderr)
+
+    def test_another_store_creates_no_plaintext_file(self):
+        self.phase(self.render)
+        r = self.phase(self.init, {"GOAT_SECRET_STORE": "env"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("nothing to create", r.stdout)
+        self.assertFalse(self.store.exists())
 
 
 if __name__ == "__main__":

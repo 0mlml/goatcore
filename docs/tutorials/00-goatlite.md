@@ -226,6 +226,36 @@ Your laptop is almost certainly on another mesh already, and this section is whe
 
 Every command here runs on your laptop. Phase 6 printed the single-use setup key this section uses.
 
+**First, trust the goatnet's root certificate.** `netbird up` reaches the goatnet's management service over TLS, with a certificate the goatnet's own authority issued, so the laptop must trust that authority before it enrols; until then the enrolment times out. Phase 1 wrote the root into your checkout at `ops/enrollment/ca/pasture/root-cert.pem` (with your goatnet's name in place of `pasture`). Install it once.
+
+On Ubuntu and Debian:
+
+```text
+sudo cp ops/enrollment/ca/pasture/root-cert.pem /usr/local/share/ca-certificates/pasture-root.crt
+sudo update-ca-certificates
+```
+
+On Fedora and other RPM systems:
+
+```text
+sudo cp ops/enrollment/ca/pasture/root-cert.pem /etc/pki/ca-trust/source/anchors/pasture-root.pem
+sudo update-ca-trust
+```
+
+On macOS:
+
+```text
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ops/enrollment/ca/pasture/root-cert.pem
+```
+
+The NetBird service reads the trust store when it starts, and installing NetBird started it, so restart it now that the root is installed:
+
+```text
+sudo netbird service restart
+```
+
+Restart the browser too, and the warnings from the sign-in step go away. Firefox keeps its own trust store; in its settings, search for "certificates" and import the same file as an authority.
+
 First, see your profiles. The checkmark is the profile you live on; you will return to it at the end, so note its name:
 
 ```text
@@ -284,29 +314,7 @@ It checks the goatnet layer by layer: the box, the management stack, TLS and DNS
 
 Every command in this section runs on your laptop.
 
-**Trust the goatnet's root certificate.** The render wrote it into your checkout at `ops/enrollment/ca/pasture/root-cert.pem` (with your goatnet's name in place of `pasture`). Install it once, and the browser warnings from the sign-in step go away.
-
-On Ubuntu and Debian:
-
-```text
-sudo cp ops/enrollment/ca/pasture/root-cert.pem /usr/local/share/ca-certificates/pasture-root.crt
-sudo update-ca-certificates
-```
-
-On Fedora and other RPM systems:
-
-```text
-sudo cp ops/enrollment/ca/pasture/root-cert.pem /etc/pki/ca-trust/source/anchors/pasture-root.pem
-sudo update-ca-trust
-```
-
-On macOS:
-
-```text
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ops/enrollment/ca/pasture/root-cert.pem
-```
-
-Restart the browser afterwards. Firefox keeps its own trust store; in its settings, search for "certificates" and import the same file as an authority.
+The goatnet's root certificate is already trusted: section 6 installed it before enrolment.
 
 **Watch a message cross the fabric.** The assay's `fabric-put-subscribe-roundtrip` row publishes a value through the goatnet's router and reads it back; a `PASS` there is your goatnet carrying data. Run that row alone:
 

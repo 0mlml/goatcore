@@ -146,7 +146,7 @@ func TestDataRoles_EmailAliasResolvesToSamePrincipal(t *testing.T) {
 	// Email is an alias — case-insensitive — and must resolve to the identity
 	// UUID as the principal id, yielding the identical role set as identity=.
 	byID := decodeDataRoles(t, getDataRoles(t, h, opKey, "identity=alice-uuid"))
-	byEmail := decodeDataRoles(t, getDataRoles(t, h, opKey, "email=person-19@example.org"))
+	byEmail := decodeDataRoles(t, getDataRoles(t, h, opKey, "email=Alice@Example.org"))
 	if byEmail.Principal.ID != "alice-uuid" || byEmail.Principal.Kind != "person" {
 		t.Fatalf("email principal = %+v, want alice-uuid keyed on UUID", byEmail.Principal)
 	}

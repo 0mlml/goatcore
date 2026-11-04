@@ -577,6 +577,11 @@ fn release_inner(repo: &Path, o: &Options, checks: Rc<RefCell<Vec<Check>>>) -> R
             return Err(goat_errors::coded("GB-011", format!("{me} holds '{role}' on {}; only a repository admin may nominate a release candidate (the rule rc-validate.yml enforces)", run.repo_slug)).into());
         }
         run.note(format!("{me} holds {role} on {}", run.repo_slug));
+        // The origin repository must run rc-validate.yml, or the tag is pushed and
+        // the wait dies on a 404 with a tag already cut. The script makes the same check.
+        if sh("gh", &["api", &format!("repos/{}/actions/workflows/rc-validate.yml", run.repo_slug), "-q", ".state"]).is_err() {
+            return Err(goat_errors::coded("GB-077", format!("{} does not run rc-validate.yml, so it is not where release candidates are cut; run from a checkout whose origin is the primary repository (git remote get-url origin)", run.repo_slug)).into());
+        }
     }
     if run.tag.is_empty() {
         let version = o.version.unwrap_or("");

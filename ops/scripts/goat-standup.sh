@@ -67,11 +67,12 @@
 #   2      host baseline + LUKS                    yes       yes
 #   3      per-instance secrets                    yes       yes
 #   4      leaf certs + name snapshot              yes       yes
-#   5      mgmt-stack (site-bootstrap)*, then      yes       yes    *first run stops at the schema wait
-#          relay-connect (internet)
-#   6      identity stack (Ory), re-run            yes       yes
-#          site-bootstrap (completes 5); a joiner
-#          seeds from its founder and mirrors here
+#   5      mgmt-stack (site-bootstrap, the         yes       yes
+#          stack part), then relay-connect
+#   6      identity stack (Ory), then the rest     yes       yes
+#          of site-bootstrap (account seed); a
+#          joiner seeds from its founder and
+#          mirrors here
 #   7      public TLS + relay tier                 --        yes
 #   8      mesh-enroll host + re-mint router       --        yes (MANUAL)
 #   9      zenoh router + SPIRE (founder)          yes       yes
@@ -496,6 +497,41 @@ RECOVER
     exit "$rc"
   fi
 }
+# ---- the image pull ----------------------------------------------------------
+# Every pinned image the site's hosts deploy, pulled on those hosts in parallel
+# (ops/ansible/standup-image-pull.yml; docs/design/goatlite.md §11 measure 2).
+# Started after phase 2, when the container engine and the registry login are in
+# place, and joined before phase 5, the first phase that runs an image. Only when
+# phase 5 is in the run's range: a resume past it pulls inside its plays as before.
+PULL_LOG="$STATE_DIR/standup-$SITE-images.log"; PULL_PID=""
+pull_start() {  # pull_start <label> <command...>  — background, logged
+  local label="$1"; shift
+  [ "$FROM" -le 5 ] && [ "$TO" -ge 5 ] || return 0
+  printf '\n=== Image pull [A ∥] %s ===\n    %s\n    (log: %s)\n' "$label" "$*" "$PULL_LOG"
+  [ "$PLAN" = 1 ] && { PULL_PID=planned; return 0; }
+  ( "$REPO/ops/scripts/standup-phase-run" "$*" ) >"$PULL_LOG" 2>&1 &
+  PULL_PID=$!
+}
+pull_join() {   # pull_join <join-phase>  — wait, print the tail, fail like a phase
+  local at="$1" rc
+  [ -n "$PULL_PID" ] || return 0
+  [ "$PLAN" = 1 ] && { printf '\n=== join the image pull before phase %s ===\n' "$at"; return 0; }
+  printf '\n=== join the image pull before phase %s (waiting) ===\n' "$at"
+  wait "$PULL_PID"; rc=$?; PULL_PID=""
+  tail -n 25 "$PULL_LOG" | sed 's/^/    | /'
+  if [ "$rc" -ne 0 ]; then
+    cat >&2 <<RECOVER
+
+  !! Image pull FAILED — exit $rc (full log: $PULL_LOG).
+     Phase $at and every later phase run these images, so the run stops here; the
+     log names each image that could not be pulled. A private package needs
+     GHCR_READ_TOKEN on the laptop (phase 2 logs the box in with it); a pin naming
+     an image the registry no longer has needs a new pin in ops/pins/.
+     Fix the cause, then resume: ops/scripts/goat-standup.sh $SITE --from $at $( [ "$PROFILE" != lan ] && echo "--profile $PROFILE" )
+RECOVER
+    exit "$rc"
+  fi
+}
 run_obs_leg_fg() {  # --obs-only: the three legs, in order, foreground, phase-style
   step 2 A "[obs] observability host: baseline + LUKS" "$OBS_LEG_BASELINE"
   step 2 A "[obs] observability host: utility (Forgejo)" "$OBS_LEG_UTILITY"
@@ -535,6 +571,10 @@ fi
 if [ "$LITE" = 1 ]; then
 step 1 GATE "goatlite: render the config surface from goatlite.yaml (idempotent; an edited file is reported, never overwritten)" \
   "python3 '$REPO/ops/scripts/goatlite-render.py' --site $SITE"
+# Then the env-file store every later phase reads (it needs the rendered groups);
+# standup-phase-run runs these two lines without loading the store.
+step 1 GATE "goatlite: create the local secrets store (strong random values; a value already there is kept)" \
+  "python3 '$REPO/ops/secrets/posture.py' init --if-env-file --env $SITE"
 fi
 
 # Pre-flight gate (fail-closed): config surface + values ready before any host.
@@ -610,6 +650,11 @@ if [ "$OBS" = 1 ]; then
   leg_start host "observability host: baseline + LUKS, then utility (Forgejo)" "$OBS_LEG_BASELINE && $OBS_LEG_UTILITY"
 fi
 
+# Every pinned image, pulled on the box in parallel with phases 3 and 4; joined
+# before phase 5. The binary's lines are the same (parity gate).
+pull_start "every pinned image for $GROUP, pulled on its hosts in parallel (joined before phase 5)" \
+  "cd '$REPO/ops/ansible' && $ANSIBLE_PRE ${INV[*]} standup-image-pull.yml -e target=$GROUP"
+
 # Phase 3. Per-instance secrets (operator machine; idempotent; store values + local references).
 step 3 T "generate per-instance secrets" \
   "'$REPO/ops/scripts/newsite-secrets.sh' $SITE"
@@ -637,10 +682,10 @@ step 4 T "name-fallback snapshot (generate + sign)" \
 #    extra-vars, not just site_id — bootstrap_owner_email plus three secrets from
 #    the site's env (loaded by direnv). Without them the play fails on a missing
 #    var (this is the "missing extra-vars" defect the guides routed around).
-#    On a FIRST run it then stops at "wait for the netbird schema": the accounts
-#    relation only appears once management-a fully boots, which needs Ory (phase
-#    6). That stop is EXPECTED, so this step is non-fatal — phase 6 re-runs
-#    site-bootstrap and completes it. On a re-run the schema is already there and the play succeeds.
+#    Phase 5 runs the `stack` plays only (--skip-tags after-ory): the account seed
+#    waits for the netbird schema, which management-a writes only once it can reach
+#    Hydra, so it and every play after it run in phase 6, after ory-deploy
+#    (--skip-tags stack). Each play runs once; no phase stops on purpose.
 OWNER_EMAIL_STANDUP="\$OWNER_EMAIL"
 [[ "${LITE}" == 1 && -n "${lite_admin:-}" ]] && OWNER_EMAIL_STANDUP="$lite_admin"
 BOOTSTRAP_EV="-e site_id=$SITE -e bootstrap_owner_email=\"$OWNER_EMAIL_STANDUP\" -e postgres_superuser_password=\"\$(printenv ${SITE_UPPER}_PG_PASS)\" -e netbird_encryption_key=\"\$(printenv ${SITE_UPPER}_NB_ENCKEY)\" -e pgbackrest_cipher_pass=\"\$(printenv ${SITE_UPPER}_BKP_KEY)\""
@@ -670,13 +715,11 @@ if [ "$JOINER" = 1 ]; then
     BOOTSTRAP_EV_P1="$BOOTSTRAP_EV -e participates_in_spock=false -e has_durable_independent_state=true"
   fi
 fi
-# Only the schema-wait stop is expected (site-bootstrap's rescue names it: "never
-# had Ory"). Any other refusal, the NTP preflight for one, used to be swallowed by
-# a bare `|| echo`, and phase 6 then failed on a compose file that was never
-# written. The play's output is kept in a temp file for the one grep and
-# removed. The binary's line is the same (parity gate).
-step 5 A "mgmt-stack (site-bootstrap) — first run STOPS at the schema wait (expected; phase 6 finishes it)" \
-  "cd '$REPO/ops/ansible' && ( log=\$(mktemp); if $ANSIBLE_PRE ${INV[*]} site-bootstrap.yml $BOOTSTRAP_EV_P1 2>&1 | tee \"\$log\"; then rm -f \"\$log\"; elif grep -q 'never had Ory' \"\$log\"; then rm -f \"\$log\"; echo '>> phase 5 stopped — expected on a first run (schema not ready until Ory is up). Continuing to phase 6, which re-runs this and must succeed.'; else rm -f \"\$log\"; exit 1; fi )"
+pull_join 5
+# Any refusal here is a real one and fails the phase. The binary's line is
+# the same (parity gate).
+step 5 A "mgmt-stack (site-bootstrap up to the account seed; the seed needs Ory and runs in phase 6)" \
+  "cd '$REPO/ops/ansible' && $ANSIBLE_PRE ${INV[*]} site-bootstrap.yml $BOOTSTRAP_EV_P1 --skip-tags after-ory"
 
 # Phase 5. [internet] Connect the mgmt host to its relays over the rathole tunnel.
 #     There is no generic play — the operator makes $SITE-rathole-client.yml from
@@ -705,13 +748,19 @@ step 6 A "[joiner] seed-from-peer (pass 2 — data-only copy from founder ${JOIN
   "cd '$REPO/ops/ansible' && { [ -n '$JOIN_FOUNDER_SITE' ] || { echo 'joiner: group_vars/$GROUP/vars.yml must set join_founder_site (the founder site-id to seed from)'; exit 1; }; } && { ls ${SITE}-seed-from-peer.yml >/dev/null 2>&1 || { echo 'missing ${SITE}-seed-from-peer.yml — clone it from any site that has <site>-seed-from-peer.yml (node-addition.md §4)'; exit 1; }; } && $ANSIBLE_PRE ${INV[*]} ${SITE}-seed-from-peer.yml -e site_id=$SITE"
 fi
 
-# Phase 6. Re-run site-bootstrap. NOW the schema exists (Ory is up), so its account step seeds
-#     the account and prints the single-use bootstrap setup key — SAVE IT (phases
-#     8 and 11 need it). This is the real proof of phase 5; unlike phase 5 it is
-#     fatal, so a genuine mgmt-stack problem surfaces here rather than being
-#     masked by the expected first-run stop.
-step 6 A "re-run site-bootstrap (completes phase 5; prints + saves the setup key)" \
+# Phase 6. The rest of site-bootstrap, now that Ory is up: the account seed waits
+#     for the netbird schema (bounded: netbird_schema_wait_seconds, default 300 s,
+#     and the rescue names the cause), seeds the account and prints the single-use
+#     bootstrap setup key — SAVE IT (phases 8 and 11 need it); then the plays after
+#     it. A founder runs only that part (--skip-tags stack). A joiner runs the whole
+#     file again: its pass 3 turns Spock on, which the stack plays configure.
+if [ "$JOINER" = 1 ]; then
+step 6 A "[joiner] re-run site-bootstrap with Spock on (pass 3; prints + saves the setup key)" \
   "cd '$REPO/ops/ansible' && $ANSIBLE_PRE ${INV[*]} site-bootstrap.yml $BOOTSTRAP_EV"
+else
+step 6 A "the rest of site-bootstrap: wait for the netbird schema, seed the account, print + save the setup key" \
+  "cd '$REPO/ops/ansible' && $ANSIBLE_PRE ${INV[*]} site-bootstrap.yml $BOOTSTRAP_EV --skip-tags stack"
+fi
 
 # Phase 6. [joiner] The founder-side mirror — the SAME change, not a follow-up
 #     (node-addition.md §5.4a). spock-mesh-wire.yml on the FOUNDER creates the

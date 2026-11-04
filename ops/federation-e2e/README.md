@@ -8,6 +8,14 @@ from the receiving side. The same scenario runs in two places.
 | `run.sh` | CI job `federation-e2e`, four privileged containers on one runner | Every phase of both avenues, both orders | M-124 |
 | `live.sh` | Two real Ubuntu hosts, one per sovereign, driven from a laptop over SSH | The same phases and proofs across a real network | M-125 |
 
+Both need only the checkout: the SPIRE image is the `spire` component of
+`ops/pins/fleet-pins.yaml`, and `overlay.py` writes each sovereign's whole
+`ops/goatbuilder/goatbuilder.yaml`, inventory and edge `group_vars` into its clone.
+`run.sh --prepare-only --goatbuilder <bin>` stops before the first container;
+`ops/ci/check-federation-e2e-prepare.sh` runs it on a copy with every
+`group_vars/*/pins.yml`, the checkout's `goatbuilder.yaml` and the committed intents
+removed and no goatnet in `fleet-pins.yaml`, as a public checkout has.
+
 Both run phase 14, `ops/federation/standup/acceptance.sh`, from both sides with
 `FED_ACCEPTANCE_STRICT=1`. A skipped check fails the run.
 

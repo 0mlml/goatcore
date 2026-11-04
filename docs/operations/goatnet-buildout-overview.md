@@ -114,7 +114,7 @@ export SITE=demo
 export GROUP=demo_hosts
 export SITE_UPPER=DEMO
 export ZONE=netbird.demo.example.net
-export OWNER_EMAIL=person-143@example.org
+export OWNER_EMAIL=person-139@example.org
 export HOST_IP=192.168.1.40
 ```
 
@@ -136,7 +136,7 @@ luks_volumes_mgmt_host:
      passphrase: "{{ lookup('env', luks_passphrase_envvar) }}"}
 
 site_admins:                              # only these emails may log in
-  - {email: "person-143@example.org", name: "You"}
+  - {email: "person-139@example.org", name: "You"}
 ```
 
 **3 — The cert manifest** — copy the template, never another GOAT-Net's (its SANs

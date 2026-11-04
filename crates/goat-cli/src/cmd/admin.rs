@@ -13201,7 +13201,7 @@ ory_ssh_user = "operator"
         // Non-ASCII name must cross the wire as literal UTF-8, NOT \uXXXX
         // (the SQLSTATE-22P05 gotcha the Ansible path hand-serialized around).
         let raw = build_identity_body(
-            "person-55@example.org",
+            "person-52@example.org",
             "Jánoš Novák",
             &groups,
             &org,
@@ -13220,7 +13220,7 @@ ory_ssh_user = "operator"
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["schema_id"], "default");
         assert_eq!(v["state"], "active");
-        assert_eq!(v["traits"]["email"], "person-55@example.org");
+        assert_eq!(v["traits"]["email"], "person-52@example.org");
         // Authorization fields land in admin-managed metadata_public, not traits
         //.
         assert_eq!(v["metadata_public"]["groups"][0], "ZAGROS-OPERATOR");
@@ -13228,8 +13228,8 @@ ory_ssh_user = "operator"
         assert_eq!(v["metadata_public"]["org"]["display_name"], "Acme Corp");
         assert!(v["traits"].get("groups").is_none(), "groups must not be in traits");
         assert_eq!(v["credentials"]["password"]["config"]["password"], "pw-123");
-        assert_eq!(v["verifiable_addresses"][0]["value"], "person-55@example.org");
-        assert_eq!(v["recovery_addresses"][0]["value"], "person-55@example.org");
+        assert_eq!(v["verifiable_addresses"][0]["value"], "person-52@example.org");
+        assert_eq!(v["recovery_addresses"][0]["value"], "person-52@example.org");
         // `aff` is omitted when the caller passes None (Phase D gate off).
         assert!(v["metadata_public"].get("aff").is_none());
     }
@@ -13260,14 +13260,14 @@ ory_ssh_user = "operator"
             nation: Some("POL".into()),
         };
         // Gate on (Some) → aff trait present with id/kind/nation.
-        let raw = build_identity_body("person-142@example.org", "X", &[], &org, Some(&aff), None);
+        let raw = build_identity_body("person-138@example.org", "X", &[], &org, Some(&aff), None);
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["metadata_public"]["aff"]["id"], "demo-org");
         assert_eq!(v["metadata_public"]["aff"]["kind"], "partner");
         assert_eq!(v["metadata_public"]["aff"]["nation"], "POL");
         // Gate on but empty kind → still omitted (no half-formed claim).
         let empty = MfAffiliation::default();
-        let raw2 = build_identity_body("person-142@example.org", "X", &[], &org, Some(&empty), None);
+        let raw2 = build_identity_body("person-138@example.org", "X", &[], &org, Some(&empty), None);
         let v2: serde_json::Value = serde_json::from_str(&raw2).unwrap();
         assert!(v2["metadata_public"].get("aff").is_none());
     }
@@ -13277,7 +13277,7 @@ ory_ssh_user = "operator"
         assert_eq!(render_ory_section(None), "");
         let pw = OryProvision {
             auth_url: "https://auth.zagros.example".into(),
-            email: "person-58@example.org".into(),
+            email: "person-55@example.org".into(),
             password: Some("secretpw".into()),
             recovery_link: None,
             already_existed: false,
@@ -13286,7 +13286,7 @@ ory_ssh_user = "operator"
         let md = render_ory_section(Some(&pw));
         assert!(md.contains("## Ory login"));
         assert!(md.contains("https://auth.zagros.example"));
-        assert!(md.contains("person-58@example.org"));
+        assert!(md.contains("person-55@example.org"));
         assert!(md.contains("secretpw"));
         assert!(md.contains("Change the temporary password"));
 
@@ -13304,7 +13304,7 @@ ory_ssh_user = "operator"
 
         let existed = OryProvision {
             auth_url: "https://auth.zagros.example".into(),
-            email: "person-58@example.org".into(),
+            email: "person-55@example.org".into(),
             password: None,
             recovery_link: None,
             already_existed: true,
@@ -13319,7 +13319,7 @@ ory_ssh_user = "operator"
         let o = sample_onboarded();
         let ory = OryProvision {
             auth_url: "https://auth.zagros.netbird.zagros.example".into(),
-            email: "person-46@example.org".into(),
+            email: "person-43@example.org".into(),
             password: Some("temp-pw-xyz".into()),
             recovery_link: None,
             already_existed: false,
@@ -13357,7 +13357,7 @@ ory_ssh_user = "operator"
         };
         let ory = OryProvision {
             auth_url: "https://auth.zagros.netbird.zagros.example".into(),
-            email: "person-27@example.org".into(),
+            email: "person-25@example.org".into(),
             password: Some("pw-browse".into()),
             recovery_link: None,
             already_existed: false,

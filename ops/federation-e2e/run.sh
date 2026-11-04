@@ -21,12 +21,19 @@
 #
 # Linux + a Docker daemon + the wireguard kernel module + a built goat and goatbuilder.
 # Touches no goatnet, no cloud account and no credential store. Synthetic names only.
+# Everything a sovereign needs is generated here or read from files every checkout
+# carries: the images from ops/pins/fleet-pins.yaml `components:`, each clone's
+# goatbuilder config and group_vars from overlay.py. A public checkout runs it as is.
+#
+# --prepare-only stops before the first container: the image pins, the refusals that need
+# no hosts, and both sovereigns generated, each clone's config validated and its
+# federation planned. It needs no Docker and no --goat (CI: check-federation-e2e-prepare.sh).
 #
 # usage: ops/federation-e2e/run.sh --goat BIN --goatbuilder BIN [--work DIR] [--record DIR]
-#                                  [--scenario 1|2] [--keep]
+#                                  [--scenario 1|2] [--keep] [--prepare-only]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
-WORK=""; RECORD=""; GOAT=""; GB=""; KEEP=0; ONLY=""
+WORK=""; RECORD=""; GOAT=""; GB=""; KEEP=0; ONLY=""; PREPARE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --goat) GOAT="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
@@ -35,11 +42,16 @@ while [ $# -gt 0 ]; do
     --record) RECORD="$2"; shift 2 ;;
     --scenario) ONLY="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
-    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    --prepare-only) PREPARE=1; shift ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "run.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
-[ -x "$GOAT" ] && [ -x "$GB" ] || { echo "run.sh: --goat and --goatbuilder must name built binaries" >&2; exit 2; }
+if [ "$PREPARE" = 1 ]; then
+  [ -x "$GB" ] || { echo "run.sh: --goatbuilder must name a built binary" >&2; exit 2; }
+else
+  [ -x "$GOAT" ] && [ -x "$GB" ] || { echo "run.sh: --goat and --goatbuilder must name built binaries" >&2; exit 2; }
+fi
 [ -n "$WORK" ] || WORK="$(mktemp -d "${TMPDIR:-/tmp}/fed-e2e.XXXXXX")"
 mkdir -p "$WORK"; WORK="$(cd "$WORK" && pwd)"
 [ -n "$RECORD" ] || RECORD="$WORK/report"
@@ -48,10 +60,13 @@ export E2E_RECORD_DIR="$RECORD"
 # The clones carry no LFS objects (the briefs' PDFs); checking one out must not try to smudge them.
 export GIT_LFS_SKIP_SMUDGE=1
 
-# The fleet image, by digest, and the SPIRE release the fleet pins. Both pull anonymously.
+# The fleet image, by digest, and the SPIRE release the fleet pins: the `spire`
+# component's value of record in ops/pins/fleet-pins.yaml, which every checkout carries
+# (a public one declares no goatnet there, but keeps every component). Both pull
+# anonymously.
 ZENOH_IMAGE="ghcr.io/usareur-af/zenoh-pqc@sha256:372de39d2e8b64fe7157194173f1b7ac6eac2700ff04c49cce2ce3c284a6fdb2"
-SPIRE_IMAGE="$(grep -hoE 'ghcr\.io/spiffe/spire-server:[^"[:space:]]+@sha256:[0-9a-f]{64}' "$REPO"/ops/ansible/group_vars/*/pins.yml | head -1 || true)"
-case "$SPIRE_IMAGE" in *@sha256:*) ;; *) echo "run.sh: no digest-pinned SPIRE image found" >&2; exit 2 ;; esac
+SPIRE_IMAGE="$(python3 -c 'import sys, yaml; print(((yaml.safe_load(open(sys.argv[1])).get("components") or {}).get("spire") or {}).get("fleet") or "")' "$REPO/ops/pins/fleet-pins.yaml" 2>/dev/null || true)"
+[[ "$SPIRE_IMAGE" =~ ^ghcr\.io/spiffe/spire-server:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "run.sh: ops/pins/fleet-pins.yaml declares no digest-pinned SPIRE image (components.spire.fleet)" >&2; exit 2; }
 HOST_IMAGE=fed-e2e-host
 ACL_ASSEMBLE="$REPO/ops/ansible/roles/goat-zenoh/files/acl-assemble.py"
 REC="$REPO/ops/e2e/rec.py"
@@ -422,10 +437,23 @@ SENT="$WORK/mock-ran"; printf '#!/bin/sh\ntouch %s\n' "$SENT" > "$WORK/mock-goat
 rec mock-executes-nothing --expect-in "MOCK" --expect-in "not executed" -- bash -c \
   "GOAT_BIN='$WORK/mock-goat' '$GB' -C '$REPO' --mock '$FX' federate hello-ally --as zagros --work '$WORK/mock-work' && [ ! -e '$SENT' ] && [ ! -e '$WORK/mock-work' ]"
 rec an-undeclared-peering-is-refused --expect-in "declare it first (C1)" -- bash -c \
-  "if '$GB' -C '$REPO' federate no-such-peer --dry-run 2>&1; then exit 1; fi"
+  "if '$GB' -C '$REPO' --mock '$FX' federate no-such-peer --dry-run 2>&1; then exit 1; fi"
 mkdir -p "$WORK/quic"; printf '{"transport":{"kind":"quic"}}' > "$WORK/quic/agreement.json"
 rec an-unknown-transport-refuses-and-substitutes-nothing --expect-in "REFUSED, no play for 'quic'" --expect-in "Do NOT substitute" --expect-not-in "ansible-preflight" -- bash -c \
   "'$GB' -C '$REPO' --mock '$FX' federate hello-ally --work '$WORK/quic' --from 11 --to 11 --dry-run 2>&1; FED_WORK='$WORK/quic' '$REPO/ops/scripts/peering-standup.sh' hello-ally --from 11 --to 11 2>&1 && exit 1; exit 0"
+
+if [ "$PREPARE" = 1 ]; then
+  say "the two sovereigns, generated and planned, no hosts"
+  for s in pasture meadow; do
+    gen_sovereign "$s"
+    rec "prepare-$s-config-validates" -- "$GB" -C "$WORK/$s/clone" validate
+    rec "prepare-$s-secrets-posture-is-env" --expect-in "env" --expect-not-in "env-file" -- env -u GOAT_SECRET_STORE python3 "$WORK/$s/clone/ops/secrets/posture.py" store
+    rec "prepare-$s-federation-plans" --expect-in "To run it for real" -- "$GB" -C "$WORK/$s/clone" federate "$(other "$s")" --as "$s" --dry-run
+    rec "prepare-$s-edge-pins-the-image" --expect-in "$ZENOH_IMAGE" -- cat "$WORK/$s/clone/ops/ansible/group_vars/$(other "$s")_edge/deployment.yml"
+  done
+  echo "spire image: $SPIRE_IMAGE"
+  [ "$FAILS" = 0 ] && exit 0 || exit 1
+fi
 
 say "the host image"
 ctx="$WORK/host-context"; rm -rf "$ctx"; cp -R "$HERE/host" "$ctx"

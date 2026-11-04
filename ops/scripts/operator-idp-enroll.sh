@@ -15,12 +15,12 @@
 #
 # Usage:
 #   sudo operator-idp-enroll.sh \
-#     --email person-18@example.org \
+#     --email person-17@example.org \
 #     --name "Alice Admin" \
 #     --groups obs-admin
 #
 #   sudo operator-idp-enroll.sh \
-#     --email person-25@example.org \
+#     --email person-23@example.org \
 #     --name "Bob SRE" \
 #     --groups grafana-admin,minio-readonly,forgejo-user
 #

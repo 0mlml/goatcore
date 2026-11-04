@@ -43,10 +43,8 @@ fi
 # Detect root partition (NVMe or SD card)
 if [ -b /dev/nvme0n1p2 ]; then
     ROOT_PART="/dev/nvme0n1p2"
-    BOOT_PART="/dev/nvme0n1p1"
 elif [ -b /dev/mmcblk0p2 ]; then
     ROOT_PART="/dev/mmcblk0p2"
-    BOOT_PART="/dev/mmcblk0p1"
 else
     echo "ERROR: No root partition found (checked nvme0n1p2 and mmcblk0p2)"
     exit 1

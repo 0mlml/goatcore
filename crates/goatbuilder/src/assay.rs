@@ -30,9 +30,22 @@ pub struct Options<'a> {
     pub stream: bool,
 }
 
-/// The two commands, as the standup phases spell them.
-pub fn commands(repo: &Path, site: &str) -> (Vec<String>, Vec<String>) {
+/// The acceptance context, one definition for both entry points (LP-015): the
+/// site's declared end-state model (ADR 1206), its values, and the runner over
+/// every eligible row with both. Standup phase 13 runs [`Acceptance::phase_line`];
+/// `assay` runs the same three itself, into private temp files, under the
+/// goatnet's secrets store ([`under_store`]), so a credential row such as
+/// `mgmt-api-answers` reads the same token either way.
+pub struct Acceptance {
+    pub model: Vec<String>,
+    pub gen: Vec<String>,
+    pub run: Vec<String>,
+    endstate: String,
+}
+
+pub fn acceptance(repo: &Path, site: &str, values: &Path, endstate: &Path) -> Acceptance {
     let v = repo.join("ops/validation");
+    let model = vec!["python3".into(), repo.join("ops/goatbuilder/endstate/endstate.py").display().to_string(), "model".into(), site.into()];
     let gen = vec!["python3".into(), v.join("generate-values.py").display().to_string(), site.into()];
     let run = vec![
         "python3".into(),
@@ -40,33 +53,103 @@ pub fn commands(repo: &Path, site: &str) -> (Vec<String>, Vec<String>) {
         "--env".into(),
         site.into(),
         "--values".into(),
-        v.join(format!("values-{site}.yaml")).display().to_string(),
+        values.display().to_string(),
+        "--endstate".into(),
+        endstate.display().to_string(),
         "--all-eligible".into(),
         "--by-layer".into(),
     ];
-    (gen, run)
+    Acceptance { model, gen, run, endstate: endstate.display().to_string() }
+}
+
+impl Acceptance {
+    /// The phase-13 line both standup drivers print and run (the parity gate diffs it
+    /// against goat-standup.sh): the model into its file, the values, then the runner.
+    pub fn phase_line(&self) -> String {
+        let sh = |a: &[String]| a.iter().map(|x| if x.contains('/') { format!("'{x}'") } else { x.clone() }).collect::<Vec<_>>().join(" ");
+        format!("{} > '{}' && {} && {}", sh(&self.model), self.endstate, sh(&self.gen), sh(&self.run))
+    }
+}
+
+/// Phase 13's own paths: the values file the generator writes in the checkout and the
+/// model in the run's state directory.
+pub fn phase13(repo: &Path, site: &str, state_dir: &str) -> Acceptance {
+    acceptance(repo, site, &repo.join(format!("ops/validation/values-{site}.yaml")), &Path::new(state_dir).join(format!("endstate-{site}.json")))
+}
+
+/// A command run under the goatnet's declared secrets store: through
+/// ops/scripts/with-secrets, the same resolution `goatbuilder secrets exec` and every
+/// standup phase use. A value store whose file cannot be read refuses here, by name,
+/// before anything is probed, so a missing store is never graded as a row.
+pub fn under_store(repo: &Path, argv: &[String]) -> Result<Command> {
+    let posture = repo.join("ops/secrets/posture.py");
+    let kind = Command::new("python3").arg(&posture).arg("kind").output();
+    if matches!(&kind, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "value") {
+        let probe = Command::new("python3").arg(&posture).args(["exec", "--", "true"]).current_dir(repo).output();
+        if let Ok(o) = probe {
+            if !o.status.success() {
+                let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                return Err(goat_errors::coded("GB-049", format!("the goatnet's secrets store could not be read, so no credential row could answer: {why}")).into());
+            }
+        }
+    }
+    let mut c = Command::new(repo.join("ops/scripts/with-secrets"));
+    c.args(argv).current_dir(repo);
+    Ok(c)
 }
 
 pub fn run(repo: &Path, o: &Options) -> Result<Report> {
-    let (gen, mut run) = commands(repo, o.site);
     if let Some(values) = o.values {
         if !values.is_file() {
             return Err(goat_errors::coded("GB-049", format!("no value set at {}", values.display())).into());
         }
+        // A rehearsal: the fixture's value set stands in for the goatnet, which has no
+        // end state or store of its own to read.
         let values = std::env::current_dir().map(|d| d.join(values)).unwrap_or_else(|_| values.to_path_buf());
-        let i = run.iter().position(|a| a == "--values").expect("commands() passes --values") + 1;
-        run[i] = values.display().to_string();
-        return finish(repo, o, run);
+        let mut run = acceptance(repo, o.site, &values, Path::new("")).run;
+        let i = run.iter().position(|a| a == "--endstate").expect("acceptance() passes --endstate");
+        run.drain(i..i + 2);
+        return finish(repo, o, run, false);
     }
-    // Derived into a private temp file with the generator's own --stdout:
-    // assay reads only, and must not write (or overwrite a tracked)
-    // ops/validation/values-<site>.yaml in the checkout.
-    let derived = derive_values(repo, o.site, &gen)?;
-    let i = run.iter().position(|a| a == "--values").expect("commands() passes --values") + 1;
-    run[i] = derived.display().to_string();
-    let result = finish(repo, o, run);
+    // Derived into private temp files: assay reads only, and must not write (or
+    // overwrite a tracked) ops/validation/values-<site>.yaml in the checkout.
+    let probe = acceptance(repo, o.site, Path::new(""), Path::new(""));
+    let derived = derive_values(repo, o.site, &probe.gen)?;
+    let model = derive(&probe.model, repo, &format!("endstate-{}", o.site), "json", "the site's declared end state");
+    let model = match model {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_file(&derived);
+            return Err(e);
+        }
+    };
+    let ctx = acceptance(repo, o.site, &derived, &model);
+    let result = finish(repo, o, ctx.run, true);
     let _ = std::fs::remove_file(&derived);
+    let _ = std::fs::remove_file(&model);
     result
+}
+
+/// Run one derivation command and keep its stdout in an owner-only temp file.
+fn derive(argv: &[String], repo: &Path, stem: &str, ext: &str, what: &str) -> Result<PathBuf> {
+    let g = Command::new(crate::endstate::python()).args(&argv[1..]).current_dir(repo).output();
+    match g {
+        Ok(out) if out.status.success() => {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            // A fresh name per call: two assays in one process (the tests, `endstate
+            // --assay`) never share a file.
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("goatbuilder-assay-{stem}-{}-{n}.{ext}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).with_context(|| format!("the temporary file for {what}"))?;
+            f.write_all(&out.stdout).with_context(|| format!("the temporary file for {what}"))?;
+            Ok(path)
+        }
+        Ok(out) => Err(goat_errors::coded("GB-049", format!("{what} could not be derived: {}", String::from_utf8_lossy(&out.stderr).trim())).into()),
+        Err(e) => Err(goat_errors::coded("GB-049", format!("cannot run python3: {e}")).into()),
+    }
 }
 
 fn derive_values(repo: &Path, site: &str, gen: &[String]) -> Result<PathBuf> {
@@ -78,31 +161,14 @@ fn derive_values(repo: &Path, site: &str, gen: &[String]) -> Result<PathBuf> {
         .into());
     }
     // The commands print as the standup spells them; they run under the Python that
-    // has PyYAML (python3 when it does, else Ansible's own, #2120).
-    let g = Command::new(crate::endstate::python()).args(&gen[1..]).arg("--stdout").current_dir(repo).output();
-    match g {
-        Ok(out) if out.status.success() => {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            // The values name the site's addresses: owner-only, and a fresh name.
-            let path = std::env::temp_dir().join(format!("goatbuilder-assay-values-{site}-{}.yaml", std::process::id()));
-            let _ = std::fs::remove_file(&path);
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).context("the temporary values file")?;
-            f.write_all(&out.stdout).context("the temporary values file")?;
-            Ok(path)
-        }
-        Ok(out) => {
-            Err(goat_errors::coded(
-                "GB-049",
-                format!("the site's values could not be derived: {}", String::from_utf8_lossy(&out.stderr).trim()),
-            )
-            .into())
-        }
-        Err(e) => Err(goat_errors::coded("GB-049", format!("cannot run python3: {e}")).into()),
-    }
+    // has PyYAML (python3 when it does, else Ansible's own, #2120). The values name
+    // the site's addresses: owner-only, and a fresh name.
+    let mut argv = gen.to_vec();
+    argv.push("--stdout".into());
+    derive(&argv, repo, &format!("values-{site}"), "yaml", "the site's values")
 }
 
-fn finish(repo: &Path, o: &Options, mut run: Vec<String>) -> Result<Report> {
+fn finish(repo: &Path, o: &Options, mut run: Vec<String>, store: bool) -> Result<Report> {
     if o.plan {
         run.retain(|a| a != "--all-eligible" && a != "--by-layer");
         run.push("--plan".into());
@@ -122,8 +188,14 @@ fn finish(repo: &Path, o: &Options, mut run: Vec<String>) -> Result<Report> {
         run.push(jsonl.display().to_string());
     }
 
-    let mut cmd = Command::new(crate::endstate::python());
-    cmd.args(&run[1..]).current_dir(repo);
+    run[0] = crate::endstate::python();
+    let mut cmd = if store && !o.plan {
+        under_store(repo, &run)?
+    } else {
+        let mut c = Command::new(&run[0]);
+        c.args(&run[1..]).current_dir(repo);
+        c
+    };
     // The runner's lines are the human report; in json/yaml mode they go to
     // stderr so stdout carries one document.
     //
@@ -366,13 +438,121 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_are_the_standup_phase_14_commands() {
-        let (gen, run) = commands(Path::new("/r"), "zagros");
-        let phase14 = format!("{} && {}", gen.join(" "), run.join(" "));
+    fn phase_13_is_one_acceptance_context_with_the_end_state() {
+        // The line both standup drivers print; the parity gate diffs it against goat-standup.sh.
         assert_eq!(
-            phase14,
-            "python3 /r/ops/validation/generate-values.py zagros && python3 /r/ops/validation/run-acceptance.py --env zagros --values /r/ops/validation/values-zagros.yaml --all-eligible --by-layer"
+            phase13(Path::new("/r"), "pasture", "/s").phase_line(),
+            "python3 '/r/ops/goatbuilder/endstate/endstate.py' model pasture > '/s/endstate-pasture.json' && python3 '/r/ops/validation/generate-values.py' pasture && python3 '/r/ops/validation/run-acceptance.py' --env pasture --values '/r/ops/validation/values-pasture.yaml' --endstate '/s/endstate-pasture.json' --all-eligible --by-layer"
         );
+        // The standalone assay runs the same runner arguments, with its own two files.
+        let standalone = acceptance(Path::new("/r"), "pasture", Path::new("/t/values.yaml"), Path::new("/t/model.json")).run;
+        let p13 = phase13(Path::new("/r"), "pasture", "/s").run;
+        let shape = |a: &[String]| a.iter().map(|x| if x.starts_with("/t/") || x.starts_with("/s/") || x.ends_with("values-pasture.yaml") { "<file>".to_string() } else { x.clone() }).collect::<Vec<_>>();
+        assert_eq!(shape(&standalone), shape(&p13));
+        assert!(standalone.windows(2).any(|w| w == ["--endstate", "/t/model.json"]), "{standalone:?}");
+    }
+
+    /// A one-box goatnet in a temp repository: stub generators and a stub runner that
+    /// grade two rows the way the real runner does. `prom-up` needs a service the
+    /// end state declares absent (N/A with --endstate, FAIL without); `mgmt-api-answers`
+    /// reads <SITE>_NB_API_TOKEN from its environment (PASS when set, UNKNOWN when not).
+    /// The real with-secrets, posture.py and standup-phase-run resolve the store.
+    fn lite_repo(token: Option<&str>) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for rel in ["ops/scripts/with-secrets", "ops/scripts/standup-phase-run", "ops/secrets/posture.py"] {
+            std::fs::create_dir_all(r.join(rel).parent().unwrap()).unwrap();
+            std::fs::copy(src.join(rel), r.join(rel)).unwrap();
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::create_dir_all(r.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(r.join(rel), body).unwrap();
+        };
+        write("ops/ansible/group_vars/cleanroom_hosts/vars.yml", "site_id: cleanroom\n");
+        write("ops/goatbuilder/goatbuilder.yaml", "secrets:\n  store: env-file\n");
+        write("ops/goatbuilder/endstate/endstate.py", "import json\nprint(json.dumps({'services': {'prometheus': {'present': False, 'assay': ['prometheus']}}}))\n");
+        write("ops/validation/generate-values.py", "import sys, os\nbody = 'nb_api_token_env: CLEANROOM_NB_API_TOKEN\\n'\nif '--stdout' in sys.argv:\n    print(body, end='')\nelse:\n    open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'values-cleanroom.yaml'), 'w').write(body)\n");
+        write("ops/validation/run-acceptance.py", r#"import json, os, sys
+a = sys.argv[1:]
+arg = lambda k: a[a.index(k) + 1] if k in a else None
+here = os.path.dirname(os.path.abspath(__file__))
+token = 'cleanroom'.upper() + '_NB_API_TOKEN'
+absent = set()
+if arg('--endstate'):
+    for s in json.load(open(arg('--endstate')))['services'].values():
+        if s.get('present') is False: absent.update(s.get('assay') or [])
+rows = [
+    {'id': 'prom-up', 'layer': 'obs', 'status': 'N/A' if 'prometheus' in absent else 'FAIL', 'evidence': ''},
+    {'id': 'mgmt-api-answers', 'layer': 'mgmt-stack', 'status': 'PASS' if os.environ.get(token) else 'UNKNOWN', 'evidence': ''},
+]
+out = arg('--json') or os.path.join(here, 'phase13-rows.jsonl')
+open(out, 'w').write(''.join(json.dumps(r) + '\n' for r in rows))
+open(os.path.join(here, 'argv.log'), 'a').write(json.dumps(a) + '\n')
+sys.exit(1 if any(r['status'] == 'FAIL' for r in rows) else 0)
+"#);
+        if let Some(t) = token {
+            write(".envrc.local.d/secrets.env", &format!("CLEANROOM_NB_API_TOKEN={t}\n"));
+        } else {
+            write(".envrc.local.d/secrets.env", "OTHER=x\n");
+        }
+        d
+    }
+
+    fn statuses(jsonl: &str) -> BTreeMap<String, String> {
+        parse(jsonl).into_iter().map(|r| (r.id, r.status)).collect()
+    }
+
+    fn standalone(r: &Path, rows: &Path) -> Result<Report> {
+        run(r, &Options { site: "cleanroom", plan: false, only: None, vars: &[], json_out: Some(rows), values: None, stream: false })
+    }
+
+    /// LP-015: the standalone assay and phase 13 grade the same rows the same way: the
+    /// end state makes the absent service's row N/A, and the stored token reaches the
+    /// credential row without a `secrets exec` wrapper.
+    #[test]
+    fn standalone_assay_and_phase_13_grade_alike_under_the_store() {
+        if std::env::var_os("GOAT_SECRET_STORE").is_some() || std::env::var_os("GOAT_SECRETS_RESOLVED").is_some() {
+            return; // a store chosen in this shell would override the fixture's
+        }
+        let d = lite_repo(Some("fixture-token-value"));
+        let r = d.path();
+        let rows = r.join("standalone.jsonl");
+        let rep = standalone(r, &rows).unwrap();
+        let alone = statuses(&std::fs::read_to_string(&rows).unwrap());
+        assert_eq!(alone.get("prom-up").map(String::as_str), Some("N/A"), "{alone:?}");
+        assert_eq!(alone.get("mgmt-api-answers").map(String::as_str), Some("PASS"), "{alone:?}");
+        assert_eq!(rep.exit, EXIT_OK, "{:?}", rep.checks);
+
+        let state = tempfile::tempdir().unwrap();
+        let line = phase13(r, "cleanroom", &state.path().display().to_string()).phase_line();
+        let st = Command::new(r.join("ops/scripts/standup-phase-run")).arg(&line).current_dir(r).env_remove("GOAT_SECRET_ENV_FILE").status().unwrap();
+        assert!(st.success());
+        assert_eq!(statuses(&std::fs::read_to_string(r.join("ops/validation/phase13-rows.jsonl")).unwrap()), alone, "the same rows, the same verdicts");
+
+        let argv: Vec<Vec<String>> = std::fs::read_to_string(r.join("ops/validation/argv.log")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let flags = |a: &[String]| a.iter().filter(|x| x.starts_with("--") && *x != "--json").cloned().collect::<Vec<_>>();
+        assert_eq!(flags(&argv[0]), flags(&argv[1]), "{argv:?}");
+    }
+
+    /// The negative control: with the token absent from the store the row stays UNKNOWN
+    /// and the assay exits non-zero; a store that cannot be read refuses before probing.
+    #[test]
+    fn without_the_token_the_credential_row_stays_unknown() {
+        if std::env::var_os("GOAT_SECRET_STORE").is_some() || std::env::var_os("GOAT_SECRETS_RESOLVED").is_some() {
+            return;
+        }
+        let d = lite_repo(None);
+        let r = d.path();
+        let rows = r.join("standalone.jsonl");
+        let rep = standalone(r, &rows).unwrap();
+        assert_eq!(statuses(&std::fs::read_to_string(&rows).unwrap()).get("mgmt-api-answers").map(String::as_str), Some("UNKNOWN"));
+        assert_eq!(rep.exit, EXIT_NOT_CONVERGED);
+
+        std::fs::remove_file(r.join(".envrc.local.d/secrets.env")).unwrap();
+        let e = standalone(r, &rows).unwrap_err();
+        assert_eq!(e.downcast_ref::<goat_errors::Coded>().unwrap().code, "GB-049");
+        assert!(!r.join("ops/validation/argv.log").exists() || std::fs::read_to_string(r.join("ops/validation/argv.log")).unwrap().lines().count() == 1, "nothing was probed");
     }
 
     #[test]

@@ -36,9 +36,10 @@ usage:
                                          declared); exit 3 if unset and >1 account is configured
   posture.py doctor                      print `ok|FAIL <check> <detail>` rows for the posture
   posture.py exec -- CMD...              run CMD with the posture's values in its environment
-  posture.py init --env GOATNET [--file PATH] [--force]
+  posture.py init --env GOATNET [--file PATH] [--force] [--if-env-file]
                                          write an env file with strong random values for every
-                                         variable the goatnet's plays template (zero-SaaS quickstart)
+                                         variable the goatnet's plays template (zero-SaaS quickstart);
+                                         --if-env-file changes nothing under any other store
   posture.py set --stdin-json            store the values of a JSON object {NAME: value} read from
                                          stdin under a VALUE store (env-file, git-crypt, sops); a
                                          name that already holds a value is kept, never rotated;
@@ -158,6 +159,19 @@ def _lite_declared(repo: str) -> dict:
     out = _flat_block(path, "secrets:")
     out.setdefault("store", "env-file")
     return out
+
+
+def lite_name(repo: str = REPO) -> str:
+    """The goatnet a goatlite checkout declares (`lite.name` in goatlite.yaml), or ''."""
+    if not _lite_declared(repo):
+        return ""
+    name = _flat_block(lite_config_path(repo), "lite:").get("name", "")
+    return re.split(r"\s+#", name, maxsplit=1)[0].strip().strip("'\"")
+
+
+def _first_standup(goatnet: str) -> str:
+    return (f"phase 1 of the standup renders the goatlite {goatnet} and creates the local secrets "
+            f"store with strong random values: goatbuilder standup {goatnet} --to 1")
 
 
 def declared_source(repo: str = REPO) -> str:
@@ -343,6 +357,9 @@ def values(repo: str = REPO) -> dict:
     path = store_file(repo)
     if s == "env-file":
         if not os.path.isfile(path):
+            lite = lite_name(repo)
+            if lite:
+                raise PostureError(f"env-file store: {path} does not exist — {_first_standup(lite)}")
             raise PostureError(f"env-file store: {path} does not exist — create it with: goatbuilder secrets init --env <goatnet>")
         return parse_dotenv(_read(path))
     if s == "git-crypt":
@@ -662,6 +679,9 @@ def goatnet_members(goatnet: str, repo: str = REPO) -> list:
     for cand in (key, f"{key}_hosts"):
         if os.path.isdir(os.path.join(repo, "ops/ansible/group_vars", cand)):
             return [cand]
+    if goatnet == lite_name(repo):
+        raise PostureError(f"the goatlite {goatnet} has no config surface yet (ops/ansible/group_vars/{key}_hosts) — "
+                           + _first_standup(goatnet))
     raise PostureError(f"no goatnet or group named '{goatnet}' (ops/pins/fleet-pins.yaml goatnets, or ops/ansible/group_vars/)")
 
 
@@ -682,9 +702,14 @@ def generated_value(name: str) -> str:
     return _secrets.token_urlsafe(32)
 
 
-def init(goatnet: str, path: str, force: bool, repo: str = REPO) -> int:
+def init(goatnet: str, path: str, force: bool, repo: str = REPO, if_env_file: bool = False) -> int:
     """Write (or extend) a 0600 env file with a strong random value for every variable the
-    goatnet's plays template. Values already in the file are kept — a re-run never rotates."""
+    goatnet's plays template. Values already in the file are kept — a re-run never rotates.
+    `if_env_file` (a goatlite's phase 1): under any store but env-file there is no such
+    file to create, so say so and change nothing."""
+    if if_env_file and store(repo) != "env-file":
+        print(f"secrets init: the store in force is {store(repo)}, not env-file — nothing to create here")
+        return 0
     names = bindings_for(goatnet, repo)
     if not names:
         print(f"secrets init: the {goatnet} groups template no variables from the environment")
@@ -885,10 +910,12 @@ def main(argv: list) -> int:
             env["GOAT_SECRETS_RESOLVED"] = "1"
             os.execvpe(rest[0], rest, env)
         elif cmd == "init":
-            goatnet, path, force = "", "", False
+            goatnet, path, force, if_env_file = "", "", False, False
             i = 0
             while i < len(rest):
-                if rest[i] == "--env":
+                if rest[i] == "--if-env-file":
+                    if_env_file = True; i += 1
+                elif rest[i] == "--env":
                     goatnet = rest[i + 1]; i += 2
                 elif rest[i] == "--file":
                     path = rest[i + 1]; i += 2
@@ -898,11 +925,11 @@ def main(argv: list) -> int:
                     print(f"posture.py init: unknown argument {rest[i]}", file=sys.stderr)
                     return 2
             if not goatnet:
-                print("usage: posture.py init --env GOATNET [--file PATH] [--force]", file=sys.stderr)
+                print("usage: posture.py init --env GOATNET [--file PATH] [--force] [--if-env-file]", file=sys.stderr)
                 return 2
             target = path or setting("env_file")
             target = target if os.path.isabs(target) else os.path.join(REPO, target)
-            return init(goatnet, target, force)
+            return init(goatnet, target, force, if_env_file=if_env_file)
         elif cmd == "set":
             if rest != ["--stdin-json"]:
                 print("usage: posture.py set --stdin-json   (a JSON object {NAME: value} on stdin)", file=sys.stderr)

@@ -63,6 +63,19 @@ On a Linux machine with Docker and the `wireguard` module, with `goat` and
 ops/federation-e2e/run.sh --goat <path to goat> --goatbuilder <path to goatbuilder>
 ```
 
+The run needs nothing beyond this checkout. It reads the SPIRE image from the
+`spire` component in `ops/pins/fleet-pins.yaml` and writes each sovereign's own
+`ops/goatbuilder/goatbuilder.yaml` and edge `group_vars` into that sovereign's
+clone, so a public checkout runs it unchanged. To check that preparation without
+Docker, on any machine with `goatbuilder` built:
+
+```text
+ops/federation-e2e/run.sh --prepare-only --goatbuilder <path to goatbuilder>
+```
+
+It generates both sovereigns, validates each clone's config, plans each side's
+federation, and stops before the first container.
+
 Four privileged containers stand in for four hosts: a core and an edge per
 sovereign. The two cores cannot reach each other or the boundary; the two edges
 share the boundary network, and only the tunnel's UDP port crosses it. The run

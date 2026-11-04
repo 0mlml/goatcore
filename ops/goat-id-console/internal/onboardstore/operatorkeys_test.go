@@ -191,7 +191,7 @@ func TestOperatorKeyDecisions_refuseSelfDecision(t *testing.T) {
 		ids       []string
 	}{
 		{"examplehandle890", nil},                            // handle as decidedBy
-		{"tyler@example.test", nil},                      // email, different case
+		{"tyler@example.test", nil},                          // email, different case
 		{"admin@example.test", []string{"Examplehandle890"}}, // matched via a resolved form
 	} {
 		if _, err := s.ApproveOperatorKey(ctx, row.ID, decider.decidedBy, decider.ids); !errors.Is(err, ErrOperatorKeySelfDecision) {

@@ -119,8 +119,8 @@ if [ "$fail" -gt 0 ]; then
 fi
 echo "ok: no floating image pins in hand-authored group_vars"
 
-# Role defaults, compose templates and Dockerfile FROM lines (ADR 0703, extended
-# ). A role default with no override is what deploys; the rest decide
+# Role defaults, compose templates and Dockerfile FROM lines (ADR 0703).
+# A role default with no override is what deploys; the rest decide
 # what a rebuild of the same commit produces. The floats that existed when this
 # landed are on a shrink-only list the helper enforces.
 python3 ops/ci/check-image-refs-pinned.py

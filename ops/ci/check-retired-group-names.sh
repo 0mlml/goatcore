@@ -36,8 +36,10 @@ SCAN_PATHS=(ops crates .github docs/design docs/operations CLAUDE.md)
 
 # Files that carry the retired names by necessity: this guard's own list, and
 # the rename runbook, which records the migrate commands verbatim. Keep this
-# list short; every entry is a place a copy can be seeded from.
-EXEMPT_RE='ops/ci/check-retired-group-names\.sh|docs/operations/obs-group-rename-cutover\.md'
+# list short; every entry is a place a copy can be seeded from. The public
+# copies of the history directories (ops/oss/docs-public/docs/<history>/) are
+# history too, exempt for the same reason as the originals.
+EXEMPT_RE='ops/ci/check-retired-group-names\.sh|docs/operations/obs-group-rename-cutover\.md|ops/oss/docs-public/docs/(adr|findings|measurements|project)/[^:]*'
 
 fail=0
 for pair in "${RETIRED[@]}"; do

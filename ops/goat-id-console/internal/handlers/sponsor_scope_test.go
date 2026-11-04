@@ -114,7 +114,7 @@ func machineReq(t *testing.T, h http.Handler, key, method, path, body string) *h
 func TestMachineRealm_ParticipantSponsorScoped(t *testing.T) {
 	s := newOnboardTestServer(t)
 	portalURL, _ := fakeSponsorPortal(t, map[string]sponsorLookupResponse{
-		"sponsora-key":    {Org: "0ff404dd", Alias: "pat-example", SponsorAuthorized: true, SponsorMaxTier: "developer"},
+		"sponsora-key":  {Org: "0ff404dd", Alias: "pat-example", SponsorAuthorized: true, SponsorMaxTier: "developer"},
 		"admin-cap-key": {Org: "aaaa1111", Alias: "big-sponsor", SponsorAuthorized: true, SponsorMaxTier: "iam-admin"},
 	}, nil)
 	s.Cfg.PortalInternalURL = portalURL
