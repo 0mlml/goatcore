@@ -1412,14 +1412,17 @@ mod tests {
     /// handed to the recorder, and no step of the run is manual but phase 11.
     #[test]
     fn phase_8_enrols_and_records_with_no_pause() {
-        let o = Options { env: "zagros_prod", site: "zagros-prod", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
-        let s = read_site(&repo_root(), &o).unwrap();
-        let ev = plan(&repo_root(), &s, &o, "goatbuilder standup zagros_prod --site zagros-prod");
+        // The fixture site, not a real goatnet's config, so the test holds in any
+        // checkout (a goatcore tree carries no goatnet).
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
+        let mut s = test_site(false);
+        s.profile = "internet".into();
+        let ev = plan(&repo_root(), &s, &o, "RESUME");
         let p8: Vec<&Phase> = ev.iter().filter_map(|e| if let Event::Phase(p) = e { Some(p) } else { None }).filter(|p| p.n == 8).collect();
         assert_eq!(p8.iter().map(|p| p.kind).collect::<Vec<_>>(), vec!["A", "T"]);
-        let ips = format!("{}/standup-zagros-prod-mesh-ips.json", s.state_dir);
-        assert!(p8[0].cmd.contains(&format!("mesh-enroll-host.yml -e target=zagros_prod_hosts -e mesh_ips_out='{ips}'")));
-        assert!(p8[1].cmd.ends_with(&format!("standup-mesh-record.py' zagros-prod --ips '{ips}'")));
+        let ips = format!("{}/standup-zagros-mesh-ips.json", s.state_dir);
+        assert!(p8[0].cmd.contains(&format!("mesh-enroll-host.yml -e target=zagros_hosts -e mesh_ips_out='{ips}'")), "{}", p8[0].cmd);
+        assert!(p8[1].cmd.ends_with(&format!("standup-mesh-record.py' zagros --ips '{ips}'")), "{}", p8[1].cmd);
         let manual: Vec<u32> = ev.iter().filter_map(|e| if let Event::Phase(p) = e { Some(p) } else { None }).filter(|p| p.kind == "MANUAL").map(|p| p.n).collect();
         assert_eq!(manual, vec![11]);
     }
