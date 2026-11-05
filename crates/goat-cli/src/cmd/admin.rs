@@ -6473,14 +6473,14 @@ pub(crate) fn native_ory_config(env: Option<&str>) -> Option<OryEnvConfig> {
         .unwrap_or_else(|_| "http://127.0.0.1:4434".to_string());
     match env? {
         "zagros" => Some(OryEnvConfig {
-            ssh_host: "100.127.0.179",
+            ssh_host: "100.127.0.180",
             ssh_user: "goat",
             kratos_admin_url,
             auth_url: "https://auth.zagros.netbird.zagros.example",
             ssh_proxy: ssh_proxy_for("zagros"),
         }),
         "zagros-prod" => Some(OryEnvConfig {
-            ssh_host: "100.127.0.221",
+            ssh_host: "100.127.0.222",
             // This goatnet uses its own baseline SSH account, declared in its inventory.
             ssh_user: "goat",
             kratos_admin_url,
@@ -6491,7 +6491,7 @@ pub(crate) fn native_ory_config(env: Option<&str>) -> Option<OryEnvConfig> {
         // GOAT_ONBOARD_KRATOS_LOCAL=1 and never uses it, but a laptop-run
         // onboard against this goatnet does.
         "zagros-dev" => Some(OryEnvConfig {
-            ssh_host: "100.127.0.152",
+            ssh_host: "100.127.0.153",
             ssh_user: "goat",
             kratos_admin_url,
             auth_url: "https://auth.zagros-dev.examplebird.zagros-dev.example",
@@ -13096,7 +13096,7 @@ ory_ssh_user = "operator"
     #[test]
     fn native_ory_config_known_and_unknown() {
         let zagros = native_ory_config(Some("zagros")).unwrap();
-        assert_eq!(zagros.ssh_host, "100.127.0.179");
+        assert_eq!(zagros.ssh_host, "100.127.0.180");
         assert_eq!(zagros.kratos_admin_url, "http://127.0.0.1:4434");
         assert!(native_ory_config(Some("vega")).is_none());
         // No --env resolves to no config: an unset env never means a goatnet.
@@ -13145,7 +13145,7 @@ ory_ssh_user = "operator"
         let args = ssh_kratos_argv(&cfg, "curl -sS http://127.0.0.1:4434/admin/identities");
         assert!(args.iter().any(|a| a == "BatchMode=yes"));
         assert!(args.iter().any(|a| a == "ConnectTimeout=15"));
-        assert_eq!(args[args.len() - 2], "goat@100.127.0.179");
+        assert_eq!(args[args.len() - 2], "goat@100.127.0.180");
         // The remote command is the last word; the body (secrets) is never here.
         assert_eq!(
             args[args.len() - 1],

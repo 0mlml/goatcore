@@ -81,8 +81,8 @@ rec rollback-list --expect-in "$COMP" -- "$GB" rollback "$COMP" --list
 # rollback.sh; --avenue overrides. Needs two refs in the host's ledger, which the
 # second --bump provides; with one, the step says so and the run stays green.
 AVENUE="${LIVE_CANARY_AVENUE:-$( [ $(( $(date -u +%j | sed 's/^0*//') % 2 )) = 0 ] && echo cli || echo scripts )}"
-LEDGER_ROW() { ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.152 "sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl"; }
-REFS="$(ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.152 "sudo grep -o '\"ref\": *\"[^\"]*\"' /var/lib/goat/$COMP/deploy-history.jsonl | sort -u | wc -l" 2>/dev/null || echo 0)"
+LEDGER_ROW() { ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.153 "sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl"; }
+REFS="$(ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.153 "sudo grep -o '\"ref\": *\"[^\"]*\"' /var/lib/goat/$COMP/deploy-history.jsonl | sort -u | wc -l" 2>/dev/null || echo 0)"
 if [ "${REFS:-0}" -ge 2 ]; then
   DECLARED="$(LEDGER_ROW | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["ref"])')"
   if [ "$AVENUE" = cli ]; then
@@ -90,7 +90,7 @@ if [ "${REFS:-0}" -ge 2 ]; then
   else
     rec rollback-one-step-scripts --expect-in "rolled back" -- "$REPO/ops/scripts/rollback.sh" "$COMP" 1
   fi
-  rec ledger-names-the-rollback -- bash -c "row=\"\$(ssh -o BatchMode=yes goat@100.127.0.152 'sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl')\"; echo \"\$row\"; echo \"\$row\" | grep -q '\"action\": *\"rollback\"' && ! echo \"\$row\" | grep -q '\"ref\": *\"$DECLARED\"'"
+  rec ledger-names-the-rollback -- bash -c "row=\"\$(ssh -o BatchMode=yes goat@100.127.0.153 'sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl')\"; echo \"\$row\"; echo \"\$row\" | grep -q '\"action\": *\"rollback\"' && ! echo \"\$row\" | grep -q '\"ref\": *\"$DECLARED\"'"
   rec roll-forward --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --ack "${USER:-operator} (live canary, roll forward)" --yes
   rec verify-after-roll-forward --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --verify-only --yes
 else

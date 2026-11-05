@@ -126,6 +126,13 @@ pub enum MachineCmd {
         #[arg(long)]
         json: bool,
     },
+    /// NetBird SSH on an enrolled machine's mesh peer (ADR 1216 `device-admin`,
+    /// tcp 22022). Needs the NetBird admin token; recorded in the
+    /// operator-action audit.
+    Ssh {
+        #[command(subcommand)]
+        op: super::machine_ssh::MachineSshCmd,
+    },
     /// Set (create or adjust) a custodian's machine enrollment quota. Operator-only.
     /// This is the management path for the enrollment grant that onboarding seeds:
     /// `goat machine grant <custodian> --quota 5`. Include `--affiliation` the FIRST
@@ -206,6 +213,7 @@ pub async fn run(ctx: &super::Ctx, op: MachineCmd) -> anyhow::Result<()> {
             revoke(out, &portal, machine, yes, json).await
         }
         MachineCmd::Ls { custodian, json } => list(out, &portal, custodian, json).await,
+        MachineCmd::Ssh { op } => super::machine_ssh::run(ctx, &portal, op).await,
         MachineCmd::Grant {
             custodian,
             quota,

@@ -342,6 +342,11 @@ pub enum Cmd {
         /// ops/goatbuilder/standup-dag.yaml declares (the script's --parallel).
         #[arg(long)]
         parallel: bool,
+        /// Run the acceptance phase (13) on a goatlite, where it is off by
+        /// default; `goatbuilder assay <site>` runs it on its own. Every other
+        /// goatnet runs it always.
+        #[arg(long)]
+        check: bool,
     },
     /// A site from verified to nothing — standup's mirror, records kept (a
     /// burn-down appends teardown rows, never erases). On a fixture (`--mock`)
@@ -1262,7 +1267,7 @@ fn main() {
             Some(dir) => verbs::Fixture::open(dir).and_then(|f| inspect::adopt_mock(&f, env, cli.yes)),
             None => inspect::adopt(&repo, env, cli.yes),
         },
-        Cmd::Standup { env, site, profile, ack, from, to, skip_obs, obs_only, dry_run, parallel } => match &cli.mock {
+        Cmd::Standup { env, site, profile, ack, from, to, skip_obs, obs_only, dry_run, parallel, check } => match &cli.mock {
             // The site is derived when --site is left out (one box, ADR 1213), and a
             // rehearsal still honours --dry-run, --from and --to.
             Some(dir) => verbs::Fixture::open(dir).and_then(|mut f| {
@@ -1273,7 +1278,7 @@ fn main() {
                 if !cli.yes && !*dry_run && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                     Err(anyhow::anyhow!("standup is a mutation: pass --yes without a terminal (C10)"))
                 } else {
-                    standup::standup(&repo, &standup::Options { env, site: &site, profile: profile.as_deref(), from: *from, to: *to, skip_obs: *skip_obs, obs_only: *obs_only, dry_run: *dry_run, parallel: *parallel })
+                    standup::standup(&repo, &standup::Options { env, site: &site, profile: profile.as_deref(), from: *from, to: *to, skip_obs: *skip_obs, obs_only: *obs_only, dry_run: *dry_run, parallel: *parallel, check: *check })
                 }
             }),
         },
@@ -1282,7 +1287,7 @@ fn main() {
             None if !cli.yes && !*dry_run && !std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
                 Err(anyhow::anyhow!("teardown is a mutation: pass --yes without a terminal (C10)"))
             }
-            None => standup::teardown(&repo, &standup::Options { env, site, profile: profile.as_deref(), from: *from, to: *to, skip_obs: false, obs_only: false, dry_run: *dry_run, parallel: false }, *services),
+            None => standup::teardown(&repo, &standup::Options { env, site, profile: profile.as_deref(), from: *from, to: *to, skip_obs: false, obs_only: false, dry_run: *dry_run, parallel: false, check: false }, *services),
         },
         Cmd::JoinNode { env, site, node, class, address, pass_var, from, to, dry_run } => {
             if !cli.yes && !*dry_run && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {

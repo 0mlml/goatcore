@@ -40,7 +40,7 @@
 # Usage:
 #   ops/scripts/goat-standup.sh <site-id> [--plan] [--profile lan|internet]
 #                                         [--from <phase>] [--to <phase>]
-#                                         [--skip-obs] [--obs-only]
+#                                         [--skip-obs] [--obs-only] [--check]
 #     --plan        print the ordered phase plan and the exact command per
 #                   phase; execute NOTHING. Offline-safe; start here.
 #     --profile     topology (default: auto-detected from the config — a group
@@ -49,6 +49,9 @@
 #     --from/--to   run a sub-range (resume after a manual step, or after a
 #                   failed phase once you have fixed its cause — every phase is
 #                   idempotent, so re-running from the failed number is safe).
+#     --check       on a goatlite, run the acceptance phase (13), which is off by
+#                   default there; `goatbuilder assay <site>` runs it on its own.
+#                   Every other goatnet runs phase 13 always.
 #
 #   Environment:
 #     GOAT_AWS_PROFILE   aws-vault profile the ansible phases run under
@@ -131,7 +134,7 @@ if [ -f "$_keep_awake" ]; then . "$_keep_awake"; goat_keep_awake; fi
 
 SITE="${1:-}"; [ -n "$SITE" ] || { echo "usage: goat-standup.sh <site-id> [--plan] [--from N] [--to N]"; exit 1; }
 shift || true
-PLAN=0; FROM=1; TO=14; PROFILE_OVERRIDE=""; SKIP_OBS=0; OBS_ONLY=0; PARALLEL=0
+PLAN=0; FROM=1; TO=14; PROFILE_OVERRIDE=""; SKIP_OBS=0; OBS_ONLY=0; PARALLEL=0; CHECK=0
 while [ $# -gt 0 ]; do case "$1" in
   --plan) PLAN=1; shift ;;
   --profile) PROFILE_OVERRIDE="$2"; shift 2 ;;
@@ -140,6 +143,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --skip-obs) SKIP_OBS=1; shift ;;
   --obs-only) OBS_ONLY=1; shift ;;
   --parallel) PARALLEL=1; shift ;;   # phase 12's independent steps in waves (ops/goatbuilder/standup-dag.yaml)
+  --check) CHECK=1; shift ;;         # a goatlite runs phase 13 (acceptance) only when asked
   --offline) export GOAT_DEPLOY_OFFLINE=1; shift ;;   # an islanded site: judged against the cached trunk (C3)
   *) echo "unknown arg: $1"; exit 1 ;;
 esac; done
@@ -1085,8 +1089,20 @@ if [ "$OBS" = 1 ]; then leg_join stack 13; fi
 #     and the goatnet stays unverifiable. Then run the gate against it.
 #     Read the report; the exit code is 0 unless a row FAILs. An UNKNOWN/expected
 #     list is normal — the handbook §"Phase 13" says which rows that is.
-step 13 GATE "acceptance suite (values derived from config; all applicable rows green)" \
+#     On a goatlite the phase is off by default (goatlite.md §11 measure 4):
+#     --check runs it here, `goatbuilder assay <site>` at any time. The binary
+#     prints the same skip.
+ACCEPTANCE_LABEL="acceptance suite (values derived from config; all applicable rows green)"
+if [ "$LITE" = 1 ] && [ "$CHECK" = 0 ]; then
+  if [ 13 -ge "$FROM" ] && [ 13 -le "$TO" ]; then
+    printf '\n=== Phase 13 [GATE] %s ===\n    SKIPPED — %s\n    %s\n' "$ACCEPTANCE_LABEL" \
+      "goatlite (ADR 1213): the acceptance phase is off by default; --check runs it in the standup" \
+      "run it on its own at any time: goatbuilder assay $SITE"
+  fi
+else
+step 13 GATE "$ACCEPTANCE_LABEL" \
   "python3 '$REPO/ops/goatbuilder/endstate/endstate.py' model $SITE > '$STATE_DIR/endstate-$SITE.json' && python3 '$REPO/ops/validation/generate-values.py' $SITE && python3 '$REPO/ops/validation/run-acceptance.py' --env $SITE --values '$REPO/ops/validation/values-$SITE.yaml' --endstate '$STATE_DIR/endstate-$SITE.json' --all-eligible --by-layer"
+fi
 
 # Phase 14. JOIN THE CROSS-GOATNET SURFACES. The goatnet overview on every relay-health
 #     box (goatnets.html) and the summary publish behind it are rendered from

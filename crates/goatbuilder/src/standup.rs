@@ -41,6 +41,9 @@ pub struct Options<'a> {
     pub obs_only: bool,
     pub dry_run: bool,
     pub parallel: bool,
+    /// Run the acceptance phase (13) on a goatlite, where it is off by default.
+    /// Every other goatnet runs it always.
+    pub check: bool,
 }
 
 /// One phase, as the script's `step <n> <kind> <label> <command>`.
@@ -67,7 +70,7 @@ enum Event {
     /// Its banners are `phase` rows, so the table prints them as section titles.
     PullStart { label: String, cmd: String, log: String },
     PullJoin { at: u32 },
-    Skip { label: String, lines: Vec<String> },
+    Skip { n: u32, kind: &'static str, label: String, lines: Vec<String> },
 }
 
 /// What the script reads from the site's group_vars before any phase, and the
@@ -496,7 +499,18 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     // `requires` names only services the site declares absent reads N/A, so a
     // one-box goatnet is graded against what it declares, not against the fleet.
     let sd = &s.state_dir;
-    ev.push(p(13, "GATE", "acceptance suite (values derived from config; all applicable rows green)".into(), crate::assay::phase13(Path::new(r), site, sd).phase_line()));
+    // On a goatlite the acceptance phase is off by default (goatlite.md §11
+    // measure 4): `--check` runs it here, `goatbuilder assay <site>` at any time.
+    let acceptance = "acceptance suite (values derived from config; all applicable rows green)";
+    if s.lite && !o.check {
+        if in_range(13, o) {
+            ev.push(Event::Skip { n: 13, kind: "GATE", label: acceptance.into(), lines: vec![
+                "SKIPPED — goatlite (ADR 1213): the acceptance phase is off by default; --check runs it in the standup".into(),
+                format!("run it on its own at any time: goatbuilder assay {site}")] });
+        }
+    } else {
+        ev.push(p(13, "GATE", acceptance.into(), crate::assay::phase13(Path::new(r), site, sd).phase_line()));
+    }
 
     // Phase 14 — the two rescue classes (ADR 1183): declared-but-not-inventoried is a
     // real state and prints its reason outside the phase gate, as the script does.
@@ -511,11 +525,11 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
         let declared = gv_value(&gv, flag).unwrap_or_default();
         if declared != "True" && declared != "true" {
             let why = gv_value(&gv, reason_key).filter(|w| !w.is_empty()).unwrap_or_else(|| "(none recorded — the phase-1 config gate refuses this; ADR 1183)".to_string());
-            ev.push(Event::Skip { label: label.clone(), lines: vec![format!("SKIPPED — {flag} is not true in group_vars/{g}/vars.yml"), format!("declared reason: {why}")] });
+            ev.push(Event::Skip { n: 14, kind: "A", label: label.clone(), lines: vec![format!("SKIPPED — {flag} is not true in group_vars/{g}/vars.yml"), format!("declared reason: {why}")] });
             continue;
         }
         if inventory_hosts(repo, &[&rgroup], false).is_empty() {
-            ev.push(Event::Skip { label: label.clone(), lines: vec![format!("SKIPPED — {flag}: true but no host in inventory group [{rgroup}] yet."), "Declared and not yet built is a real state; add the host when the box arrives.".to_string()] });
+            ev.push(Event::Skip { n: 14, kind: "A", label: label.clone(), lines: vec![format!("SKIPPED — {flag}: true but no host in inventory group [{rgroup}] yet."), "Declared and not yet built is a real state; add the host when the box arrives.".to_string()] });
             continue;
         }
         let inv_extra = if repo.join("ops/ansible").join(&extra_inv).is_file() { format!("-i {extra_inv}") } else { String::new() };
@@ -526,7 +540,7 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
         // cross-env.yaml -- other goatnets' machines. A goatlite must not
         // reach past its one box (ADR 1213), and a fresh checkout's roster
         // names goatnets whose credentials a learner does not hold.
-        ev.push(Event::Skip { label: "join the cross-goatnet surfaces (relay-health overview on every box)".into(), lines: vec![
+        ev.push(Event::Skip { n: 14, kind: "A", label: "join the cross-goatnet surfaces (relay-health overview on every box)".into(), lines: vec![
             "SKIPPED — goatlite (ADR 1213): one box on its own LAN; this step reaches every relay-health box in ops/goatnets/cross-env.yaml, none of which belong to this goatnet".into(),
             "declared reason: cross-env.yaml carries this goatnet as relay_health absent; the overviews pick its roster row up on their next deploy".into()] });
     } else {
@@ -786,8 +800,8 @@ pub fn standup(repo: &Path, o: &Options) -> Result<Report> {
             }
         }
         match ev {
-            Event::Skip { label, lines } => {
-                checks.push(row("phase", format!("=== Phase 14 [A] {label} ===")));
+            Event::Skip { n, kind, label, lines } => {
+                checks.push(row("phase", format!("=== Phase {n} [{kind}] {label} ===")));
                 for l in lines {
                     checks.push(row("note", l.clone()));
                 }
@@ -1320,7 +1334,7 @@ mod tests {
 
     #[test]
     fn a_full_teardown_of_a_live_site_is_refused_and_services_only_is_not() {
-        let o = Options { env: "zagros_dev", site: "zagros-dev", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "zagros_dev", site: "zagros-dev", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let full = teardown(&repo_root(), &o, false).unwrap();
         assert!(full.checks.iter().any(|c| c.detail.starts_with("=== Teardown verdict: refused:")));
         let svc = teardown(&repo_root(), &Options { from: 12, ..o }, true).unwrap();
@@ -1410,7 +1424,7 @@ mod tests {
     /// the `after-ory` plays, whose seed waits for the schema with Ory up.
     #[test]
     fn phase_5_runs_the_stack_and_phase_6_the_rest_after_ory() {
-        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let lines = phase_lines(&test_site(false), &o);
         let sb: Vec<&(u32, String, String)> = lines.iter().filter(|l| l.2.contains("site-bootstrap.yml")).collect();
         assert_eq!(sb.len(), 2, "{sb:?}");
@@ -1433,7 +1447,7 @@ mod tests {
     /// when phase 5 is in the run's range.
     #[test]
     fn the_image_pull_runs_between_phase_2_and_phase_5() {
-        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let at = |ev: &[Event]| -> Vec<String> { ev.iter().map(|e| match e {
             Event::Phase(p) => format!("{}", p.n), Event::PullStart { .. } => "pull".into(), Event::PullJoin { at } => format!("join{at}"), _ => "other".into() }).collect() };
         let ev = plan(&repo_root(), &test_site(false), &o, "RESUME");
@@ -1457,7 +1471,7 @@ mod tests {
     /// applies the Default-policy action). A joiner applies none.
     #[test]
     fn the_declared_acl_is_one_play_run_groups_then_enforce() {
-        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let lines = phase_lines(&test_site(false), &o);
         let acl: Vec<&(u32, String, String)> = lines.iter().filter(|l| l.2.contains("netbird-acl-")).collect();
         assert_eq!(acl.len(), 1, "{acl:?}");
@@ -1606,7 +1620,7 @@ mod tests {
         if !crate::config::checkout_declares_a_deployment() {
             return; // a public clone of goatcore ships no deployment
         }
-        let o = Options { env: "zagros_prod", site: "zagros-prod", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "zagros_prod", site: "zagros-prod", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let r = standup(&repo(), &o).unwrap();
         assert_eq!(r.exit, EXIT_OK);
         let phases: Vec<&str> = r.checks.iter().filter(|c| c.name == "phase").map(|c| c.detail.as_str()).collect();
@@ -1639,7 +1653,7 @@ mod tests {
     /// every truthy spelling enables the step, and a comment does not.
     #[test]
     fn the_synth_guard_agrees_with_yaml() {
-        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let lines = phase_lines(&test_site(false), &o);
         let line = lines.iter().find(|l| l.2.contains("synth-vendors-deploy.yml")).expect("the synth step is planned");
         assert!(line.2.contains("'^[[:space:]]*synth_vendors_enabled:"), "anchored past comments: {}", line.2);
@@ -1651,7 +1665,7 @@ mod tests {
     /// the `|| echo` that used to report a failed play as "not configured".
     #[test]
     fn optional_plays_do_not_mask_their_own_failure() {
-        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let lines = phase_lines(&test_site(false), &o);
         for play in ["pubsub-state-mirror-deploy.yml", "zagros-zenoh-synth-vendors-deploy.yml"] {
             let line = lines.iter().find(|l| l.2.contains(play)).unwrap_or_else(|| panic!("{play} is in the plan"));
@@ -1662,7 +1676,7 @@ mod tests {
 
     #[test]
     fn undeclared_environment_is_refused() {
-        let o = Options { env: "nowhere", site: "zagros-prod", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "nowhere", site: "zagros-prod", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         assert!(standup(&repo(), &o).is_err());
     }
 
@@ -1696,7 +1710,7 @@ mod tests {
     /// parity gate diffs against goat-standup.sh.
     #[test]
     fn a_goatlite_plan_renders_first_mints_the_ca_and_pauses_for_the_lan_token() {
-        let o = Options { env: "pasture", site: "pasture", profile: Some("lan"), from: 1, to: 14, skip_obs: true, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "pasture", site: "pasture", profile: Some("lan"), from: 1, to: 14, skip_obs: true, obs_only: false, dry_run: true, parallel: false, check: false };
         let ev = plan(Path::new("/r"), &lan_site(true, false), &o, "goatbuilder standup pasture --site pasture");
         let ph = phases_of(&ev);
         assert_eq!((ph[0].n, ph[0].kind, ph[0].label.as_str()), (1, "GATE", "goatlite: render the config surface from goatlite.yaml (idempotent; an edited file is reported, never overwritten)"));
@@ -1726,7 +1740,7 @@ mod tests {
     /// while the token is missing, and never when it is available.
     #[test]
     fn a_lan_site_that_is_not_lite_keeps_its_plan_and_pauses_only_without_the_token() {
-        let o = Options { env: "pasture", site: "pasture", profile: Some("lan"), from: 1, to: 14, skip_obs: true, obs_only: false, dry_run: true, parallel: false };
+        let o = Options { env: "pasture", site: "pasture", profile: Some("lan"), from: 1, to: 14, skip_obs: true, obs_only: false, dry_run: true, parallel: false, check: false };
         let ev = plan(Path::new("/r"), &lan_site(false, false), &o, "RESUME");
         let ph = phases_of(&ev);
         assert_eq!(ph[0].label, "config preflight (fail-closed)");
@@ -1737,6 +1751,25 @@ mod tests {
         assert!(!phases_of(&ev).iter().any(|p| p.n == 11), "the token is available: no pause");
         let ev = plan(Path::new("/r"), &lan_site(true, true), &o, "RESUME");
         assert!(!phases_of(&ev).iter().any(|p| p.n == 11), "lite with the token available: no pause either");
+    }
+
+    /// On a goatlite the acceptance phase is off by default and says how to run
+    /// it; `--check` puts it back; every other goatnet runs it always.
+    #[test]
+    fn a_goatlite_runs_acceptance_only_with_check() {
+        let o = Options { env: "pasture", site: "pasture", profile: Some("lan"), from: 1, to: 14, skip_obs: true, obs_only: false, dry_run: true, parallel: false, check: false };
+        let gate = |ev: &[Event]| phases_of(ev).iter().any(|p| p.n == 13 && p.cmd.contains("run-acceptance.py"));
+        let skip = |ev: &[Event]| ev.iter().find_map(|e| match e { Event::Skip { n: 13, kind, label, lines } => Some((*kind, label.clone(), lines.clone())), _ => None });
+        let lite = plan(Path::new("/r"), &lan_site(true, true), &o, "RESUME");
+        assert!(!gate(&lite), "off by default on a goatlite");
+        let (kind, label, lines) = skip(&lite).expect("the skip is printed");
+        assert_eq!((kind, label.as_str()), ("GATE", "acceptance suite (values derived from config; all applicable rows green)"));
+        assert!(lines[0].contains("--check runs it") && lines[1] == "run it on its own at any time: goatbuilder assay pasture", "{lines:?}");
+        assert!(skip(&plan(Path::new("/r"), &lan_site(true, true), &Options { from: 12, to: 12, ..o }, "RESUME")).is_none(), "outside the range: nothing printed");
+        let checked = plan(Path::new("/r"), &lan_site(true, true), &Options { check: true, ..o }, "RESUME");
+        assert!(gate(&checked) && skip(&checked).is_none(), "--check runs it");
+        let full = plan(Path::new("/r"), &lan_site(false, true), &o, "RESUME");
+        assert!(gate(&full) && skip(&full).is_none(), "a goatnet that is not lite keeps phase 13");
     }
 
     /// Tutorial 1's rehearsal: a new goatnet's founder site converges and

@@ -29,7 +29,7 @@ set -u
 # federation leg rides the relay VPS, so its capacity is already the existing
 # relay-path capacity measurement — not re-probed here. Optional; unset on
 # single-node goatnets.
-: "${CAPACITY_TARGET_CROSSNODE:=}"   # peer mgmt-node mesh IP, e.g. 100.127.0.205 (zagros-b)
+: "${CAPACITY_TARGET_CROSSNODE:=}"   # peer mgmt-node mesh IP, e.g. 100.127.0.206 (zagros-b)
 : "${CAPACITY_CROSSNODE_NAME:=peer-node}"  # provenance label
 : "${CAPACITY_PORT:=5201}"
 : "${CAPACITY_DURATION_S:=4}"        # per-measurement; keep total <= ~10s

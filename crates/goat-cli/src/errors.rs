@@ -117,6 +117,24 @@ pub enum GoatError {
     /// Bundle CBOR parse / signature verify failed at `profile init`.
     #[error("E_BUNDLE_INVALID")]
     BundleInvalid { hint: String },
+
+    /// The machine named on a `goat machine` verb is not exactly one enrolled
+    /// machine this profile can see: no handle or anchor matches, or a handle
+    /// matches machines under more than one custodian.
+    #[error("E_MACHINE_UNRESOLVED")]
+    MachineUnresolved { machine: String, hint: String },
+
+    /// The enrolled machine has no single NetBird peer: none carries its name
+    /// (never joined, or renamed off its handle), or several do.
+    #[error("E_MESH_PEER_UNRESOLVED")]
+    MeshPeerUnresolved { machine: String, hint: String },
+
+    /// A NetBird management API call failed for a reason other than
+    /// authorization (that is `E_NOT_ADMIN`): unreachable, a rejected token,
+    /// an unexpected status, or a peer record missing a setting the update
+    /// must send back. Nothing was changed.
+    #[error("E_NETBIRD_FAILED")]
+    NetbirdFailed { hint: String },
 }
 
 impl GoatError {
@@ -151,6 +169,9 @@ impl GoatError {
             Self::NotAdmin { .. } => "E_NOT_ADMIN",
             Self::TopicConflict { .. } => "E_TOPIC_CONFLICT",
             Self::BundleInvalid { .. } => "E_BUNDLE_INVALID",
+            Self::MachineUnresolved { .. } => "E_MACHINE_UNRESOLVED",
+            Self::MeshPeerUnresolved { .. } => "E_MESH_PEER_UNRESOLVED",
+            Self::NetbirdFailed { .. } => "E_NETBIRD_FAILED",
         }
     }
 
@@ -174,6 +195,10 @@ impl GoatError {
             | Self::PortalForbidden { .. }
             | Self::NotAdmin { .. } => exit_codes::EXIT_PORTAL,
             Self::TopicConflict { .. } => exit_codes::EXIT_GENERIC,
+            Self::MachineUnresolved { .. } | Self::MeshPeerUnresolved { .. } => {
+                exit_codes::EXIT_GENERIC
+            }
+            Self::NetbirdFailed { .. } => exit_codes::EXIT_PORTAL,
         }
     }
 
@@ -275,6 +300,21 @@ impl GoatError {
                 )
             }
             Self::BundleInvalid { .. } => fl!(LANGUAGE_LOADER, "error-bundle-invalid-summary"),
+            Self::MachineUnresolved { machine, .. } => {
+                fl!(
+                    LANGUAGE_LOADER,
+                    "error-machine-unresolved-summary",
+                    machine = machine.clone()
+                )
+            }
+            Self::MeshPeerUnresolved { machine, .. } => {
+                fl!(
+                    LANGUAGE_LOADER,
+                    "error-mesh-peer-unresolved-summary",
+                    machine = machine.clone()
+                )
+            }
+            Self::NetbirdFailed { .. } => fl!(LANGUAGE_LOADER, "error-netbird-failed-summary"),
         }
     }
 
@@ -297,7 +337,10 @@ impl GoatError {
             | Self::PortalForbidden { hint }
             | Self::NotAdmin { hint }
             | Self::TopicConflict { hint, .. }
-            | Self::BundleInvalid { hint } => hint,
+            | Self::BundleInvalid { hint }
+            | Self::MachineUnresolved { hint, .. }
+            | Self::MeshPeerUnresolved { hint, .. }
+            | Self::NetbirdFailed { hint } => hint,
         }
     }
 
@@ -326,7 +369,10 @@ impl GoatError {
             | Self::PortalForbidden { hint }
             | Self::NotAdmin { hint }
             | Self::TopicConflict { hint, .. }
-            | Self::BundleInvalid { hint } => {
+            | Self::BundleInvalid { hint }
+            | Self::MachineUnresolved { hint, .. }
+            | Self::MeshPeerUnresolved { hint, .. }
+            | Self::NetbirdFailed { hint } => {
                 hint.push('\n');
                 hint.push_str("  hint: ");
                 hint.push_str(extra);

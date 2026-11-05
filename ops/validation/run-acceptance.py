@@ -488,11 +488,11 @@ def self_test():
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                         "-keyout", str(key), "-out", str(pem), "-days", "1",
                         "-subj", "/O=goat/OU=zagros-prod/CN=goat-zenoh-router",
-                        "-addext", "subjectAltName=IP:100.127.0.221"],
+                        "-addext", "subjectAltName=IP:100.127.0.222"],
                        capture_output=True)
         if pem.exists():
             check("tls green", probes.tls_identity({"pem_file": str(pem),
-                  "expect_cn": "goat-zenoh-router", "expect_san_ip": "100.127.0.221"}).status, probes.PASS)
+                  "expect_cn": "goat-zenoh-router", "expect_san_ip": "100.127.0.222"}).status, probes.PASS)
             check("tls RED (stale IP)", probes.tls_identity({"pem_file": str(pem),
                   "expect_san_ip": "100.127.0.114"}).status, probes.FAIL)
             check("tls RED (refuse default)", probes.tls_identity({"pem_file": str(pem),

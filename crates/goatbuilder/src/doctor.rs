@@ -1897,7 +1897,7 @@ mod tests {
         }
     }
 
-    const MESH_ROW: &str = "[zagros_hosts]\nmgmt-zagros-01 ansible_host=100.127.0.45\n\n[zagros_dev_hosts]\n# the Thor\nmgmt-zagros-dev-01-thor ansible_host=100.127.0.152\n";
+    const MESH_ROW: &str = "[zagros_hosts]\nmgmt-zagros-01 ansible_host=100.127.0.45\n\n[zagros_dev_hosts]\n# the Thor\nmgmt-zagros-dev-01-thor ansible_host=100.127.0.153\n";
 
     #[test]
     fn mesh_row_and_ssm_door_is_reachable_two_ways() {
@@ -1917,7 +1917,7 @@ mod tests {
     /// No mesh row, and the only door an address on one operator's own network.
     #[test]
     fn a_one_machine_door_is_refused() {
-        let repo = reach_repo("tailscale", Some("[zagros_hosts]\nx ansible_host=100.127.0.45\n"), Some("doors:\n  zagros-dev:\n    type: tailscale\n    ip: 100.127.1.4\n"));
+        let repo = reach_repo("tailscale", Some("[zagros_hosts]\nx ansible_host=100.127.0.45\n"), Some("doors:\n  zagros-dev:\n    type: tailscale\n    ip: 100.127.1.5\n"));
         let c = reach_check(&repo, &env("zagros_dev"));
         assert!(!c.ok);
         assert!(c.detail.contains("door type 'tailscale'"), "{}", c.detail);

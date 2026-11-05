@@ -767,8 +767,8 @@ mod tests {
     #[test]
     fn locator_parses() {
         assert_eq!(
-            parse_zenoh_locator("tls/100.127.0.190:7447"),
-            Some(("100.127.0.190".into(), 7447))
+            parse_zenoh_locator("tls/100.127.0.191:7447"),
+            Some(("100.127.0.191".into(), 7447))
         );
     }
 
@@ -890,10 +890,10 @@ mod tests {
         let fronted = "resolver #5\n  domain   : netbird.zagros.example\n  nameserver[0] : 127.0.0.1\n  port     : 53531\n  flags    : Supplemental\n";
         assert!(scutil_zone_fronted(fronted, "netbird.zagros.example", "127.0.0.1", "53531"));
         // Same zone pointed at the netbird proxy → not fronted.
-        let direct = "resolver #5\n  domain   : netbird.zagros.example\n  nameserver[0] : 100.127.0.249\n  port     : 53\n";
+        let direct = "resolver #5\n  domain   : netbird.zagros.example\n  nameserver[0] : 100.127.0.250\n  port     : 53\n";
         assert!(!scutil_zone_fronted(direct, "netbird.zagros.example", "127.0.0.1", "53531"));
         // The ip+port must be claimed by the ZONE's block, not another's.
-        let split = "resolver #4\n  domain   : other.zone\n  nameserver[0] : 127.0.0.1\n  port     : 53531\nresolver #5\n  domain   : netbird.zagros.example\n  nameserver[0] : 100.127.0.249\n";
+        let split = "resolver #4\n  domain   : other.zone\n  nameserver[0] : 127.0.0.1\n  port     : 53531\nresolver #5\n  domain   : netbird.zagros.example\n  nameserver[0] : 100.127.0.250\n";
         assert!(!scutil_zone_fronted(split, "netbird.zagros.example", "127.0.0.1", "53531"));
     }
 }

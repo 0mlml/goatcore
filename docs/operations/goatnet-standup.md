@@ -136,7 +136,7 @@ here touches a host; it is all repo, cloud and hardware.
 | 7 | Cert manifest | `ops/enrollment/manifests/<site>-certs.yaml`, from [`TEMPLATE-certs.yaml`](../../ops/enrollment/manifests/TEMPLATE-certs.yaml). Copy the template, never another GOAT-Net's manifest — its URI SANs name that GOAT-Net | template header |
 | 8 | Fleet-pins row + parity | The env must appear in `ops/pins/fleet-pins.yaml` and the parity surfaces from the first commit, or it deploys unobserved | runbook §"Fleet-pins row" and §"Parity observability" |
 | 9 | Env-door registry entry | One entry in [`ops/ansible/inventory/doors.yaml`](../../ops/ansible/inventory/doors.yaml) declaring the goatnet's door transport (`ssm` peer + port, or `tailscale` IP) so it is deployable off-profile. Phase 1 then renders its `doors.ini` / `doors-groupvars.ini` rows from it (`generate-door-inventory.py <site>`); without the entry the standup stops and names the fields. [env-doors](../design/env-doors.md) | `doors.yaml` + [`env-doors`](../design/env-doors.md) |
-| 10 | Compliance-dashboard decision | **A decision, opt-in:** a cloud goatnet ties into the compliance dashboard; a throwaway LAN sandbox with no cloud footprint does not. To opt in, the env's `terraform-<env>/main.tf` carries BOTH the `compliance` (tags) and `iac_registry` (the `/usareur-af/<env>/iac-registry/*` write the dashboard enumerates) modules — apply registers it. Half of that pair (tags without the registry write) is the trap: resources are tagged but the tree is invisible to the dashboard. `check-compliance-registration.py` fails a tree that has one module without the other, so the decision is whole or absent — never silently half-registered | `terraform-<env>/main.tf`; `ops/ci/check-compliance-registration.py` |
+| 10 | Resource tagging | Tag the cloud resources the way your organisation's policy requires, with the AWS provider's `default_tags` in your terraform root module; `host-node`, `mesh-dns-host` and `relay-health-host` also take a `tags` variable that is merged with them. goatcore ships no compliance registry of its own. A LAN site with no cloud footprint has nothing to tag | your terraform root module |
 
 **A goatlite skips this table.** Under `preset: lite` ([`goatlite.md`](../design/goatlite.md)), the first phase-1 gate runs `ops/scripts/goatlite-render.py`, which writes rows 5, 7, 8 and 9 (the config surface, the cert manifest, the pins row in the sidecar table `ops/pins/lite-pins.yaml`, the `direct` door entry) from the four facts in `goatlite.yaml`, and mints the goatnet's CA (row 2's one non-self-served item) on the first run.
 
@@ -209,7 +209,7 @@ wrong by pasting a default, and not caught by the preflight. Get these right in
 your group vars *before* phase 1.
 
 **1 — Encrypt the data disk (the default, not the exception).** A real host with
-a data disk MUST encrypt it: `os-baseline-and-luks.md`
+a data disk MUST encrypt it: [`os-baseline-and-luks.md`](../design/os-baseline-and-luks.md)
 R4 requires data-at-rest encryption on every box carrying non-public data (STIG
 V-260515, CSfC DAR CP), and the data disk is exactly where Postgres, audit logs,
 `.env` files and TLS private keys live. Two settings move together and must

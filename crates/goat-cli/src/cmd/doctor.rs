@@ -1616,8 +1616,8 @@ mod tests {
     #[test]
     fn parse_zenoh_locator_tls() {
         assert_eq!(
-            parse_zenoh_locator("tls/100.127.0.190:7447"),
-            Some(("100.127.0.190".into(), 7447))
+            parse_zenoh_locator("tls/100.127.0.191:7447"),
+            Some(("100.127.0.191".into(), 7447))
         );
     }
 
@@ -1631,12 +1631,12 @@ mod tests {
 
     #[test]
     fn parse_zenoh_locator_rejects_bare_host() {
-        assert_eq!(parse_zenoh_locator("100.127.0.190:7447"), None);
+        assert_eq!(parse_zenoh_locator("100.127.0.191:7447"), None);
     }
 
     #[test]
     fn parse_zenoh_locator_rejects_no_port() {
-        assert_eq!(parse_zenoh_locator("tls/100.127.0.190"), None);
+        assert_eq!(parse_zenoh_locator("tls/100.127.0.191"), None);
     }
 
     #[test]
@@ -1644,7 +1644,7 @@ mod tests {
         let body = r#"
 # goat profile.toml — written by `goat profile init` (ADR 1019).
 portal_endpoint = "https://portal.nova.netbird.test"
-router_endpoint = "tls/100.127.0.190:7447"
+router_endpoint = "tls/100.127.0.191:7447"
 device_id = "operator-test"
 issued_at_unix = 1779969600
 "#;
@@ -1655,7 +1655,7 @@ issued_at_unix = 1779969600
         );
         assert_eq!(
             eps.router_endpoint.as_deref(),
-            Some("tls/100.127.0.190:7447")
+            Some("tls/100.127.0.191:7447")
         );
     }
 
@@ -1761,10 +1761,10 @@ issued_at_unix = 1779969600
                 verdict: Verdict::Fail,
                 elapsed_ms: 0,
                 summary: "TCP connect to router host timed out".into(),
-                hint: "router host 100.127.0.190:7447 did not answer in 1500ms — compare from another mesh peer; check tunnel, route and router service"
+                hint: "router host 100.127.0.191:7447 did not answer in 1500ms — compare from another mesh peer; check tunnel, route and router service"
                     .into(),
                 summary_loc: "TCP connect to router host timed out".into(),
-                hint_loc: "router host 100.127.0.190:7447 did not answer in 1500ms — compare from another mesh peer; check tunnel, route and router service"
+                hint_loc: "router host 100.127.0.191:7447 did not answer in 1500ms — compare from another mesh peer; check tunnel, route and router service"
                     .into(),
                 cause: None,
                 checks: None,

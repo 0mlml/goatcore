@@ -18,7 +18,7 @@
 # deploy-history.yml hosts-map.
 #
 # Usage: ops/scripts/rollback-coverage.sh <site-label> <host> [ssh_user]
-#   e.g. ops/scripts/rollback-coverage.sh zagros 100.127.0.179 goat
+#   e.g. ops/scripts/rollback-coverage.sh zagros 100.127.0.180 goat
 set -euo pipefail
 
 SITE="${1:?usage: $0 <site-label> <host> [ssh_user]}"

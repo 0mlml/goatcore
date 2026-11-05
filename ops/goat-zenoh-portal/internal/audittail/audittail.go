@@ -44,7 +44,7 @@ import (
 
 // Config holds the MinIO/S3 endpoint + credentials.
 type Config struct {
-	Endpoint     string // e.g. "http://100.127.0.190:9000"
+	Endpoint     string // e.g. "http://100.127.0.191:9000"
 	Bucket       string // e.g. "audit-integrity"
 	Region       string // e.g. "us-east-1"
 	AccessKey    string

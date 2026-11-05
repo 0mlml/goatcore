@@ -204,6 +204,7 @@ A site from nothing to verified: the standup's phases in the doctrine's order wi
 | `--obs-only` | Run only the observability legs, in the foreground |  |
 | `--dry-run` | Print every phase and command; run nothing |  |
 | `--parallel` | Run phase 12's independent steps together, wave by wave, as ops/goatbuilder/standup-dag.yaml declares (the script's --parallel) |  |
+| `--check` | Run the acceptance phase (13) on a goatlite, where it is off by default; `goatbuilder assay <site>` runs it on its own. Every other goatnet runs it always |  |
 
 ## `goatbuilder teardown`
 

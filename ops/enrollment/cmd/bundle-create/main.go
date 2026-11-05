@@ -152,7 +152,7 @@ func main() {
 	// onboard bundles do.
 	goatCLIPortalEndpoint := flag.String("goat-cli-portal-endpoint", "", "ADR 1019. Optional. Operator-facing portal URL (https), e.g. https://portal.nova.netbird.nova.example. Required when any other --goat-cli-* flag is set.")
 	goatCLIPortalTokenPath := flag.String("goat-cli-portal-token", "", "ADR 1019. Optional. Path to a file containing the opaque Bearer API key for the portal REST API (one line). Required when any other --goat-cli-* flag is set.")
-	goatCLIRouterEndpoint := flag.String("goat-cli-router-endpoint", "", "ADR 1019. Optional. Zenoh router locator the goat-cli connects to, e.g. tls/100.127.0.190:7447. Required when any other --goat-cli-* flag is set.")
+	goatCLIRouterEndpoint := flag.String("goat-cli-router-endpoint", "", "ADR 1019. Optional. Zenoh router locator the goat-cli connects to, e.g. tls/100.127.0.191:7447. Required when any other --goat-cli-* flag is set.")
 	goatCLIOnboardEndpoint := flag.String("goat-cli-onboard-endpoint", "", "Optional. Onboarding-engine URL (https), e.g. https://onboard.zagros.netbird.zagros.example — the goat-id-console machine realm the CLI targets for /api/onboard/* (docs/design/onboarding-extraction-plan.md). NOT part of the atomic --goat-cli-* set: omit it on a goatnet without the onboard route and the CLI falls back to the portal endpoint.")
 	goatCLIMTLSCertPath := flag.String("goat-cli-mtls-cert", "", "ADR 1019. Optional. Path to PEM file containing the per-operator client cert (leaf, chain). Required when any other --goat-cli-* flag is set.")
 	goatCLIMTLSKeyPath := flag.String("goat-cli-mtls-key", "", "ADR 1019. Optional. Path to PEM file containing the per-operator client private key. Required when any other --goat-cli-* flag is set.")

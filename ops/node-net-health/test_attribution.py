@@ -132,9 +132,9 @@ def test_categorize():
     # arrives here as bucket="mesh"; a `bucket == "fabric"` test alone reported
     # ZERO fabric bytes.
     check("zenoh to a mesh peer is fabric despite bucket=mesh",
-          nnh.categorize(conn("mesh", remote="100.127.0.221:7447"), rules), "fabric")
+          nnh.categorize(conn("mesh", remote="100.127.0.222:7447"), rules), "fabric")
     check("zenohd by comm is fabric even on an odd port",
-          nnh.categorize(conn("mesh", comm="zenohd", remote="100.127.0.221:9999"), rules),
+          nnh.categorize(conn("mesh", comm="zenohd", remote="100.127.0.222:9999"), rules),
           "fabric")
 
     # The transport underlay. These carry the mesh; the transport plane already

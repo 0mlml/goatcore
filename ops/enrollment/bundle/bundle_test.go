@@ -570,7 +570,7 @@ func fixtureGoatCLIExtras() GoatCLIExtras {
 	return GoatCLIExtras{
 		PortalEndpoint: "https://portal.nova.netbird.nova.example",
 		PortalToken:    []byte("opaque-bearer-token-32-bytes-pad"),
-		RouterEndpoint: "tls/100.127.0.190:7447",
+		RouterEndpoint: "tls/100.127.0.191:7447",
 		MTLSCert:       []byte("-----BEGIN CERTIFICATE-----\nMIIB...AB\n-----END CERTIFICATE-----\n"),
 		MTLSKey:        []byte("-----BEGIN PRIVATE KEY-----\nMIIE...AB\n-----END PRIVATE KEY-----\n"),
 		CARoots:        []byte("-----BEGIN CERTIFICATE-----\nMIIC...AB\n-----END CERTIFICATE-----\n"),

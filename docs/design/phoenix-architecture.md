@@ -426,7 +426,7 @@ Soft prerequisites:
 - `zenoh-data-fabric.md` — data fabric doc, Phase 3+ scope expansion section extends Zenoh to universal peer-interaction substrate
 - [`offline-enrollment.md`](offline-enrollment.md) — capability tokens + re-enrollment flow
 - [`bootstrap-bundle.md`](bootstrap-bundle.md) — cloud-held stateless bundle for rapid site provisioning
-- `os-baseline-and-luks.md` — per-host disk setup
+- [`os-baseline-and-luks.md`](os-baseline-and-luks.md) — per-host disk setup
 - [`../operations/setup-key-rotation.md`](../operations/setup-key-rotation.md) — short-TTL enrollment keys
 - `../project/implementation-plan.md` Block 20 — authoritative implementation tracking
 - `../compliance/comparative-posture.md` — posture framing that this block strengthens

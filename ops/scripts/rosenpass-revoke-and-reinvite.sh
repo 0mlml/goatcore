@@ -43,7 +43,7 @@
 #   SSH_USER    ssh user (default: goat)
 set -euo pipefail
 
-THOR_HOST="${THOR_HOST:-100.127.0.179}"
+THOR_HOST="${THOR_HOST:-100.127.0.180}"
 SSH_USER="${SSH_USER:-goat}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${HERE}/rosenpass_revoke_and_reinvite.py"

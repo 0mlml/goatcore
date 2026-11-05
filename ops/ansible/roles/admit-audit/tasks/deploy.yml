@@ -244,12 +244,12 @@
     create: false
 
 # ---------------------------------------------------------------------------
-# 5a. Build admit-audit image locally from committed source.
+# 5a. The image: pulled by its digest pin, or built from committed source.
 # ---------------------------------------------------------------------------
-# The admit-audit image isn't published to GHCR yet (no CI workflow).
-# Build on the host from the source at ops/admit-audit/ — same pattern as
-# ops/wave3/soak-gen and signal-server/cmd/federation-probe. Source is
-# tiny (~500 LOC Go) so tarball+base64 push fits SSM's 100KB cap.
+# .github/workflows/admit-audit-image.yml publishes goat-admit-audit and the
+# default pins it by digest, so a host pulls it (5b). A tag-only override is
+# built on the host from the source at ops/admit-audit/. Source is tiny
+# (~500 LOC Go) so tarball+base64 push fits SSM's 100KB cap.
 #
 # Block 75E gate: when admit_audit_use_substrate is true, the image flows
 # from the OCI distribution substrate (T2 Orin-C Forgejo) instead of being
@@ -257,8 +257,14 @@
 # substrate URL set in group_vars/<site>_hosts/vars.yml, and Step 5a is
 # skipped entirely. See ADR 0838 + docs/design/oci-goat-substrate.md.
 
-- name: Build admit-audit locally (skipped on substrate)
-  when: not (admit_audit_use_substrate | default(false))
+# A reference pinned by digest (the default, the image CI publishes) is
+# pulled, never built: `docker build -t` refuses a tag that carries a digest,
+# so building it failed on every host. The local build stays for an operator
+# override that names a tag only.
+- name: Build admit-audit locally (a tag-only override; skipped on substrate or a digest pin)
+  when:
+    - not (admit_audit_use_substrate | default(false))
+    - "'@' not in admit_audit_image"
   block:
     - name: Package admit-audit source into base64 tarball
       # Runs on the controller (my laptop), NOT the target. delegate_to +
@@ -300,8 +306,8 @@
       poll: 30
       changed_when: true
 
-- name: Pull admit-audit from OCI substrate (Block 75E)
-  when: admit_audit_use_substrate | default(false)
+- name: Pull admit-audit (the digest pin, or the OCI substrate of Block 75E)
+  when: (admit_audit_use_substrate | default(false)) or ('@' in admit_audit_image)
   ansible.builtin.command:
     cmd: docker pull {{ admit_audit_image }}
   register: admit_audit_pull

@@ -27,7 +27,7 @@
 #   PG_CONTAINER  postgres container name (default postgres-a)
 set -euo pipefail
 
-THOR_HOST="${THOR_HOST:-100.127.0.179}"
+THOR_HOST="${THOR_HOST:-100.127.0.180}"
 PG_CONTAINER="${PG_CONTAINER:-postgres-a}"
 SSH_USER="${SSH_USER:-goat}"
 MODE="${1:-report}"
