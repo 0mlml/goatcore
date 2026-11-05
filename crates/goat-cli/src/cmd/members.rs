@@ -215,8 +215,7 @@ fn resolve_move_ory_config(
     let cfg = super::admin::native_ory_config_for(Some(env), profile);
     if required && cfg.is_none() {
         anyhow::bail!(
-            "env `{env}` has no native Ory config — the Ory-plane leg supports \
-             zagros/zagros-prod/zagros-dev today"
+            "no Ory facts for goatnet `{env}` — run `goat context refresh` in that goatnet's context"
         );
     }
     Ok(cfg)
@@ -926,8 +925,7 @@ async fn run_move(ctx: &super::Ctx, a: MoveArgs) -> anyhow::Result<()> {
     if ory_plane || markers {
         let cfg = ory_config.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "env `{env}` has no native Ory config — the Ory-plane leg supports \
-                 zagros/zagros-prod/zagros-dev today"
+                "no Ory facts for goatnet `{env}` — run `goat context refresh` in that goatnet's context"
             )
         })?;
         for sel in &selectors {

@@ -227,20 +227,76 @@ async fn refresh(
         );
         return Ok(());
     }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, merged.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &path)?;
+    write_profile_toml(&path, &merged)?;
     println!(
         "context `{}`: {} key(s) written from {source}",
         target.context,
         changed.len()
     );
     Ok(())
+}
+
+/// Replace profile.toml atomically, mode 0600 like the rest of the context.
+fn write_profile_toml(path: &std::path::Path, body: &str) -> anyhow::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Run before a `goat admin` command. A context that names no goatnet yet (it
+/// has never been refreshed) gets its goatnet's facts once, from
+/// get.<site>/goatnet.toml, with a short timeout. Any failure is left to the
+/// command, which names `goat context refresh` wherever it needs a fact.
+pub(crate) async fn ensure_goatnet_facts(profile: &Profile) {
+    let path = profile.profile_toml_path();
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if crate::profile::extract_toml_field(&body, "goatnet").is_some() {
+        return;
+    }
+    let Some(base) = crate::version_check::get_base_url(profile) else {
+        return;
+    };
+    let url = format!("{}/goatnet.toml", base.trim_end_matches('/'));
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+    else {
+        return;
+    };
+    let Ok(resp) = client.get(&url).send().await else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(text) = resp.text().await else {
+        return;
+    };
+    let Ok(facts) = parse_goatnet_toml(&text) else {
+        return;
+    };
+    let Ok((merged, changed)) = merge_goatnet_facts(&body, &facts) else {
+        return;
+    };
+    if !changed.is_empty() && write_profile_toml(&path, &merged).is_ok() {
+        let g = facts
+            .iter()
+            .find(|(k, _)| k == "goatnet")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("?");
+        eprintln!(
+            "goat: context `{}` now carries goatnet `{g}`'s facts from {url}",
+            profile.context
+        );
+    }
 }
 
 /// List context dirs under `<profile>/contexts/`. Marks the active

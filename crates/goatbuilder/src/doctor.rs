@@ -1725,6 +1725,10 @@ mod tests {
     #[test]
     fn observability_on_zagros_dev_needs_no_outside_alert_channel() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !repo.join("ops/ansible/group_vars/zagros_dev_hosts").is_dir() {
+            eprintln!("skipped: no zagros_dev_hosts in this tree (a goatcore checkout carries no goatnet)");
+            return;
+        }
         let play = repo.join("ops/ansible/obs.yml");
         let got = secrets_needed(&repo, &["zagros_dev_hosts".into()], "observability", "observability", &play);
         for var in ["pagerduty_integration_key", "slack_webhook_url", "smtp_smarthost", "smtp_auth_username", "smtp_auth_password", "email_digest_recipients"] {

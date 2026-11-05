@@ -495,7 +495,10 @@ async fn run(cli: Cli) -> i32 {
         Cmd::Complete { op } => cmd::complete::run(&ctx, op).await,
         Cmd::Explain(args) => cmd::explain::run(&ctx, args).await,
         Cmd::Mock(args) => cmd::mock::run(&ctx, args).await,
-        Cmd::Admin { op } => cmd::admin::run(&ctx, op).await,
+        Cmd::Admin { op } => {
+            cmd::context::ensure_goatnet_facts(&ctx.profile).await;
+            cmd::admin::run(&ctx, op).await
+        }
         Cmd::Status(args) => cmd::status::run(&ctx, args).await,
         Cmd::Heal(args) => cmd::heal::run(&ctx, args).await,
         Cmd::Services(args) => cmd::services::run(&ctx, args).await,

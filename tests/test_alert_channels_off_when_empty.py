@@ -73,6 +73,8 @@ class Declarations(unittest.TestCase):
                                          "%s:%d binds %s with no empty fallback" % (os.path.relpath(path, REPO), n, name))
                         self.assertIn(name, off, "%s is bound in %s but not listed in ops/secrets/off-when-empty.txt"
                                       % (name, os.path.relpath(path, REPO)))
+        if not os.path.isdir(os.path.join(ANSIBLE, "group_vars", "zagros_dev_hosts")):
+            self.skipTest("no goatnet in this tree binds the alert channels (a goatcore checkout carries none)")
         self.assertTrue({"PAGERDUTY_INTEGRATION_KEY", "SLACK_ALERT_WEBHOOK_URL", "ALERT_SMTP_SMARTHOST"} <= seen,
                         "the scan found no channel bindings: it is not reading the tree")
 
@@ -205,7 +207,11 @@ class PresenceCheck(unittest.TestCase):
     def test_deploy_presence_check_never_reports_a_channel_missing(self):
         env = {k: v for k, v in os.environ.items() if not CHANNEL_ENV.match(k) and k != "NTFY_ALERTMANAGER_WEBHOOK_URL"}
         env["GOAT_SECRET_STORE"] = "env"
-        for group in ("zagros_dev_hosts", "zagros_hosts", "zagros_prod_obs_hosts", "integdev_hosts"):
+        groups = [g for g in ("zagros_dev_hosts", "zagros_hosts", "zagros_prod_obs_hosts", "integdev_hosts")
+                  if os.path.isdir(os.path.join(ANSIBLE, "group_vars", g))]
+        if not groups:
+            self.skipTest("no goatnet with an observability host in this tree (a goatcore checkout carries none)")
+        for group in groups:
             r = subprocess.run([sys.executable, os.path.join(REPO, "ops/scripts/deploy-secrets-needed.py"), "--repo", REPO,
                                 "--component", "observability", "--ledger", "obs-host",
                                 "--play", os.path.join(ANSIBLE, "obs.yml"), group],
