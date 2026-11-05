@@ -27,7 +27,7 @@
 #   ops/scripts/peer-dormancy-report.sh --csv
 set -euo pipefail
 
-THOR_HOST="${THOR_HOST:-100.127.0.180}"
+THOR_HOST="${THOR_HOST:-100.127.0.182}"
 PG_CONTAINER="${PG_CONTAINER:-postgres-a}"
 SSH_USER="${SSH_USER:-goat}"
 MODE="${1:-report}"

@@ -512,6 +512,43 @@ pub struct GoatnetEndpoints {
 }
 
 impl Profile {
+    /// The per-goatnet endpoints that apply to `env` (an `--env` goatnet).
+    ///
+    /// A command can act on a goatnet other than the active context's
+    /// (`goat admin onboard x --env zagros-prod` from the zagros context). The
+    /// active profile's facts describe ITS goatnet, so they apply only when the
+    /// profile names `env` or names no goatnet at all (a profile written before
+    /// `goat context refresh`, whose behaviour is unchanged). When it names a
+    /// different goatnet, the facts come from the sibling context whose profile
+    /// names `env`; with no such context nothing is overridden.
+    pub fn goatnet_endpoints_for(&self, env: Option<&str>) -> GoatnetEndpoints {
+        let own = self.goatnet_endpoints();
+        let (Some(env), Some(named)) = (env, own.goatnet.as_deref()) else {
+            return own;
+        };
+        if named == env {
+            return own;
+        }
+        let Ok(entries) = std::fs::read_dir(self.contexts_dir()) else {
+            return GoatnetEndpoints::default();
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".bak") || name == self.context {
+                continue;
+            }
+            let sibling = Profile {
+                dir: self.dir.clone(),
+                context: name,
+            };
+            let g = sibling.goatnet_endpoints();
+            if g.goatnet.as_deref() == Some(env) {
+                return g;
+            }
+        }
+        GoatnetEndpoints::default()
+    }
+
     /// Read whatever per-goatnet endpoints this context declares. Every field is
     /// optional: a profile written before this existed yields all-None and the
     /// caller keeps its built-in value, so old bundles are unaffected.
@@ -570,6 +607,70 @@ mod tests {
 
     fn write_config(dir: &std::path::Path, body: &str) {
         std::fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    fn ctx_with(dir: &std::path::Path, name: &str, body: &str) -> Profile {
+        let d = dir.join("contexts").join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("profile.toml"), body).unwrap();
+        Profile {
+            dir: dir.to_path_buf(),
+            context: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn endpoints_for_another_goatnet_come_from_its_own_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zagros = ctx_with(
+            tmp.path(),
+            "zagros",
+            "goatnet = \"zagros\"\nnetbird_mgmt_url = \"https://nb.zagros\"\n",
+        );
+        ctx_with(
+            tmp.path(),
+            "nova-op",
+            "goatnet = \"nova\"\nnetbird_mgmt_url = \"https://nb.nova\"\n",
+        );
+        assert_eq!(
+            zagros
+                .goatnet_endpoints_for(Some("zagros"))
+                .netbird_mgmt_url
+                .as_deref(),
+            Some("https://nb.zagros")
+        );
+        assert_eq!(
+            zagros
+                .goatnet_endpoints_for(Some("nova"))
+                .netbird_mgmt_url
+                .as_deref(),
+            Some("https://nb.nova"),
+            "--env nova from the zagros context must use nova's facts"
+        );
+        assert!(
+            zagros
+                .goatnet_endpoints_for(Some("vega"))
+                .netbird_mgmt_url
+                .is_none(),
+            "a goatnet no context names gets no facts, never the active context's"
+        );
+        assert_eq!(
+            zagros.goatnet_endpoints_for(None).goatnet.as_deref(),
+            Some("zagros")
+        );
+    }
+
+    #[test]
+    fn a_profile_naming_no_goatnet_keeps_todays_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = ctx_with(tmp.path(), "default", "router_endpoint = \"tls/r:7447\"\n");
+        assert_eq!(
+            legacy
+                .goatnet_endpoints_for(Some("zagros"))
+                .router_endpoint
+                .as_deref(),
+            Some("tls/r:7447")
+        );
     }
 
     #[test]

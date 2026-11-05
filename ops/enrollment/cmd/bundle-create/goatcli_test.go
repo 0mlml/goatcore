@@ -35,7 +35,7 @@ func fullGoatCLIArgs(t *testing.T) runArgs {
 	return runArgs{
 		GoatCLIPortalEndpoint:  "https://portal.nova.netbird.nova.example",
 		GoatCLIPortalTokenPath: tokenPath,
-		GoatCLIRouterEndpoint:  "tls/100.127.0.191:7447",
+		GoatCLIRouterEndpoint:  "tls/100.127.0.193:7447",
 		GoatCLIMTLSCertPath:    certPath,
 		GoatCLIMTLSKeyPath:     keyPath,
 		GoatCLICARootsPath:     caRootsPath,
@@ -127,7 +127,7 @@ func TestBuildGoatCLIExtras_RejectsNonHTTPSPortal(t *testing.T) {
 // host:port" mistake before signing.
 func TestBuildGoatCLIExtras_RejectsBareIPRouter(t *testing.T) {
 	args := fullGoatCLIArgs(t)
-	args.GoatCLIRouterEndpoint = "100.127.0.191:7447"
+	args.GoatCLIRouterEndpoint = "100.127.0.193:7447"
 	_, err := buildGoatCLIExtras(args)
 	if err == nil || !strings.Contains(err.Error(), "Zenoh transport prefix") {
 		t.Errorf("expected transport-prefix error, got %v", err)

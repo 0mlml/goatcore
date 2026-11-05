@@ -782,13 +782,13 @@ func TestProbationPeerSnapshotAdmitsNewPeerAfterBackgroundRefresh(t *testing.T) 
 	}
 
 	s.probationPeerSource = func(context.Context) ([]meshstate.Peer, error) {
-		return []meshstate.Peer{{ID: "peer-new", Name: "peer-new", IP: "100.127.0.64", LastSeen: time.Now().UTC()}}, nil
+		return []meshstate.Peer{{ID: "peer-new", Name: "peer-new", IP: "100.127.0.67", LastSeen: time.Now().UTC()}}, nil
 	}
 	s.probationMu.Lock()
 	s.probationRefreshAfter = time.Time{}
 	s.probationMu.Unlock()
 	req := probationRequest(http.MethodGet, "/internal/probation/auth", "")
-	req.Header.Set("X-Forwarded-For", "100.127.0.64")
+	req.Header.Set("X-Forwarded-For", "100.127.0.67")
 	if _, decision := s.classifyProbation(req); decision != probationDeny {
 		t.Fatalf("decision from stale snapshot=%v, want fail-closed deny", decision)
 	}

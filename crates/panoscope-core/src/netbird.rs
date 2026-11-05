@@ -1324,7 +1324,7 @@ mod group_update_tests {
 
     fn peer_body(ssh: bool, login: bool, inactivity: bool) -> String {
         serde_json::json!({
-            "id": "peer-1", "name": "machine-switch-a-host", "ip": "100.127.0.64",
+            "id": "peer-1", "name": "machine-switch-a-host", "ip": "100.127.0.67",
             "ssh_enabled": ssh,
             "login_expiration_enabled": login,
             "inactivity_expiration_enabled": inactivity,

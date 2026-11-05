@@ -140,18 +140,18 @@ def self_test():
             "doors:\n  x:\n    type: ssm\n    mgmt:\n      - {name: mgmt-x-01-thor, mesh_ip: 100.127.0.45}\n")
         Path(t, "ops/ansible/group_vars/x_hosts/vars.yml").write_text(
             "operator_ssh_scopes:\n  host-nodes:\n    - { ssh_host: \"100.127.0.45\", ssh_user: u }\n"
-            "  breakglass-path:\n    - { ssh_host: \"100.127.1.4\", ssh_user: u }   # bad-day\n")
+            "  breakglass-path:\n    - { ssh_host: \"100.127.1.6\", ssh_user: u }   # bad-day\n")
         Path(t, "ops/ansible/inventory/mgmt-hosts.ini").write_text(
             "[x_hosts]\nmgmt-x-01-thor ansible_host=100.127.0.45 ansible_user=u\n")
         Path(t, "ops/validation/values-x.yaml").write_text("orin_a: \"u@100.127.0.45\"\n")
         mesh, bad = declared_mesh(t), declared_bad_day(t)
         assert scan(t, mesh, bad) == [], scan(t, mesh, bad)
-        Path(t, "ops/validation/values-x.yaml").write_text("orin_a: \"u@100.127.1.4\"\n")
+        Path(t, "ops/validation/values-x.yaml").write_text("orin_a: \"u@100.127.1.6\"\n")
         with open(os.path.join(t, "ops/ansible/inventory/mgmt-hosts.ini"), "a") as fixture:
-            fixture.write("[x_other]\nmgmt-x-01-thor ansible_host=100.127.0.254 ansible_user=u\n")
+            fixture.write("[x_other]\nmgmt-x-01-thor ansible_host=100.127.1.2 ansible_user=u\n")
         got = scan(t, mesh, bad)
         assert any("bad-day" in o and o.startswith("ops/validation/values-x.yaml") for o in got), got
-        assert any("100.127.0.254" in o for o in got), got
+        assert any("100.127.1.2" in o for o in got), got
         assert not any(o.startswith("ops/ansible/group_vars") for o in got), got
         assert len(got) == 2, got
     print("self-test ok: clean tree passes; a bad-day address in a value and a foreign inventory address are both refused")

@@ -8,7 +8,7 @@ setup() {
   # Create a temporary .env for tests
   export TEST_ENV="$BATS_TEST_TMPDIR/.env"
   cat > "$TEST_ENV" <<'EOF'
-NETHOST_HOST=100.127.1.32
+NETHOST_HOST=100.127.1.34
 NETHOST_USER=goat
 NETHOST_PASS=TestPass123
 NETBIRD_DOMAIN=test.example.com

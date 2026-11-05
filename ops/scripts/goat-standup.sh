@@ -95,7 +95,8 @@
 # table is in docs/operations/goatnet-standup.md §"Phase numbers".
 #
 # goatlite (ADR 1213, docs/design/goatlite.md): when <repo>/goatlite.yaml declares
-# `preset: lite` and its lite.name is this site, the profile defaults to lan, the
+# `preset: lite` and its lite.name is this site, the profile defaults to lan (to
+# internet when goatlite.yaml declares lite.internet, goatlite.md §6), the
 # obs leg is skipped, phase 1 opens with the render of the config surface from
 # goatlite.yaml (ops/scripts/goatlite-render.py), and phase 4 mints the goatnet's
 # own CA when none exists (mint-site-certs.sh --mint-ca-if-missing). Same fourteen
@@ -169,7 +170,7 @@ GROUP="${SITE//-/_}_hosts"
 # goatlite (ADR 1213): is THIS site the one <repo>/goatlite.yaml declares? Read as
 # YAML with python3 + PyYAML, the way gv_value reads group_vars below; no file, no
 # python3, no PyYAML, or another name all mean "not lite" and change nothing.
-LITE=0
+LITE=0; LITE_INTERNET_AWS=""
 if [ -f "$REPO/goatlite.yaml" ]; then
   lite_name="$(python3 - "$REPO/goatlite.yaml" <<'PY' 2>/dev/null || true
 import sys
@@ -180,14 +181,19 @@ except Exception:
     sys.exit(0)
 if isinstance(d, dict) and d.get("preset") == "lite":
     lite = d.get("lite") or {}
-    # name on the first line, the declared administrator on the second
+    # name on the first line, the declared administrator on the second, and on the
+    # third the AWS profile of a goatlite grown to the internet (lite.internet, its
+    # aws_profile or else the name), empty for a LAN goatlite
     print(str(lite.get("name", "")).strip())
     print(str(lite.get("admin", "")).strip())
+    inet = lite.get("internet")
+    print(str((inet.get("aws_profile") or lite.get("name", "")) if isinstance(inet, dict) else "").strip())
 PY
 )"
   lite_admin="$(printf '%s\n' "$lite_name" | sed -n 2p)"
+  lite_aws="$(printf '%s\n' "$lite_name" | sed -n 3p)"
   lite_name="$(printf '%s\n' "$lite_name" | sed -n 1p)"
-  if [ -n "$lite_name" ] && [ "$lite_name" = "$SITE" ]; then LITE=1; fi
+  if [ -n "$lite_name" ] && [ "$lite_name" = "$SITE" ]; then LITE=1; LITE_INTERNET_AWS="$lite_aws"; fi
 fi
 
 # Phase 12's dependency graph, the same file `goatbuilder standup` reads
@@ -239,8 +245,10 @@ fi
 # AWS tools fall back to themselves. The builder reads the same three
 # (crate::settings, the portability track): this driver held one organisation's
 # profile name as its default, which is what that track exists to remove. No
-# python3, no PyYAML or no declaration all mean the tools' own fallback.
-AWS_PROFILE_STANDUP="${GOAT_AWS_PROFILE:-}"
+# python3, no PyYAML or no declaration all mean the tools' own fallback. A goatlite
+# grown to the internet declares its own (lite.internet.aws_profile, else its name),
+# read after GOAT_AWS_PROFILE and before the project's.
+AWS_PROFILE_STANDUP="${GOAT_AWS_PROFILE:-$LITE_INTERNET_AWS}"
 if [ -z "$AWS_PROFILE_STANDUP" ] && [ -f "$REPO/ops/goatbuilder/goatbuilder.yaml" ]; then
   AWS_PROFILE_STANDUP="$(python3 - "$REPO/ops/goatbuilder/goatbuilder.yaml" <<'PY' 2>/dev/null || true
 import sys
@@ -255,14 +263,6 @@ PY
 )"
 fi
 AWS_PROFILE_STANDUP="${AWS_PROFILE_STANDUP:-default}"
-# A goatlite reaches its one box directly at its inventory address and declares
-# no cloud at all, so no play in the run needs AWS. with-aws defaults to
-# aws-vault whenever aws-vault is installed (ADR 1204), so without this every
-# play asked the operator's keychain for credentials it would never use, once
-# per play. The builder does the same (crates/goatbuilder/src/standup.rs).
-AWS_MODE_STANDUP=""
-[[ "${LITE}" == 1 ]] && AWS_MODE_STANDUP="GOAT_AWS_MODE=none "
-ANSIBLE_PRE="OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ${AWS_MODE_STANDUP}../scripts/with-aws $AWS_PROFILE_STANDUP -- ../scripts/ansible-preflight.sh"
 # Fresh source (contract C3): once, before phase 1 touches a host. Every play
 # then goes through ansible-preflight.sh judged against the same trunk commit,
 # so a merge that lands during a long standup does not stop it half way.
@@ -278,7 +278,9 @@ fi
 # treated as lan for --plan purposes (the phase-1 gate refuses for real anyway).
 PROFILE="$PROFILE_OVERRIDE"
 if [ -z "$PROFILE" ]; then
-  if [ "$LITE" = 1 ]; then
+  if [ "$LITE" = 1 ] && [ -n "$LITE_INTERNET_AWS" ]; then
+    PROFILE=internet   # goatlite.yaml declares lite.internet: grown out of lite (goatlite.md §6)
+  elif [ "$LITE" = 1 ]; then
     PROFILE=lan   # goatlite is a LAN goatnet (ADR 1213 D1); its surface may not be rendered yet
   elif grep -qE '^[[:space:]]*dashboard_cert_delivery_mode:[[:space:]]*acme' \
         "$REPO/ops/ansible/group_vars/$GROUP/vars.yml" 2>/dev/null; then
@@ -288,6 +290,16 @@ if [ -z "$PROFILE" ]; then
   fi
 fi
 case "$PROFILE" in lan|internet) ;; *) echo "bad --profile '$PROFILE' (want lan|internet)"; exit 1 ;; esac
+# A LAN goatlite reaches its one box directly at its inventory address and declares
+# no cloud at all, so no play in the run needs AWS. with-aws defaults to
+# aws-vault whenever aws-vault is installed (ADR 1204), so without this every
+# play asked the operator's keychain for credentials it would never use, once
+# per play. A goatlite on the internet profile reaches its relays through AWS
+# (SSM, Secrets Manager), so it keeps the profile. The builder does the same
+# (crates/goatbuilder/src/standup.rs).
+AWS_MODE_STANDUP=""
+[[ "${LITE}" == 1 && "$PROFILE" == lan ]] && AWS_MODE_STANDUP="GOAT_AWS_MODE=none "
+ANSIBLE_PRE="OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ${AWS_MODE_STANDUP}../scripts/with-aws $AWS_PROFILE_STANDUP -- ../scripts/ansible-preflight.sh"
 
 # Founder or joiner (ADR 1084). goatnet_founder:false in the site's group_vars
 # makes site-bootstrap auto-skip the account seed (the account arrives by Spock
@@ -762,7 +774,7 @@ fi
 # Phase 6. The rest of site-bootstrap, now that Ory is up: the account seed waits
 #     for the netbird schema (bounded: netbird_schema_wait_seconds, default 300 s,
 #     and the rescue names the cause), seeds the account and prints the single-use
-#     bootstrap setup key — SAVE IT (phases 8 and 11 need it); then the plays after
+#     bootstrap setup key — SAVE IT (phase 11 needs it; phase 8 mints its own); then the plays after
 #     it. A founder runs only that part (--skip-tags stack). A joiner runs the whole
 #     file again: its pass 3 turns Spock on, which the stack plays configure.
 if [ "$JOINER" = 1 ]; then
@@ -869,13 +881,21 @@ step 7 A "[joiner] wire $SITE into the founder (${JOIN_FOUNDER_SITE:-?}) relay i
   "cd '$REPO/ops/ansible' && { [ -n '$JOIN_FOUNDER_SITE' ] || { echo 'joiner: join_founder_site not set in group_vars/$GROUP/vars.yml'; exit 1; }; } && { ls inventory/hosts-$JOIN_FOUNDER_SITE.ini >/dev/null 2>&1 || { echo 'founder relay inventory inventory/hosts-$JOIN_FOUNDER_SITE.ini missing — generate it first: inventory/generate-relays.sh $JOIN_FOUNDER_SITE terraform-$JOIN_FOUNDER_SITE'; exit 1; }; } && $ANSIBLE_PRE -i inventory/hosts-$JOIN_FOUNDER_SITE.ini -i inventory/$JOIN_FOUNDER_SITE-goat-relay-alias.ini relay-ingress-add-site.yml -e target=goat_relay_hosts -e founder_site=$JOIN_FOUNDER_SITE -e join_site=$SITE"
 fi
 
-# Phase 8. [internet] Mesh-enroll the host onto its own goatnet — genuinely manual
-#     (netbird up + the apex/:port override that must agree; F-188), then re-mint
-#     the router cert against the real mesh IP. LAN skips this: its router cert is
-#     already final from phase 4 (bound to the LAN IP).
+# Phase 8. [internet] Mesh-enroll the hosts onto their own goatnet, scripted
+#     (docs/design/goatbuilder-speed.md): a single-use key minted where the
+#     NetBird database is, `netbird up` against the site's declared
+#     mesh_enrollment_url (its port checked against where the name resolves,
+#     F-188; rosenpass flags from rosenpass_enabled), a wait for the management
+#     connection and a mesh IP. Then the IPs go into group_vars, the mesh
+#     inventory and the cert manifest, and the router pair is re-minted against
+#     them. A host already enrolled mints nothing. LAN skips this: its router
+#     cert is already final from phase 4 (bound to the LAN IP).
 if [ "$PROFILE" = internet ]; then
-step 8 MANUAL "[internet] mesh-enroll the host + re-mint the router cert" \
-  "see docs/operations/goatnet-standup.md §'Phase 8' for the exact block; run ops/preflight-enrollment.sh first (it PRINTS the netbird up line, rosenpass flags included); confirm 'netbird status' shows Management: Connected + a 100.x IP BEFORE re-minting; then fill the mesh IP into inventory + the cert manifest and re-mint: mint-site-certs.sh $SITE --only router (delete the phase-4 router pair first, or the mint is a no-op)"
+MESH_IPS="$STATE_DIR/standup-$SITE-mesh-ips.json"
+step 8 A "[internet] mesh-enroll the hosts (a single-use key each, the declared enrolment URL)" \
+  "cd '$REPO/ops/ansible' && $ANSIBLE_PRE ${INV[*]} mesh-enroll-host.yml -e target=$GROUP -e mesh_ips_out='$MESH_IPS'"
+step 8 T "[internet] record the mesh IPs (group_vars, mesh inventory, cert manifest) and re-mint the router cert" \
+  "python3 '$REPO/ops/scripts/standup-mesh-record.py' $SITE --ips '$MESH_IPS'"
 fi
 
 # Phase 9. Per-uuid Zenoh router (binds the mesh IP on internet, LAN IP on lan; cert from phase 4/8).
@@ -1185,8 +1205,8 @@ step 14 A "join the cross-goatnet surfaces (relay-health overview on every box)"
 fi
 
 if [ "$PLAN" = 1 ]; then
-  echo; echo "PLAN complete ($PROFILE profile). Remove --plan to execute. Manual steps"
-  echo "(phase 8 enrolment, internet only; phase 11 first login, both profiles, until the"
-  echo "posture holds ${SITE_UPPER}_NB_API_TOKEN) pause the run; resume with --from <next>."
+  echo; echo "PLAN complete ($PROFILE profile). Remove --plan to execute. The one manual step"
+  echo "(phase 11 first login, both profiles, until the posture holds ${SITE_UPPER}_NB_API_TOKEN)"
+  echo "pauses the run; resume with --from <next>."
   echo "Read docs/operations/goatnet-standup.md first."
 fi

@@ -252,7 +252,24 @@ def needed_for(repo, play, names, groups):
                 needed[var] = [env]
     for var, alts in role_default_bindings(repo, names, gv_names, svars, play_words(play)).items():
         needed.setdefault(var, alts)
-    return needed
+    # An outbound channel whose empty value turns it off (ops/secrets/off-when-empty.txt)
+    # is never a need: a goatnet with no PagerDuty, Slack or mail account still deploys.
+    off = off_when_empty(repo)
+    return {var: alts for var, alts in needed.items() if not all(a in off for a in alts)}
+
+
+def off_when_empty(repo):
+    """The names in ops/secrets/off-when-empty.txt: first word of each non-comment line."""
+    out = set()
+    try:
+        with open(os.path.join(repo, "ops/secrets/off-when-empty.txt"), encoding="utf-8") as fh:
+            for line in fh:
+                word = line.split("#", 1)[0].split()
+                if word:
+                    out.add(word[0])
+    except OSError:
+        return out   # no list in this checkout: every binding stays a need, as before
+    return out
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ case "$ENV" in
   zagros)
     INSTANCE=i-0000083a640499a93   # mesh-dns-zagros-a (ZAGROS mesh peer, SSM)
     REGION=eu-central-1
-    TARGET_IP=100.127.0.180       # mgmt-zagros-01-thor
+    TARGET_IP=100.127.0.182       # mgmt-zagros-01-thor
     TARGET_NAME=mgmt-zagros-01-thor
     PORT=12201
     DOOR_USER=goat
@@ -28,7 +28,7 @@ case "$ENV" in
   zagros-prod)
     INSTANCE=i-000002bff6114fc6b   # relay-health-zagros-prod-a (zagros-prod mesh peer, SSM)
     REGION=eu-central-1
-    TARGET_IP=100.127.0.222         # mgmt-zagros-prod-01-orin
+    TARGET_IP=100.127.0.224         # mgmt-zagros-prod-01-orin
     TARGET_NAME=mgmt-zagros-prod-01-orin
     PORT=12202
     DOOR_USER=goat
@@ -36,7 +36,7 @@ case "$ENV" in
   uk)
     INSTANCE=i-0000083a640499a93
     REGION=eu-central-1
-    TARGET_IP=100.127.0.180   # mgmt-zagros-01-thor
+    TARGET_IP=100.127.0.182   # mgmt-zagros-01-thor
     TARGET_NAME=mgmt-zagros-01-thor
     PORT=12201
     DOOR_USER=goat
@@ -44,7 +44,7 @@ case "$ENV" in
   zagros-dev)
     INSTANCE=i-00000f9f89849d917
     REGION=eu-central-1
-    TARGET_IP=100.127.0.153   # mgmt-zagros-dev-01-thor
+    TARGET_IP=100.127.0.155   # mgmt-zagros-dev-01-thor
     TARGET_NAME=mgmt-zagros-dev-01-thor
     PORT=12203
     DOOR_USER=goat

@@ -366,7 +366,7 @@ deploy_rathole=false
 # mesh-internal DNS is per-site CoreDNS on Orin-A; relay-side dnsmasq
 # only ever served the legacy single-NETHOST topology and is vestigial
 # on prod (its addn-hosts zone resolves *.netbird.legacy.example to
-# the legacy NETHOST at 100.127.1.32 — unreachable + irrelevant for
+# the legacy NETHOST at 100.127.1.34 — unreachable + irrelevant for
 # prod peers). relay-server.yml fires the explicit stop+disable+purge
 # path when this flag is false.
 deploy_dnsmasq=false

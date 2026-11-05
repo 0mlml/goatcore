@@ -551,7 +551,21 @@ pub fn secrets_needed(repo: &Path, groups: &[String], name: &str, ledger: &str, 
     for (var, alts) in role_default_bindings(repo, &roles, groups, &play_text) {
         out.entry(var).or_insert_with(|| alts.join("|"));
     }
+    // An outbound channel whose empty value turns it off is never a need
+    // (ops/secrets/off-when-empty.txt; pluggable-dependencies.md row 16).
+    let off = off_when_empty(repo);
+    out.retain(|_, alts| !alts.split('|').all(|a| off.contains(a)));
     out
+}
+
+/// The names in ops/secrets/off-when-empty.txt (first word of each non-comment
+/// line). Mirrors `off_when_empty` in ops/scripts/deploy-secrets-needed.py.
+pub fn off_when_empty(repo: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(repo.join("ops/secrets/off-when-empty.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split('#').next().and_then(|w| w.split_whitespace().next()).map(String::from))
+        .collect()
 }
 
 /// True when any one of `alts` (`A|B|C`, as [`secrets_needed`] renders a role
@@ -1706,6 +1720,20 @@ mod tests {
         assert_eq!(got.get("goat_get_github_token").map(String::as_str), Some("GOAT_CLI_RELEASE_TOKEN|GH_TOKEN|GHCR_READ_TOKEN"));
     }
 
+    /// An outside alert channel left empty is off, never a missing secret
+    /// (ops/secrets/off-when-empty.txt); the goatnet's own ntfy still is one.
+    #[test]
+    fn observability_on_zagros_dev_needs_no_outside_alert_channel() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let play = repo.join("ops/ansible/obs.yml");
+        let got = secrets_needed(&repo, &["zagros_dev_hosts".into()], "observability", "observability", &play);
+        for var in ["pagerduty_integration_key", "slack_webhook_url", "smtp_smarthost", "smtp_auth_username", "smtp_auth_password", "email_digest_recipients"] {
+            assert!(!got.contains_key(var), "{var} is an outside alert channel; empty turns it off");
+        }
+        assert!(got.contains_key("ntfy_alertmanager_webhook_url"), "control: the goatnet's own channel is still a need");
+        assert!(off_when_empty(&repo).contains("PAGERDUTY_INTEGRATION_KEY"));
+    }
+
     #[test]
     fn site_inputs_lists_every_missing_input_and_secret() {
         let v: serde_json::Value = serde_json::json!({
@@ -1897,7 +1925,7 @@ mod tests {
         }
     }
 
-    const MESH_ROW: &str = "[zagros_hosts]\nmgmt-zagros-01 ansible_host=100.127.0.45\n\n[zagros_dev_hosts]\n# the Thor\nmgmt-zagros-dev-01-thor ansible_host=100.127.0.153\n";
+    const MESH_ROW: &str = "[zagros_hosts]\nmgmt-zagros-01 ansible_host=100.127.0.45\n\n[zagros_dev_hosts]\n# the Thor\nmgmt-zagros-dev-01-thor ansible_host=100.127.0.155\n";
 
     #[test]
     fn mesh_row_and_ssm_door_is_reachable_two_ways() {
@@ -1917,7 +1945,7 @@ mod tests {
     /// No mesh row, and the only door an address on one operator's own network.
     #[test]
     fn a_one_machine_door_is_refused() {
-        let repo = reach_repo("tailscale", Some("[zagros_hosts]\nx ansible_host=100.127.0.45\n"), Some("doors:\n  zagros-dev:\n    type: tailscale\n    ip: 100.127.1.5\n"));
+        let repo = reach_repo("tailscale", Some("[zagros_hosts]\nx ansible_host=100.127.0.45\n"), Some("doors:\n  zagros-dev:\n    type: tailscale\n    ip: 100.127.1.7\n"));
         let c = reach_check(&repo, &env("zagros_dev"));
         assert!(!c.ok);
         assert!(c.detail.contains("door type 'tailscale'"), "{}", c.detail);

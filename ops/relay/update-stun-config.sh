@@ -6,7 +6,7 @@
 # Netbird relay servers for lower-latency data relay (vs relaying through NETHOST).
 #
 # Usage (from admin machine):
-#   ssh -t goat@100.127.1.32 'bash -s' < ops/relay/update-stun-config.sh
+#   ssh -t goat@100.127.1.34 'bash -s' < ops/relay/update-stun-config.sh
 #
 # Optional env vars:
 #   STUN_IPS — space-separated VPS IPs (overrides hardcoded defaults)

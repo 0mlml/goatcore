@@ -128,7 +128,7 @@ def generate_caddy_compose(reg):
     )
     dns_block = ""
     if has_hostname_proxy:
-        dns_block = "\n    dns:\n      - 100.127.1.32  # Netbird DNS proxy on NETHOST mesh interface"
+        dns_block = "\n    dns:\n      - 100.127.1.34  # Netbird DNS proxy on NETHOST mesh interface"
 
     content = HEADER + f"""
 services:
@@ -191,7 +191,7 @@ def validate_container_middleware(reg):
 def update_mesh_hosts(reg):
     """Update the managed service DNS block in ops/dns/mesh-hosts."""
     suffix = reg["domain_suffix"]
-    mesh_ip = reg.get("mesh_ip", "100.127.1.32")
+    mesh_ip = reg.get("mesh_ip", "100.127.1.34")
     path = os.path.join(REPO_ROOT, "ops", "dns", "mesh-hosts")
 
     BEGIN = "# BEGIN services (managed by generate.py — do not edit)"

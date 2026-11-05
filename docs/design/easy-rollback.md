@@ -105,7 +105,7 @@ Per-host metadata in `deploy-history.yml` toggles the script onto a different ro
 
 ```yaml
 hosts:
-  - host: 100.127.0.191
+  - host: 100.127.0.193
     ssh_user: goat
     container_name: isitup
     compose_path: /opt/mgmt-host/docker-compose.isitup.yml

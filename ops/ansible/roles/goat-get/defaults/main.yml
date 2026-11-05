@@ -54,10 +54,9 @@ goat_get_hostname: "get.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }
 #   - No command exits 0 having failed — 56 defects from a full-surface audit,
 #     including the missing-cert error that named the build machine's own paths
 #     instead of "re-run `goat profile init`" (#1153).
-# Verify 13 assets in BOTH repos before deploying — goat_get_release_repo is
-# self-referential ({{ source_repo }}) and resolves to whichever repo the
-# deploy runs from, and the tag builds twice with non-matching bytes,
-# so parity is repaired by COPYING from the primary, never by rebuilding.
+# Verify 13 assets on USAREUR-AF/goatcore before deploying
+# (ops/ci/check-release-asset-parity.sh); goat_get_release_repo resolves
+# through {{ source_repo }} to the primary repo.
 # goat-cli-v0.5.8: `goat warrant apply --membership`, the ADR 1189
 #   membership converger (#1450). Bumping this default moves no goatnet: each
 #   serves the new release only when goat-get-deploy.yml runs there.
@@ -79,9 +78,8 @@ goat_get_hostname: "get.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }
 #   revoke reports SSH removal evidence, which the offboarding driver needs
 #   (#1976); native onboarding derives the affiliation kind (#1870).
 goat_get_release_tag: "goat-cli-v0.5.14"
-# Self-referential — resolves to whichever repo the deploy runs from
-# (group_vars/all.yml `source_repo`). Both repos carry these releases
-# byte-identically; ops/ci/check-release-asset-parity.sh keeps it that way.
+# Resolves through group_vars/all.yml `source_repo` to USAREUR-AF/goatcore;
+# ops/ci/check-release-asset-parity.sh confirms the release carries its assets.
 goat_get_release_repo: "{{ source_repo }}"
 goat_get_assets:
   - goat-linux-amd64
@@ -322,7 +320,7 @@ goat_get_refused_release_reason:
 #
 # The tag is EMPTY until the first release is cut: the release-asset parity
 # guard (ops/ci/check-release-asset-parity.sh) refuses a pin that names a
-# release existing in neither repo, which is what a tag ahead of its release
+# release that does not exist on USAREUR-AF/goatcore, which is what a tag ahead of its release
 # would be. Bump path, once `goatbuilder/v<semver>` exists: set the tag here
 # (the first is goatbuilder/v0.1.0), flip the flag per goatnet in group_vars
 # (a test goatnet first), re-run goat-get-deploy.yml, record the served tag in
@@ -347,3 +345,25 @@ goat_get_goatbuilder_assets:
   - goatbuilder-docs.tar.gz.sha256
   - SHA256SUMS
   - SHA256SUMS.cosign-bundle
+
+# --- goatnet.toml: this goatnet's own facts, for the goat CLI ----------------
+# goat-cli holds no goatnet. `goat context refresh` reads get.<site>/goatnet.toml
+# and writes its keys into the context's profile.toml, where every command that
+# needs a per-goatnet fact reads it (crates/goat-cli/src/profile.rs,
+# GoatnetEndpoints). Each value derives from the group_var that is already this
+# goatnet's source of truth, by the same derivations the onboard-runner role uses
+# (roles/onboard-runner/defaults/main.yml, F-485), so a correctly configured
+# goatnet needs no new declaration. An empty value is left out of the file.
+goat_get_goatnet_facts:
+  goatnet: "{{ site_id }}"
+  # Same fallback as roles/goat-zenoh-portal/defaults/main.yml, which a goatnet
+  # without portal_router_endpoint in its group_vars (zagros-prod) runs on.
+  router_endpoint: "{{ portal_router_endpoint | default('tls/zenoh.' ~ site_id ~ '.' ~ site_dns_zone ~ ':7447', true) }}"
+  netbird_mgmt_url: "https://{{ public_mgmt_fqdn }}"
+  netbird_token_env: "{{ (site_id | upper | replace('-', '_')) ~ '_NB_API_TOKEN' }}"
+  netbird_site_prefix: "{{ site_id | upper }}"
+  netbird_rosenpass: "{{ rosenpass_enabled | default('') | string | lower }}"
+  ory_auth_url: "https://auth.{{ site_id }}.{{ site_dns_zone }}"
+  ory_ssh_host: "{{ mesh_ip_a | default('', true) }}"
+  ory_ssh_user: "{{ ansible_user | default('', true) }}"
+  mgmt_ssh_user: "{{ ansible_user | default('', true) }}"

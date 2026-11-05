@@ -23,7 +23,7 @@ func writeSummary(t *testing.T, body string, age time.Duration) string {
 // Shaped on the zagros case of: registered with management, the
 // management host never completed a handshake with it.
 const summary = `{"peers":[
- {"ip":"100.127.0.68","fqdn":"srv.example","status":"Connecting","last_handshake":"0001-01-01T00:00:00Z"},
+ {"ip":"100.127.0.71","fqdn":"srv.example","status":"Connecting","last_handshake":"0001-01-01T00:00:00Z"},
  {"ip":"100.127.0.46","fqdn":"laptop.example","status":"Connected","last_handshake":"2026-10-05T10:00:00Z"},
  {"ip":"100.127.0.47","fqdn":"idle.example","status":"Idle","last_handshake":"2026-10-04T10:00:00Z"}
 ]}`
@@ -62,7 +62,7 @@ func TestDevicesForFlagsControlOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	known := map[string]struct{}{"mz": {}, "al": {}}
-	srv := Peer{Name: "peer-mz-zagros-2026-10-05", IP: "100.127.0.68", Connected: true, OS: "Oracle Linux Server 8.10"}
+	srv := Peer{Name: "peer-mz-zagros-2026-10-05", IP: "100.127.0.71", Connected: true, OS: "Oracle Linux Server 8.10"}
 	got := DevicesFor([]Peer{srv}, "mz", known, hs)
 	if !got.ControlOnly || !got.Peers[0].ControlOnly {
 		t.Fatalf("control-only device not flagged: %+v", got)
@@ -76,7 +76,7 @@ func TestDevicesForFlagsControlOnly(t *testing.T) {
 	}
 
 	// No row for the peer means unknown, never flagged; neither is a nil view.
-	other := Peer{Name: "peer-al-zagros-x", IP: "100.127.0.64", Connected: true}
+	other := Peer{Name: "peer-al-zagros-x", IP: "100.127.0.67", Connected: true}
 	if got := DevicesFor([]Peer{other}, "al", known, hs); got.ControlOnly {
 		t.Fatal("a peer the host has no view of must not be flagged")
 	}

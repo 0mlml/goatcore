@@ -85,7 +85,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Domain:     "netbird.legacy.example",
-		NETHOSTMeshIP: "100.127.1.32",
+		NETHOSTMeshIP: "100.127.1.34",
 		Relays: []RelayInfo{
 			{Name: "fra", IP: "203.0.113.2", Region: "eu-central-1", InstanceID: "i-00000cea114dd2d2f"},
 			{Name: "isr", IP: "203.0.113.20", Region: "il-central-1", InstanceID: "i-00000c028101b56e6"},

@@ -81,7 +81,9 @@ impl Lite {
     }
 }
 
-/// Growing out of lite (goatlite.md §6). Shape only in v1; nothing acts on it yet.
+/// Growing out of lite (goatlite.md §6). ops/scripts/goatlite-render.py renders the
+/// internet surface from it; the binary reads `aws_profile` and makes the standup's
+/// profile internet. The rest is the renderer's (validated by the schema).
 #[derive(Debug, Clone, Deserialize)]
 pub struct LiteInternet {
     pub zone: String,
@@ -802,6 +804,13 @@ mod tests {
         let cfg = typed(&v);
         assert_eq!(cfg.lite.as_ref().unwrap().internet.as_ref().unwrap().zone, "pasture.example.org");
         assert_eq!(cfg.lite.unwrap().disk_encryption, Some(false));
+        let mut v = goatlite();
+        v["lite"]["internet"] = json!({"zone": "pasture.example.org", "acme_email": "ops@example.org",
+            "relays": [{"name": "a", "region": "us-east-2"}], "mesh_ip": "192.0.2.7"});
+        assert_eq!(typed(&v).lite.unwrap().internet.unwrap().zone, "pasture.example.org");
+        let mut v = goatlite();
+        v["lite"]["internet"] = json!({"zone": "pasture.example.org", "relays": [{"name": "a"}]});
+        rejected(&v, "region");
     }
 
     /// Parity with validate.py: both accept this repository's generated config.

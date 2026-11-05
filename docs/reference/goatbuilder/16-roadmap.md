@@ -5,12 +5,8 @@ designed and dated but not built, so a reader can tell the two apart.
 
 | Date | Item | What it adds | Design |
 |---|---|---|---|
-| 2026-11-13 | Scripted phase-8 enrolment | the standup mints a single-use setup key on the host, enrols it, waits for the mesh address, writes it into inventory and re-mints the router certificate, with no person at the keyboard | [goatbuilder-speed.md](../../design/goatbuilder-speed.md) |
 | 2026-11-13 | Tutorial 2 on hardware | the founder-and-joiner pair run once on real machines | [goatnet-tutorials.md](../../design/goatnet-tutorials.md) |
-| 2026-11-20 | Site-local image mirror | a registry mirror and package cache on the observability host, and a pre-pull of every pinned digest; rebuilds and joiners pull locally | [goatbuilder-speed.md](../../design/goatbuilder-speed.md) |
-| 2026-11-20 | The rest of the teardown | teardown plays for mesh DNS, dashboard, SPIRE, the router, the relay connection and the observability leg, so a full `teardown` runs on real hosts | [goatbuilder-speed.md](../../design/goatbuilder-speed.md) |
 | 2026-11-20 | A `boundary` machine class | `join-node --class boundary` installs a partner egress node through its released installer, with a parity gate | [goatnet-tutorials.md](../../design/goatnet-tutorials.md) |
-| 2026-11-27 | Installer seed per node class | an unattended OS install per class with per-host disk encryption, so the baseline play finds most of its work done | [goatbuilder-speed.md](../../design/goatbuilder-speed.md) |
 | 2026-11-27 | Tutorial 3 | install a boundary node, grant one topic to one partner, prove the read and its revocation | [goatnet-tutorials.md](../../design/goatnet-tutorials.md) |
 | 2026-11-30 | Zero-SaaS recipes | a store-generic new-site secret generator, a local registry, a local mail sink, alert channels off when empty | [pluggable-dependencies.md](../../design/pluggable-dependencies.md) |
 | 2026-11-30 | Zero-SaaS standup, measured | a goatnet stood up end to end on the `env-file` posture with no hosted account | [pluggable-dependencies.md](../../design/pluggable-dependencies.md) |

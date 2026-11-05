@@ -265,7 +265,7 @@ def self_test():
     ts = _load_registry("""doors:
   ts:
     type: tailscale
-    ip: 100.127.1.8
+    ip: 100.127.1.10
     user: goat
     mgmt:
       - {name: mgmt-ts-01, group: ts_door_hosts, gv_group: ts_hosts, landed: true}
@@ -273,7 +273,7 @@ def self_test():
     out3, _ = establish("ts", ts, {"doors_ini": "", "groupvars_ini": "", "env_door": "  *)\n"})
     if out3["env_door"] != "  *)\n":
         problems.append("tailscale wrongly wrote an env-door arm")
-    if "ansible_host=100.127.1.8" not in out3["doors_ini"]:
+    if "ansible_host=100.127.1.10" not in out3["doors_ini"]:
         problems.append("tailscale lands on ip")
     # direct (ADR 1213): no env-door arm, the host as-is, no ssh overrides
     direct = _load_registry("""doors:

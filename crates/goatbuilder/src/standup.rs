@@ -224,10 +224,18 @@ fn read_site(repo: &Path, o: &Options) -> Result<Site> {
     let group = format!("{site_us}_hosts");
     let obs_group = format!("{site_us}_obs_hosts");
     let upper = site_us.to_uppercase();
-    let aws = crate::settings::aws_profile(repo);
     let gv = repo.join("ops/ansible/group_vars").join(&group).join("vars.yml");
     let lite_cfg = resolve_lite(repo, &site)?;
     let lite = lite_cfg.is_some();
+    // A goatlite grown to the internet (goatlite.md §6) declares its own AWS profile,
+    // lite.internet.aws_profile or else its name, read after GOAT_AWS_PROFILE and
+    // before the project's (the script reads the same order).
+    let lite_internet_aws = lite_cfg.as_ref().and_then(|c| c.lite.as_ref()).and_then(|l| {
+        l.internet.as_ref().map(|i| i.aws_profile.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| l.name.clone()))
+    });
+    let aws = std::env::var("GOAT_AWS_PROFILE").ok().filter(|s| !s.is_empty())
+        .or_else(|| lite_internet_aws.clone())
+        .unwrap_or_else(|| crate::settings::aws_profile(repo));
     // A goatlite declares its administrator (lite.admin), so the run uses that
     // rather than an OWNER_EMAIL the person must remember to export: phase 5
     // expanded "$OWNER_EMAIL" in its arguments and died before Ansible, and
@@ -260,7 +268,7 @@ fn read_site(repo: &Path, o: &Options) -> Result<Site> {
 
     let profile = match o.profile {
         Some(p) => p.to_string(),
-        None if lite => "lan".to_string(),
+        None if lite => if lite_internet_aws.is_some() { "internet".to_string() } else { "lan".to_string() },
         None => if gv_matches(&gv, "dashboard_cert_delivery_mode", "acme") { "internet".to_string() } else { "lan".to_string() },
     };
     if profile != "lan" && profile != "internet" {
@@ -282,12 +290,13 @@ fn read_site(repo: &Path, o: &Options) -> Result<Site> {
         upper,
         obs_group,
         state_dir: crate::settings::state_dir_abs(repo),
-        // A goatlite reaches its one box directly at its inventory address and
+        // A LAN goatlite reaches its one box directly at its inventory address and
         // declares no cloud, so no play needs AWS. with-aws defaults to
         // aws-vault whenever aws-vault is installed (ADR 1204), so without this
-        // every play asked the operator's keychain, once per play.
+        // every play asked the operator's keychain, once per play. On the internet
+        // profile the relay plays reach AWS (SSM, Secrets Manager), so it stays.
         ansible_pre: format!("OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES {}../scripts/with-aws {aws} -- ../scripts/ansible-preflight.sh",
-                             if lite { "GOAT_AWS_MODE=none " } else { "" }),
+                             if lite && profile == "lan" { "GOAT_AWS_MODE=none " } else { "" }),
         inv: INV,
         profile,
         joiner,
@@ -438,7 +447,12 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
         if s.joiner {
             ev.push(p(7, "A", format!("[joiner] wire {site} into the founder ({}) relay ingress + re-render", or_q(jfs)), format!("cd '{r}/ops/ansible' && {{ [ -n '{jfs}' ] || {{ echo 'joiner: join_founder_site not set in group_vars/{g}/vars.yml'; exit 1; }}; }} && {{ ls inventory/hosts-{jfs}.ini >/dev/null 2>&1 || {{ echo 'founder relay inventory inventory/hosts-{jfs}.ini missing — generate it first: inventory/generate-relays.sh {jfs} terraform-{jfs}'; exit 1; }}; }} && {pre} -i inventory/hosts-{jfs}.ini -i inventory/{jfs}-goat-relay-alias.ini relay-ingress-add-site.yml -e target=goat_relay_hosts -e founder_site={jfs} -e join_site={site}")));
         }
-        ev.push(p(8, "MANUAL", "[internet] mesh-enroll the host + re-mint the router cert".into(), format!("see docs/operations/goatnet-standup.md §'Phase 8' for the exact block; run ops/preflight-enrollment.sh first (it PRINTS the netbird up line, rosenpass flags included); confirm 'netbird status' shows Management: Connected + a 100.x IP BEFORE re-minting; then fill the mesh IP into inventory + the cert manifest and re-mint: mint-site-certs.sh {site} --only router (delete the phase-4 router pair first, or the mint is a no-op)")));
+        // Phase 8, scripted (goatbuilder-speed.md): enrol with a single-use key
+        // against the declared mesh_enrollment_url, then record the mesh IPs and
+        // re-mint the router pair. A host already enrolled mints nothing.
+        let mesh_ips = format!("{}/standup-{site}-mesh-ips.json", s.state_dir);
+        ev.push(p(8, "A", "[internet] mesh-enroll the hosts (a single-use key each, the declared enrolment URL)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} mesh-enroll-host.yml -e target={g} -e mesh_ips_out='{mesh_ips}'")));
+        ev.push(p(8, "T", "[internet] record the mesh IPs (group_vars, mesh inventory, cert manifest) and re-mint the router cert".into(), format!("python3 '{r}/ops/scripts/standup-mesh-record.py' {site} --ips '{mesh_ips}'")));
     }
     ev.push(p(9, "A", "zenoh router".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} zenoh-deploy.yml -e target={g}")));
     ev.push(p(9, "A", "SPIRE server on the founder (workload identity)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} spire-deploy.yml -e target={g} -l 'mgmt-{site}-01*' -e spire_enabled=true -e postgres_superuser_password=\"$(printenv {u}_PG_PASS)\"")));
@@ -931,7 +945,7 @@ pub fn standup(repo: &Path, o: &Options) -> Result<Report> {
         }
     }
     if o.dry_run {
-        checks.push(row("footer", format!("PLAN complete ({} profile). Remove --dry-run to execute. Manual steps (phase 8 enrolment and phase 11 first login, internet only) pause the run; resume with --from <next>. Read docs/operations/goatnet-standup.md first.", s.profile)));
+        checks.push(row("footer", format!("PLAN complete ({} profile). Remove --dry-run to execute. The one manual step (phase 11 first login) pauses the run; resume with --from <next>. Read docs/operations/goatnet-standup.md first.", s.profile)));
     } else if o.obs_only && exit == EXIT_OK {
         checks.push(row("footer", format!("obs leg complete for {}.", s.site)));
     }
@@ -1208,6 +1222,51 @@ struct TeardownDecl {
     dirs: Vec<TeardownDir>,
     #[serde(default)]
     why: String,
+    /// `obs`: the step runs against the site's observability host group.
+    #[serde(default)]
+    target: String,
+    /// service-stop: the shared compose project's working directory, and the
+    /// compose service names to stop in it.
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    services: Vec<String>,
+    /// systemd-stop: the unit names (globs allowed).
+    #[serde(default)]
+    units: Vec<String>,
+    /// command: the line run on the operator machine ({repo} and {site} filled in).
+    #[serde(default)]
+    run: String,
+}
+
+/// The actions `--services` runs: each stops something and keeps its data.
+const SERVICE_ACTIONS: [&str; 3] = ["compose-down", "service-stop", "systemd-stop"];
+
+/// The command that takes a runnable step down (the same string
+/// ops/goatbuilder/teardown-plan.py prints), or None for keep/refused/designed.
+fn teardown_cmd(s: &Site, d: &TeardownDecl) -> Result<Option<String>> {
+    let group = if d.target == "obs" { s.obs_group.clone() } else { s.group.clone() };
+    let pre = format!("cd '{}/ops/ansible' && {} {}", s.repo, s.ansible_pre, s.inv);
+    Ok(match d.action.as_str() {
+        "compose-down" => {
+            let dirs: Vec<TeardownDir> = d.dirs.iter().map(|x| TeardownDir { var: x.var.clone(), default: x.default.replace("<site>", &s.site) }).collect();
+            let dirs = serde_json::to_string(&dirs)?;
+            Some(format!("{pre} teardown-compose.yml -e target={group} -e teardown_component={} -e 'teardown_dirs={dirs}'", d.component))
+        }
+        "service-stop" => Some(format!("{pre} teardown-service-stop.yml -e target={group} -e teardown_component={} -e teardown_project={} -e 'teardown_services={}'", d.component, d.project, serde_json::to_string(&d.services)?)),
+        "systemd-stop" => Some(format!("{pre} teardown-systemd.yml -e target={group} -e teardown_component={} -e 'teardown_units={}'", d.component, serde_json::to_string(&d.units)?)),
+        "command" => Some(d.run.replace("{repo}", &s.repo).replace("{site}", &s.site)),
+        _ => None,
+    })
+}
+
+fn teardown_what(action: &str, component: &str) -> String {
+    match action {
+        "compose-down" => format!("stop {component}, volumes kept"),
+        "service-stop" => format!("stop {component} in its shared compose project, containers and volumes kept"),
+        "systemd-stop" => format!("stop and disable {component}, unit files kept"),
+        _ => format!("{component} on the operator machine"),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -1247,28 +1306,35 @@ pub fn teardown(repo: &Path, o: &Options, services: bool) -> Result<Report> {
     let decls = load_teardown(repo)?;
     let events = plan(repo, &s, &Options { from: 1, to: 14, ..*o }, &resume);
     let mut checks = vec![row("banner", format!("teardown: site={}  group={}  {}", s.site, s.group, if o.dry_run { "(DRY RUN — nothing executes)" } else { "" }))];
-    let applied: Vec<&Phase> = events.iter().filter_map(|e| if let Event::Phase(p) = e { Some(p) } else { None }).filter(|p| p.kind == "A" && p.n >= o.from && p.n <= o.to).collect();
+    // The applied phases ([A] only) and the observability legs, in plan order;
+    // a leg counts as the phase it starts with (host 2, stack 9).
+    let applied: Vec<(u32, String, &str)> = events.iter().filter_map(|e| match e {
+        Event::Phase(p) if p.kind == "A" => Some((p.n, format!("phase {} [A]", p.n), p.label.as_str())),
+        Event::LegStart { leg, label, .. } => { let n = if *leg == "stack" { 9 } else { 2 }; Some((n, format!("observability leg \"{leg}\" [A ∥]"), label.as_str())) }
+        _ => None,
+    }).filter(|(n, _, _)| *n >= o.from && *n <= o.to).collect();
     let mut cmds: Vec<(String, String)> = Vec::new();
     let mut blocking: Vec<String> = Vec::new();
-    for p in applied.iter().rev() {
-        checks.push(row("phase", format!("=== Teardown of phase {} [A] {} ===", p.n, p.label)));
-        match teardown_decl(&decls, &p.label) {
-            None => {
-                checks.push(row("note", "undeclared: no line in ops/goatbuilder/teardown.yaml says how this step comes down".into()));
-                blocking.push(format!("{} {} (undeclared)", p.n, p.label));
-            }
-            Some(d) if d.action == "compose-down" => {
-                let dirs = serde_json::to_string(&d.dirs)?;
-                let cmd = format!("cd '{}/ops/ansible' && {} {} teardown-compose.yml -e target={} -e teardown_component={} -e 'teardown_dirs={dirs}'", s.repo, s.ansible_pre, s.inv, s.group, d.component);
-                checks.push(row("note", format!("compose-down: stop {}, volumes kept", d.component)));
-                checks.push(row("cmd", cmd.clone()));
+    for (n, head, label) in applied.iter().rev() {
+        checks.push(row("phase", format!("=== Teardown of {head} {label} ===")));
+        let Some(d) = teardown_decl(&decls, label) else {
+            checks.push(row("note", "undeclared: no line in ops/goatbuilder/teardown.yaml says how this step comes down".into()));
+            blocking.push(format!("{n} {label} (undeclared)"));
+            continue;
+        };
+        if let Some(cmd) = teardown_cmd(&s, d)? {
+            let why = if d.why.is_empty() { String::new() } else { format!(" ({})", d.why) };
+            checks.push(row("note", format!("{}: {}{why}", d.action, teardown_what(&d.action, &d.component))));
+            checks.push(row("cmd", cmd.clone()));
+            if SERVICE_ACTIONS.contains(&d.action.as_str()) || !services {
                 cmds.push((d.component.clone(), cmd));
+            } else {
+                blocking.push(format!("{n} {label} ({})", d.action));
             }
-            Some(d) => {
-                checks.push(row("note", format!("{}: {}", d.action, d.why)));
-                if d.action == "refused" || d.action == "designed" {
-                    blocking.push(format!("{} {} ({})", p.n, p.label, d.action));
-                }
+        } else {
+            checks.push(row("note", format!("{}: {}", d.action, d.why)));
+            if d.action == "refused" || d.action == "designed" {
+                blocking.push(format!("{n} {label} ({})", d.action));
             }
         }
     }
@@ -1283,7 +1349,7 @@ pub fn teardown(repo: &Path, o: &Options, services: bool) -> Result<Report> {
         return Ok(r);
     }
     let left = if blocking.is_empty() { String::new() } else { format!("; {} step(s) left in place", blocking.len()) };
-    checks.push(row("phase", format!("=== Teardown verdict: {} service(s) come down, volumes kept{left}. Records go to teardown.jsonl; deploy-history.jsonl is untouched. ===", cmds.len())));
+    checks.push(row("phase", format!("=== Teardown verdict: {} step(s) come down, volumes kept{left}. Records go to teardown.jsonl; deploy-history.jsonl is untouched. ===", cmds.len())));
     if o.dry_run {
         return Ok(Report::new("teardown", checks, EXIT_OK));
     }
@@ -1338,8 +1404,47 @@ mod tests {
         let full = teardown(&repo_root(), &o, false).unwrap();
         assert!(full.checks.iter().any(|c| c.detail.starts_with("=== Teardown verdict: refused:")));
         let svc = teardown(&repo_root(), &Options { from: 12, ..o }, true).unwrap();
-        assert!(svc.checks.iter().any(|c| c.detail.contains("service(s) come down, volumes kept")));
+        assert!(svc.checks.iter().any(|c| c.detail.contains("step(s) come down, volumes kept")));
         assert!(svc.checks.iter().filter(|c| c.detail.contains("teardown-compose.yml")).count() >= 4);
+    }
+
+    /// Phase 8 is two scripted steps on an internet site, the play's IP file
+    /// handed to the recorder, and no step of the run is manual but phase 11.
+    #[test]
+    fn phase_8_enrols_and_records_with_no_pause() {
+        let o = Options { env: "zagros_prod", site: "zagros-prod", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
+        let s = read_site(&repo_root(), &o).unwrap();
+        let ev = plan(&repo_root(), &s, &o, "goatbuilder standup zagros_prod --site zagros-prod");
+        let p8: Vec<&Phase> = ev.iter().filter_map(|e| if let Event::Phase(p) = e { Some(p) } else { None }).filter(|p| p.n == 8).collect();
+        assert_eq!(p8.iter().map(|p| p.kind).collect::<Vec<_>>(), vec!["A", "T"]);
+        let ips = format!("{}/standup-zagros-prod-mesh-ips.json", s.state_dir);
+        assert!(p8[0].cmd.contains(&format!("mesh-enroll-host.yml -e target=zagros_prod_hosts -e mesh_ips_out='{ips}'")));
+        assert!(p8[1].cmd.ends_with(&format!("standup-mesh-record.py' zagros-prod --ips '{ips}'")));
+        let manual: Vec<u32> = ev.iter().filter_map(|e| if let Event::Phase(p) = e { Some(p) } else { None }).filter(|p| p.kind == "MANUAL").map(|p| p.n).collect();
+        assert_eq!(manual, vec![11]);
+    }
+
+    /// Every step the standup applies now has a built way down or a reason it
+    /// stays: no `designed` declaration is left, the router's compose path is
+    /// the site's, the shared-project services stop by name, the tunnel client
+    /// stops by unit, and the cross-goatnet removal is a command `--services`
+    /// leaves in place.
+    #[test]
+    fn the_rest_of_the_teardown_is_declared_and_built() {
+        let decls = load_teardown(&repo_root()).unwrap();
+        assert!(decls.iter().all(|d| d.action != "designed"), "a step is still only designed");
+        let o = Options { env: "zagros_prod", site: "zagros-prod", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
+        let s = read_site(&repo_root(), &o).unwrap();
+        let cmd = |label: &str| teardown_cmd(&s, teardown_decl(&decls, label).unwrap()).unwrap().unwrap();
+        assert!(cmd("zenoh router").contains(r#"{"var":"goat_zenoh_compose_dir","default":"/opt/zagros-prod-zenoh"}"#));
+        assert!(cmd("[internet] dashboard").contains(r#"teardown-service-stop.yml -e target=zagros_prod_hosts -e teardown_component=netbird-dashboard -e teardown_project=/opt/mgmt-host -e 'teardown_services=["dashboard","dashboard-admin"]'"#));
+        assert!(cmd("[internet] relay-connect (rathole-client, site-rathole-client.yml)").contains(r#"teardown-systemd.yml -e target=zagros_prod_hosts -e teardown_component=rathole-client -e 'teardown_units=["rathole-client@*.service"]'"#));
+        assert!(cmd("observability host: stack (Prometheus)").contains("-e target=zagros_prod_obs_hosts"));
+        assert!(cmd("join the cross-goatnet surfaces").ends_with("/ops/goatnets/cross-env-apply.sh' --absent zagros-prod"));
+        let svc = teardown(&repo_root(), &Options { from: 13, ..o }, true).unwrap();
+        assert!(svc.checks.iter().any(|c| c.detail.contains("0 step(s) come down, volumes kept; 1 step(s) left in place")), "--services leaves the cross-env removal in place");
+        let full = teardown(&repo_root(), &Options { from: 13, ..o }, false).unwrap();
+        assert!(full.checks.iter().any(|c| c.detail.contains("1 step(s) come down")), "a full teardown of phase 14 runs the cross-env removal");
     }
 
     #[test]

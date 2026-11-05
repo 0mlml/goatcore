@@ -72,6 +72,22 @@ MANDATORY = re.compile(r"\b(" + IDENT + r")\s*\|\s*mandatory\b")
 CONDITIONAL_LINE = re.compile(r"\s(?:and|or|if|else)\s|^\s*-?\s*when:|^\s*-\s*not\s")
 
 
+def env_lookup_is_a_need(val):
+    """Whether a value's env lookup names a variable the run must be given. Three shapes
+    read the environment without needing it: `lookup(...) | default('x')` and
+    `lookup(...) or 'x'` declare a fallback (group_vars/all.yml's ghcr_org, source_repo),
+    and `{% if lookup('env', 'X') %}` tests the run's own context — group_vars/all.yml's
+    aws_cmd asks whether the run is already inside aws-vault (AWS_VAULT), and renders
+    the aws-vault prefix when it is not."""
+    if "default(" in val and "true)" not in val.replace(" ", ""):
+        return False
+    if re.search(r"""\)\s+or\s+['"][^'"]+['"]""", val):
+        return False
+    if re.search(r"""\{%-?\s*if\s+lookup\(\s*['"]env['"]""", val):
+        return False
+    return True
+
+
 def mandatory_vars(text):
     """`x | mandatory` outside a conditional expression: inside `a and (x | mandatory)` the
     filter is short-circuited away whenever `a` is false, so it is not an unconditional need."""
@@ -918,10 +934,8 @@ def main():
                 if var in words and isinstance(val, str):
                     m = ENV_LOOKUP.search(val)
                     if m and not env_supplied(m.group(1)) and not any(k[1] == var for k in unsupplied):
-                        if "default(" in val and "true)" not in val.replace(" ", ""):
-                            continue   # lookup(...) | default('x'): a declared fallback, not a need
-                        if re.search(r"""\)\s+or\s+['"][^'"]+['"]""", val):
-                            continue   # lookup(...) or 'x' (group_vars/all.yml's ghcr_org, source_repo): the same declared fallback
+                        if not env_lookup_is_a_need(val):
+                            continue
                         unsupplied.setdefault((group, var, m.group(1)), set()).add("templated by a reached play or role")
             # Role defaults bind secrets too (goat-get's release token reads
             # GOAT_CLI_RELEASE_TOKEN, else GH_TOKEN, else GHCR_READ_TOKEN): the same

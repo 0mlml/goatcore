@@ -69,7 +69,7 @@ EOF
   mkdir -p "$tmp/green/group_vars/wired_obs_hosts"
   cat > "$tmp/green/group_vars/wired_obs_hosts/vars.yml" <<'EOF'
 pagerduty_integration_key: "{{ lookup('env', 'PAGERDUTY_INTEGRATION_KEY') | default('', true) }}"
-deadman_webhook_url: "http://100.127.0.222:9099/"
+deadman_webhook_url: "http://100.127.0.224:9099/"
 EOF
   KNOWN_OPEN_FILE=/dev/null "$self" "$tmp/green" >/dev/null
   echo "self-test: GREEN proven — wired obs scope passes"

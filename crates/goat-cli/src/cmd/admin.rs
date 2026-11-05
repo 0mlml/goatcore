@@ -5106,7 +5106,7 @@ fn native_router_endpoint_for(
     env: Option<&str>,
     profile: &crate::profile::Profile,
 ) -> Option<String> {
-    if let Some(v) = profile.goatnet_endpoints().router_endpoint {
+    if let Some(v) = profile.goatnet_endpoints_for(env).router_endpoint {
         return Some(v);
     }
     native_router_endpoint(env).map(str::to_string)
@@ -5158,7 +5158,7 @@ pub(crate) fn native_netbird_config_for(
     env: Option<&str>,
     profile: &crate::profile::Profile,
 ) -> Option<NbEnvConfig> {
-    let g = profile.goatnet_endpoints();
+    let g = profile.goatnet_endpoints_for(env);
     let base = native_netbird_config(env);
     match (base, g.netbird_mgmt_url.clone(), g.netbird_token_env.clone()) {
         // Nothing in the table and no complete profile declaration: unsupported,
@@ -5195,13 +5195,15 @@ fn native_netbird_config(env: Option<&str>) -> Option<NbEnvConfig> {
             mgmt_url: "https://netbird.zagros.example",
             token_env_var: "ZAGROS_NB_API_TOKEN",
             site_prefix: "ZAGROS",
-            rosenpass: true,
+            // rosenpass_enabled is false in this goatnet's group_vars.
+            rosenpass: false,
         }),
         "zagros-prod" => Some(NbEnvConfig {
             mgmt_url: "https://netbird.zagros-prod.example",
             token_env_var: "ZAGROS_PROD_NB_API_TOKEN",
             site_prefix: "ZAGROS-PROD",
-            rosenpass: true,
+            // rosenpass_enabled is false in this goatnet's group_vars.
+            rosenpass: false,
         }),
         // mgmt_url = public_mgmt_fqdn, site_prefix =
         // netbird_acl_taxonomy[<env>].site_prefix, and rosenpass FALSE
@@ -6441,7 +6443,7 @@ pub(crate) fn native_ory_config_for(
     env: Option<&str>,
     profile: &crate::profile::Profile,
 ) -> Option<OryEnvConfig> {
-    let g = profile.goatnet_endpoints();
+    let g = profile.goatnet_endpoints_for(env);
     let base = native_ory_config(env);
     match (base.is_none(), g.ory_auth_url.clone(), g.ory_ssh_host.clone()) {
         (true, None, _) | (true, _, None) => None,
@@ -6473,14 +6475,14 @@ pub(crate) fn native_ory_config(env: Option<&str>) -> Option<OryEnvConfig> {
         .unwrap_or_else(|_| "http://127.0.0.1:4434".to_string());
     match env? {
         "zagros" => Some(OryEnvConfig {
-            ssh_host: "100.127.0.180",
+            ssh_host: "100.127.0.182",
             ssh_user: "goat",
             kratos_admin_url,
             auth_url: "https://auth.zagros.netbird.zagros.example",
             ssh_proxy: ssh_proxy_for("zagros"),
         }),
         "zagros-prod" => Some(OryEnvConfig {
-            ssh_host: "100.127.0.222",
+            ssh_host: "100.127.0.224",
             // This goatnet uses its own baseline SSH account, declared in its inventory.
             ssh_user: "goat",
             kratos_admin_url,
@@ -6491,7 +6493,7 @@ pub(crate) fn native_ory_config(env: Option<&str>) -> Option<OryEnvConfig> {
         // GOAT_ONBOARD_KRATOS_LOCAL=1 and never uses it, but a laptop-run
         // onboard against this goatnet does.
         "zagros-dev" => Some(OryEnvConfig {
-            ssh_host: "100.127.0.153",
+            ssh_host: "100.127.0.155",
             ssh_user: "goat",
             kratos_admin_url,
             auth_url: "https://auth.zagros-dev.examplebird.zagros-dev.example",
@@ -12822,7 +12824,7 @@ ory_ssh_user = "operator"
         );
         let nb = native_netbird_config_for(Some("zagros"), &p).expect("zagros is in the table");
         assert_eq!(nb.mgmt_url, "https://netbird.zagros.example");
-        assert!(nb.rosenpass, "zagros's table value is rosenpass ON and must survive");
+        assert!(!nb.rosenpass, "zagros's table value is rosenpass OFF (group_vars) and must survive");
     }
 
     #[test]
@@ -12831,18 +12833,18 @@ ory_ssh_user = "operator"
         // mistake this overlay must not make.
         let (_td, absent) = profile_with("netbird_mgmt_url = \"https://x\"\n");
         assert!(
-            native_netbird_config_for(Some("zagros"), &absent).unwrap().rosenpass,
-            "absent must keep zagros's ON"
+            !native_netbird_config_for(Some("zagros"), &absent).unwrap().rosenpass,
+            "absent must keep zagros's OFF"
         );
         let (_td2, garbage) = profile_with("netbird_rosenpass = \"perhaps\"\n");
         assert!(
-            native_netbird_config_for(Some("zagros"), &garbage).unwrap().rosenpass,
-            "an unparseable value must keep the table's, not silently mean false"
+            !native_netbird_config_for(Some("zagros"), &garbage).unwrap().rosenpass,
+            "an unparseable value must keep the table's, not silently mean true"
         );
-        let (_td3, off) = profile_with("netbird_rosenpass = \"false\"\n");
+        let (_td3, on) = profile_with("netbird_rosenpass = \"true\"\n");
         assert!(
-            !native_netbird_config_for(Some("zagros"), &off).unwrap().rosenpass,
-            "an explicit false must be honoured"
+            native_netbird_config_for(Some("zagros"), &on).unwrap().rosenpass,
+            "an explicit true must be honoured"
         );
     }
 
@@ -13018,8 +13020,10 @@ ory_ssh_user = "operator"
 
     #[test]
     fn native_netbird_config_carries_rosenpass_flag() {
-        // The canary goatnet is on; unknown env → None; no env → None (no silent default).
-        assert!(native_netbird_config(Some("zagros")).unwrap().rosenpass);
+        // Rosenpass is off on every live goatnet, matching each
+        // goatnet's rosenpass_enabled; unknown env → None; no env → None.
+        assert!(!native_netbird_config(Some("zagros")).unwrap().rosenpass);
+        assert!(!native_netbird_config(Some("zagros-prod")).unwrap().rosenpass);
         assert!(native_netbird_config(None).is_none());
         assert!(native_netbird_config(Some("vega")).is_none());
     }
@@ -13096,7 +13100,7 @@ ory_ssh_user = "operator"
     #[test]
     fn native_ory_config_known_and_unknown() {
         let zagros = native_ory_config(Some("zagros")).unwrap();
-        assert_eq!(zagros.ssh_host, "100.127.0.180");
+        assert_eq!(zagros.ssh_host, "100.127.0.182");
         assert_eq!(zagros.kratos_admin_url, "http://127.0.0.1:4434");
         assert!(native_ory_config(Some("vega")).is_none());
         // No --env resolves to no config: an unset env never means a goatnet.
@@ -13145,7 +13149,7 @@ ory_ssh_user = "operator"
         let args = ssh_kratos_argv(&cfg, "curl -sS http://127.0.0.1:4434/admin/identities");
         assert!(args.iter().any(|a| a == "BatchMode=yes"));
         assert!(args.iter().any(|a| a == "ConnectTimeout=15"));
-        assert_eq!(args[args.len() - 2], "goat@100.127.0.180");
+        assert_eq!(args[args.len() - 2], "goat@100.127.0.182");
         // The remote command is the last word; the body (secrets) is never here.
         assert_eq!(
             args[args.len() - 1],

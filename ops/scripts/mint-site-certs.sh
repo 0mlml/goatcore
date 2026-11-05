@@ -120,7 +120,7 @@ MESH_IP_B="$(yq -r '.mesh_ip_b // ""' "$GROUP_VARS" 2>/dev/null || true)"
 resolve_san() {
   local v="$1"
   case "$v" in
-    TBD_*_CORE_A_MESH_IP|TBD_*_MESH_IP_A) v="$MESH_IP_A" ;;
+    TBD_*_CORE_A_MESH_IP|TBD_*_MESH_IP_A|TBD_ROUTER_MESH_IP) v="$MESH_IP_A" ;;
     TBD_*_CORE_B_MESH_IP|TBD_*_MESH_IP_B) v="$MESH_IP_B" ;;
   esac
   case "$v" in
