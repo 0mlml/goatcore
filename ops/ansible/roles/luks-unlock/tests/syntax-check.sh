@@ -21,6 +21,8 @@ ansible-playbook -i 'localhost,' -c local playbook.yml --syntax-check
 
 echo "[luks-unlock/syntax-check] offline test: clevis-bind-one-line.yml"
 ansible-playbook -i 'localhost,' -c local clevis-bind-one-line.yml
+echo "[luks-unlock/syntax-check] offline test: crypttab-keep-installer.yml"
+ansible-playbook -i 'localhost,' -c local crypttab-keep-installer.yml
 
 echo "[luks-unlock/syntax-check] register-uniqueness lint (workspace)"
 bash ../../../tests/check-register-uniqueness.sh
