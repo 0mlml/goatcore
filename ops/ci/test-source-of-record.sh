@@ -17,6 +17,9 @@
 #   a goatstuff file edited -> GB-064; goatstuff.ref disagrees -> GB-064;
 #   another goatstuff commit layered -> GB-064; no goatstuff checkout -> GB-065
 #   (offline: 0); an overlay file replacing a goatstuff file -> 0
+#   pre-disclosure patches (embargo=), carried in the overlay or declared by
+#   digest in embargo/<id>/patches.sha256: recorded and applied -> 0; any
+#   other change, a missing or altered patch, a marker that disagrees -> GB-064
 # and that a clone (no marker) is still judged by the trunk-remote path.
 # No network, no host.
 set -euo pipefail
@@ -189,6 +192,93 @@ git "${G[@]}" -C "$S/ov" commit -q -m "overlay replaces z"
 git -C "$S/ov" push -q origin main
 assemble_stuff "$STUFF"
 expect "an overlay file replacing a goatstuff file runs" 0 "$CORE" fs
+
+# --- pre-disclosure patches: embargo/<id>/{core,stuff}.patch in the overlay ------
+# Patches are made against the pinned commits: A changes a goatcore role and a
+# goatstuff role, B deletes a goatcore file.
+mkpatch() {   # <repo> <commit> <out> <edit command...>
+  local repo="$1" commit="$2" out="$3"; shift 3
+  rm -rf "$S/p"; git clone -q "$repo" "$S/p"; git -C "$S/p" -c advice.detachedHead=false checkout -q "$commit"
+  (cd "$S/p" && "$@"); git -C "$S/p" diff HEAD > "$out"
+}
+mkdir -p "$S/ov/embargo/A" "$S/ov/embargo/B"
+mkpatch "$S/core" "$CORE" "$S/ov/embargo/A/core.patch" sh -c 'echo "- debug: msg=fixed" >> ops/ansible/roles/x/tasks/main.yml'
+mkpatch "$S/stuff" "$STUFF" "$S/ov/embargo/A/stuff.patch" sh -c 'echo "- debug: msg=fixed" >> ops/ansible/roles/y/tasks/main.yml'
+mkpatch "$S/core" "$CORE" "$S/ov/embargo/B/core.patch" git rm -q ops/ansible/group_vars_all.yml
+echo "# A" > "$S/ov/embargo/A/README.md"; echo "# B" > "$S/ov/embargo/B/README.md"
+git -C "$S/ov" add -A
+git "${G[@]}" -C "$S/ov" commit -q -m "embargo A and B"
+git -C "$S/ov" push -q origin main
+sha256() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+assemble_embargo() {   # goatstuff layered, the patches applied, then the overlay; the marker records them
+  assemble_stuff "$STUFF"
+  (cd "$S/t" && git apply "$S/ov/embargo/A/core.patch" "$S/ov/embargo/A/stuff.patch" "$S/ov/embargo/B/core.patch")
+  printf 'embargo=A/core.patch:%s,A/stuff.patch:%s,B/core.patch:%s\n' "$(sha256 "$S/ov/embargo/A/core.patch")" \
+    "$(sha256 "$S/ov/embargo/A/stuff.patch")" "$(sha256 "$S/ov/embargo/B/core.patch")" >> "$S/t/.goat-assembled"
+}
+
+assemble_embargo
+expect "recorded pre-disclosure patches, current tree runs" 0 "pre-disclosure patches A, B" fs
+D="$(python3 "$S/t/ops/scripts/lib/source_of_record.py" describe --repo "$S/t")"
+if printf '%s' "$D" | grep -q '"embargo":\["A","B"\]'; then ok "describe names the pre-disclosure patches"; else bad "describe with patches: $D"; fi
+OBJ_BEFORE="$(git -C "$S/t" count-objects -v | tr '\n' ' ')$(git -C "$S/stuff" count-objects -v | tr '\n' ' ')"
+fs --quiet >/dev/null 2>&1 || true
+OBJ_AFTER="$(git -C "$S/t" count-objects -v | tr '\n' ' ')$(git -C "$S/stuff" count-objects -v | tr '\n' ' ')"
+if [ "$OBJ_BEFORE" = "$OBJ_AFTER" ]; then ok "the check writes no object into the tree or the goatstuff checkout"; else bad "objects written: $OBJ_BEFORE -> $OBJ_AFTER"; fi
+
+echo "- debug: msg=more" >> "$S/t/ops/ansible/roles/x/tasks/main.yml"
+expect "a patched goatcore file edited further" 1 "pre-disclosure patches change are not" fs
+assemble_embargo
+echo "- debug: msg=more" >> "$S/t/ops/ansible/roles/y/tasks/main.yml"
+expect "a patched goatstuff file edited further" 1 "pre-disclosure patches change are not" fs
+assemble_embargo
+echo "core: example" > "$S/t/ops/ansible/group_vars_all.yml"
+expect "a file a patch deletes is present" 1 "pre-disclosure patches change are not" fs
+assemble_embargo
+echo "- debug: msg=hand" > "$S/t/ops/ansible/roles/w.yml"
+expect "with patches, any other goatcore change is still refused" 1 "neither goatcore" fs
+assemble_embargo
+grep -v '^embargo=' "$S/t/.goat-assembled" > "$S/m"; mv "$S/m" "$S/t/.goat-assembled"
+expect "the overlay carries patches the marker does not record" 1 "not the ones the overlay commit declares" fs
+assemble_embargo
+sed -i.bak -E 's/(A\/core\.patch:)[0-9a-f]{8}/\100000000/' "$S/t/.goat-assembled"; rm -f "$S/t/.goat-assembled.bak"
+expect "a recorded patch digest differs" 1 "not the ones the overlay commit declares" fs
+assemble_stuff "$STUFF"
+printf 'embargo=A/core.patch:%s,A/stuff.patch:%s,B/core.patch:%s\n' "$(sha256 "$S/ov/embargo/A/core.patch")" \
+  "$(sha256 "$S/ov/embargo/A/stuff.patch")" "$(sha256 "$S/ov/embargo/B/core.patch")" >> "$S/t/.goat-assembled"
+expect "patches recorded but not applied" 1 "pre-disclosure patches change are not" fs
+
+# the declared form: the overlay keeps only patches.sha256; the assemble step
+# fetched the patches and wrote them into the tree at the same paths
+for id in A B; do
+  (cd "$S/ov/embargo/$id" && for k in core stuff; do [ -f "$k.patch" ] && printf '%s  %s.patch\n' "$(sha256 "$k.patch")" "$k"; done; true) > "$S/ov/embargo/$id/patches.sha256"
+done
+mkdir -p "$S/held"; cp -R "$S/ov/embargo" "$S/held/"
+git -C "$S/ov" rm -q embargo/A/core.patch embargo/A/stuff.patch embargo/B/core.patch
+git -C "$S/ov" add -A
+git "${G[@]}" -C "$S/ov" commit -q -m "embargo A and B declared by digest"
+git -C "$S/ov" push -q origin main
+assemble_declared() {
+  assemble_stuff "$STUFF"
+  for f in A/core.patch A/stuff.patch B/core.patch; do cp "$S/held/embargo/$f" "$S/t/embargo/$f"; done
+  (cd "$S/t" && git apply "$S/held/embargo/A/core.patch" "$S/held/embargo/A/stuff.patch" "$S/held/embargo/B/core.patch")
+  printf 'embargo=A/core.patch:%s,A/stuff.patch:%s,B/core.patch:%s\n' "$(sha256 "$S/held/embargo/A/core.patch")" \
+    "$(sha256 "$S/held/embargo/A/stuff.patch")" "$(sha256 "$S/held/embargo/B/core.patch")" >> "$S/t/.goat-assembled"
+}
+assemble_declared
+expect "patches declared by digest and fetched into the tree, current tree runs" 0 "pre-disclosure patches A, B" fs
+assemble_declared
+echo "# changed" >> "$S/t/embargo/A/core.patch"
+expect "a fetched patch differs from its declared digest" 1 "in this tree has sha256" fs
+assemble_declared
+rm -f "$S/t/embargo/B/core.patch"
+expect "a declared patch missing from the tree" 1 "not in this tree" fs
+
+git -C "$S/ov" rm -q -r embargo
+git "${G[@]}" -C "$S/ov" commit -q -m "embargo A and B disclosed"
+git -C "$S/ov" push -q origin main
+assemble_stuff "$STUFF"
+expect "patches removed from the overlay, unpatched tree runs" 0 "$CORE" fs
 
 # a marker without goatstuff_ref records no goatstuff
 assemble

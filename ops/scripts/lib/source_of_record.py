@@ -12,6 +12,7 @@ overlay's assemble step:
     overlay_path=<the overlay checkout it was copied from>   (optional;
                                                                overlay_dir= also read)
     goatstuff_path=<the goatstuff checkout it was copied from> (optional)
+    embargo=<id>/core.patch:<sha256>,<id>/stuff.patch:<sha256>,…  (optional)
 
 Its source of record is the pair (goatcore commit, overlay commit). The tree is
 current when its git HEAD is the goatcore commit goatcore.ref declares, every
@@ -27,6 +28,21 @@ goatstuff file under ops/ the overlay does not replace is in the tree byte for
 byte as that commit has it. Without goatstuff_ref nothing about goatstuff is
 checked or recorded.
 
+Pre-disclosure patches. An overlay may declare fixes that are not yet public as
+patches, embargo/<id>/core.patch (applied to goatcore) and embargo/<id>/stuff.patch
+(applied to goatstuff): either it carries the patch file, or it declares the
+patch's sha256 in embargo/<id>/patches.sha256 ("<sha256>  core.patch" lines) and
+its assemble step fetches the patch from where the overlay names it and writes
+it into the tree at that path. The assemble step applies them, in id order,
+after goatstuff and before the overlay, and records each in the embargo= line
+with the sha256 of its bytes. The tree is then current only if the marker lists
+exactly the patches the overlay commit declares, with those digests, and every
+file the patches change is in the tree byte for byte as the pinned commit plus
+the patches has it (a file a patch deletes is absent). Those files are judged
+against that and nothing else; any other change to a goatcore or goatstuff file
+is still refused. Without the embargo= line and with no patches in the overlay
+commit, nothing about patches is checked or recorded.
+
     source_of_record.py kind     --repo DIR   prints "assembled" or "clone"
     source_of_record.py check    --repo DIR [--offline] [--quiet]
         contract C3 for an assembled tree. Exit 0 (current or ahead), 1 (refused:
@@ -39,7 +55,8 @@ checked or recorded.
         clone      {"commit": <HEAD>}
         assembled  {"goatcore": <commit>, "goatcore_ref": <goatcore.ref>,
                     "overlay": <commit>, "goatcore_export_of": <commit>?,
-                    "goatstuff": <commit>?, "goatstuff_ref": <goatstuff.ref>?}
+                    "goatstuff": <commit>?, "goatstuff_ref": <goatstuff.ref>?,
+                    "embargo": [<id>, …]?}
 
 Overlay checkout: the marker's overlay_path (or overlay_dir), else
 $GOAT_OVERLAY_DIR. Overlay trunk remote: $GOAT_OVERLAY_TRUNK_REMOTE, else
@@ -47,11 +64,13 @@ $GOAT_OVERLAY_REMOTE, else `origin`. goatstuff checkout: the marker's
 goatstuff_path, else $GOAT_GOATSTUFF_DIR. Standard library only.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 
 MARKER = ".goat-assembled"
 # What the overlay's assemble step does not copy (it is not part of the tree).
@@ -62,6 +81,11 @@ NOT_DEPLOYED = [":(exclude)docs", ":(exclude)README.md", ":(exclude)assemble.sh"
 # Where a goatcore file edited inside the assembled tree changes a deploy.
 CORE_DEPLOYED = ["ops", "goatcore.ref"]
 SHA = re.compile(r"^[0-9a-f]{40}$")
+# A pre-disclosure patch in the overlay: embargo/<id>/core.patch or embargo/<id>/stuff.patch.
+PATCH = re.compile(r"^embargo/([A-Za-z0-9][A-Za-z0-9._-]*)/(core|stuff)\.patch$")
+# The overlay's declaration of patches it does not carry itself: sha256sum lines "<sha256>  <kind>.patch".
+DECLARED = re.compile(r"^embargo/([A-Za-z0-9][A-Za-z0-9._-]*)/patches\.sha256$")
+DECLARED_LINE = re.compile(r"^([0-9a-f]{64}) [ *](core|stuff)\.patch$")
 
 
 def git(repo, *args, env=None, raw=False):
@@ -162,13 +186,15 @@ def tree_matches_overlay(repo, od, commit):
     return differing(repo, want)
 
 
-def tree_matches_goatstuff(repo, sd, commit, overlay_paths):
+def tree_matches_goatstuff(repo, sd, commit, overlay_paths, patched_paths=()):
     """goatstuff files under ops/ the overlay does not replace whose assembled bytes differ from the commit's, or are missing."""
     want, err = blobs(sd, commit, ["ops"])
     if want is None:
         return None, err
     for p in overlay_paths:
         want.pop(p, None)  # copied after goatstuff: the overlay's bytes win, checked against the overlay
+    for p in patched_paths:
+        want.pop(p, None)  # changed by a pre-disclosure patch: judged against the patched result
     return differing(repo, want)
 
 
@@ -188,6 +214,154 @@ def stray_core_edits(repo, overlay_paths):
         if path not in overlay_paths:
             stray.append(path)
     return stray, ""
+
+
+def embargo_entries(m):
+    """[(embargo/<id>/<core|stuff>.patch, sha256)] from the marker's embargo= line, in its order."""
+    out = []
+    for item in (m.get("embargo") or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        path, _, digest = item.rpartition(":")
+        out.append(("embargo/" + path, digest))
+    return out
+
+
+def embargo_ids(entries):
+    return sorted({p.split("/")[1] for p, _ in entries if p.count("/") >= 2})
+
+
+def patched(base, commit, patches):
+    """{path: blob, or None when deleted} after applying patches, in order, to commit in base.
+
+    The patches are applied to a scratch index with a scratch object store (base's
+    objects borrowed read-only), so nothing in base changes.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        rc, objects, err = git(base, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+        if rc != 0:
+            return None, err
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"),
+                   GIT_OBJECT_DIRECTORY=os.path.join(tmp, "objects"),
+                   GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
+        os.makedirs(env["GIT_OBJECT_DIRECTORY"])
+        rc, _, err = git(base, "read-tree", commit, env=env)
+        if rc != 0:
+            return None, err
+        for p in patches:
+            rc, _, err = git(base, "apply", "--cached", "--whitespace=nowarn", p, env=env)
+            if rc != 0:
+                return None, f"{p} does not apply to {commit[:12]}: {err}"
+        rc, out, err = git(base, "diff-index", "--cached", "--no-renames", "-z", "--name-status", commit, env=env, raw=True)
+        if rc != 0:
+            return None, err
+        recs = [r for r in out.split("\0") if r]
+        changed = {}
+        for status, path in zip(recs[0::2], recs[1::2]):
+            changed[path] = None if status.startswith("D") else ""
+        kept = [p for p, v in changed.items() if v is not None]
+        if kept:
+            rc, out, err = git(base, "ls-files", "-s", "-z", "--", *kept, env=env, raw=True)
+            if rc != 0:
+                return None, err
+            for rec in out.split("\0"):
+                if rec:
+                    meta, path = rec.split("\t", 1)
+                    changed[path] = meta.split()[1]
+        return changed, ""
+
+
+def declared_patches(od, commit, supplied):
+    """{embargo/<id>/<kind>.patch: sha256} the overlay commit declares, or (None, error).
+
+    A patch is declared by a line of embargo/<id>/patches.sha256 (the patch is
+    fetched by the assemble step from where the overlay names it), or by the
+    overlay carrying the patch file itself.
+    """
+    out = {}
+    for p in sorted(supplied):
+        hit = DECLARED.match(p)
+        if hit:
+            rc, text, err = git(od, "show", f"{commit}:{p}", raw=True)
+            if rc != 0:
+                return None, err
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                d = DECLARED_LINE.match(line)
+                if not d:
+                    return None, f"{p}: not a '<sha256>  <core|stuff>.patch' line: {line[:60]}"
+                out[f"embargo/{hit.group(1)}/{d.group(2)}.patch"] = d.group(1)
+    for p in sorted(supplied):
+        if PATCH.match(p):
+            blob = subprocess.run(["git", "-C", od, "cat-file", "blob", f"{commit}:{p}"], capture_output=True)
+            if blob.returncode != 0:
+                return None, blob.stderr.decode(errors="replace").strip()
+            digest = hashlib.sha256(blob.stdout).hexdigest()
+            if out.get(p, digest) != digest:
+                return None, f"{p} is carried with sha256 {digest[:12]} but patches.sha256 declares {out[p][:12]}"
+            out[p] = digest
+    return out, ""
+
+
+def check_embargo(repo, m, supplied, od, ocsha, ref, sref, sd):
+    """The paths the recorded pre-disclosure patches change, after showing the tree holds exactly them.
+
+    Refuses when the marker's patches or digests are not the ones the overlay
+    commit declares, a patch in the tree differs, a patch does not apply, or a
+    patched file is not as the patches make it.
+    """
+    reassemble = "fix: re-assemble from the overlay checkout (its assemble.sh into a new directory) and deploy from that tree."
+    entries = embargo_entries(m)
+    declared, err = declared_patches(od, ocsha, supplied)
+    if declared is None:
+        refuse("GB-064", f"the overlay commit's pre-disclosure patch declaration cannot be read ({err})", [reassemble])
+    if not entries and not declared:
+        return set()
+    if dict(entries) != declared:
+        listed = [f"{p} {d[:12]}" for p, d in sorted(entries)]
+        want = [f"{p} {d[:12]}" for p, d in sorted(declared.items())]
+        refuse("GB-064", "the pre-disclosure patches the marker records are not the ones the overlay commit declares",
+               ["marker: " + (", ".join(listed) or "(none)"), "overlay: " + (", ".join(want) or "(none)"), reassemble])
+    for p, digest in entries:
+        if not os.path.isfile(os.path.join(repo, p)):
+            refuse("GB-064", f"{p} is recorded in the marker but is not in this tree", [reassemble])
+        f = os.path.join(repo, p)
+        with open(f, "rb") as fh:
+            got = hashlib.sha256(fh.read()).hexdigest()
+        if got != digest:
+            refuse("GB-064", f"{p} in this tree has sha256 {got[:12]}, the marker records {digest[:12]}", [reassemble])
+    order = sorted(p for p, _ in entries)
+    core = [os.path.join(repo, p) for p in order if p.endswith("/core.patch")]
+    stuff = [os.path.join(repo, p) for p in order if p.endswith("/stuff.patch")]
+    want = {}
+    if core:
+        got, err = patched(repo, ref, core)
+        if got is None:
+            refuse("GB-065", f"could not apply the pre-disclosure patches to goatcore {ref[:12]} ({err})", [reassemble])
+        want.update(got)
+    if stuff:
+        if sref is None or not sd or not os.path.isdir(sd):
+            refuse("GB-065", "the overlay carries goatstuff patches but this tree names no goatstuff checkout to apply them to", [reassemble])
+        got, err = patched(sd, sref, stuff)
+        if got is None:
+            refuse("GB-065", f"could not apply the pre-disclosure patches to goatstuff {sref[:12]} ({err})", [reassemble])
+        both = sorted(set(got) & set(want))
+        if both:
+            refuse("GB-064", "a path is changed by both a goatcore and a goatstuff patch: " + ", ".join(both[:5]), [reassemble])
+        want.update(got)
+    gone = sorted(p for p, b in want.items() if b is None and os.path.lexists(os.path.join(repo, p)))
+    diff, err = differing(repo, {p: b for p, b in want.items() if b is not None})
+    if diff is None:
+        refuse("GB-065", f"could not read the patched files ({err})", [reassemble])
+    bad = diff + gone
+    if bad:
+        shown = "\n    ".join(bad[:10]) + (f"\n    … and {len(bad) - 10} more" if len(bad) > 10 else "")
+        refuse("GB-064", f"{len(bad)} file(s) the pre-disclosure patches change are not in this tree as the pinned commits plus the patches make them",
+               ["changed or missing:\n    " + shown, reassemble])
+    return set(want)
 
 
 def overlay_tree(od, commit):
@@ -243,8 +417,8 @@ def check(repo, offline, quiet):
                ["changed or missing:\n    " + shown,
                 "Edit the overlay, commit, re-assemble; a deploy renders only what a commit records.", reassemble])
     supplied = overlay_tree(od, ocsha)
+    sd = goatstuff_dir(m) if sref is not None else ""
     if sref is not None:
-        sd = goatstuff_dir(m)
         if not sd or not os.path.isdir(sd):
             if offline:
                 say(f"OFFLINE — no goatstuff checkout to judge goatstuff {sref[:12]} against; proceeding as an offline run.")
@@ -255,7 +429,9 @@ def check(repo, offline, quiet):
         rc, _, _ = git(sd, "rev-parse", "--verify", "--quiet", sref + "^{commit}")
         if rc != 0:
             refuse("GB-064", f"goatstuff commit {sref[:12]} is not in the goatstuff checkout {sd}", [reassemble])
-        sdiff, err = tree_matches_goatstuff(repo, sd, sref, supplied)
+    embargoed = check_embargo(repo, m, supplied, od, ocsha, ref, sref, sd)
+    if sref is not None:
+        sdiff, err = tree_matches_goatstuff(repo, sd, sref, supplied, embargoed)
         if sdiff is None:
             refuse("GB-065", f"could not read goatstuff commit {sref[:12]} ({err})", [reassemble])
         if sdiff:
@@ -265,7 +441,7 @@ def check(repo, offline, quiet):
                     "A change to goatstuff lands in goatstuff and reaches the tree by moving goatstuff.ref.", reassemble])
         sw, _ = blobs(sd, sref, ["ops"])
         supplied = supplied | set(sw or {})
-    stray, err = stray_core_edits(repo, supplied)
+    stray, err = stray_core_edits(repo, supplied | embargoed)
     if stray is None:
         refuse("GB-065", f"could not read this tree's git status ({err})", [reassemble])
     if stray:
@@ -311,8 +487,10 @@ def check(repo, offline, quiet):
             for line in lines[:5]:
                 print(f"    {line}", file=sys.stderr)
         exp = export_of(repo)
+        ids = embargo_ids(embargo_entries(m))
         say(f"assembled tree: goatcore {ref[:12]}" + (f" (export of {exp})" if exp else "")
-            + (f" + goatstuff {sref[:12]}" if sref is not None else "") + f" + overlay {oc[:12]}")
+            + (f" + goatstuff {sref[:12]}" if sref is not None else "") + f" + overlay {oc[:12]}"
+            + (f" + pre-disclosure patches {', '.join(ids)}" if ids else ""))
     print(ref)
 
 
@@ -333,6 +511,9 @@ def describe(repo):
     exp = export_of(repo)
     if exp:
         d["goatcore_export_of"] = exp
+    ids = embargo_ids(embargo_entries(m))
+    if ids:
+        d["embargo"] = ids
     return d
 
 
