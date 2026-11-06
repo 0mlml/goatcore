@@ -48,14 +48,7 @@ pub async fn run_test(args: AclTestArgs) -> anyhow::Result<()> {
     // the files and not in the embedded copy, which answered "no site named"
     // for every such goatnet. Outside a checkout, the embedded copy.
     // The note stays on stderr, apart from JSON and from the verdict.
-    let on_disk = std::env::current_dir().ok().and_then(|cwd| checkout_declaration(&cwd));
-    let decl = match &on_disk {
-        Some((tax, mat)) => {
-            eprintln!("acl test: checking the declaration in this checkout");
-            Declaration::parse(tax, mat)?
-        }
-        None => Declaration::parse(TAXONOMY_YAML, MATRIX_YAML)?,
-    };
+    let decl = declaration("acl test: checking the declaration in this checkout")?;
     let scopes = match &args.scope {
         Some(s) => vec![s.clone()],
         None => decl.scopes(),
@@ -98,6 +91,20 @@ pub async fn run_test(args: AclTestArgs) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("ACL assertions did not hold against the declaration")
     }
+}
+
+/// The ACL declaration that governs here: the checkout's files when the working
+/// directory is inside a goat checkout, else the copy compiled in. `note` goes to
+/// stderr when the checkout's files are used, so the source is never silent.
+pub(crate) fn declaration(note: &str) -> anyhow::Result<Declaration> {
+    let on_disk = std::env::current_dir().ok().and_then(|cwd| checkout_declaration(&cwd));
+    Ok(match &on_disk {
+        Some((tax, mat)) => {
+            eprintln!("{note}");
+            Declaration::parse(tax, mat)?
+        }
+        None => Declaration::parse(TAXONOMY_YAML, MATRIX_YAML)?,
+    })
 }
 
 /// Both declaration files read from the checkout `start` is inside, if any.
@@ -267,6 +274,18 @@ mod tests {
             changed_declaration_files(plain.path()).is_empty(),
             "not a checkout"
         );
+    }
+
+    #[test]
+    fn the_checkouts_declaration_is_the_one_read() {
+        let edited = format!("{MATRIX_YAML}\n# edited\n");
+        let dir = checkout(TAXONOMY_YAML, &edited);
+        let nested = dir.path().join("crates/goat-cli");
+        let (tax, mat) = checkout_declaration(&nested).expect("inside a checkout");
+        assert_eq!(tax, TAXONOMY_YAML);
+        assert_eq!(mat, edited);
+        let plain = tempfile::tempdir().expect("temp dir");
+        assert!(checkout_declaration(plain.path()).is_none(), "not a checkout");
     }
 
     #[test]

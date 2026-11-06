@@ -593,7 +593,7 @@ mod more_tests {
             return; // a public clone of goatcore ships no deployment
         }
         let hs = [sited("zagros"), sited("nova-a"), sited("zagros"), host(&[], "", "")];
-        assert_eq!(goatnets_of(&hs), vec!["zagros".to_string(), "nova-a".to_string()]);
+        assert_eq!(goatnets_of(&hs), vec!["nova-a".to_string(), "zagros".to_string()]);
         // A group-based ledger (every host site-less) spans zero goatnets here.
         assert!(goatnets_of(&[host(&[], "", ""), host(&[], "", "")]).is_empty());
     }
@@ -616,8 +616,8 @@ mod more_tests {
         assert_eq!(e.downcast_ref::<goat_errors::Coded>().map(|c| c.code.as_str()), Some("GB-055"));
         let m = e.to_string();
         assert!(m.contains("deployed on 3 goatnets"), "{m}");
-        assert!(m.contains("zagros, zagros-prod, nova-a"), "{m}");
-        assert!(m.contains("prod included") && m.contains("--site <zagros|zagros-prod|nova-a>"), "{m}");
+        assert!(m.contains("nova-a, zagros, zagros-prod"), "{m}");
+        assert!(m.contains("prod included") && m.contains("--site <nova-a|zagros|zagros-prod>"), "{m}");
     }
 
     #[test]

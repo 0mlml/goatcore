@@ -10,16 +10,16 @@
 //	    --root-cert ops/enrollment/ca/dev/root-cert.pem \
 //	    --root-key  ops/enrollment/ca/dev/ca.key.age \
 //	    --age-identity ~/.config/age/keys.txt \
-//	    --site-id vega \
-//	    --cn mgmt.vega.netbird.legacy.example \
+//	    --site-id site-a \
+//	    --cn mgmt.site-a.galaxy.example \
 //	    --san 198.18.0.1 \
 //	    --san 127.0.0.1 \
-//	    --san mgmt.vega.netbird.legacy.example \
+//	    --san mgmt.site-a.galaxy.example \
 //	    --validity 8760h \
 //	    --eku serverAuth \
-//	    --out-cert ./out/mgmt-vega-a-cert.pem \
-//	    --out-key  ./out/mgmt-vega-a-key.pem \
-//	    [--audit-log ~/.goat/ca-audit.jsonl]
+//	    --out-cert ./out/mgmt-site-a-cert.pem \
+//	    --out-key  ./out/mgmt-site-a-key.pem \
+//	    [--audit-log <path>]
 //
 // On success, writes the leaf cert PEM (mode 0644) and the leaf private
 // key PEM (mode 0400 root:root) and appends a JSON line to the audit log.
@@ -62,13 +62,13 @@ func main() {
 		rootKeyPath  = flag.String("root-key", "", "Path to age-encrypted CA private key file")
 		ageIdentity  = flag.String("age-identity", "", "Path to age identity file (decrypts --root-key OR --intermediate-key)")
 		caID         = flag.String("ca-id", "", "CA identifier carried with audit-log entries; defaults to root-cert filename minus .pem")
-		siteID       = flag.String("site-id", "", "Site identifier (Subject OU); e.g. vega")
+		siteID       = flag.String("site-id", "", "Site identifier (Subject OU); e.g. site-a")
 		cn           = flag.String("cn", "", "Subject CommonName (typically the canonical FQDN)")
 		validity     = flag.Duration("validity", 365*24*time.Hour, "Leaf cert lifetime; default 1 year per ADR 0407")
 		ekuFlag      = flag.String("eku", "serverAuth", "Comma-separated EKU set; values: serverAuth,clientAuth")
 		outCert      = flag.String("out-cert", "", "Path to write the leaf cert PEM (mode 0644)")
 		outKey       = flag.String("out-key", "", "Path to write the leaf key PEM (mode 0400)")
-		auditLog     = flag.String("audit-log", defaultAuditLog(), "Path to append-only JSON audit log")
+		auditLog     = flag.String("audit-log", ca.DefaultAuditLogPath(), "Path to append-only JSON audit log")
 		keyType      = flag.String("key-type", "auto", "Leaf private-key algorithm; values: auto (default — ecdsa-p256 when EKU includes serverAuth, ed25519 otherwise), ed25519, ecdsa-p256. Auto closes F-071 + F-089: every operator-facing TLS leaf must be ECDSA-P256 because Chrome on macOS rejects Ed25519 leaves at TLS handshake.")
 		// F-090 closure path B: when both flags are set, sign leaves
 		// chained through an ECDSA-P256 intermediate. Operators install
@@ -82,7 +82,7 @@ func main() {
 		uriSANs              stringList
 	)
 	flag.Var(&sans, "san", "Subject Alternative Name; repeat once per name/IP. IPs and DNS names are auto-classified.")
-	flag.Var(&uriSANs, "uri-san", "Optional URI Subject Alternative Name; repeat once per URI. Must be an absolute URI (e.g. urn:goat-nova:vendor=org11x). Used by per-peer identity schemes (nova X.509, ADR 0844 production).")
+	flag.Var(&uriSANs, "uri-san", "Optional URI Subject Alternative Name; repeat once per URI. Must be an absolute URI (e.g. urn:goat-galaxy:vendor=example-org). Used by per-peer identity schemes (trial X.509, ADR 0844 production).")
 	flag.Parse()
 
 	if err := run(*rootCertPath, *rootKeyPath, *ageIdentity, *caID, *siteID, *cn, *validity, *ekuFlag, *keyType, *outCert, *outKey, *auditLog, *intermediateCertPath, *intermediateKeyPath, sans, uriSANs); err != nil {
@@ -374,14 +374,6 @@ func loadAgeIdentities(path string) ([]age.Identity, error) {
 	}
 	defer f.Close()
 	return age.ParseIdentities(f)
-}
-
-func defaultAuditLog() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "./ca-audit.jsonl"
-	}
-	return filepath.Join(home, ".goat", "ca-audit.jsonl")
 }
 
 func bytesEqual(a, b []byte) bool {

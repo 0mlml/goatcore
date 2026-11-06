@@ -1056,6 +1056,10 @@ def manifest_yaml(f: dict) -> str:
     body = template[template.index("site_id:"):]
     body = body.replace("zenoh.<SITE>.netbird.<SITE-APEX>", f"zenoh.{n}.{zone}")
     body = body.replace("TBD_ROUTER_MESH_IP", f"TBD_{up}_MESH_IP_A")
+    # The state directory is the one facts() keeps the CA key under, written with
+    # a leading ~ so the committed manifest names no person's home.
+    state, home = str(f["root_key"].parent.parent), os.path.expanduser("~")
+    body = body.replace("TBD_STATE_DIR", "~" + state[len(home):] if state.startswith(home + os.sep) else state)
     body = body.replace("TBD_SITE_ID", n).replace("<SITE>", n).replace("TBD_CA_ID", f["ca_id"])
     body = re.sub(r"[ \t]+# e\.g\. zenoh\.[^\n]*", "", body)
     body = re.sub(r"[ \t]+# from `wt0` after phase 10",

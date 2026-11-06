@@ -33,7 +33,7 @@ func TestSubmit_RealCallerShape(t *testing.T) {
 	// Empty strings for fields the candidate left blank.
 	fullPayload := map[string]any{
 		"name":              "Real Caller",
-		"email":             "person-122@example.org",
+		"email":             "person-109@example.org",
 		"principal_type":    "person",
 		"organization":      "",    // Blank triggers validation_failed
 		"nationality":       "can", // Lowercase nationality triggers bad validation
@@ -195,7 +195,7 @@ func TestSubmit_ValidationEdgeCases(t *testing.T) {
 			name: "organization with no letter or digit cannot form an id",
 			submission: map[string]any{
 				"name":            "Test",
-				"email":           "person-131@example.org",
+				"email":           "person-118@example.org",
 				"principal_type":  "person",
 				"organization":    "!!! ---",
 				"nationality":     "CAN",
@@ -223,7 +223,7 @@ func TestSubmit_ValidationEdgeCases(t *testing.T) {
 			name: "system without nationality is accepted",
 			submission: map[string]any{
 				"name":            "System",
-				"email":           "person-132@example.org",
+				"email":           "person-119@example.org",
 				"principal_type":  "system",
 				"organization":    "Test Org",
 				"nationality":     "",
@@ -237,7 +237,7 @@ func TestSubmit_ValidationEdgeCases(t *testing.T) {
 			name: "person without nationality is refused",
 			submission: map[string]any{
 				"name":            "Person",
-				"email":           "person-120@example.org",
+				"email":           "person-107@example.org",
 				"principal_type":  "person",
 				"organization":    "Test Org",
 				"nationality":     "",

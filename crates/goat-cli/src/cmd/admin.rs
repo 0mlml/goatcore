@@ -165,7 +165,7 @@ pub enum AdminCmd {
         handle: Option<String>,
         /// ORG-scope revoke (cascade). Instead of one handle, revoke EVERY
         /// active member of the affiliation org `<id>` (the `affiliation.id`,
-        /// e.g. `org63x`) — persons + systems, the whole unit. Resolves the
+        /// e.g. `acme`) — persons + systems, the whole unit. Resolves the
         /// members from the declared registry (`docs/operators/roster.json`,
         /// the affiliation-grouped roster) and runs the per-handle revoke for
         /// each, after printing the blast radius and asking to confirm
@@ -1262,7 +1262,7 @@ pub async fn run(ctx: &super::Ctx, op: AdminCmd) -> anyhow::Result<()> {
         // a feature-COVERAGE test and none is a safety test, which meant the
         // ADR 1062 rule that nobody both invites and admits could be defeated on
         // a production goatnet by one command against a hand-written file
-        //. This closes that half.
+        // This closes that half.
         //
         // REVOKE is deliberately untouched on both paths — it is the live
         // offboarding mechanism (ADR 1031) and has already returned above.
@@ -3420,7 +3420,7 @@ async fn pqc_remote(ctx: &super::Ctx, args: &PqcArgs<'_>, selector: &str) -> any
     let zmode = if state.is_on() { "pq" } else { "classical" };
     let zfile = panoscope_core::tls::PQC_MODE_SYSTEM_FILE;
     // Detached zenoh-file write + down → up. The zenoh kx-mode file goes first
-    //, then each netbird
+    // then each netbird
     // call tries NOPASSWD sudo (the mgmt-host baseline) then falls back to
     // non-sudo. The status read-back is written to a file on the peer for the
     // operator to inspect once the link re-forms.
@@ -5977,14 +5977,20 @@ async fn reissue_handset_key_native(
              Raise it in the manifest first."
         );
     }
+    // With no --env the key is for the active context's goatnet: the one its
+    // profile names, else the context's own name.
+    let envname: String = env
+        .map(str::to_string)
+        .or_else(|| profile.goatnet_endpoints().goatnet)
+        .unwrap_or_else(|| profile.context.clone());
+    let envname = envname.as_str();
     let cfg = native_netbird_config_for(env, profile).ok_or_else(|| {
         anyhow::anyhow!(
             "no NetBird facts for goatnet `{}` — run `goat context refresh` in that goatnet's context; \
              the handset key is reissued natively only.",
-            env.unwrap_or("nova")
+            envname
         )
     })?;
-    let envname = env.unwrap_or("nova");
     let tag = manifest.org.short_tag.trim().to_string();
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let key_name = peername::mint(handle, &tag, envname, &date);
@@ -9158,7 +9164,7 @@ async fn onboard_native(
         anyhow::bail!(
             "refusing to write a bundle for `{handle}`: the manifest enables the NetBird mesh \
              surface but no leg provisioned anything, so the bundle would carry no credentials. \
-             This is the stub-mint shape (zagros-prod, 2026-08-04) — nothing was delivered and \
+             This is the stub-mint shape — nothing was delivered and \
              nothing should be reported as delivered. Check the leg warnings above, then re-run."
         );
     }

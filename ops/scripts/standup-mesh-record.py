@@ -97,9 +97,35 @@ def replace_router_sans(text, old_to_new):
     return "".join(out), n
 
 
-def leaves_dir(manifest_text, site):
+def state_dir(repo):
+    """Where this machine keeps the project's local state: `deploy.state_dir` in
+    ops/goatbuilder/goatbuilder.yaml (the key goatbuilder and mint-site-certs.sh
+    read), else ~/.goat/state. Read without a YAML library, block or flow style."""
+    try:
+        text = (Path(repo) / "ops/goatbuilder/goatbuilder.yaml").read_text()
+    except OSError:
+        return "~/.goat/state"
+    # line by line: inside the `deploy:` block (block style) or on its own line (flow style)
+    inside = False
+    for line in text.splitlines():
+        if re.match(r'deploy:', line):
+            flow = re.search(r'\bstate_dir:[ \t]*([^,}\s]+)', line)
+            if flow:
+                return flow.group(1).strip('"\'')
+            inside = True
+            continue
+        if inside:
+            if line.strip() and not line[0] in " \t":
+                break
+            key = re.match(r'[ \t]+state_dir:[ \t]*([^\s#]+)', line)
+            if key:
+                return key.group(1).strip('"\'')
+    return "~/.goat/state"
+
+
+def leaves_dir(manifest_text, site, repo=DEFAULT_REPO):
     m = re.search(r'^out_dir:\s*(\S+)', manifest_text, re.M)
-    d = m.group(1) if m else f"~/.goat/state/{site}-leaves"
+    d = m.group(1) if m else f"{state_dir(repo)}/{site}-leaves"
     return Path(os.path.expanduser(d.strip('"\'')))
 
 
@@ -158,7 +184,7 @@ def main(argv):
         manifest.write_text(mtext)
         print(f"  router leaf: {n} SAN(s) moved to the new mesh IP")
         changed = True
-    out = leaves_dir(mtext, a.site)
+    out = leaves_dir(mtext, a.site, repo)
     pair = [out / "router-cert.pem", out / "router-key.pem"]
     if a.no_mint:
         print("  --no-mint: router certificate left as it is")

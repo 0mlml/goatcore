@@ -40,7 +40,7 @@ import (
 func runProd(idFlag, cardSelector, pivSlotName, mgmtKeyHex, pinFlag, genRootCertPath, rootCN, rootOU, pubKeyDir string) {
 	caID := idFlag
 	if caID == "" {
-		caID = "prod-goat-ca-" + time.Now().UTC().Format("2006-01-02")
+		caID = "prod-" + ca.DefaultCAIDStem + "-" + time.Now().UTC().Format("2006-01-02")
 	} else if !strings.HasPrefix(caID, "prod-") && !strings.HasPrefix(caID, "test-") {
 		caID = "prod-" + caID
 	}

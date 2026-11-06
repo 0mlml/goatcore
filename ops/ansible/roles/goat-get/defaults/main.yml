@@ -54,7 +54,7 @@ goat_get_hostname: "get.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }
 #   - No command exits 0 having failed — 56 defects from a full-surface audit,
 #     including the missing-cert error that named the build machine's own paths
 #     instead of "re-run `goat profile init`" (#1153).
-# Verify 13 assets on USAREUR-AF/goatcore before deploying
+# Verify 13 assets on the release repository before deploying
 # (ops/ci/check-release-asset-parity.sh); goat_get_release_repo resolves
 # through {{ source_repo }} to the primary repo.
 # goat-cli-v0.5.8: `goat warrant apply --membership`, the ADR 1189
@@ -78,7 +78,7 @@ goat_get_hostname: "get.{{ site_id | mandatory }}.{{ site_dns_zone | mandatory }
 #   revoke reports SSH removal evidence, which the offboarding driver needs
 #   (#1976); native onboarding derives the affiliation kind (#1870).
 goat_get_release_tag: "goat-cli-v0.5.14"
-# Resolves through group_vars/all.yml `source_repo` to USAREUR-AF/goatcore;
+# Resolves through group_vars/all.yml `source_repo` to the release repository;
 # ops/ci/check-release-asset-parity.sh confirms the release carries its assets.
 goat_get_release_repo: "{{ source_repo }}"
 goat_get_assets:
@@ -201,8 +201,10 @@ goat_get_traefik_dynamic_dir: "/etc/traefik/dynamic"
 goat_get_traefik_dynamic_filename: "goat-get.yml"
 
 # The pre-rename filename, removed from the host on deploy. Leaving it
-# behind would give Traefik two routers on the same Host() rule.
-goat_get_traefik_dynamic_filename_legacy: "nova-goat-get.yml"
+# behind would give Traefik two routers on the same Host() rule. Empty = no
+# such file on this goatnet's hosts; a goatnet that carried one names it in
+# group_vars.
+goat_get_traefik_dynamic_filename_legacy: ""
 goat_get_traefik_cert_resolver: "le"
 goat_get_traefik_router_name: "goat-get"
 
@@ -223,7 +225,7 @@ goat_get_cloudflare_a_record_ips: []
 # ---------------------------------------------------------------------------
 # jetson-wireguard-kmod assets — OPT-IN parallel payload at get.<site>/kmod/.
 # Same host/cert/DNS/mesh-gate as the goat-cli surface; the public sibling
-# repo's release (jetson-wireguard-kmod, ADR 1118) pinned by tag,
+# repo's release (goat_get_kmod_release_repo, ADR 1118) pinned by tag,
 # fetched host-side into a www/kmod/ subdir nginx already serves. Guarded by
 # goat_get_kmod_enabled, default OFF. Mirrors the SDK family exactly.
 # On-mesh Jetsons install kernelspace WireGuard without any GitHub reach:
@@ -237,7 +239,7 @@ goat_get_kmod_assets:
   - jetson-wireguard-kmod-6.8.12-tegra.tar.gz
   - SHA256SUMS
 
-# octo-pod appliance (octo-pod) — OPT-IN parallel payload at
+# octo-pod appliance (goat_get_octopod_release_repo) — OPT-IN parallel payload at
 # get.<site>/octo-pod/. Same shape as the kmod family: sibling repo pinned by
 # tag, fetched host-side into a www subdir nginx already serves, default OFF.
 #
@@ -292,8 +294,8 @@ goat_get_mirror_prefix: "cli/{{ goat_get_release_tag }}"
 # without the fix that teaches it to recognise the onboard-runner, so `goat
 # admin onboard --native` refuses the runner and onboarding stops on any goatnet
 # that serves it. It has never bitten because every live goatnet still runs
-# 0.4.44, which predates the fence — the exposure is one line in this file
-#. Superseded by v0.5.1.
+# 0.4.44, which predates the fence — the exposure is one line in this file.
+# Superseded by v0.5.1.
 goat_get_refused_release_tags:
   - "goat-cli-v0.5.0"
 
@@ -315,18 +317,19 @@ goat_get_refused_release_reason:
 # book for the same tag is served beside it by the goat-docs role
 # (goat_docs_goatbuilder_release_tag — keep the two tags coupled).
 #
-# The release repo is the source repository by name, not `source_repo`: the
-# release is cut and signed there (ADR 1195 direction — one release source).
+# The release repo is the source repository: the release is cut and signed
+# there (ADR 1195 direction — one release source). A deployment that sets
+# GOAT_SOURCE_REPO names the release repository itself in group_vars.
 #
 # The tag is EMPTY until the first release is cut: the release-asset parity
 # guard (ops/ci/check-release-asset-parity.sh) refuses a pin that names a
-# release that does not exist on USAREUR-AF/goatcore, which is what a tag ahead of its release
+# release that does not exist on the release repository, which is what a tag ahead of its release
 # would be. Bump path, once `goatbuilder/v<semver>` exists: set the tag here
 # (the first is goatbuilder/v0.1.0), flip the flag per goatnet in group_vars
 # (a test goatnet first), re-run goat-get-deploy.yml, record the served tag in
 # deploy-history.yml. The role refuses `enabled` with an empty tag.
 goat_get_goatbuilder_enabled: false
-goat_get_goatbuilder_release_repo: "USAREUR-AF/goatcore"
+goat_get_goatbuilder_release_repo: "{{ source_repo }}"
 goat_get_goatbuilder_release_tag: "goatbuilder/v0.4.1"
 goat_get_goatbuilder_version: "{{ goat_get_goatbuilder_release_tag | regex_replace('^goatbuilder/v', '') }}"
 goat_get_goatbuilder_www_subdir: "goatbuilder"
@@ -367,3 +370,6 @@ goat_get_goatnet_facts:
   ory_ssh_host: "{{ mesh_ip_a | default('', true) }}"
   ory_ssh_user: "{{ ansible_user | default('', true) }}"
   mgmt_ssh_user: "{{ ansible_user | default('', true) }}"
+  # Set per goatnet in its group_vars; empty (the default) leaves the key out.
+  demo_service: "{{ goat_get_demo_service | default('', true) }}"
+  i18n_feedback_email: "{{ goat_get_i18n_feedback_email | default('', true) }}"

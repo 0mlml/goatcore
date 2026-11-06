@@ -833,7 +833,7 @@ func (s *Server) handleOnboardInviteCreate(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if !envPattern.MatchString(env) {
-		s.renderError(w, r, 400, "env must be a lowercase goatnet slug (e.g. zagros)")
+		s.renderError(w, r, 400, "env must be a lowercase goatnet slug (e.g. galaxy)")
 		return
 	}
 	quotaStr := strings.TrimSpace(r.FormValue("machine_quota"))

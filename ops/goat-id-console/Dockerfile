@@ -17,7 +17,10 @@ RUN go mod download
 # Sources.
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
-COPY web/ ./web/
+# Only what web.go embeds; web/e2e (browser tests) never reaches the binary.
+COPY web/web.go ./web/
+COPY web/templates/ ./web/templates/
+COPY web/static/ ./web/static/
 
 ARG VERSION=0.1.0
 ENV CGO_ENABLED=0
@@ -45,7 +48,10 @@ FROM cgr.dev/chainguard/static:latest
 # `docker image inspect` and refuses to deploy an image whose store differs
 # from the goatnet's declared id_admin_console_store. An image without the label
 # predates the Postgres server and is read as "sqlite".
+# goat.id-console.store carries the same fact under a neutral key; the role
+# reads whichever key id_admin_console_store_label names.
 LABEL org.usareur-af.goat-id-console.store="postgres"
+LABEL goat.id-console.store="postgres"
 USER 65532:65532
 COPY --from=build /goat-id-console /usr/local/bin/goat-id-console
 COPY --from=build /store-migrate /usr/local/bin/store-migrate

@@ -60,7 +60,7 @@ pub struct DoctorArgs {
     /// unique sentinel to a scratch sub-key under <KEY> and reads it
     /// back. A round-trip means you can write here; a silent miss is
     /// exactly what an ACL ingress-denial looks like to a publisher
-    ///. Uses only your own publish credential — no COP/admin
+    /// Uses only your own publish credential — no COP/admin
     /// access — so a denied org can self-diagnose. Replaces the
     /// local-readiness and fabric sweep; runs the probe and exits.
     #[arg(long, value_name = "KEY")]

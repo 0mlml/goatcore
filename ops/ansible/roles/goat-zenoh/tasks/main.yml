@@ -1,16 +1,16 @@
 ---
 # ops/ansible/roles/goat-zenoh/tasks/main.yml
 #
-# Nova-mode Zenoh router deployment. Forked from the canonical
+# Trial-fabric Zenoh router deployment. Forked from the canonical
 # zenoh role; the deviations (mTLS, access_control, per-vendor storages,
-# different file paths) were large enough that an `if nova_mode`
+# different file paths) were large enough that a mode switch
 # pile in the parent role would be net-negative on readability.
 #
 # Pre-flight gates the deploy on Track A's substrate being in place:
-#   - nova offline-CA root cert
+#   - the goatnet's offline-CA root cert
 #   - Zenoh router leaf cert + key
-# If any are missing, the role fails fast with a clear error pointing
-# at docs/operations/nova-zenoh-trial-deploy.md §"Pre-flight gate".
+# If any are missing, the role fails fast with a clear error naming what
+# to mint.
 
 - name: Pre-flight | edge-queryable lockdown carries its re-grants
   # Fail CLOSED. The lockdown narrows `trial-peer-r-all`, and every service
@@ -136,7 +136,7 @@
     path: "{{ goat_ca_root_cert_path }}"
   delegate_to: localhost
   become: false
-  register: nova_ca_root_stat
+  register: zenoh_ca_root_stat
   changed_when: false
 
 - name: Pre-flight | the goatnet's router leaf cert exists on controller
@@ -144,7 +144,7 @@
     path: "{{ zenoh_router_leaf_cert_path }}"
   delegate_to: localhost
   become: false
-  register: nova_router_cert_stat
+  register: zenoh_router_cert_stat
   changed_when: false
 
 - name: Pre-flight | the goatnet's router leaf key exists on controller
@@ -152,23 +152,22 @@
     path: "{{ zenoh_router_leaf_key_path }}"
   delegate_to: localhost
   become: false
-  register: nova_router_key_stat
+  register: zenoh_router_key_stat
   changed_when: false
 
 - name: Pre-flight | refuse to deploy without Track A substrate
   ansible.builtin.assert:
     that:
-      - nova_ca_root_stat.stat.exists
-      - nova_router_cert_stat.stat.exists
-      - nova_router_key_stat.stat.exists
+      - zenoh_ca_root_stat.stat.exists
+      - zenoh_router_cert_stat.stat.exists
+      - zenoh_router_key_stat.stat.exists
     fail_msg: >-
       GB-071 goat-zenoh refuses to deploy: the CA root or the router leaf is
       not on this controller. Looked for
         - {{ goat_ca_root_cert_path }}
         - {{ zenoh_router_leaf_cert_path }}
         - {{ zenoh_router_leaf_key_path }}
-      The leaf is read from the site manifest's out_dir
-      (~/.goat/state/{{ goat_router_leaf_site }}-leaves), so any checkout
+      The leaf is read from the site manifest's out_dir, so any checkout
       finds it. If it is missing there, mint it:
       {{ 'router-cert.pem' | goat_leaf_mint(goat_router_leaf_site) }}
 
@@ -337,7 +336,7 @@
     checksum: "sha256:{{ goat_zenoh_rocksdb_backend_sha256 }}"
     mode: "0644"
   register: goat_zenoh_rocksdb_zip
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
   when: not goat_zenoh_fips_variant | bool
 
 - name: Install libzenoh_backend_rocksdb.so to host plugin dir
@@ -346,7 +345,7 @@
     dest: "{{ goat_zenoh_plugin_dir }}/"
     remote_src: true
     creates: "{{ goat_zenoh_plugin_dir }}/libzenoh_backend_rocksdb.so"
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
   when: not goat_zenoh_fips_variant | bool
 
 # Snapshot which issuers the router trusts RIGHT NOW, before the copy below
@@ -385,7 +384,7 @@
     src: "{{ goat_ca_root_cert_path }}"
     dest: "{{ goat_zenoh_tls_dir }}/ca-root-cert.pem"
     mode: "0644"
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
   tags: [trust-anchors]
 
 # Deliver repo-side extra trust roots (e.g. ZAGROS's own offline-CA root during
@@ -400,7 +399,7 @@
   loop_control:
     label: "{{ item.dest }}"
   when: goat_zenoh_extra_ca_deliver | length > 0
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
   tags: [trust-anchors]
 
 # Fold extra trust roots (e.g. the SPIRE CA on ZAGROS) into the same root_ca
@@ -425,10 +424,10 @@
         fi
       done
       echo "extra_ca_changed=${changed}"
-  register: nova_extra_ca
-  changed_when: "'extra_ca_changed=1' in nova_extra_ca.stdout"
+  register: zenoh_extra_ca
+  changed_when: "'extra_ca_changed=1' in zenoh_extra_ca.stdout"
   when: goat_zenoh_extra_ca_paths | length > 0
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
   tags: [trust-anchors]
 
 # Fail CLOSED if the rebuilt bundle lost an issuer it previously carried.
@@ -467,14 +466,14 @@
     src: "{{ zenoh_router_leaf_cert_path }}"
     dest: "{{ goat_zenoh_tls_dir }}/router-cert.pem"
     mode: "0644"
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
 
 - name: Deliver the goatnet's router leaf key to host
   ansible.builtin.copy:
     src: "{{ zenoh_router_leaf_key_path }}"
     dest: "{{ goat_zenoh_tls_dir }}/router-key.pem"
     mode: "0600"
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
 
 # --- F-258 identity-model branch ------------------------------------------
 # per-vendor mode (nova-a / nova-lan / nova-twin): the portal appends per-vendor ACL
@@ -582,7 +581,7 @@
     src: "config.json5.j2"
     dest: "{{ goat_zenoh_config_path }}"
     mode: "0644"
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
   when: not jz_per_vendor
 
 # F-447 — a render that STOPS declaring a storage does not remove what that
@@ -756,7 +755,7 @@
     dest: "{{ goat_zenoh_config_path }}"
     remote_src: true
     mode: "0644"
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
   when: jz_per_vendor
 
 - name: F-258 | remove assemble scratch file
@@ -832,7 +831,7 @@
     src: "docker-compose.yml.j2"
     dest: "{{ goat_zenoh_compose_path }}"
     mode: "0644"
-  notify: Restart nova zenoh router
+  notify: Restart zenoh router
 
 # ---- Boot-race healer ---------------------------------------------
 # The router's host-port publish is pinned to the netbird mesh IP, which
@@ -952,4 +951,4 @@
     name: rollback-ledger
     tasks_from: render-manifest
   vars:
-    render_component: nova-zenoh
+    render_component: "{{ goat_zenoh_ledger_component | default('goat-zenoh') }}"

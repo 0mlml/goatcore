@@ -12,11 +12,13 @@ import (
 	"strings"
 
 	"filippo.io/age/armor"
+
+	"github.com/usareur-af/goatcore/ops/enrollment/x509ca"
 )
 
-// legacyRootCN is the subject every early root shared,
+// legacyRootCN is the subject every early root shared (the x509ca default),
 // which made roots of different goatnets indistinguishable in a chain dump.
-const legacyRootCN = "goat Root CA"
+const legacyRootCN = x509ca.DefaultRootCommonName
 
 // runVerify checks an existing CA without minting anything and exits 1 when
 // any check fails. The round-trip decrypt is not repeated here: it already

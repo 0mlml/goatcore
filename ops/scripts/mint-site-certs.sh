@@ -39,7 +39,8 @@
 #
 # The manifest carries NO secrets: subjects, SANs, EKUs and output paths only.
 # Keys never leave the operator machine; out-dir defaults to
-# ~/.goat/state/<site-id>-leaves .
+# <state dir>/<site-id>-leaves, where the state dir is what the project declares
+# (deploy.state_dir in ops/goatbuilder/goatbuilder.yaml), else ~/.goat/state.
 #
 # Class-A warning (instance-variability-model.md §1): URI SANs are
 # freeze-critical identity. A new site's manifest must use ITS OWN
@@ -105,7 +106,13 @@ case "$ROOT_CERT" in /*) ;; *) ROOT_CERT="$REPO_ROOT/$ROOT_CERT" ;; esac
 ROOT_KEY="$(expand_home "$(yq -r '.ca.root_key' "$MANIFEST")")"
 AGE_IDENTITY="$(expand_home "$(yq -r '.ca.age_identity // "~/.config/age/keys.txt"' "$MANIFEST")")"
 CA_ID="$(yq -r '.ca.ca_id' "$MANIFEST")"
-OUT_DIR="$(expand_home "$(yq -r ".out_dir // \"~/.goat/state/${SITE}-leaves\"" "$MANIFEST")")"
+# Where this machine keeps a project's local state when the manifest names no
+# out_dir: what the project declares (deploy.state_dir in
+# ops/goatbuilder/goatbuilder.yaml, the key goatbuilder reads), else ~/.goat/state.
+STATE_DIR="$(yq -r '.deploy.state_dir // ""' "$REPO_ROOT/ops/goatbuilder/goatbuilder.yaml" 2>/dev/null || true)"
+# shellcheck disable=SC2088  # quoted tilde is deliberate: expand_home expands it
+[ -n "$STATE_DIR" ] || STATE_DIR="~/.goat/state"
+OUT_DIR="$(expand_home "$(yq -r ".out_dir // \"${STATE_DIR}/${SITE}-leaves\"" "$MANIFEST")")"
 
 # Resolve post-enrol mesh-IP SAN placeholders from the site's group_vars so the
 # router cert always carries the node's real wt0 IP without a hand-edit of the

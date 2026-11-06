@@ -435,13 +435,13 @@ impl Profile {
         Some(format!("https://netbird.{backbone}"))
     }
 
-    /// Best-effort derive the Demo Game host + site_id from the profile's
-    /// `portal_endpoint`. `portal.<site>.netbird.<backbone>` yields
-    /// `("https://demogame.<site>.netbird.<backbone>", "<site>")` — the
+    /// Best-effort derive a sibling service's host + site_id from the profile's
+    /// `portal_endpoint`. `portal.<site>.netbird.<backbone>` with `label` yields
+    /// `("https://<label>.<site>.netbird.<backbone>", "<site>")` — the
     /// sibling-surface swap used across the inspection surfaces. Returns None
     /// if the host doesn't match the `<label>.<site>.netbird.<backbone>` shape
     /// (caller then requires `--url`/`--site`).
-    pub fn derive_demogame(&self) -> Option<(String, String)> {
+    pub fn derive_sibling(&self, label: &str) -> Option<(String, String)> {
         let toml = std::fs::read_to_string(self.profile_toml_path()).ok()?;
         let portal = extract_toml_field(&toml, "portal_endpoint")?;
         let scheme = if portal.starts_with("http://") {
@@ -459,13 +459,19 @@ impl Profile {
             return None; // no <site> label before "netbird"
         }
         let site = parts[idx - 1].to_string();
-        // Swap the leading label (e.g. "portal") for "demogame", keeping
+        // Swap the leading label (e.g. "portal") for `label`, keeping
         // <site>.netbird.<backbone> intact.
         let rest = parts[1..].join(".");
         if rest.is_empty() {
             return None;
         }
-        Some((format!("{scheme}://demogame.{rest}"), site))
+        Some((format!("{scheme}://{label}.{rest}"), site))
+    }
+
+    /// The `<site>` label of the profile's `portal_endpoint`
+    /// (`portal.<site>.netbird.<backbone>`), or None for another shape.
+    pub fn derive_site(&self) -> Option<String> {
+        self.derive_sibling("portal").map(|(_, s)| s)
     }
 }
 
@@ -509,6 +515,11 @@ pub struct GoatnetEndpoints {
     /// and is routinely something else (`acme-op`, `demoorg`); a cascade must
     /// not guess a goatnet from it.
     pub goatnet: Option<String>,
+    /// The demo service `goat demo` opens when no name is given: its host label
+    /// and its key prefix (`<name>.<site>.netbird.<backbone>`, `<name>/<site>/**`).
+    pub demo_service: Option<String>,
+    /// Where operators report translation errors (the machine-translation notice).
+    pub i18n_feedback_email: Option<String>,
 }
 
 impl Profile {
@@ -572,6 +583,8 @@ impl Profile {
             ory_ssh_host: g("ory_ssh_host"),
             ory_ssh_user: g("ory_ssh_user"),
             goatnet: g("goatnet"),
+            demo_service: g("demo_service"),
+            i18n_feedback_email: g("i18n_feedback_email"),
         }
     }
 }

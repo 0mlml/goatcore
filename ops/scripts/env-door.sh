@@ -10,50 +10,39 @@
 #   ops/scripts/env-door.sh <env>            # open the tunnel (foreground; Ctrl-C closes)
 #   ops/scripts/env-door.sh <env> --print    # print ssh/ansible usage, don't connect
 #
-# envs: zagros | zagros-prod
+# envs: every goatnet with an ssm door in the door registry
+# (ops/ansible/inventory/doors.yaml); a joiner site rides its founder's door.
 set -euo pipefail
 
 ENV="${1:-}"
 MODE="${2:-run}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-case "$ENV" in
-  zagros)
-    INSTANCE=i-0000083a640499a93   # mesh-dns-zagros-a (ZAGROS mesh peer, SSM)
-    REGION=eu-central-1
-    TARGET_IP=100.127.0.182       # mgmt-zagros-01-thor
-    TARGET_NAME=mgmt-zagros-01-thor
-    PORT=12201
-    DOOR_USER=goat
-    ;;
-  zagros-prod)
-    INSTANCE=i-000002bff6114fc6b   # relay-health-zagros-prod-a (zagros-prod mesh peer, SSM)
-    REGION=eu-central-1
-    TARGET_IP=100.127.0.224         # mgmt-zagros-prod-01-orin
-    TARGET_NAME=mgmt-zagros-prod-01-orin
-    PORT=12202
-    DOOR_USER=goat
-    ;;
-  uk)
-    INSTANCE=i-0000083a640499a93
-    REGION=eu-central-1
-    TARGET_IP=100.127.0.182   # mgmt-zagros-01-thor
-    TARGET_NAME=mgmt-zagros-01-thor
-    PORT=12201
-    DOOR_USER=goat
-    ;;
-  zagros-dev)
-    INSTANCE=i-00000f9f89849d917
-    REGION=eu-central-1
-    TARGET_IP=100.127.0.155   # mgmt-zagros-dev-01-thor
-    TARGET_NAME=mgmt-zagros-dev-01-thor
-    PORT=12203
-    DOOR_USER=goat
-    ;;
-  *)
-    echo "usage: $0 <zagros|zagros-prod> [--print|--ssh-target]" >&2
-    exit 1
-    ;;
-esac
+# The door's facts come from the registry, read at run time: the script names no
+# goatnet. In an assembled tree (goatcore + an environment overlay) this script
+# is goatcore's and the registry is the overlay's. Plain KEY=token lines only;
+# never sourced.
+# The registry is YAML: python3 when it has PyYAML, else Ansible's own
+# interpreter, which always does (the choice deploy-component.sh makes).
+PY="${GOATBUILDER_PYTHON:-python3}"
+if ! "$PY" -c 'import yaml' 2>/dev/null; then
+  _ap="$(head -1 "$(command -v ansible-playbook 2>/dev/null || echo /dev/null)" 2>/dev/null | sed 's/^#!//' | awk '{print $NF}' || true)"
+  if [ -n "$_ap" ] && "$_ap" -c 'import yaml' 2>/dev/null; then PY="$_ap"; fi
+fi
+_facts=""
+[ -z "$ENV" ] || _facts="$("$PY" "$HERE/generate-door-inventory.py" --arm "$ENV" 2>/dev/null || true)"
+if [ -z "$_facts" ]; then
+  echo "usage: $0 <goatnet> [--print|--ssh-target]" >&2
+  [ -z "$ENV" ] || echo "env-door: no ssm door for '$ENV' in ops/ansible/inventory/doors.yaml (or the registry could not be read: it needs python3 with PyYAML)." >&2
+  exit 1
+fi
+while IFS='=' read -r _k _v; do
+  case "$_k" in
+    INSTANCE) INSTANCE="$_v" ;; REGION) REGION="$_v" ;; TARGET_IP) TARGET_IP="$_v" ;;
+    TARGET_NAME) TARGET_NAME="$_v" ;; PORT) PORT="$_v" ;; DOOR_USER) DOOR_USER="$_v" ;;
+  esac
+done <<< "$_facts"
+unset _facts _k _v
 
 # --ssh-target: the one line a caller needs to run something on the host through
 # an OPEN door (door-open.sh <env> first): user@127.0.0.1:port. The release
@@ -106,7 +95,13 @@ command -v session-manager-plugin >/dev/null || {
   exit 1
 }
 
-exec "$(dirname "$0")/with-aws" usareur-af -- \
+# The AWS profile the door opens under is the project's: GOAT_AWS_PROFILE for
+# one command, then deploy.aws_profile in ops/goatbuilder/goatbuilder.yaml, then
+# `default`, the name the AWS tools fall back to themselves.
+AWS_PROFILE_DOOR="${GOAT_AWS_PROFILE:-$("$HERE/project-setting.sh" deploy aws_profile 2>/dev/null || true)}"
+[ -n "$AWS_PROFILE_DOOR" ] || AWS_PROFILE_DOOR=default
+
+exec "$HERE/with-aws" "$AWS_PROFILE_DOOR" -- \
   aws ssm start-session \
     --target "$INSTANCE" \
     --region "$REGION" \

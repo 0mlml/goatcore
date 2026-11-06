@@ -1,14 +1,14 @@
 # goat-zenoh-portal role
 
 Deploys the **vendor self-service portal + message inspector** for the
-Zenoh trial fabric onto a single host (nova-a). Per design at
+Zenoh trial fabric onto a single host. Per design at
 `docs/design/zenoh-trial-fabric.md`
 §"Vendor self-service portal + inspector."
 
 ## What it deploys
 
 - A docker-compose stack with one container running the
-  `ghcr.io/usareur-af/goat-zenoh-portal:<tag>` image (built from
+  `ghcr.io/<ghcr_org>/goat-zenoh-portal:<tag>` image (built from
   `ops/goat-zenoh-portal/Dockerfile`).
 - A persistent volume holding the SQLite registry + minted vendor
   tarballs.
@@ -21,7 +21,7 @@ Zenoh trial fabric onto a single host (nova-a). Per design at
   distroless image).
 - A bind-mount of the operator's age-identity file (read-only) so the
   portal can shell out to `cert-sign --age-identity ...` for vendor
-  mint, AND a bind-mount of the nova CA bundle directory.
+  mint, AND a bind-mount of the goatnet's CA bundle directory.
 - A Traefik route (mesh-only; **no public DNS**) at
   `portal.<trial-zone>` per the operator's `site_dns_zone`.
 
@@ -29,7 +29,7 @@ Zenoh trial fabric onto a single host (nova-a). Per design at
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `portal_image` | image ref | `ghcr.io/usareur-af/goat-zenoh-portal:v0.1.0` |
+| `portal_image` | image ref | none: the goatnet's pin sets it |
 | `portal_listen_port` | host port on the loopback | `8090` |
 | `portal_data_dir` | base for SQLite + bundle tarballs | `/opt/goat-zenoh-portal` |
 | `portal_zenoh_rest_url` | zenohd REST plugin URL | `http://zenohd:8000` |
@@ -38,9 +38,9 @@ Zenoh trial fabric onto a single host (nova-a). Per design at
 | `portal_acl_docker_socket` | Docker Engine API socket (mounted into portal) | `/var/run/docker.sock` |
 | `portal_acl_storage_dir_prefix` | per-vendor rocksdb parent dir | `/var/lib/goat-zenoh/rocksdb` |
 | `portal_acl_reload_fake` | skip SIGHUP step (marker edits still run) | `false` |
-| `portal_ca_bundle_dir` | mounted ro into container | `/etc/nova-ca` |
-| `portal_age_identity_path` | mounted ro into container | `/etc/nova-age/keys.txt` |
-| `portal_ca_root_cert` | path inside container | `/etc/nova-ca/root-cert.pem` |
+| `portal_ca_bundle_dir` | mounted ro into container | `/etc/<site_id>-ca` |
+| `portal_age_identity_path` | mounted ro into container | `/etc/<site_id>-age/keys.txt` |
+| `portal_ca_root_cert` | path inside container | `/etc/<site_id>-ca/root-cert.pem` |
 | `portal_onboarding_packet_path` | mounted ro inside container | `/etc/goat-zenoh-portal/zenoh-trial-onboarding.md` |
 | `portal_operator_api_key` | env-supplied; required | (env: `PORTAL_OPERATOR_API_KEY`) |
 | `portal_operator_approval_required` | flips first-cohort vendor approval | `true` |
@@ -57,7 +57,7 @@ Zenoh trial fabric onto a single host (nova-a). Per design at
   via the host docker socket.
 - An age-identity file at `portal_age_identity_path` containing the
   operator's age private key — used by `cert-sign` to decrypt the
-  nova CA key for per-vendor leaf issuance.
+  goatnet's CA key for per-vendor leaf issuance.
 - A `cert-sign` binary on the host PATH **inside the container**.
   Achieved by either (a) using the goat-zenoh-portal image that already
   bundles `cert-sign`, or (b) bind-mounting a host-side `cert-sign`
@@ -82,8 +82,8 @@ Zenoh trial fabric onto a single host (nova-a). Per design at
 ## What this role does NOT do
 
 - Deploy `zenohd` itself (Track A / `roles/zenoh/`).
-- Mint the nova CA root or seed the age identity (operator
-  ceremony per `docs/operations/nova-cert-issuance.md`).
+- Mint the goatnet's CA root or seed the age identity (an operator
+  ceremony).
 - Provision a public DNS record. Trial fabric is mesh-only.
 
 ## Tests

@@ -18,7 +18,7 @@
 #   1 preflight   main fetched, this account holds admin on the repository
 #                 (the rule rc-validate.yml enforces), next rc number
 #   2 tag         <image>/vX.Y.Z-rc.N on origin/main, pushed; wait for rc-validate
-#                 and the image build; resolve the digest under ghcr.io/usareur-af
+#                 and the image build; resolve the digest under the image namespace
 #   3 dev pin     declared deviation on the dev rung's goatnet, pins + intents
 #                 regenerated and re-signed, gates run, PR landed (pr-land.sh)
 #   4 dev deploy  deploy-component.sh --goatnet <dev>, ledger-verified
@@ -50,10 +50,21 @@ HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 PINS="$REPO/ops/pins/fleet-pins.yaml"; LADDER="$REPO/ops/release/ladder.yaml"
 RUNNERS="$REPO/ops/validation/goatnet-runners.yaml"
 die() { echo "rc: $*" >&2; exit 1; }
+# One value this checkout declares about itself in ops/goatbuilder/goatbuilder.yaml
+# (<section> <key>), as the builder reads it; empty when it declares none.
+declared() { python3 -c 'import sys, yaml; print(str(((yaml.safe_load(open(sys.argv[1])) or {}).get(sys.argv[2]) or {}).get(sys.argv[3]) or "").strip())' "$REPO/ops/goatbuilder/goatbuilder.yaml" "$1" "$2" 2>/dev/null || true; }
+# The image namespace this checkout deploys from: the ghcr_org default
+# ops/ansible/group_vars/all.yml sets, the value every play renders a pin with.
+IMAGE_ORG="$(sed -nE "s/^ghcr_org:.*[\"' ]([A-Za-z0-9][A-Za-z0-9._-]*)[\"']?[ }\"]*\$/\\1/p" "$REPO/ops/ansible/group_vars/all.yml" 2>/dev/null | head -1 || true)"
+# Where this machine keeps the project's local state (its CA keys):
+# deploy.state_dir, else ~/.goat/state, the builder's rule.
+STATE_DIR="$(declared deploy state_dir)"; [ -n "$STATE_DIR" ] || STATE_DIR="$HOME/.goat/state"
+# shellcheck disable=SC2088  # a declared path is written with a literal "~/"
+case "$STATE_DIR" in "~/"*) STATE_DIR="$HOME/${STATE_DIR#\~/}" ;; esac
 # Display-only: render {{ ghcr_org }} (the default org, as group_vars/all.yml) so
 # a printed ref does not read like an unrendered/broken variable. The stored pin
 # keeps the template; Ansible renders the real value per goatnet at deploy time.
-render() { printf '%s' "$1" | sed "s#{{ ghcr_org }}#${GHCR_ORG:-usareur-af}#g"; }
+render() { if [ -n "${GHCR_ORG:-$IMAGE_ORG}" ]; then printf '%s' "$1" | sed "s#{{ ghcr_org }}#${GHCR_ORG:-$IMAGE_ORG}#g"; else printf '%s' "$1"; fi; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 run() { if [ "$DRY" = 1 ]; then note "DRY: $*"; else "$@"; fi; }
@@ -202,7 +213,7 @@ PY
 # panoscope run did exactly that; the dry run had not looked). A dry run prints
 # the same report and continues, so the operator sees it before the real run.
 secrets_preflight() { # $1 goatnet key -> 0 ok, 1 missing (printed)
-  local g="$1" play hosts_play members report rc missing
+  local g="$1" play hosts_play members report rc missing owner account
   members="$(python3 - "$PINS" "$COMP" "$g" <<'PY'
 import sys, yaml
 pins = yaml.safe_load(open(sys.argv[1])); comp = pins["components"][sys.argv[2]]
@@ -226,8 +237,11 @@ PY
   if [ "$rc" = 1 ]; then
     missing="$(printf '%s\n' "$report" | awk '$3=="MISSING"{print $2}' | tr '\n' ' ')"
     note "secrets: $COMP on $g templates $(printf '%s\n' "$report" | grep -c .) variable(s) from your environment; NOT SET: $missing"
-    note "         references (pointers, no values) live in usareur-af/goat-credentials refs/goat.refs; put the lines for those names in .envrc.local.d/<file>.refs, then"
-    note "         OP_ACCOUNT=example.1password.com op run --env-file=.envrc.local.d/<file>.refs -- <this same command>   (under direnv: direnv exec . env OP_ACCOUNT=… op run …)"
+    # Named by this checkout, as the builder's release names them: `repo: source:`
+    # and `secrets: op_account:` in ops/goatbuilder/goatbuilder.yaml.
+    owner="$(declared repo source)"; owner="${owner%%/*}"; account="$(declared secrets op_account)"
+    note "         references (pointers, no values) live in ${owner:-<owner>}/goat-credentials refs/goat.refs; put the lines for those names in .envrc.local.d/<file>.refs, then"
+    note "         OP_ACCOUNT=${account:-<your account>} op run --env-file=.envrc.local.d/<file>.refs -- <this same command>   (under direnv: direnv exec . env OP_ACCOUNT=… op run …)"
     return 1
   fi
   [ "$rc" = 0 ] && note "secrets: $COMP on $g — every variable the play templates is set" || note "secrets: could not derive what $COMP needs on $g ($report)"
@@ -276,8 +290,9 @@ TMPDIR_RC_DIGEST_ERR="$(mktemp)"
 if [ "$DRY" = 0 ]; then
   # Any of crane, skopeo or docker resolves it (ADR 1204); a tool's own error is kept,
   # so a missing tool or a refused login never reads as "image not found".
-  D1="$("$HERE/image-digest" "ghcr.io/usareur-af/$IMAGE:${TAG#*/}" 2>"$TMPDIR_RC_DIGEST_ERR")" || D1=""
-  [ -n "$D1" ] || die "no digest for ghcr.io/usareur-af/$IMAGE:${TAG#*/}: $(cat "$TMPDIR_RC_DIGEST_ERR" 2>/dev/null)"
+  [ -n "$IMAGE_ORG" ] || die "no image namespace: ops/ansible/group_vars/all.yml sets no ghcr_org default, so there is nowhere to resolve $IMAGE:${TAG#*/}"
+  D1="$("$HERE/image-digest" "ghcr.io/$IMAGE_ORG/$IMAGE:${TAG#*/}" 2>"$TMPDIR_RC_DIGEST_ERR")" || D1=""
+  [ -n "$D1" ] || die "no digest for ghcr.io/$IMAGE_ORG/$IMAGE:${TAG#*/}: $(cat "$TMPDIR_RC_DIGEST_ERR" 2>/dev/null)"
   DIG="$D1"
 else
   DIG="sha256:<digest of $IMAGE:${TAG#*/}>"
@@ -372,7 +387,7 @@ regen_sign_check() {
     if [ "$DRY" = 0 ] && [ -f "$BEFORE/$g.json" ] && cmp -s "$BEFORE/$g.json" "$I"; then continue; fi
     SRC="$I"; [ -f "$SRC" ] || SRC="$REPO/ops/consistency/intent/$g/intent.json"
     CA="$(python3 -c "import json; print(json.load(open('$SRC')).get('ca_id',''))")"; N="$(printf '%s' "$CA" | sed -e 's/^dev-//' -e 's/-ecdsa-[0-9-]*$//')"
-    K="$HOME/.goat/state/$N/ca.key.age"
+    K="$STATE_DIR/$N/ca.key.age"
     # A dry run signs nothing: say what a real run needs and go on, so the
     # rehearsal of a step runs anywhere (ops/e2e/rehearsal.sh).
     if [ ! -f "$K" ]; then

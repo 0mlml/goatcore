@@ -813,8 +813,7 @@ fn print_trigger_guidance(ctx: &super::Ctx) {
     // site hint from the active context.
     let site = ctx
         .profile
-        .derive_demogame()
-        .map(|(_, s)| s)
+        .derive_site()
         .unwrap_or_else(|| "<site>".to_string());
     println!(
         "  {}",

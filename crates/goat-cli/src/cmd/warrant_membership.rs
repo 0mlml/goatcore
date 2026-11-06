@@ -41,7 +41,6 @@ use panoscope_core::netbird::{NbEvent, NbGroup, NbPeer, NbUser, NetbirdClient, S
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{MATRIX_YAML, TAXONOMY_YAML};
 
 /// Where the declarations live, relative to the repo root.
 pub const MEMBERSHIP_DIR: &str = "ops/warrant/membership";
@@ -2640,7 +2639,7 @@ pub async fn run_apply(ctx: &crate::cmd::Ctx, a: ApplyArgs) -> anyhow::Result<()
     }
     let decl = load_decl(&a.file, &a.scope)?;
     let prefix = scope_prefix(&a.scope);
-    let tax = Declaration::parse(TAXONOMY_YAML, MATRIX_YAML)?;
+    let tax = super::super::acl::declaration("warrant apply: reading the ACL declaration in this checkout")?;
     if let Ok(m) = tax.model(&a.scope) {
         if m.prefix != prefix {
             anyhow::bail!(

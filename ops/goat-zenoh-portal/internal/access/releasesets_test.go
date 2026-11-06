@@ -19,8 +19,8 @@ func TestLoadReleaseSets_ParsesAndNormalizes(t *testing.T) {
 	p := writeTemp(t, `
 version: 1
 release_sets:
-  - set: ZAGROS
-    prefix: release/ZAGROS/
+  - set: GALAXY
+    prefix: release/GALAXY/
     members: [abc123, def456, abc123, "  ", ""]
   - set: NATO
     # prefix omitted → defaults to release/NATO/
@@ -35,12 +35,12 @@ release_sets:
 	if len(got) != 2 {
 		t.Fatalf("want 2 sets (blank-named dropped), got %d: %+v", len(got), got)
 	}
-	zagros := got[0]
-	if zagros.Set != "ZAGROS" || zagros.Prefix != "release/ZAGROS/" {
-		t.Errorf("ZAGROS set/prefix wrong: %+v", zagros)
+	galaxy := got[0]
+	if galaxy.Set != "GALAXY" || galaxy.Prefix != "release/GALAXY/" {
+		t.Errorf("GALAXY set/prefix wrong: %+v", galaxy)
 	}
-	if len(zagros.Partners) != 2 || zagros.Partners[0] != "abc123" || zagros.Partners[1] != "def456" {
-		t.Errorf("ZAGROS members not deduped/trimmed: %+v", zagros.Partners)
+	if len(galaxy.Partners) != 2 || galaxy.Partners[0] != "abc123" || galaxy.Partners[1] != "def456" {
+		t.Errorf("GALAXY members not deduped/trimmed: %+v", galaxy.Partners)
 	}
 	if got[1].Set != "NATO" || got[1].Prefix != "release/NATO/" {
 		t.Errorf("NATO default prefix wrong: %+v", got[1])
@@ -50,7 +50,7 @@ release_sets:
 func TestLoadReleaseSets_EmptyDeclaredIsNotAnError(t *testing.T) {
 	// A declared-empty registry is a valid governance state (no partners in
 	// any set yet), distinct from a missing file.
-	p := writeTemp(t, "version: 1\nrelease_sets:\n  - set: ZAGROS\n    members: []\n")
+	p := writeTemp(t, "version: 1\nrelease_sets:\n  - set: GALAXY\n    members: []\n")
 	got, err := LoadReleaseSets(p)
 	if err != nil {
 		t.Fatalf("declared-empty must not error: %v", err)
@@ -78,7 +78,7 @@ func TestLoadReleaseSets_MalformedFailsClosed(t *testing.T) {
 // edges (Assemble already models this; here we lock that LoadReleaseSets output
 // composes with it).
 func TestReleaseSets_FeedGraphEdges(t *testing.T) {
-	rel := []ReleaseIn{{Set: "ZAGROS", Prefix: "release/ZAGROS/", Partners: []string{"abc123"}}}
+	rel := []ReleaseIn{{Set: "GALAXY", Prefix: "release/GALAXY/", Partners: []string{"abc123"}}}
 	g := Assemble(Sources{Releases: rel})
 	var found bool
 	for _, e := range g.Edges {

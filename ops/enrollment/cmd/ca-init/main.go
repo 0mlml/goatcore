@@ -55,7 +55,7 @@ func main() {
 	mode := flag.String("mode", "dev", "CA mode: dev (age-encrypted file) or prod (YubiKey PIV slot 9c per ADR 0406)")
 	out := flag.String("out", "", "Path to write the age-encrypted CA private key (dev mode only)")
 	recipientsFlag := flag.String("recipients", "", "Comma-separated age X25519 recipient public keys (format: age1...)")
-	idFlag := flag.String("id", "", "CA identifier; dev mode prefixes 'dev-', prod mode prefixes 'prod-' if absent. Defaults to <prefix>goat-ca-<date>")
+	idFlag := flag.String("id", "", "CA identifier; dev mode prefixes 'dev-', prod mode prefixes 'prod-' if absent. Defaults to <prefix>"+ca.DefaultCAIDStem+"-<date>")
 	genRootCert := flag.String("gen-root-cert", "", "Optional. Path to write a self-signed X.509 v3 root cert generated from the CA key (Block 22J / ADR 0407). Distributes as bundle tls_trust_anchor.")
 	ageIdentity := flag.String("age-identity", "", "Path to age identity file (dev mode only; required if --gen-root-cert is set, to decrypt the just-written key)")
 
@@ -67,7 +67,7 @@ func main() {
 	// operator WHICH goatnet's root signed it, and a router cert can chain to the
 	// wrong root without anyone noticing at issuance time. A per-goatnet CN makes
 	// the lineage readable in every trust store, chain dump and browser dialog.
-	rootCN := flag.String("root-cn", "", "Optional. Subject CommonName for the generated root cert. Defaults to \"<ca_id> Root CA\". Prefer a readable name for a new goatnet — e.g. \"zagros-prod Root CA\" — so the root is self-identifying in a chain dump.")
+	rootCN := flag.String("root-cn", "", "Optional. Subject CommonName for the generated root cert. Defaults to \"<ca_id> Root CA\". Prefer a readable name for a new goatnet — e.g. \"galaxy-prod Root CA\" — so the root is self-identifying in a chain dump.")
 	allowSingleRecipient := flag.Bool("allow-single-recipient", false, "Dev mode. Accept a single age recipient. A CA key encrypted to one recipient is unrecoverable if that identity is lost; use only for a throwaway test CA.")
 	verify := flag.Bool("verify", false, "Check an existing CA instead of minting: the --out key's recipient count, and with --root-cert / --public-key the root subject CN and that the public key is the root's. Exit 1 on any problem.")
 	verifyRootCert := flag.String("root-cert", "", "With --verify: path to the existing root cert PEM.")
@@ -141,7 +141,7 @@ func runDev(out, recipientsFlag, idFlag, genRootCertPath, ageIdentityPath, genIn
 
 	caID := idFlag
 	if caID == "" {
-		caID = "dev-goat-ca-" + time.Now().UTC().Format("2006-01-02")
+		caID = "dev-" + ca.DefaultCAIDStem + "-" + time.Now().UTC().Format("2006-01-02")
 	} else if !strings.HasPrefix(caID, "dev-") {
 		caID = "dev-" + caID
 	}

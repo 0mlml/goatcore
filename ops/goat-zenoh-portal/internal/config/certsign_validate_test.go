@@ -10,7 +10,7 @@ func TestValidate_CertSignRequiresCAID(t *testing.T) {
 	c.CertSignFake = false
 	c.CABundleDir = "/etc/goat-zenoh-portal/ca"
 	c.AgeIdentityPath = "/etc/goat-age/keys.txt"
-	c.NovaRootCert = "/etc/goat-zenoh-portal/ca/onboarding-roots.pem"
+	c.CARootCert = "/etc/goat-zenoh-portal/ca/onboarding-roots.pem"
 
 	c.CertSignCAID = ""
 	if err := c.Validate(); err == nil {
@@ -23,7 +23,7 @@ func TestValidate_CertSignRequiresCAID(t *testing.T) {
 		t.Fatal("expected an error when --ca-id is only whitespace")
 	}
 
-	c.CertSignCAID = "dev-zagros-ca-ecdsa-2026-09-03"
+	c.CertSignCAID = "dev-galaxy-ca-ecdsa-2026-09-03"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate with a CA id: %v", err)
 	}

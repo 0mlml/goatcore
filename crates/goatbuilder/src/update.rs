@@ -508,7 +508,7 @@ mod tests {
         write(t.path(), "ops/ansible/group_vars/zagros_dev_hosts/vars.yml", "site_id: zagros-dev   # was: zagros\nsite_dns_zone: netbird.zagros-dev.example\ngoat_get_goatbuilder_enabled: true\n");
         for name in ["zagros-dev", "zagros_dev", "zagros_dev_hosts"] {
             let s = from_site(t.path(), name).unwrap();
-            assert_eq!(s.base, "https://get.zagros-dev.examplebird.zagros-dev.example/goatbuilder", "{name}");
+            assert_eq!(s.base, "https://get.zagros-dev.netbird.zagros-dev.example/goatbuilder", "{name}");
         }
     }
 

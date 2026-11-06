@@ -166,3 +166,23 @@ func TestUnknownIdPLookup(t *testing.T) {
 		t.Error("IdP() returned ok=true for nonsense key")
 	}
 }
+
+func TestPublicDoorAdminPWAlias(t *testing.T) {
+	cases := []struct{ old, neutral, want string }{
+		{"", "", ""},
+		{"old-pw", "", "old-pw"},
+		{"", "neutral-pw", "neutral-pw"},
+		{"old-pw", "neutral-pw", "old-pw"},
+	}
+	for _, tc := range cases {
+		t.Setenv("GOAT_IDM_ADMIN_PW", tc.old)
+		t.Setenv("GOAT_IDM_ADMIN_PW", tc.neutral)
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.PublicDoorAdminPW != tc.want {
+			t.Errorf("old=%q neutral=%q: PublicDoorAdminPW = %q, want %q", tc.old, tc.neutral, c.PublicDoorAdminPW, tc.want)
+		}
+	}
+}

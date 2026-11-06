@@ -143,7 +143,7 @@ func cmdServe(args []string) error {
 		URIPrefix:        cfg.CertSignURIPrefix,
 		CNSuffix:         cfg.CertSignCNSuffix,
 		DNSSuffix:        cfg.CertSignDNSSuffix,
-		NovaRoot:    cfg.NovaRootCert,
+		CARoot:           cfg.CARootCert,
 		BundleCAPubkey:   cfg.BundleCAPubkey,
 		OnboardingPacket: cfg.OnboardingPacket,
 		PacketName:       cfg.OnboardingPacketName,

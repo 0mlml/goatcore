@@ -30,8 +30,8 @@
 #      compose-watch allowlist so the watcher can revive Traefik with
 #      the overlay if the container ever disappears. The first patch
 #      is upstream-in-tree (re-runnable role), the second is the
-#      `mgmt_host_compose_watch_services` group_var which nova_hosts/vars.yml
-#      owns.
+#      `mgmt_host_compose_watch_services` group_var which the site's
+#      vars.yml owns.
 #   5. Brings up Traefik against the merged stack via
 #      `docker compose -f docker-compose.yml -f docker-compose.acme.yml
 #      up -d traefik`.
@@ -154,9 +154,9 @@
 
           It defaults to `cloudflare_api_token` from the TARGET GROUP's
           group_vars, which every ACME group declares as a lookup of its own
-          zone's token, e.g. in group_vars/zagros_hosts/vars.yml:
+          zone's token, e.g. in group_vars/<site>_hosts/vars.yml:
 
-            cloudflare_api_token: "{{ '{{' }} lookup('env', 'CLOUDFLARE_API_TOKEN_ZAGROS') {{ '}}' }}"
+            cloudflare_api_token: "{{ '{{' }} lookup('env', 'CLOUDFLARE_API_TOKEN_<SITE>') {{ '}}' }}"
 
           Empty means one of two things: the group has no `cloudflare_api_token`
           (declare it), or the CLOUDFLARE_API_TOKEN_* variable it names is not
@@ -276,6 +276,9 @@
       ansible.builtin.import_tasks: tasks/pgbackrest-config-preflight.yml
       tags: [always]
 
+    - name: Write the Traefik certificate directory to .env before the compose file
+      ansible.builtin.import_tasks: tasks/mgmt-host-tls-root-env.yml
+
     - name: Re-sync base mgmt-host docker-compose.yml (canonical at ops/compose/mgmt-host/)
       ansible.builtin.copy:
         src: ../compose/mgmt-host/docker-compose.yml
@@ -321,14 +324,14 @@
     # clients against the OFFLINE dev CA — the same root that signs this
     # goatnet's zenoh leaves, already on this host at zenoh_door_client_ca_src
     # (default /etc/<zenoh_stack>/tls/ca-root-cert.pem). Copy it (public
-    # material, remote_src) into /etc/goat/tls/, which the base
+    # material, remote_src) into the host TLS directory, which the base
     # compose already mounts read-only into the Traefik container — no new
     # mount, no secret transfer. Must land BEFORE the dynamic render so the
     # file-watcher reload finds the CA file.
     # =====================================================================
-    - name: Ensure /etc/goat/tls exists (zenoh-door client-CA home)
+    - name: Ensure the host TLS directory exists (zenoh-door client-CA home)
       ansible.builtin.file:
-        path: /etc/goat/tls
+        path: "{{ goat_host_etc_dir | default('/etc/goat') }}/tls"
         state: directory
         owner: root
         group: root
@@ -338,7 +341,7 @@
     - name: Install zenoh-door client-CA for Traefik mTLS (env-doors Tier 2)
       ansible.builtin.copy:
         src: "{{ zenoh_door_client_ca_src }}"
-        dest: /etc/goat/tls/zenoh-door-client-ca.pem
+        dest: "{{ goat_host_etc_dir | default('/etc/goat') }}/tls/zenoh-door-client-ca.pem"
         remote_src: true
         owner: root
         group: root
@@ -353,8 +356,10 @@
         src: traefik-acme/mgmt-dynamic.yml.j2
         dest: "{{ dynamic_dir }}/mgmt.yml"
 
-    # The route filename is mgmt.yml; an older deployment may still hold
-    # nova-mgmt.yml. Traefik's file provider reads the whole directory, so leaving
+    # The route filename is mgmt.yml; an older deployment may still hold the
+    # file under its earlier name, which the goatnet declares as
+    # traefik_acme_dynamic_filename_legacy (unset: nothing to remove).
+    # Traefik's file provider reads the whole directory, so leaving
     # the old file behind is not inert: every router in it would be declared a
     # second time, on the same Host() rules, including the two enrollment
     # routers. Removed here, in the same play that renders the replacement, so
@@ -365,11 +370,14 @@
     # middleware flag already depends on.
     - name: Remove the pre-rename mgmt route file
       ansible.builtin.file:
-        path: "{{ dynamic_dir }}/nova-mgmt.yml"
+        path: "{{ dynamic_dir }}/{{ traefik_acme_dynamic_filename_legacy }}"
         state: absent
         owner: root
         group: root
         mode: "0644"
+      when:
+        - traefik_acme_dynamic_filename_legacy | default('') | length > 0
+        - traefik_acme_dynamic_filename_legacy != 'mgmt.yml'
       register: _dynamic_rendered
 
     # =====================================================================
@@ -499,7 +507,7 @@
     # =====================================================================
     # --no-deps: traefik depends_on management-a, which depends on postgres-a.
     # Without it, a base compose file that changed recreates that whole chain:
-    # on 2026-11-03 this task restarted Postgres on zagros-prod A and started the
+    # on 2026-11-03 this task restarted Postgres on a production router A and started the
     # stopped standby stack on Router-B. Only Traefik is meant to move here.
     - name: Recreate Traefik with the ACME overlay
       ansible.builtin.command:
@@ -581,5 +589,5 @@
           If issuer reads "C=US, O=Let's Encrypt, CN=..." then Phase 2.5
           is closed. If issuer still says "TRAEFIK DEFAULT CERT", check
           the Traefik logs above — common causes are CF token scope
-          (must include `Zone:DNS:Edit` for `nova.example`) or
+          (must include `Zone:DNS:Edit` for the goatnet's zone) or
           DNS propagation slower than the 5min wait budget.

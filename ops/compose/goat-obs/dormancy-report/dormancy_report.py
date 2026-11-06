@@ -42,7 +42,7 @@ comparison and never an absent() form. Peer names go to journald only.
 
 Usage: dormancy_report.py <output-dir>
   env: NETBIRD_MGMT_URL, NETBIRD_API_TOKEN, KRATOS_ADMIN_URL (default
-       http://127.0.0.1:4434), GOAT_ENV (default zagros),
+       http://127.0.0.1:4434), GOAT_ENV (default unknown; obs.yml sets it),
        DORMANCY_THRESHOLDS (default "7,14,30" days)
 Exit: 0 ok (report written), 1 config/fetch error (up=0 written).
 """
@@ -224,7 +224,7 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     out_path = outdir / "goat_dormancy_report.prom"
 
-    env = os.environ.get("GOAT_ENV", "zagros")
+    env = os.environ.get("GOAT_ENV", "unknown")
     nb_url = os.environ.get("NETBIRD_MGMT_URL", "").strip()
     nb_token = os.environ.get("NETBIRD_API_TOKEN", "").strip()
     kratos = os.environ.get("KRATOS_ADMIN_URL", "http://127.0.0.1:4434").strip()

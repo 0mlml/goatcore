@@ -237,7 +237,9 @@ mod tests {
         edge.linked.store(true, Ordering::SeqCst);
         let m = metrics();
         let (tx, rx) = mpsc::channel(8);
-        tx.send(sample("from/zagros/weather/forecast")).await.unwrap();
+        tx.send(sample("from/zagros/weather/forecast"))
+            .await
+            .unwrap();
         drop(tx);
         run_publisher(rx, edge.clone(), m.clone()).await;
         let sent = edge.sent.lock().unwrap();
@@ -252,7 +254,9 @@ mod tests {
         let m = metrics();
         let (tx, rx) = mpsc::channel(8);
         for _ in 0..3 {
-            tx.send(sample("from/zagros/weather/forecast")).await.unwrap();
+            tx.send(sample("from/zagros/weather/forecast"))
+                .await
+                .unwrap();
         }
         drop(tx);
         run_publisher(rx, edge.clone(), m.clone()).await;

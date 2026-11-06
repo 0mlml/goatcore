@@ -45,7 +45,7 @@ target="${1:-all}"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 err() { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; }
 
-NETHOST_HOST="${NETHOST_USER:-goat}@${NETHOST_HOST:-100.127.1.34}"
+NETHOST_HOST="${NETHOST_USER:-goat}@${NETHOST_HOST:-100.127.1.28}"
 SHARED_TURN_SECRET=""
 NB_RELAY_AUTH_SECRET=""
 RELAY_OUTPUT=""

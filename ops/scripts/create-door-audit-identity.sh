@@ -21,7 +21,10 @@
 #   ops/scripts/create-door-audit-identity.sh --plane collab
 #
 # Needs, in the environment (direnv):
-#   public → <PUBLIC>_IDM_ADMIN_PW      collab → COLLAB_KANIDM_IDM_ADMIN_PW
+#   public → PUBLIC_DOOR_KANIDM_URL + <PUBLIC>_IDM_ADMIN_PW
+#   collab → COLLAB_KANIDM_URL      + COLLAB_KANIDM_IDM_ADMIN_PW
+# The URL is the base of that door's Kanidm (https://idm.<zone>), the value the
+# goatnet's group_vars name for its identity console.
 #
 # Idempotent: an existing service account is reused (its creation answers HTTP
 # 409 with an attribute-uniqueness body, which is ACHIEVED, not failed — the
@@ -45,10 +48,13 @@ while [ $# -gt 0 ]; do
 done
 
 case "$PLANE" in
-  public) HOST=https://idm.goat.example;        PW="${GOAT_IDM_ADMIN_PW:-}";    PWVAR=GOAT_IDM_ADMIN_PW ;;
-  collab) HOST=https://idm.collab.goat.example; PW="${COLLAB_KANIDM_IDM_ADMIN_PW:-}"; PWVAR=COLLAB_KANIDM_IDM_ADMIN_PW ;;
+  public) HOSTVAR=PUBLIC_DOOR_KANIDM_URL; PW="${GOAT_IDM_ADMIN_PW:-}";    PWVAR=GOAT_IDM_ADMIN_PW ;;
+  collab) HOSTVAR=COLLAB_KANIDM_URL;      PW="${COLLAB_KANIDM_IDM_ADMIN_PW:-}"; PWVAR=COLLAB_KANIDM_IDM_ADMIN_PW ;;
   *) echo "unknown --plane '$PLANE' (want: public | collab)" >&2; exit 64 ;;
 esac
+# The door's address is the goatnet's, not this script's: no built-in door.
+HOST="${!HOSTVAR:-}"; HOST="${HOST%/}"
+[ -n "$HOST" ] || { echo "$HOSTVAR is not set — the base URL of the $PLANE door's Kanidm (https://idm.<zone>). Run under direnv in the repo." >&2; exit 1; }
 [ -n "$PW" ] || { echo "$PWVAR is not set — run under direnv in the repo." >&2; exit 1; }
 
 if [ "$DRY_RUN" = 1 ]; then

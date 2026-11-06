@@ -53,6 +53,18 @@
 # ops/ansible or ops/pins (GB-064). A trunk that cannot be fetched is a
 # refusal too (GB-065); an islanded site runs with GOAT_DEPLOY_OFFLINE=1
 # (the drivers' --offline) and is judged against the cached trunk.
+#
+# Assembled tree (goatcore + overlay)
+# -----------------------------------
+# A tree with `.goat-assembled` at its root is a goatcore checkout at the
+# commit in goatcore.ref with an environment overlay copied over it. Its
+# source of record is that pair: fresh-source.sh judges it against
+# goatcore.ref and the overlay's main (ops/scripts/lib/source_of_record.py),
+# the safety-critical paths must be goatcore's own (an overlay copy is
+# refused), there is no trunk-branch check, and secret references load from
+# the overlay checkout's master worktree. Every play exports
+# GOAT_DEPLOY_SOURCE_TREE, which the deploy ledger row records as
+# `source_tree` (both avenues, clone or assembled).
 
 set -euo pipefail
 # Hold the Mac awake for the whole run (#2122; ops/scripts/lib/keep-awake.sh).
@@ -206,6 +218,19 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# An ASSEMBLED tree (ops/scripts/lib/source_of_record.py): goatcore at the commit
+# in goatcore.ref with an environment overlay copied over it, marked by
+# `.goat-assembled` at the root. Its git checkout is goatcore's, so the trunk-remote
+# reasoning below does not apply to it: fresh-source.sh judges it against the pair
+# (goatcore.ref, the overlay's main), and the operator's secret references live in
+# the overlay checkout's master worktree, not in this tree's.
+ASSEMBLED=0; OVERLAY_DIR=""
+if [ -f "$REPO_ROOT/.goat-assembled" ]; then
+  ASSEMBLED=1
+  OVERLAY_DIR="$(awk -F= '$1=="overlay_dir"{print substr($0, index($0, "=") + 1); exit}' "$REPO_ROOT/.goat-assembled" || true)"
+  [ -n "$OVERLAY_DIR" ] || OVERLAY_DIR="${GOAT_OVERLAY_DIR:-}"
+fi
+
 # ---------------------------------------------------------------------
 # Secrets are per-LAPTOP, not per-worktree.
 #
@@ -222,7 +247,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 #
 # So: load the master worktree's secret files when the current worktree
 # has none. Loudly — file names only, never values.
-GIT_COMMON="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")"
+# In an assembled tree the master worktree is the overlay checkout's.
+SECRETS_FROM="$REPO_ROOT"
+[ "$ASSEMBLED" = 1 ] && [ -n "$OVERLAY_DIR" ] && SECRETS_FROM="$OVERLAY_DIR"
+GIT_COMMON="$(git -C "$SECRETS_FROM" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")"
 if [ -n "$GIT_COMMON" ]; then
   MASTER_ROOT="$(cd "$(dirname "$GIT_COMMON")" 2>/dev/null && pwd || echo "")"
   SECRET_DIR="$MASTER_ROOT/.envrc.local.d"
@@ -316,6 +344,17 @@ fi
 
 goat_arg_guards "$@"
 
+# The source of record this play renders from, for the deploy ledger row
+# (rollback-ledger records it as `source_tree`): {"commit": HEAD} from a clone,
+# {"goatcore", "goatcore_ref", "overlay"} from an assembled tree. Set here, the
+# one wrapper every play of both avenues passes through, so a deploy-component.sh
+# run, a goatbuilder run and a bare preflight run all record it. A caller's value
+# wins; an empty one records nothing.
+if [ -z "${GOAT_DEPLOY_SOURCE_TREE+x}" ]; then
+  GOAT_DEPLOY_SOURCE_TREE="$(python3 "$SCRIPT_DIR/lib/source_of_record.py" describe --repo "$REPO_ROOT" 2>/dev/null || true)"
+  export GOAT_DEPLOY_SOURCE_TREE
+fi
+
 # The override bypasses staleness checks, not credential loading or argument guards.
 if [ "${GOAT_SKIP_ANSIBLE_PREFLIGHT:-}" = "1" ]; then
   echo "ansible-preflight: BYPASS (GOAT_SKIP_ANSIBLE_PREFLIGHT=1) — running ansible-playbook from possibly-stale tree." >&2
@@ -360,16 +399,20 @@ ops/ansible/mgmt-host.yml
 # checkout that matches the mirror while being 30 commits behind the primary,
 # which is precisely the stale-control-plane deploy F-312 is about.
 #
-# Resolution order: $GOAT_ANSIBLE_TRUNK_REMOTE, else a remote named `usareur-af`
-# if one exists, else `origin`. Repos with a single remote are unaffected.
-if [ -n "${GOAT_ANSIBLE_TRUNK_REMOTE:-}" ]; then
+# Resolution order: $GOAT_ANSIBLE_TRUNK_REMOTE, else the remote whose URL is the
+# source repository this checkout declares (repo.source in
+# ops/goatbuilder/goatbuilder.yaml, read by project-setting.sh), else `origin`.
+# Repos with a single remote are unaffected.
+if [ "$ASSEMBLED" = 1 ]; then
+  TRUNK_REMOTE="goatcore.ref"   # a label for the messages; no remote of this checkout is the trunk
+elif [ -n "${GOAT_ANSIBLE_TRUNK_REMOTE:-}" ]; then
   TRUNK_REMOTE="$GOAT_ANSIBLE_TRUNK_REMOTE"
-elif git -C "$REPO_ROOT" remote get-url usareur-af >/dev/null 2>&1; then
-  TRUNK_REMOTE="usareur-af"
 else
-  TRUNK_REMOTE="origin"
+  TRUNK_REMOTE="$("$SCRIPT_DIR/project-setting.sh" --repo "$REPO_ROOT" trunk-remote 2>/dev/null || true)"
+  [ -n "$TRUNK_REMOTE" ] || TRUNK_REMOTE="origin"
 fi
-if ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$TRUNK_REMOTE/main" >/dev/null 2>&1 \
+if [ "$ASSEMBLED" = 0 ] \
+   && ! git -C "$REPO_ROOT" rev-parse --verify --quiet "$TRUNK_REMOTE/main" >/dev/null 2>&1 \
    && [ "$TRUNK_REMOTE" != "origin" ]; then
   echo "ansible-preflight: $TRUNK_REMOTE/main not present, falling back to origin/main" >&2
   TRUNK_REMOTE="origin"
@@ -384,7 +427,8 @@ fi
 # do. A driver that already ran it before its first host passes the trunk commit
 # it judged against in GOAT_FRESH_SOURCE_TRUNK, so every play of one run is
 # judged against the same commit and nothing is fetched again.
-FS_ARGS=(--repo "$REPO_ROOT" --remote "$TRUNK_REMOTE")
+FS_ARGS=(--repo "$REPO_ROOT")
+[ "$ASSEMBLED" = 1 ] || FS_ARGS+=(--remote "$TRUNK_REMOTE")
 [ -n "${GOAT_FRESH_SOURCE_TRUNK:-}" ] && FS_ARGS+=(--quiet)
 if ! trunk_sha="$("$SCRIPT_DIR/fresh-source.sh" "${FS_ARGS[@]}")"; then
   echo "ansible-preflight: REFUSE — see fresh-source above. Bypass only with a reason: GOAT_SKIP_ANSIBLE_PREFLIGHT=1 <your command>" >&2
@@ -399,6 +443,19 @@ for path in $SAFETY_CRITICAL_PATHS; do
 "
   fi
 done
+if [ -n "$STALE_CRITICAL" ] && [ "$ASSEMBLED" = 1 ]; then
+  {
+    echo "ansible-preflight: REFUSE — the overlay replaces a SAFETY-CRITICAL goatcore file:"
+    printf '%s' "$STALE_CRITICAL"
+    echo ""
+    echo "These files decide whether traefik keeps its ACME certificate resolver."
+    echo "They belong to goatcore ($TRUNK_CMP); an overlay that carries its own copy"
+    echo "deploys a control plane no goatcore release has. Remove the file from the"
+    echo "overlay (or land the change in goatcore and move goatcore.ref), re-assemble,"
+    echo "and re-run. Bypass only with a reason: GOAT_SKIP_ANSIBLE_PREFLIGHT=1 <your command>"
+  } >&2
+  exit 1
+fi
 if [ -n "$STALE_CRITICAL" ]; then
   {
     echo "ansible-preflight: REFUSE — this checkout differs from $TRUNK_REMOTE/main in a SAFETY-CRITICAL path:"
@@ -445,8 +502,15 @@ fi
 # and airgap runs are never blocked by a check that could not reach the registry.
 if [ "${GOAT_SKIP_GHCR_PARITY:-}" != "1" ]; then
   PARITY="$REPO_ROOT/ops/ci/check-ghcr-namespace-parity.sh"
-  # Same rule as group_vars/all.yml: GHCR_ORG wins, else usareur-af.
-  RESOLVED_ORG="${GHCR_ORG:-usareur-af}"
+  # Same rule as group_vars/all.yml: GHCR_ORG wins, else the organisation of the
+  # image namespace this checkout declares (repo.image_namespace in
+  # ops/goatbuilder/goatbuilder.yaml, as the builder reads it). No declaration
+  # under ghcr.io: there is no namespace to check, and the check is skipped.
+  RESOLVED_ORG="${GHCR_ORG:-}"
+  if [ -z "$RESOLVED_ORG" ]; then
+    DECLARED_NS="$("$SCRIPT_DIR/project-setting.sh" --repo "$REPO_ROOT" repo image_namespace 2>/dev/null || true)"
+    case "$DECLARED_NS" in ghcr.io/*) RESOLVED_ORG="${DECLARED_NS#ghcr.io/}" ;; esac
+  fi
   if [ -x "$PARITY" ] && [ -n "$RESOLVED_ORG" ]; then
     # `|| PARITY_RC=$?` rather than set +e: a failing command inside a bare
     # assignment still fires the ERR trap above, which printed "INTERNAL ABORT"
@@ -484,6 +548,9 @@ fi
 # Only enforce whole-tree staleness on trunk branches. Feature-branch worktrees
 # are SUPPOSED to be ahead/behind of origin/<branch> — the safety-critical check
 # above is what covers them.
+# An assembled tree has no trunk branch of its own: fresh-source.sh above judged
+# it against goatcore.ref and the overlay's main, which is the whole-tree check.
+[ "$ASSEMBLED" = 1 ] && exec ansible-playbook "$@"
 case "$BRANCH" in
   main|master) ;;
   *) exec ansible-playbook "$@" ;;

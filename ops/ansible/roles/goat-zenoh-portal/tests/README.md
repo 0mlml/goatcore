@@ -7,4 +7,4 @@ tarball assembly, end-to-end HTTP smoke through every API surface).
 
 This role is a thin deployment wrapper. Its risk surface is the
 template rendering (which `syntax-check.sh` covers) and the
-docker-compose wiring (covered live at deploy time on nova-a).
+docker-compose wiring (covered live at deploy time).

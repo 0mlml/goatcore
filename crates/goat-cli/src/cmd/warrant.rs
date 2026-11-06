@@ -22,11 +22,9 @@
 // time, rather than implying a completeness it does not have.
 
 use clap::{Args, Subcommand};
-use panoscope_core::aclcheck::{Declaration, Model, Permit};
+use panoscope_core::aclcheck::{Model, Permit};
 use panoscope_core::portsets::{PortSet, Vocabulary};
 
-const TAXONOMY_YAML: &str = include_str!("../../../../ops/ansible/netbird_acl_taxonomy.yml");
-const MATRIX_YAML: &str = include_str!("../../../../ops/ansible/netbird_acl_matrix.yml");
 /// The vocabulary, so a blocked verdict can propose a NAMED set rather than
 /// asking the operator for a port list. Asking for ports is how the vocabulary
 /// re-fragments (docs/design/warrant.md §2).
@@ -137,7 +135,7 @@ fn run_why_blocked(args: WhyBlockedArgs) -> anyhow::Result<()> {
     // `{e:?}` (Debug) discarded DeclError's own hand-authored Display prose;
     // acl.rs's identical case just uses `?` (Display, via anyhow's blanket
     // conversion), which is what this should have done too.
-    let decl = Declaration::parse(TAXONOMY_YAML, MATRIX_YAML)?;
+    let decl = super::acl::declaration("warrant: reading the ACL declaration in this checkout")?;
     let model = decl.model(&args.scope)?;
 
     let from = qualify(&model, &args.from);

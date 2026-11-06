@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""scoped-read-check.py — prove what the scoped peer read ALLOWS and REFUSES
-
+"""scoped-read-check.py — prove what the scoped peer read ALLOWS and REFUSES.
 
 Every other test in this role asserts the SHAPE of the rendered config. This one
 asserts the DECISIONS: it renders the template, loads it through the ACL

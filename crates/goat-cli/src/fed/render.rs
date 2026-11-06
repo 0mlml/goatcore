@@ -989,7 +989,7 @@ mod tests {
             // SCOPED TO THE INGRESS BLOCK, not the whole file. A body-wide
             // assertion was only ever correct while `egress` carried the
             // `release/**` staging name; now that egress is our own wire name
-            //, `from/<ours>/**` legitimately appears further down, and a
+            // `from/<ours>/**` legitimately appears further down, and a
             // whole-body check would forbid the correct output.
             let ingress_block = body
                 .split("ingress:\n")

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/usareur-af/goatcore/ops/snitch/internal/auth"
+	"github.com/usareur-af/goatcore/ops/snitch/internal/compat"
 	"github.com/usareur-af/goatcore/ops/snitch/internal/measure"
 	"github.com/usareur-af/goatcore/ops/snitch/internal/safego"
 	"github.com/usareur-af/goatcore/ops/snitch/internal/store"
@@ -24,8 +25,8 @@ var satlinkHTML []byte
 
 var satlinkProbeMu sync.Mutex
 
-// StartSatlinkProber runs the Satlink PoP benchmark on startup and then
-// at the given interval. The probe measures latency from behind Satlink to
+// StartSatlinkProber runs the satellite-link PoP benchmark on startup and then
+// at the given interval. The probe measures latency from behind the satellite link to
 // each relay VPS, identifying the egress ground station / PoP.
 func (s *Server) StartSatlinkProber(interval time.Duration) {
 	if interval <= 0 {
@@ -92,15 +93,21 @@ func (s *Server) runSatlinkProbe() {
 	}
 }
 
-// registerSatlinkRoutes adds Satlink PoP tracker endpoints.
+// registerSatlinkRoutes adds satellite-link PoP tracker endpoints.
 func (s *Server) registerSatlinkRoutes() {
 	a := s.cfg.Auth
 
-	s.mux.HandleFunc("/satlink", s.handleSatlinkPage)
-	s.mux.Handle("/api/satlink/latest", a.Require(auth.RoleViewer, s.handleSatlinkLatest))
-	s.mux.Handle("/api/satlink/trend", a.Require(auth.RoleViewer, s.handleSatlinkTrend))
-	s.mux.Handle("/api/satlink/pops", a.Require(auth.RoleViewer, s.handleSatlinkPops))
-	s.mux.Handle("/api/satlink/probe", a.Require(auth.RoleOperator, s.handleSatlinkRunProbe))
+	// Each route is served under its current path and its earlier compat
+	// path, so existing bookmarks and API clients keep working.
+	for _, page := range []string{"/satlink", compat.SatlinkPageRoute} {
+		s.mux.HandleFunc(page, s.handleSatlinkPage)
+	}
+	for _, prefix := range []string{"/api/satlink/", compat.SatlinkAPIPrefix} {
+		s.mux.Handle(prefix+"latest", a.Require(auth.RoleViewer, s.handleSatlinkLatest))
+		s.mux.Handle(prefix+"trend", a.Require(auth.RoleViewer, s.handleSatlinkTrend))
+		s.mux.Handle(prefix+"pops", a.Require(auth.RoleViewer, s.handleSatlinkPops))
+		s.mux.Handle(prefix+"probe", a.Require(auth.RoleOperator, s.handleSatlinkRunProbe))
+	}
 }
 
 func (s *Server) handleSatlinkPage(w http.ResponseWriter, r *http.Request) {

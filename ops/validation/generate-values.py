@@ -719,18 +719,18 @@ def self_test():
     import tempfile
     d = Path(tempfile.mkdtemp())
     (d / "gv").mkdir(); (d / "gv" / "vars.yml").write_text(
-        'site_dns_zone: netbird.demo.net\nmesh_ip_a: "100.127.0.9"\n'
+        'site_dns_zone: netbird.demo.net\nmesh_ip_a: "100.127.0.7"\n'
         'name_snapshot_enabled: true\nhas_obs_host: false\nintra_site_pair: false\n'
         'dashboard_cert_delivery_mode: acme\n')
     inv = d / "inv.ini"
-    inv.write_text("[demo_hosts]\nmgmt-demo-01 ansible_host=100.127.0.9 router_role=A\n")
+    inv.write_text("[demo_hosts]\nmgmt-demo-01 ansible_host=100.127.0.7 router_role=A\n")
     v = generate("demo", gv_dir=d / "gv", inv_path=inv)
     problems = []
     if v.get("site_dns_zone") != "netbird.demo.net": problems.append("site_dns_zone not derived")
-    if v.get("mesh_ip_a") != "100.127.0.9": problems.append("mesh_ip_a not derived")
+    if v.get("mesh_ip_a") != "100.127.0.7": problems.append("mesh_ip_a not derived")
     if v.get("name_snapshot_enabled") is not True: problems.append("name_snapshot_enabled not bool-true")
     if v.get("has_obs_host") is not False: problems.append("has_obs_host not bool-false")
-    if v.get("orin_a") != "goat@100.127.0.9": problems.append("orin_a not user@addr")
+    if v.get("orin_a") != "goat@100.127.0.7": problems.append("orin_a not user@addr")
     if v.get("public_mgmt_fqdn") != "netbird.demo.net": problems.append("public_mgmt_fqdn fallback failed")
     if v.get("pubsub_state_repl_enabled") is not False: problems.append("pubsub flag not false")
     if v.get("nb_api_token_env") != "DEMO_NB_API_TOKEN": problems.append("nb_api_token_env not <SITE>_NB_API_TOKEN")
@@ -743,10 +743,10 @@ def self_test():
     d4 = Path(tempfile.mkdtemp())
     (d4 / "ca_hosts").mkdir(parents=True)
     (d4 / "ca_hosts" / "vars.yml").write_text(
-        'site_dns_zone: netbird.ca-site.net\nmesh_ip_a: "100.127.0.22"\n'
+        'site_dns_zone: netbird.ca-site.net\nmesh_ip_a: "100.127.0.20"\n'
         'dashboard_cert_delivery_mode: file\ninternal_ca_cn: ca-site-internal-ca\n')
     inv4 = d4 / "inv.ini"
-    inv4.write_text("[ca_hosts]\nmgmt-ca-01 ansible_host=100.127.0.22 router_role=A\n")
+    inv4.write_text("[ca_hosts]\nmgmt-ca-01 ansible_host=100.127.0.20 router_role=A\n")
     v4 = generate("ca-site", gv_dir=d4 / "ca_hosts", inv_path=inv4)
     if v.get("curl_ca_opt") != "":
         problems.append(f"acme site: curl_ca_opt should be empty (got {v.get('curl_ca_opt')!r})")
@@ -761,10 +761,10 @@ def self_test():
     d5 = Path(tempfile.mkdtemp())
     (d5 / "nocn_hosts").mkdir(parents=True)
     (d5 / "nocn_hosts" / "vars.yml").write_text(
-        'site_dns_zone: netbird.nocn.net\nmesh_ip_a: "100.127.0.23"\n'
+        'site_dns_zone: netbird.nocn.net\nmesh_ip_a: "100.127.0.21"\n'
         'dashboard_cert_delivery_mode: file\n')
     inv5 = d5 / "inv.ini"
-    inv5.write_text("[nocn_hosts]\nmgmt-nocn-01 ansible_host=100.127.0.23 router_role=A\n")
+    inv5.write_text("[nocn_hosts]\nmgmt-nocn-01 ansible_host=100.127.0.21 router_role=A\n")
     v5 = generate("nocn", gv_dir=d5 / "nocn_hosts", inv_path=inv5)
     if "entrypoint_cert_issuer" in v5:
         problems.append("non-acme site with no internal_ca_cn: must not invent entrypoint_cert_issuer")
@@ -775,7 +775,7 @@ def self_test():
     # These four assertions are the point of the change: a goatnet is
     # checked because it RUNS a Prometheus, not because a hand-set topology flag
     # says it has a separate box for one.
-    if v.get("obs_prometheus_host") != "goat@100.127.0.9":
+    if v.get("obs_prometheus_host") != "goat@100.127.0.7":
         problems.append("co-resident obs: prometheus host should be orin_a")
     if v.get("obs_prometheus_url") != "http://localhost:9192":
         problems.append("co-resident obs: goat-obs serves :9192, not :9090")
@@ -786,7 +786,7 @@ def self_test():
     d2 = Path(tempfile.mkdtemp())
     (d2 / "ded_hosts").mkdir(parents=True)
     (d2 / "ded_hosts" / "vars.yml").write_text(
-        'site_dns_zone: netbird.ded.net\nmesh_ip_a: "100.127.0.18"\n'
+        'site_dns_zone: netbird.ded.net\nmesh_ip_a: "100.127.0.16"\n'
         'has_obs_host: true\nintra_site_pair: false\n')
     # …and its relay TLS targets declared in the OBS group, not the site group —
     # the placement that hides a declaration from every check.
@@ -800,14 +800,14 @@ def self_test():
         '  - "relay-b.ded.net:33073"\n'
         'obs_blackbox_enabled: true\n')
     inv2 = d2 / "inv.ini"
-    inv2.write_text("[ded_hosts]\nmgmt-ded-01 ansible_host=100.127.0.18 router_role=A\n"
-                    "[ded_obs_hosts]\nmgmt-ded-obs ansible_host=100.127.0.20 router_role=C\n")
+    inv2.write_text("[ded_hosts]\nmgmt-ded-01 ansible_host=100.127.0.16 router_role=A\n"
+                    "[ded_obs_hosts]\nmgmt-ded-obs ansible_host=100.127.0.18 router_role=C\n")
     v2 = generate("ded", gv_dir=d2 / "ded_hosts", inv_path=inv2)
     if v2.get("obs_prometheus_url") != "http://localhost:9090":
         problems.append("dedicated obs: obs-host serves :9090")
     if v2.get("obs_alertmanager_config") != "/opt/obs-host/alertmanager.yml":
         problems.append("dedicated obs: alertmanager path is the role's")
-    if not (v2.get("obs_prometheus_host") or "").endswith("100.127.0.20"):
+    if not (v2.get("obs_prometheus_host") or "").endswith("100.127.0.18"):
         problems.append("dedicated obs: prometheus host should be the obs group's node")
     if v2.get("obs_relay_tls_targets") != ["relay-a.ded.net:33073", "relay-b.ded.net:33073"]:
         problems.append("declared relay TLS targets: obs-group placement, comment mid-list "
@@ -824,18 +824,18 @@ def self_test():
     d3 = Path(tempfile.mkdtemp())
     (d3 / "join_hosts").mkdir(parents=True)
     (d3 / "join_hosts" / "vars.yml").write_text(
-        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.66"\n'
+        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.62"\n'
         'participates_in_spock: true\ngoatnet_founder: false\nintra_site_pair: false\n'
         'ory_spock_enabled: true\n'
         'inter_site_spock_topology: explicit\ninter_site_spock_peers:\n  - orig\n')
     # the founder ("orig") the joiner peers with — its mesh_ip_a is the DSN host.
     (d3 / "orig_hosts").mkdir(parents=True)
     (d3 / "orig_hosts" / "vars.yml").write_text(
-        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.65"\n'
+        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.61"\n'
         'participates_in_spock: true\ngoatnet_founder: true\n'
         'spock_mesh_publisher_host: "{{ mesh_ip_a }}"\n')
     inv3 = d3 / "inv.ini"
-    inv3.write_text("[join_hosts]\nmgmt-join-01 ansible_host=100.127.0.66 router_role=A\n")
+    inv3.write_text("[join_hosts]\nmgmt-join-01 ansible_host=100.127.0.62 router_role=A\n")
     vj = generate("join", gv_dir=d3 / "join_hosts", inv_path=inv3)
     if vj.get("spock_joiner") is not True:
         problems.append("joiner: spock_joiner should be true")
@@ -845,7 +845,7 @@ def self_test():
         problems.append(f"joiner: spock_peer_node (got {vj.get('spock_peer_node')})")
     if vj.get("spock_inbound_sub") != "sub_orig_to_join":
         problems.append(f"joiner: spock_inbound_sub (got {vj.get('spock_inbound_sub')})")
-    if vj.get("spock_peer_dsn_host") != "100.127.0.65":
+    if vj.get("spock_peer_dsn_host") != "100.127.0.61":
         problems.append(f"joiner: peer DSN host should be the founder's mesh_ip_a "
                         f"(got {vj.get('spock_peer_dsn_host')})")
     if vj.get("spock_ory_dbs") != ["kratos", "hydra"]:

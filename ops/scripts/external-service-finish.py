@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """external-service-finish.py -- finish an external service the proposer opened.
 
-When a service owner's declaration is approved in
-usareur-af/hello-galaxy-external-service, a pull request opens here carrying it.
+When a service owner's declaration is approved in the proposal repository
+(hello-galaxy-external-service, beside this one), a pull request opens here
+carrying it.
 A platform engineer runs this, once, from a laptop that can reach the goatnet:
 
     python3 ops/scripts/external-service-finish.py <goat PR number>
@@ -45,6 +46,10 @@ usage:
   --dry-run   do every read, print every write, change nothing
   --from      resume at a step (state is kept in ~/.goat/external-service-finish/)
   --email     skip the lookup and deliver to this address
+This repository, the proposal repository beside it, the state directory holding
+the goatnet CA key and the AWS profile an env door opens under are the
+checkout's own: repo.source, deploy.state_dir and deploy.aws_profile in
+ops/goatbuilder/goatbuilder.yaml (GOAT_AWS_PROFILE overrides the profile).
 Design: docs/design/external-service-golden-path.md, "Finishing a proposed service".
 """
 import argparse
@@ -71,7 +76,26 @@ except ImportError:
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "ops", "warrant"))
 import membership as warrant_membership  # noqa: E402  (ops/warrant/membership.py)
-GH_REPO = "USAREUR-AF/goatcore"
+
+
+def declared(section, key, default=""):
+    """What this checkout declares about itself in ops/goatbuilder/goatbuilder.yaml,
+    read as the builder reads it (crates/goatbuilder/src/settings.rs)."""
+    try:
+        with open(os.path.join(REPO, "ops", "goatbuilder", "goatbuilder.yaml"), encoding="utf-8") as fh:
+            value = ((yaml.safe_load(fh) or {}).get(section) or {}).get(key)
+    except (OSError, yaml.YAMLError, AttributeError):
+        return default
+    return str(value).strip() if value else default
+
+
+# The repository the pull request is in (owner/name), and the proposal
+# repository, which lives beside it under the same owner.
+GH_REPO = declared("repo", "source")
+SOURCE_REPO = "%s/hello-galaxy-external-service" % GH_REPO.split("/")[0] if GH_REPO else ""
+# Where this machine keeps the goatnet CA keys, and the AWS profile a door opens under.
+PROJECT_STATE_DIR = declared("deploy", "state_dir", "~/.goat/state")
+AWS_PROFILE = os.environ.get("GOAT_AWS_PROFILE") or declared("deploy", "aws_profile", "default")
 STEPS = ["check", "read", "peer", "prepare", "review", "merge", "pull", "tier", "apply", "verify", "email"]
 STATE_DIR = os.path.expanduser("~/.goat/external-service-finish")
 TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -224,10 +248,15 @@ def external_infra_entry(st, facts, today=None):
     if expires is None or expires < today:
         expires = today + datetime.timedelta(days=180)
     reason = "external service %s host (ADR 1178), goat #%s" % (st.get("name") or "?", st.get("pr") or "?")
+    owner = str(st.get("owner") or "").strip()
+    if not owner:
+        # ops/ansible/external-service.yml refuses a declaration without one.
+        raise Stop("The declaration names no `owner` (who to call about the service), so the membership "
+                   "entry has none to carry. Add it to the declaration and re-run.")
     return {
         "peer": st["peer_name"],
         "exact": [facts["external_infra"]],
-        "owner": str(st.get("owner") or "user369x"),
+        "owner": owner,
         "reason": reason[:warrant_membership.REASON_MAX],
         "expires": expires.isoformat(),
     }
@@ -285,6 +314,9 @@ def transport(facts):
 
 def do_check(a, st):
     step("check", "tools, credentials and a route to the goatnet")
+    if not GH_REPO:
+        raise Stop("ops/goatbuilder/goatbuilder.yaml declares no repo.source (owner/name), so the repository "
+                   "the pull request is in is unknown. Nothing has changed.")
     missing = []
     # aws-vault is NOT here: over the mesh the apply is plain SSH. Only an env
     # door needs AWS, and check_site asks for it once it knows the route.
@@ -306,7 +338,7 @@ def check_site(a, facts):
         need += [facts["smtp_user_env"], facts["smtp_pass_env"]]
     missing = [v for v in need if not os.environ.get(v)]
     if facts["snapshot"]:
-        rk = os.path.expanduser(a.root_key or "~/.goat/state/%s-ca/ca.key.age" % facts["site_id"])
+        rk = os.path.expanduser(a.root_key or "%s/%s-ca/ca.key.age" % (PROJECT_STATE_DIR, facts["site_id"]))
         ai = os.path.expanduser(a.age_identity)
         if not os.path.exists(rk):
             missing.append("the %s CA key at %s (or pass --root-key)" % (facts["site_id"], rk))
@@ -321,15 +353,15 @@ def check_site(a, facts):
         raise Stop("No route to %s: connect this laptop to the %s NetBird profile (no AWS needed), or register an "
                    "env door (ops/scripts/env-door.sh, docs/design/env-doors.md)." % (facts["site_id"], facts["site_id"]))
     if how == "door" and not shutil.which("aws-vault"):
-        raise Stop("The route to %s is an env door, which opens through AWS: install aws-vault and add the `usareur-af` "
+        raise Stop("The route to %s is an env door, which opens through AWS: install aws-vault and add the `%s` "
                    "profile -- or connect this laptop to the %s NetBird profile instead, which needs no AWS."
-                   % (facts["site_id"], facts["site_id"]))
+                   % (facts["site_id"], AWS_PROFILE, facts["site_id"]))
     ok("credentials for %s present; route: %s%s" % (facts["site_id"], how, "" if how == "door" else " (no AWS needed)"))
 
 
 # ---- 2 read ------------------------------------------------------------------
 DECL_PATH = re.compile(r"^ops/ansible/group_vars/([a-z0-9_]+)/external-service-([a-z0-9-]+)\.yml$")
-SOURCE_URL = re.compile(r"https://github\.com/usareur-af/hello-galaxy-external-service/pull/(\d+)")
+SOURCE_URL = re.compile(r"https://github\.com/%s/pull/(\d+)" % re.escape(SOURCE_REPO))
 
 
 def do_read(a, st):
@@ -757,7 +789,7 @@ def linked_email(st, facts):
     """(login, email or None, why) -- the goatnet identity whose onboarding record names the PR author's GitHub login."""
     if not st.get("source_pr"):
         return None, None, "the goat PR does not record which hello-galaxy-external-service PR requested it"
-    login = gh_json(["api", "repos/usareur-af/hello-galaxy-external-service/pulls/%s" % st["source_pr"]])["user"]["login"]
+    login = gh_json(["api", "repos/%s/pulls/%s" % (SOURCE_REPO, st["source_pr"])])["user"]["login"]
     key = os.environ.get(facts["portal_key_env"])
     if not key:
         return login, None, "%s is not set, so the onboarding records could not be read" % facts["portal_key_env"]

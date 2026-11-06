@@ -116,8 +116,24 @@ def relay_tls_targets(gv_path):
     return yaml.safe_load("obs_relay_tls_targets:\n" + m.group(1))["obs_relay_tls_targets"]
 
 
+def declared(gv, var):
+    """One top-level scalar or plain list from any file of a group_vars directory.
+
+    The Traefik name prefix and the ICMP targets are values the goatnet declares
+    and the template only reads. Absent is not an error: the template omits the
+    relabel rules and the ICMP job for a goatnet that declares neither."""
+    import glob
+    for path in sorted(glob.glob(f"ops/ansible/group_vars/{gv}/*.yml")):
+        m = re.search(rf"^{re.escape(var)}:[^\n]*\n(?:[ \t]+-[^\n]*\n)*", open(path).read(), re.M)
+        if m:
+            return yaml.safe_load(m.group(0))[var]
+    return None
+
+
 for name, gv, site, zone in GOATNETS:
     gv_path = f"ops/ansible/group_vars/{gv}/vars.yml"
+    legacy_prefix = declared(gv, "obs_traefik_legacy_name_prefix")
+    icmp_targets = declared(gv, "obs_blackbox_icmp_targets")
     svcs = isitup_services(gv_path, site, zone)
     if svcs is None:
         failures.append(f"{name}: {gv_path} declares no isitup_services")
@@ -128,6 +144,8 @@ for name, gv, site, zone in GOATNETS:
         rendered = tmpl.render(site_id=site, site_dns_zone=zone,
                                isitup_services=svcs,
                                obs_relay_tls_targets=relay_tls_targets(gv_path),
+                               obs_traefik_legacy_name_prefix=legacy_prefix,
+                               obs_blackbox_icmp_targets=icmp_targets,
                                portal_traefik_host=f"portal.{site}.{zone}", now=_now)
     except jinja2.TemplateError as e:
         failures.append(f"{name}: template did not render — {e}")
@@ -180,6 +198,26 @@ for name, gv, site, zone in GOATNETS:
                 if "://" in t or ":" not in t:
                     failures.append(
                         f"{name}: relay target {t!r} must be host:port, not a URL")
+
+    # Declared values the template only reads. A goatnet that declares a
+    # Traefik name prefix must get both relabel rules built from it, and one
+    # that declares ICMP targets must get exactly those behind the exporter.
+    # Without this a renamed variable renders a config with neither and the
+    # only symptom is a label that changed value or a panel with no data.
+    if legacy_prefix:
+        want = f"^{legacy_prefix}-(.*)$"
+        got = {r.get("target_label"): r.get("regex")
+               for r in (jobs.get("traefik", {}).get("metric_relabel_configs") or [])}
+        if got != {"service": want, "router": want}:
+            failures.append(f"{name}: traefik job must strip {legacy_prefix!r}- from "
+                            f"service and router, rendered {got}")
+    if icmp_targets:
+        icmp = jobs.get("blackbox-icmp", {})
+        got = [t for sc in (icmp.get("static_configs") or []) for t in (sc.get("targets") or [])]
+        if got != list(icmp_targets):
+            failures.append(f"{name}: blackbox-icmp targets {got} are not the declared {icmp_targets}")
+        if not icmp.get("relabel_configs"):
+            failures.append(f"{name}: job 'blackbox-icmp' lost its relabel_configs")
 
     # LIFECYCLE (#1518). Render once more with three rows that must NOT be
     # probed — planned, retiring, listed: false — and one live control row,

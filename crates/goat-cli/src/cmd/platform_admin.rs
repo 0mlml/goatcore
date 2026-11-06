@@ -1915,8 +1915,11 @@ fn governed_entries(
     use super::warrant::{EntryForm, MembershipEntry};
     let managed = |g: &str| g.starts_with(&format!("{prefix}-"));
     let admin = format!("{prefix}-{PLATFORM_ADMIN}");
+    // The owner label every platform-admin grant carries: the team that holds the
+    // role, named after it: the role name in lower case, plural.
+    let owner_label = format!("{}s", PLATFORM_ADMIN.to_lowercase());
     let (owner, reason) = (
-        "user369x",
+        owner_label.as_str(),
         format!("platform-admin {} (ADR 1182)", dir.verb()),
     );
     let mut out = Vec::new();

@@ -78,6 +78,8 @@ pub(crate) const GOATNET_KEYS: &[&str] = &[
     "ory_ssh_host",
     "ory_ssh_user",
     "mgmt_ssh_user",
+    "demo_service",
+    "i18n_feedback_email",
 ];
 const GOATNET_SCHEMA: &str = "goat/goatnet/v1";
 /// Keys the signed bundle also writes: `goatnet.toml` fills them only when the

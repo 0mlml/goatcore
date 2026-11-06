@@ -228,6 +228,12 @@
       ansible.builtin.import_tasks: tasks/pgbackrest-config-preflight.yml
       tags: [always]
 
+    # The compose file mounts Traefik's certificate directory from
+    # TRAEFIK_TLS_ROOT. Written before the file lands, so no compose command
+    # on this host ever reads the file without the key.
+    - name: Write the Traefik certificate directory to .env before the compose file
+      ansible.builtin.import_tasks: tasks/mgmt-host-tls-root-env.yml
+
     - name: Copy base docker-compose.yml (port via MGMT_CONTAINER_HOST_PORT in .env)
       ansible.builtin.copy:
         src: ../compose/mgmt-host/docker-compose.yml
@@ -422,8 +428,8 @@
           {% endif %}
           {# ORY images: pin the multi-arch INDEX digest, never a per-arch    #}
           {# manifest. The compose defaults are amd64-only manifests, so on   #}
-          {# an arm64 Thor they pull and then die with "exec format error"    #}
-          {#. The bare tag resolves correctly; the default digest     #}
+          {# an arm64 Thor they pull and then die with "exec format error".   #}
+          {# The bare tag resolves correctly; the default digest              #}
           {# does not.                                                       #}
           {% if ory_hydra_image is defined and ory_hydra_image %}
           ORY_HYDRA_IMAGE={{ ory_hydra_image }}
@@ -446,11 +452,17 @@
           {% if traefik_image is defined and traefik_image %}
           TRAEFIK_IMAGE={{ traefik_image }}
           {% endif %}
+          {# The host directory of Traefik's certificates, mounted at the    #}
+          {# same path inside the container: the traefik role's dynamic      #}
+          {# config names each cert by this path. Always written, so the     #}
+          {# mount never falls back to the compose default on a host whose   #}
+          {# certificates live elsewhere.                                    #}
+          TRAEFIK_TLS_ROOT={{ traefik_tls_root | default((goat_host_etc_dir | default('/etc/goat')) ~ '/tls') }}
           {# Where Traefik's :8082 metrics entrypoint is published (ADR 1161). #}
           {# Unset -> the compose default of 127.0.0.1, which is correct for   #}
           {# every co-located obs stack. Sites whose obs host is a separate    #}
           {# machine set this to the mgmt host's MESH address so Prometheus    #}
-          {# can reach it; never 0.0.0.0.                              #}
+          {# can reach it; never 0.0.0.0.                                      #}
           {% if traefik_metrics_bind is defined and traefik_metrics_bind %}
           TRAEFIK_METRICS_BIND={{ traefik_metrics_bind }}
           {% endif %}

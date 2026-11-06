@@ -116,7 +116,7 @@ pub fn classify(value_name: Option<&str>) -> ContextKind {
 /// label it renders under. The completion grammar is a property of the feed,
 /// not the CLI — so it lives with the feed definition and ports with it.
 ///   - a write prefix continues the topic-key path, so it completes with a
-///     trailing `/` (`org11x` → `org11x/…`);
+///     trailing `/` (`acme` → `acme/…`);
 ///   - a recent topic / declared schema is a finished token, so it completes
 ///     with a trailing space.
 ///

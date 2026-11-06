@@ -248,7 +248,7 @@ test.describe("candidate intake form (mocked backend)", () => {
             message: "one or more fields need correction before this request can be reviewed",
             fields: {
               nationality:
-                "please provide your nationality as an ISO 3166-1 alpha-3 code (e.g. CAN, USA, SVK)",
+                "please provide your nationality as an ISO 3166-1 alpha-3 code (e.g. CAN, USA)",
               organization: "organization is required",
               tier: "choose your access level",
             },
@@ -352,7 +352,7 @@ test.describe("candidate intake form (mocked backend)", () => {
             message: "one or more fields need correction before this request can be reviewed",
             fields: {
               organization: "organization is required",
-              nationality: "please provide your nationality as an ISO 3166-1 alpha-3 code (e.g. CAN, USA, SVK)",
+              nationality: "please provide your nationality as an ISO 3166-1 alpha-3 code (e.g. CAN, USA)",
             },
           },
         }),

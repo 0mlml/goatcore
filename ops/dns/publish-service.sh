@@ -3,20 +3,22 @@ set -euo pipefail
 
 # goat — Publish a service to mesh DNS
 #
-# Adds a DNS entry for a service, pushes to the NETHOST, and reloads CoreDNS.
-# Idempotent — safe to run multiple times with the same arguments.
+# Adds a DNS entry for a service, pushes to the network host, and reloads
+# CoreDNS. Idempotent — safe to run multiple times with the same arguments.
 #
 # Run from LOCAL:
-#   bash ops/dns/publish-service.sh demogame
-#   bash ops/dns/publish-service.sh --remove demogame
+#   bash ops/dns/publish-service.sh myservice
+#   bash ops/dns/publish-service.sh --remove myservice
 #
-# IP defaults to NETHOST_HOST (all services route through the NETHOST reverse proxy).
-# Override with a second arg only if the service runs on a different node.
+# IP defaults to the network host's address (all services route through its
+# reverse proxy). Override with a second arg only if the service runs on a
+# different node.
+#
+# The zone is NETBIRD_DOMAIN, which .envrc exports and this script sources.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 HOSTS_FILE="$SCRIPT_DIR/mesh-hosts"
-DOMAIN="netbird.legacy.example"
 REMOTE_HOSTS_PATH="/opt/goat/dns/mesh-hosts"
 REMOTE_DNS_DIR="/opt/goat/dns"
 
@@ -30,6 +32,8 @@ fi
 
 : "${NETHOST_HOST:?Set NETHOST_HOST}"
 : "${NETHOST_USER:?Set NETHOST_USER}"
+: "${NETBIRD_DOMAIN:?Set NETBIRD_DOMAIN (the mesh DNS zone)}"
+DOMAIN="$NETBIRD_DOMAIN"
 
 SSH_TARGET="$NETHOST_USER@$NETHOST_HOST"
 
@@ -69,12 +73,12 @@ IP="${2:-$NETHOST_HOST}"
 
 if [ -z "$NAME" ]; then
   echo "Usage:"
-  echo "  publish-service.sh <name> [ip]             Add/update a service (IP defaults to NETHOST_HOST)"
+  echo "  publish-service.sh <name> [ip]             Add/update a service (IP defaults to the network host)"
   echo "  publish-service.sh --remove <name>          Remove a service"
   echo ""
   echo "Examples:"
-  echo "  publish-service.sh demogame"
-  echo "  publish-service.sh --remove demogame"
+  echo "  publish-service.sh myservice"
+  echo "  publish-service.sh --remove myservice"
   exit 1
 fi
 
@@ -102,12 +106,12 @@ else
   fi
 fi
 
-# Push to NETHOST and reload
+# Push to the network host and reload
 echo "Pushing to $SSH_TARGET..."
 scp_to_remote "$HOSTS_FILE" "/tmp/mesh-hosts"
 sudo_remote "cp /tmp/mesh-hosts $REMOTE_HOSTS_PATH"
 run_remote "cd $REMOTE_DNS_DIR && echo '${NETHOST_PASS:-}' | sudo -S docker compose restart coredns 2>/dev/null"
-echo "NETHOST coredns reloaded."
+echo "Network host coredns reloaded."
 
 # Push to VPS relays (redundant DNS)
 # Relay metadata sourced from ops/relay-env.sh (single source of truth).

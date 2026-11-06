@@ -123,7 +123,7 @@
 # runs while the core host goes through 2..6. The stack leg scrapes the core
 # host's mesh (or LAN) addresses, so it starts once the router is up and runs
 # while 10..12 deploy the service surface. Each leg logs to
-# ~/.goat/state/standup-<site>-obs-<leg>.log and is joined (rc checked,
+# <state dir>/standup-<site>-obs-<leg>.log and is joined (rc checked,
 # tail printed) at the phase that needs it. A failed leg fails the run at the
 # join, with the same recovery message as a failed phase; the leg itself is
 # idempotent, so the resume is `--obs-only` then `--from <join phase>`.
@@ -214,7 +214,17 @@ Q_N=0
 SITE_UPPER="$(printf '%s' "${SITE//-/_}" | tr '[:lower:]' '[:upper:]')"  # env-var prefix, e.g. DEMO
 INV=(-i inventory/mgmt-hosts.ini -i inventory/mgmt-hosts-mesh.ini)
 OBS_GROUP="${SITE//-/_}_obs_hosts"
-STATE_DIR="$HOME/.goat/state"; mkdir -p "$STATE_DIR"
+# Where this machine keeps the project's local state (run logs, CA keys): the
+# deploy.state_dir the checkout declares in ops/goatbuilder/goatbuilder.yaml
+# (read by project-setting.sh), else ~/.goat/state. The builder reads the same
+# (crate::settings), so a run resumed with the other avenue finds its files.
+# STATE_DECL keeps the `~` for the commands a phase prints and runs; STATE_DIR
+# is the same path expanded, for what this script opens itself.
+STATE_DECL="$("$REPO/ops/scripts/project-setting.sh" --repo "$REPO" deploy state_dir 2>/dev/null || true)"
+# shellcheck disable=SC2088  # the literal `~` is kept on purpose, see above
+[ -n "$STATE_DECL" ] || STATE_DECL='~/.goat/state'
+case "$STATE_DECL" in \~/*) STATE_DIR="$HOME/${STATE_DECL#\~/}" ;; *) STATE_DIR="$STATE_DECL" ;; esac
+mkdir -p "$STATE_DIR"
 
 # Is there an obs host to build, and is it identified + prepped? All four
 # conditions, or the leg is skipped and says why. A declared-but-absent obs
@@ -694,9 +704,9 @@ step 4 T "mint leaf certs" \
 step 4 T "name-fallback snapshot (generate + sign)" \
   "if grep -qE 'name_snapshot_enabled:[[:space:]]*true' '$REPO/ops/ansible/group_vars/${GROUP}/vars.yml' 2>/dev/null; then \
      python3 '$REPO/ops/dns/generate-mesh-hosts.py'; \
-     if [ -f ~/.goat/state/${SITE}-ca/ca.key.age ]; then \
-       ( cd '$REPO/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '$REPO/ops/dns/${SITE}/name-snapshot.json' --root-key ~/.goat/state/${SITE}-ca/ca.key.age --age-identity ~/.config/age/keys.txt ); \
-     else echo 'name_snapshot: no ~/.goat/state/${SITE}-ca/ca.key.age — generate ran, SIGN manually with ops/enrollment/cmd/name-snapshot-sign'; fi; \
+     if [ -f ${STATE_DECL}/${SITE}-ca/ca.key.age ]; then \
+       ( cd '$REPO/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '$REPO/ops/dns/${SITE}/name-snapshot.json' --root-key ${STATE_DECL}/${SITE}-ca/ca.key.age --age-identity ~/.config/age/keys.txt ); \
+     else echo 'name_snapshot: no ${STATE_DECL}/${SITE}-ca/ca.key.age — generate ran, SIGN manually with ops/enrollment/cmd/name-snapshot-sign'; fi; \
    else echo 'name_snapshot_enabled not true for ${GROUP} — skipping (ADR 1082)'; fi"
 
 # Phase 5. mgmt-stack (postgres/signal/management/traefik/admit-audit). Needs FIVE
@@ -907,7 +917,7 @@ step 9 A "zenoh router" \
 #      bridge, id-console, onboard-runner and grant-keyd authenticate with. The
 #      role does nothing on a host not declared the CA holder, so the founder is
 #      declared here rather than relying on a host_vars line a new goatnet may
-#      not have.
+#      not have (SPIRE was reached only by a hand-run play).
 step 9 A "SPIRE server on the founder (workload identity)" \
   "cd '$REPO/ops/ansible' && $ANSIBLE_PRE ${INV[*]} spire-deploy.yml -e target=$GROUP -l 'mgmt-${SITE}-01*' -e spire_enabled=true -e postgres_superuser_password=\"\$(printenv ${SITE_UPPER}_PG_PASS)\""
 

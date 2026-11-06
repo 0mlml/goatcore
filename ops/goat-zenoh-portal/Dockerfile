@@ -49,8 +49,10 @@ FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e035
 # The store this image's server opens. The goat-zenoh-portal-store role reads it
 # with `docker image inspect` and refuses to deploy an image whose store differs
 # from the goatnet's declared portal_store. An image without the label predates
-# the Postgres server and is read as "sqlite".
+# the Postgres server and is read as "sqlite". The second label carries the
+# same fact under a neutral key, so the role can read either.
 LABEL org.usareur-af.goat-zenoh-portal.store="postgres"
+LABEL io.goat.zenoh-portal.store="postgres"
 # Static binary, but Chainguard glibc-dynamic gives ca-certificates +
 # /etc/passwd for a non-root run. Use chainguard's nonroot user.
 USER 65532:65532

@@ -6,7 +6,7 @@
 # setup. So a person whose code expired, or whose one-shot link was spent in
 # transit by a mail-security scanner, is stranded silently — and stays
 # stranded until they happen to email somebody. that was the only
-# reason anyone learned that 83 of 98 persons on idm.goat.example carry no
+# reason anyone learned that 83 of 98 persons on one door carried no
 # credential at all.
 #
 # The measurable fact, and the only one this reports as fact: a person with
@@ -17,11 +17,11 @@
 # depends on the DOOR, which is why the fallback is per-plane rather than a
 # constant. Verified by fetching each login page:
 #
-#   public (relay-health / consistency, via auth.goat.example)
+#   public (relay-health / consistency, via the public sign-in broker)
 #       "Log in with Google" + "Log in with Kanidm"  -> gmail/googlemail is a
 #       certain second way in; those accounts are not stranded.
-#   collab (chat / docs / files, via auth.collab.goat.example)
-#       Kanidm ONLY — the request goes straight to idm.collab.goat.example with no
+#   collab (chat / docs / files, via the collaboration sign-in broker)
+#       Kanidm ONLY — the request goes straight to the collab Kanidm with no
 #       connector chooser. There is NO fallback. On this door, no credential
 #       means no access, gmail or not.
 #
@@ -44,11 +44,15 @@
 # keeps (docs/design/collab-onboarding-provisioner.md). A domain is what makes
 # the Google-fallback call, so a domain is what it prints.
 #
-# Credentials come from the environment (direnv), never arguments:
-#   public plane (dashboard door, idm.goat.example) → GOAT_IDM_ADMIN_PW,
+# The door and its credential come from the environment (direnv, or the unit's
+# EnvironmentFile), never arguments:
+#   public plane (dashboard door) → PUBLIC_DOOR_KANIDM_URL, and
+#     <PUBLIC>_IDM_ADMIN_PW (the variable the case below names),
 #     or a read-scoped service-account bearer in DOOR_AUDIT_TOKEN (preferred;
 #     mint with ops/scripts/create-door-audit-identity.sh)
-#   collab plane (idm.collab.goat.example)          → COLLAB_KANIDM_IDM_ADMIN_PW
+#   collab plane                  → COLLAB_KANIDM_URL, COLLAB_KANIDM_IDM_ADMIN_PW
+# The URL is the base of that door's Kanidm (https://idm.<zone>); there is no
+# built-in door.
 #
 # Exit codes: 0 = the audit ran (findings are a REPORT, not a failure — a guard
 # that exits non-zero on "found something" trains people to mute it). 2 = usage
@@ -73,10 +77,12 @@ while [ $# -gt 0 ]; do
 done
 
 case "$PLANE" in
-  public) HOST=https://idm.goat.example;        PW="${GOAT_IDM_ADMIN_PW:-}";    PWVAR=GOAT_IDM_ADMIN_PW ;;
-  collab) HOST=https://idm.collab.goat.example; PW="${COLLAB_KANIDM_IDM_ADMIN_PW:-}"; PWVAR=COLLAB_KANIDM_IDM_ADMIN_PW ;;
+  public) HOSTVAR=PUBLIC_DOOR_KANIDM_URL; PW="${GOAT_IDM_ADMIN_PW:-}";    PWVAR=GOAT_IDM_ADMIN_PW ;;
+  collab) HOSTVAR=COLLAB_KANIDM_URL;      PW="${COLLAB_KANIDM_IDM_ADMIN_PW:-}"; PWVAR=COLLAB_KANIDM_IDM_ADMIN_PW ;;
   *) echo "unknown --plane '$PLANE' (want: public | collab)" >&2; exit 2 ;;
 esac
+HOST="${!HOSTVAR:-}"; HOST="${HOST%/}"
+[ -n "$HOST" ] || { echo "$HOSTVAR is not set — the base URL of the $PLANE door's Kanidm (https://idm.<zone>)." >&2; exit 2; }
 case "$FORMAT" in text|tsv) : ;; *) echo "unknown --format '$FORMAT' (want: text | tsv)" >&2; exit 2 ;; esac
 
 TOKEN="${DOOR_AUDIT_TOKEN:-}"

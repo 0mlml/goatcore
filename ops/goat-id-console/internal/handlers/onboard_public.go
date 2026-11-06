@@ -398,7 +398,7 @@ func validationErrorsForSubmission(inv *onboardstore.Invite, sub candidateSubmis
 
 	// Organisation nation (legacy field; the form no longer renders it).
 	if n := strings.TrimSpace(sub.Nation); n != "" && !validNationCode(n) {
-		fields["nation"] = "nation must be an ISO 3166-1 alpha-3 code (e.g. CAN, USA, SVK) or a multinational marker (NATO, EU), not a full country name — got " + strconv.Quote(n)
+		fields["nation"] = "nation must be an ISO 3166-1 alpha-3 code (e.g. CAN, USA) or a multinational marker (NATO, EU), not a full country name — got " + strconv.Quote(n)
 	}
 
 	// Person nationality: required for a person, optional for a system; both
@@ -409,10 +409,10 @@ func validationErrorsForSubmission(inv *onboardstore.Invite, sub candidateSubmis
 	nat := strings.TrimSpace(sub.Nationality)
 	if nat != "" {
 		if !validNationCode(nat) {
-			fields["nationality"] = "nationality must be an ISO 3166-1 alpha-3 code (e.g. CAN, USA, SVK), not a full country name — got " + strconv.Quote(nat)
+			fields["nationality"] = "nationality must be an ISO 3166-1 alpha-3 code (e.g. CAN, USA), not a full country name — got " + strconv.Quote(nat)
 		}
 	} else if !isSystem {
-		fields["nationality"] = "please provide your nationality as an ISO 3166-1 alpha-3 code (e.g. CAN, USA, SVK) — it decides which shared data you may be shown, so a request without it cannot be reviewed"
+		fields["nationality"] = "please provide your nationality as an ISO 3166-1 alpha-3 code (e.g. CAN, USA) — it decides which shared data you may be shown, so a request without it cannot be reviewed"
 	}
 
 	if len(fields) == 0 {

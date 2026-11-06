@@ -11,7 +11,8 @@ set -euo pipefail
 #
 # Prerequisites:
 #   - NETBIRD_API_TOKEN set (create a PAT in the dashboard: Users → Personal Access Tokens)
-#   - NETBIRD_DOMAIN set (default: netbird.legacy.example)
+#   - NETBIRD_DOMAIN set (the mesh DNS zone; .envrc exports it, and the
+#     cron entry --install-cron writes carries it)
 #   - curl, python3 available
 #
 # Usage:
@@ -20,7 +21,7 @@ set -euo pipefail
 #
 # The script preserves any lines in mesh-hosts below a "# Custom entries" marker.
 
-DOMAIN="${NETBIRD_DOMAIN:-netbird.legacy.example}"
+DOMAIN="${NETBIRD_DOMAIN:?Set NETBIRD_DOMAIN (the mesh DNS zone)}"
 API_URL="https://${DOMAIN}/api"
 
 # Detect if running on the router or admin machine
@@ -85,7 +86,7 @@ domain = '${DOMAIN}'
 custom = '''${CUSTOM_ENTRIES}'''
 
 # Collect FQDNs already claimed in the custom entries section.
-# If a peer's FQDN appears there (e.g., as a service pointed at NETHOST),
+# If a peer's FQDN appears there (e.g., as a service pointed at the network host),
 # emit only the short alias so dnsmasq doesn't return two IPs.
 custom_fqdns = set()
 for line in custom.splitlines():

@@ -30,7 +30,7 @@
 #     FED_COUNTERPARTY    path to the counterparty's package (phase 6 needs it)
 #     FED_SIGNING_KEY     our Ed25519 signing key (64 hex or 44 base64)
 #     FED_ROUTER_DOCKER_HOST  DOCKER_HOST for phase 3 when the core router is not on
-#                         this host, e.g. ssh://goat@<core>. `init` reads the
+#                         this host, e.g. ssh://<user>@<core>. `init` reads the
 #                         federation interface here and the running router there; the
 #                         edge must not share a machine with the core.
 #     GOAT_AWS_PROFILE    aws-vault profile the ansible phases run under
@@ -66,7 +66,13 @@ done
 : "${FED_WORK:=/var/lib/goat-federation/$PEERING}"
 : "${FED_COUNTERPARTY:=$FED_WORK/theirs.canonical.json}"
 : "${FED_SIGNING_KEY:=}"
-: "${GOAT_AWS_PROFILE:=usareur-af}"
+# GOAT_AWS_PROFILE, then the project's own deploy.aws_profile
+# (ops/goatbuilder/goatbuilder.yaml), then the name the AWS tools fall back to
+# themselves: the three goat-standup.sh and the builder read, in that order.
+if [ -z "${GOAT_AWS_PROFILE:-}" ] && [ -f "$REPO/ops/goatbuilder/goatbuilder.yaml" ]; then
+  GOAT_AWS_PROFILE="$(python3 -c 'import sys, yaml; print(str(((yaml.safe_load(open(sys.argv[1])) or {}).get("deploy") or {}).get("aws_profile") or "").strip())' "$REPO/ops/goatbuilder/goatbuilder.yaml" 2>/dev/null || true)"
+fi
+: "${GOAT_AWS_PROFILE:=default}"
 
 # THE PROFILE DIRECTORY, RESOLVED ONCE, HERE. Every phase that reads the profile
 # resolves it from $HOME, and `sudo -E` PRESERVES the invoking user's HOME — so a

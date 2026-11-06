@@ -2,8 +2,8 @@
 # ops/ci/check-portal-cert-identity-override.sh — fail-closed guard so a NEW
 # goatnet cannot silently inherit ANY part of the legacy portal identity.
 #
-# WHY: every per-goatnet portal identity value DEFAULTS to a legacy literal when
-# unset (certmint.go `"" → …`), so the parameterization is fail-OPEN — a goatnet
+# WHY: every per-goatnet portal identity value DEFAULTS to a legacy literal in
+# the role defaults when a goatnet leaves it unset, so the parameterization is fail-OPEN — a goatnet
 # that forgets to override any single value ships artifacts named for another
 # goatnet: URI-SAN collisions (409s), or scripts that reference one CA filename
 # while the tarball ships another.
@@ -30,7 +30,8 @@ ALLOWLIST_RE='^nova_lan_hosts$'
 PORTAL_SIGNAL='^[[:space:]]*(portal_image|portal_cert_sign_[a-z_]+|portal_identity_model)[[:space:]]*:'
 
 # The full per-goatnet identity set: "<group_vars key>|<legacy default>".
-# Keep in lock-step with certmint.go's `"" → <legacy literal>` fallbacks.
+# Keep in lock-step with the legacy values in
+# ops/ansible/roles/goat-zenoh-portal/defaults/main.yml.
 IDENTITY_KEYS='
 portal_cert_sign_uri_prefix|urn:goat-nova:vendor=
 portal_cert_sign_cn_suffix|-trial-peer

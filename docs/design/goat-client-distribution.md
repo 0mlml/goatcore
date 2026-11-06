@@ -150,7 +150,8 @@ new assets to the bucket. Invite-link hosting is untouched (a separate, later
 track). Implementation tracking in in-flight.md.
 
 B6 (retire Phase 3.6) is **built, validation pending**:
-`ops/ansible/operator-laptop-onboarding.yml` is rewritten from the
+the operator-laptop onboarding playbook (`operator-laptop-onboarding.yml`,
+kept with the deployment that runs it) is rewritten from the
 three-piece legacy flow (wg-cp0-bundle-apply + wg-quick + hand-built
 patched netbird + onboarding-time setup-key) to the goat-client model —
 install the signed release from `get.goat.example` (SHA256SUMS-verified

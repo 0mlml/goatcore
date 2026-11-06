@@ -235,8 +235,8 @@ enum Cmd {
         op: cmd::audit::AuditCmd,
     },
     /// Run a fabric demo end-to-end: open the browser-side traffic generator
-    /// and tail the resulting Zenoh traffic in this terminal. Currently the
-    /// only target is `demogame` (8 auto-pilot bots in one page).
+    /// and tail the resulting Zenoh traffic in this terminal. With no name it runs
+    /// the demo service the goatnet publishes (`demo_service`).
     Demo(cmd::demo::DemoArgs),
     /// Publish a payload to a topic key.
     Pub(cmd::pubsub::PubArgs),
@@ -445,7 +445,12 @@ async fn main() {
         cli.cmd,
         Cmd::Completion { .. } | Cmd::Complete { .. } | Cmd::Docs { .. }
     ) {
-        i18n::warn_if_machine_translated();
+        // The feedback address is the active context's goatnet fact; a context
+        // that cannot be resolved yet simply has none.
+        let goatnet_email = profile::Profile::resolve(cli.profile_dir.as_deref(), cli.context.as_deref())
+            .ok()
+            .and_then(|p| p.goatnet_endpoints().i18n_feedback_email);
+        i18n::warn_if_machine_translated(goatnet_email.as_deref());
     }
 
     let exit = run(cli).await;
@@ -573,7 +578,7 @@ fn report_anyhow(err: anyhow::Error) -> i32 {
 ///
 /// We skip global flags that take values (`--profile-dir <p>`,
 /// `--context <c>`, `--color <m>`) so that
-/// `goat --color always org11x foo` still resolves `org11x` as the
+/// `goat --color always acme foo` still resolves `acme` as the
 /// subcommand. Boolean global flags (`--narrate`, `--verbose`/`-v`)
 /// don't take values.
 ///
