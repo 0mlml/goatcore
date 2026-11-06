@@ -2,6 +2,7 @@
 package types
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"time"
@@ -515,8 +516,12 @@ func (e SatlinkPopEvent) MarshalJSON() ([]byte, error) {
 }
 
 // withCompatRangeKey appends the compat range key to a marshaled non-empty
-// JSON object.
+// JSON object. Where the compat key is the same string as the current key the
+// object already carries it and is returned unchanged.
 func withCompatRangeKey(obj []byte, v bool) []byte {
+	if bytes.Contains(obj, []byte(`"`+compat.SatlinkRangeJSONKey+`":`)) {
+		return obj
+	}
 	out := append([]byte{}, obj[:len(obj)-1]...)
 	out = append(out, `,"`+compat.SatlinkRangeJSONKey+`":`...)
 	out = strconv.AppendBool(out, v)

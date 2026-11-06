@@ -48,6 +48,7 @@ Usage:
 Exit 0 all invariants hold; 1 otherwise.
 """
 import argparse
+import getpass
 import re
 import shlex
 import subprocess
@@ -279,13 +280,13 @@ def check(h):
     for key in ("net.ipv4.ip_nonlocal_bind", "net.ipv6.ip_nonlocal_bind"):
         ok, val = h.sh(f"sysctl -n {key} 2>/dev/null")
         if not ok or val == "":
-            h.unknown(f"{key}", val or "no value")
+            h.unknown(key, val or "no value")
         elif val.strip() == "1":
-            h.ok(f"{key}", "1")
+            h.ok(key, "1")
         elif h.baseline_pending:
-            h.set_by_phase_2(f"{key}", f"is {val.strip()}")
+            h.set_by_phase_2(key, f"is {val.strip()}")
         else:
-            h.bad(f"{key}", f"is {val.strip()}, must be 1",
+            h.bad(key, f"is {val.strip()}, must be 1",
                   "A VIP cannot be bound before it is held; failover then fails "
                   "in a way that reads as a service crash.")
 
@@ -374,10 +375,31 @@ def load_inventory(files):
     return hosts
 
 
+def default_user() -> str:
+    """The account this project reaches a machine as: deploy.ssh_user in
+    ops/goatbuilder/goatbuilder.yaml, else the login name, which is what ssh
+    itself uses."""
+    try:
+        lines = (Path(__file__).resolve().parents[2] / "ops/goatbuilder/goatbuilder.yaml").read_text().splitlines()
+    except OSError:
+        lines = []
+    inside = False
+    for line in lines:
+        if line[:1] not in ("", " ", "\t", "#"):
+            inside = line.rstrip() == "deploy:"
+        elif inside and line.strip().startswith("ssh_user:"):
+            value = line.split(":", 1)[1].split("#", 1)[0].strip().strip("'\"")
+            if value:
+                return value
+    return getpass.getuser()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("hosts", nargs="+")
-    ap.add_argument("--user", default="goat")
+    ap.add_argument("--user", default=default_user(),
+                    help="ssh user for a host the inventory names no ansible_user for "
+                         "(default: deploy.ssh_user in ops/goatbuilder/goatbuilder.yaml, else the login name)")
     ap.add_argument("--inventory", action="append", default=None,
                     help="ansible inventory file(s) that carry the host transport "
                          "(ansible_host / ansible_user / ansible_ssh_common_args); "

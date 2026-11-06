@@ -1727,11 +1727,14 @@ pub fn ca_key_for(intent: &Path, goatnet: &str) -> Result<(String, String, Strin
 }
 
 /// `intent-sign` for one goatnet's intent, from the enrollment module root.
+/// The audit log is the project's (`settings::ca_audit_log_abs_global`), named
+/// on the call, so the entry lands in one file whatever the tool was built from.
 pub fn sign_intent(repo: &Path, intent: &Path, key: &str) -> Result<Vec<String>> {
     let home = std::env::var("HOME").unwrap_or_default();
+    let audit = crate::settings::ca_audit_log_abs_global();
     let out = Command::new("go")
         .current_dir(repo.join("ops/enrollment"))
-        .args(["run", "./cmd/intent-sign", "--intent", intent.to_str().unwrap_or(""), "--root-key", key, "--age-identity", &format!("{home}/.config/age/keys.txt")])
+        .args(["run", "./cmd/intent-sign", "--intent", intent.to_str().unwrap_or(""), "--root-key", key, "--age-identity", &format!("{home}/.config/age/keys.txt"), "--audit-log", &audit])
         .output()
         .map_err(|e| anyhow!("go run ./cmd/intent-sign: {e}"))?;
     if !out.status.success() {

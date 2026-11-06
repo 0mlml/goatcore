@@ -45,11 +45,23 @@ class Build(unittest.TestCase):
         self.assertNotIn("apt", without["autoinstall"])
 
     def test_day_one_access_is_key_only_with_sudo(self):
-        ud, _, _ = ns.build(REPO, "demo", "h", "x86-tpm2", "p", KEYS, "")
+        ud, _, _ = ns.build(REPO, "demo", "h", "x86-tpm2", "p", KEYS, "", user="first-day")
         ai = ud["autoinstall"]
         self.assertEqual(ai["ssh"], {"install-server": True, "allow-pw": False})
         u = ai["user-data"]["users"][0]
-        self.assertEqual((u["name"], u["lock_passwd"], u["sudo"], u["ssh_authorized_keys"]), ("goat", True, "ALL=(ALL) NOPASSWD:ALL", KEYS))
+        self.assertEqual((u["name"], u["lock_passwd"], u["sudo"], u["ssh_authorized_keys"]), ("first-day", True, "ALL=(ALL) NOPASSWD:ALL", KEYS))
+
+    def test_the_account_and_state_dir_are_what_the_checkout_declares(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ns.seed_user(Path(d)), "goat")
+            self.assertEqual(ns.state_dir(Path(d)), Path(os.path.expanduser("~/.goat/state")))
+            cfg = Path(d) / "ops/goatbuilder"
+            cfg.mkdir(parents=True)
+            (cfg / "goatbuilder.yaml").write_text("deploy:\n  ssh_user: ops\n  state_dir: /srv/state\n")
+            self.assertEqual(ns.seed_user(Path(d)), "ops")
+            self.assertEqual(ns.state_dir(Path(d)), Path("/srv/state"))
+        ud, _, _ = ns.build(REPO, "demo", "h", "x86-tpm2", "p", KEYS, "")
+        self.assertEqual(ud["autoinstall"]["user-data"]["users"][0]["name"], ns.seed_user(REPO))
 
     def test_the_marker_names_the_seed_and_never_the_passphrase(self):
         a, _, ma = ns.build(REPO, "demo", "h", "x86-tpm2", "secret-one", KEYS, "")

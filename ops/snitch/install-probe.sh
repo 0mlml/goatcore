@@ -5,7 +5,7 @@
 # systemd service that probes every 60s and reports to the collector.
 #
 # Usage:
-#   curl -fsSL http://100.127.1.28:8080/install | bash
+#   curl -fsSL http://100.127.1.23:8080/install | bash
 #   # or manually:
 #   bash install-probe.sh [--collector URL] [--interval SECONDS]
 #
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-COLLECTOR="${SNITCH_COLLECTOR:-http://100.127.1.28:8080}"
+COLLECTOR="${SNITCH_COLLECTOR:-http://100.127.1.23:8080}"
 INTERVAL=60
 INSTALL_DIR=/usr/local/bin
 SERVICE_NAME=snitch-probe

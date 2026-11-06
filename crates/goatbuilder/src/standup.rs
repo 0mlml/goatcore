@@ -399,8 +399,9 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     let mint_ca = if s.lite { " --mint-ca-if-missing" } else { "" };
     ev.push(p(4, "T", "mint leaf certs".into(), format!("'{r}/ops/scripts/mint-site-certs.sh' {site}{mint_ca}")));
     let state = crate::settings::state_dir(repo);
+    let audit = crate::settings::ca_audit_log(repo);
     ev.push(p(4, "T", "name-fallback snapshot (generate + sign)".into(), format!(
-        "if grep -qE 'name_snapshot_enabled:[[:space:]]*true' '{r}/ops/ansible/group_vars/{g}/vars.yml' 2>/dev/null; then      python3 '{r}/ops/dns/generate-mesh-hosts.py';      if [ -f {state}/{site}-ca/ca.key.age ]; then        ( cd '{r}/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '{r}/ops/dns/{site}/name-snapshot.json' --root-key {state}/{site}-ca/ca.key.age --age-identity ~/.config/age/keys.txt );      else echo 'name_snapshot: no {state}/{site}-ca/ca.key.age — generate ran, SIGN manually with ops/enrollment/cmd/name-snapshot-sign'; fi;    else echo 'name_snapshot_enabled not true for {g} — skipping (ADR 1082)'; fi")));
+        "if grep -qE 'name_snapshot_enabled:[[:space:]]*true' '{r}/ops/ansible/group_vars/{g}/vars.yml' 2>/dev/null; then      python3 '{r}/ops/dns/generate-mesh-hosts.py';      if [ -f {state}/{site}-ca/ca.key.age ]; then        ( cd '{r}/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '{r}/ops/dns/{site}/name-snapshot.json' --root-key {state}/{site}-ca/ca.key.age --age-identity ~/.config/age/keys.txt --audit-log {audit} );      else echo 'name_snapshot: no {state}/{site}-ca/ca.key.age — generate ran, SIGN manually with ops/enrollment/cmd/name-snapshot-sign'; fi;    else echo 'name_snapshot_enabled not true for {g} — skipping (ADR 1082)'; fi")));
 
     let ev_bootstrap = format!("-e site_id={site} -e bootstrap_owner_email=\"{oe}\" -e postgres_superuser_password=\"$(printenv {u}_PG_PASS)\" -e netbird_encryption_key=\"$(printenv {u}_NB_ENCKEY)\" -e pgbackrest_cipher_pass=\"$(printenv {u}_BKP_KEY)\"");
     let ev_p1 = if s.joiner {
@@ -505,7 +506,7 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     ev.push(p(12, "A", "onboarding intake front desk (public, ADR 1062 stage 1)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} onboard-intake-deploy.yml -e target={g} -e site_id={site}")));
     ev.push(p(12, "A", "onboard-runner (auto-mint on approval, ADR 1062 stage 3)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} onboard-runner-deploy.yml -e target={g} -e site_id={site}")));
     ev.push(p(12, "A", "grant-keyd (encryption key distribution)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} grant-keyd-deploy.yml -e target={g} -l 'mgmt-{site}-01*'")));
-    ev.push(p(12, "A", "notional pub/sub (synthetic vendors — opt-in via synth_vendors_enabled)".into(), format!("cd '{r}/ops/ansible' && {{ [ ! -e group_vars/{g}/synth-vendors.yml ] || [ -r group_vars/{g}/synth-vendors.yml ] || {{ echo 'cannot read group_vars/{g}/synth-vendors.yml' >&2; false; }}; }} && if grep -qE '^[[:space:]]*synth_vendors_enabled:[[:space:]]*.?(true|True|TRUE|yes|Yes|YES|on|On|ON|1).?[[:space:]]*(#.*)?$' group_vars/{g}/synth-vendors.yml 2>/dev/null; then {pre} {inv} zagros-zenoh-synth-vendors-deploy.yml -e target={g}; else echo 'synth_vendors_enabled not true for {g} — notional pub/sub not requested, skipping'; fi")));
+    ev.push(p(12, "A", "notional pub/sub (synthetic vendors — opt-in via synth_vendors_enabled)".into(), format!("cd '{r}/ops/ansible' && {{ [ ! -e group_vars/{g}/synth-vendors.yml ] || [ -r group_vars/{g}/synth-vendors.yml ] || {{ echo 'cannot read group_vars/{g}/synth-vendors.yml' >&2; false; }}; }} && if grep -qE '^[[:space:]]*synth_vendors_enabled:[[:space:]]*.?(true|True|TRUE|yes|Yes|YES|on|On|ON|1).?[[:space:]]*(#.*)?$' group_vars/{g}/synth-vendors.yml 2>/dev/null; then {pre} {inv} zenoh-synth-vendors-slot-pool-deploy.yml -e target={g}; else echo 'synth_vendors_enabled not true for {g} — notional pub/sub not requested, skipping'; fi")));
     if s.obs {
         ev.push(Event::LegJoin { leg: "stack", at: 13 });
     }
@@ -1763,7 +1764,7 @@ mod tests {
     fn the_synth_guard_agrees_with_yaml() {
         let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let lines = phase_lines(&test_site(false), &o);
-        let line = lines.iter().find(|l| l.2.contains("synth-vendors-deploy.yml")).expect("the synth step is planned");
+        let line = lines.iter().find(|l| l.2.contains("synth-vendors-slot-pool-deploy.yml")).expect("the synth step is planned");
         assert!(line.2.contains("'^[[:space:]]*synth_vendors_enabled:"), "anchored past comments: {}", line.2);
         assert!(line.2.contains("(true|True|TRUE|yes|Yes|YES|on|On|ON|1)"), "{}", line.2);
         assert!(line.2.contains("cannot read group_vars/"), "an unreadable file fails: {}", line.2);
@@ -1775,7 +1776,7 @@ mod tests {
     fn optional_plays_do_not_mask_their_own_failure() {
         let o = Options { env: "e", site: "zagros", profile: None, from: 1, to: 14, skip_obs: false, obs_only: false, dry_run: true, parallel: false, check: false };
         let lines = phase_lines(&test_site(false), &o);
-        for play in ["pubsub-state-mirror-deploy.yml", "zagros-zenoh-synth-vendors-deploy.yml"] {
+        for play in ["pubsub-state-mirror-deploy.yml", "zenoh-synth-vendors-slot-pool-deploy.yml"] {
             let line = lines.iter().find(|l| l.2.contains(play)).unwrap_or_else(|| panic!("{play} is in the plan"));
             assert!(line.2.contains("; then ") && line.2.ends_with("; fi"), "{}", line.2);
             assert!(!line.2.contains("|| echo"), "{}", line.2);

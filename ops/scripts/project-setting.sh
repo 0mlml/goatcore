@@ -16,6 +16,23 @@
 #   project-setting.sh repo image_namespace
 #   project-setting.sh --repo DIR trunk-remote     the git remote of DIR whose
 #                                                  URL is repo.source
+#   project-setting.sh ca-audit-log                the append-only audit log
+#                                                  the signing tools write
+#                                                  (cert-sign, intent-sign,
+#                                                  name-snapshot-sign):
+#                                                  ca-audit.jsonl beside
+#                                                  deploy.state_dir (else beside
+#                                                  ~/.goat/state), `~` kept. Every
+#                                                  driver passes it as
+#                                                  --audit-log.
+#   project-setting.sh var <name>                  one plain `<name>: value`
+#                                                  line of the fleet-wide
+#                                                  variables file,
+#                                                  ops/ansible/group_vars/all.yml:
+#                                                  a name of this deployment
+#                                                  that a play and an operator
+#                                                  script both read. A templated
+#                                                  value prints nothing.
 #
 # Prints the value and exits 0. Prints nothing and exits 0 when the file, the
 # section or the key is absent, so a caller writes its own fallback:
@@ -28,7 +45,10 @@
 # with awk alone, so it runs where python3 has no PyYAML.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The script's own directory without `dirname`, so a caller on a bare PATH
+# (bash and awk only) still gets an answer.
+case "${BASH_SOURCE[0]}" in */*) HERE="${BASH_SOURCE[0]%/*}" ;; *) HERE=. ;; esac
+REPO="$(cd "$HERE/../.." && pwd)"
 if [ "${1:-}" = "--repo" ]; then REPO="${2:?--repo needs a directory}"; shift 2; fi
 
 declared() {  # declared <section> <key>
@@ -42,6 +62,30 @@ declared() {  # declared <section> <key>
       sub(/[ \t]+$/, "")
       if ($0 ~ /^".*"$/ || $0 ~ /^\047.*\047$/) $0 = substr($0, 2, length($0) - 2)
       print
+      exit
+    }
+  ' "$f"
+}
+
+ca_audit_log() {
+  local state
+  state="$(declared deploy state_dir)"
+  # shellcheck disable=SC2088  # the tilde is kept: a caller prints or expands it
+  [ -n "$state" ] || state="~/.goat/state"
+  state="${state%/}"
+  case "$state" in */*) printf '%s/ca-audit.jsonl\n' "${state%/*}" ;; *) printf './ca-audit.jsonl\n' ;; esac
+}
+
+fleet_var() {  # fleet_var <name>
+  local f="$REPO/ops/ansible/group_vars/all.yml"
+  [ -f "$f" ] || return 0
+  awk -v key="$1" '
+    $0 ~ ("^" key ":") {
+      sub("^" key ":[ \t]*", "")
+      sub(/[ \t]+#.*$/, "")
+      sub(/[ \t]+$/, "")
+      if ($0 ~ /^".*"$/ || $0 ~ /^\047.*\047$/) $0 = substr($0, 2, length($0) - 2)
+      if ($0 !~ /[{][{%]/) print
       exit
     }
   ' "$f"
@@ -66,6 +110,8 @@ trunk_remote() {
 
 case "$#:${1:-}" in
   1:trunk-remote) trunk_remote ;;
+  1:ca-audit-log) ca_audit_log ;;
+  2:var) fleet_var "$2" ;;
   2:*) declared "$1" "$2" ;;
-  *) echo "usage: project-setting.sh [--repo DIR] <section> <key> | trunk-remote" >&2; exit 2 ;;
+  *) echo "usage: project-setting.sh [--repo DIR] <section> <key> | trunk-remote | ca-audit-log | var <name>" >&2; exit 2 ;;
 esac

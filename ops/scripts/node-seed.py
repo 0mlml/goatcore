@@ -10,7 +10,8 @@ usage: node-seed.py <site> --host <inventory host> --class <class>
                     [--out DIR] [--no-cache] [--disk-serial SERIAL] [--print]
 
 Writes a NoCloud seed (user-data + meta-data, mode 0600) to
-~/.goat/state/seeds/<host>/ unless --out is given. Put both files on a
+<state dir>/seeds/<host>/ unless --out is given (the state dir is
+deploy.state_dir in ops/goatbuilder/goatbuilder.yaml, else ~/.goat/state). Put both files on a
 volume labelled CIDATA (e.g. `cloud-localds seed.img user-data meta-data`)
 beside the Ubuntu Server installer and boot; the installer runs unattended.
 
@@ -23,7 +24,8 @@ What the seed carries:
   - apt: the site cache (http://<site_cache_host>:3142) when the site's
     group_vars declare site_cache_host and --no-cache is not given.
   - packages: the class's packages plus the role default lists it names.
-  - the user `goat`, key-only SSH from the platform-admin roster
+  - the account the project reaches a new machine as (deploy.ssh_user in
+    ops/goatbuilder/goatbuilder.yaml, else `goat`), key-only SSH from the platform-admin roster
     (PLATFORM_ADMIN_SSH_PUBKEYS), passwordless sudo, locked password: the
     day-1 access the baseline play expects. An empty roster is refused.
   - /etc/goat/node-seed.json: class, site, host and the seed's hash, so a
@@ -79,7 +81,28 @@ def site_cache_host(repo, site):
     return v if isinstance(v, str) and "{{" not in v else ""
 
 
-def build(repo, site, host, cls_name, passphrase, keys, cache, disk_serial=""):
+def declared(repo, key):
+    """deploy.<key> in the checkout's ops/goatbuilder/goatbuilder.yaml, as the
+    builder reads it; '' when the file or the key is absent."""
+    try:
+        cfg = yaml.safe_load((Path(repo) / "ops/goatbuilder/goatbuilder.yaml").read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return ""
+    return str((cfg.get("deploy") or {}).get(key) or "").strip()
+
+
+def seed_user(repo):
+    """The account the seed creates: the one the project reaches a new machine
+    as (deploy.ssh_user), else `goat`."""
+    return declared(repo, "ssh_user") or "goat"
+
+
+def state_dir(repo):
+    """Where this machine keeps the project's local state: deploy.state_dir, else ~/.goat/state."""
+    return Path(os.path.expanduser(declared(repo, "state_dir") or "~/.goat/state"))
+
+
+def build(repo, site, host, cls_name, passphrase, keys, cache, disk_serial="", user=""):
     """The autoinstall user-data as a dict, and the meta-data text."""
     classes = (yaml.safe_load((repo / "ops/goatbuilder/node-classes.yaml").read_text()) or {}).get("classes") or {}
     if cls_name not in classes:
@@ -101,7 +124,7 @@ def build(repo, site, host, cls_name, passphrase, keys, cache, disk_serial=""):
         "user-data": {
             "hostname": host,
             "users": [{
-                "name": "goat",
+                "name": user or seed_user(repo),
                 "groups": ["sudo"],
                 "shell": "/bin/bash",
                 "lock_passwd": True,
@@ -161,7 +184,7 @@ def main(argv):
     if a.print:
         print(text.replace(passphrase, "<masked>") if passphrase else text)
         return 0
-    out = Path(a.out) if a.out else Path.home() / ".goat/state/seeds" / a.host
+    out = Path(a.out) if a.out else state_dir(repo) / "seeds" / a.host
     out.mkdir(parents=True, exist_ok=True)
     for name, body in (("user-data", text), ("meta-data", meta)):
         p = out / name

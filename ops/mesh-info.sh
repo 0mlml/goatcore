@@ -70,7 +70,7 @@ show_peers() {
 }
 
 show_dns() {
-  local nethost_dns="100.127.1.28"
+  local nethost_dns="100.127.1.23"
 
   printf "${B}DNS resolver test:${N}\n"
 

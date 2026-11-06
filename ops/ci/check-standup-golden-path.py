@@ -51,7 +51,7 @@ PLAYS_OUTSIDE_THIS_TREE = {
     "utility-host-bootstrap.yml": (
         "the driver refuses the obs leg and names --skip-obs",
         '[ ! -f "$REPO/ops/ansible/utility-host-bootstrap.yml" ]'),
-    "zagros-zenoh-synth-vendors-deploy.yml": (
+    "zenoh-synth-vendors-slot-pool-deploy.yml": (
         "opt-in; the step fails when synth_vendors_enabled is true",
         "group_vars/${GROUP}/synth-vendors.yml 2>/dev/null; then"),
     "herd-connector-deploy.yml": (

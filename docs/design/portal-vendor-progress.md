@@ -156,7 +156,7 @@ no new docker-network surface needed.
 New package `internal/audittail/`:
 
 - AWS-SDK-go-v2 S3 client pointed at `--audit-s3-endpoint` (env
-  `PORTAL_AUDIT_S3_ENDPOINT`, default `http://100.127.0.189:9000`).
+  `PORTAL_AUDIT_S3_ENDPOINT`, default `http://100.127.0.186:9000`).
   Path-style addressing + region `us-east-1` matches MinIO's posture.
 - Bucket `--audit-s3-bucket` (env, default `audit-integrity`).
 - Credentials via env vars `PORTAL_AUDIT_S3_ACCESS_KEY` /
@@ -280,7 +280,7 @@ Additions to `ops/ansible/roles/goat-zenoh-portal/`:
 - `defaults/main.yml`:
   - `portal_netbird_mgmt_url: "https://netbird.nova.example"`
   - `portal_netbird_poll_interval: "60s"`
-  - `portal_audit_s3_endpoint: "http://100.127.0.189:9000"`
+  - `portal_audit_s3_endpoint: "http://100.127.0.186:9000"`
   - `portal_audit_s3_bucket: "audit-integrity"`
   - `portal_audit_s3_access_key: "goat-portal-audit-read"` (fixed contract = the MinIO read-user name; NOT env-sourced — prevents F-188 access-key drift)
   - `portal_audit_s3_secret_key_envvar: "NOVA_PORTAL_AUDIT_S3_SECRET_KEY"`

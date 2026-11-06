@@ -83,3 +83,36 @@ YAML
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+@test "project-setting: ca-audit-log is ca-audit.jsonl beside the state directory" {
+  run "$SETTING" --repo "$T" ca-audit-log
+  [ "$status" -eq 0 ]
+  [ "$output" = "~/.example/ca-audit.jsonl" ]
+  run "$SETTING" --repo "$BATS_TEST_TMPDIR/absent" ca-audit-log
+  [ "$status" -eq 0 ]
+  [ "$output" = "~/.goat/ca-audit.jsonl" ]
+}
+
+@test "project-setting: var prints one plain line of group_vars/all.yml and nothing for a template" {
+  mkdir -p "$T/ops/ansible/group_vars"
+  cat > "$T/ops/ansible/group_vars/all.yml" <<'YAML'
+plain_name: "EXAMPLE_VALUE"   # quoted, with a comment
+bare_name: two words
+templated: "{{ lookup('env', 'HOME') }}/x"
+plain_name_longer: other
+YAML
+  run "$SETTING" --repo "$T" var plain_name
+  [ "$status" -eq 0 ]
+  [ "$output" = "EXAMPLE_VALUE" ]
+  run "$SETTING" --repo "$T" var bare_name
+  [ "$output" = "two words" ]
+  run "$SETTING" --repo "$T" var templated
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run "$SETTING" --repo "$T" var absent_name
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run "$SETTING" --repo "$BATS_TEST_TMPDIR/absent" var plain_name
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}

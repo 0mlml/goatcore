@@ -295,7 +295,8 @@ impl<'a> Run<'a> {
                 return Err(goat_errors::coded("GB-019", format!("CA key for {g} not at {key}")).into());
             }
             let home = std::env::var("HOME").unwrap_or_default();
-            let cmd = format!("cd '{}' && go run ./cmd/intent-sign --intent '{}' --root-key '{}' --age-identity '{home}/.config/age/keys.txt' >/dev/null", self.wt.join("ops/enrollment").display(), i.display(), key);
+            let audit = crate::settings::ca_audit_log_abs_global();
+            let cmd = format!("cd '{}' && go run ./cmd/intent-sign --intent '{}' --root-key '{}' --age-identity '{home}/.config/age/keys.txt' --audit-log '{audit}' >/dev/null", self.wt.join("ops/enrollment").display(), i.display(), key);
             if self.o.dry_run {
                 self.note(format!("DRY: bash -c {cmd}"));
             } else {

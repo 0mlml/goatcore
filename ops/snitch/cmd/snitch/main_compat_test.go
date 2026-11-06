@@ -23,8 +23,7 @@ func TestSatlinkIntervalFlagAlias(t *testing.T) {
 		{[]string{"--satlink-interval", "1h", "--" + compat.SatlinkIntervalFlag, "3h"}, 3 * time.Hour},
 	} {
 		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-		cur := fs.Duration("satlink-interval", 24*time.Hour, "")
-		old := fs.Duration(compat.SatlinkIntervalFlag, 24*time.Hour, "")
+		cur, old := satlinkIntervalFlags(fs)
 		if err := fs.Parse(tc.args); err != nil {
 			t.Fatal(err)
 		}

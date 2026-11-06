@@ -61,6 +61,9 @@ IMAGE_ORG="$(sed -nE "s/^ghcr_org:.*[\"' ]([A-Za-z0-9][A-Za-z0-9._-]*)[\"']?[ }\
 STATE_DIR="$(declared deploy state_dir)"; [ -n "$STATE_DIR" ] || STATE_DIR="$HOME/.goat/state"
 # shellcheck disable=SC2088  # a declared path is written with a literal "~/"
 case "$STATE_DIR" in "~/"*) STATE_DIR="$HOME/${STATE_DIR#\~/}" ;; esac
+# The audit log intent-sign appends to: ca-audit.jsonl beside the state
+# directory, named on every call (the builder derives the same path).
+AUDIT_LOG="$(dirname "$STATE_DIR")/ca-audit.jsonl"
 # Display-only: render {{ ghcr_org }} (the default org, as group_vars/all.yml) so
 # a printed ref does not read like an unrendered/broken variable. The stored pin
 # keeps the template; Ansible renders the real value per goatnet at deploy time.
@@ -394,7 +397,7 @@ regen_sign_check() {
       [ "$DRY" = 1 ] && { note "DRY: CA key for $g not at $K — a real run signs $g's intent with it and refuses without it"; continue; }
       die "CA key for $g not at $K"
     fi
-    run bash -c "cd '$WT/ops/enrollment' && go run ./cmd/intent-sign --intent '$I' --root-key '$K' --age-identity '$HOME/.config/age/keys.txt' >/dev/null"
+    run bash -c "cd '$WT/ops/enrollment' && go run ./cmd/intent-sign --intent '$I' --root-key '$K' --age-identity '$HOME/.config/age/keys.txt' --audit-log '$AUDIT_LOG' >/dev/null"
   done
   run python3 "$WT/ops/release/graduate.py" check
   run python3 "$WT/ops/pins/generate-pins.py" --check

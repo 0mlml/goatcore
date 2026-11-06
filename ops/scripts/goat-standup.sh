@@ -225,6 +225,11 @@ STATE_DECL="$("$REPO/ops/scripts/project-setting.sh" --repo "$REPO" deploy state
 [ -n "$STATE_DECL" ] || STATE_DECL='~/.goat/state'
 case "$STATE_DECL" in \~/*) STATE_DIR="$HOME/${STATE_DECL#\~/}" ;; *) STATE_DIR="$STATE_DECL" ;; esac
 mkdir -p "$STATE_DIR"
+# The audit log the signing tools append to: ca-audit.jsonl beside the state
+# directory, passed as --audit-log so the file is the project's and not a
+# default built into the tool. The builder derives the same path
+# (ops/scripts/project-setting.sh ca-audit-log prints it).
+case "${STATE_DECL%/}" in */*) AUDIT_DECL="${STATE_DECL%/}"; AUDIT_DECL="${AUDIT_DECL%/*}/ca-audit.jsonl" ;; *) AUDIT_DECL=./ca-audit.jsonl ;; esac
 
 # Is there an obs host to build, and is it identified + prepped? All four
 # conditions, or the leg is skipped and says why. A declared-but-absent obs
@@ -705,7 +710,7 @@ step 4 T "name-fallback snapshot (generate + sign)" \
   "if grep -qE 'name_snapshot_enabled:[[:space:]]*true' '$REPO/ops/ansible/group_vars/${GROUP}/vars.yml' 2>/dev/null; then \
      python3 '$REPO/ops/dns/generate-mesh-hosts.py'; \
      if [ -f ${STATE_DECL}/${SITE}-ca/ca.key.age ]; then \
-       ( cd '$REPO/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '$REPO/ops/dns/${SITE}/name-snapshot.json' --root-key ${STATE_DECL}/${SITE}-ca/ca.key.age --age-identity ~/.config/age/keys.txt ); \
+       ( cd '$REPO/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '$REPO/ops/dns/${SITE}/name-snapshot.json' --root-key ${STATE_DECL}/${SITE}-ca/ca.key.age --age-identity ~/.config/age/keys.txt --audit-log ${AUDIT_DECL} ); \
      else echo 'name_snapshot: no ${STATE_DECL}/${SITE}-ca/ca.key.age — generate ran, SIGN manually with ops/enrollment/cmd/name-snapshot-sign'; fi; \
    else echo 'name_snapshot_enabled not true for ${GROUP} — skipping (ADR 1082)'; fi"
 
@@ -1105,7 +1110,7 @@ step 12 A "grant-keyd (encryption key distribution)" \
 #      zenoh-synth-vendors-deploy.yml instead.) Needs PORTAL_OPERATOR_API_KEY.
 
 step 12 A "notional pub/sub (synthetic vendors — opt-in via synth_vendors_enabled)" \
-  "cd '$REPO/ops/ansible' && { [ ! -e group_vars/${GROUP}/synth-vendors.yml ] || [ -r group_vars/${GROUP}/synth-vendors.yml ] || { echo 'cannot read group_vars/${GROUP}/synth-vendors.yml' >&2; false; }; } && if grep -qE '^[[:space:]]*synth_vendors_enabled:[[:space:]]*.?(true|True|TRUE|yes|Yes|YES|on|On|ON|1).?[[:space:]]*(#.*)?$' group_vars/${GROUP}/synth-vendors.yml 2>/dev/null; then $ANSIBLE_PRE ${INV[*]} zagros-zenoh-synth-vendors-deploy.yml -e target=$GROUP; else echo 'synth_vendors_enabled not true for ${GROUP} — notional pub/sub not requested, skipping'; fi"
+  "cd '$REPO/ops/ansible' && { [ ! -e group_vars/${GROUP}/synth-vendors.yml ] || [ -r group_vars/${GROUP}/synth-vendors.yml ] || { echo 'cannot read group_vars/${GROUP}/synth-vendors.yml' >&2; false; }; } && if grep -qE '^[[:space:]]*synth_vendors_enabled:[[:space:]]*.?(true|True|TRUE|yes|Yes|YES|on|On|ON|1).?[[:space:]]*(#.*)?$' group_vars/${GROUP}/synth-vendors.yml 2>/dev/null; then $ANSIBLE_PRE ${INV[*]} zenoh-synth-vendors-slot-pool-deploy.yml -e target=$GROUP; else echo 'synth_vendors_enabled not true for ${GROUP} — notional pub/sub not requested, skipping'; fi"
 
 # --parallel: run the queued phase-12 steps in their waves, before anything of phase 13.
 dag_flush

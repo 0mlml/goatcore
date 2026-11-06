@@ -89,12 +89,25 @@ def declared(section, key, default=""):
     return str(value).strip() if value else default
 
 
-# The repository the pull request is in (owner/name), and the proposal
-# repository, which lives beside it under the same owner.
-GH_REPO = declared("repo", "source")
+def _clone_slug():
+    """The current clone's trunk remote as owner/name (ops/scripts/repo-slug.sh), or ""."""
+    try:
+        return subprocess.run([os.path.join(REPO, "ops", "scripts", "repo-slug.sh"), "primary"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# The repository the pull request is in (owner/name): GH_REPO, else the
+# checkout's declared repo.source, else the clone's trunk remote. The proposal
+# repository lives beside it under the same owner.
+GH_REPO = os.environ.get("GH_REPO") or declared("repo", "source") or _clone_slug()
 SOURCE_REPO = "%s/hello-galaxy-external-service" % GH_REPO.split("/")[0] if GH_REPO else ""
 # Where this machine keeps the goatnet CA keys, and the AWS profile a door opens under.
 PROJECT_STATE_DIR = declared("deploy", "state_dir", "~/.goat/state")
+# The audit log name-snapshot-sign appends to: ca-audit.jsonl beside the state
+# directory, named on the call (ops/scripts/project-setting.sh ca-audit-log).
+CA_AUDIT_LOG = os.path.join(os.path.dirname(os.path.expanduser(PROJECT_STATE_DIR.rstrip("/"))) or ".", "ca-audit.jsonl")
 AWS_PROFILE = os.environ.get("GOAT_AWS_PROFILE") or declared("deploy", "aws_profile", "default")
 STEPS = ["check", "read", "peer", "prepare", "review", "merge", "pull", "tier", "apply", "verify", "email"]
 STATE_DIR = os.path.expanduser("~/.goat/external-service-finish")
@@ -513,7 +526,8 @@ def do_prepare(a, st, facts):
                 note("signing ops/dns/%s/name-snapshot.json with the %s CA key (age may ask for a passphrase)"
                      % (facts["zone_dir"], facts["site_id"]))
                 run(["go", "run", "./cmd/name-snapshot-sign", "--snapshot", "../dns/%s/name-snapshot.json" % facts["zone_dir"],
-                     "--root-key", a.root_key, "--age-identity", a.age_identity],
+                     "--root-key", a.root_key, "--age-identity", a.age_identity,
+                     "--audit-log", CA_AUDIT_LOG],
                     cwd=os.path.join(tmp, "ops", "enrollment"), capture=False, write=True)
                 if not DRY:
                     run(["bash", "ops/ci/check-name-snapshot-sig.sh"], cwd=tmp)

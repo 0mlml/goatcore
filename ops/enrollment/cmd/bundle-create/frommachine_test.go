@@ -226,15 +226,33 @@ func TestRefuseHandTypedGearGroups(t *testing.T) {
 
 func TestRefuseHandTypedGearGroups_DefaultPathWalksUpToRepo(t *testing.T) {
 	// The default --taxonomy resolves repo-relative by walking up from the
-	// working directory — from this package dir it must find the real
-	// ops/ansible/netbird_acl_taxonomy.yml, whose gear vocabulary refuses
-	// SENSOR-FEED.
-	err := refuseHandTypedGearGroups(defaultTaxonomyRelPath, []string{"ZAGROS-PROD-SENSOR-FEED"})
-	if err == nil || !strings.Contains(err.Error(), gearGroupRefusal) {
-		t.Fatalf("real-taxonomy gear refusal: err = %v", err)
+	// working directory: from a package directory deep in a tree it must find
+	// that tree's ops/ansible/netbird_acl_taxonomy.yml, whose gear vocabulary
+	// refuses SENSOR-FEED. The tree here is a fixture, so the test reads no
+	// goatnet's taxonomy.
+	content, err := os.ReadFile(fixtureTaxonomy(t))
+	if err != nil {
+		t.Fatalf("read fixture taxonomy: %v", err)
 	}
-	if err := refuseHandTypedGearGroups(defaultTaxonomyRelPath, []string{"VEGA", "ZAGROS-INFRA"}); err != nil {
-		t.Fatalf("real-taxonomy infra groups should pass: %v", err)
+	root := t.TempDir()
+	taxonomy := filepath.Join(root, filepath.FromSlash(defaultTaxonomyRelPath))
+	if err := os.MkdirAll(filepath.Dir(taxonomy), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(taxonomy, content, 0o644); err != nil {
+		t.Fatalf("write taxonomy: %v", err)
+	}
+	pkg := filepath.Join(root, "ops", "enrollment", "cmd", "bundle-create")
+	if err := os.MkdirAll(pkg, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Chdir(pkg)
+	err = refuseHandTypedGearGroups(defaultTaxonomyRelPath, []string{"GALAXY-PROD-SENSOR-FEED"})
+	if err == nil || !strings.Contains(err.Error(), gearGroupRefusal) {
+		t.Fatalf("walked-up taxonomy gear refusal: err = %v", err)
+	}
+	if err := refuseHandTypedGearGroups(defaultTaxonomyRelPath, []string{"LAB", "GALAXY-INFRA"}); err != nil {
+		t.Fatalf("walked-up taxonomy infra groups should pass: %v", err)
 	}
 }
 

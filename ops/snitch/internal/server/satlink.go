@@ -99,15 +99,25 @@ func (s *Server) registerSatlinkRoutes() {
 
 	// Each route is served under its current path and its earlier compat
 	// path, so existing bookmarks and API clients keep working.
-	for _, page := range []string{"/satlink", compat.SatlinkPageRoute} {
+	// Where a compat path is the same string as the current one it is
+	// registered once (registering a pattern twice panics).
+	for _, page := range distinct("/satlink", compat.SatlinkPageRoute) {
 		s.mux.HandleFunc(page, s.handleSatlinkPage)
 	}
-	for _, prefix := range []string{"/api/satlink/", compat.SatlinkAPIPrefix} {
+	for _, prefix := range distinct("/api/satlink/", compat.SatlinkAPIPrefix) {
 		s.mux.Handle(prefix+"latest", a.Require(auth.RoleViewer, s.handleSatlinkLatest))
 		s.mux.Handle(prefix+"trend", a.Require(auth.RoleViewer, s.handleSatlinkTrend))
 		s.mux.Handle(prefix+"pops", a.Require(auth.RoleViewer, s.handleSatlinkPops))
 		s.mux.Handle(prefix+"probe", a.Require(auth.RoleOperator, s.handleSatlinkRunProbe))
 	}
+}
+
+// distinct returns a and b, or a alone when they are the same string.
+func distinct(a, b string) []string {
+	if a == b {
+		return []string{a}
+	}
+	return []string{a, b}
 }
 
 func (s *Server) handleSatlinkPage(w http.ResponseWriter, r *http.Request) {

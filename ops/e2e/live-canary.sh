@@ -60,8 +60,13 @@ PY
   python3 "$WT/ops/pins/generate-pins.py" >/dev/null
   I="$WT/ops/consistency/intent/$ENV/intent.json"
   CA="$(python3 -c "import json; print(json.load(open('$I')).get('ca_id',''))")"; N="$(printf '%s' "$CA" | sed -e 's/^dev-//' -e 's/-ecdsa-[0-9-]*$//')"
-  K="$HOME/.goat/state/$N/ca.key.age"; [ -f "$K" ] || { echo "live-canary: CA key for $ENV not at $K" >&2; exit 1; }
-  (cd "$WT/ops/enrollment" && go run ./cmd/intent-sign --intent "$I" --root-key "$K" --age-identity "$HOME/.config/age/keys.txt" >/dev/null)
+  # The CA key and the audit log are where the checkout declares its state
+  # directory (deploy.state_dir, else ~/.goat/state), as rc.sh reads them.
+  S="$("$REPO/ops/scripts/project-setting.sh" --repo "$REPO" deploy state_dir 2>/dev/null || true)"; S="${S:-$HOME/.goat/state}"
+  # shellcheck disable=SC2088  # matching the literal "~/" of a declared path
+  case "$S" in "~/"*) S="$HOME/${S#\~/}" ;; esac
+  K="$S/$N/ca.key.age"; [ -f "$K" ] || { echo "live-canary: CA key for $ENV not at $K" >&2; exit 1; }
+  (cd "$WT/ops/enrollment" && go run ./cmd/intent-sign --intent "$I" --root-key "$K" --age-identity "$HOME/.config/age/keys.txt" --audit-log "$(dirname "$S")/ca-audit.jsonl" >/dev/null)
   python3 "$WT/ops/pins/generate-pins.py" --check >/dev/null
   python3 "$WT/ops/release/graduate.py" check >/dev/null
   B="$(mktemp)"; printf 'The live canary moves to the image CI built from main@%s (docs/design/deployment-e2e.md §Live canary). zagros-dev only.\n' "$MAIN" > "$B"
@@ -81,8 +86,8 @@ rec rollback-list --expect-in "$COMP" -- "$GB" rollback "$COMP" --list
 # rollback.sh; --avenue overrides. Needs two refs in the host's ledger, which the
 # second --bump provides; with one, the step says so and the run stays green.
 AVENUE="${LIVE_CANARY_AVENUE:-$( [ $(( $(date -u +%j | sed 's/^0*//') % 2 )) = 0 ] && echo cli || echo scripts )}"
-LEDGER_ROW() { ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.151 "sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl"; }
-REFS="$(ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.151 "sudo grep -o '\"ref\": *\"[^\"]*\"' /var/lib/goat/$COMP/deploy-history.jsonl | sort -u | wc -l" 2>/dev/null || echo 0)"
+LEDGER_ROW() { ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.148 "sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl"; }
+REFS="$(ssh -o BatchMode=yes -o ConnectTimeout=10 goat@100.127.0.148 "sudo grep -o '\"ref\": *\"[^\"]*\"' /var/lib/goat/$COMP/deploy-history.jsonl | sort -u | wc -l" 2>/dev/null || echo 0)"
 if [ "${REFS:-0}" -ge 2 ]; then
   DECLARED="$(LEDGER_ROW | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["ref"])')"
   if [ "$AVENUE" = cli ]; then
@@ -90,7 +95,7 @@ if [ "${REFS:-0}" -ge 2 ]; then
   else
     rec rollback-one-step-scripts --expect-in "rolled back" -- "$REPO/ops/scripts/rollback.sh" "$COMP" 1
   fi
-  rec ledger-names-the-rollback -- bash -c "row=\"\$(ssh -o BatchMode=yes goat@100.127.0.151 'sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl')\"; echo \"\$row\"; echo \"\$row\" | grep -q '\"action\": *\"rollback\"' && ! echo \"\$row\" | grep -q '\"ref\": *\"$DECLARED\"'"
+  rec ledger-names-the-rollback -- bash -c "row=\"\$(ssh -o BatchMode=yes goat@100.127.0.148 'sudo tail -n 1 /var/lib/goat/$COMP/deploy-history.jsonl')\"; echo \"\$row\"; echo \"\$row\" | grep -q '\"action\": *\"rollback\"' && ! echo \"\$row\" | grep -q '\"ref\": *\"$DECLARED\"'"
   rec roll-forward --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --ack "${USER:-operator} (live canary, roll forward)" --yes
   rec verify-after-roll-forward --expect-in "every host's ledger names the declared ref" -- "$GB" deploy --env "$ENV" --component "$COMP" --verify-only --yes
 else

@@ -63,6 +63,7 @@ func main() {
 		ageIdentity  = flag.String("age-identity", "", "Path to age identity file (decrypts --root-key OR --intermediate-key)")
 		caID         = flag.String("ca-id", "", "CA identifier carried with audit-log entries; defaults to root-cert filename minus .pem")
 		siteID       = flag.String("site-id", "", "Site identifier (Subject OU); e.g. site-a")
+		org          = flag.String("org", "", "Subject Organization (O) of the leaf. Empty: the x509ca default. A CA whose earlier leaves carry another organisation passes it on every call.")
 		cn           = flag.String("cn", "", "Subject CommonName (typically the canonical FQDN)")
 		validity     = flag.Duration("validity", 365*24*time.Hour, "Leaf cert lifetime; default 1 year per ADR 0407")
 		ekuFlag      = flag.String("eku", "serverAuth", "Comma-separated EKU set; values: serverAuth,clientAuth")
@@ -85,12 +86,12 @@ func main() {
 	flag.Var(&uriSANs, "uri-san", "Optional URI Subject Alternative Name; repeat once per URI. Must be an absolute URI (e.g. urn:goat-galaxy:vendor=example-org). Used by per-peer identity schemes (trial X.509, ADR 0844 production).")
 	flag.Parse()
 
-	if err := run(*rootCertPath, *rootKeyPath, *ageIdentity, *caID, *siteID, *cn, *validity, *ekuFlag, *keyType, *outCert, *outKey, *auditLog, *intermediateCertPath, *intermediateKeyPath, sans, uriSANs); err != nil {
+	if err := run(*rootCertPath, *rootKeyPath, *ageIdentity, *caID, *siteID, *org, *cn, *validity, *ekuFlag, *keyType, *outCert, *outKey, *auditLog, *intermediateCertPath, *intermediateKeyPath, sans, uriSANs); err != nil {
 		fatal("%v", err)
 	}
 }
 
-func run(rootCertPath, rootKeyPath, ageIdentityPath, caID, siteID, cn string, validity time.Duration, ekuFlag, keyTypeFlag, outCertPath, outKeyPath, auditLogPath, intermediateCertPath, intermediateKeyPath string, sans, uriSANs []string) error {
+func run(rootCertPath, rootKeyPath, ageIdentityPath, caID, siteID, org, cn string, validity time.Duration, ekuFlag, keyTypeFlag, outCertPath, outKeyPath, auditLogPath, intermediateCertPath, intermediateKeyPath string, sans, uriSANs []string) error {
 	switch {
 	case rootCertPath == "":
 		return errors.New("--root-cert is required")
@@ -162,13 +163,14 @@ func run(rootCertPath, rootKeyPath, ageIdentityPath, caID, siteID, cn string, va
 	}
 
 	tpl := &x509ca.LeafTemplate{
-		CommonName: cn,
-		OrgUnit:    siteID,
-		SANs:       sans,
-		URISANs:    uriSANs,
-		Validity:   validity,
-		EKU:        eku,
-		KeyType:    keyType,
+		CommonName:   cn,
+		Organization: org, // empty: x509ca.DefaultOrganization
+		OrgUnit:      siteID,
+		SANs:         sans,
+		URISANs:      uriSANs,
+		Validity:     validity,
+		EKU:          eku,
+		KeyType:      keyType,
 	}
 
 	// Sign path: intermediate when both flags

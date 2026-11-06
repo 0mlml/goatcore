@@ -824,18 +824,18 @@ def self_test():
     d3 = Path(tempfile.mkdtemp())
     (d3 / "join_hosts").mkdir(parents=True)
     (d3 / "join_hosts" / "vars.yml").write_text(
-        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.62"\n'
+        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.59"\n'
         'participates_in_spock: true\ngoatnet_founder: false\nintra_site_pair: false\n'
         'ory_spock_enabled: true\n'
         'inter_site_spock_topology: explicit\ninter_site_spock_peers:\n  - orig\n')
     # the founder ("orig") the joiner peers with — its mesh_ip_a is the DSN host.
     (d3 / "orig_hosts").mkdir(parents=True)
     (d3 / "orig_hosts" / "vars.yml").write_text(
-        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.61"\n'
+        'site_dns_zone: netbird.join.net\nmesh_ip_a: "100.127.0.58"\n'
         'participates_in_spock: true\ngoatnet_founder: true\n'
         'spock_mesh_publisher_host: "{{ mesh_ip_a }}"\n')
     inv3 = d3 / "inv.ini"
-    inv3.write_text("[join_hosts]\nmgmt-join-01 ansible_host=100.127.0.62 router_role=A\n")
+    inv3.write_text("[join_hosts]\nmgmt-join-01 ansible_host=100.127.0.59 router_role=A\n")
     vj = generate("join", gv_dir=d3 / "join_hosts", inv_path=inv3)
     if vj.get("spock_joiner") is not True:
         problems.append("joiner: spock_joiner should be true")
@@ -845,7 +845,7 @@ def self_test():
         problems.append(f"joiner: spock_peer_node (got {vj.get('spock_peer_node')})")
     if vj.get("spock_inbound_sub") != "sub_orig_to_join":
         problems.append(f"joiner: spock_inbound_sub (got {vj.get('spock_inbound_sub')})")
-    if vj.get("spock_peer_dsn_host") != "100.127.0.61":
+    if vj.get("spock_peer_dsn_host") != "100.127.0.58":
         problems.append(f"joiner: peer DSN host should be the founder's mesh_ip_a "
                         f"(got {vj.get('spock_peer_dsn_host')})")
     if vj.get("spock_ory_dbs") != ["kratos", "hydra"]:

@@ -60,7 +60,7 @@ Four lines stay in the baseline, each naming something real rather than a deploy
 
 | File | Line | Why it stays |
 |---|---|---|
-| `crates/goatbuilder/src/standup.rs` | the synthetic-vendors phase | runs the playbook `ops/ansible/zagros-zenoh-synth-vendors-deploy.yml` by its file name |
+| `crates/goatbuilder/src/standup.rs` | the synthetic-vendors phase | runs the playbook `ops/ansible/zenoh-synth-vendors-slot-pool-deploy.yml` by its file name |
 | `crates/goatbuilder/src/update.rs` | the signer when no config can be read | the binary's own publisher; `update` always verifies the signature, so it needs a signer even outside a checkout |
 | `docs/reference/goatbuilder/02-install.md` | the `cosign verify-blob` example | goatbuilder's own releases are signed by `USAREUR-AF/goatcore`'s workflow |
 | `docs/reference/goatbuilder/11-workflows.md` | the worked example | names the example repository `USAREUR-AF/hello-galaxy-goatenv` |

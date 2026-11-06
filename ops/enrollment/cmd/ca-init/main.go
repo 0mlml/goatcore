@@ -74,6 +74,10 @@ func main() {
 	verifyPublicKey := flag.String("public-key", "", "With --verify: path to the existing CA public key PEM (the <ca_id>.pem ca-init wrote).")
 	pubKeyDir := flag.String("public-key-dir", "", "Directory to write <ca_id>.pem (the CA public key) into; for a goatnet CA, "+publicKeysRel+". Refuses to overwrite. Empty: stdout only, with a warning.")
 	rootOU := flag.String("root-ou", "", "Optional. Subject OrganizationalUnit for the generated root cert. Defaults to \"offline-ca\".")
+	org := flag.String("org", "", "Optional. Subject Organization (O) for the generated root and intermediate certs. Empty: the x509ca default. cert-sign takes the same flag for leaves.")
+	intermediateCN := flag.String("intermediate-cn", "", "Optional. Subject CommonName for the generated intermediate cert. Empty: the x509ca default.")
+	sharedRootCN := flag.String("shared-root-cn", x509ca.DefaultRootCommonName, "With --verify: a root CommonName that names no goatnet because several roots carry it; a root with this CN fails the check.")
+	slotCertSubject := flag.String("slot-cert-subject", "", "Prod mode. CommonName of the self-signed certificate installed in the PIV slot. Empty: \""+ca.YubikeyCertSubjectPrefix+"<ca_id>\".")
 
 	// Intermediate-cert tier. Produces an
 	// ECDSA-P256 X.509 intermediate signed by the dev CA root. Operators
@@ -95,21 +99,21 @@ func main() {
 	flag.Parse()
 
 	if *verify {
-		runVerify(*out, *verifyRootCert, *verifyPublicKey)
+		runVerify(*out, *verifyRootCert, *verifyPublicKey, *sharedRootCN)
 		return
 	}
 
 	switch *mode {
 	case "dev":
-		runDev(*out, *recipientsFlag, *idFlag, *genRootCert, *ageIdentity, *genIntermediateCert, *intermediateOutKey, *intermediateOnly, *rootCN, *rootOU, *pubKeyDir, *allowSingleRecipient)
+		runDev(*out, *recipientsFlag, *idFlag, *genRootCert, *ageIdentity, *genIntermediateCert, *intermediateOutKey, *intermediateOnly, *rootCN, *rootOU, *org, *intermediateCN, *pubKeyDir, *allowSingleRecipient)
 	case "prod":
-		runProd(*idFlag, *cardSelector, *pivSlotName, *mgmtKeyHex, *pinFlag, *genRootCert, *rootCN, *rootOU, *pubKeyDir)
+		runProd(*idFlag, *cardSelector, *pivSlotName, *mgmtKeyHex, *pinFlag, *genRootCert, *rootCN, *rootOU, *org, *slotCertSubject, *pubKeyDir)
 	default:
 		fatal("unknown --mode %q (valid: dev, prod)", *mode)
 	}
 }
 
-func runDev(out, recipientsFlag, idFlag, genRootCertPath, ageIdentityPath, genIntermediateCertPath, intermediateOutKeyPath string, intermediateOnly bool, rootCN, rootOU, pubKeyDir string, allowSingleRecipient bool) {
+func runDev(out, recipientsFlag, idFlag, genRootCertPath, ageIdentityPath, genIntermediateCertPath, intermediateOutKeyPath string, intermediateOnly bool, rootCN, rootOU, org, intermediateCN, pubKeyDir string, allowSingleRecipient bool) {
 	if out == "" {
 		fatal("--out is required for dev mode (path to age-encrypted root key — existing or new)")
 	}
@@ -202,7 +206,7 @@ func runDev(out, recipientsFlag, idFlag, genRootCertPath, ageIdentityPath, genIn
 			if derived {
 				warnDerivedCN(cn)
 			}
-			emitRootCert(out, ageIdentityPath, caID, genRootCertPath, cn, rootOU)
+			emitRootCert(out, ageIdentityPath, caID, genRootCertPath, cn, rootOU, org)
 		}
 	} else {
 		// Intermediate-only: don't touch the existing root key or the
@@ -212,7 +216,7 @@ func runDev(out, recipientsFlag, idFlag, genRootCertPath, ageIdentityPath, genIn
 
 	// Optional ECDSA-P256 intermediate generation.
 	if genIntermediateCertPath != "" {
-		emitIntermediate(out, ageIdentityPath, recipients, caID, genRootCertPath, genIntermediateCertPath, intermediateOutKeyPath)
+		emitIntermediate(out, ageIdentityPath, recipients, caID, genRootCertPath, genIntermediateCertPath, intermediateOutKeyPath, org, intermediateCN)
 	}
 
 	fmt.Fprintf(os.Stderr,
@@ -254,7 +258,7 @@ func runDev(out, recipientsFlag, idFlag, genRootCertPath, ageIdentityPath, genIn
 // emitRootCert generates a self-signed X.509 v3 root cert from the CA key
 // (just written by GenerateAndWrite) and writes it to outPath. Aborts the
 // process on error.
-func emitRootCert(caKeyPath, ageIdentityPath, caID, outPath, rootCN, rootOU string) {
+func emitRootCert(caKeyPath, ageIdentityPath, caID, outPath, rootCN, rootOU, org string) {
 	identities, err := loadAgeIdentities(ageIdentityPath)
 	if err != nil {
 		fatal("load age identity: %v", err)
@@ -265,11 +269,12 @@ func emitRootCert(caKeyPath, ageIdentityPath, caID, outPath, rootCN, rootOU stri
 	}
 	defer signer.Close() //nolint:errcheck // generated certificate result is complete before signer cleanup
 
-	// Empty CommonName / OrgUnit fall through to x509ca's historical
-	// defaults, so roots minted before --root-cn existed are unchanged.
+	// Empty CommonName / OrgUnit / Organization fall through to x509ca's
+	// defaults.
 	rootPEM, _, err := x509ca.GenerateRootCert(signer, x509ca.RootCertOptions{
-		CommonName: rootCN,
-		OrgUnit:    rootOU,
+		CommonName:   rootCN,
+		OrgUnit:      rootOU,
+		Organization: org,
 	})
 	if err != nil {
 		fatal("generate root cert: %v", err)
@@ -294,7 +299,7 @@ func emitRootCert(caKeyPath, ageIdentityPath, caID, outPath, rootCN, rootOU stri
 // private key with the same age recipients (so any operator who can
 // decrypt the root can also decrypt the intermediate), and writes the
 // public cert + age-encrypted key to disk.
-func emitIntermediate(caKeyPath, ageIdentityPath string, recipients []age.Recipient, caID, rootCertPath, intCertOutPath, intKeyOutPath string) {
+func emitIntermediate(caKeyPath, ageIdentityPath string, recipients []age.Recipient, caID, rootCertPath, intCertOutPath, intKeyOutPath, org, intermediateCN string) {
 	identities, err := loadAgeIdentities(ageIdentityPath)
 	if err != nil {
 		fatal("load age identity: %v", err)
@@ -314,7 +319,10 @@ func emitIntermediate(caKeyPath, ageIdentityPath string, recipients []age.Recipi
 		fatal("parse root cert: %v", err)
 	}
 
-	intCertPEM, intKeyPEM, err := x509ca.GenerateIntermediate(rootSigner, rootCert, x509ca.IntermediateCertOptions{})
+	intCertPEM, intKeyPEM, err := x509ca.GenerateIntermediate(rootSigner, rootCert, x509ca.IntermediateCertOptions{
+		Organization: org,
+		CommonName:   intermediateCN,
+	})
 	if err != nil {
 		fatal("generate intermediate: %v", err)
 	}

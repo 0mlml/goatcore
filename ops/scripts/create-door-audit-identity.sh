@@ -21,10 +21,14 @@
 #   ops/scripts/create-door-audit-identity.sh --plane collab
 #
 # Needs, in the environment (direnv):
-#   public → PUBLIC_DOOR_KANIDM_URL + <PUBLIC>_IDM_ADMIN_PW
+#   public → PUBLIC_DOOR_KANIDM_URL + GOAT_IDM_ADMIN_PW (or, when that is
+#            unset, the variable the checkout names as
+#            public_door_idm_admin_pw_env in ops/ansible/group_vars/all.yml)
 #   collab → COLLAB_KANIDM_URL      + COLLAB_KANIDM_IDM_ADMIN_PW
-# The URL is the base of that door's Kanidm (https://idm.<zone>), the value the
-# goatnet's group_vars name for its identity console.
+# The URL is the base of that door's Kanidm (https://idm.<zone>). With the URL
+# variable unset, the address is what the checkout declares as
+# public_door_kanidm_url / collab_door_kanidm_url in
+# ops/ansible/group_vars/all.yml.
 #
 # Idempotent: an existing service account is reused (its creation answers HTTP
 # 409 with an attribute-uniqueness body, which is ACHIEVED, not failed — the
@@ -47,14 +51,35 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# One value this checkout declares in ops/ansible/group_vars/all.yml (through
+# project-setting.sh). Prints nothing where the script runs outside a checkout.
+declared_var() {
+  local helper
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/project-setting.sh"
+  [ -x "$helper" ] || return 0
+  "$helper" var "$1" 2>/dev/null || true
+}
+
+# The variable the public door's idm_admin password is read from:
+# GOAT_IDM_ADMIN_PW. A checkout whose secret references carry another name
+# declares it as public_door_idm_admin_pw_env, and that variable is read when
+# GOAT_IDM_ADMIN_PW is unset.
+public_pw_var() {
+  local name=""
+  [ -n "${GOAT_IDM_ADMIN_PW:-}" ] || name="$(declared_var public_door_idm_admin_pw_env)"
+  case "$name" in ""|[0-9]*|*[!A-Za-z0-9_]*) name="" ;; esac
+  if [ -n "$name" ] && [ -n "${!name:-}" ]; then printf '%s' "$name"; else printf 'GOAT_IDM_ADMIN_PW'; fi
+}
+
 case "$PLANE" in
-  public) HOSTVAR=PUBLIC_DOOR_KANIDM_URL; PW="${GOAT_IDM_ADMIN_PW:-}";    PWVAR=GOAT_IDM_ADMIN_PW ;;
-  collab) HOSTVAR=COLLAB_KANIDM_URL;      PW="${COLLAB_KANIDM_IDM_ADMIN_PW:-}"; PWVAR=COLLAB_KANIDM_IDM_ADMIN_PW ;;
+  public) HOSTVAR=PUBLIC_DOOR_KANIDM_URL; HOSTKEY=public_door_kanidm_url; PWVAR="$(public_pw_var)" ;;
+  collab) HOSTVAR=COLLAB_KANIDM_URL;      HOSTKEY=collab_door_kanidm_url; PWVAR=COLLAB_KANIDM_IDM_ADMIN_PW ;;
   *) echo "unknown --plane '$PLANE' (want: public | collab)" >&2; exit 64 ;;
 esac
 # The door's address is the goatnet's, not this script's: no built-in door.
-HOST="${!HOSTVAR:-}"; HOST="${HOST%/}"
-[ -n "$HOST" ] || { echo "$HOSTVAR is not set — the base URL of the $PLANE door's Kanidm (https://idm.<zone>). Run under direnv in the repo." >&2; exit 1; }
+PW="${!PWVAR:-}"
+HOST="${!HOSTVAR:-}"; [ -n "$HOST" ] || HOST="$(declared_var "$HOSTKEY")"; HOST="${HOST%/}"
+[ -n "$HOST" ] || { echo "$HOSTVAR is not set and the checkout declares no $HOSTKEY — the base URL of the $PLANE door's Kanidm (https://idm.<zone>)." >&2; exit 1; }
 [ -n "$PW" ] || { echo "$PWVAR is not set — run under direnv in the repo." >&2; exit 1; }
 
 if [ "$DRY_RUN" = 1 ]; then

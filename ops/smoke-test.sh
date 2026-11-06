@@ -43,7 +43,7 @@ RELAYS=()
 for i in "${!RELAY_NAMES[@]}"; do
   RELAYS+=("${RELAY_NAMES[$i]}:${RELAY_IPS[$i]}:${RELAY_REGIONS[$i]}:${RELAY_INSTANCE_IDS[$i]}")
 done
-NETHOST_MESH_IP="${NETHOST_HOST:-100.127.1.28}"
+NETHOST_MESH_IP="${NETHOST_HOST:-100.127.1.23}"
 NETBIRD_DOMAIN="${NETBIRD_DOMAIN:-netbird.legacy.example}"
 RELAY_DNS_NAMES=("relay.legacy.example" "relay-rlb.legacy.example" "relay-rlc.legacy.example")
 

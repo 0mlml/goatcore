@@ -36,14 +36,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
+	// The earlier subcommand name runs the same command. Mapped before the
+	// switch: a build in which both names are the same string still compiles.
+	cmd := os.Args[1]
+	if cmd == compat.SatlinkProbeCommand {
+		cmd = "satlink-probe"
+	}
+
+	switch cmd {
 	case "serve":
 		cmdServe(os.Args[2:])
 	case "probe":
 		cmdProbe(os.Args[2:])
 	case "run":
 		cmdRun(os.Args[2:])
-	case "satlink-probe", compat.SatlinkProbeCommand:
+	case "satlink-probe":
 		cmdSatlinkProbe(os.Args[2:])
 	case "throughput-probe":
 		cmdThroughputProbe(os.Args[2:])
@@ -79,7 +86,7 @@ Serve flags:
   --satlink-interval      Satellite-link PoP probe interval (default: 24h, 0 = disabled)
 
 Probe flags:
-  --collector      Collector URL (default: http://100.127.1.28:8080)
+  --collector      Collector URL (default: http://100.127.1.23:8080)
   --interval       Repeat interval in seconds (0 = run once, default: 60)
   --probe-key      API key for authentication
 
@@ -95,8 +102,7 @@ func cmdServe(args []string) {
 	addr := fs.String("addr", ":8080", "listen address")
 	dbURL := fs.String("db-url", "", "PostgreSQL connection string")
 	keyFile := fs.String("key-file", "identity.key", "identity encryption key file")
-	satlinkInterval := fs.Duration("satlink-interval", 24*time.Hour, "satellite-link PoP probe interval (0 = disabled)")
-	compatInterval := fs.Duration(compat.SatlinkIntervalFlag, 24*time.Hour, "earlier name of --satlink-interval (wins when both are set)")
+	satlinkInterval, compatInterval := satlinkIntervalFlags(fs)
 	_ = fs.Parse(args) //nolint:errcheck // ExitOnError terminates instead of returning an error
 	*satlinkInterval = resolveSatlinkInterval(fs, *satlinkInterval, *compatInterval)
 
@@ -184,7 +190,7 @@ func cmdProbe(args []string) {
 		*collectorURL = os.Getenv("SNITCH_COLLECTOR")
 	}
 	if *collectorURL == "" {
-		*collectorURL = "http://100.127.1.28:8080"
+		*collectorURL = "http://100.127.1.23:8080"
 	}
 	if *probeKey == "" {
 		*probeKey = os.Getenv("SNITCH_PROBE_KEY")
@@ -475,7 +481,7 @@ func cmdPolicy(args []string) {
 	}
 	collectorURL := os.Getenv("SNITCH_COLLECTOR")
 	if collectorURL == "" {
-		collectorURL = "http://100.127.1.28:8080"
+		collectorURL = "http://100.127.1.23:8080"
 	}
 	switch args[0] {
 	case "get":
@@ -621,6 +627,18 @@ func cmdThroughputProbe(args []string) {
 	if err := enc.Encode(out); err != nil {
 		log.Fatalf("encode: %v", err)
 	}
+}
+
+// satlinkIntervalFlags defines --satlink-interval and its earlier name on fs.
+// Where both names are the same string, one flag is defined and both results
+// point at it (defining a flag twice panics).
+func satlinkIntervalFlags(fs *flag.FlagSet) (current, earlier *time.Duration) {
+	current = fs.Duration("satlink-interval", 24*time.Hour, "satellite-link PoP probe interval (0 = disabled)")
+	if fs.Lookup(compat.SatlinkIntervalFlag) != nil {
+		return current, current
+	}
+	earlier = fs.Duration(compat.SatlinkIntervalFlag, 24*time.Hour, "earlier name of --satlink-interval (wins when both are set)")
+	return current, earlier
 }
 
 // resolveSatlinkInterval applies the earlier flag name when it was given on
