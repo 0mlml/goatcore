@@ -11,7 +11,7 @@ You will stand up a working goatnet on one Ubuntu host or VM on your LAN and use
 
 goatlite is `preset: lite` in the goatbuilder configuration. It runs the same fourteen-phase standup every goatnet runs, in its LAN profile, with every decision already made ([goatlite.md](../design/goatlite.md), [ADR 1213](../adr/1213-goatlite-preset-one-box-one-file.md)). The procedure behind every phase is the standup runbook, [goatnet-standup.md](../operations/goatnet-standup.md); this tutorial is one instance of it, not a second procedure. The script that stands beside the builder, `ops/scripts/goat-standup.sh`, runs the same phases and stays documented.
 
-Until ADR 1197's public images land, pulling the goatnet's container images needs one account: a GitHub token with `read:packages`, exported as `GHCR_READ_TOKEN`. Nothing else in this tutorial needs an account with any outside service.
+Nothing in this tutorial needs an account with any outside service. The goatnet's container images are public on `ghcr.io` and pull without credentials.
 
 ## The words used here
 
@@ -99,8 +99,6 @@ brew install git python node yq age go rustup
 ```
 
 The Python environment below uses Homebrew's `python3`; macOS's own is too old for `ansible-core` 2.20. Check with `python3 --version`, which must print 3.12 or newer.
-
-One registry token is also needed before images can be pulled; section 4 names it and where to put it.
 
 ### Get the checkout and build the two programs
 
@@ -241,7 +239,7 @@ goatbuilder standup pasture
 | 10    | The LAN services come up: the dashboard, the name server for your zone, the login pages                        | the dashboard answers on the LAN                                                                                              |
 | 11    | **The one browser step.** The run pauses and prints what to do, below                                    | you resume with `--from 12`                                                                                                 |
 | 12    | The access policy is applied, the service identities are minted, the portal and the remaining services come up | `OK: no All-group rule; every enabled policy is declared.` then `OK: every required identity is present and verified.`    |
-| 13    | The assay                                                                                                      | every applicable row `PASS`                                                                                                 |
+| 13    | Skipped under the lite preset: you run the assay yourself in section 7                                         | it says so                                                                                                                  |
 | 14    | Skipped: no rescue node and no relay tier are declared                                                         | it says so                                                                                                                    |
 
 A phase that fails says which phase, what state the box is in, and the resume command. Running a phase again is safe; it changes only what is missing. The repair is always the same: fix the cause, then resume from that number.
@@ -350,9 +348,10 @@ You want `Management: Connected` and an address in the mesh range. From here the
 
 ## 7. Prove it is finished
 
-Phase 13 ran the assay. The rows that use the `goat` command run as the goatnet's own probe identity on the box, not as you, and that identity is minted once by you, because minting key material is never a playbook's side effect. **On your laptop, once:**
+Under the lite preset phase 13 does not run the assay; you run it here. The rows that use the `goat` command run as the goatnet's own probe identity on the box, not as you, and that identity is minted once by you, because minting key material is never a playbook's side effect. First write the values the assay reads from your goatnet's configuration, then mint the identity. **On your laptop, once:**
 
 ```text
+python3 ops/validation/generate-values.py pasture
 ops/scripts/create-assay-probe-identity.sh pasture
 ```
 
@@ -391,7 +390,7 @@ goat --context pasture status
 goat --context pasture health
 ```
 
-`goat status` opens one real session to the router and gives one verdict per layer. `goat health` reads the fabric's own health beat.
+`goat status` opens one real session to the router and gives one verdict per layer; the `session` row is the one that proves your identity. Its `portal` row fails for this identity, which holds no portal key. `goat health` reads the fabric's own health beat; a goatlite runs no health publisher, so it reports that it saw none.
 
 **Send a message to yourself.** `goat hello` publishes through the fabric and receives its own message back.
 
@@ -406,10 +405,10 @@ goat --context pasture sub 'founder/**' --take 1 --for 60s
 ```
 
 ```text
-goat --context pasture pub founder/hello/v1 --payload 'first message on pasture' --confirm
+goat --context pasture pub founder/hello/v1 --payload 'first message on pasture'
 ```
 
-`--confirm` reads the value back from the router's storage, so a denied write is reported instead of silently dropped.
+The subscriber prints the message and stops. A goatlite keeps no storage for `founder/**`, so `--confirm`, which reads the value back from the router's storage, reports it as not confirmed even when it arrived; leave it off here.
 
 ## When something fails
 
@@ -435,6 +434,6 @@ Re-running is the repair: fix the cause and resume from the failed phase. `goatb
 
 ## What you have
 
-A real goatnet on one box: its own mesh with your laptop on it, its own identity service with you as its administrator, its own certificate authority, its own data-fabric router carrying your messages, every secret in one local file, and no account with any outside service beyond the image-pull token. What you learn on it applies to every larger goatnet. The growth path to an internet-enrollable goatnet is an `internet:` block added to the `lite:` entry and a re-run, never a second standup; the renderer writes the internet surface from it, and its status (built, not yet stood up against real relays) is in [goatlite.md §6](../design/goatlite.md#6-growing-out-of-lite).
+A real goatnet on one box: its own mesh with your laptop on it, its own identity service with you as its administrator, its own certificate authority, its own data-fabric router carrying your messages, every secret in one local file, and no account with any outside service. What you learn on it applies to every larger goatnet. The growth path to an internet-enrollable goatnet is an `internet:` block added to the `lite:` entry and a re-run, never a second standup; the renderer writes the internet surface from it, and its status (built, not yet stood up against real relays) is in [goatlite.md §6](../design/goatlite.md#6-growing-out-of-lite).
 
 The next tutorial is [Tutorial 1](01-new-goatnet.md), the full shape: the same fourteen phases with every decision this preset made for you written out, a founder site that can take an observability host, a rescue node and, later, federated nodes.
