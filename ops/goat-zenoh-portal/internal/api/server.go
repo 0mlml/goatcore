@@ -147,7 +147,14 @@ func (s *Server) Routes() http.Handler {
 	// handler carries its own precomputed encoding and is skipped by the
 	// already-has-Content-Encoding check. conditionalMiddleware sits inside
 	// gzip so its ETag covers the identity body (cache.go).
-	return s.middleware(gzipMiddleware(conditionalMiddleware(s.mux())))
+	return s.chain(s.mux())
+}
+
+// chain wraps h in the middleware stack Routes serves, outermost first. Split
+// out so tests can put a handler of their own behind the exact production
+// chain.
+func (s *Server) chain(h http.Handler) http.Handler {
+	return s.middleware(gzipMiddleware(conditionalMiddleware(h)))
 }
 
 // mux is the bare route table. Split from Routes so the OpenAPI contract test
@@ -547,11 +554,18 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 					"stack", string(debug.Stack()),
 				)
 				if ww.wroteHeader {
-					// Status and part of the body are already on the wire; a
-					// second WriteHeader would be ignored and the problem body
-					// would be appended to whatever was sent. Record the
-					// failure and let the truncated response end.
+					// Status and part of the body are already on the wire, so
+					// there is no answering with a problem now. Returning
+					// normally would let net/http finish the response as if
+					// it had succeeded (a 200 with a cut-off body and nothing
+					// to say so). Record the failure, then abort the way
+					// net/http understands, so the connection is dropped and
+					// the client sees the truncation as an error. With gzip in
+					// the chain this is the common case: its deferred Close
+					// commits the buffered bytes during the unwind.
 					ww.status = http.StatusInternalServerError
+					s.logAccess(r, ww, reqID, start)
+					panic(http.ErrAbortHandler)
 				} else {
 					writeError(ww, http.StatusInternalServerError, "panic", "internal server error")
 				}
@@ -717,9 +731,10 @@ func (sw *statusWriter) Unwrap() http.ResponseWriter { return sw.ResponseWriter 
 // fails, which handleStream deliberately swallows, so the endpoint would answer
 // 200 with an empty body and no event would reach a client.
 func (sw *statusWriter) Flush() {
-	// A flush sends an implicit 200 if nothing was written yet.
-	sw.wroteHeader = true
 	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		// A flush sends an implicit 200 if nothing was written yet. A writer
+		// that cannot flush sends nothing, so it leaves wroteHeader alone.
+		sw.wroteHeader = true
 		f.Flush()
 	}
 }
