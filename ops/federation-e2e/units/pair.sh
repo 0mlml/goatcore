@@ -25,7 +25,34 @@ for r in d if isinstance(d,list) else []:
     except Exception: pass
     print(v)'
 }
-export -f put_release stored_at
+# Every router's subscribers and queryables in the receiving core's admin space. $1 core.
+pr_admin() {
+  local q
+  for q in subscriber queryable linkstate; do
+    echo "## @/*/router/$q/**"; curl -s -m 5 "http://$(core_ip "$1"):8000/@/*/router/$q/**" | head -c 20000; echo
+  done
+}
+# After the receiving core restarts: all four routers' logs since the restart, whole, and the
+# republishers' dropped counts. $1 sender, $2 receiver, $3 since (UTC), $4 record file.
+pr_capture() {
+  local s="$1" them="$2" since="$3" out="$4" x
+  {
+    for x in "$s" "$them"; do
+      echo "### $x core router, since $since"; docker exec "$HP-$x-core" docker logs --since "$since" "$x-zenoh-router" 2>&1
+      echo "### $x edge router toward $(other "$x"), since $since"; docker exec "$HP-$x-edge" docker logs --since "$since" "goat-zenoh-edge-$(other "$x")" 2>&1
+      echo "### $x republisher toward $(other "$x"): dropped"
+      docker exec "$HP-$x-core" curl -s -m 5 "http://127.0.0.1:$(rp_metrics "$x" "$(other "$x")")/metrics" 2>&1 | grep -E 'dropped' || echo '(no dropped series)'
+    done
+    echo "### admin space, as $them's core sees it"; pr_admin "$them"
+    for x in "$s" "$them"; do
+      echo "### $x edge router toward $(other "$x"): its rendered configuration"
+      docker exec "$HP-$x-edge" sh -c "cat /etc/goat-zenoh-edge-$(other "$x")/config.json5" 2>&1
+      echo "### $x edge router toward $(other "$x"): its whole log from container start"
+      docker exec "$HP-$x-edge" docker logs "goat-zenoh-edge-$(other "$x")" 2>&1
+    done
+  } > "$out" 2>&1
+}
+export -f put_release stored_at pr_admin pr_capture
 
 unit_main() {
   local n first second; n="$(pair_n)"; first="$(pair_first)"; second="$(other "$first")"
@@ -61,21 +88,46 @@ pair_persistent_reception() {
   rec "s$n-no-diagnostic-subscriber-runs" -- bash -c \
     "for s in $first $second; do docker exec $HP-\$s-core pgrep -f fed-responder.py && exit 1; docker exec $HP-\$s-edge docker ps -q --filter name=fed-probe- | grep . && exit 1; done; echo none; exit 0"
   for s in "$first" "$second"; do
-    them="$(other "$s")"; nonce="pr$(date +%s)$RANDOM"
+    them="$(other "$s")"; nonce="pr$(date +%s)$RANDOM"; echo "$nonce" > "$WORK/pr-before-restart-$s"
     rec "s$n-$s-to-$them-stored-without-a-subscriber" -- bash -c \
-      "put_release $s all $nonce >/dev/null; for _ in \$(seq 1 30); do v=\$(stored_at $them from/$s/all/$nonce); [ \"\$v\" = $nonce ] && { echo stored: \$v; exit 0; }; sleep 1; done; echo 'not stored at $them: from/$s/all/$nonce'; exit 1"
+      "put_release $s all $them $nonce >/dev/null; for _ in \$(seq 1 30); do v=\$(stored_at $them from/$s/all/$nonce); [ \"\$v\" = $nonce ] && { echo stored: \$v; exit 0; }; sleep 1; done; echo 'not stored at $them: from/$s/all/$nonce'; exit 1"
   done
   # The receiving core restarts (a host reboot, an upgrade): its store's interest must reach
   # the edge again by itself. Nothing restarts the edge; a fresh value must be stored anyway.
+  # Until that interest is back (seconds), a release has no route and Zenoh drops it silently
+  # (docs/design/zenoh-brokerless-consequences.md, row 4), so a fresh value is released every
+  # 2 s for 60 s and the first one stored passes, with how long the route took to return.
   local edge_before edge_after
   for s in "$first" "$second"; do
     them="$(other "$s")"; nonce="pr$(date +%s)$RANDOM"
     edge_before="$(docker exec "$HP-$them-edge" docker inspect -f '{{.State.StartedAt}}' "goat-zenoh-edge-$s" 2>/dev/null)"
-    docker exec "$HP-$them-core" docker restart "$them-zenoh-router" >/dev/null 2>&1 || true
+    # The routers' subscribers and queryables as the receiving core sees them, before the restart.
+    pr_admin "$them" > "$RECORD/s$n-$them-admin-before-restart.txt" 2>&1 || true
+    docker exec "$HP-$them-edge" sh -c "date -u +%Y-%m-%dT%H:%M:%S" > "$WORK/pr-restart-at-$them" 2>/dev/null || true
+    rec "s$n-$them-core-router-restarted" -- docker exec "$HP-$them-core" docker restart "$them-zenoh-router"
     rec "s$n-$s-to-$them-stored-after-the-receiving-core-restarts" -- bash -c \
       "for _ in \$(seq 1 60); do curl -s -m 2 -o /dev/null 'http://$(core_ip "$them"):8000/@/**' && break; sleep 1; done
-       put_release $s all $nonce >/dev/null; for _ in \$(seq 1 60); do v=\$(stored_at $them from/$s/all/$nonce); [ \"\$v\" = $nonce ] && { echo stored after the core restart: \$v; exit 0; }; sleep 1; done
-       echo 'not stored at $them after its core restarted (edge not restarted): from/$s/all/$nonce'; exit 1"
+       t0=\$(date +%s); i=0
+       for _ in \$(seq 1 30); do i=\$((i + 1)); k=$nonce-\$i; put_release $s all $them \$k >/dev/null; sleep 2
+         v=\$(stored_at $them from/$s/all/\$k); [ \"\$v\" = \"\$k\" ] && { echo \"stored after the core restart: \$v; \$((i - 1)) release(s) before it lost while the route returned; \$((\$(date +%s) - t0)) s after the core answered\"; exit 0; }; done
+       echo \"not stored at $them after its core restarted (edge not restarted): \$i fresh release(s) of from/$s/all/$nonce-<n> over \$((\$(date +%s) - t0)) s, none stored\"
+       b=\$(cat '$WORK/pr-before-restart-$s' 2>/dev/null)
+       echo \"--- the value stored before the restart, from/$s/all/\$b, read now: '\$(stored_at $them from/$s/all/\$b)' (expected \$b)\"
+       echo '--- the receiving core, its sessions and storages (admin space):'
+       curl -s -m 5 'http://$(core_ip "$them"):8000/@/*/router' | head -c 4000; echo
+       curl -s -m 5 'http://$(core_ip "$them"):8000/@/*/router/status/plugins/storage_manager/storages/*' | head -c 2000; echo
+       echo '--- subscribers and queryables the receiving core sees, before the restart:'
+       cat '$RECORD/s$n-$them-admin-before-restart.txt'
+       echo '--- the same, now:'
+       pr_admin $them
+       echo '--- the receiving edge router: its ACL decisions on declarations and from/ keys since the restart, whole:'
+       docker exec $HP-$them-edge docker logs --since \$(cat '$WORK/pr-restart-at-$them') goat-zenoh-edge-$s 2>&1 | grep -E 'Declare (Subscriber|Queryable)|Declare/Undeclare|from/' | head -200
+       echo '--- the receiving edge router, its last log lines:'
+       docker exec $HP-$them-edge docker logs --tail 40 goat-zenoh-edge-$s 2>&1 | cut -c1-300
+       echo '--- the receiving core router, its last log lines:'
+       docker exec $HP-$them-core docker logs --tail 40 $them-zenoh-router 2>&1 | cut -c1-300
+       exit 1"
+    pr_capture "$s" "$them" "$(cat "$WORK/pr-restart-at-$them" 2>/dev/null)" "$RECORD/s$n-$s-to-$them-after-restart-capture.txt" || true
     edge_after="$(docker exec "$HP-$them-edge" docker inspect -f '{{.State.StartedAt}}' "goat-zenoh-edge-$s" 2>/dev/null)"
     rec "s$n-$them-edge-was-not-restarted" --expect-in "$edge_before" -- echo "edge router goat-zenoh-edge-$s started at $edge_after (before the core restart: $edge_before)"
   done
@@ -88,7 +140,7 @@ pair_republisher_boundary() {
   for s in "$first" "$second"; do
     them="$(other "$s")"; c="rbc$(date +%s)$RANDOM"; x="rbx$(date +%s)$RANDOM"
     rec "s$n-$s-control-crosses-the-republisher" -- bash -c \
-      "put_release $s all $c >/dev/null; put_release $s not-offered $x >/dev/null; for _ in \$(seq 1 30); do [ \"\$(stored_at $them from/$s/all/$c)\" = $c ] && { echo control stored; exit 0; }; sleep 1; done; exit 1"
+      "put_release $s all $them $c >/dev/null; put_release $s not-offered $them $x >/dev/null; for _ in \$(seq 1 30); do [ \"\$(stored_at $them from/$s/all/$c)\" = $c ] && { echo control stored; exit 0; }; sleep 1; done; exit 1"
     rec "s$n-$s-unoffered-set-does-not-cross" -- bash -c \
       "sleep 5; v=\$(stored_at $them 'from/$s/not-offered/**'); echo \"stored='\$v'\"; case \"\$v\" in *$x*) exit 1 ;; esac; docker exec $HP-$s-core docker logs goat-fed-republisher-$them 2>&1 | grep -c 'not-offered' | grep -qx 0"
   done
