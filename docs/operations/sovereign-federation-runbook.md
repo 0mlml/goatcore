@@ -82,15 +82,35 @@ segment: `release/REL-ALL/<rest>` crosses as `from/<you>/REL-ALL/<rest>`.
 `goatbuilder federate <partner>` runs four stages in order, and each is also a command of its own:
 
 ```bash
-goatbuilder federate plan <partner>      # validate and explain the change; nothing that carries traffic changes
-goatbuilder federate deploy <partner>    # carry out the approved plan through the existing roles
-goatbuilder federate test <partner>      # a bounded acceptance session with the partner
-goatbuilder federate status [<partner>]  # deployment health and the last acceptance evidence
+goatbuilder federate <partner>           # at a terminal: phases 1 to 14, asking at its prompts
+goatbuilder federate plan <partner>      # phase 1's checks and the plan of what is in <work>; changes no host
+goatbuilder federate deploy <partner>    # phases 10 to 13 of the approved plan, through the existing roles
+goatbuilder federate test <partner>      # phase 14, acceptance, alone
+goatbuilder federate status [<partner>]  # what the run journal and the last acceptance evidence say
 ```
 
-You make one decision and two confirmations; the commands do, check and record the rest. A third
-human act ends the procedure: publishing `exchanging` is a reviewable change that both operators
-approve.
+Phases 1 to 9 (the exchange, the agreement, the certificates, the rendered configuration) run
+under `goatbuilder federate <partner>`. `plan` does not run them: it runs phase 1's checks and
+writes the plan from what those phases left in the working directory. Without a terminal, the
+same procedure is:
+
+```bash
+goatbuilder federate <partner> --yes --partner-key <base64> --partner-ca-fingerprint <sha256> \
+  --agreement-digest <sha256>            # phases 1 to 9; stops at 10
+goatbuilder federate plan <partner>
+goatbuilder federate deploy <partner> --approve-plan <plan hash> --approve-admission <digest>
+goatbuilder federate test <partner>
+```
+
+A run that stops for a value it does not have yet (their key at phase 5, the agreement digest at
+phase 6, the admission digest at 10) says which, and the same command with it carries on.
+
+You make one decision and answer the run's prompts at phases 5, 6 and 10; the commands do, check
+and record the rest. At phase 5 you type the verifying key the partner reads aloud and confirm
+that they read their CA fingerprint; at phase 6 you confirm that both agreement digests are the
+same (together, confirmation 1 below); at phase 10 you approve the plan's hash and then what your
+core admits (confirmation 2). A third human act ends the procedure: publishing `exchanging` is a
+reviewable change that both operators approve.
 
 **Do not follow the phases by hand.** A peering stood up by hand on 2026-09-07 needed about a dozen
 improvised interventions, and four defects were invisible until the GENERATED artifacts were the
@@ -122,12 +142,16 @@ The decision has two parts, each with one owner:
       site: alpha
       edge_class: edge
       # offer: [REL-ALL]            # optional: only narrows what federation.toml offers
-      # transport: wireguard        # or ipsec-fips; default: what both packages accept
+      # tunnel: wireguard           # or ipsec; the agreement picks the transport from both packages
       # values: {}                  # pins for the per-peering values
   ```
 
-The verified agreement determines what may flow. Your configuration may narrow it or demand
-stronger checks; it never widens it, and there is no second hand-kept access list or lane list.
+The verified agreement determines what may flow, and which transport carries it: it picks the
+transport from both packages' measured capabilities, and phase 11 runs the play for that transport.
+There is no `transport` key on a peering. The optional `tunnel` key (`wireguard` or `ipsec`) is this
+side's local choice; a `tunnel` that disagrees with the agreement is a configuration to correct,
+never an override. Your configuration may narrow what flows or demand stronger checks; it never
+widens it, and there is no second hand-kept access list or lane list.
 `init`, `lint`, `compose`, `diff`, `verify`, `apply`, `plan`, `deploy`, `test` and `status` are
 verbs and can never be a partner name.
 
@@ -149,7 +173,8 @@ The per-peering values are **proposed** as a change to your deployment's own con
 you to review and commit like any other change. Once committed they never move on a re-run; `plan`
 validates them.
 
-To produce the agreement, `plan` runs phases 1 to 9: it prepares the federation interface with no
+To produce the agreement, `goatbuilder federate <partner>` runs phases 1 to 9 (`plan` then
+reads what they leave in the working directory): it prepares the federation interface with no
 peer on it so that it can be measured, measures your half over SSH, exchanges packages and CA
 certificates through the directory, composes and verifies the agreement, validates or mints the
 peering certificates, and renders the configuration. `apply` stays a renderer: it writes files and
@@ -196,13 +221,18 @@ access fragment your **core** will take:
 3. The edge receives into `from/<them>/**` and nothing wider; no rule names `**`, `from/**` or
    another partner's prefix.
 4. The partner CA the edge will trust has the fingerprint you read back in confirmation 1.
-5. The router's dry run of the new access configuration passed.
-6. The configuration change `plan` proposed (the per-peering values and the rendered
+5. The configuration change `plan` proposed (the per-peering values and the rendered
    configuration) has been reviewed and merged through your deployment's normal change process.
    That review is part of this confirmation, and the approval covers it.
 
 If anything the plan covers changes after you approve, the approval no longer applies: run `plan`
 again and approve the new hash.
+
+The router's dry run is not something to check before you approve: it runs after the approval.
+In order, stopping at the first failure, admission places the staged files (keeping a backup), runs
+the core router's dry run (its play with `--check --diff`, or the deployment's own command), checks
+the committed slot list against the registry, and restarts the core router. A failed dry run or slot
+check puts every placed file back and says so; nothing on the core is live before the restart.
 
 ### `deploy` — carry out the approved plan
 
@@ -217,6 +247,23 @@ and it never removes or changes another peering's resources.
 | 11 | open the transport the AGREEMENT selected | `wireguard` runs `peering-wg.yml`, `ipsec-fips` runs `peering-edge.yml`, with the peering's values; through a forwarder, its entry too | the link is up. It never substitutes one transport for the other, and any other transport refuses |
 | 12 | deploy the edge, then the outbound republisher (`peering-zenoh-edge.yml`, then `peering-republisher.yml` with `--limit <peering>_core`) | the roles install the peering certificates on the edge and core host | the edge dials our core and accepts the partner's CN; the container `goat-fed-republisher-<them>` runs on the core host, its `/metrics` on loopback reads `goat_fed_republisher_local_subscribed 1` and `goat_fed_republisher_edge_linked 1`, and its log has one `release release/<set>/** -> wire from/<us>/<set>/**` line per offered set |
 | 13 | federate the SPIRE trust domains (ADR 1157 step 2) | runs `peering-spire.yml` | our server refreshes their trust domain across the link, or the play says the step was not done for a side with no SPIRE server |
+
+**Where phase 10 admits.** On a core the goat-zenoh role deploys, admission takes the core
+router's inventory group, its `site_id`, the role's play, the org fragment's path and the router
+leaf's location from the role's own declarations; nothing needs to be set. For any other core,
+the deployment names them in the environment, and admission stops (GB-194), naming the missing
+ones, before anything changes:
+
+| Setting | What it names |
+|---|---|
+| `FED_CORE_ACL_ORG` | the core's org fragment (required): the partner's block is merged into it, and every other vendor and partner is kept |
+| `FED_CORE_ACL_SEED` with `FED_CORE_ACL_OUT` | when the core's configuration is assembled: the seed it is assembled from, and where the assembled configuration goes |
+| `FED_CORE_CERT`, `FED_CORE_KEY` | where phase 8's core certificate and key are placed; each only when it is set |
+| `FED_CORE_PLAY` (on `FED_CORE_GROUP`, default `<partner>_core`) | the play that deploys the core router; its `--check --diff` run is the dry run |
+| `FED_CORE_RESTART` with `FED_CORE_DRY_RUN` | instead of a play: the restart command, and the dry-run command (or `skip`) |
+| `FED_SLOT_REGISTRY_DB` or `FED_SLOT_PG_SSH` (or `FED_SLOT_CHECK=skip`) | the slot registry the committed slot list is checked against before the restart; not needed, and the check NOT APPLICABLE, when the core keeps no committed slot list |
+
+Each of these also overrides what a goat-zenoh role core would take from the role.
 
 `deploy` keeps three things apart: the intent (your reviewed configuration and the verified
 agreement), the progress (the run journal in the working directory: the phase attempts and the
@@ -236,6 +283,31 @@ directory. It never skips a phase because a file says the phase passed.
 3. Each side writes a result bundle into `<work>/evidence/acceptance/`, and the two operators
    exchange bundles **by file**. Your own observations and the results your partner reports are kept
    apart and labeled; a reported result is not something you observed.
+
+The session, step by step, with `ops/federation/standup/acceptance_session.py`
+([federation-acceptance.md §6](../design/federation-acceptance.md#6-a-bilateral-session-exchanged-by-file)):
+
+```bash
+S=ops/federation/standup/acceptance_session.py
+# one operator writes the manifest, sends it, and both read its digest aloud
+python3 $S new --agreement <work>/agreement.json --us <us> --out session.json
+python3 $S digest session.json
+# each side runs phase 14 in the session
+FED_ACCEPTANCE_SESSION=session.json goatbuilder federate test <partner>
+# each imports the partner's result.json, then combines both sides
+python3 $S import --manifest session.json --us <us> --evidence <work>/evidence/acceptance <their result.json>
+python3 $S combine --manifest session.json --us <us> --evidence <work>/evidence/acceptance
+# after both operators reviewed the combined result: the reviewed partner-file change
+python3 $S propose --manifest session.json --us <us> --evidence <work>/evidence/acceptance \
+  --partner-file <overlay>/ops/federation/partners/<them>.yaml \
+  --approved-by <us>=<name> --approved-by <them>=<name> --out <dir>
+```
+
+`combine` writes `<evidence>/bilateral/<session id>.json` and `.md`, with your rows and the
+partner's side by side, and exits 0 only when the required scope of both sides passed. `propose`
+writes the partner file with its `acceptance:` block and a diff into `<dir>`, never the
+deployment's own file, and refuses unless the combined result passed
+([§7](../design/federation-acceptance.md#7-publishing-exchanging)).
 
 | Check | Required evidence |
 |---|---|
@@ -270,13 +342,21 @@ confirmed, and both operators approve the result, is `exchanging` published, and
 reviewable change through your normal configuration process. The two bundles are reviewed by
 people; nothing gates on the partner's report automatically.
 
-### `status` — health and evidence, with its age
+### `status` — the run journal and the evidence, with its age
 
 `goatbuilder federate status` lists every declared peering; `goatbuilder federate status <partner>`
-shows one: where the peering stands, read from its actual state, and what it waits for (you, the
-partner, or a fix), the agreement digest, the offer, the per-peering values, deployment health, and the last
-acceptance evidence with its age and scope. Later drift, expiry or a failed health check marks the
-evidence stale or degraded; it never changes a grant by itself.
+shows one. It reads the peering's run journal and its evidence in the working directory, and
+nothing else: it writes nothing, takes no lock and reaches no host. For each peering it shows the
+last run and how it ended (`in progress` or `killed` for a run with no end, by whether the process
+in its lock file is alive), each phase's last outcome, the confirmations given, the resources it
+holds on shared hosts, the digest of the agreement in the working directory, the last acceptance
+evidence with its verdict, age and counts by outcome word, and the command that carries the
+peering on.
+
+The evidence is `stale` only when it was produced against another agreement than the one in the
+working directory now, and `unknown` when either digest is missing. `status` does not measure the
+deployed edge's live health, does not show the offer, and does not say whether a stop waits for
+you or for the partner; the stop's own message and its fix say that.
 
 ### When a phase fails
 
