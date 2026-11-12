@@ -121,7 +121,7 @@ pub struct Paths {
 }
 
 fn env_or(name: &str, default: String) -> String {
-    std::env::var(name)
+    crate::federate::runenv::var(name)
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or(default)
@@ -142,7 +142,7 @@ impl Paths {
             applied: w.join("applied"),
             rotation: w.join("rotation.json"),
             pki: w.join("pki"),
-            signing: std::env::var("FED_SIGNING_KEY")
+            signing: crate::federate::runenv::var("FED_SIGNING_KEY")
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
