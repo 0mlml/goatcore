@@ -218,6 +218,27 @@ pub(crate) fn obs_play_missing(repo: &Path) -> Option<String> {
     Some("has_obs_host: true, but ops/ansible/utility-host-bootstrap.yml is not in this tree, so the obs leg cannot run.".to_string())
 }
 
+/// A declared value as one POSIX shell word, always single-quoted: each `'` is
+/// written as `'\''`, so the shell passes the value on exactly as written. For a
+/// value with no `'` this is the plain `'value'` the plans have always carried.
+pub(crate) fn sh_quote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
+}
+
+/// A declared value as one shell word, quoted only when it needs to be: a value of
+/// letters, digits and `_ . / : = @ % + , -` stands as it is, a leading `~/` keeps
+/// meaning the home directory, and anything else is `sh_quote`d. Today's values
+/// (`default`, `~/.goat/state/...`) therefore read exactly as they always have.
+pub(crate) fn sh_word(v: &str) -> String {
+    let plain = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c));
+    match v.strip_prefix("~/") {
+        Some(rest) if plain(rest) => v.to_string(),
+        Some(rest) => format!("~/{}", sh_quote(rest)),
+        None if plain(v) => v.to_string(),
+        None => sh_quote(v),
+    }
+}
+
 fn read_site(repo: &Path, o: &Options) -> Result<Site> {
     let site = o.site.to_string();
     let site_us = site.replace('-', "_");
@@ -295,8 +316,8 @@ fn read_site(repo: &Path, o: &Options) -> Result<Site> {
         // aws-vault whenever aws-vault is installed (ADR 1204), so without this
         // every play asked the operator's keychain, once per play. On the internet
         // profile the relay plays reach AWS (SSM, Secrets Manager), so it stays.
-        ansible_pre: format!("OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES {}../scripts/with-aws {aws} -- ../scripts/ansible-preflight.sh",
-                             if lite && profile == "lan" { "GOAT_AWS_MODE=none " } else { "" }),
+        ansible_pre: format!("OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES {}../scripts/with-aws {} -- ../scripts/ansible-preflight.sh",
+                             if lite && profile == "lan" { "GOAT_AWS_MODE=none " } else { "" }, sh_word(&aws)),
         inv: INV,
         profile,
         joiner,
@@ -414,9 +435,11 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
     let mint_ca = if s.lite { " --mint-ca-if-missing" } else { "" };
     ev.push(p(4, "T", "mint leaf certs".into(), format!("'{r}/ops/scripts/mint-site-certs.sh' {site}{mint_ca}")));
     let state = crate::settings::state_dir(repo);
-    let audit = crate::settings::ca_audit_log(repo);
+    let ca_key = sh_word(&format!("{state}/{site}-ca/ca.key.age"));
+    let no_key = sh_quote(&format!("name_snapshot: no {state}/{site}-ca/ca.key.age — generate ran, SIGN manually with ops/enrollment/cmd/name-snapshot-sign"));
+    let audit = sh_word(&crate::settings::ca_audit_log(repo));
     ev.push(p(4, "T", "name-fallback snapshot (generate + sign)".into(), format!(
-        "if grep -qE 'name_snapshot_enabled:[[:space:]]*true' '{r}/ops/ansible/group_vars/{g}/vars.yml' 2>/dev/null; then      python3 '{r}/ops/dns/generate-mesh-hosts.py';      if [ -f {state}/{site}-ca/ca.key.age ]; then        ( cd '{r}/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '{r}/ops/dns/{site}/name-snapshot.json' --root-key {state}/{site}-ca/ca.key.age --age-identity ~/.config/age/keys.txt --audit-log {audit} );      else echo 'name_snapshot: no {state}/{site}-ca/ca.key.age — generate ran, SIGN manually with ops/enrollment/cmd/name-snapshot-sign'; fi;    else echo 'name_snapshot_enabled not true for {g} — skipping (ADR 1082)'; fi")));
+        "if grep -qE 'name_snapshot_enabled:[[:space:]]*true' '{r}/ops/ansible/group_vars/{g}/vars.yml' 2>/dev/null; then      python3 '{r}/ops/dns/generate-mesh-hosts.py';      if [ -f {ca_key} ]; then        ( cd '{r}/ops/enrollment' && go run ./cmd/name-snapshot-sign --snapshot '{r}/ops/dns/{site}/name-snapshot.json' --root-key {ca_key} --age-identity ~/.config/age/keys.txt --audit-log {audit} );      else echo {no_key}; fi;    else echo 'name_snapshot_enabled not true for {g} — skipping (ADR 1082)'; fi")));
 
     let ev_secrets = format!("-e bootstrap_owner_email=\"{oe}\" -e postgres_superuser_password=\"$(printenv {u}_PG_PASS)\" -e netbird_encryption_key=\"$(printenv {u}_NB_ENCKEY)\" -e pgbackrest_cipher_pass=\"$(printenv {u}_BKP_KEY)\"");
     // A joiner's bootstrap carries site_id as a play variable (bootstrap_play):
@@ -480,8 +503,8 @@ fn plan(repo: &Path, s: &Site, o: &Options, resume: &str) -> Vec<Event> {
         // against the declared mesh_enrollment_url, then record the mesh IPs and
         // re-mint the router pair. A host already enrolled mints nothing.
         let mesh_ips = format!("{}/standup-{site}-mesh-ips.json", s.state_dir);
-        ev.push(p(8, "A", "[internet] mesh-enroll the hosts (a single-use key each, the declared enrolment URL)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} mesh-enroll-host.yml -e target={g} -e mesh_ips_out='{mesh_ips}'")));
-        ev.push(p(8, "T", "[internet] record the mesh IPs (group_vars, mesh inventory, cert manifest) and re-mint the router cert".into(), format!("python3 '{r}/ops/scripts/standup-mesh-record.py' {site} --ips '{mesh_ips}'")));
+        ev.push(p(8, "A", "[internet] mesh-enroll the hosts (a single-use key each, the declared enrolment URL)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} mesh-enroll-host.yml -e target={g} -e mesh_ips_out={}", sh_quote(&mesh_ips))));
+        ev.push(p(8, "T", "[internet] record the mesh IPs (group_vars, mesh inventory, cert manifest) and re-mint the router cert".into(), format!("python3 '{r}/ops/scripts/standup-mesh-record.py' {site} --ips {}", sh_quote(&mesh_ips))));
     }
     ev.push(p(9, "A", "zenoh router".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} zenoh-deploy.yml -e target={g}")));
     ev.push(p(9, "A", "SPIRE server on the founder (workload identity)".into(), format!("cd '{r}/ops/ansible' && {pre} {inv} spire-deploy.yml -e target={g} -l 'mgmt-{site}-01*' -e spire_enabled=true -e postgres_superuser_password=\"$(printenv {u}_PG_PASS)\"")));
@@ -1940,6 +1963,65 @@ mod tests {
         let ns: Vec<u32> = ph.iter().map(|p| p.n).collect();
         assert!(ns.windows(2).all(|w| w[0] <= w[1]), "phases stay in order: {ns:?}");
         assert!(!ph.iter().any(|p| p.label.starts_with("[internet]")), "a lite site is a LAN site");
+    }
+
+    /// Declared values a phase's command line carries (the state directory, the
+    /// CA audit log beside it, the AWS profile) reach the phase's shell as one word
+    /// each, passed on as declared: `~/` still means the home directory, and
+    /// nothing else in the value is interpreted.
+    #[test]
+    fn declared_paths_and_profiles_reach_the_phases_without_shell_interpolation() {
+        let state = "~/a b$(x)'q`y`\"z/state";
+        let profile = "p$(x) 'q\"r";
+        let dir = crate::testdir::path("gb-declared-words-");
+        std::fs::create_dir_all(dir.join("ops/goatbuilder")).unwrap();
+        let cfg = format!(
+            "schema: goatbuilder/v1\nrepo: {{source: example-org/x, image_namespace: ghcr.io/example-org}}\ncomponents: {{svc: {{declared_in: ops/pins/fleet-pins.yaml}}}}\n\
+             environments: [{{name: dev, converger: push-ansible, sites: [{{name: alpha, role: founder, classes: {{core: {{}}}}}}]}}]\n\
+             promotion: {{path: [{{name: dev, kind: rung, environment: dev}}]}}\ndeploy: {{state_dir: {}, aws_profile: {}}}\n",
+            serde_json::to_string(state).unwrap(),
+            serde_json::to_string(profile).unwrap()
+        );
+        std::fs::write(dir.join("ops/goatbuilder/goatbuilder.yaml"), cfg).unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let abs = |p: &str| p.strip_prefix("~/").map(|r| format!("{home}/{r}")).unwrap_or_else(|| p.to_string());
+        let eval = |w: &str| {
+            let out = Command::new("bash").args(["-euo", "pipefail", "-c", &format!("printf '%s' {w}")]).env("HOME", &home).output().unwrap();
+            assert!(out.status.success(), "the shell takes {w} as one word");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let between = |cmd: &str, a: &str, b: &str| -> Option<String> { Some(cmd.split_once(a)?.1.split_once(b)?.0.to_string()) };
+        let mut seen = 0;
+        for profile_name in ["lan", "internet"] {
+            let o = Options { env: "dev", site: "alpha", profile: Some(profile_name), from: 1, to: 14, skip_obs: true, obs_only: false, dry_run: true, parallel: false, check: false };
+            let site = read_site(&dir, &o).unwrap();
+            for ph in phases_of(&plan(&dir, &site, &o, "R")) {
+                let c = &ph.cmd;
+                if let Some(w) = between(c, "../scripts/with-aws ", " -- ") {
+                    // GOAT_AWS_PROFILE, when this machine sets one, wins over the declaration.
+                    let want = std::env::var("GOAT_AWS_PROFILE").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| profile.to_string());
+                    assert_eq!(eval(&w), want, "{}", ph.label);
+                    seen |= 1;
+                }
+                if let Some(w) = between(c, "--root-key ", " --age-identity") {
+                    assert_eq!(eval(&w), abs(&format!("{state}/alpha-ca/ca.key.age")));
+                    seen |= 2;
+                }
+                if let Some(w) = between(c, "--audit-log ", " )") {
+                    assert_eq!(eval(&w), abs("~/a b$(x)'q`y`\"z/ca-audit.jsonl"));
+                    seen |= 4;
+                }
+                if let Some((_, w)) = c.split_once("mesh_ips_out=") {
+                    assert_eq!(eval(w), abs(&format!("{state}/standup-alpha-mesh-ips.json")));
+                    seen |= 8;
+                }
+                if let Some(w) = between(c, "model alpha > ", " && ") {
+                    assert_eq!(eval(&w), abs(&format!("{state}/endstate-alpha.json")));
+                    seen |= 16;
+                }
+            }
+        }
+        assert_eq!(seen, 31, "every declared word was found in the plan");
     }
 
     /// Not lite: no render gate, phase 4 as before; a LAN site pauses at 11 only
