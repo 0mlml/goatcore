@@ -43,6 +43,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub mod backout;
+pub mod rotation;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -632,6 +633,9 @@ pub fn federate_with(repo: &Path, o: &Options, s: &mut Surface) -> Result<Report
     let mut phases = plan(repo, o, &work, &edge_group, &resume);
     // A peering a forwarder relays: the forwarder runs inside phase 2 (federate/forwarder.rs).
     forwarder::splice(&mut phases, &cfg, cfg_path.parent().unwrap_or(repo), o, &edge_group)?;
+    if s.rotate_leaves {
+        rotation::leaves(&mut phases);
+    }
     let banner_mode = if o.dry_run {
         "(DRY RUN — nothing executes)"
     } else if o.mock.is_some() {
@@ -728,6 +732,11 @@ pub fn federate_with(repo: &Path, o: &Options, s: &mut Surface) -> Result<Report
                     confirm::Verdict::Continue => {
                         r.end(ph, state::Outcome::Passed, "keys confirmed");
                         replanned = Some(plan(repo, o, &work, &edge_group, &resume));
+                        if s.rotate_leaves {
+                            if let Some(p) = replanned.as_mut() {
+                                rotation::leaves(p);
+                            }
+                        }
                         continue;
                     }
                     confirm::Verdict::Stop(d) => {
@@ -832,6 +841,7 @@ pub fn federate_with(repo: &Path, o: &Options, s: &mut Surface) -> Result<Report
                 }
             }
             r.end(ph, state::Outcome::Passed, "");
+            rotation::after_phase(s, ph.n);
         }
     }
     if let Some(r) = run.as_mut() {
@@ -958,6 +968,44 @@ mod tests {
         assert!(!by(6).cmd.contains("gb-pwned"), "{}", by(6).cmd);
         assert!(shell_safe("ipsec-fips") && shell_safe("wireguard") && shell_safe("alpha=QUJD+/=="));
         assert!(!shell_safe("") && !shell_safe("a b") && !shell_safe("a'b") && !shell_safe("$(x)") && !shell_safe("`x`"));
+    }
+
+    /// `rotate <partner> leaves` (docs/design/federation-key-rotation.md §5,
+    /// K3): phase 8 replaces every leaf with --rotate, and only phase 8's
+    /// command changes; the run is 8 to 14.
+    #[test]
+    fn rotating_the_leaves_asks_phase_8_to_replace_them_and_nothing_else() {
+        let work = tempfile::tempdir().unwrap();
+        let work_s = work.path().display().to_string();
+        let o = Options { with: "velmara", env: None, r#as: None, edge_group: None, work: Some(&work_s), mock: None, from: 1, to: 99, dry_run: true, table: false };
+        let before = plan(&repo(), &o, &work_s, "velmara_edge", "resume");
+        let mut after = plan(&repo(), &o, &work_s, "velmara_edge", "resume");
+        rotation::leaves(&mut after);
+        for (a, b) in before.iter().zip(after.iter()) {
+            if a.n == 8 {
+                assert_eq!(b.cmd, format!("{} --rotate", a.cmd));
+            } else {
+                assert_eq!(a.cmd, b.cmd, "phase {}", a.n);
+            }
+        }
+        let (o2, s) = rotation::leaves_run(&o);
+        assert_eq!((o2.from, o2.to), (8, 14));
+        assert!(s.rotate_leaves && !s.resume);
+        assert_eq!(s.stage, "rotate");
+        assert_eq!(s.again.as_deref(), Some("goatbuilder federate rotate velmara leaves"));
+        // The carry-on after the phase-10 stop names --from 11: that start
+        // reaches the run, and the leaves are not minted again.
+        let (o3, s3) = rotation::leaves_run(&Options { from: 11, ..o });
+        assert_eq!((o3.from, o3.to), (11, 14));
+        assert!(!s3.rotate_leaves, "phase 8 is not in the run, so nothing is re-minted");
+        assert!(s3.again.is_none(), "its stop and failure hints offer the plain resume, never rotate again");
+        // Once phase 8 has passed, the command that carries on is the plain
+        // resume, so following a stop or a failure never mints another set.
+        let mut s4 = rotation::leaves_run(&o).1;
+        rotation::after_phase(&mut s4, 7);
+        assert!(s4.again.is_some());
+        rotation::after_phase(&mut s4, 8);
+        assert!(s4.again.is_none() && !s4.rotate_leaves);
     }
 
     /// A dry run reads as a plan: one aligned phase table, then the commands;
