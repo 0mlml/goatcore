@@ -71,7 +71,7 @@ A new push removes the label. The approval that merges the pull request comes fr
 
 ### What you can expect from the maintainers
 
-- **A first reply within one working day.** A maintainer answers every pull request and issue from outside the team in words: who has it, and what happens next. A label or an assignment alone is not a reply.
+- **Once you are validated, the maintainers aim to reply within one working day.** This is an aim, not a guarantee. You are validated when you are registered in a goat community environment with a linked GitHub account, or have an earlier merged pull request here: the "Known" row in the table above. Validation takes work from both sides and has no fixed time. The reply is in words: who has it, and what happens next.
 - **Your pull request is labeled `community`.** The same check that asks who wrote a pull request applies the label to every one from outside the maintainers. Maintainers work that list first: [open community pull requests](https://github.com/usareur-af/goatcore/pulls?q=is%3Apr+is%3Aopen+label%3Acommunity).
 - **Maintainers carry the rebase.** `main` moves many times a day. A pull request does not have to be up to date with `main` to merge. When yours conflicts, a maintainer rebases it; leave "Allow edits from maintainers" on so they can push to your branch.
 - **Your work is not replaced without a word.** If a maintainer's pull request carries the same change, it says so in yours before yours is closed, and credits your commits.
@@ -81,6 +81,8 @@ The decision is ADR 1231 (`docs/adr/`).
 ## Merging
 
 Development happens in this repository. A pull request merged to `main` is the change; there is no other upstream. A deployment picks it up by moving the commit it pins, in its own overlay repository.
+
+`main` changes many times a day. To build on goat, pin a whole-tree release, the tag `goatcore/vX.Y.Z`, or follow the branch `stable`, which always points at the newest one. `stable` takes no pull requests: every contribution goes to `main` ([the design](docs/design/community-and-stable-line.md)).
 
 ## Reporting a bug or proposing a feature
 
