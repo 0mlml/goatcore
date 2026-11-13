@@ -6,6 +6,16 @@ Each release is the tag `goatbuilder/v<semver>` on `main`, built and signed by
 
 ## Unreleased
 
+### For someone deploying
+
+#### Fixed: a federate run killed in phase 11 resumes and brings the link up
+
+A run killed after phase 11 wrote the WireGuard link's files, and before it
+restarted the link, left the interface with no peer. Resuming with `--from 11`
+changed no file, so the link was never restarted and phase 11 refused, then
+phase 12. The `goat-peering-wg` role now reads the interface and restarts the
+link whenever the interface does not hold the agreed peer and address (#597).
+
 ## 0.6.0 — 2026-11-13
 
 What changed since 0.5.3, the previous release. Every run that drives hosts
