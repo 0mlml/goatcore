@@ -881,7 +881,7 @@ pub fn federate_with(repo: &Path, o: &Options, s: &mut Surface) -> Result<Report
     }
     if o.dry_run {
         checks.extend(preflight::plan_rows(&inputs));
-        checks.push(row("footer", "PLAN ONLY — nothing above executed. Phases 5 and 10 are MANUAL and stop the run; resume with --from 6 and --from 11. Acceptance criteria for every phase: docs/operations/sovereign-federation-runbook.md. The shape and why: docs/design/staged-delivery-pattern.md".into()));
+        checks.push(row("footer", "PLAN ONLY — nothing above executed. Phases 5 and 10 are MANUAL and stop the run; resume with --from 6 and --from 11. Acceptance criteria for every phase: docs/operations/sovereign-federation-runbook.md. The shape and why: https://github.com/usareur-af/goatdocs/blob/main/docs/design/staged-delivery-pattern.md".into()));
     }
     let mut r = Report::new("federate", checks, EXIT_REFUSED);
     r.exit = exit;
@@ -1043,6 +1043,90 @@ mod tests {
         assert!(s4.again.is_some());
         rotation::after_phase(&mut s4, 8);
         assert!(s4.again.is_none() && !s4.rotate_leaves);
+    }
+
+    /// Conformance check (d), for federate: every phase the plan can hold, for
+    /// each transport an agreement may select (or none), has its entry in the
+    /// phase catalog (ops/phases/catalog.yaml), with every field `explain`
+    /// answers from.
+    #[test]
+    fn every_federate_phase_has_a_phase_catalog_entry() {
+        for transport in [None, Some("wireguard"), Some("ipsec-fips"), Some("quic")] {
+            let work = tempfile::tempdir().unwrap();
+            if let Some(t) = transport {
+                std::fs::write(work.path().join("agreement.json"), format!(r#"{{"transport":{{"kind":"{t}"}}}}"#)).unwrap();
+            }
+            let work_s = work.path().display().to_string();
+            let o = Options { with: "velmara", env: None, r#as: None, edge_group: None, work: Some(&work_s), mock: None, from: 1, to: 99, dry_run: true, table: false };
+            let phases = plan(&repo(), &o, &work_s, "velmara_edge", "resume");
+            assert_eq!(phases.len(), 14, "{transport:?}");
+            for ph in &phases {
+                let e = goat_errors::phases::explain_phase("federate", &ph.n.to_string())
+                    .unwrap_or_else(|| panic!("federate phase {} ({}) has no phase-catalog entry", ph.n, ph.label));
+                assert!(!e.what.is_empty() && !e.why.is_empty() && !e.by_hand.is_empty(), "federate phase {}", ph.n);
+            }
+        }
+    }
+
+    /// The catalog's `by_hand` is the command the plan runs: for every phase
+    /// the plan runs a command for (not the MANUAL stops, whose `by_hand` is
+    /// what the person does), the entry's `by_hand` with its placeholders
+    /// filled from the plan's own values, `[...]` an optional part, equals the
+    /// phase's command once the repository prefix and the quoting are taken
+    /// out. Someone who copies it reaches the hosts and credentials the tool
+    /// would.
+    #[test]
+    fn the_catalog_by_hand_is_the_command_the_plan_runs() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("agreement.json"), r#"{"transport":{"kind":"wireguard"}}"#).unwrap();
+        std::fs::write(work.path().join("keys.txt"), "xaa=QUJD\nvelmara=QUJE\n").unwrap();
+        let work_s = work.path().display().to_string();
+        let o = Options { with: "velmara", env: None, r#as: Some("xaa"), edge_group: None, work: Some(&work_s), mock: None, from: 1, to: 99, dry_run: true, table: false };
+        // The checkout as it is, and one whose peering has its own inventory
+        // file (allocate renders inventory/peering-<edge-group>.ini), which the
+        // plays then read beside the hand-written one.
+        let own = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(own.path().join("ops/ansible/inventory")).unwrap();
+        std::fs::write(own.path().join("ops/ansible/inventory/peering-velmara_edge.ini"), "").unwrap();
+        for r in [repo(), own.path().to_path_buf()] {
+        let phases = plan(&r, &o, &work_s, "velmara_edge", "resume");
+        let root = format!("{}/", r.display());
+        let norm = |s: &str| -> String {
+            s.replace(&root, "").replace('\'', "").split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let fill = |s: &str| -> String {
+            s.replace("<work>", &work_s)
+                .replace("<peering>", "velmara")
+                .replace("<edge-group>", "velmara_edge")
+                .replace("<core-group>", "velmara_core")
+                .replace("<counterparty-file>", &format!("{work_s}/theirs.canonical.json"))
+                .replace("<us>", "xaa")
+                .replace("<profile>", &crate::settings::aws_profile(&r))
+                .replace("<repository>", &r.display().to_string())
+                .replace("<keys>", "--key xaa=QUJD --key velmara=QUJE")
+                .replace("<declaration>", "")
+                .replace("<router>", "")
+        };
+        // `[...]` is optional: every combination of each part kept or left out.
+        fn readings(s: &str) -> Vec<String> {
+            let Some(i) = s.find('[') else { return vec![s.to_string()] };
+            let Some(j) = s[i..].find(']').map(|j| i + j) else { return vec![s.to_string()] };
+            let (head, part, tail) = (&s[..i], &s[i + 1..j], &s[j + 1..]);
+            readings(tail)
+                .into_iter()
+                .flat_map(|t| [format!("{head}{part}{t}"), format!("{head}{t}")])
+                .collect()
+        }
+        let mut wrong = Vec::new();
+        for ph in phases.iter().filter(|p| p.kind != "MANUAL") {
+            let e = goat_errors::phases::explain_phase("federate", &ph.n.to_string()).unwrap();
+            let want = norm(&ph.cmd);
+            if !readings(&fill(&e.by_hand)).iter().any(|b| norm(b) == want) {
+                wrong.push(format!("phase {}:\n    by_hand: {}\n    the plan: {want}", ph.n, norm(&fill(&e.by_hand))));
+            }
+        }
+        assert!(wrong.is_empty(), "by_hand is not the command the plan runs ({}):\n  {}", r.display(), wrong.join("\n  "));
+        }
     }
 
     /// A dry run reads as a plan: one aligned phase table, then the commands;
