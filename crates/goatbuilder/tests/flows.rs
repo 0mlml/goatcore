@@ -23,6 +23,9 @@
 
 #[path = "common/test_home.rs"]
 mod test_home;
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -907,9 +910,7 @@ fn rollback_list_and_status_leave_no_run_record() {
     let bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let ssh = bin_dir.join("ssh");
-    std::fs::write(&ssh, "#!/bin/sh\nexit 255\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::executable(&ssh, "#!/bin/sh\nexit 255\n");
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
     for mode in ["--list", "--status"] {
         let o = test_home::isolate(&mut Command::new(bin()))
@@ -947,9 +948,7 @@ fn fastlane_repo(name: &str, component: &str) -> FastlaneRepo {
     std::fs::write(dir.join("ops/ansible/odd-name.yml"), "- hosts: all\n").unwrap();
     let gh_log = dir.join("gh.log");
     let gh = dir.join("bin/gh");
-    std::fs::write(&gh, format!("#!/bin/sh\necho \"$*\" >> '{}'\necho sha256:{}\n", gh_log.display(), "a".repeat(64))).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::executable(&gh, &format!("#!/bin/sh\necho \"$*\" >> '{}'\necho sha256:{}\n", gh_log.display(), "a".repeat(64)));
     let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     FastlaneRepo { dir, gh_log, path, _held: held }
 }
