@@ -88,6 +88,10 @@ pub struct PhaseEntry {
     /// command, or one that did not start.
     pub exit: Option<i32>,
     pub commands: usize,
+    /// What the verb concluded for a phase that started no command, such as a
+    /// step it skipped (`not checked: the deploy failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
 }
 
 /// A run as it ends: what the run record writes.
@@ -256,6 +260,7 @@ pub fn phase(id: &str, name: &str, purpose: &str) {
             ended: None,
             exit: None,
             commands: 0,
+            verdict: None,
         });
         r.phase = Some(Phase {
             id: id.to_string(),
@@ -263,6 +268,16 @@ pub fn phase(id: &str, name: &str, purpose: &str) {
             purpose: purpose.to_string(),
             shown: false,
         });
+    }
+}
+
+/// The verb's verdict on the phase now open, kept in its record entry: for a
+/// step it skips, which starts no command and so has no exit.
+pub fn verdict(text: &str) {
+    if let Some(r) = lock_run().as_mut() {
+        if let Some(p) = r.phases.last_mut().filter(|p| p.ended.is_none()) {
+            p.verdict = Some(text.to_string());
+        }
     }
 }
 
@@ -281,6 +296,8 @@ pub struct Cmd {
     host: Option<String>,
     stdout_set: bool,
     stderr_set: bool,
+    /// The file the caller sends both streams to: then it is this command's log.
+    own_log: Option<PathBuf>,
 }
 
 impl Cmd {
@@ -288,6 +305,7 @@ impl Cmd {
         Cmd {
             inner: Command::new(program),
             host: None,
+            own_log: None,
             stdout_set: false,
             stderr_set: false,
         }
@@ -356,6 +374,14 @@ impl Cmd {
         self
     }
 
+    /// The caller sends stdout and stderr to the file at `path` itself (a
+    /// parallel step's own log): the record and the frame name that file as the
+    /// command's log, and the runner copies nothing.
+    pub fn logged_at<P: AsRef<Path>>(&mut self, path: P) -> &mut Cmd {
+        self.own_log = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Where the command acts, for the frame and the record (`alpha_hosts`, `operator@192.0.2.10`).
     pub fn host<S: Into<String>>(&mut self, h: S) -> &mut Cmd {
         self.host = Some(h.into());
@@ -370,6 +396,10 @@ impl Cmd {
         self.inner.get_args()
     }
 
+    pub fn get_envs(&self) -> std::process::CommandEnvs<'_> {
+        self.inner.get_envs()
+    }
+
     /// The argv, as strings.
     pub fn argv(&self) -> Vec<String> {
         std::iter::once(self.inner.get_program())
@@ -382,6 +412,25 @@ impl Cmd {
     /// each word quoted only when it needs it.
     pub fn line(&self) -> String {
         line_of(&self.argv())
+    }
+
+    /// The line as it runs from `base`, the checkout a person pastes it in: a
+    /// command with a working directory is `(cd <dir> && <line>)`, its
+    /// directory relative to `base` when it is under it, and no `cd` when it is
+    /// `base` itself.
+    pub fn line_from(&self, base: &Path) -> String {
+        match self.inner.get_current_dir() {
+            Some(d) => {
+                let dir = d.strip_prefix(base).unwrap_or(d).display().to_string();
+                if dir.is_empty() {
+                    // It runs in the checkout itself: no cd to print.
+                    self.line()
+                } else {
+                    format!("(cd {} && {})", quote(&dir), self.line())
+                }
+            }
+            None => self.line(),
+        }
     }
 
     /// Run it, streaming its output, and wait.
@@ -491,6 +540,8 @@ impl Cmd {
         };
         let where_ = if terminal.is_some() {
             "no log: the command keeps the terminal".to_string()
+        } else if let Some(own) = &self.own_log {
+            format!("log {}", shown(own))
         } else if self.stdout_set && self.stderr_set {
             "no log: the caller's own streams".to_string()
         } else {
@@ -518,6 +569,10 @@ impl Cmd {
         // nor logs it, and the record says so rather than naming an empty log.
         let (log, log_note) = match (self.stdout_set, self.stderr_set) {
             _ if terminal.is_some() => (None, terminal),
+            _ if self.own_log.is_some() => (
+                self.own_log.clone(),
+                Some("the caller writes this log".to_string()),
+            ),
             (true, true) => (
                 None,
                 Some("not captured: stdout and stderr are the caller's own".to_string()),
@@ -997,6 +1052,45 @@ mod tests {
             "{f}"
         );
         assert_eq!(end().unwrap().phases[0].exit, Some(3));
+    }
+
+    #[test]
+    fn a_command_the_caller_logs_names_the_callers_file() {
+        let (_g, _sink) = capture();
+        let t = tempfile::tempdir().unwrap();
+        begin(t.path(), "standup", vec![], None);
+        phase("image-pull", "pull the images", "");
+        let own = t.path().join("pull.log");
+        let f = std::fs::File::create(&own).unwrap();
+        let mut child = Cmd::new("sh")
+            .args(["-c", "echo pulled"])
+            .stdout(Stdio::from(f.try_clone().unwrap()))
+            .stderr(Stdio::from(f))
+            .logged_at(&own)
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        assert!(frame().contains(&format!("(log {})", shown(&own))), "{}", frame());
+        let cmds = end().unwrap().commands;
+        assert_eq!(
+            cmds[0].log.as_deref(),
+            Some(own.display().to_string().as_str())
+        );
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "pulled\n");
+    }
+
+    #[test]
+    fn a_line_from_the_checkout_carries_its_working_directory() {
+        let base = Path::new("/srv/checkout");
+        let mut c = Cmd::new("../scripts/with-aws");
+        c.args(["dev", "--", "ansible", "all"]);
+        assert_eq!(c.line_from(base), "../scripts/with-aws dev -- ansible all");
+        c.current_dir(base.join("ops/ansible"));
+        assert_eq!(c.line_from(base), "(cd ops/ansible && ../scripts/with-aws dev -- ansible all)");
+        c.current_dir(base);
+        assert_eq!(c.line_from(base), "../scripts/with-aws dev -- ansible all", "the checkout itself needs no cd");
+        c.current_dir("/other place");
+        assert_eq!(c.line_from(base), "(cd '/other place' && ../scripts/with-aws dev -- ansible all)");
     }
 
     #[test]

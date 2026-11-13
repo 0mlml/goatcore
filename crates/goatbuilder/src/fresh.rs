@@ -47,6 +47,14 @@ impl Fresh {
     }
 }
 
+/// The fresh-source command a real run starts: what a dry run prints for it,
+/// and what [`check`] runs (one builder, so the two cannot differ).
+pub fn command(repo: &Path) -> Cmd {
+    let mut cmd = Cmd::new(repo.join("ops/scripts/fresh-source.sh"));
+    cmd.args(["--repo".as_ref(), repo.as_os_str()]);
+    cmd
+}
+
 /// Run the check for `repo`. `GOAT_DEPLOY_OFFLINE=1` (`--offline`) and an
 /// already-pinned `GOAT_FRESH_SOURCE_TRUNK` reach the script through the
 /// environment, as they do from the script avenue; so do the overlay and
@@ -74,8 +82,7 @@ fn check_with(repo: &Path, set: &[(&str, &str)], unset: &[&str]) -> Result<Fresh
             });
         }
     }
-    let mut cmd = Cmd::new(repo.join("ops/scripts/fresh-source.sh"));
-    cmd.args(["--repo".as_ref(), repo.as_os_str()]);
+    let mut cmd = command(repo);
     for (k, v) in set {
         cmd.env(k, v);
     }

@@ -201,8 +201,8 @@ impl Proc {
 /// The recorder. It records the invocation, then, by `GB_REC_MODE`, exits 0
 /// (`stub`) or runs the real program of the same name from `GB_REC_PATH` (`pass`);
 /// a `pass` with no real program fails loudly. When the program and its first
-/// argument are `GB_REC_SAY_FOR`, it first prints `GB_REC_SAY` on stdout, as a
-/// child that talks would. Its own tools come from
+/// argument are `GB_REC_SAY_FOR`, or its arguments contain `GB_REC_SAY_WHEN`,
+/// it first prints `GB_REC_SAY` on stdout, as a child that talks would. Its own tools come from
 /// `GB_REC_PATH`, since the tool's PATH holds only recorders.
 const RECORDER: &str = r#"#!/bin/sh
 # goatbuilder C11 recorder (crates/goatbuilder/tests/legibility.rs)
@@ -225,6 +225,10 @@ printf '%s
 if [ -n "${GB_REC_SAY_FOR:-}" ] && [ "$name ${1:-}" = "$GB_REC_SAY_FOR" ]; then
   printf '%s
 ' "${GB_REC_SAY:?}"
+fi
+if [ -n "${GB_REC_SAY_WHEN:-}" ]; then
+  case " $* " in *"$GB_REC_SAY_WHEN"*) printf '%s
+' "${GB_REC_SAY:?}" ;; esac
 fi
 if [ "${GB_REC_MODE:-stub}" = pass ]; then
   ifs=$IFS; IFS=:
@@ -1221,6 +1225,106 @@ fn every_c11_world_opts_out_of_keep_awake() {
     let w = federate_world::world();
     assert!(opted_out(&w.command(&["hello-ally"])), "the federate world");
     assert!(opted_out(&w.command_with(&["-o", "table"], &["hello-ally"])), "the federate world, as a table");
+}
+
+/// Each group of a deploy is its own phase in the record, `deploy:<group>`
+/// and `verify:<group>`, so `runs diff` sees one group's outcome change while
+/// another's stays the same.
+#[test]
+fn a_two_group_deploy_records_a_phase_per_group() {
+    let h = hollow();
+    let r = h.repo();
+    exe(
+        &h.repo.join("ops/pins/fleet-pins.yaml"),
+        &format!("goatnets:\n  dev:\n    members: [dev_hosts, dev_edge]\ncomponents:\n  portal:\n    var: portal_image\n    fleet: \"{PORTAL_REF}\"\n"),
+    );
+    exe(
+        &h.repo.join("ops/ansible/inventory/mgmt-hosts.ini"),
+        "[dev_hosts]\ndev-core-a ansible_host=192.0.2.11\n\n[dev_edge]\ndev-edge-a ansible_host=192.0.2.12\n",
+    );
+    exe(
+        &h.repo.join("ops/ansible/group_vars/dev_edge/pins.yml"),
+        &format!("portal_image: \"{PORTAL_REF}\"\n"),
+    );
+    let args = ["deploy", "-C", r, "--env", "dev", "--component", "portal", "--ack", "A Person", "--yes"];
+    // dev_edge's play prints a clean recap, so its deploy succeeds and its
+    // verify runs; dev_hosts's prints none, so its deploy fails.
+    let mut cmd = h.command(&args);
+    cmd.env("GB_REC_SAY_WHEN", "target=dev_edge")
+        .env("GB_REC_SAY", "PLAY RECAP ***\ndev-edge-a : ok=1 changed=0 unreachable=0 failed=0");
+    let (out, procs) = run_recorded(cmd, &h.root.path().join("rec/two"));
+    ran("deploy, two groups", &out, &procs, &[0, 3]);
+    let records = run_records(h.root.path(), "deploy");
+    assert_eq!(records.len(), 1, "one run record: {records:?}");
+    let ids: Vec<String> = records[0]["phases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["id"].as_str().map(String::from))
+        .collect();
+    let phase = |id: &str| records[0]["phases"].as_array().unwrap().iter().find(|p| p["id"] == id).cloned();
+    for g in ["dev_hosts", "dev_edge"] {
+        assert!(ids.contains(&format!("deploy:{g}")), "no phase deploy:{g} in {ids:?}");
+        assert!(ids.contains(&format!("verify:{g}")), "no phase verify:{g} in {ids:?}");
+    }
+    // dev_edge's verify ran: it read the ledger, and gave no skip verdict.
+    let edge = phase("verify:dev_edge").unwrap();
+    assert!(edge["commands"].as_u64().unwrap_or(0) > 0 && edge["verdict"].is_null(), "verify:dev_edge did not run: {edge}");
+    // dev_hosts's deploy failed: its verify is a phase with its verdict.
+    let hosts = phase("verify:dev_hosts").unwrap();
+    assert_eq!(hosts["verdict"], "not checked: the deploy failed", "{hosts}");
+    let unique: BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "a phase id repeats: {ids:?}");
+}
+
+/// A deploy's dry run names its four probes under two headings: the two it
+/// ran itself (the secrets posture and the mesh status, whose answers shaped
+/// the plan) and the two only a real run starts (the fresh-source check and
+/// the ledger read). Each row is the line its builder makes, as `-o json`
+/// lists it.
+#[test]
+fn a_deploy_dry_run_names_its_probes_under_two_headings() {
+    let h = hollow();
+    let r = h.repo();
+    let dry = ["deploy", "-C", r, "--env", "dev", "--component", "portal", "--dry-run"];
+    let page = at_a_terminal(&h.command(&dry)).unwrap_or_else(|e| panic!("{e}"));
+    let mut plan = vec!["-o", "json"];
+    plan.extend(&dry);
+    let plan = json(&ok("deploy plan", h.command(&plan).output().unwrap()));
+    let rows = |name: &str| -> Vec<String> {
+        plan["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["name"] == name)
+            .filter_map(|c| c["detail"].as_str().map(|d| d.trim().to_string()))
+            .collect()
+    };
+    let (ran, real) = (rows("probe-ran"), rows("probe"));
+    assert_eq!(ran.len(), 2, "the dry run's own probes: {ran:?}");
+    assert!(ran[0].contains("available") && ran[1].contains("netbird status"), "{ran:?}");
+    assert_eq!(real.len(), 2, "the real run's probes: {real:?}");
+    assert!(real[0].contains("fresh-source.sh"), "{real:?}");
+    assert!(real[1].starts_with("(cd ops/ansible && ") && real[1].contains("deploy-history.jsonl"), "the ledger read, runnable from the checkout: {real:?}");
+    // On the page, each row sits under its own heading: after it, and before
+    // the next heading of the other kind.
+    let page = norm(&page);
+    let ran_h = "This dry run ran (its answers shaped the plan above):";
+    let real_h = "A real run also runs (each verdict is known only then):";
+    let under = |heading: &str, other: &str, row: &str| {
+        let row = norm(row);
+        page.match_indices(heading).any(|(at, _)| {
+            let section = &page[at..];
+            let end = section[heading.len()..].find(other).map_or(section.len(), |e| e + heading.len());
+            section[..end].contains(&row)
+        })
+    };
+    for row in &ran {
+        assert!(under(ran_h, real_h, row), "{row:?} is not under {ran_h:?}:\n{page}");
+    }
+    for row in &real {
+        assert!(under(real_h, ran_h, row), "{row:?} is not under {real_h:?}:\n{page}");
+    }
 }
 
 #[test]

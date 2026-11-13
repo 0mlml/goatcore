@@ -1067,7 +1067,25 @@ fn narrative_body(report: &Report, color: bool) -> String {
             }
         }
     };
+    // The previous row's name, so a run of probes of one kind has one header.
+    let mut prev = "";
     for c in &report.checks {
+        let after = std::mem::replace(&mut prev, c.name.as_str());
+        // A probe: the command verbatim, built by the code that starts it, under
+        // one header per kind. `probe-ran` is one this dry run started itself,
+        // whose answer the plan used; `probe` is one only a real run starts.
+        if c.name == "probe" || c.name == "probe-ran" {
+            flush(&mut dry, &mut out);
+            if after != c.name {
+                out.push_str(if c.name == "probe-ran" {
+                    "  This dry run ran (its answers shaped the plan above):\n"
+                } else {
+                    "  A real run also runs (each verdict is known only then):\n"
+                });
+            }
+            out.push_str(&format!("    {}\n", c.detail.trim()));
+            continue;
+        }
         let flat = c.detail.split_whitespace().collect::<Vec<_>>().join(" ");
         // A ledger left unread by a dry run is no command of its own to show.
         if c.ok && flat.contains(": DRY: nothing was read") {
@@ -1261,7 +1279,10 @@ fn phased(report: &Report, color: bool) -> String {
         (false, _, false) => "\u{2717}",
     };
     let mut out = String::new();
+    // The previous row's name, so a run of probes of one kind has one header.
+    let mut prev = "";
     for c in &report.checks {
+        let after = std::mem::replace(&mut prev, c.name.as_str());
         if let Some(h) = heading(c) {
             if !out.is_empty() {
                 out.push('\n');
@@ -1283,6 +1304,19 @@ fn phased(report: &Report, color: bool) -> String {
             "note" => {
                 out.push_str(fill(&detail, "  ", "  ").trim_end());
                 out.push('\n');
+            }
+            // A probe, printed verbatim so the line is the command that starts:
+            // `probe-ran` this dry run started itself, and the plan below used
+            // its answer; `probe` a real run starts before its phases.
+            "probe" | "probe-ran" => {
+                if after != c.name {
+                    out.push_str(if c.name == "probe-ran" {
+                        "This dry run ran (its answers shaped the plan below):\n"
+                    } else {
+                        "Before phase 1, a real run runs (each verdict is known only then):\n"
+                    });
+                }
+                out.push_str(&format!("  {}\n", c.detail.trim()));
             }
             "banner" => {
                 out.push_str(fill(&detail, "", "").trim_end());
@@ -1441,6 +1475,24 @@ mod tests {
 
     fn c(name: &str, ok: bool, fix: Option<&str>) -> Check {
         Check { name: name.into(), ok, detail: format!("{name} detail"), fix: fix.map(String::from) }
+    }
+
+    /// A probe the dry run ran and one only a real run starts each get their
+    /// own heading, on the deploy page and the standup page.
+    #[test]
+    fn a_probe_the_dry_run_ran_and_one_a_real_run_starts_have_their_own_headings() {
+        let probe = |name: &str, line: &str| Check { name: name.into(), ok: true, detail: line.into(), fix: None };
+        let checks = vec![probe("probe-ran", "posture available"), probe("probe-ran", "netbird status"), probe("probe", "fresh-source.sh --repo .")];
+        let deploy = narrative_body(&Report::new("deploy", checks.clone(), EXIT_OK), false);
+        assert_eq!(
+            deploy.trim(),
+            "This dry run ran (its answers shaped the plan above):\n    posture available\n    netbird status\n  A real run also runs (each verdict is known only then):\n    fresh-source.sh --repo ."
+        );
+        let standup = phased(&Report::new("standup", checks, EXIT_OK), false);
+        assert!(
+            standup.contains("This dry run ran (its answers shaped the plan below):\n  posture available\n  netbird status\nBefore phase 1, a real run runs (each verdict is known only then):\n  fresh-source.sh --repo .\n"),
+            "{standup}"
+        );
     }
 
     #[test]

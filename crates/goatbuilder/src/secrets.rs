@@ -49,12 +49,19 @@ pub(crate) fn test_lite_config() -> Option<String> {
     None
 }
 
-fn ask_with(repo: &Path, args: &[&str], probe: bool) -> Option<(i32, String)> {
+/// The posture command `args` runs: what a dry run prints for a probe, and what
+/// the probe starts (one builder, so the two cannot differ).
+pub fn posture_cmd(repo: &Path, args: &[&str]) -> Cmd {
     let mut cmd = Cmd::new("python3");
     cmd.arg(posture(repo)).args(args).current_dir(repo);
     if let Some(p) = test_lite_config() {
         cmd.env("GOAT_LITE_CONFIG", p);
     }
+    cmd
+}
+
+fn ask_with(repo: &Path, args: &[&str], probe: bool) -> Option<(i32, String)> {
+    let mut cmd = posture_cmd(repo, args);
     if !probe {
         cmd.env("GOAT_STORE_PROBE", "0");
     }
@@ -182,6 +189,18 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("EXAMPLE_SECRET") && text.contains("secrets init"), "{text}");
+    }
+
+    /// The posture command a dry run prints and a probe starts carries the
+    /// test thread's GOAT_LITE_CONFIG, as ask_with's did before it was built
+    /// by posture_cmd; it never reaches the process environment.
+    #[test]
+    fn posture_cmd_carries_the_test_lite_config() {
+        set_test_lite_config("/nonexistent/goatlite.yaml");
+        let c = posture_cmd(&repo(), &["kind"]);
+        let lite: Vec<_> = c.get_envs().filter(|(k, _)| *k == "GOAT_LITE_CONFIG").map(|(_, v)| v.map(|v| v.to_string_lossy().to_string())).collect();
+        assert_eq!(lite, vec![Some("/nonexistent/goatlite.yaml".to_string())]);
+        assert_ne!(std::env::var("GOAT_LITE_CONFIG").ok().as_deref(), Some("/nonexistent/goatlite.yaml"));
     }
 
     /// goat's declared store, not a learner's: a goatlite.yaml at the checkout root
