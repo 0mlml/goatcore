@@ -507,6 +507,62 @@ pub fn rows(inputs: &[Input]) -> Vec<crate::Check> {
         .collect()
 }
 
+/// `goatbuilder why <value>`: the inputs a query names, each with the chain of
+/// sources that gave it. A query matches an input by its name, else by its
+/// value (a secret never matches by value). Each answer is the input's line,
+/// then, for a value derived from other listed inputs (`from: "<name> (above)"`,
+/// or `"<a> and <b> (above)"` for one derived from two), each one's answer,
+/// indented, down to a source that names a file, the environment, a default, an
+/// allocation, an argument or nothing.
+pub fn why(inputs: &[Input], query: &str) -> Vec<String> {
+    let by_name: Vec<&Input> = inputs.iter().filter(|i| i.name == query).collect();
+    let hits = if by_name.is_empty() {
+        inputs.iter().filter(|i| i.value() == Some(query)).collect()
+    } else {
+        by_name
+    };
+    let mut out = Vec::new();
+    for i in hits {
+        follow(inputs, i, 0, &mut vec![i.name.as_str()], &mut out);
+    }
+    out
+}
+
+/// One input's line at `depth`, then each listed input it was derived from, one
+/// level deeper. `path` holds the names above it, so a cycle stops.
+fn follow<'a>(
+    inputs: &'a [Input],
+    at: &'a Input,
+    depth: usize,
+    path: &mut Vec<&'a str>,
+    out: &mut Vec<String>,
+) {
+    out.push(format!("{}{}", "  ".repeat(depth), at.line()));
+    for name in parents(&at.source) {
+        let Some(next) = inputs.iter().find(|x| x.name == name) else {
+            continue;
+        };
+        if path.contains(&next.name.as_str()) {
+            continue;
+        }
+        path.push(next.name.as_str());
+        follow(inputs, next, depth + 1, path, out);
+        path.pop();
+    }
+}
+
+/// The listed inputs a derived source names: `<name> (above)`, or several
+/// joined by ` and `. Empty for any other source.
+fn parents(source: &Source) -> Vec<&str> {
+    match source {
+        Source::Derived { from, .. } => from
+            .strip_suffix(" (above)")
+            .map(|names| names.split(" and ").collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Add an input unless one of that name is already listed (the first source
 /// to give a value is the one the run uses).
 pub fn push(v: &mut Vec<Input>, i: Input) {
@@ -672,6 +728,18 @@ pub fn ini_host_line(text: &str, group: &str, name: &str) -> Option<usize> {
 /// A path as a person reads it: relative to `repo` when inside it.
 pub fn rel(repo: &Path, p: &Path) -> String {
     p.strip_prefix(repo).unwrap_or(p).display().to_string()
+}
+
+/// Every input a derived source names (`<name> (above)`, each part of `<a> and <b>`)
+/// that is not listed: `why` cannot follow it, so each verb's tests ask for none.
+#[cfg(test)]
+pub(crate) fn dangling(inputs: &[Input]) -> Vec<String> {
+    inputs
+        .iter()
+        .flat_map(|i| parents(&i.source))
+        .filter(|n| !inputs.iter().any(|x| x.name == *n))
+        .map(String::from)
+        .collect()
 }
 
 /// The values of one command line by the conformance test's rule
@@ -893,6 +961,78 @@ mod tests {
             aws_profile_source(d.path(), &set),
             Source::env("GOAT_AWS_PROFILE")
         );
+    }
+
+    #[test]
+    fn why_answers_by_name_or_value_and_follows_what_a_value_was_derived_from() {
+        let v = vec![
+            Input::new(
+                "join_founder_site",
+                "zagros-a",
+                Source::file(
+                    "ops/ansible/group_vars/zagros_b_hosts/vars.yml",
+                    Some(3),
+                    "join_founder_site",
+                ),
+            ),
+            Input::new(
+                "founder_group",
+                "zagros_a_hosts",
+                Source::derived("join_founder_site (above)", "<founder, - as _>_hosts"),
+            ),
+            Input::new(
+                "acl_site",
+                "zagros-a",
+                Source::derived(
+                    "join_founder_site (above)",
+                    "a joiner is governed by its founder's NetBird ACL",
+                ),
+            ),
+            Input::secret("ZAGROS_B_PG_PASS", Source::env("ZAGROS_B_PG_PASS")),
+            Input::unset("public_mgmt_fqdn", "declare public_mgmt_fqdn in vars.yml"),
+        ];
+        // By value: the derived group, then what it came from, indented.
+        assert_eq!(
+            why(&v, "zagros_a_hosts"),
+            [
+                "founder_group=zagros_a_hosts  derived from join_founder_site (above) by <founder, - as _>_hosts",
+                "  join_founder_site=zagros-a  ops/ansible/group_vars/zagros_b_hosts/vars.yml:3 join_founder_site",
+            ]
+        );
+        // A value two inputs share answers for both.
+        assert_eq!(why(&v, "zagros-a").len(), 3);
+        // By name, before value.
+        assert_eq!(why(&v, "join_founder_site").len(), 1);
+        // A secret answers by name with its source, never by value.
+        assert_eq!(
+            why(&v, "ZAGROS_B_PG_PASS"),
+            ["ZAGROS_B_PG_PASS (secret, not shown)  environment $ZAGROS_B_PG_PASS"]
+        );
+        // Missing says where to declare it; an unknown query answers nothing.
+        assert_eq!(
+            why(&v, "public_mgmt_fqdn"),
+            ["public_mgmt_fqdn not set: declare public_mgmt_fqdn in vars.yml"]
+        );
+        assert!(why(&v, "nowhere").is_empty());
+        // A cycle stops.
+        let c = vec![
+            Input::new("a", "1", Source::derived("b (above)", "r")),
+            Input::new("b", "2", Source::derived("a (above)", "r")),
+        ];
+        assert_eq!(why(&c, "a").len(), 2);
+    }
+
+    /// A source derived from several inputs (`a and b (above)`) names each;
+    /// one that is not listed is dangling, though another part is.
+    #[test]
+    fn a_source_from_two_inputs_names_each_and_each_must_be_listed() {
+        let v = vec![
+            Input::new("a", "1", Source::file("f", Some(1), "a")),
+            Input::new("t", "1@2", Source::derived("a and nosuch (above)", "r")),
+        ];
+        assert_eq!(dangling(&v), ["nosuch"]);
+        // The listed parent is still followed.
+        assert_eq!(why(&v, "t"), [v[1].line(), format!("  {}", v[0].line())]);
     }
 
     #[test]
