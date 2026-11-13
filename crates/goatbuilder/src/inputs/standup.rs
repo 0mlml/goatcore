@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::{push, rel, yaml_key_line, yaml_line, Input, Seg, Source};
+use super::{push, yaml_key_line, yaml_line, Input, Seg, Source};
 use crate::standup::{self, Options, Site};
 
 /// Reads the operator's environment.
@@ -51,16 +51,6 @@ fn lite(repo: &Path, keys: &[&str]) -> Source {
         yaml_line(&text, &path),
         format!("lite.{}", keys.join(".")),
     )
-}
-
-/// `deploy.<key>` in goatbuilder.yaml at its line, else `default`.
-fn deploy_or(repo: &Path, key: &str, default: &str) -> Source {
-    let p = repo.join("ops/goatbuilder/goatbuilder.yaml");
-    let text = std::fs::read_to_string(&p).unwrap_or_default();
-    match yaml_line(&text, &[Seg::Key("deploy"), Seg::Key(key)]) {
-        Some(n) => Source::file(rel(repo, &p), Some(n), format!("deploy.{key}")),
-        None => Source::default(default.to_string()),
-    }
 }
 
 /// The inputs of a standup whose site is `s` (read by `standup::read_site`).
@@ -146,13 +136,19 @@ pub fn site_inputs(repo: &Path, s: &Site, o: &Options, env: Env) -> Vec<Input> {
         }
     };
     v.push(Input::new("profile", s.profile.clone(), profile_src));
-    let aws = s
-        .ansible_pre
-        .split_whitespace()
-        .skip_while(|w| !w.ends_with("with-aws"))
-        .nth(1)
-        .unwrap_or_default()
-        .to_string();
+    // The word after with-aws, read as the shell reads it: a declared profile
+    // that needs quoting is passed quoted, and its value is the unquoted word.
+    // A `~/...` profile is listed as declared: the shell does not expand a
+    // tilde inside the quoted word, and neither does this. A prefix that does
+    // not parse (an unbalanced quote), or names no profile, is listed as
+    // missing rather than as an empty profile.
+    let aws_word = shlex::split(&s.ansible_pre).and_then(|w| {
+        w.into_iter()
+            .skip_while(|w| !w.ends_with("with-aws"))
+            .nth(1)
+            .filter(|p| p != "--" && !p.is_empty())
+    });
+    let aws = aws_word.clone().unwrap_or_default();
     let aws_src = if set(env, "GOAT_AWS_PROFILE").is_some() {
         Source::env("GOAT_AWS_PROFILE")
     } else if s.lite && aws != crate::settings::aws_profile(repo) {
@@ -165,13 +161,19 @@ pub fn site_inputs(repo: &Path, s: &Site, o: &Options, env: Env) -> Vec<Input> {
             ),
         }
     } else {
-        deploy_or(
+        super::deploy_setting(
             repo,
             "aws_profile",
             "default, the profile the AWS tools themselves fall back to",
         )
     };
-    v.push(Input::new("aws_profile", aws, aws_src));
+    match aws_word {
+        Some(_) => v.push(Input::new("aws_profile", aws, aws_src)),
+        None => v.push(Input::unset(
+            "aws_profile",
+            "the plays' command prefix names no AWS profile that reads as one word after with-aws (an unbalanced quote, or nothing there): declare deploy.aws_profile in ops/goatbuilder/goatbuilder.yaml, or set GOAT_AWS_PROFILE",
+        )),
+    }
     v.push(Input::new("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES", Source::default("set on every play, so Ansible's forked workers run on macOS; it changes nothing elsewhere")));
     if s.ansible_pre.contains("GOAT_AWS_MODE=none") {
         v.push(Input::new(
@@ -299,7 +301,7 @@ pub fn site_inputs(repo: &Path, s: &Site, o: &Options, env: Env) -> Vec<Input> {
     v.push(Input::new(
         "state_dir",
         s.state_dir.clone(),
-        deploy_or(
+        super::deploy_setting(
             repo,
             "state_dir",
             "~/.goat/state, the state directory when deploy.state_dir is not declared",
@@ -589,6 +591,70 @@ mod tests {
             missing.sort();
             missing.dedup();
             assert!(missing.is_empty(), "joiner={joiner} profile={profile} lite={lite} obs={obs}: values with no sourced input: {missing:?}");
+        }
+    }
+
+    /// A declared AWS profile that has to be quoted on the command line is
+    /// listed as the shell reads it, not as the quoted text.
+    #[test]
+    fn a_quoted_aws_profile_is_listed_as_the_shell_reads_it() {
+        let mut s = site(false, "lan", false, false, false);
+        let profile = "p$(x) 'q\"r";
+        let quoted = format!("'{}'", profile.replace('\'', "'\\''"));
+        s.ansible_pre = format!("OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/with-aws {quoted} -- ../scripts/ansible-preflight.sh");
+        let o = Options {
+            env: "zagros",
+            site: "zagros-b",
+            profile: Some("lan"),
+            from: 1,
+            to: 14,
+            skip_obs: true,
+            obs_only: false,
+            dry_run: true,
+            parallel: false,
+            check: false,
+        };
+        let env = |_: &str| None;
+        let inputs = site_inputs(Path::new("/r"), &s, &o, &env);
+        let aws = inputs.iter().find(|i| i.name == "aws_profile").unwrap();
+        assert_eq!(aws.value(), Some(profile));
+        // And check (b)'s reading of the plan's commands finds it.
+        let words = super::super::command_values(
+            &format!("cd /r/ops/ansible && {} site.yml", s.ansible_pre),
+            &[],
+        );
+        assert!(words.contains(&(false, profile.to_string())), "{words:?}");
+    }
+
+    /// A prefix the shell cannot read (an unbalanced quote), or one that names
+    /// no profile, is listed as missing, never as an empty profile.
+    #[test]
+    fn an_unreadable_aws_profile_is_missing_not_empty() {
+        let o = Options {
+            env: "zagros",
+            site: "zagros-b",
+            profile: Some("lan"),
+            from: 1,
+            to: 14,
+            skip_obs: true,
+            obs_only: false,
+            dry_run: true,
+            parallel: false,
+            check: false,
+        };
+        let env = |_: &str| None;
+        for pre in [
+            "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/with-aws 'p q -- ../scripts/ansible-preflight.sh",
+            "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/with-aws -- ../scripts/ansible-preflight.sh",
+            "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/with-aws",
+            "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/with-aws '' -- ../scripts/ansible-preflight.sh",
+        ] {
+            let mut s = site(false, "lan", false, false, false);
+            s.ansible_pre = pre.into();
+            let inputs = site_inputs(Path::new("/r"), &s, &o, &env);
+            let aws = inputs.iter().find(|i| i.name == "aws_profile").unwrap();
+            assert!(!aws.sourced() && aws.value().is_none(), "{pre}: {aws:?}");
+            assert!(aws.unset.as_deref().unwrap().contains("deploy.aws_profile"), "{pre}");
         }
     }
 
