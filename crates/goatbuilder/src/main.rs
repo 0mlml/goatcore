@@ -461,6 +461,8 @@ pub enum Cmd {
         site: Box<federate::verbs::SiteArgs>,
         #[command(flatten)]
         measure: Box<federate::measure::MeasureArgs>,
+        #[command(flatten)]
+        edge_run: Box<federate::handoff::EdgeRunArgs>,
         /// The peering name (the counterparty, as declared), or a stage run
         /// alone: `status [<partner>]`, `deploy <partner>`, `test <partner>`,
         /// `allocate [<peering>]`.
@@ -897,6 +899,10 @@ pub struct Report {
     pub ok: bool,
     pub exit: i32,
     pub checks: Vec<Check>,
+    /// A federate run that stopped to hand a phase to the other driver: the
+    /// hand-off object (docs/design/federation-two-drivers.md).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<serde_json::Value>,
     /// The verb already printed its own human view (a federate dry run's plan
     /// table), so the rows are not printed again as a table. They still go to
     /// -o json and to the tutor's log.
@@ -913,6 +919,7 @@ impl Report {
             ok,
             exit: if ok { EXIT_OK } else { exit_when_refused },
             checks,
+            handoff: None,
             printed: false,
         }
     }
@@ -1542,10 +1549,23 @@ fn main() {
                 federate::plan::run(&repo, stage, cli.mock.as_deref())
             }
         }
-        Cmd::Federate { verb: None, site, measure, with, partner, plan, approve_plan, confirm, no_confirm, partner_key, partner_ca_fingerprint, agreement_digest, place_pointer_package, approve_admission, review_in_pr, env, as_party, edge_group, work, from, to, dry_run, resume, no_resume } => {
+        Cmd::Federate { verb: None, site, measure, edge_run, with, partner, plan, approve_plan, confirm, no_confirm, partner_key, partner_ca_fingerprint, agreement_digest, place_pointer_package, approve_admission, review_in_pr, env, as_party, edge_group, work, from, to, dry_run, resume, no_resume } => {
             let with = with.as_deref().unwrap_or_default();
             let cfg_path = cli.mock.as_ref().map(|m| m.join("goatbuilder.yaml")).unwrap_or_else(|| repo.join("ops/goatbuilder/goatbuilder.yaml"));
-            if with == "status" {
+            // `--side edge` alone on a peering run is the edge driver's run of
+            // a two-driver peering (federate/handoff.rs). `--side` is also init's
+            // phase-3 half (federate/measure.rs): beside another measure flag,
+            // after a verb's name, or on status or allocate, it is a misplaced
+            // init flag or ignored, and gets the message it always got below.
+            let side_edge_alone = measure.side.as_deref() == Some("edge")
+                && federate::measure::MeasureArgs { side: None, ..(**measure).clone() }.is_empty()
+                && !goat_federation::verbs::VERB_NAMES.contains(&with)
+                && !matches!(with, "status" | "allocate");
+            if side_edge_alone {
+                Err(federate::handoff::edge_side_not_built())
+            } else if edge_run.expect_commit.is_some() {
+                Err(goat_errors::coded("GB-189", "--expect-commit belongs to the edge driver's run, `goatbuilder federate <partner> --side edge`").into())
+            } else if with == "status" {
                 let format = match cli.output {
                     OutputFormat::Table => federate::status::Format::Table,
                     OutputFormat::Json => federate::status::Format::Json,
