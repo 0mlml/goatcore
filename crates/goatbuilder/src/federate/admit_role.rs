@@ -388,10 +388,27 @@ pub fn merge_peerings(repo: &Path, group: &str, them: &str, cn: &str) -> Result<
             ));
         }
     }
-    let doc: serde_yaml::Value = match std::fs::read_to_string(&file) {
-        Ok(t) => serde_yaml::from_str(&t)
-            .map_err(|e| format!("{} is not YAML ({e}) (GB-237)", file.display()))?,
-        Err(_) => serde_yaml::Value::Null,
+    // The text is kept: everything but the list's own block is written back as read.
+    let original: Option<String> = std::fs::read_to_string(&file).ok();
+    let doc: serde_yaml::Value = match &original {
+        Some(t) => serde_yaml::from_str(t).map_err(|e| {
+            format!(
+                "{} is not YAML ({e}) (GB-237). Nothing was written",
+                file.display()
+            )
+        })?,
+        None => serde_yaml::Value::Null,
+    };
+    // A mapping of variables, or nothing yet.
+    let top = match &doc {
+        serde_yaml::Value::Null => serde_yaml::Mapping::new(),
+        serde_yaml::Value::Mapping(m) => m.clone(),
+        _ => {
+            return Err(format!(
+                "{} is not a mapping of variables (GB-237): it is the core router group's group_vars file, so write it as `variable: value` lines. Nothing was written",
+                file.strip_prefix(repo).unwrap_or(&file).display()
+            ))
+        }
     };
     let shown = file
         .strip_prefix(repo)
@@ -452,14 +469,115 @@ pub fn merge_peerings(repo: &Path, group: &str, them: &str, cn: &str) -> Result<
             list.push(serde_yaml::Value::Mapping(m));
         }
     }
-    let mut top = serde_yaml::Mapping::new();
-    top.insert(
+    let mut block = serde_yaml::Mapping::new();
+    block.insert(
+        key("zenoh_sovereign_peerings"),
+        serde_yaml::Value::Sequence(list.clone()),
+    );
+    let block =
+        serde_yaml::to_string(&serde_yaml::Value::Mapping(block)).map_err(|e| e.to_string())?;
+    let refuse = |why: String| format!("{shown}: {why} (GB-237). Nothing was written");
+    let text = match &original {
+        // A new file: admission's header, then the list.
+        None => format!("{}{block}", PEERINGS_HEADER.join("")),
+        Some(t) => replace_list_block(t, &block).map_err(refuse)?,
+    };
+    // The rewrite must read back as the file did, but for the list: every other
+    // variable with its value, the list as merged. Anything else is refused.
+    let back: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| refuse(format!("the rewritten file would not be YAML ({e})")))?;
+    let back = back.as_mapping().cloned().unwrap_or_default();
+    let mut want = top.clone();
+    want.insert(
         key("zenoh_sovereign_peerings"),
         serde_yaml::Value::Sequence(list),
     );
-    let body =
-        serde_yaml::to_string(&serde_yaml::Value::Mapping(top)).map_err(|e| e.to_string())?;
-    Ok(format!("# Each partner this core admits (the goat-zenoh role's zenoh_sovereign_peerings),\n# written by phase 10's admission from the agreement's access-control fragment.\n{body}"))
+    if back != want {
+        return Err(refuse(
+            "admission cannot rewrite the list here without changing another variable (an anchor or alias shared with the list, or a layout it cannot split); edit zenoh_sovereign_peerings into a plain block list".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// The comment admission writes at the top of a new peerings.yml.
+const PEERINGS_HEADER: [&str; 2] = [
+    "# Each partner this core admits (the goat-zenoh role's zenoh_sovereign_peerings),\n",
+    "# written by phase 10's admission from the agreement's access-control fragment.\n",
+];
+
+/// `text` with its top-level `zenoh_sovereign_peerings` block replaced by `block`
+/// and every other line kept byte for byte. A block-style file's variables start
+/// at column 0: a variable's block is its key line and the lines after it that
+/// are indented or are sequence items (`-` at column 0), up to the next key line.
+/// Comment and blank lines after the block's last item belong to what follows.
+/// No such variable yet: `block` is added after the last line. Refused (the
+/// reason, without the code): a flow-style top level, the variable twice, or a
+/// comment inside the block, which the rewrite could not keep.
+fn replace_list_block(text: &str, block: &str) -> Result<String, String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let is_content = |l: &str| !l.trim().is_empty() && !l.starts_with('#');
+    let is_key = |l: &str| {
+        is_content(l)
+            && !l.starts_with([' ', '\t', '-'])
+            && !l.starts_with("---")
+            && !l.starts_with("...")
+    };
+    if let Some(first) = lines
+        .iter()
+        .find(|l| is_content(l) && !l.starts_with("---"))
+    {
+        if first.trim_start().starts_with(['{', '[']) {
+            return Err("its top level is flow style ({ ... }), which admission cannot split into variables; write it as one `variable: value` block per line".into());
+        }
+    }
+    let is_list_key = |l: &str| {
+        let k = l
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(['"', '\'']);
+        is_key(l) && l.contains(':') && k == "zenoh_sovereign_peerings"
+    };
+    let starts: Vec<usize> = (0..lines.len())
+        .filter(|&i| is_list_key(lines[i]))
+        .collect();
+    match starts.as_slice() {
+        [] => {
+            let sep = if text.is_empty() || text.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            Ok(format!("{text}{sep}{block}"))
+        }
+        [i0] => {
+            // The block ends at the next key line or at a document marker (`---`, `...`).
+            let is_marker = |l: &str| l.starts_with("---") || l.starts_with("...");
+            let next = (i0 + 1..lines.len())
+                .find(|&i| is_key(lines[i]) || is_marker(lines[i]))
+                .unwrap_or(lines.len());
+            // The block ends at its last content line; trailing comments and blank
+            // lines stay with what follows.
+            let end = (*i0..next)
+                .rev()
+                .find(|&i| is_content(lines[i]))
+                .unwrap_or(*i0);
+            if let Some(i) = (*i0..=end).find(|&i| lines[i].contains('#')) {
+                return Err(format!(
+                    "line {} is inside zenoh_sovereign_peerings and holds a '#', and admission rewrites that list and cannot keep a comment in it; move the comment above the list or out of the file",
+                    i + 1
+                ));
+            }
+            Ok(format!(
+                "{}{block}{}",
+                lines[..*i0].concat(),
+                lines[end + 1..].concat()
+            ))
+        }
+        _ => Err("zenoh_sovereign_peerings is set more than once in it; keep one".into()),
+    }
 }
 
 #[cfg(test)]
@@ -803,5 +921,168 @@ mod tests {
         ]);
         let e = find(r.path(), "xab_core").unwrap_err();
         assert!(e.contains("(GB-236)") && e.contains("fleet pin"), "{e}");
+    }
+
+    /// peerings.yml may hold more than the list. Admission changes only
+    /// `zenoh_sovereign_peerings`; every other key and value stays as it was.
+    #[test]
+    fn admission_keeps_every_other_key_in_peerings_yml() {
+        let body = "zenoh_peering_note: kept\nzenoh_sovereign_peerings:\n- sovereign: xac\n  cn: fed.xac.zagros.01\nzenoh_peering_limits:\n  xac: {rate: 100, size: 4096}\n  nested:\n    deep: [1, 2]\n";
+        let r = checkout(&[
+            INV,
+            GV,
+            ("ops/ansible/group_vars/core_router/peerings.yml", body),
+        ]);
+        let text = merge_peerings(r.path(), "core_router", "xab", "fed.xab.zagros.01").unwrap();
+        let before: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
+        let after: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let (b, a) = (before.as_mapping().unwrap(), after.as_mapping().unwrap());
+        assert_eq!(a.len(), b.len(), "no key added or dropped: {text}");
+        for (k, v) in b {
+            if k.as_str() == Some("zenoh_sovereign_peerings") {
+                continue;
+            }
+            assert_eq!(a.get(k), Some(v), "{k:?} unchanged: {text}");
+        }
+        let l = after["zenoh_sovereign_peerings"].as_sequence().unwrap();
+        assert_eq!(l.len(), 2, "{text}");
+        assert_eq!(
+            (l[0]["sovereign"].as_str(), l[1]["sovereign"].as_str()),
+            (Some("xac"), Some("xab"))
+        );
+        // A second admission over admission's own output (its header comment included) works.
+        let r2 = checkout(&[
+            INV,
+            GV,
+            ("ops/ansible/group_vars/core_router/peerings.yml", &text),
+        ]);
+        let again = merge_peerings(r2.path(), "core_router", "xad", "fed.xad.zagros.01").unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&again).unwrap();
+        assert_eq!(
+            v["zenoh_peering_limits"], before["zenoh_peering_limits"],
+            "{again}"
+        );
+        assert_eq!(
+            v["zenoh_sovereign_peerings"].as_sequence().unwrap().len(),
+            3,
+            "{again}"
+        );
+    }
+
+    /// Admission replaces only the `zenoh_sovereign_peerings` block and keeps
+    /// every other line of the file byte for byte: comments anywhere outside the
+    /// list (leading, between variables, after a value, after an apostrophe in a
+    /// plain scalar), blank lines, `---`, and values whose meaning depends on their
+    /// exact text (`0644`, which YAML 1.1 and so Ansible read as the int 420).
+    #[test]
+    fn every_line_outside_the_list_is_kept_byte_for_byte() {
+        let head = "# who to call: the platform team\n#\n---\nzenoh_peering_note: it's agreed  # remove after the review\nzenoh_mode: 0644\n\n# the limits below are per partner\nzenoh_peering_limits:\n  xac: {rate: 100}  # agreed 2026-11-01\n";
+        let list = "zenoh_sovereign_peerings:\n- sovereign: xac\n  cn: fed.xac.zagros.01\n";
+        let tail = "# end of the partners\nzenoh_peering_room: \"room #4\"\n";
+        let body = format!("{head}{list}{tail}");
+        let r = checkout(&[
+            INV,
+            GV,
+            ("ops/ansible/group_vars/core_router/peerings.yml", &body),
+        ]);
+        let text = merge_peerings(r.path(), "core_router", "xab", "fed.xab.zagros.01").unwrap();
+        assert!(
+            text.starts_with(head),
+            "everything before the list, byte for byte:\n{text}"
+        );
+        assert!(
+            text.ends_with(tail),
+            "everything after the list, byte for byte:\n{text}"
+        );
+        assert!(
+            text.contains("zenoh_mode: 0644\n"),
+            "0644 is not re-quoted: {text}"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let l = v["zenoh_sovereign_peerings"].as_sequence().unwrap();
+        assert_eq!(
+            (l.len(), l[1]["sovereign"].as_str()),
+            (2, Some("xab")),
+            "{text}"
+        );
+        // A rerun with nothing new changes nothing.
+        let r2 = checkout(&[
+            INV,
+            GV,
+            ("ops/ansible/group_vars/core_router/peerings.yml", &text),
+        ]);
+        assert_eq!(
+            merge_peerings(r2.path(), "core_router", "xab", "fed.xab.zagros.01").unwrap(),
+            text
+        );
+        // No list yet: it is added after the file's last line, which stays as it was.
+        let r3 = checkout(&[
+            INV,
+            GV,
+            (
+                "ops/ansible/group_vars/core_router/peerings.yml",
+                "zenoh_mode: 0644  # octal\n",
+            ),
+        ]);
+        let t3 = merge_peerings(r3.path(), "core_router", "xab", "fed.xab.zagros.01").unwrap();
+        assert!(
+            t3.starts_with("zenoh_mode: 0644  # octal\n") && t3.contains("- sovereign: xab"),
+            "{t3}"
+        );
+    }
+
+    /// A YAML document marker after the list is a line outside it: `...` (the end
+    /// of the document) is kept as it was. A `---` after the list starts a second
+    /// document, which the YAML reader refuses, so the file is refused, not dropped.
+    #[test]
+    fn a_document_marker_after_the_list_is_kept_or_refused_never_dropped() {
+        let body = "zenoh_a: 1\nzenoh_sovereign_peerings: []\n...\n";
+        let r = checkout(&[
+            INV,
+            GV,
+            ("ops/ansible/group_vars/core_router/peerings.yml", body),
+        ]);
+        let text = merge_peerings(r.path(), "core_router", "xab", "fed.xab.zagros.01").unwrap();
+        assert!(
+            text.starts_with("zenoh_a: 1\n") && text.ends_with("\n...\n"),
+            "`...` kept: {text}"
+        );
+        assert!(text.contains("- sovereign: xab"), "{text}");
+        let body = "zenoh_a: 1\nzenoh_sovereign_peerings:\n- sovereign: xac\n  cn: fed.xac.zagros.01\n---\n";
+        let r = checkout(&[
+            INV,
+            GV,
+            ("ops/ansible/group_vars/core_router/peerings.yml", body),
+        ]);
+        let file = r
+            .path()
+            .join("ops/ansible/group_vars/core_router/peerings.yml");
+        let e = merge_peerings(r.path(), "core_router", "xab", "fed.xab.zagros.01").unwrap_err();
+        assert!(
+            e.contains("(GB-237)") && e.contains("Nothing was written"),
+            "{e}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), body, "unchanged");
+    }
+
+    /// What admission cannot keep is refused, and the file is left as it was: a
+    /// comment inside the list it rewrites, a flow-style top level it cannot split
+    /// into variables, the list written twice.
+    #[test]
+    fn what_admission_cannot_keep_is_refused_not_dropped() {
+        for (why, body) in [
+            ("a comment inside the list", "zenoh_sovereign_peerings:\n- sovereign: xac  # agreed\n  cn: fed.xac.zagros.01\n"),
+            ("a comment line between entries", "zenoh_sovereign_peerings:\n- sovereign: xac\n  cn: fed.xac.zagros.01\n# next\n- sovereign: xad\n  cn: fed.xad.zagros.01\n"),
+            ("a flow-style top level", "{zenoh_mode: 1, zenoh_sovereign_peerings: []}\n"),
+            ("an anchor in the list that another variable aliases", "zenoh_sovereign_peerings:\n- &first\n  sovereign: xac\n  cn: fed.xac.zagros.01\nzenoh_first_partner: *first\n"),
+            ("the list written twice", "zenoh_sovereign_peerings: []\nzenoh_mode: 1\nzenoh_sovereign_peerings: []\n"),
+        ] {
+            let r = checkout(&[INV, GV, ("ops/ansible/group_vars/core_router/peerings.yml", body)]);
+            let file = r.path().join("ops/ansible/group_vars/core_router/peerings.yml");
+            let e = merge_peerings(r.path(), "core_router", "xab", "fed.xab.zagros.01")
+                .expect_err(&format!("{why} is refused"));
+            assert!(e.contains("(GB-237)") && e.contains("Nothing was written"), "{why}: {e}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), body, "{why}: unchanged");
+        }
     }
 }
