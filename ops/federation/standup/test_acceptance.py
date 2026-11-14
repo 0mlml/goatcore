@@ -639,14 +639,15 @@ class AcceptanceRun(unittest.TestCase):
         self.assertIn("waiting for xab's phase 14", out)
         self.assertFalse(os.path.isdir(os.path.join(self.tmp, "ev-xaa", "bilateral")), out)
 
-    def test_derived_each_run_draws_a_new_challenge_and_a_stale_partner_result_is_refused(self):
+    def test_derived_each_run_draws_a_new_challenge_and_an_earlier_runs_partner_sample_teaches_nothing(self):
         ev, (rc_a, out_a), (rc_b, out_b) = self.both_derived()
         self.assertEqual((rc_a, rc_b), (0, 0), (out_a, out_b))
         with open(os.path.join(ev["xaa"], "result.json")) as f:
             first = json.load(f)["session"]["challenge"]
-        # xaa again, alone, in the same session: a new challenge, so xab's result,
-        # still on xaa's core and echoing the first, is refused as stale and the run
-        # waits, then stays open.
+        # xaa again, alone, in the same session: a new challenge. xab's samples and
+        # result are still on xaa's core, from xab's run that started before xaa's
+        # start minus the wait: an earlier run's, so its challenge is not learned, no
+        # result is published or verified, and the run stays open.
         p = self.derived_side("xaa", ev["xaa"], full=True, wait="3")
         out = p.communicate(timeout=120)[0]
         with open(os.path.join(ev["xaa"], "result.json")) as f:
@@ -655,7 +656,48 @@ class AcceptanceRun(unittest.TestCase):
         self.assertNotEqual(second["challenge"], first)
         self.assertEqual(second["id"], json.load(open(os.path.join(ev["xab"], "result.json")))["session"]["id"])
         self.assertEqual(p.returncode, 3, out)
-        self.assertIn("GB-273", out)
+        self.assertIn("from an earlier run", out)
+        self.assertIn("BILATERAL OPEN", out)
+        self.assertNotIn("FAIL", out.replace("ACCEPTANCE FAILED", ""))
+
+    def test_derived_a_partner_sample_left_by_an_earlier_run_is_ignored_and_both_verdicts_agree(self):
+        """A sample the partner's earlier run left on our core carries that run's
+        challenge. It says when that run started; a run ignores a partner sample
+        that started before its own start minus FED_SESSION_WAIT and waits for this
+        run's, so our signed result echoes the partner's current challenge and both
+        sides reach the same verdict (§6.3)."""
+        import subprocess as sp, time
+        path = os.path.join(self.tmp, "agreement.json")
+        with open(path, "w") as f:
+            json.dump(self.ag, f)
+        der = os.path.join(self.tmp, "derived.json")
+        sp.run(["python3", str(HERE / "acceptance_session.py"), "derive", "--agreement", path, "--us", "xaa",
+                "--attempt", "1", "--out", der], check=True, capture_output=True)
+        sid = json.load(open(der))["session_id"]
+        old = "0123456789abcdef0123456789abcdef"
+        long_ago = str(int(time.time()) - 100000).encode()
+        stale = {}
+        for st in self.fabric.offered("xab"):
+            wire = "from/xab/%s/acceptance/%s/xab" % (st[len("release/"):], sid)
+            stale[wire] = ("xab-%s-%s" % (old, st[len("release/"):])).encode()
+            stale[wire + "/persist"] = ("xab-%s-%s-persist" % (old, st[len("release/"):])).encode()
+            stale[wire + "/started"] = long_ago
+        self.fabric.faults.stale["xaa"] = stale
+        ev, (rc_a, out_a), (rc_b, out_b) = self.both_derived(delay=3)
+        self.assertEqual((rc_a, rc_b), (0, 0), (out_a, out_b))
+        for side in ("xaa", "xab"):
+            self.assertEqual(self.bilateral(ev[side])["verdict"], "PASS", side)
+        self.assertNotIn("echoes " + old, out_a)
+        self.assertIn("from an earlier run", out_a)
+
+    def test_derived_each_run_stages_when_it_started_beside_its_samples(self):
+        ev, (rc_a, out_a), (rc_b, out_b) = self.both_derived()
+        self.assertEqual((rc_a, rc_b), (0, 0), (out_a, out_b))
+        sid = json.load(open(os.path.join(ev["xaa"], "result.json")))["session"]["id"]
+        st = self.fabric.offered("xaa")[0]
+        started = self.fabric.cores["xab"].store.get("from/xaa/%s/acceptance/%s/xaa/started" % (st[len("release/"):], sid))
+        self.assertIsNotNone(started, "xaa's start time crossed to xab's core with its samples")
+        self.assertRegex(started.decode(), r"^[0-9]{10}$")
 
     def test_derived_a_signature_over_other_bytes_than_the_published_result_is_refused_gb_272(self):
         # The partner's signer signs other bytes than the result it publishes; a wire
