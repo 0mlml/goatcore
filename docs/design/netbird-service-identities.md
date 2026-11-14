@@ -6,7 +6,7 @@
 | Registry | [`ops/netbird/service-identities.yaml`](../../ops/netbird/service-identities.yaml) |
 | Script | [`ops/scripts/netbird-service-identities.py`](../../ops/scripts/netbird-service-identities.py) |
 | Deploy gate | [`ops/ansible/tasks/require-netbird-service-identity.yml`](../../ops/ansible/tasks/require-netbird-service-identity.yml) |
-| CI | [`ops/ci/check-netbird-service-identities.py`](../../ops/ci/check-netbird-service-identities.py), in `repo-guards` |
+| CI | [`ops/ci/check-netbird-service-identities.py`](../../ops/ci/check-netbird-service-identities.py), in `ci.yml`'s `ops-ci-guards` job, with its `--self-test` |
 | Related | mesh-identity-operations.md (service users vs people), [live-state-guard-scheduling.md](live-state-guard-scheduling.md) §4 (minting is operator-run), [goatnet-standup.md](../operations/goatnet-standup.md) phases 11 and 12 |
 
 ## 1. What this is
@@ -38,11 +38,13 @@ Each identity declares:
 | `token_env` | the operator variable, `{SITE}_...` (`GALAXY_PORTAL_NB_SVC_TOKEN`) |
 | `required_when` | `always`, or `{var, role}`: the goatnet's `group_vars` value, else that role's default |
 | `onepassword` | item and field in the team vault (`<goatnet>-portal-nb-svc` / `token`) |
-| `consumers` | roles that read the token |
+| `consumers` | roles in this repository that read the token; each includes the require task |
+| `external_consumers` | services that read the token but whose roles live in another repository (goatstuff); the check refuses one that has a role here |
 | `bootstrap` | exactly one identity (`netbird-infra`) is minted by hand; it mints the rest |
 
-Five identities are declared: `netbird-infra`, `portal-mint`,
-`console-enrollwatch`, `provenance-guard`, `membership-reconcile`.
+Six identities are declared: `netbird-infra`, `portal-mint`,
+`console-enrollwatch`, `provenance-guard`, `membership-reconcile`,
+`warrant-membership`.
 
 **Adding a consumer or an identity is one registry edit plus one include in the
 role.** CI refuses the role until both exist.
@@ -82,7 +84,7 @@ attribution. It does not reduce privilege.
 |---|---|---|
 | Standup phase 12 (`goat-standup.sh`) | `--mint`, then `--live` as a GATE | a goatnet leaving standup without an identity its config needs |
 | Every deploy of a consumer role | `require-netbird-service-identity.yml`: token empty, or read from a variable other than the registry's name for this goatnet | a service deploying without its capability; `group_vars` reading another goatnet's token |
-| CI (`repo-guards`) | malformed registry; a consumer role without the include; a role rendering a `..._NB_..._TOKEN` variable that no identity lists; a `group_vars` name that disagrees with the registry | a new consumer added without a registered identity; name drift |
+| CI (`ops-ci-guards`) | malformed registry; a consumer role without the include; a role rendering a `..._NB_..._TOKEN` variable that no identity lists; a `group_vars` name that disagrees with the registry | a new consumer added without a registered identity; name drift |
 
 The standup ordering changed to make phase 12 possible: the browser step that
 creates the bootstrap identity is phase 11, right after the dashboard, and mesh
