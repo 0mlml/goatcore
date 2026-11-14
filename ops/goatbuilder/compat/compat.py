@@ -2,9 +2,10 @@
 """goatbuilder keeps its promise to the last release (docs/design/goatbuilder-v1-gate.md, group A).
 
 Four surfaces are what other people build on. This script holds a build of
-goatbuilder to three of them, against the baseline kept beside it
-(baseline.yaml names the release it was recorded from). The fourth, A2's
-configuration files, is crates/goatbuilder/tests/config_compat.rs:
+goatbuilder to two of them, against the baseline kept beside it
+(baseline.yaml names the release it was recorded from). A2's configuration
+files are crates/goatbuilder/tests/config_compat.rs, and A5's error codes are
+ops/ci/check-error-codes-kept.py:
 
   surface    A3  every command and flag of the last release is still there
                  (and still takes a value if it took one, and no optional
@@ -13,11 +14,9 @@ configuration files, is crates/goatbuilder/tests/config_compat.rs:
                  is still produced by the same invocation as a superset: the
                  same version, no field removed, no field retyped, no list
                  that held entries now empty
-  errors     A5  every GB-nnn code of the last release is in ops/errors/catalog.yaml
-                 with the same title, unless the entry carries `retired:`
 
 usage:
-  compat.py check   --bin <goatbuilder> [--repo DIR] [--only surface,documents,errors]
+  compat.py check   --bin <goatbuilder> [--repo DIR] [--only surface,documents]
   compat.py refresh --tag goatbuilder/vX.Y.Z --bin <that release's binary> --sums <its SHA256SUMS> [--repo DIR]
 
 `check` prints one row per kept item and exits 0 when every row holds, 1 when
@@ -55,7 +54,6 @@ except ImportError:  # pragma: no cover - the CI step installs it
     sys.exit(2)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CATALOG = "ops/errors/catalog.yaml"
 
 # ---------------------------------------------------------------- A3: the command surface
 
@@ -140,7 +138,7 @@ def parse_values(help_text: str) -> dict:
 def surface_values(binary: str, tree: dict) -> dict:
     """Each command's possible values, from its `--help` (English, its own HOME)."""
     home = tempfile.mkdtemp(prefix="compat-home-")
-    env = dict(_env(), HOME=home)
+    env = _env(home)
     try:
         for cmd in tree:
             r = subprocess.run([binary, *cmd.split()[1:], "--help"], capture_output=True, text=True, env=env)
@@ -410,31 +408,6 @@ def release_values_problems(tag: str, docs: list, meta: dict) -> list:
     return []
 
 
-# ---------------------------------------------------------------- A5: the error codes
-
-
-def load_catalog(repo: str) -> list:
-    with open(os.path.join(repo, CATALOG)) as f:
-        return yaml.safe_load(f).get("entries") or []
-
-
-def release_codes(entries: list) -> list:
-    """The codes the promise covers: goatbuilder's own, GB-nnn."""
-    return [{"code": e["code"], "title": e["title"]} for e in entries if str(e.get("code", "")).startswith("GB-")]
-
-
-def error_problems(base: list, catalog: list) -> list:
-    now = {e.get("code"): e for e in catalog}
-    out = []
-    for b in base:
-        e = now.get(b["code"])
-        if e is None:
-            out.append(f"{b['code']}: in the last release ({b['title']!r}) and gone from {CATALOG}; a code stays in the catalog, marked `retired:` when it is no longer printed")
-        elif e.get("title") != b["title"] and not e.get("retired"):
-            out.append(f"{b['code']}: the title was {b['title']!r} and is now {e.get('title')!r}; a code is never reused for a different fault: restore the title, or mark the entry `retired:` and give the new fault a new code")
-    return out
-
-
 # ---------------------------------------------------------------- the baseline on disk
 
 
@@ -456,11 +429,12 @@ class Baseline:
         with open(os.path.join(self.root, "surface.json")) as f:
             return json.load(f)
 
-    def errors(self) -> list:
-        return _read_yaml(os.path.join(self.root, "errors.yaml"))["codes"]
-
     def documents(self) -> list:
         return _read_yaml(os.path.join(self.root, "documents", "manifest.yaml"))["documents"]
+
+    def not_kept(self) -> dict:
+        """The verbs with no kept document, each with the reason."""
+        return _read_yaml(os.path.join(self.root, "documents", "manifest.yaml")).get("not_kept") or {}
 
     def document(self, d: dict):
         with open(os.path.join(self.root, "documents", d["name"] + "." + d["format"])) as f:
@@ -475,18 +449,69 @@ class Baseline:
         return (_read_yaml(path).get("conditional") or []) if os.path.isfile(path) else []
 
 
-def _env() -> dict:
+SCRATCH = "{scratch}"
+
+
+def _env(home: str) -> dict:
+    """The environment of one run: this process's, without the switches that
+    change what a run prints, and with its own HOME and XDG directories, so a
+    verb that keeps state there (`tutor`) neither edits the caller's nor
+    depends on it."""
     env = dict(os.environ)
     for k in ("GOAT_EXPLAIN", "GOATBUILDER_UPDATE_URL", "GOATBUILDER_TIMEOUT", "CLICOLOR_FORCE", "RUST_LOG"):
         env.pop(k, None)
-    env.update({"GOAT_LANG": "en", "NO_COLOR": "1", "LC_ALL": "C.UTF-8"})
+    env.update({"GOAT_LANG": "en", "NO_COLOR": "1", "LC_ALL": "C.UTF-8", "HOME": home})
+    for k, sub in (("XDG_CONFIG_HOME", ".config"), ("XDG_CACHE_HOME", ".cache"), ("XDG_DATA_HOME", ".local/share"), ("XDG_STATE_HOME", ".local/state")):
+        env[k] = os.path.join(home, sub)
     return env
 
 
-def run_document(binary: str, repo: str, d: dict):
-    r = subprocess.run([binary, "-o", d["format"], *d["args"]], capture_output=True, text=True, env=_env(), cwd=repo)
+def _run(cmd: list, cwd=None) -> subprocess.CompletedProcess:
+    """Run a goatbuilder with a fresh HOME, removed afterwards."""
+    home = tempfile.mkdtemp(prefix="compat-home-")
     try:
-        doc = json.loads(r.stdout) if d["format"] == "json" else yaml.safe_load(r.stdout)
+        return subprocess.run(cmd, capture_output=True, text=True, env=_env(home), cwd=cwd)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def unscratch(text: str, tmp: str) -> str:
+    """`text` with the scratch directory written back as {scratch}, in every
+    form a run can print it: as given, resolved (macOS's /private/var/...),
+    and JSON-escaped."""
+    forms = {tmp, os.path.realpath(tmp)}
+    forms |= {json.dumps(f)[1:-1] for f in list(forms)}
+    for f in sorted(forms, key=len, reverse=True):
+        text = text.replace(f, SCRATCH)
+    return text
+
+
+def invocation_verb(args: list, verbs: list):
+    """The top-level verb an invocation runs: its first argument that names one."""
+    return next((a for a in args if a in verbs), None)
+
+
+def run_document(binary: str, repo: str, d: dict):
+    """Run one kept invocation. A verb that changes state runs on a scratch copy:
+    each fixture named in `scratch:` is copied from documents/fixtures/ into a
+    fresh directory, `{scratch}` in the arguments names it, and its path is
+    written back as `{scratch}` in the output, so the kept document names no
+    machine's directory."""
+    args = list(d["args"])
+    tmp = None
+    if d.get("scratch"):
+        tmp = tempfile.mkdtemp(prefix="compat-scratch-")
+        for f in d["scratch"]:
+            shutil.copytree(os.path.join(HERE, "documents", "fixtures", f), os.path.join(tmp, f))
+        args = [a.replace(SCRATCH, tmp) for a in args]
+    try:
+        r = _run([binary, "-o", d["format"], *args], cwd=repo)
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    out = unscratch(r.stdout, tmp) if tmp else r.stdout
+    try:
+        doc = json.loads(out) if d["format"] == "json" else yaml.safe_load(out)
     except (ValueError, yaml.YAMLError) as e:
         return r.returncode, None, f"not a {d['format']} document ({e}); stderr: {r.stderr.strip()[:300]}"
     return r.returncode, doc, None
@@ -495,7 +520,7 @@ def run_document(binary: str, repo: str, d: dict):
 # ---------------------------------------------------------------- check
 
 
-def check_all(repo: str, root: str, binary: str, only=("surface", "documents", "errors")) -> list:
+def check_all(repo: str, root: str, binary: str, only=("surface", "documents")) -> list:
     """Rows of (ok, surface, item, detail)."""
     b = Baseline(root)
     rows = []
@@ -516,7 +541,7 @@ def check_all(repo: str, root: str, binary: str, only=("surface", "documents", "
         rows.append((False, "documents", "conditional.yaml", p))
 
     if "surface" in only:
-        r = subprocess.run([binary, "docs", "--markdown"], capture_output=True, text=True, env=_env(), cwd=repo)
+        r = _run([binary, "docs", "--markdown"], cwd=repo)
         if r.returncode != 0:
             rows.append((False, "surface", "docs --markdown", f"exit {r.returncode}: {r.stderr.strip()[:300]}"))
         else:
@@ -539,12 +564,6 @@ def check_all(repo: str, root: str, binary: str, only=("surface", "documents", "
                 p.append(f"exit {d['exit']} in {b.release}, {rc} now")
             rows.append((not p, "documents", item, "; ".join(p) if p else "a superset of the release's document"))
 
-    if "errors" in only:
-        problems = error_problems(b.errors(), load_catalog(repo))
-        for p in problems:
-            rows.append((False, "errors", p.split(":", 1)[0], p.split(":", 1)[1].strip()))
-        if not problems:
-            rows.append((True, "errors", f"{len(b.errors())} codes", f"every GB code of {b.release} keeps its title"))
     return rows
 
 
@@ -614,7 +633,7 @@ def release_binary_problem(binary: str, sums: str, tag: str, pins=None):
     pinned = (pins or {}).get((tag, name))
     if pinned and pinned != digest:
         return f"{sums} gives {name} of {tag} the sha256 {digest[:16]}…, but {PINS} pins {pinned[:16]}…"
-    r = subprocess.run([binary, "--version"], capture_output=True, text=True)
+    r = _run([binary, "--version"])
     if r.stdout.split()[-1:] != [tag.split("/", 1)[1].lstrip("v")]:
         return f"{binary} reports {r.stdout.strip()!r}, not {tag}"
     return None
@@ -652,18 +671,15 @@ def refresh(repo: str, root: str, tag: str, binary: str, sums=None) -> int:
 
 
 def _refresh_last_release(repo: str, root: str, tag: str, binary: str, b: "Baseline") -> None:
-    """Record the surface, the error codes and the documents of the release as the new baseline."""
+    """Record the surface and the documents of the release as the new baseline."""
     # A3: the released binary's command tree.
-    md = subprocess.run([binary, "docs", "--markdown"], capture_output=True, text=True, check=True, env=_env()).stdout
+    r = _run([binary, "docs", "--markdown"])
+    if r.returncode != 0:
+        raise SystemExit(f"compat: {binary} docs --markdown: exit {r.returncode}")
+    md = r.stdout
     with open(os.path.join(root, "surface.json"), "w") as f:
         json.dump(surface_values(binary, parse_reference(md)), f, indent=1, sort_keys=True)
         f.write("\n")
-
-    # A5: the catalog the tag carried.
-    entries = yaml.safe_load(_git(repo, "show", f"{tag}:{CATALOG}"))["entries"]
-    with open(os.path.join(root, "errors.yaml"), "w") as f:
-        f.write(f"# The GB codes of {tag} and their titles, read from {CATALOG} at the tag by compat.py refresh.\n")
-        yaml.safe_dump({"codes": release_codes(entries)}, f, sort_keys=False, allow_unicode=True, width=1000)
 
     # A4: the released binary's documents for the kept invocations.
     docs = b.documents()
@@ -680,7 +696,7 @@ def _refresh_last_release(repo: str, root: str, tag: str, binary: str, b: "Basel
                 f.write("\n")
             else:
                 yaml.safe_dump(doc, f, sort_keys=False, allow_unicode=True)
-    _write_manifest(os.path.join(root, "documents", "manifest.yaml"), "documents", docs)
+    _write_manifest(os.path.join(root, "documents", "manifest.yaml"), None, {"documents": docs, "not_kept": b.not_kept()})
 
 
 def _write_manifest(path: str, key, value) -> None:
@@ -705,7 +721,7 @@ def main(argv=None) -> int:
     c = sub.add_parser("check")
     c.add_argument("--bin", required=True)
     c.add_argument("--repo", default=os.path.abspath(os.path.join(HERE, "..", "..", "..")))
-    c.add_argument("--only", default="surface,documents,errors")
+    c.add_argument("--only", default="surface,documents")
     r = sub.add_parser("refresh")
     r.add_argument("--tag", required=True)
     r.add_argument("--bin", required=True)
