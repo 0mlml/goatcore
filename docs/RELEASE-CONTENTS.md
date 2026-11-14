@@ -22,6 +22,7 @@ Each component below has one of four words, and each word means one thing.
 | `goat`, the operator CLI | `crates/goat-cli/` | Tested in CI | `ci.yml`, `goat-cli-pr.yml` |
 | `goatbuilder`, build, release, deploy and standup | `crates/goatbuilder/` | Tested in CI | `ci.yml` |
 | Release binaries of `goat` and `goatbuilder` for linux-amd64, linux-arm64 and darwin-arm64, with a signed `SHA256SUMS` | `.github/workflows/goat-release.yml`, `.github/workflows/goatbuilder-release.yml` | Not run | They run on a tag `goat-cli-v<semver>` or `goatbuilder/v<semver>` |
+| Federation e2e environment: synthetic sovereigns, a scenario matrix against any ref | `ops/federation-e2e/env`, [design](design/federation-e2e-environment.md) | WIP | `federation-e2e.yml` runs its two-party subset |
 | Error catalog and interpreter | `crates/goat-errors/`, `ops/errors/` | Tested in CI | `ci.yml`, `error-catalog.yml` |
 | `panoscope-core`, the portal client shared with `goatstuff` | `crates/panoscope-core/` | Tested in CI | `ci.yml` |
 | Relay and relay protocol | `goat-relay/`, `goat-relay-protocol/` | Tested in CI | `goat-relay.yml`, `goat-relay-protocol.yml` |
@@ -49,7 +50,7 @@ What you need depends on how far you go. The rehearsal needs a laptop; everythin
 | To do this | You bring |
 |---|---|
 | The rehearsal | Rust, to build `goatbuilder` from `crates/` |
-| goatlite | One Ubuntu 24.04 host or VM with 4 cores and 16 GB that you can reach by SSH with a key; a laptop on the same LAN with Rust and the NetBird client; a GitHub token with `read:packages` as `GHCR_READ_TOKEN`, or your own images |
+| goatlite | One Ubuntu 24.04 host or VM with 4 cores and 16 GB that you can reach by SSH with a key; a laptop on the same LAN with Rust and the NetBird client. The images are public on ghcr.io and need no account |
 | A full goatnet on one LAN | The hosts: a core pair and an observability pair is the baseline, one core host is enough to start. Each runs Ubuntu 24.04 with disk encryption. Also a secret store, and `yq`, `sshpass`, `go` and `age`, which `goatbuilder doctor` checks |
 | A full goatnet on the internet | The above, plus your own AWS account, a Cloudflare zone and a domain, for the relays and public DNS |
 | Your own images | A fork. The image workflows publish to `ghcr.io/<your owner>/` with `GITHUB_TOKEN` alone |
@@ -60,7 +61,7 @@ These work from a clone with no configuration:
 
 - `goatbuilder standup zagros --site alpha --mock <dir>` and the other verbs under `--mock`, against the fixtures.
 - `goatbuilder explain` and `goat explain`, with an error code or pasted text.
-- `goat --help` and the `goat acl` verbs, which read the example policy compiled in from `ops/warrant/demo/`.
+- `goat --help`, and the `goat acl` verbs run inside a checkout (they read its `ops/ansible/netbird_acl_*.yml`; elsewhere pass `--declaration <dir>`).
 - Every script in `ops/ci/`, from a git checkout.
 
 These need configuration from you first:

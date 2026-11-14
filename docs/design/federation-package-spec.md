@@ -7,6 +7,7 @@
 | Conformance vectors | [`../../ops/federation/vectors/`](../../ops/federation/vectors/) — **normative** |
 | Reference implementation | [`../../ops/federation/reference/`](../../ops/federation/reference/) |
 | Transport design | `cross-sovereign-peering-transport.md` |
+| Our tool | `goat federate init\|lint\|compose\|diff\|verify\|apply` today; moving to `goatbuilder federate` on the `goat-federation` library, **designed** ([ADR 1225](../adr/1225-federation-belongs-to-goatbuilder-one-command-one-decision.md), Proposed) |
 
 The contract between two organisations setting up a data link. This document is the
 authority; our tool is one implementation of it. **A partner must be able to implement
@@ -299,6 +300,12 @@ runs **on its own side, over its own data**. It is deliberately not a router fea
 underlying fabric cannot rename key expressions in transit, and building that capability
 would mean forking it.
 
+The mapping is fixed: `release/<set>/<rest>` crosses as `from/<sovereign_id>/<set>/<rest>`, so
+several sets share one wire prefix with the set kept as a path segment. Where a party runs that
+process is its own decision. This repository's republisher (`ops/federation/republisher/`) runs on
+the party's core host, with both of its sessions on the party's core router, and is the only writer
+of the party's wire name there; the party's edge carries that name out.
+
 ## 3.3 Coalitions, alliances and frameworks
 
 **No coalition is named anywhere in this specification, and no package declares its own
@@ -379,8 +386,8 @@ hints only, and **never an input to an access decision**. It is not part of v1 b
 in v1 needs it: release sets are explicit lists, so no lane abstraction crosses the link.
 
 `capabilities.tool_version` is reserved. **Designed, not built.** If a future version adds it,
-it carries the version of the tool that composed the package (`goat --version`), measured by
-`goat federate init` and never declared. It is informational: it changes no negotiated field
+it would carry the version of the tool that composed the package, measured by
+`goatbuilder federate init`, or `goat federate init` during the transition, and never declared. It is informational: it changes no negotiated field
 and is never a precondition. The digest matches when both sides compose under the same `spec`
 version, and each side's tool proves it implements that version by passing the normative
 conformance vectors (§10). Two parties do not need the same tool, the same release or the same
@@ -957,8 +964,8 @@ and digest are in [`../../ops/federation/vectors/`](../../ops/federation/vectors
 
 The example above is pretty-printed, and the vectors hold its byte-exact form. That is a
 convenience, and it must not become the only place a rule lives. **The vectors are normative
-(§10), and an external partner may not have them** — they sit in a repository; this document
-travels by email, in a meeting pack, as an attachment to an interconnection agreement.
+(§10), and this document is also read on its own** — as an attachment to an interconnection
+agreement, away from the repository the vectors live in.
 
 So: **every rule that changes the bytes, or changes whether an agreement exists at all, is
 stated in prose in this document.** The vectors confirm an implementation. They are not where it
@@ -1082,3 +1089,58 @@ is what makes them a test of it rather than a description of it.
   locally, and never inside the digest (§7).
 - **A directory.** Convenient, and never required. Two parties who share none federate
   exactly as well (§5.1).
+- **A counterparty member.** A package does not name the party it is meant for, and does not
+  need to. §11.1 says why that holds for a party with several peerings.
+
+### 11.1 A party with several peerings signs one package per counterparty
+
+This section adds no member and changes no rule; the version stays `federation-package/v1`, and
+every conformance vector stands as written.
+
+A package carries at most one `transport_offer`, so it describes one link: one endpoint, one
+public key, one proposed link subnet. A party that peers with several counterparties issues one
+package per counterparty, each carrying that peering's offer, all signed with the same key and
+naming the same `identity`. Each pair composes exactly as in §6 and §7, from two packages, with
+no knowledge of the party's other peerings.
+
+Three things follow. The first and third need no rule of their own; the second puts one
+obligation on a reader that fetches a package from a per-counterparty slot:
+
+- **An agreement already composed stays valid.** Composition reads only the two packages' bytes.
+  Moving a package to a different place (a per-counterparty slot in a directory, a different
+  file name) changes nothing that is hashed, so the agreement's canonical bytes and digest are
+  the same.
+- **The digest catches a package delivered to the wrong counterparty only in part.** The
+  agreement (§8.1) does not carry every member of the two packages: it carries neither
+  `transport_offer.endpoint` nor `transport_offer.public_key`, and it takes `link_subnet` only
+  from `parties[0]`. Two packages of one party that differ only in those members compose with
+  the same counterparty package to the same agreement bytes and the same digest. So if one side
+  composes with the package the other issued for a third party, §9's comparison fails only when
+  the two packages differ in a member the agreement carries (for example `expires`,
+  `measured_mtu`, `listener`, a `data_offer` or `accept_*` value, or `proposed_link_subnet` for
+  the party that sorts first). Otherwise the digests match and nothing in this specification
+  notices. What ties a package to its counterparty is then the upload signature of the
+  directory slot it came from, whose resource line names both parties
+  (`<party>/packages/<counterparty>`, `peering-directory-service.md` §6.3). A reader that takes a
+  package from a per-counterparty slot MUST verify that signature over the resource
+  `<their sovereign_id>/packages/<our sovereign_id>` before it uses the package, under the key
+  read aloud, or, before the call, under the key the directory has bound, which is then the key
+  the two parties confirm on the call. It MUST also verify the package's own signature (§5)
+  under that same key: otherwise a directory could sign the slot statement under a key of its
+  own and serve another peering's genuine package with it. A package exchanged any other way is
+  tied to its counterparty only by what the two parties say on the call.
+- **One offer for several partners is not this version.** A single `transport_offer` shared by
+  several peerings would need one `proposed_link_subnet` for several links, and §7 takes
+  `link_subnet` from whichever party sorts first, so two partners' proposals could collide on the
+  shared side. Allowing it needs a new subnet rule, which changes agreement bytes: a later
+  version, with its own vectors.
+
+How the packages travel is still out of scope (above). The peering directory keeps one slot per
+counterparty (`peering-directory-service.md` §6.3).
+
+
+## Receiving storage interests
+
+Built: the core router declares one storage subscription on `from/<peer>/**` for each configured sovereign peering. A broader subscription on `from/**` does not fit an edge grant on `from/<peer>/**`, so it cannot establish the interest needed to receive that peer’s data. Access rules remain unchanged.
+
+Each peer store has its own `sovereign_from_<peer>` directory and uses the configured federation retention period, the same for every peer. There is no shared store: a peer's samples are held in its own store only, and when the peering is backed out that store is dropped whole ([ADR 1234](../adr/1234-a-partners-data-lives-in-its-own-store-dropped-whole-when-the-peering-ends.md)). Built (`roles/goat-zenoh/templates/config.json5.j2`, `tests/render-check.py`). A core that kept the earlier shared `sovereign_from` store on `from/**` keeps its directory on disk, with no retention, listed in `.undeclared-stores` until a person disposes of it.

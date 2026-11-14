@@ -333,7 +333,10 @@
 # set here (postgres_initdb_encoding) is what the .env render writes as
 # POSTGRES_INITDB_ARGS. A joiner whose cluster already exists with another
 # encoding is refused: initdb never runs again on an existing PGDATA.
-# A founder is untouched.
+# A founder is untouched. A SQL_ASCII goatnet moves to UTF8 with
+# postgres-encoding-migrate.yml, every Spock member at once
+# (docs/operations/postgres-utf8-migration.md); its joiners then follow a
+# UTF8 founder here.
 # ============================================================================
 - name: "site-bootstrap: joiner cluster encoding follows the founder (when goatnet_founder false)"
   tags: [stack]
@@ -504,6 +507,18 @@
               {% endif %}
               {% if postgres_spock_image is defined and postgres_spock_image %}
               POSTGRES_SPOCK_IMAGE={{ postgres_spock_image }}
+              {% endif %}
+              {# postgres-a's memory, as mgmt-host.yml renders it; unset -> the  #}
+              {# compose defaults (2G, 512M) and the image's config (768MB, 300).#}
+              {% if mgmt_postgres_memory | default('') | string | length > 0 %}
+              POSTGRES_A_MEMORY={{ mgmt_postgres_memory }}
+              {% endif %}
+              {% if mgmt_postgres_memory_reservation | default('') | string | length > 0 %}
+              POSTGRES_A_MEMORY_RESERVATION={{ mgmt_postgres_memory_reservation }}
+              {% endif %}
+              {% set _pg_args = ((['-c shared_buffers=' ~ mgmt_postgres_shared_buffers] if (mgmt_postgres_shared_buffers | default('') | string | length > 0) else []) + (['-c max_connections=' ~ mgmt_postgres_max_connections] if (mgmt_postgres_max_connections | default('') | string | length > 0) else [])) | join(' ') %}
+              {% if _pg_args | length > 0 %}
+              POSTGRES_A_MEMORY_ARGS={{ _pg_args }}
               {% endif %}
 
         - name: pull postgres-spock image
@@ -954,10 +969,19 @@
   gather_facts: false
   become: true
   vars:
+    # The per-host seed is the name recorded on the host the first time this
+    # runs (tasks/pgbackrest-cipher-seed.yml), so a renamed host keeps the
+    # passphrase its repo was made with. A host with no record gets its
+    # current inventory_hostname, the value this derivation always used.
     pgbackrest_repo1_cipher_pass: >-
-      {{ (pgbackrest_cipher_pass | default('') ~ '-repo1-' ~ inventory_hostname)
+      {{ (pgbackrest_cipher_pass | default('') ~ '-repo1-'
+          ~ (pgbackrest_cipher_seed | default(inventory_hostname)))
          | hash('sha256') | truncate(32, True, '') }}
   tasks:
+    - name: Record or read the pgBackRest cipher seed
+      ansible.builtin.include_tasks: tasks/pgbackrest-cipher-seed.yml
+      when: has_durable_independent_state | default(true) | bool
+
     - name: Apply pgbackrest role
       ansible.builtin.import_role:
         name: pgbackrest
@@ -1033,13 +1057,26 @@
   gather_facts: false
   become: true
   tasks:
-    - name: management-a is up (when has_mgmt_api)
+    # management-a crash-loops on a streaming standby until that node is promoted
+    # (its Ory stays stopped; roles/keepalived-mgmt/README.md), so it is checked
+    # only where postgres-a is not in recovery. A promoted B is checked again.
+    - name: Ask whether postgres-a is a streaming standby (when has_mgmt_api)
+      ansible.builtin.command:
+        cmd: docker exec postgres-a psql -U postgres -tAc 'SELECT pg_is_in_recovery()'
+      register: smoke_pg_recovery
+      changed_when: false
+      failed_when: false
+      when: has_mgmt_api | default(false) | bool
+
+    - name: management-a is up (when has_mgmt_api, not on a standby)
       ansible.builtin.command:
         cmd: docker ps --filter name=management-a --format '{{ "{{" }}.Status{{ "}}" }}'
       register: mgmt_status
       changed_when: false
       failed_when: mgmt_status.stdout is not search('Up')
-      when: has_mgmt_api | default(false) | bool
+      when:
+        - has_mgmt_api | default(false) | bool
+        - (smoke_pg_recovery.stdout | default('') | trim) != 't'
 
     - name: postgres-a is up
       ansible.builtin.command:
@@ -1136,7 +1173,7 @@
           {{ site_id }} bootstrap complete for {{ inventory_hostname }} (profile={{ mgmt_stack_profile }}).
           postgres-a:    {{ pg_status.stdout }}
           {% if has_mgmt_api | default(false) | bool %}
-          management-a:  {{ mgmt_status.stdout }}
+          management-a:  {{ mgmt_status.stdout | default('not checked: postgres-a is a streaming standby') }}
           mgmt-host-bootstrap wrapper: {{ wrapper_path.stdout | trim }}
           {% endif %}
           {% if participates_in_spock | default(false) | bool %}

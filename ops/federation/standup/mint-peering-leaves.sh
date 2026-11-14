@@ -14,7 +14,7 @@
 # expensive failure shape this system has. Every name below comes
 # out of the agreement, and every address that will be dialled goes in as a SAN.
 #
-# THREE CERTIFICATES, and they are not interchangeable:
+# FOUR CERTIFICATES, and they are not interchangeable:
 #
 #   outward   presented TO the partner.   CN = fed.<us>.<them>.NN   (ours, derived)
 #   inward    presented to OUR core.      CN = fed.<them>.<us>.NN   (the agreed
@@ -22,30 +22,55 @@
 #             foreign authority ever reaches a core router — F-424)
 #   core      presented BY our core.      CN = the core's own name, with a SAN
 #             for every address the edge is configured to dial
+#   republisher  presented to OUR core by the outbound republisher.
+#             CN = fed.<us>.<them>.republisher.01 (ours, derived; the subject the
+#             core fragment `apply` renders admits it to read the offered release
+#             sets and write our wire name, nothing else). Never shown to them.
 #
 # Usage:
 #   mint-peering-leaves.sh <agreement.json> <out-dir> [--as <sovereign>]
 #                          [--ca-cert <pem>] [--ca-key <pem>]
+#                          [--ca-key-age <file.age> --age-identity <keys.txt>]
 #                          [--core-cn <name>] [--core-san <san>[,<san>...]]
-#                          [--link-ip <ip>]
+#                          [--link-ip <ip>] [--rotate] [--min-valid-seconds <n>]
 #
-# Environment: FED_CA_CERT, FED_CA_KEY, FED_CORE_CN, FED_CORE_SAN, FED_LINK_IP
+# Environment: FED_CA_CERT, FED_CA_KEY, FED_CA_KEY_FROM_AGE, FED_CA_KEY_AGE,
+#              FED_AGE_IDENTITY, FED_CA_KEY_TMP, FED_CORE_CN, FED_CORE_SAN, FED_LINK_IP
+#
+# THE CA KEY. An explicit key file (--ca-key, FED_CA_KEY) always wins. Opening
+# the deployment's age-encrypted key is opt-in, off by default: only with
+# FED_CA_KEY_FROM_AGE=1 (or --ca-key-from-age; goatbuilder sets it from
+# goat_federation_ca_key_from_age: true) is the key (--ca-key-age,
+# FED_CA_KEY_AGE; the driver derives it from <deploy.state_dir>/<site>-ca/ca.key.age)
+# opened with its age identity into a file this run owns: mode 0600 in a fresh
+# private directory under FED_CA_KEY_TMP, else memory-backed /dev/shm, else
+# $TMPDIR, else /tmp, removed when the script exits, whatever the exit. The key
+# is needed only to issue a missing leaf or to rotate.
 set -uo pipefail
 
 AGREEMENT=""; OUT=""; AS=""
 CA_CERT="${FED_CA_CERT:-}"; CA_KEY="${FED_CA_KEY:-}"
+CA_KEY_AGE="${FED_CA_KEY_AGE:-}"; AGE_IDENTITY="${FED_AGE_IDENTITY:-}"
+FROM_AGE="${FED_CA_KEY_FROM_AGE:-0}"
 CORE_CN="${FED_CORE_CN:-goat-zenoh}"; CORE_SAN="${FED_CORE_SAN:-}"; LINK_IP="${FED_LINK_IP:-}"
 DAYS="${FED_LEAF_DAYS:-90}"
+ROTATE=0; MIN_VALID_SECONDS="${FED_LEAF_MIN_VALID_SECONDS:-86400}"
+HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/peering_leaf_material.py"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --rotate)   ROTATE=1; shift ;;
+    --min-valid-seconds) MIN_VALID_SECONDS="$2"; shift 2 ;;
     --as)       AS="$2"; shift 2 ;;
     --ca-cert)  CA_CERT="$2"; shift 2 ;;
     --ca-key)   CA_KEY="$2"; shift 2 ;;
+    --ca-key-age)   CA_KEY_AGE="$2"; shift 2 ;;
+    --age-identity) AGE_IDENTITY="$2"; shift 2 ;;
+    --ca-key-from-age) FROM_AGE=1; shift ;;
     --core-cn)  CORE_CN="$2"; shift 2 ;;
     --core-san) CORE_SAN="$2"; shift 2 ;;
     --link-ip)  LINK_IP="$2"; shift 2 ;;
-    -h|--help)  sed -n '2,32p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,44p' "$0"; exit 0 ;;
     -*)         echo "unknown flag $1" >&2; exit 2 ;;
     *)          if [ -z "$AGREEMENT" ]; then AGREEMENT="$1"; else OUT="$1"; fi; shift ;;
   esac
@@ -56,7 +81,7 @@ done
 fail() { echo "[✗] $1" >&2; [ -n "${2:-}" ] && printf '     %s\n' "$2" >&2; exit 1; }
 
 # --- the two derived names, read from the agreement, never typed --------------
-read -r US THEM OURS_CN THEIRS_CN DERIVED_LINK_IP <<EOF
+read -r US THEM OURS_CN THEIRS_CN DERIVED_LINK_IP REPUBLISHER_CN CA_FINGERPRINT <<EOF
 $(python3 - "$AGREEMENT" "$AS" <<'PY'
 import json, sys
 ag = json.load(open(sys.argv[1]))
@@ -83,7 +108,8 @@ if subnet:
     hosts = list(net) if net.prefixlen == 31 else list(net.hosts())
     if len(hosts) == 2:
         link = str(hosts[parties.index(us)])
-print(us, them, cn(us, them), cn(them, us), link)
+fingerprint = next(p.get("ca_fingerprint", "-") for p in ag["parties"] if p["sovereign_id"] == us)
+print(us, them, cn(us, them), cn(them, us), link, f"fed.{us}.{them}.republisher.01", fingerprint)
 PY
 )
 EOF
@@ -97,37 +123,13 @@ EOF
 echo "  agreement names us '$US', counterparty '$THEM'"
 echo "  outward CN (to them):   $OURS_CN"
 echo "  inward  CN (to core):   $THEIRS_CN   <- the name our core's ACL matches"
+echo "  republisher CN (core):  $REPUBLISHER_CN"
 
-# --- the CA that signs all three ---------------------------------------------
-[ -n "$CA_CERT" ] && [ -n "$CA_KEY" ] || fail "no signing CA" \
-  "Set FED_CA_CERT and FED_CA_KEY (or --ca-cert/--ca-key) to OUR OWN CA.
-Never the counterparty's: a foreign root anywhere near a core router IS an
-authorization grant, because the access layer matches a name and cannot see
-the issuer."
-[ -f "$CA_CERT" ] || fail "CA certificate $CA_CERT does not exist"
-[ -f "$CA_KEY" ]  || fail "CA key $CA_KEY does not exist"
-
-mkdir -p "$OUT" || fail "cannot create $OUT"
-cd "$OUT" || exit 1
-
-mint() { # mint <name> <CN> <SANs>
-  local name="$1" cn="$2" sans="$3"
-  openssl ecparam -name prime256v1 -genkey -noout -out "$name-key.pem" 2>/dev/null \
-    || fail "could not generate a key for $name"
-  openssl req -new -key "$name-key.pem" -out "$name.csr" -subj "/CN=$cn" 2>/dev/null \
-    || fail "could not build a CSR for $name"
-  printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n' \
-    "$sans" > "$name.ext"
-  # The serial file lives with the leaves. `-CAcreateserial` alone writes it beside the
-  # CA, and an offline CA's directory is the last place that should need to be writable.
-  openssl x509 -req -in "$name.csr" -CA "$CA_CERT" -CAkey "$CA_KEY" \
-    -CAserial "ca.srl" -CAcreateserial \
-    -out "$name.pem" -days "$DAYS" -sha256 -extfile "$name.ext" 2>/dev/null \
-    || fail "could not sign $name"
-  rm -f "$name.csr" "$name.ext"
-  chmod 600 "$name-key.pem"; chmod 644 "$name.pem"
-  echo "  [✓] $name.pem  CN=$cn  SAN=$sans"
-}
+# Validate every requested pair before issuing or replacing anything. The CA
+# private key is needed only for missing leaves or explicit rotation.
+[ -n "$CA_CERT" ] || fail "no CA certificate" "Set FED_CA_CERT to OUR OWN CA."
+LEAVES=()
+mint() { LEAVES+=(--leaf "$1" "$2" "$3"); }
 
 # Outward: what the partner dials. The link address must be a SAN or their
 # name verification fails, and on this software that failure is quiet.
@@ -138,6 +140,11 @@ mint peering-outward "$OURS_CN" "$osan"
 # Inward: an identity from OUR domain carrying the agreed per-partner CN, which
 # is what our core's generated ACL fragment names as its subject.
 mint peering-inward "$THEIRS_CN" "DNS:$THEIRS_CN"
+
+# Republisher: our own client of our own core. Both of its sessions dial the core,
+# so it needs no SAN beyond its name; the core fragment's `fed-rp-<them>` subject
+# matches this CN.
+mint republisher "$REPUBLISHER_CN" "DNS:$REPUBLISHER_CN"
 
 # Core: presented BY our core TO this edge. Every address the edge may dial has
 # to appear here — a missing SAN is the silent failure this script exists for.
@@ -163,9 +170,59 @@ else
   echo "      verification, and the edge logs nothing at INFO when it does."
 fi
 
+# The CA key from the deployment's declared source, when no key file is given.
+RUN_KEY_DIR=""
+cleanup_key() { [ -z "$RUN_KEY_DIR" ] || rm -rf "$RUN_KEY_DIR"; }
+trap cleanup_key EXIT
+trap 'cleanup_key; exit 130' INT
+trap 'cleanup_key; exit 143' TERM
+trap 'cleanup_key; exit 129' HUP
+if [ -z "$CA_KEY" ] && [ -n "$CA_KEY_AGE" ] && [ "$FROM_AGE" != 1 ]; then
+  echo "  CA key: $CA_KEY_AGE is not opened (opt-in: FED_CA_KEY_FROM_AGE=1, or goat_federation_ca_key_from_age: true)" >&2
+fi
+if [ -z "$CA_KEY" ] && [ -n "$CA_KEY_AGE" ] && [ "$FROM_AGE" = 1 ]; then
+  why=""
+  if [ ! -f "$CA_KEY_AGE" ]; then
+    why="$CA_KEY_AGE does not exist"
+  elif [ -z "$AGE_IDENTITY" ] || [ ! -f "$AGE_IDENTITY" ]; then
+    why="no age identity at ${AGE_IDENTITY:-(unset; set FED_AGE_IDENTITY)}"
+  elif ! command -v age >/dev/null 2>&1; then
+    why="the age command is not installed"
+  else
+    # FED_CA_KEY_TMP when set; else memory-backed /dev/shm where there is one,
+    # so the plaintext never reaches a disk; else $TMPDIR; else /tmp.
+    key_parent="${FED_CA_KEY_TMP:-}"
+    if [ -z "$key_parent" ]; then
+      if [ -d /dev/shm ] && [ -w /dev/shm ]; then key_parent=/dev/shm; else key_parent="${TMPDIR:-/tmp}"; fi
+    fi
+    RUN_KEY_DIR="$(umask 077 && mktemp -d "$key_parent/fed-ca-key.XXXXXX")" || why="no private temporary directory"
+    if [ -z "$why" ]; then
+      if ( umask 077 && age -d -i "$AGE_IDENTITY" -o "$RUN_KEY_DIR/ca-key.pem" -- "$CA_KEY_AGE" ) 2>"$RUN_KEY_DIR/age.err"; then
+        CA_KEY="$RUN_KEY_DIR/ca-key.pem"
+        echo "  CA key: opened $CA_KEY_AGE for this run; the copy is removed when it ends"
+      else
+        # age repeats a quoted line of a file it cannot read, which is a
+        # secret when an identity file is named by mistake: quoted text and
+        # anything shaped like an age secret key are never repeated.
+        said="$(head -n 1 "$RUN_KEY_DIR/age.err" | sed -e 's/"[^"]*"/"..."/g' -e 's/AGE-SECRET-KEY-[A-Za-z0-9]*/AGE-SECRET-KEY-.../g' | cut -c1-200)"
+        why="$CA_KEY_AGE did not open with $AGE_IDENTITY (age: ${said:-no message})"
+      fi
+    fi
+  fi
+  # A key is needed only to issue or rotate; a re-run that reuses every leaf
+  # goes on without one, and the helper refuses if it does need it.
+  [ -z "$why" ] || echo "  [!] CA key not opened: $why" >&2
+fi
+
+ARGS=(--out "$OUT" --ca-cert "$CA_CERT" --ca-fingerprint "$CA_FINGERPRINT" --days "$DAYS"
+      --min-valid-seconds "$MIN_VALID_SECONDS")
+[ -z "$CA_KEY" ] || ARGS+=(--ca-key "$CA_KEY")
+[ "$ROTATE" = 0 ] || ARGS+=(--rotate)
+python3 "$HELPER" "${ARGS[@]}" "${LEAVES[@]}" || exit 1
+
 cat <<DONE
 
-  Minted into $OUT. Wire them to the edge role as:
+  Validated material in $OUT. Wire them to the edge role as:
 
     goat_zenoh_edge_outward_cert: $OUT/peering-outward.pem
     goat_zenoh_edge_outward_key:  $OUT/peering-outward-key.pem
@@ -173,6 +230,18 @@ cat <<DONE
     goat_zenoh_edge_inward_key:   $OUT/peering-inward-key.pem
     goat_zenoh_edge_partner_cn:   $THEIRS_CN     (set by \`goat federate apply\`)
 
+  And the republisher role, on the core host the edge dials, as:
+
+    goat_fed_republisher_cert:    $OUT/republisher.pem
+    goat_fed_republisher_key:     $OUT/republisher-key.pem
+    goat_fed_republisher_cn:      $REPUBLISHER_CN     (set by \`goat federate apply\`)
+
+  Our CA is placed beside them as $OUT/our-ca.pem: the CA of the edge's
+  inward endpoint (root_ca_certificate_file=) and goat_fed_republisher_core_ca_src.
+
   The partner's CA — and ONLY the partner's CA — goes in
   goat_zenoh_edge_partner_ca_path. Never in a core router's trust store.
+
+  Or set goat_zenoh_edge_install_certs: true and leave the edge paths unset:
+  phase 12 checks these files and the partner CA and installs them on the edge.
 DONE

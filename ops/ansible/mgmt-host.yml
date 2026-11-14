@@ -212,6 +212,11 @@
           docs/findings/F-070-management-json-default-stun-host-nxdomain.md
           for full context.
 
+    # A proxy with no peer address dies at startup; an ingress without a token
+    # is an unauthenticated public Forward surface. Refused before .env exists.
+    - name: Refuse a half-configured signal federation
+      ansible.builtin.include_tasks: tasks/signal-federation-assert.yml
+
     - name: Ensure compose directory exists
       ansible.builtin.file:
         path: "{{ compose_dir }}"
@@ -306,6 +311,26 @@
     - name: Pre-flight | relay secret is the one this host already signs with
       ansible.builtin.include_tasks: tasks/assert-relay-secret-unchanged.yml
 
+    # The management server trusts the deployment's internal CA through files
+    # this play places here, not through a CA baked into the image: compose
+    # mounts the directory at /etc/netbird/trust and adds it to SSL_CERT_DIR.
+    # netbird_mgmt_trust_certs lists PEM files on the controller (a goatnet's
+    # internal root and intermediate); empty, the directory stays empty and
+    # only the image's system trust applies.
+    - name: Ensure management-a trust directory exists
+      ansible.builtin.file:
+        path: "{{ compose_dir }}/management-a/trust"
+        state: directory
+        mode: "0755"
+
+    - name: Place the deployment's CA certificates for management-a
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ compose_dir }}/management-a/trust/{{ item | basename | regex_replace('\\.(crt|pem)$', '') }}.pem"
+        mode: "0644"
+      loop: "{{ netbird_mgmt_trust_certs | default([]) }}"
+      register: _mgmt_trust_certs
+
     - name: Render management-a/management.json from template
       ansible.builtin.template:
         src: templates/management.json.j2
@@ -355,6 +380,24 @@
           Refusing to render a .env that would drop the ACME resolver.
         quiet: true
       when: _mgmt_acme_overlay.stat.exists
+
+    # A command-line setting wins over ALTER SYSTEM, which the
+    # postgres-streaming-replication role uses for max_connections. Refuse two
+    # different values for the one setting.
+    - name: Assert postgres-a's max_connections is set in one place only
+      ansible.builtin.assert:
+        that:
+          - >-
+            (mgmt_postgres_max_connections | default('') | string | length == 0)
+            or (postgres_max_connections is not defined)
+            or ((mgmt_postgres_max_connections | string) == (postgres_max_connections | string))
+        fail_msg: >-
+          mgmt_postgres_max_connections ({{ mgmt_postgres_max_connections | default('') }}) and
+          postgres_max_connections ({{ postgres_max_connections | default('') }}) disagree. The first is
+          passed on postgres-a's command line and wins over the second, which streaming replication
+          sets with ALTER SYSTEM and needs equal on every standby. Set one of them, or both to the
+          same value, in group_vars.
+        quiet: true
 
     - name: Render .env from playbook vars
       # F-471 -- this task renders POSTGRES_SUPERUSER_PASSWORD,
@@ -496,6 +539,47 @@
           {% if mgmt_signal_memory is defined and mgmt_signal_memory %}
           SIGNAL_A_MEMORY={{ mgmt_signal_memory }}
           {% endif %}
+          {# Postgres memory settings on postgres-a's command line; unset -> the #}
+          {# image's baked config (shared_buffers 768MB, max_connections 300).  #}
+          {% set _pg_args = ((['-c shared_buffers=' ~ mgmt_postgres_shared_buffers] if (mgmt_postgres_shared_buffers | default('') | string | length > 0) else []) + (['-c max_connections=' ~ mgmt_postgres_max_connections] if (mgmt_postgres_max_connections | default('') | string | length > 0) else [])) | join(' ') %}
+          {% if _pg_args | length > 0 %}
+          POSTGRES_A_MEMORY_ARGS={{ _pg_args }}
+          {% endif %}
+          {# Every other container memory limit and reservation of the mgmt-host #}
+          {# compose files. Unset -> the compose file's default, today's value. #}
+          {# The same list is in tasks/mgmt-host-ceilings-env.yml;              #}
+          {# ops/ci/check-compose-memory-is-variable.sh holds the two together. #}
+          {% for _k, _v in [
+               ['POSTGRES_A_MEMORY', 'mgmt_postgres_memory'],
+               ['POSTGRES_A_MEMORY_RESERVATION', 'mgmt_postgres_memory_reservation'],
+               ['SIGNAL_A_MEMORY_RESERVATION', 'mgmt_signal_memory_reservation'],
+               ['FEDERATION_PROXY_MEMORY', 'mgmt_federation_proxy_memory'],
+               ['FEDERATION_PROXY_MEMORY_RESERVATION', 'mgmt_federation_proxy_memory_reservation'],
+               ['MANAGEMENT_A_MEMORY_RESERVATION', 'mgmt_management_memory_reservation'],
+               ['TRAEFIK_MEMORY_RESERVATION', 'mgmt_traefik_memory_reservation'],
+               ['KRATOS_MEMORY', 'mgmt_kratos_memory'],
+               ['KRATOS_MEMORY_RESERVATION', 'mgmt_kratos_memory_reservation'],
+               ['HYDRA_MEMORY', 'mgmt_hydra_memory'],
+               ['HYDRA_MEMORY_RESERVATION', 'mgmt_hydra_memory_reservation'],
+               ['SELFSERVICE_UI_MEMORY', 'mgmt_selfservice_ui_memory'],
+               ['SELFSERVICE_UI_MEMORY_RESERVATION', 'mgmt_selfservice_ui_memory_reservation'],
+               ['ADMIT_AUDIT_MEMORY', 'mgmt_admit_audit_memory'],
+               ['ADMIT_AUDIT_MEMORY_RESERVATION', 'mgmt_admit_audit_memory_reservation'],
+               ['DASHBOARD_ADMIN_MEMORY', 'mgmt_dashboard_admin_memory'],
+               ['OAUTH2_PROXY_DASHBOARD_ADMIN_MEMORY', 'mgmt_oauth2_proxy_dashboard_admin_memory'],
+               ['PROMETHEUS_MEMORY', 'mgmt_prometheus_memory'],
+               ['PROMETHEUS_MEMORY_RESERVATION', 'mgmt_prometheus_memory_reservation'],
+               ['ALERTMANAGER_MEMORY', 'mgmt_alertmanager_memory'],
+               ['ALERTMANAGER_MEMORY_RESERVATION', 'mgmt_alertmanager_memory_reservation'],
+               ['NODE_EXPORTER_MEMORY', 'mgmt_node_exporter_memory'],
+               ['NODE_EXPORTER_MEMORY_RESERVATION', 'mgmt_node_exporter_memory_reservation'],
+               ['POSTGRES_EXPORTER_MEMORY', 'mgmt_postgres_exporter_memory'],
+               ['POSTGRES_EXPORTER_MEMORY_RESERVATION', 'mgmt_postgres_exporter_memory_reservation'],
+             ] %}
+          {% if lookup('vars', _v, default='') | string | length > 0 %}
+          {{ _k }}={{ lookup('vars', _v) }}
+          {% endif %}
+          {% endfor %}
           {# Signal-server federation peers (full mesh among multi-site fleet). #}
           {# Per-host selection by router_role; each Orin federates to all other #}
           {# sites' signal-servers via wg-cp0 IPs. Empty string = standalone. #}
@@ -578,6 +662,14 @@
           {% if _mgmt_acme_overlay.stat.exists %}-f docker-compose.acme.yml{% endif %}
           up -d
         chdir: "{{ compose_dir }}"
+      changed_when: true
+
+    # compose recreates management-a when its definition changes, not when a
+    # mounted file does; a new or changed CA file needs the process restarted.
+    - name: Restart management-a after its trusted CA files changed
+      ansible.builtin.command:
+        cmd: docker restart management-a
+      when: _mgmt_trust_certs is changed
       changed_when: true
 
     # =====================================================================

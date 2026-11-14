@@ -112,7 +112,10 @@ after its wave, and the message names every failed step and its log.
 
 The bot step in phase 12 used to stop the run so a person could export
 `FORGEJO_PUBSUB_TOKEN` and resume. It now reads the token from the operator's
-envrc with `ops/scripts/envrc-var.sh` and continues. `goatbuilder` does the same.
+envrc with `ops/scripts/envrc-var.sh` and continues. `goatbuilder` does the same,
+and keeps the token as the run's own state (`RunState` in `crates/goatbuilder/src/standup.rs`):
+only the phases that read it, the mint step and the mirror play, receive it, and
+every other phase child is started without it (built).
 
 ### Phase 8 enrolment as a scripted step (sink 3)
 
@@ -257,3 +260,7 @@ cat ~/.goat/state/standup-<site>-timings.tsv
 
 Record the total and the per-phase rows as a measurement. The slowest three
 phases are the next three levers.
+
+What is inside the clock and before it, how phase 11 is timed on its own, and
+what a measurement records are in
+[goatbuilder-hardware-measurement.md](goatbuilder-hardware-measurement.md).

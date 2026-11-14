@@ -30,3 +30,17 @@ In scope: the code in this repository and the images and release artifacts built
 ## Supported versions
 
 Pre-1.0, the latest tagged release of each component is supported. Fixes land on `main` and are released by tag.
+
+## Advance notice for operators of goat deployments
+
+Registered members of the goat user community can receive advance notice of a vulnerability before its public advisory. A recipient receives, privately, the advisory text, the fix as a patch, and fixed images and binaries built from it, so the deployments they operate are patched by the time the advisory is published.
+
+**When it is used.** Only for a vulnerability in this repository's own code that is not already public or easily discoverable, and only once a fix exists. A vulnerability in a dependency that already has a public advisory is handled in the open, through the normal dependency update.
+
+**Timing.** The advance-notice window sits inside the coordinated disclosure date agreed with the reporter and never moves that date. It is 7 days from the notice by default, may be extended once to 14 days, and always ends at the agreed disclosure date or earlier. The advisory is published at once, ending the window, if the vulnerability is found being exploited, becomes public, or is disclosed by anyone who received notice.
+
+**What a recipient may do during the window.** Deploy the fix to the deployments they operate, and share the notice with the people who operate them. They may not discuss the vulnerability publicly, publish the patch or the fixed artifacts, or share them with anyone outside those deployments.
+
+**Who receives notice.** Registered members of the goat user community. A registered member is a person who has completed onboarding to one of the community environments the goat maintainers operate, whose registration is current, and who has linked a GitHub account to that registration. There may be several community environments, each serving a different user community; registration in any one of them qualifies. Registration is the admission: there is no separate application.
+
+To link your GitHub account, add your GitHub username to your registration in your community environment's identity service, when you register or at any time afterwards. Registered members are given read access to a private repository, from which notices, patches and fixed artifacts are distributed, and receive each notice by e-mail. Access ends when the registration ends.

@@ -214,6 +214,85 @@ def check_rescue_nodes(values, group):
                  f"what covers this site instead, or what is on order (ADR 1183)")
 
 
+def _mgmt_hosts_children(inv):
+    """The group names listed under [mgmt_hosts:children] in `inv`, or None
+    when the file or the section is absent."""
+    if not inv.is_file():
+        return None
+    out, inside, seen = set(), False, False
+    for line in inv.read_text().splitlines():
+        st = line.split("#", 1)[0].split(";", 1)[0].strip()
+        if st.startswith("["):
+            inside = st == "[mgmt_hosts:children]"
+            seen = seen or inside
+            continue
+        if inside and st:
+            out.add(st.split()[0])
+    return out if seen else None
+
+
+def check_mgmt_hosts_membership(group, v):
+    """[Spock discovery] Every inter-site Spock role finds its peers by walking
+    groups['mgmt_hosts'] (roles/spock-mesh-peering). A management-stack group
+    that is not a child of [mgmt_hosts:children] in inventory/mgmt-hosts.ini is
+    invisible to that walk: a founder missing from it leaves every joiner with
+    zero peers. Checked for this group and the groups it federates with (its
+    join_founder_site and inter_site_spock_peers), each that runs the
+    management stack (mgmt_stack_profile: full, or has_mgmt_api: true)."""
+    inv = REPO / "ops" / "ansible" / "inventory" / "mgmt-hosts.ini"
+    names = [group]
+    founder = str(v.get("join_founder_site") or "").strip()
+    peers = v.get("inter_site_spock_peers") or []
+    for site in ([founder] if founder else []) + [str(p) for p in peers if isinstance(p, str)]:
+        if "{{" in site:
+            continue
+        g = site.replace("-", "_") + "_hosts"
+        if g not in names:
+            names.append(g)
+    needs = []
+    for g in names:
+        gv = v if g == group else (load_group(g)[0] if (GV / g).is_dir() else None)
+        if gv is None:
+            continue
+        if str(gv.get("mgmt_stack_profile", "")).strip() == "full" or gv.get("has_mgmt_api") is True:
+            needs.append(g)
+    if not needs:
+        return
+    children = _mgmt_hosts_children(inv)
+    if children is None:
+        fail(f"[mgmt_hosts] inventory/mgmt-hosts.ini has no "
+             f"[mgmt_hosts:children] section — Spock peer discovery walks groups['mgmt_hosts'] "
+             f"and would find none of {', '.join(needs)}. Add the section listing every "
+             f"management-stack group.")
+        return
+    for g in needs:
+        if g not in children:
+            fail(f"[mgmt_hosts] {g} runs the management stack but is not a child of "
+                 f"[mgmt_hosts:children] in inventory/mgmt-hosts.ini — Spock peer discovery "
+                 f"walks groups['mgmt_hosts'], so every site federating with it sees zero "
+                 f"peers. Add the line `{g}` under [mgmt_hosts:children].")
+
+
+# A mesh address is known only once the node has enrolled (join-node phase 10),
+# so its placeholder is the one TBD_ sentinel a run before enrolment expects.
+MESH_PLACEHOLDER = re.compile(r"TBD_[A-Z0-9_]*MESH_IP[A-Z0-9_]*")
+
+
+def check_tbd_sentinels(raw, before_enrolment=False):
+    """[P1] TBD_ sentinels — the runbook's own first-boot gate, surfaced early.
+
+    With before_enrolment, a mesh-address placeholder (TBD_<...>MESH_IP<...>)
+    is a WARN, not a FAIL: join-node's phases 3 and 7 run before the node has
+    a mesh address, and phase 12 runs this check again without the flag, after
+    the address is filled. Every other sentinel fails either way."""
+    for m in sorted(set(re.findall(r"TBD_[A-Z0-9_]+", raw))):
+        if before_enrolment and MESH_PLACEHOLDER.fullmatch(m):
+            warn(f"mesh-address placeholder {m}: allowed before enrolment; "
+                 "join-node phase 12 fails on it once the node has enrolled")
+        else:
+            fail(f"TBD sentinel still present: {m}")
+
+
 def load_group(group):
     d = GV / group
     if not d.is_dir():
@@ -514,6 +593,10 @@ def main():
     ap.add_argument("--scaffold-from", metavar="GROUP",
                     help="reference group for --scaffold and --scaffold-plan "
                          "(default: the parity manifest's `reference`)")
+    ap.add_argument("--before-enrolment", action="store_true",
+                    help="the node has not enrolled yet: a mesh-address "
+                         "placeholder (TBD_..MESH_IP..) is a warning, not a "
+                         "failure (join-node phases 3 and 7)")
     ap.add_argument("--force", action="store_true",
                     help="overwrite files that already exist")
     ap.add_argument("--scaffold-plan", action="store_true",
@@ -531,6 +614,9 @@ def main():
 
     # [30/32] the config surface is a FILE SET, not one vars.yml
     check_file_inventory(args.group)
+
+    # [Spock discovery] management-stack groups are children of mgmt_hosts
+    check_mgmt_hosts_membership(args.group, v)
 
     # [ADR 1183] the two rescue classes are declared, or their absence is
     check_rescue_nodes(v, args.group)
@@ -558,8 +644,7 @@ def main():
                          f"use its own relays from ops/relay/health/relays*.conf)")
 
     # [P1] TBD_ sentinels — the runbook's own first-boot gate, surfaced early.
-    for m in sorted(set(re.findall(r"TBD_[A-Z0-9_]+", raw))):
-        fail(f"TBD sentinel still present: {m}")
+    check_tbd_sentinels(raw, args.before_enrolment)
 
     # [16] sidecar owns 127.0.0.1:8080 — every goatnet must override.
     if "mgmt_container_host_port" not in v:

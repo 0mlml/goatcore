@@ -81,11 +81,20 @@ portal_release_sets_path: "{{ portal_data_dir }}/release-sets.yaml"
 #       prefix: release/REL-ALL/   # optional, defaults to release/<set>/
 #       members: []                # org ids; optional, defaults to []
 # Non-empty => the role renders portal_release_sets_path from this list
-# (templates/release-sets.yaml.j2). Empty => the role copies the generic
+# (templates/release-sets.yaml.j2). Empty => the deploy STOPS, unless
+# portal_release_sets_use_example says to install the example registry
 # ops/permissions/release-sets.yaml. List every lane the goatnet's
 # zenoh_release_writers / zenoh_partner_read_lanes / zenoh_partner_slot_blocks
 # name, or the COP will not show it.
 portal_release_sets: []
+
+# true installs the example registry ops/permissions/release-sets.yaml (the
+# example goatnet's sets) when portal_release_sets is empty. True by default
+# only on the example goatnet (zagros, zagros-*), which keeps the committed
+# file; a learning box sets it on purpose. Anywhere else an empty
+# portal_release_sets fails the deploy (tasks/release-sets-guard.yml) rather
+# than showing another goatnet's release lanes as this one's.
+portal_release_sets_use_example: "{{ (site_id | default('')) is match('^zagros(-|$)') }}"
 
 # ADR 1138 portal half — the pre-cut partner slot blocks, RENDERED FROM THE SAME
 # group_var the router reads (`zenoh_partner_slot_blocks`). One fact, one home:
@@ -154,6 +163,11 @@ portal_slot_pool_size: 0
 # pre-cuts a store per pool slot). See zenoh-storage-taxonomy-sharding.md.
 portal_lazy_slot_storage: false
 
+# Concurrent /api/topics/stream connections one org or slot key may hold
+# (operators are exempt). Empty leaves the portal's built-in default (8); set a
+# number to raise it where people share one org key, or 0 to turn the cap off.
+portal_max_streams_per_principal: ""
+
 # Path to the live zenohd config.json5 (bind-mounted r/w into the
 # portal container). The zenoh role renders this file under its per-stack
 # /etc/<zenoh_stack> dir with BEGIN/END markers the portal edits between
@@ -203,9 +217,16 @@ portal_ca_key_src: "{{ goat_controller_state_dir | default(lookup('env', 'HOME')
 portal_age_identity_src: "{{ lookup('env', 'HOME') }}/.config/age/keys.txt"
 portal_age_identity_path: "/etc/{{ site_id }}-age/keys.txt"   # a shared role must not name a goatnet
 portal_ca_root_cert: "/etc/{{ site_id }}-ca/root-cert.pem"   # a shared role must not name a goatnet
-# The portal flag that takes portal_ca_root_cert. A goatnet whose pinned image
-# predates --ca-root-cert sets the flag that image reads.
-portal_ca_root_cert_flag: "--ca-root-cert"
+# The portal flag that takes portal_ca_root_cert. One flag, or a list of
+# candidates: the role then passes the first one the pinned image's `serve -h`
+# defines, so an overlay whose goatnets run images from different source trees
+# lists every name once (neutral first) and a pin move needs no flag change.
+# Both names by default: the pinned image (ops/pins/fleet-pins.yaml) predates
+# the neutral --ca-root-cert and defines only the legacy -nova-root-cert, which
+# the source still accepts; a string here refused every standup on that pin.
+# `nova` here is the legacy flag's name, not a goatnet's, so
+# ops/ci/goatnet-defaults.allow exempts this variable.
+portal_ca_root_cert_flag: ["--ca-root-cert", "--nova-root-cert"]
 portal_onboarding_packet_path: "/etc/goat-zenoh-portal/zenoh-trial-onboarding.md"
 portal_cert_sign_ca_id: ""   # REQUIRED per goatnet — a shared default
 # would sign certs for a new goatnet under ANOTHER goatnet's authority.
@@ -362,7 +383,9 @@ portal_intake_base_url: ""
 portal_netbird_mgmt_url: "https://{{ site_dns_zone }}"
 portal_netbird_api_token_envvar: "{{ site_id | upper | replace('-', '_') }}_NB_API_TOKEN"
 # The name the token carries INSIDE the container (portal.env). A goatnet whose
-# pinned image predates PORTAL_NETBIRD_API_TOKEN sets the name that image reads.
+# pinned image predates PORTAL_NETBIRD_API_TOKEN sets the name that image reads,
+# or a list of names: portal.env then carries the token under each, and any of
+# the images reads its own.
 portal_netbird_api_token_env: "PORTAL_NETBIRD_API_TOKEN"
 # Where the NetBird management hostname in portal_netbird_mgmt_url points INSIDE the container.
 # On a mgmt host `mesh-coredns` pins that name to 127.0.0.1 in /etc/hosts, and

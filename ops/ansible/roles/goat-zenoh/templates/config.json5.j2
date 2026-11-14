@@ -96,31 +96,6 @@
 {% endif %}
     ],
   },
-{% for _p in (zenoh_sovereign_peerings | default([])) %}
-      // Sovereign peering: {{ _p.sovereign }} (ADR 1157). INGRESS WRITE ONLY,
-      // confined to that sovereign's own prefix. There is deliberately NO read
-      // rule here -- a sovereign reads only what an explicit release rule grants,
-      // so the default for a new peering is "may send us data, may see nothing".
-      {
-        id: "sovereign-{{ _p.sovereign }}-w",
-        messages: ["put", "delete"],
-        flows: ["ingress"],
-        permission: "allow",
-        key_exprs: ["from/{{ _p.sovereign }}/**"],
-      },
-{% if (_p.release_key_exprs | default([])) | length > 0 %}
-      // Declared release set for {{ _p.sovereign }}: EGRESS only, and only the
-      // prefixes named in the peering declaration. Never a wildcard -- a release
-      // set is a decision, and a wildcard is the absence of one.
-      {
-        id: "sovereign-{{ _p.sovereign }}-r",
-        messages: ["declare_subscriber", "query", "reply", "declare_liveliness_subscriber", "liveliness_query"],
-        flows: ["egress"],
-        permission: "allow",
-        key_exprs: [{% for _k in _p.release_key_exprs %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
-      },
-{% endif %}
-{% endfor %}
 {% if goat_zenoh_connect_endpoints | default([]) | length > 0 %}
 
   // Outbound router-to-router federation (ADR 0844 topology + ADR 1020 canonical
@@ -353,15 +328,19 @@
         // delivered to live subscribers, and then gone -- a later query answers
         // EMPTY and nobody can audit what a partner actually sent.
         //
-        // Its own store rather than a carve-out of another, for two reasons.
-        // Partner data is the one class we did not generate and may be obliged
-        // to delete on request or on peering termination, and its retention is a
-        // different decision from ours (zenoh_from_retention_days).
-        sovereign_from: {
-          key_expr: "from/**",
+        // One store per partner and nothing shared (ADR 1234). Partner data is
+        // the one class we did not generate; its retention is its own decision
+        // (zenoh_from_retention_days, the same for every partner), and when a
+        // peering ends its store is dropped whole. Each store's interest also
+        // fits that partner's edge grant, which a from/** interest does not.
+        // The shared store on from/** that earlier releases rendered is gone:
+        // it held every partner's samples a second time.
+{% for _p in zenoh_sovereign_peerings %}
+        "sovereign_from_{{ _p.sovereign }}": {
+          key_expr: "from/{{ _p.sovereign }}/**",
           volume: {
             id: "rocksdb",
-            dir: "{{ goat_zenoh_storage_path }}/sovereign_from",
+            dir: "{{ goat_zenoh_storage_path }}/sovereign_from_{{ _p.sovereign }}",
             on_closure: "do_nothing",
             create_db: true,
             db_recovery_enabled: false,
@@ -369,6 +348,7 @@
           garbage_collect_period: 86400,
           time_to_live: {{ zenoh_from_retention_days | int * 86400 * 1000 }},
         },
+{% endfor %}
 {% endif %}
 {% if goat_zenoh_legacy_system_namespace | default(false) | bool %}
         // DEPRECATED operator namespace (ADR 1035) — only rendered for an
@@ -430,6 +410,26 @@
           garbage_collect_period: 86400,
           time_to_live: {{ goat_zenoh_audit_retention_days | int * 86400 * 1000 }},
         },
+{% if zenoh_founder_cn | default('') %}
+
+        // A goatlite founder's own space (goatlite.md §8). founder/** is the
+        // one prefix a goatlite person writes (the founder-w ACL rule below),
+        // so it is stored like every other writable prefix: retained for the
+        // fabric window and queryable, which is what `goat pub --confirm`
+        // reads back. Rendered only where zenoh_founder_cn is set.
+        founder: {
+          key_expr: "founder/**",
+          volume: {
+            id: "rocksdb",
+            dir: "{{ goat_zenoh_storage_path }}/founder",
+            on_closure: "do_nothing",
+            create_db: true,
+            db_recovery_enabled: false,
+          },
+          garbage_collect_period: 86400,
+          time_to_live: {{ goat_zenoh_retention_days | int * 86400 * 1000 }},
+        },
+{% endif %}
 
 {% if zenoh_identity_model == 'per-uuid-slot-pool' %}
 {% if zenoh_lazy_slot_storage | default(false) | bool %}
@@ -574,6 +574,83 @@
     enabled: true,
     default_permission: "deny",
     rules: [
+{% for _p in (zenoh_sovereign_peerings | default([])) %}
+      // Sovereign peering: {{ _p.sovereign }} (ADR 1157). The same four rules
+      // `goat federate apply` renders into ops/federation/acl/<them>-fragment.json5,
+      // so a core configured from this role and one spliced from the fragment
+      // carry one grant. DATA FLOWS ONE WAY PER KEY SET AND INTEREST THE OTHER:
+      // the edge writes into `from/<sov>/**` and we send it our subscriber
+      // declaration for it; it reads the declared release set and its
+      // declaration for that set arrives here as ingress.
+      {
+        id: "sovereign-{{ _p.sovereign }}-w",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: ["from/{{ _p.sovereign }}/**"],
+      },
+      {
+        id: "sovereign-{{ _p.sovereign }}-w-interest",
+        messages: ["declare_subscriber", "query", "declare_queryable"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: ["from/{{ _p.sovereign }}/**"],
+      },
+{% if (_p.release_key_exprs | default([])) | length > 0 %}
+      // What {{ _p.sovereign }} may READ from us: our wire name `from/<us>/**`,
+      // never a `release/**` staging name and never a wildcard. `put` and
+      // `delete` are here because delivering a sample to a subscriber IS an
+      // egress put from the router's side.
+      {
+        id: "sovereign-{{ _p.sovereign }}-r",
+        messages: ["put", "delete", "declare_subscriber", "query", "reply", "declare_liveliness_subscriber", "liveliness_query"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [{% for _k in _p.release_key_exprs %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+      {
+        id: "sovereign-{{ _p.sovereign }}-r-interest",
+        messages: ["declare_subscriber", "query", "declare_queryable"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: [{% for _k in (_p.release_interest_key_exprs | default(_p.release_key_exprs, true)) %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+{% endif %}
+{% if (_p.republisher_cn | default('')) | length > 0 %}
+      // The outbound republisher for {{ _p.sovereign }} (ops/federation/republisher).
+      // It READS the offered release sets and WRITES our wire name, and is the
+      // only writer of `from/<us>/**` on this core. Both of its sessions dial
+      // this router; the edge then carries the wire name out on the -r rule above.
+      {
+        id: "sovereign-{{ _p.sovereign }}-rp-r",
+        messages: ["put", "delete", "declare_subscriber", "query", "reply"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [{% for _k in _p.republisher_release_key_exprs %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+      {
+        id: "sovereign-{{ _p.sovereign }}-rp-r-interest",
+        messages: ["declare_subscriber", "query", "declare_queryable"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: [{% for _k in _p.republisher_release_key_exprs %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+      {
+        id: "sovereign-{{ _p.sovereign }}-rp-w",
+        messages: ["put", "delete"],
+        flows: ["ingress"],
+        permission: "allow",
+        key_exprs: [{% for _k in _p.release_key_exprs %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+      {
+        id: "sovereign-{{ _p.sovereign }}-rp-w-interest",
+        messages: ["declare_subscriber", "query", "declare_queryable"],
+        flows: ["egress"],
+        permission: "allow",
+        key_exprs: [{% for _k in (_p.release_interest_key_exprs | default(_p.release_key_exprs, true)) %}"{{ _k }}"{% if not loop.last %}, {% endif %}{% endfor %}],
+      },
+{% endif %}
+{% endfor %}
       // Universal read — any CA-rooted peer subscribes /
       // queries any topic on the fabric. Wide-open reads per the
       // community-of-trust posture. Zenoh 1.x `messages:` variant set:
@@ -1556,6 +1633,13 @@
         id: "sovereign-{{ _p.sovereign }}",
         cert_common_names: ["{{ _p.cn }}"],
       },
+{% if (_p.republisher_cn | default('')) | length > 0 %}
+      // Its outbound republisher: our own CA, our own name, never the partner's.
+      {
+        id: "sovereign-{{ _p.sovereign }}-republisher",
+        cert_common_names: ["{{ _p.republisher_cn }}"],
+      },
+{% endif %}
 {% endfor %}
       // Fabric-health meter — operator-minted leaf carries
       // CN=fabric-health-trial-peer (ADR 1034 infra peer). Distinct from the
@@ -1794,7 +1878,11 @@
 {% endif %}
 {% for _p in (zenoh_sovereign_peerings | default([])) %}
       // {{ _p.sovereign }}: write into its own prefix{% if (_p.release_key_exprs | default([])) | length > 0 %}, read the declared release set{% else %}, read NOTHING{% endif %}.
-      { rules: [{% if (_p.release_key_exprs | default([])) | length > 0 %}"sovereign-{{ _p.sovereign }}-w", "sovereign-{{ _p.sovereign }}-r"{% else %}"sovereign-{{ _p.sovereign }}-w"{% endif %}], subjects: ["sovereign-{{ _p.sovereign }}"] },
+      { rules: ["sovereign-{{ _p.sovereign }}-w", "sovereign-{{ _p.sovereign }}-w-interest"{% if (_p.release_key_exprs | default([])) | length > 0 %}, "sovereign-{{ _p.sovereign }}-r", "sovereign-{{ _p.sovereign }}-r-interest"{% endif %}], subjects: ["sovereign-{{ _p.sovereign }}"] },
+{% if (_p.republisher_cn | default('')) | length > 0 %}
+      // {{ _p.sovereign }}'s republisher: read the offered release sets, write our wire name.
+      { rules: ["sovereign-{{ _p.sovereign }}-rp-r", "sovereign-{{ _p.sovereign }}-rp-r-interest", "sovereign-{{ _p.sovereign }}-rp-w", "sovereign-{{ _p.sovereign }}-rp-w-interest"], subjects: ["sovereign-{{ _p.sovereign }}-republisher"] },
+{% endif %}
 {% endfor %}
 
       // Audit subscriber: read + receive deliveries on ** so it persists

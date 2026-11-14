@@ -1,4 +1,6 @@
 # Role: rust-build (build argument BASE_RUST_BUILD). The Rust build stage. Pair it with runtime-cc: a binary runs only on a runtime whose glibc is at least the builder's.
-# Public default: an image anyone may pull and redistribute. An overlay replaces
-# this file to build on other bases; goatcore docs/operations/build-on-your-own-base-images.md.
-FROM docker.io/library/rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2
+# Public default: Chainguard's free image, pulled anonymously and pinned by
+# digest (the free catalogue tags only latest; Dependabot moves the digest).
+# An overlay replaces this file to build on other bases, such as a private
+# Chainguard catalogue: goatcore docs/operations/build-on-your-own-base-images.md.
+FROM cgr.dev/chainguard/rust:latest-dev@sha256:bb029397076cc17b3a96b4d5183b4c362d8323a6d36394c71a21e8e5706664af

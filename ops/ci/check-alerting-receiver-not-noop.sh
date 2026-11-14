@@ -4,8 +4,8 @@
 #
 # THE COUPLED FACTS: an obs host runs Prometheus + Alertmanager ("alerting is
 # on"), but every route in the rendered alertmanager.yml can resolve to the
-# always-defined `webhook-noop` receiver, which POSTs to localhost:9999/noop
-# and drops it — alerts fire, reach Alertmanager, and reach NOBODY. The
+# always-defined `webhook-noop` receiver, which has no integrations and
+# drops every alert — alerts fire, reach Alertmanager, and reach NOBODY. The
 # fall-through lives in roles/obs-host/templates/alertmanager.yml.j2 (and its
 # twin roles/observability/templates/alertmanager.yml.j2):
 #
@@ -188,7 +188,7 @@ for scope, keys in sorted(scopes().items()):
         print(f"      ({' / '.join(CRITICAL_KEYS)} all absent or literally empty; role defaults are \"\",")
         print( "      roles/obs-host/defaults/main.yml:58-72). The rendered critical route resolves to")
         print( "      webhook-noop with static certainty — alerts fire, reach Alertmanager, reach nobody")
-        print( ". Declare at")
+        print( "      (amtool config routes test severity=critical -> webhook-noop). Declare at")
         print( "      least one vendor receiver var for this scope.")
         fail = 1
     else:
@@ -207,7 +207,7 @@ for scope, keys in sorted(scopes().items()):
         else:
             print(f"FAIL: group_vars/{scope}: obs-host scope with no {DEADMAN_KEY} declared — the Watchdog")
             print( "      route renders webhook-noop, making the dead-man's switch decorative: a dead")
-            print( "      Prometheus stops the heartbeat and no external watcher ever notices
+            print( "      Prometheus stops the heartbeat and no external watcher ever notices (the")
             print( "      acceptance row deadman-switch-has-external-receiver is the runtime twin of this")
             print( "      check). Wire an off-host absence-watcher endpoint.")
             fail = 1

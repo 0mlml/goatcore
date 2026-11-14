@@ -10,8 +10,8 @@
 # the ordering, executable and inspectable.
 #
 # Same shape as ops/scripts/goat-standup.sh on purpose: numbered phases, a kind
-# per phase, --plan, --from/--to, every phase idempotent. Someone who has run one
-# has effectively run the other. See docs/design/staged-delivery-pattern.md.
+# per phase, --plan and --from/--to for controlled resumption. Someone who has run one
+# has effectively run the other. See https://github.com/usareur-af/goatdocs/blob/main/docs/design/staged-delivery-pattern.md.
 #
 # Usage:
 #   ops/scripts/peering-standup.sh <peering-name> [--plan] [--from N] [--to N]
@@ -20,30 +20,55 @@
 #                   execute NOTHING. Offline-safe; start here, always.
 #     --from/--to   run a sub-range — resume after a manual step, or after a
 #                   failed phase once its cause is fixed. Every phase is
-#                   idempotent, so re-running from the failed number is safe.
+#                   resumable; inspect its inputs and end state before re-running.
 #     --as          which party we are (default: read from the declaration)
 #     --edge-group  the ansible group the edge runs in (default: <peering>_edge)
 #
+#   The outbound republisher runs on our core host, the host the edge dials, in
+#   the inventory group <peering>_core (a child of [peering_cores]).
+#
 #   Environment:
 #     GOAT_BIN            the goat binary (default: whatever is on PATH)
+#     FED_VERBS           who runs the federation verbs of phases 3, 4, 6, 7 and 9:
+#                         `goatbuilder` (the default: `$GOATBUILDER_BIN federate <verb>`)
+#                         or `goat` (`$GOAT_BIN federate <verb>`, the same library,
+#                         flags and exit codes)
+#     GOATBUILDER_BIN     the goatbuilder binary (default: whatever is on PATH)
+#     FED_MEASURE         where phase 3 measures: `ssh` (the default:
+#                         `$GOATBUILDER_BIN federate init --over-ssh`, the hosts of
+#                         <peering>_edge and <peering>_core over SSH, as the plays
+#                         reach them; nothing is copied to either host) or `here`
+#                         (the host this runs on, and the core router through
+#                         FED_ROUTER_DOCKER_HOST, with whoever FED_VERBS names)
+#     FED_DECLARATION     the peering's own federation.toml for phase 3 (default: the
+#                         goat context's federation.toml). goatbuilder sets it to
+#                         ops/federation/<env>/peerings/<peering>/federation.toml when
+#                         `goatbuilder federate allocate` generated that file
 #     FED_WORK            working directory (default: /var/lib/goat-federation/<peering>)
 #     FED_COUNTERPARTY    path to the counterparty's package (phase 6 needs it)
-#     FED_SIGNING_KEY     our Ed25519 signing key (64 hex or 44 base64)
-#     FED_ROUTER_DOCKER_HOST  DOCKER_HOST for phase 3 when the core router is not on
+#     FED_SIGNING_KEY     the path to our Ed25519 signing key file (the file holds
+#                         64 hex or 44 base64 characters); never the key itself
+#     FED_ROUTER_DOCKER_HOST  with FED_MEASURE=here: DOCKER_HOST for phase 3 when the core router is not on
 #                         this host, e.g. ssh://<user>@<core>. `init` reads the
 #                         federation interface here and the running router there; the
 #                         edge must not share a machine with the core.
+#     FED_ROUTER_CONTAINER  optional exported core container name or ID for phase 3;
+#                         unset, init discovers a running core by role label or
+#                         standard/legacy name. Multiple candidates refuse.
 #     GOAT_AWS_PROFILE    aws-vault profile the ansible phases run under
-#     FED_DIRECTORY_URL   optional: a peering directory (saltlick). Set, phase 5
-#                         publishes our pointer, looks up the counterparty's,
-#                         fetches their package and prints a compatibility report
-#                         before it stops. Advisory: a directory failure is a
-#                         warning. Unset, phase 5 is unchanged.
+#     FED_DIRECTORY_URL   the peering directory (saltlick), required unless
+#                         FED_NO_DIRECTORY=1. Phase 5 uploads our package and CA,
+#                         publishes our pointer, fetches the counterparty's package
+#                         and CA, and prints both keys and CA fingerprints and a
+#                         compatibility report before it stops. It grants nothing:
+#                         compose checks their package against the key read aloud.
+#     FED_NO_DIRECTORY    1 only for a counterparty that can reach no directory;
+#                         phase 5 then names the files to hand over directly
 #     FED_PACKAGE_URL     optional: where our own public host serves our package
 #                         (https, a static file). Unset, phase 5 uploads our
 #                         package to the directory and the pointer names that, so
 #                         a party behind NAT needs no public host
-#     FED_CA_CERT         our own CA certificate (PEM), the one phase 8 signs the
+#     FED_CA_CERT         the path to our own CA certificate (PEM), the one phase 8 signs the
 #                         peering leaves with; phase 5 uploads it to the directory
 #                         (unset there, the profile's ca-roots.pem). Only the
 #                         certificate whose SHA-256 is our identity.ca_fingerprint
@@ -52,10 +77,9 @@
 #                         fetches their package and CA (to $FED_WORK/theirs-ca.pem)
 #
 # WHAT THIS DOES NOT DO. It never trusts anything from the counterparty on its
-# own. The two exchanges — our package and CA out, theirs in — are phase 5, either
-# through the directory or by a channel the two parties choose, and phase 5 is
-# MANUAL by design: the corroboration (reading the key and CA fingerprint aloud)
-# is theirs to perform.
+# own. The two exchanges — our package and CA out, theirs in — are phase 5, through
+# the directory, and phase 5 stops for the one act a machine cannot do: reading
+# the verifying key and CA fingerprint aloud, and recording the key once read back.
 set -uo pipefail
 # Hold the Mac awake for the whole run (#2122; ops/scripts/lib/keep-awake.sh).
 _keep_awake="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/keep-awake.sh"
@@ -72,7 +96,7 @@ while [ $# -gt 0 ]; do
     --to)         TO="$2"; shift 2 ;;
     --as)         AS="$2"; shift 2 ;;
     --edge-group) EDGE_GROUP="$2"; shift 2 ;;
-    -h|--help)    sed -n '2,58p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '2,66p' "$0"; exit 0 ;;
     -*)           echo "unknown flag $1" >&2; exit 2 ;;
     *)            [ -z "$PEERING" ] && PEERING="$1"; shift ;;
   esac
@@ -80,6 +104,16 @@ done
 [ -n "$PEERING" ] || { echo "usage: peering-standup.sh <peering-name> [--plan] [--from N] [--to N]" >&2; exit 2; }
 
 : "${GOAT_BIN:=$(command -v goat || echo goat)}"
+: "${GOATBUILDER_BIN:=$(command -v goatbuilder || echo goatbuilder)}"
+case "${FED_VERBS:-goatbuilder}" in
+  goat)        FED_VERB="$GOAT_BIN federate" ;;
+  goatbuilder) FED_VERB="$GOATBUILDER_BIN federate" ;;
+  *) echo "peering-standup.sh: FED_VERBS is goat or goatbuilder, not '$FED_VERBS'" >&2; exit 2 ;;
+esac
+case "${FED_MEASURE:=ssh}" in
+  here|ssh) ;;
+  *) echo "peering-standup.sh: FED_MEASURE is here or ssh, not '$FED_MEASURE'" >&2; exit 2 ;;
+esac
 : "${FED_WORK:=/var/lib/goat-federation/$PEERING}"
 : "${FED_COUNTERPARTY:=$FED_WORK/theirs.canonical.json}"
 : "${FED_SIGNING_KEY:=}"
@@ -103,13 +137,48 @@ if [ -z "${GOAT_PROFILE_DIR:-}" ]; then
 fi
 export GOAT_PROFILE_DIR
 [ -n "$EDGE_GROUP" ] || EDGE_GROUP="${PEERING}_edge"
+# The core host the edge dials: the outbound republisher runs there, beside our
+# core router, and both of its sessions dial that router (phase 12).
+CORE_GROUP="${PEERING}_core"
+# Phase 14 reads our core and edge declarations by group (acceptance_surfaces.py).
+export FED_EDGE_GROUP="$EDGE_GROUP"
+: "${FED_CORE_GROUP:=$CORE_GROUP}"; export FED_CORE_GROUP
 
 # THE BOUND KEYS. `compose` refuses (exit 20) unless a verifying key is bound to
 # each party, and it will never take one from the package it verifies — a package
 # carrying its own key authenticates nothing. So the keys live in a file the
-# operator writes during phase 5, out of band, and phase 6 passes them.
+# operator writes during phase 5, after reading them aloud, and phase 6 passes them.
 : "${FED_KEYRING:=$FED_WORK/keys.txt}"
 OURS="$FED_WORK/ours.canonical.json"
+
+# OUR PARTY. Phases 7, 8, 9 and 14 always name it: without --as, the
+# declaration's sovereign_id, as the usage says, else our half's. Mint and
+# acceptance otherwise take the agreement's first party, which is us only when
+# we sort first. The same rule as the driver (crates/goatbuilder/src/federate/mod.rs
+# our_id): the goat context the verbs read is $GOAT_CONTEXT_DIR, else
+# $GOAT_PROFILE_DIR/contexts/<$GOAT_CONTEXT, else config.toml current_context,
+# else default>.
+our_id() {
+  local dir name id
+  dir="${GOAT_CONTEXT_DIR:-}"
+  if [ -z "$dir" ]; then
+    name="${GOAT_CONTEXT:-}"
+    if [ -z "$name" ] && [ -f "$GOAT_PROFILE_DIR/config.toml" ]; then
+      name="$(sed -n 's/^[[:space:]]*current_context[[:space:]]*=[[:space:]]*//p' "$GOAT_PROFILE_DIR/config.toml" | head -1 | sed 's/[[:space:]]*$//; s/^"//; s/"$//')"
+    fi
+    dir="$GOAT_PROFILE_DIR/contexts/${name:-default}"
+  fi
+  id=""
+  if [ -f "$dir/federation.toml" ]; then
+    id="$(python3 -c 'import sys, tomllib; print(str(tomllib.load(open(sys.argv[1], "rb")).get("sovereign_id", "")))' "$dir/federation.toml" 2>/dev/null || true)"
+  fi
+  if ! printf '%s' "$id" | grep -Eq '^[a-z0-9][a-z0-9-]{1,31}$'; then
+    id="$(python3 -c 'import sys, json; print(str(json.load(open(sys.argv[1])).get("sovereign_id", "")))' "$OURS" 2>/dev/null || true)"
+  fi
+  printf '%s' "$id" | grep -Eq '^[a-z0-9][a-z0-9-]{1,31}$' && printf '%s' "$id"
+  return 0
+}
+[ -n "$AS" ] || AS="$(our_id)"
 AGREEMENT="$FED_WORK/agreement.json"
 APPLIED="$FED_WORK/applied"
 PKI="$FED_WORK/pki"
@@ -123,8 +192,8 @@ step() {   # step <n> <kind> <label> <command...>
   [ "$PLAN" = 1 ] && return 0
   case "$kind" in
     MANUAL)
-      # The optional directory step runs inside phase 5, before the stop. It is
-      # advisory, so its exit status is never read.
+      # The directory step runs inside phase 5, before the stop. It is advisory:
+      # compose is the check, so its exit status is never read.
       if [ "$n" = 5 ] && [ -n "$DIRECTORY_STEP" ]; then
         python3 "$REPO/ops/federation/standup/directory.py" --url "$FED_DIRECTORY_URL" --ours "$OURS" \
           ${FED_PACKAGE_URL:+--package-url "$FED_PACKAGE_URL"} ${FED_SIGNING_KEY:+--key "$FED_SIGNING_KEY"} \
@@ -151,10 +220,14 @@ step() {   # step <n> <kind> <label> <command...>
        1. Read the error above. \`goat federate\` exit codes are specific:
             20 composition refused   21 lint refused
             22 diff refused          23 a value could not be derived
+          Phase 14 (acceptance) exits 3 when a required check was BLOCKED or
+          skipped: nothing was proven by it (catalog X-ACCEPT-001); exit 2
+          when the agreement or the evidence bundle could not be read or
+          written.
        2. Open docs/operations/sovereign-federation-runbook.md — the phase
           table names this phase's "worked when" (the end state you are
           aiming for), and Steps 7 and 8 are the acceptance criteria.
-       3. Fix the cause, then resume — every phase is idempotent:
+       3. Fix the cause, check the inputs and current state, then resume:
             ops/scripts/peering-standup.sh $PEERING --from $n
 RECOVER
         exit "$rc"
@@ -169,8 +242,12 @@ echo "peering-standup: peering=$PEERING  work=$FED_WORK  edge-group=$EDGE_GROUP 
 
 # Every ansible phase, one shape. The generated vars and the two exchanged files
 # reach the plays through these, so a phase cannot read an older run's copy.
+# This peering's own inventory file (goatbuilder federate allocate, when not every
+# peering declares hosts:), read beside the hand-written one.
+MORE_INV=""
+[ -f "$REPO/ops/ansible/inventory/peering-$EDGE_GROUP.ini" ] && MORE_INV=" -i inventory/peering-$EDGE_GROUP.ini"
 play() {
-  printf "%s" "cd '$REPO/ops/ansible' && OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/with-aws $GOAT_AWS_PROFILE -- ../scripts/ansible-preflight.sh -i inventory/peering-edges.ini --limit '$EDGE_GROUP' -e fed_edge_group='$EDGE_GROUP' -e fed_work='$FED_WORK' -e fed_counterparty='$FED_COUNTERPARTY' $1"
+  printf "%s" "cd '$REPO/ops/ansible' && OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ../scripts/with-aws $GOAT_AWS_PROFILE -- ../scripts/ansible-preflight.sh -i inventory/peering-edges.ini$MORE_INV --limit '${2:-$EDGE_GROUP}' -e fed_edge_group='$EDGE_GROUP' -e fed_work='$FED_WORK' -e fed_counterparty='$FED_COUNTERPARTY' $1"
 }
 
 # ---------------------------------------------------------------------------
@@ -195,19 +272,38 @@ step 2 A "prepare what the package measures: the federation interface and the SP
 # Phase 3 — OUR HALF, MEASURED. Exit 23 means a value could not be derived and init
 #     refused to invent it; the list of what is missing IS the output.
 # ---------------------------------------------------------------------------
-step 3 T "init — our half, read from the running system" \
-  "${FED_ROUTER_DOCKER_HOST:+DOCKER_HOST='$FED_ROUTER_DOCKER_HOST' }$GOAT_BIN federate init --with-transport --with-data ${FED_SIGNING_KEY:+--signing-key '$FED_SIGNING_KEY' }--out '$OURS'"
+#     By default (FED_MEASURE=ssh) the edge and the core are measured over SSH from
+#     this machine (goatbuilder federate init --over-ssh); only goatbuilder can, so
+#     phase 3 runs goatbuilder whoever runs the other verbs, and
+#     FED_ROUTER_DOCKER_HOST is not used. FED_MEASURE=here measures this host.
+#     FED_DECLARATION names the peering's own federation.toml for init to read
+#     (goatbuilder derives it when allocate generated one); unset, init reads the
+#     goat context's.
+case "${FED_DECLARATION:-}" in *"'"*)
+  echo "peering-standup.sh: FED_DECLARATION holds a quote: '$FED_DECLARATION'" >&2; exit 2 ;;
+esac
+if [ "$FED_MEASURE" = ssh ]; then
+  # Each value below is pasted into a command that step evaluates.
+  for v in "$PEERING" "$EDGE_GROUP" "${FED_ROUTER_CONTAINER:-x}"; do
+    case "$v" in ''|-*|*[!A-Za-z0-9_.-]*)
+      echo "peering-standup.sh: FED_MEASURE=ssh: '$v' is not an inventory or container name" >&2; exit 2 ;;
+    esac
+  done
+  step 3 T "init — our half, read from the running system" \
+    "$GOATBUILDER_BIN federate init --with-transport --with-data ${FED_SIGNING_KEY:+--signing-key '$FED_SIGNING_KEY' }${FED_DECLARATION:+--declaration '$FED_DECLARATION' }--out '$OURS' --over-ssh '$PEERING' --ssh-edge-group '$EDGE_GROUP' ${FED_ROUTER_CONTAINER:+--router-container '$FED_ROUTER_CONTAINER' }--repo '$REPO'"
+else
+  step 3 T "init — our half, read from the running system" \
+    "${FED_ROUTER_DOCKER_HOST:+DOCKER_HOST='$FED_ROUTER_DOCKER_HOST' }$FED_VERB init --with-transport --with-data ${FED_SIGNING_KEY:+--signing-key '$FED_SIGNING_KEY' }${FED_DECLARATION:+--declaration '$FED_DECLARATION' }--out '$OURS'"
+fi
 
 step 4 T "lint our package against the spec" \
-  "$GOAT_BIN federate lint '$OURS'"
+  "$FED_VERB lint '$OURS'"
 
 # ---------------------------------------------------------------------------
-# Phase 5 — THE EXCHANGE, and it stops for a person on purpose: the counterparty's
-#     verifying key is bound over a channel authenticated INDEPENDENTLY of this
-#     link — never taken from the package, never from a directory.
-#     With FED_DIRECTORY_URL set, the phase first runs the optional directory step
-#     (ops/federation/standup/directory.py): the directory holds pointers, not
-#     permissions, and is never an input to compose's check.
+# Phase 5 — THE EXCHANGE, through the directory (ops/federation/standup/directory.py),
+#     then a stop for a person: the counterparty's verifying key is bound by reading
+#     it aloud — never taken from the package, never from the directory, which
+#     holds pointers, not permissions, and is never an input to compose's check.
 # ---------------------------------------------------------------------------
 # A value printed into the plan and passed to the helper: anything but plain URL
 # characters disables the step rather than reach a command line.
@@ -218,35 +314,45 @@ if [ -n "${FED_DIRECTORY_URL:-}" ]; then
     *) DIRECTORY_STEP=1 ;;
   esac
 fi
-if [ -n "$DIRECTORY_STEP" ]; then
-  DIRECTORY_TEXT="     Directory step (advisory; grants nothing), run before this stop:
-       python3 '$REPO/ops/federation/standup/directory.py' --url '$FED_DIRECTORY_URL' --ours '$OURS'${FED_PACKAGE_URL:+ --package-url '$FED_PACKAGE_URL'} --their-id '${FED_COUNTERPARTY_ID:-<unset>}'
-     It uploads our package (unless FED_PACKAGE_URL names our own host) and CA,
-     publishes our pointer, fetches their package and CA, checks digest,
-     signatures and CA fingerprint, places what is not on disk, and prints the
-     key and fingerprint to read back and a compatibility report."
-elif [ -n "${FED_DIRECTORY_URL:-}" ]; then
-  DIRECTORY_TEXT="     FED_DIRECTORY_URL, FED_PACKAGE_URL, FED_COUNTERPARTY_ID or FED_CA_CERT holds
-     characters outside a plain URL; the directory step is off."
-else
-  DIRECTORY_TEXT="     Optional: set FED_DIRECTORY_URL, FED_COUNTERPARTY_ID and FED_SIGNING_KEY to
-     exchange packages and CA certificates through a peering directory instead
-     (advisory; grants nothing; no public host needed)."
-fi
-step 5 MANUAL "exchange packages, and bind their verifying key out of band" \
-  "Send $OURS and our CA certificate to the counterparty, with $FED_WORK/ours.spiffe-bundle if phase 2 wrote one
-     (with FED_DIRECTORY_URL set, phase 5 moves the package and CA through the directory).
+if [ "${FED_NO_DIRECTORY:-}" = 1 ]; then
+  EXCHANGE_LABEL="exchange packages by hand (FED_NO_DIRECTORY=1); read the key and CA fingerprint aloud"
+  EXCHANGE_TEXT="No directory: FED_NO_DIRECTORY=1 is for a counterparty that can reach none.
+     Send $OURS and our CA certificate to the counterparty, with $FED_WORK/ours.spiffe-bundle if phase 2 wrote one.
      Obtain theirs and place them at: $FED_COUNTERPARTY
        $FED_WORK/theirs-ca.pem
-       $FED_WORK/theirs.spiffe-bundle
-     Bind their verifying key over a channel authenticated independently of
-     this link — a key taken from the package it verifies proves nothing.
-     Record BOTH parties' keys, one per line, at:
+       $FED_WORK/theirs.spiffe-bundle"
+elif [ -n "$DIRECTORY_STEP" ]; then
+  EXCHANGE_LABEL="exchange through the directory; read the key and CA fingerprint aloud"
+  EXCHANGE_TEXT="Directory step, run before this stop (it grants nothing):
+       python3 '$REPO/ops/federation/standup/directory.py' --url '$FED_DIRECTORY_URL' --ours '$OURS'${FED_PACKAGE_URL:+ --package-url '$FED_PACKAGE_URL'} --their-id '${FED_COUNTERPARTY_ID:-<unset>}'
+     It uploads our package (unless FED_PACKAGE_URL names our own host), CA and
+     SPIFFE bundle (when phase 2 wrote one), publishes our pointer, fetches
+     theirs to $FED_COUNTERPARTY, $FED_WORK/theirs-ca.pem and
+     $FED_WORK/theirs.spiffe-bundle, checks digest, signatures and CA
+     fingerprint, and prints both verifying keys and CA fingerprints in groups
+     of four and a compatibility report. Their entry not there yet: run phase 5
+     again after they run theirs."
+elif [ -n "${FED_DIRECTORY_URL:-}" ]; then
+  EXCHANGE_LABEL="exchange through the directory; read the key and CA fingerprint aloud"
+  EXCHANGE_TEXT="FED_DIRECTORY_URL, FED_PACKAGE_URL, FED_COUNTERPARTY_ID or FED_CA_CERT holds
+     characters outside a plain URL; phase 1 refuses this run."
+else
+  EXCHANGE_LABEL="exchange through the directory; read the key and CA fingerprint aloud"
+  EXCHANGE_TEXT="Set FED_DIRECTORY_URL, FED_COUNTERPARTY_ID and FED_SIGNING_KEY; phase 1 refuses
+     without them. The directory step then uploads our package and CA, fetches
+     theirs, and prints both keys and CA fingerprints and a compatibility report.
+     FED_NO_DIRECTORY=1 is for a counterparty that can reach no directory."
+fi
+step 5 MANUAL "$EXCHANGE_LABEL" \
+  "$EXCHANGE_TEXT
+     On one call, each side reads its verifying key and CA fingerprint aloud and
+     the other reads them back: a key taken from the package it verifies proves
+     nothing. Then record BOTH parties' keys, one per line, at:
        $FED_KEYRING
      as   <sovereign_id>=<44 base64 characters>
      Phase 6 passes each line to compose as --key; compose refuses (exit 20)
-     for any party whose key is not bound.
-$DIRECTORY_TEXT"
+     for any party whose key is not bound. After compose, read the agreement
+     digest to each other the same way."
 
 # Each `sovereign=key` line in the keyring becomes one --key argument. A missing
 # or empty keyring is not patched over here: compose's own refusal names the
@@ -265,10 +371,10 @@ if [ -f "$FED_KEYRING" ]; then
 fi
 
 step 6 T "compose — one agreement, one digest, no perspective" \
-  "$GOAT_BIN federate compose '$OURS' '$FED_COUNTERPARTY'$KEYARGS --out '$AGREEMENT'"
+  "$FED_VERB compose '$OURS' '$FED_COUNTERPARTY'$KEYARGS --out '$AGREEMENT'"
 
 step 7 T "verify the agreement from our side" \
-  "$GOAT_BIN federate verify '$AGREEMENT' ${AS:+--as '$AS'}"
+  "$FED_VERB verify '$AGREEMENT' ${AS:+--as '$AS'}"
 
 # ---------------------------------------------------------------------------
 # Phase 8 — PEERING LEAVES, minted from the agreement's DERIVED names. Hand-minting
@@ -284,7 +390,7 @@ step 8 T "mint the peering leaf certificates from the agreement" \
 #     cannot drift apart by being typed twice.
 # ---------------------------------------------------------------------------
 step 9 T "apply — render the access rules and configuration" \
-  "$GOAT_BIN federate apply '$AGREEMENT' ${AS:+--as '$AS'} --edge-group '$EDGE_GROUP' --out '$APPLIED' --confirm"
+  "$FED_VERB apply '$AGREEMENT' ${AS:+--as '$AS'} --edge-group '$EDGE_GROUP' --out '$APPLIED' --confirm"
 
 # ---------------------------------------------------------------------------
 # Phase 10 — WHAT ONLY THIS PARTY MAY CHANGE. `apply` renders the core's access
@@ -340,10 +446,18 @@ else
      false"
 fi
 
-# The edge binds its partner-facing port on the link address, which exists once the
-# transport is open, and that is why the transport comes first.
-step 12 A "deploy the sovereign edge router" \
-  "$(play peering-zenoh-edge.yml)"
+# ---------------------------------------------------------------------------
+# Phase 12 — THE EDGE, THEN THE REPUBLISHER. The edge binds its partner-facing port
+#      on the link address, which exists once the transport is open, and that is
+#      why the transport comes first. The republisher runs on our core host and
+#      both of its sessions dial our core: it reads `release/<set>/**` and writes
+#      `from/<us>/<set>/**`, the only writer of our wire name, and the edge carries
+#      that name out. Worked when the edge reached our core and the republisher
+#      reports `local_subscribed 1` and `edge_linked 1` with one `release -> wire`
+#      line per offered set.
+# ---------------------------------------------------------------------------
+step 12 A "deploy the sovereign edge router and the outbound republisher" \
+  "$(play peering-zenoh-edge.yml) && $(play peering-republisher.yml "$CORE_GROUP")"
 
 # ---------------------------------------------------------------------------
 # Phase 13 — ADR 1157 STEP 2. Each side federates the other's SPIRE trust domain:
@@ -369,6 +483,6 @@ if [ "$PLAN" = 1 ]; then
   PLAN ONLY — nothing above executed.
   Phases 5 and 10 are MANUAL and stop the run; resume with --from 6 and --from 11.
   Acceptance criteria for every phase: docs/operations/sovereign-federation-runbook.md
-  The shape and why: docs/design/staged-delivery-pattern.md
+  The shape and why: https://github.com/usareur-af/goatdocs/blob/main/docs/design/staged-delivery-pattern.md
 PLANEND
 fi

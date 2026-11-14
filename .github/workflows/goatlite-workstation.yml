@@ -1,0 +1,73 @@
+# goatlite-workstation — the goatlite tutorial's laptop setup
+# (docs/tutorials/00-goatlite.md section 1) runs as written in a fresh
+# ubuntu:24.04 container: apt after apt update, mikefarah's yq, Go, one Python
+# venv with the pinned ansible-core and its collections, Playwright's Chromium
+# with its system libraries and a launch check, then a goatlite render that
+# mints a CA with that toolchain. Each step has a negative control
+# (ops/tutorials/check-workstation.sh). The macOS job runs the page's macOS
+# commands as written on a GitHub macOS runner (Homebrew comes installed there;
+# the page installs it first). Path-filtered to the page and what its commands
+# read.
+#
+# Rollback: rm this file.
+
+name: goatlite-workstation
+
+on:
+  pull_request:
+    paths:
+      - 'docs/tutorials/00-goatlite.md'
+      - 'ops/tutorials/check-workstation.sh'
+      - 'ops/goat-id-console/web/e2e/package.json'
+      - 'ops/goat-id-console/web/e2e/package-lock.json'
+      - 'ops/scripts/goatlite-render.py'
+      - 'ops/scripts/mint-site-certs.sh'
+      - 'ops/enrollment/go.mod'
+      - 'ops/enrollment/go.sum'
+      - 'ops/ansible/requirements.yml'
+      - '.github/workflows/goatlite-workstation.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: goatlite-workstation-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  fresh-ubuntu:
+    name: tutorial setup on a fresh Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 25
+    container: ubuntu:24.04
+    # Our package cache, read only when the Ubuntu mirror does not answer
+    # (.github/actions/apt-failover). A job container has no docker, so the cache runs as
+    # this job's service. The image is named twice: here and in that action's cache-image
+    # default; swap the digest into both. GitHub pulls it on every run of this job.
+    services:
+      apt-cache:
+        image: ghcr.io/usareur-af/ci-apt-cache:2026-11-11@sha256:f2e089fcd18ead4e97f13fb0eff5c934e7b6a27c8f37bca730b34f4ef5521ac6
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/apt-failover
+        with:
+          service-host: apt-cache
+      - name: The page declares every prerequisite step
+        run: bash ops/tutorials/check-workstation.sh --lint
+      - name: The setup runs as written, with a negative control per prerequisite
+        run: bash ops/tutorials/check-workstation.sh
+
+  macos:
+    name: tutorial setup on macOS (Apple Silicon)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: The macOS setup runs as written, with its controls
+        run: bash ops/tutorials/check-workstation.sh --macos

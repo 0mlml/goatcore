@@ -11,7 +11,8 @@
 //! holds one assertion, not two. `GOAT_NO_CAFFEINATE=1` opts out. Off macOS, or
 //! without `caffeinate`, nothing happens.
 
-use std::process::{Command, Stdio};
+use crate::runner::Cmd;
+use std::process::Stdio;
 
 pub const MARKER: &str = "GOAT_KEEP_AWAKE";
 pub const OPT_OUT: &str = "GOAT_NO_CAFFEINATE";
@@ -32,7 +33,7 @@ pub fn should_hold(f: &Facts) -> bool {
 
 fn pid_alive(pid: &str) -> bool {
     pid.parse::<u32>().is_ok()
-        && Command::new("kill")
+        && Cmd::new("kill")
             .args(["-0", pid])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -61,14 +62,15 @@ pub fn hold(long_running: bool) {
         return;
     }
     let me = std::process::id().to_string();
-    let started = Command::new("caffeinate")
+    let started = Cmd::new("caffeinate")
         .args(["-i", "-w", &me])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
     if started.is_ok() {
-        // Single-threaded here (main, before any verb runs), so set_var is sound.
+        // main only, before any thread starts (main.rs calls this before the run begins),
+        // so set_var is sound here (tests/no_process_env_in_unit_tests.rs allows this site).
         std::env::set_var(MARKER, &me);
     }
 }

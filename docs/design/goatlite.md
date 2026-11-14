@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Run once on hardware, not yet proven for its purpose. A goatlite is never for production: production is the full preset (§7).** Designed 2026-10-31; built 2026-11-02; first real run 2026-11-02 on a fresh cloud VM through `goatbuilder`: every automated phase completes in about 24 minutes of phase time, and the defects that run found are fixed. Proven for its purpose when the cold-read drill of §9 passes and the grow-out of §6 is measured (phases C and D). |
+| Status | **Run end to end from the tutorial on clean machines, not yet proven for its purpose. A goatlite is never for production: production is the full preset (§7).** Designed 2026-10-31; built 2026-11-02; first real run 2026-11-02 on a fresh cloud VM through `goatbuilder`: every automated phase completes in about 24 minutes of phase time, and the defects that run found are fixed. On 2026-11-08 the Linux path of `docs/tutorials/00-goatlite.md` was followed as written on two fresh Ubuntu 24.04 VMs (a workstation and the box) and reached `goatbuilder doctor` 21/21, `GATE: PASS — 23 PASS, 0 FAIL, 0 UNKNOWN` and a round-trip publish; the defects it found are fixed in #185–#193. The macOS workstation path was not part of that run. Proven for its purpose when the cold-read drill of §9 passes and the grow-out of §6 is measured (phases C and D). |
 | ADR | [ADR 1213](../adr/1213-goatlite-preset-one-box-one-file.md) |
 | Prepared for by | [ADR 1198 D6](../adr/1198-goatbuilder-config-driven-deploy-release-cli.md) ("goatlite is a preset, not a fork"); [goatbuilder.md §"A goatlite profile"](goatbuilder.md#a-goatlite-profile-future) |
 | Bar it is measured against | [complexity-budget-and-encapsulation.md §"The bar"](https://github.com/usareur-af/goatdocs/blob/main/docs/design/complexity-budget-and-encapsulation.md#the-bar-definition-of-success): the 5-minute and 30-minute onboarding paths (ADR 1016 D2) |
@@ -55,7 +55,7 @@ Each row is a value the full shape asks for and the lite preset supplies. The "t
 | Host on its own mesh | `install_netbird_daemon: true` | an isolated node is not on any other mesh |
 | Secrets | `secrets.store: env-file`; `goatbuilder secrets init --env <name>` writes the gitignored 0600 file | ADR 1204 D1, D4, D5 |
 | Cloud | none. `GOAT_AWS_MODE=none`; no Cloudflare token; no Terraform tree | `with-aws` supports `none` ([ops/scripts/with-aws](../../ops/scripts/with-aws) line 8) |
-| Images | pulled anonymously from the public namespace | ADR 1197 D1 (Proposed): the open core publishes signed OCI images. Until it lands, `GHCR_READ_TOKEN` is the one account goatlite needs, and the quickstart says so in one line |
+| Images | pulled anonymously from the public namespace | Built: every image in `ops/pins/fleet-pins.yaml` pulls from `ghcr.io/usareur-af` without credentials (checked 2026-11-08), so goatlite needs no account |
 | Disk encryption | `disk_encryption: true` by default; `false` is a declared exclusion for a VM | doctrine P2; standup decision 1 "Encrypt the data disk" |
 | Administrator | `site_admins: [admin]`; the bootstrap identity and the NetBird infra service token are created by the driver | standup decision 2 "`site_admins` is you"; today the LAN path stops before phase 12 until the identity is made in the dashboard (goatnet-standup.md line 558) |
 | Service tier | `site_deploy_tier_max: 1` | the tier model's minimal-node ceiling |
@@ -92,7 +92,7 @@ A goatlite first run should need no account with any outside service. Each row i
 | 4 | Phase 12 `netbird-service-identities.py --mint` writes to 1Password; the driver never passes `--no-1password` | [netbird-service-identities.py](../../ops/scripts/netbird-service-identities.py) line 250; goat-standup.sh line 785 | the driver passes the flag whenever `secrets.store` is not `1password` |
 | 5 | Phase 4 expects a CA root to exist; the dev blob is "out-of-band from the trunk owner" | goatnet-standup.md line 124; [mint-site-certs.sh](../../ops/scripts/mint-site-certs.sh) line 85 | phase 4 calls `ca-init --mode dev --allow-single-recipient` when the manifest's root does not exist, generating the age key first if absent |
 | 6 | The LAN path needs the bootstrap identity made in the dashboard before phase 12, and the infra service-user token made in the dashboard UI | goatnet-standup.md lines 502–520, 558 | the management service seeds `svc-<name>-netbird-infra` and writes its token to a root-only file at first account creation (a change in the forked management binary); the driver reads the file. Until that lands, the driver prints the exact dashboard steps with the one-time password |
-| 7 | Images are private; every host needs `GHCR_READ_TOKEN` | goatnet-standup.md line 124 | ADR 1197 public images. Until then the token is the one account, named in the quickstart |
+| 7 | Images are private; every host needs `GHCR_READ_TOKEN` | goatnet-standup.md line 124 | Resolved: the images are public on `ghcr.io/usareur-af` and pull without credentials (checked 2026-11-08); the quickstart names no token |
 | 8 | Every goatnet's signed pins intent hashes the whole `fleet-pins.yaml`, so a learner's row would invalidate goat's three intents in their checkout, which they cannot re-sign | `intent.py` and `pins.rs` `build_body`, `sources` | a lite goatnet lives in the sidecar table `ops/pins/lite-pins.yaml`; both loaders merge it; goat's intents keep their sources, a lite intent lists both tables |
 
 **Status 2026-11-02.** Rows 1, 2, 3, 4, 5 and 8 are built. Row 6 is built as the printed phase-11 step on every LAN site; the driver-made token (a change in the forked management service) is not. Row 7 is owned by ADR 1197.
@@ -141,10 +141,16 @@ The SPIRE trust domain and the CA stay as they were: both are locked once minted
 
 **Proof today.** Rendered from scratch and grown from a LAN render, each surface passes `goat-standup.sh <name> --plan` on the internet profile, `standup-required-inputs.py <name> --profile internet --no-secrets` with nothing missing, `standup-config-preflight.py <name>_hosts`, `--verify`, and the standup parity gate between the two drivers. `tests/test_goatlite_render_internet.py` holds the value checks and their negative controls. The `goatenv` repository carries a rendered internet example, `example-internet`, under `internet/`.
 
+### Growing into a full environment
+
+Status: designed, not built. Gate rows G1 and G2.
+
+Reach is the first of the growth steps, not the last. `goatbuilder grow` takes a running goatlite into a full-preset goatnet on the same box, with the same name, CA and database, in numbered steps that each show what they change first: custody of the identity root, reach (the `lite.internet` render above), the hand-over of `goatlite.yaml` and the rendered file set to a full configuration, the secrets store, the tier ceiling and promotion rungs, an observability host, and a second core. The first run gains nothing from this: no fact, prompt, outside account or phase, and nothing is provisioned ahead of growth. The design, with the identity-root options, what the name fixes for good, and whether a second site can join a running one, is [goatlite-growth.md](goatlite-growth.md).
+
 ## 7. What goatlite is not
 
 - Not a second procedure. `check-deployment-doctrine.sh` must see the quickstart point back to goatnet-standup.md.
-- Not production, now or later. No obs host, no core pair, no Spock, no relays, tier ceiling 1. Those are the full preset, and growing out (§6) adds reach, not those. A production goatnet is stood up with the full preset.
+- Not production. No obs host, no core pair, no Spock, no relays, tier ceiling 1. Those are the full preset. A goatlite reaches them only by growing into a full-preset goatnet ([goatlite-growth.md](goatlite-growth.md)); whether a goatnet grown that way is acceptable for production is its owning team's declared posture.
 - Not a participant appliance. A learner who wants to join someone else's goatnet runs a moon-pod ([goat-moon-pod.md](https://github.com/usareur-af/goatstuff/blob/main/docs/design/goat-moon-pod.md)); rung 2 of the ladder.
 - Not a fork of the playbooks. Any lite-only playbook is a defect against ADR 1198 D6.
 

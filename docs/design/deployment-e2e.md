@@ -16,12 +16,32 @@ each answering a different question, each with the host's ledger as the only pro
 |---|---|---|---|
 | **Hermetic** | do the drivers, as committed, move a component through dev → preprod → prod and back? | every PR touching them; nightly | three containers on the CI runner that look like management hosts |
 | **Live canary** | does a deploy work on a real goatnet today? | nightly, from an operator laptop (`ops/e2e/live-canary.sh`) | the management host of the release ladder's dev rung |
-| **Release rehearsal** | will the next step of every open candidate run, before a person runs it? | daily, in CI | none; dry runs |
+| **Release rehearsal** | will the next step of every open candidate run, before a person runs it? | daily, in the CI of the repository that holds the deployment's candidate records and ladder | none; dry runs |
 
 Two gates sit beside them, because the 2026-10-28 releases failed on things no
 tier would have moved: **secrets-coverage** (every variable a deploy templates
 has a reference line a deployer can copy) and **deps-named** (every tool the
 release path invokes is named by its preflight).
+
+Both gates, and the presence check `deploy-component.sh` and `goatbuilder deploy`
+run before the first host (`ops/scripts/deploy-secrets-needed.py`, mirrored in
+`crates/goatbuilder/src/doctor.rs`), derive one set: every environment variable
+the component's play reads with `lookup('env', …)` on that goatnet. The set is
+the group_vars bindings the play and its roles reference; the bindings in the
+defaults of every role it reaches (the component's, the roles the play lists,
+`include_role` / `import_role` and meta dependencies); and the lookups its tasks
+make themselves (a `set_fact`, an `assert`, a file's content), walked through
+`include_tasks` / `import_tasks` into later phases with each enclosing `when:`
+carried down. A name computed per goatnet resolves through the group's value,
+then the role's: audit-subscriber in durable-write mode on zagros needs
+`ZAGROS_AUDIT_SUBSCRIBER_S3_ACCESS_KEY` / `…_SECRET_KEY` and, for its lifecycle
+phase, `ZAGROS_MINIO_ROOT_USER` / `…_PASSWORD` (through `minio_root_user_envvar`),
+so a missing one refuses before a container is replaced. A lookup is not a need
+when it has a literal fallback (`| default('')`), sits under an `if … else`,
+names a shell variable (`HOME`, `USER`), is guarded by a `when:` that reads the
+same environment, or its task's condition is false on the goatnet; a condition
+the walk cannot decide counts the task as reached
+(`tests/test_deploy_secrets_task_lookups.py`).
 
 ## The corpus: what two releases on 2026-10-28 ran into, and which gate now holds it
 
@@ -39,9 +59,9 @@ log kept by hand) — are the regression corpus. Every item has a gate or a fix:
 | 5 | a variable a deploy templates had no reference line for a deployer to copy | `ops/ci/check-secrets-coverage.py` |
 | 7 | `crane` not installed, and `rc.sh` discarded its stderr: "image not found" for an image that existed | `ops/scripts/image-digest` (ADR 1204) uses any of crane, skopeo or docker and keeps the tool's own error; `rc.sh` refuses up front when none is present, `goatbuilder doctor` names it; `check-deps-named.py` |
 | 9 | the smoke exited 2 (no Playwright toolchain) and `rc.sh` said "the candidate is dead, delete the tag" | `rc.sh browser_toolchain_check` before the rows, exit 2 = **UNTESTED**, never FAIL; mirrored in `release.rs`; hermetic `release-dry-run-names-browser-toolchain` |
-| 13 | the preprod rows ran from the laptop, which had to be meshed to zagros and hold its contexts — against the door model | `goatnet-runners.yaml goat_via: door:<env>`: the rows run `goat` on the rung's management host through the door (`env-door.sh --ssh-target`); the host must hold the contexts (zagros-dev does; zagros and zagros-prod need theirs minted) |
+| 13 | the preprod rows ran from the laptop, which had to be meshed to zagros and hold its contexts — against the door model | `goatnet-runners.yaml goat_via: door:<env>`: the rows run `goat` on the rung's management host through the door (`env-door.sh --host-target` through `--ssh-target`); the host must hold the contexts (zagros-dev does; zagros and zagros-prod need theirs minted) |
 | 14 | the laptop's zagros profile lacked `onboard_endpoint`; the mint got a bare 405 | moot under 13; the 405 is catalogued (track/error-interpreter) |
-| 15 | every retry merged a +3/−3 PR of signature files only | #2046 re-signs only a changed intent and lands nothing when only signatures would change; the deviation edit (`rc.sh set_deviation`, `pins::edit_set_deviation`) now replaces a re-declared deviation where it stands — it used to move it to the top of the map, so every re-run after a later rung's deviation reordered the table and opened a PR; hermetic `release-rerun-dev-step-opens-no-pr` re-runs from dev after the ladder reached preprod and asserts "nothing to land" and no new dev-pin PR |
+| 15 | every retry merged a +3/−3 PR of signature files only | #2046 re-signs only a changed intent and lands nothing when only signatures would change; the deviation edit (`rc.sh set_deviation`, `pins::edit_set_deviation`) now replaces a re-declared deviation where it stands — it used to move it to the top of the map, so every re-run after a later rung's deviation reordered the table and opened a PR; hermetic `release-rerun-dev-step-opens-no-pr` re-runs from dev after the ladder reached preprod and asserts "nothing to land" and no new dev-pin PR. A re-run on a later day (the hermetic run that crossed midnight UTC) still opened one: the dev reason carries the day it was declared, and the edit rewrote it. `rc.sh set_deviation` and `pins::edit_set_deviation` in `goatbuilder release` now leave a deviation that already declares the same value as it stands, reason included (built; `tests/rc-set-deviation.bats` and `release::tests::a_dev_step_rerun_on_a_later_day_leaves_fleet_pins_byte_identical`) |
 | 16 | `--from preprod` rebuilt the record's dev evidence from a variable only the dev step sets | `rc.sh` reads the evidence file from disk on a resume |
 | 17 | "had to install a couple random things" mid-run | `RC_DEPS` + `check-deps-named.py`: every binary the release path invokes is named before step 1, with the install |
 | 18 | both operators kept a run log by hand | the run record (`ops/e2e/rec.py`, `report.schema.json`): every step's command, exit, duration and the ledger rows read, rendered as one page in the CI job summary |
@@ -94,7 +114,7 @@ laptop that reaches the goatnet (mesh or door). The goatnet is the release
 ladder's `dev` rung (`ops/release/ladder.yaml`) unless `--env` names another, and
 the host whose ledger the rollback steps read is that goatnet's first management
 host in `ops/ansible/inventory/doors.yaml` unless `--host` names another; both are
-read by `ops/scripts/goatnet-facts.py`. The run: `goatbuilder doctor`, a dry run, the live deploy of
+read by `ops/scripts/goatnet-facts.py`. When that host's mesh address does not answer, the canary opens the goatnet's door (`door-open.sh`). It then reads the ledger at the same mesh address by jumping through the door (`env-door.sh --ssh-target`, `user@127.0.0.1:<port>`, as a ProxyCommand hop), and the host's own key is checked. Both rollback avenues and `rollback --list` get `--site <goatnet>`, so each tries the host directly and then through the goatnet's door (universal-deploy-rollback.md §Reaching a goatnet through its door). **Built** (issue 261), tested by `tests/goatnet-operator-scripts.bats` with stubbed commands. Status: WIP — gate: a live canary run from off the mesh passes its rollback steps. The run: `goatbuilder doctor`, a dry run, the live deploy of
 `e2e-canary`, `--verify-only`, `rollback --list`, then a real rollback one step back (proved by the host ledger's newest row reading `action: rollback` and naming the prior ref) and the roll forward through `deploy`, verified again — all recorded. The rollback alternates avenue by day (even days `goatbuilder rollback`, odd days `rollback.sh`; `LIVE_CANARY_AVENUE` overrides, ADR 1201) and needs two refs in the host's ledger, which the second `--bump` provides. The canary
 templates no secret, so no `op run`. `--bump` first points the goatnet's deviation
 at the newest image `e2e-canary-image.yml` built from main
@@ -109,7 +129,10 @@ operator's nightly command, not a workflow.
 
 ## Release rehearsal
 
-`ops/e2e/rehearsal.sh`, daily in CI: for every open ladder candidate (a record
+`ops/e2e/rehearsal.sh`, daily in the CI of the repository that carries the
+deployment's release records and live ladder rungs (this repository carries
+neither, so `deploy-e2e.yml` here runs the hermetic tier, the goat suite and
+the gates): for every open ladder candidate (a record
 in state `candidate`) the next step is `--from prod`; for every component whose
 dev rung carries an rc deviation with no open record, `--from dev`. Both
 `rc.sh --dry-run` and `goatbuilder release --dry-run` rehearse it, and the run
@@ -120,8 +143,10 @@ up in the daily record, not on the day a person runs the step.
 
 `ops/validation/goatnet-runners.yaml` carries `goat_via: door:<env>` for zagros
 and zagros-prod: `rc.sh` and `goatbuilder release` open the door
-(`door-open.sh`), resolve `env-door.sh <env> --ssh-target` to `user@127.0.0.1:port`,
-and `onboard-intake-smoke.sh` runs its `goat` legs there. The rows run as
+(`door-open.sh`), resolve `env-door.sh <env> --host-target` to the management
+host (`user@<mesh address>`) and `--ssh-target` to the door (`user@127.0.0.1:port`,
+passed as `GOAT_ROWS_SSH_JUMP`), and `onboard-intake-smoke.sh` runs its `goat`
+legs on the host through the door. The rows run as
 the non-person identities the values file names, never as an operator: the
 intake rows as `acceptance` (`goat_sponsor_context`, [ADR 1207](../adr/1207-acceptance-rows-run-as-a-non-person-sponsor-identity.md)),
 the fabric rows as `assay-probe` (`probe_context`) where the goatnet declares
@@ -188,6 +213,8 @@ come from what each command promises, and this table checks that no class is bli
 avenues, a real WireGuard link, and reads the proof from the receiving side's storage and ACL trace.
 Its hosts run systemd and their own dockerd, because the edge role bind-mounts host paths and reads
 the container's PID, which a socket shared with the runner would break.
+[federation-e2e-environment.md](federation-e2e-environment.md) runs the same engine with several
+sovereigns, network profiles and a scenario matrix against any ref.
 
 ## What is not here
 

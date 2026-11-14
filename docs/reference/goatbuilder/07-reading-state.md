@@ -52,6 +52,7 @@ your laptop.
 goatbuilder doctor                         # every environment
 goatbuilder doctor --env <goatnet>         # one environment
 goatbuilder doctor --site <site>           # also scan every input a standup of <site> reaches
+goatbuilder doctor --browser-tests         # also require the live rows' browser toolchain
 ```
 
 `--site` runs the static required-input scan over every play the site's
@@ -65,10 +66,10 @@ touched. It takes 6 to 13 seconds per site.
 | `config`, `repo` | the config validates; the source repository, image namespace and signing |
 | `tool:*` | git, gh, ansible-playbook, aws-vault, go (intent signing), ssh, image-digest, cosign, crane, op |
 | `python:deps` | PyYAML and jsonschema for the Python tools both avenues call |
-| `checkout` | the checkout is `main` and current with origin |
+| `checkout` | the checkout is `main` and current with origin; or the tree is an assembled tree, which only its `.goat-assembled` marker says, and the row names what the marker records it was built from (goatcore, any public layers, the overlay). An assembled tree is on a detached HEAD by construction, so that is not a failure; the row fails when the marker cannot be read, says `goatcore_ref=local`, records a `-dirty` overlay commit, or names a goatcore commit that is not the tree's HEAD. A marker that names no overlay checkout with an `assemble.sh` passes with a note: `release` and `rc.sh` refuse that tree (GB-009), while a deploy finds the overlay through `GOAT_OVERLAY_DIR`. The marker is trusted the same way `rc.sh` and `release` trust it. A detached HEAD without the marker still fails (F-586) |
 | `secrets:*` | the store in force and whether it can serve |
 | `env:op-refs` | no incomplete `op://` reference anywhere in the shell |
-| `tool:live-rows` | the browser toolchain the live validation rows need |
+| `tool:live-rows` | the browser toolchain the live validation rows need. Only a release runs those rows, so a missing toolchain is a note (the row passes and prints its install line under `Note:`); with `--browser-tests` it is a failure |
 | per environment | transport, each play's target mode, each component's templated secrets |
 
 **Refusals:** GB-009 (not a current `main` checkout), GB-010 (a Python
@@ -202,8 +203,10 @@ With no host reachable it prints the in-repo history, exactly as
 **Purpose.** Grade every machine of an environment as converged, pending or
 unknown, for every component.
 
-**Status:** built on fixtures. On real hosts `status` refuses with GB-026 and
-names `verify` and `diff`, which read real hosts today.
+**Status:** built, on fixtures and on real hosts. Without `--mock` it reads each
+machine's ledger as `diff` does and grades it as `verify` does, so the three agree
+about every machine. It reads only: no play runs. Exit 3 while any machine is
+pending or unknown.
 
 ```bash
 goatbuilder status --mock ops/goatbuilder/fixtures/basic --env dev
