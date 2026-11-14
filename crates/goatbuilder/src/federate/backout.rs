@@ -1202,6 +1202,46 @@ pub fn slot_recheck(repo: &Path, env: Option<&str>, run: bool) -> (String, bool,
     }
 }
 
+/// A role core the back-out takes a partner out of: the role, and either the
+/// rewritten `peerings.yml` with the command that drops the store, or why
+/// the entry is kept.
+type RoleDrop = (
+    super::admit_role::RoleCore,
+    Result<(String, String), String>,
+);
+
+/// The play that drops a backed-out partner's store whole on a goat-zenoh
+/// role core (ADR 1234), on the role's own inventory group, after the role's
+/// play has restarted the router without it. The role's store and
+/// configuration paths and its stack name are passed as the role resolves
+/// them, since the play reads the task file by path and not the role's
+/// defaults. Refused (GB-236) when one does not resolve to a plain value.
+fn store_drop_cmd(
+    repo: &Path,
+    role: &super::admit_role::RoleCore,
+    partner: &str,
+) -> Result<String, String> {
+    let mut extra = format!(" -e goat_zenoh_drop_partner_store='{partner}'");
+    for key in [
+        "goat_zenoh_storage_path",
+        "goat_zenoh_config_path",
+        "zenoh_stack",
+    ] {
+        let v = role.role_value(repo, key)?;
+        if !plain(&v) {
+            return Err(format!(
+                "{key} '{v}' holds characters a plan line cannot carry safely (GB-236)"
+            ));
+        }
+        extra.push_str(&format!(" -e {key}='{v}'"));
+    }
+    let play = super::admit_role::RoleCore {
+        play: "zenoh-drop-partner-store.yml".into(),
+        ..role.clone()
+    };
+    Ok(format!("{}{extra}", play.play_cmd(repo, false)))
+}
+
 fn run_bash(repo: &Path, cmd: &str) -> Result<bool> {
     Ok(crate::federate::runenv::command("bash")
         .args(["-euo", "pipefail", "-c", cmd])
@@ -1375,6 +1415,36 @@ pub fn backout_with(
             t.core_files.push(("peering_backout_core_tls_dir", tls));
         }
     }
+    // ADR 1234: on a goat-zenoh role core with no route of its own, the
+    // partner leaves the role's list in the file admission wrote it into; the
+    // role's play restarts the router without the partner's store, and then
+    // ops/ansible/zenoh-drop-partner-store.yml deletes that store whole. An
+    // entry the back-out cannot take out (GB-237), or a store path the role's
+    // declarations do not resolve (GB-236), is reported and kept.
+    let role_drop: Option<RoleDrop> = match &driver {
+        Some(_) => None,
+        None => super::admit::role_core(repo, &t.partner, |k| crate::federate::runenv::var(k).ok())
+            .map_err(|e| {
+                anyhow::Error::from(goat_errors::coded("GB-221", format!("{e} (GB-221)")))
+            })?
+            .and_then(|role| {
+                match super::admit_role::remove_peering(repo, &role.group, &t.partner) {
+                    Ok(None) => None,
+                    Ok(Some(text)) => {
+                        let store = store_drop_cmd(repo, &role, &t.partner).map(|c| (text, c));
+                        Some((role, store))
+                    }
+                    Err(e) => Some((role, Err(e))),
+                }
+            }),
+    };
+    let drop_cmd = |role: &super::admit_role::RoleCore, check: bool| {
+        format!(
+            "{} -e goat_zenoh_drop_partner_store='{}'",
+            role.play_cmd(repo, check),
+            t.partner
+        )
+    };
     let mut checks = vec![row(
         "banner",
         true,
@@ -1436,6 +1506,23 @@ pub fn backout_with(
             ),
         ]
         .into_iter()
+        .chain(
+            role_drop
+                .iter()
+                .filter(|(_, plan)| plan.is_ok())
+                .flat_map(|(role, plan)| {
+                    [
+                        (
+                            "take the partner out of the role's list and restart the core router without its store",
+                            drop_cmd(role, false),
+                        ),
+                        (
+                            "drop the partner's store whole, once the router runs without it",
+                            plan.as_ref().map(|(_, c)| c.clone()).unwrap_or_default(),
+                        ),
+                    ]
+                }),
+        )
         .enumerate()
         {
             checks.push(row("step", true, format!("{} {label}", n + 1), None));
@@ -1575,6 +1662,21 @@ pub fn backout_with(
             Some(false) => format!("keep {}: it is not the file apply generates for {}", rec_path.display(), t.partner),
         },
     ));
+    if let Some((role, plan)) = &role_drop {
+        let file = super::admit_role::peerings_file(repo, &role.group);
+        let shown = file
+            .strip_prefix(repo)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        extra.push((
+            "Partner's store".into(),
+            match plan {
+                Ok(_) => format!("take {} out of zenoh_sovereign_peerings in {shown} (commit the change through review), then run the role's play on [{}], dry run then deploy: the core router restarts without sovereign_from_{} and that store is then deleted whole (ADR 1234)", t.partner, role.group, t.partner),
+                Err(e) => format!("kept: {e}"),
+            },
+        ));
+    }
     if !s.kept.is_empty() {
         extra.push((
             "Kept: another peering's, or the deployment's configuration to remove by review".into(),
@@ -1848,6 +1950,82 @@ pub fn backout_with(
             }
         }
     }
+    // ADR 1234: the partner leaves the role's list, and the role's play
+    // restarts the router without its store, then deletes that store whole.
+    // A play that fails puts the list back, so running the back-out again
+    // repeats this step.
+    if core_done {
+        if let Some((role, Ok((text, store_cmd)))) = &role_drop {
+            let file = super::admit_role::peerings_file(repo, &role.group);
+            let shown = file
+                .strip_prefix(repo)
+                .unwrap_or(&file)
+                .display()
+                .to_string();
+            let mut backups = Vec::new();
+            let mut done = super::admit::publish(
+                text.as_bytes(),
+                &file,
+                &mut backups,
+                &base.join("core/role/backup"),
+            )
+            .map_err(|e| format!("cannot write {shown} ({e})"));
+            if done.is_ok() {
+                for check in [true, false] {
+                    let cmd = drop_cmd(role, check);
+                    checks.push(row("cmd", true, cmd.clone(), None));
+                    if !exec(repo, &cmd)? {
+                        done = Err(if check {
+                            format!(
+                                "the role's play on [{}] failed its dry run (GB-224)",
+                                role.group
+                            )
+                        } else {
+                            format!(
+                                "the role's play on [{}] did not restart the router without sovereign_from_{} and drop it; the store was kept (GB-270)",
+                                role.group, t.partner
+                            )
+                        });
+                        break;
+                    }
+                }
+            }
+            if done.is_ok() {
+                checks.push(row("cmd", true, store_cmd.clone(), None));
+                if !exec(repo, store_cmd)? {
+                    done = Err(format!(
+                        "the core router does not yet run without sovereign_from_{}, or its store could not be deleted; the store was kept (GB-270)",
+                        t.partner
+                    ));
+                }
+            }
+            match done {
+                Ok(()) => checks.push(row(
+                    "core store",
+                    true,
+                    format!(
+                        "{} left zenoh_sovereign_peerings in {shown}: commit that change through review; the core router restarted without sovereign_from_{} and that store was deleted whole",
+                        t.partner, t.partner
+                    ),
+                    None,
+                )),
+                Err(e) => {
+                    let back = super::admit::put_back(&backups);
+                    core_done = false;
+                    checks.push(row(
+                        "core store",
+                        false,
+                        format!("{e}; {back}"),
+                        Some(format!(
+                            "read the play output above, then goatbuilder federate backout {}",
+                            t.partner
+                        )),
+                    ));
+                    exit = EXIT_NOT_CONVERGED;
+                }
+            }
+        }
+    }
     if !core_done {
         // The partner is still admitted on the core: keep its directory slot and
         // record until the core step has run, so the record matches the core.
@@ -1940,10 +2118,10 @@ pub fn backout_with(
                 "the core still admits {} through zenoh_sovereign_peerings (GB-227)",
                 t.partner
             ),
-            Some(
-                "remove the entry from the core's configuration by review and run the core play"
-                    .into(),
-            ),
+            Some(match &role_drop {
+                Some((_, Err(e))) => format!("the back-out could not take the entry out: {e}"),
+                _ => "the entry is declared where admission did not write it: remove it there by review and run the core play".into(),
+            }),
         ));
         exit = EXIT_NOT_CONVERGED;
     } else {
@@ -2538,7 +2716,7 @@ mod tests {
     fn role_core_checkout() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         for (rel, text) in [
-            ("ops/ansible/roles/goat-zenoh/defaults/main.yml", "zenoh_router_image: \"x\"\nzenoh_stack: \"{{ site_id }}-zenoh\"\ngoat_zenoh_config_path: \"/etc/{{ zenoh_stack }}/config.json5\"\ngoat_zenoh_acl_seed_path: \"/etc/{{ zenoh_stack }}/config.seed.json5\"\ngoat_zenoh_acl_org_path: \"/etc/{{ zenoh_stack }}/acl-org-fragment.json5\"\ngoat_zenoh_tls_dir: \"/etc/{{ zenoh_stack }}/tls\"\nzenoh_sovereign_peerings: []\n"),
+            ("ops/ansible/roles/goat-zenoh/defaults/main.yml", "zenoh_router_image: \"x\"\nzenoh_stack: \"{{ site_id }}-zenoh\"\ngoat_zenoh_config_path: \"/etc/{{ zenoh_stack }}/config.json5\"\ngoat_zenoh_acl_seed_path: \"/etc/{{ zenoh_stack }}/config.seed.json5\"\ngoat_zenoh_acl_org_path: \"/etc/{{ zenoh_stack }}/acl-org-fragment.json5\"\ngoat_zenoh_tls_dir: \"/etc/{{ zenoh_stack }}/tls\"\ngoat_zenoh_storage_path: \"/var/lib/{{ zenoh_stack }}/rocksdb\"\nzenoh_sovereign_peerings: []\n"),
             ("ops/ansible/zenoh-deploy.yml", "- hosts: \"{{ target | mandatory }}\"\n"),
             ("ops/pins/fleet-pins.yaml", "components:\n  zenoh-router:\n    var: zenoh_router_image\n    ledger_component: xaa-zenoh\n    deploy_playbook: zenoh-deploy.yml\n"),
             ("ops/ansible/inventory/core-router.ini", "[core_router]\nxaa-core ansible_host=192.0.2.10\n"),
@@ -2559,6 +2737,16 @@ mod tests {
     fn role_leaf_back_out(
         prior: Option<&[u8]>,
     ) -> (Vec<String>, PathBuf, PathBuf, Report, tempfile::TempDir) {
+        role_back_out(prior, None, false)
+    }
+
+    /// As `role_leaf_back_out`, with the role group's `peerings.yml` holding
+    /// `peerings` when given (the file admission writes the partner into).
+    fn role_back_out(
+        prior: Option<&[u8]>,
+        peerings: Option<&str>,
+        drop_fails: bool,
+    ) -> (Vec<String>, PathBuf, PathBuf, Report, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();
         let (repo, work) = stand_in(d.path());
         let role = role_core_checkout();
@@ -2572,6 +2760,13 @@ mod tests {
             let to = repo.join(rel);
             std::fs::create_dir_all(to.parent().unwrap()).unwrap();
             std::fs::copy(role.path().join(rel), &to).unwrap();
+        }
+        if let Some(text) = peerings {
+            std::fs::write(
+                repo.join("ops/ansible/group_vars/core_router/peerings.yml"),
+                text,
+            )
+            .unwrap();
         }
         let leaves = d.path().join("xaa-leaves");
         std::fs::create_dir_all(&leaves).unwrap();
@@ -2613,7 +2808,9 @@ mod tests {
                 r#"{"host":"core-x","peering":"hello-ally","rows":[]}"#,
             )
             .unwrap();
-            Ok(true)
+            Ok(!(drop_fails
+                && cmd.contains("goat_zenoh_drop_partner_store")
+                && !cmd.contains("--check")))
         };
         let o = Options {
             partner: "hello-ally",
@@ -2699,6 +2896,126 @@ mod tests {
                 "{c}"
             );
         }
+    }
+
+    #[test]
+    fn on_a_role_core_the_partner_leaves_the_roles_list_and_its_store_is_dropped() {
+        // ADR 1234: the back-out takes the partner's entry out of the file
+        // admission wrote it into, keeping every other line, then runs the
+        // role's play (dry run, then deploy), which restarts the router without
+        // the partner's store and only then deletes that store's directory.
+        let before = "# Each partner this core admits.\nzenoh_sovereign_peerings:\n- sovereign: hello-ally\n  cn: fed.hello-ally.zagros.01\n- sovereign: xab\n  cn: fed.xab.zagros.01\nzenoh_from_retention_days: 7 # kept as written\n";
+        let (ran, _cert, _key, r, d) = role_back_out(Some(b"THE-LEAF-BEFORE"), Some(before), false);
+        let file = d
+            .path()
+            .join("repo/ops/ansible/group_vars/core_router/peerings.yml");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "# Each partner this core admits.\nzenoh_sovereign_peerings:\n- sovereign: xab\n  cn: fed.xab.zagros.01\nzenoh_from_retention_days: 7 # kept as written\n",
+            "{:?}",
+            r.checks
+        );
+        let drops: Vec<&String> = ran
+            .iter()
+            .filter(|c| c.contains("goat_zenoh_drop_partner_store"))
+            .collect();
+        assert_eq!(
+            drops.len(),
+            3,
+            "the role's dry run and deploy, then the store's own play: {ran:?}"
+        );
+        assert!(
+            drops[0].contains("--check") && !drops[1].contains("--check"),
+            "{drops:?}"
+        );
+        for c in &drops[..2] {
+            assert!(
+                c.contains("zenoh-deploy.yml")
+                    && c.contains("-e goat_zenoh_drop_partner_store='hello-ally'"),
+                "{c}"
+            );
+        }
+        assert!(
+            drops[2].contains("zenoh-drop-partner-store.yml")
+                && !drops[2].contains("--check")
+                && drops[2].contains("-e goat_zenoh_drop_partner_store='hello-ally'")
+                && drops[2].contains("-e goat_zenoh_storage_path='/var/lib/xaa-zenoh/rocksdb'")
+                && drops[2].contains("-e goat_zenoh_config_path='/etc/xaa-zenoh/config.json5'")
+                && drops[2].contains("-e zenoh_stack='xaa-zenoh'")
+                && drops[2].contains("-e target='core_router'"),
+            "{}",
+            drops[2]
+        );
+        let core = ran
+            .iter()
+            .position(|c| c.contains("peering_backout_apply"))
+            .expect("the removal play");
+        let first = ran
+            .iter()
+            .position(|c| c.contains("goat_zenoh_drop_partner_store"))
+            .unwrap();
+        assert!(core < first, "the edge goes first: {ran:?}");
+        assert!(
+            r.checks.iter().find(|c| c.name == "converged").unwrap().ok,
+            "{:?}",
+            r.checks
+        );
+        // The last partner: the list is left empty, not dropped.
+        let only =
+            "zenoh_sovereign_peerings:\n- sovereign: hello-ally\n  cn: fed.hello-ally.zagros.01\n";
+        let (_ran, _c, _k, r, d) = role_back_out(Some(b"THE-LEAF-BEFORE"), Some(only), false);
+        assert_eq!(
+            std::fs::read_to_string(
+                d.path()
+                    .join("repo/ops/ansible/group_vars/core_router/peerings.yml")
+            )
+            .unwrap(),
+            "zenoh_sovereign_peerings: []\n",
+            "{:?}",
+            r.checks
+        );
+    }
+
+    #[test]
+    fn a_store_drop_that_fails_puts_the_partner_back_in_the_list() {
+        // The role kept the store (it refuses while the router still serves
+        // it): the list is as it was, so running the back-out again repeats
+        // the step, and the run is not converged, naming GB-270.
+        let before =
+            "zenoh_sovereign_peerings:\n- sovereign: hello-ally\n  cn: fed.hello-ally.zagros.01\n";
+        let (_ran, _c, _k, r, d) = role_back_out(Some(b"THE-LEAF-BEFORE"), Some(before), true);
+        assert_eq!(
+            std::fs::read_to_string(
+                d.path()
+                    .join("repo/ops/ansible/group_vars/core_router/peerings.yml")
+            )
+            .unwrap(),
+            before,
+            "{:?}",
+            r.checks
+        );
+        let row = r.checks.iter().find(|c| c.name == "core store").unwrap();
+        assert!(!row.ok && row.detail.contains("(GB-270)"), "{row:?}");
+        assert_eq!(r.exit, EXIT_NOT_CONVERGED, "{:?}", r.checks);
+    }
+
+    #[test]
+    fn a_role_core_that_does_not_list_the_partner_runs_no_store_drop() {
+        let (ran, _c, _k, r, _d) = role_back_out(
+            Some(b"THE-LEAF-BEFORE"),
+            Some("zenoh_sovereign_peerings:\n- sovereign: xab\n  cn: fed.xab.zagros.01\n"),
+            false,
+        );
+        assert!(
+            ran.iter()
+                .all(|c| !c.contains("goat_zenoh_drop_partner_store")),
+            "{ran:?}"
+        );
+        assert!(
+            r.checks.iter().find(|c| c.name == "converged").unwrap().ok,
+            "{:?}",
+            r.checks
+        );
     }
 
     #[test]
