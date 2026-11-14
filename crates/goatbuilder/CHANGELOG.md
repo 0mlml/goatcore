@@ -88,6 +88,21 @@ it for this class", followed by the declaration that keeps each one off.
 and the grade cannot disagree. When the model cannot be read, the section
 says so in one line and lists nothing; the run is not stopped. (#612)
 
+#### "Changed: join-node has no manual phase after reaching the node"
+
+`goatbuilder join-node` stopped at phase 8, to mint a setup key, and at
+phase 10, to enrol the node by hand. Now phase 10 enrols the node itself. It
+mints a single-use, one-hour key where the NetBird database is (for a joiner
+site, the founder's first host), hands it to `netbird up` through a 0600 file
+on the node, and checks that the node is on the kernel ACL plane. The key
+never reaches your machine and is not stored. Phase 10 then writes the node's
+mesh address into your checkout; the run's summary and its run record name
+each file it wrote, for you to review and commit. Phase 8 now checks that the
+site declares `mesh_enrollment_url`, and phase 9 sends no setup key. Phase 2
+resolves the first-login password through the secrets injector and refuses
+one that still holds a reference (GB-269); the password reaches `sudo` on
+standard input. Only phase 1, reaching the node, stops the run (#661).
+
 #### Fixed: join-node adds a node at a third site, phases 1 to 15
 
 Three refusals stopped `goatbuilder join-node` for a node not yet enrolled at
@@ -112,6 +127,14 @@ from `postgres_max_connections`. The roles that schedule jobs with cron
 (`apt-cacher-ng`, `docker-registry-mirror`, `oci-substrate-t2-sync`,
 `isitup`, `operator-idp-postgres` and the observability play) now install
 `cron` first, so a minimal Debian host runs those jobs (#615).
+
+#### Changed: the forwarder's carrier read-back reads each peer's public key and allowed address
+
+`goat-peering-forwarder` reads each carrier back with `wg show <carrier>
+allowed-ips` and `listen-port`, and a back-out checks that a carrier exists with
+`listen-port`. When a carrier does not hold what the declaration says, the failure
+message lists each peer's public key and allowed address, then the port the
+carrier listens on.
 
 #### Fixed: a phase 11 link that did not come up is named as GB-271
 
@@ -184,6 +207,16 @@ under `-o json` and as a section of the plan page, and names the secrets
 posture probes it ran to read them. A secret is shown by its source only,
 never its value (#649).
 
+#### Added: a failed standup phase names the error in its output
+
+When a standup phase fails, its output (the log the run kept of it) is matched
+against the error catalog, as `goatbuilder federate` already does. The failure
+then carries an `interpreted` row: the error's code, its likely cause and fix,
+the log, and the command that runs that phase again by hand. With no known
+error in the output, the row gives the phase's own guidance from the phase
+catalog. This covers the numbered phases; the image pull, the observability
+legs and phase 12's parallel steps are not covered yet.
+
 #### Added: goatbuilder status reads real hosts
 
 `goatbuilder status --env <env>` without `--mock` refused with GB-026. It now
@@ -202,6 +235,19 @@ installs: the keyless signature over `SHA256SUMS` (`SHA256SUMS.cosign-bundle`)
 for the release workflow of `<owner>/<repo>` at `goatbuilder/v<version>`, and
 every other file in `<dir>` against that `SHA256SUMS`. It reads only. A
 refusal names the failed check: GB-261 for the signature, GB-074 for a file.
+
+#### Fixed: an edge deployed from a workspace gets the certificates it mounts, or phase 12 says why
+
+`goatbuilder federate` run from a machine that is not the edge host (an operator's
+workspace) used to deploy an edge whose leaves and CAs lived only on the
+workspace, in `<work>/pki`: the edge started, mounted nothing and never reached
+the core. Phase 12 now refuses first (GB-275) when the edge group's vars point
+the edge at files in `<work>/pki`, the inventory names the edge as another
+machine, and `goat_zenoh_edge_install_certs` is off; the fix is to turn that
+switch on. With it on, the `goat-zenoh-edge` role now also installs our CA's
+certificate as `<cert_dir>/our-ca.pem`, from `<work>/pki/our-ca.pem` (never the
+CA's key: a source holding a private key is refused), and `goatbuilder federate
+allocate` renders our CA's path and the core endpoint's override at that path.
 
 ### For someone contributing
 
