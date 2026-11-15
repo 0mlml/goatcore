@@ -43,6 +43,17 @@ partner's new CA beside the current one during their rotation. It is opt-in,
 and without a rotation id nothing changes. `goatbuilder federate rotate` does
 not drive it yet.
 
+### For someone contributing
+
+#### Changed: the compatibility check is held to goatbuilder/v0.7.1
+
+`ops/ci/check-goatbuilder-compat.sh` now compares each build with
+`goatbuilder/v0.7.1`, the last published release: its command surface and its
+kept `-o json` documents. The upgrade tests' list pins v0.7.1's four
+published binaries (`crates/goatbuilder/tests/upgrade/releases.sha256`), and
+v0.7.1's configuration files are kept for gate row A2 with the outcome its
+published binary gives each.
+
 <!-- END generated: changelog unreleased -->
 
 ## 0.7.1 — 2026-11-15
