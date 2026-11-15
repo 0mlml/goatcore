@@ -132,11 +132,24 @@ is made (GB-280). See ADR 1235 (#678).
 
 Every other class and transport plans and runs as before (#747).
 
+#### Added: goatbuilder federate plan --accept host-allocation records a judged SKIP
+
+A deployment that declares its other peerings by hand may not be able to make
+every value the host-allocation check compares resolve. That check is not run
+again by deploy, so its SKIP used to stop deploy for good. `goatbuilder
+federate plan <partner> --accept host-allocation` now records that SKIP with
+its exact detail inside the plan and its hash. The plan view shows it at
+approval, and deploy goes ahead while the check reads exactly the same. When
+it reads differently, deploy refuses (GB-188) and names what it reads now and
+what was accepted. Only a check deploy does not run again can be accepted,
+and only when it is SKIP (#779).
+
 #### Fixed: a host-allocation SKIP says which case it is and what clears it
 
-A plan whose host-allocation check was SKIP cannot be deployed: deploy does
-not run that check again, so it refuses the plan (GB-188), and a new plan
-records the same SKIP. The refusal used to say only "host-allocation was SKIP
+A plan whose host-allocation check was SKIP cannot be deployed as it stands:
+deploy does not run that check again, so it refuses the plan (GB-188), and a
+new plan records the same SKIP, unless the plan accepts it (`--accept
+host-allocation`, below). The refusal used to say only "host-allocation was SKIP
 when the plan was made". Now the plan view, the refusal and the run record
 carry the check's detail, which gives the case and the route:
 - the inventory names no host for this peering: run `goatbuilder federate
@@ -145,7 +158,7 @@ carry the check's detail, which gives the case and the route:
   value is named with its key and the group whose vars set it;
 - its agreement was not found: both paths that were looked at are named.
 
-GB-188's catalog entry gains this cause (#742).
+GB-188's catalog entry gains this cause (#753, fixes #742).
 
 ### For someone contributing
 

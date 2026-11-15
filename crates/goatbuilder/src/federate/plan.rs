@@ -194,6 +194,11 @@ pub struct Plan {
     /// machine (the host-level allocation check, federate/hostalloc.rs). Only
     /// the conflicts this peering is part of.
     pub conflicts: Vec<hostalloc::Conflict>,
+    /// SKIPs the operator judged and accepted with `plan --accept <check>`,
+    /// each with the exact detail it had (#742). Inside the hash, so the
+    /// approval covers them; absent when none, so an older plan's hash holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted: Vec<Accepted>,
     /// READY, `READY, <n> check(s) not verified` (SKIP is never a pass), or BLOCKED.
     pub verdict: String,
     /// sha256 over the plan without this field and without readiness details.
@@ -202,6 +207,54 @@ pub struct Plan {
     /// build that cannot read it can say which one did.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub written_by: String,
+}
+
+/// A SKIP the operator accepted, as it read when accepted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Accepted {
+    pub check: String,
+    pub detail: String,
+}
+
+/// The checks `plan --accept` takes: those deploy does not run again, whose
+/// SKIP would otherwise make the plan unready for good.
+pub const ACCEPTABLE: &[&str] = &["host-allocation"];
+
+/// Record each named check's SKIP as accepted, with its exact detail, and
+/// write the new hash. Refused for a check that cannot be accepted, or one
+/// that is not SKIP in this plan.
+pub fn accept(p: &mut Plan, checks: &[String]) -> Result<()> {
+    for c in checks {
+        if !ACCEPTABLE.contains(&c.as_str()) {
+            return Err(goat_errors::coded(
+                "GB-189",
+                format!(
+                    "--accept {c}: only a check deploy does not run again can be accepted ({}); a live check is rerun before anything changes",
+                    ACCEPTABLE.join(", ")
+                ),
+            )
+            .into());
+        }
+        let Some(row) = p.readiness.iter().find(|r| r.check == *c) else {
+            return Err(anyhow!("--accept {c}: the plan has no {c} row"));
+        };
+        if row.outcome != "SKIP" {
+            return Err(goat_errors::coded(
+                "GB-189",
+                format!("--accept {c}: {c} is {} in this plan, so there is nothing to accept", row.outcome),
+            )
+            .into());
+        }
+        let a = Accepted {
+            check: c.clone(),
+            detail: row.detail.clone(),
+        };
+        if !p.accepted.contains(&a) {
+            p.accepted.push(a);
+        }
+    }
+    p.hash = plan_hash(p);
+    Ok(())
 }
 
 /// The sections an input change can move, by name, for the recheck's report.
@@ -1287,6 +1340,7 @@ fn inputs_part(
         resources,
         host_firewall,
         conflicts,
+        accepted: Vec::new(),
         edge_group,
         core_group,
         work,
@@ -1464,6 +1518,9 @@ pub struct Recheck {
     /// The checks the approved plan itself recorded as SKIP. The person
     /// approved the plan with them shown, so the same SKIP now is no change.
     pub skipped_in_plan: Vec<String>,
+    /// The SKIPs the approved plan accepted (`plan --accept`): such a check
+    /// holds only while it reads exactly as accepted.
+    pub accepted: Vec<Accepted>,
 }
 
 impl Recheck {
@@ -1482,9 +1539,26 @@ impl Recheck {
 
     /// Whether one rechecked row lets the change go ahead.
     pub fn holds(&self, r: &Readiness) -> bool {
+        if r.outcome == "SKIP" {
+            if let Some(a) = self.accepted.iter().find(|a| a.check == r.check) {
+                return a.detail == r.detail;
+            }
+        }
         r.outcome == "PASS"
             || r.outcome == "NOT APPLICABLE"
             || (r.outcome == "SKIP" && self.skipped_in_plan.contains(&r.check))
+    }
+
+    /// Why a rechecked row does not hold, for the refusal: an accepted
+    /// check names what it reads now and what was accepted.
+    pub fn why_not(&self, r: &Readiness) -> String {
+        match self.accepted.iter().find(|a| a.check == r.check) {
+            Some(a) if r.outcome == "SKIP" => format!(
+                "{} SKIP is not the SKIP the plan accepted: it reads now: {}; it was accepted as: {}",
+                r.check, r.detail, a.detail
+            ),
+            _ => format!("{} {}", r.check, r.outcome),
+        }
     }
 }
 
@@ -1511,7 +1585,10 @@ fn unready_at(saved: &Plan, now: chrono::DateTime<chrono::Utc>, max_hours: i64) 
         .readiness
         .iter()
         .filter(|r| {
-            blocks(&r.outcome) || (r.outcome == "SKIP" && !LIVE_CHECKS.contains(&r.check.as_str()))
+            blocks(&r.outcome)
+                || (r.outcome == "SKIP"
+                    && !LIVE_CHECKS.contains(&r.check.as_str())
+                    && !saved.accepted.iter().any(|a| a.check == r.check && a.detail == r.detail))
         })
         .map(|r| {
             if r.detail.is_empty() {
@@ -1640,10 +1717,11 @@ pub fn recheck_live_prerequisites(repo: &Path, plan_path: &Path, with: &str) -> 
     Ok(Recheck {
         peering: saved.peering.clone(),
         unready: unready(&saved),
-        plan_hash: saved.hash,
+        plan_hash: saved.hash.clone(),
         changed,
         live,
         skipped_in_plan,
+        accepted: saved.accepted,
     })
 }
 
@@ -1777,6 +1855,14 @@ fn rows_of(p: &Plan) -> Vec<Check> {
             r.code.clone().filter(|_| blocks(&r.outcome)),
         ));
     }
+    for a in &p.accepted {
+        c.push(row(
+            "accepted",
+            true,
+            format!("{} SKIP accepted by the operator, as it read: {}; deploy goes ahead only while it reads the same", a.check, a.detail),
+            None,
+        ));
+    }
     for h in &p.host_firewall {
         c.push(row(
             "host-firewall",
@@ -1798,7 +1884,16 @@ fn rows_of(p: &Plan) -> Vec<Check> {
 /// `goatbuilder federate plan <partner>`: build the plan, write it (not under
 /// `--mock`), and report it. Exit 0 when READY, refused when BLOCKED.
 pub fn plan(repo: &Path, o: &PlanOptions) -> Result<Report> {
-    let p = build(repo, o)?;
+    plan_accepting(repo, o, &[])
+}
+
+/// [`plan`], recording each SKIP named by `--accept` with its exact detail
+/// ([`accept`]).
+pub fn plan_accepting(repo: &Path, o: &PlanOptions, accepting: &[String]) -> Result<Report> {
+    let mut p = build(repo, o)?;
+    if !accepting.is_empty() {
+        accept(&mut p, accepting)?;
+    }
     let mut checks = rows_of(&p);
     if o.mock.is_none() {
         let path = write(&p)?;
@@ -1857,7 +1952,7 @@ pub fn recheck(repo: &Path, o: &PlanOptions) -> Result<Report> {
         ));
     }
     for l in &r.live {
-        let ok = l.outcome == "PASS" || l.outcome == "NOT APPLICABLE";
+        let ok = r.holds(l);
         checks.push(row(
             "live",
             ok,
@@ -1920,6 +2015,12 @@ pub enum Stage {
         /// file was altered, an input changed, or a live prerequisite fails.
         #[arg(long)]
         recheck: bool,
+        /// Accept this check's SKIP, as it reads now, into the plan and its
+        /// hash: deploy then goes ahead while it reads exactly the same, and
+        /// refuses when it reads otherwise. Only host-allocation, a check
+        /// deploy does not run again. Repeatable.
+        #[arg(long, value_name = "CHECK")]
+        accept: Vec<String>,
     },
     /// Back out ONE peering: survey its hosts, confirm, remove its tunnel,
     /// SPIRE federation, edge router, republisher, forwarder mapping and core
@@ -1952,6 +2053,7 @@ pub fn run(repo: &Path, stage: &Stage, mock: Option<&Path>) -> Result<Report> {
             work,
             no_live,
             recheck: again,
+            accept: accepting,
         } => {
             let o = PlanOptions {
                 with,
@@ -1963,9 +2065,12 @@ pub fn run(repo: &Path, stage: &Stage, mock: Option<&Path>) -> Result<Report> {
                 live: !no_live,
             };
             if *again {
+                if !accepting.is_empty() {
+                    return Err(anyhow!("--accept records into a new plan; --recheck reads the saved one: run them apart"));
+                }
                 recheck(repo, &o)
             } else {
-                plan(repo, &o)
+                plan_accepting(repo, &o, accepting)
             }
         }
     }
@@ -2252,6 +2357,7 @@ mod tests {
             changed,
             live,
             skipped_in_plan: Vec::new(),
+            accepted: Vec::new(),
         };
         assert!(r(vec![], vec![], all("PASS")).allows_change());
         assert!(r(vec![], vec![], all("NOT APPLICABLE")).allows_change());
@@ -2696,6 +2802,69 @@ mod tests {
             view.contains("readiness:  host-allocation SKIP: not verified: the value named here"),
             "{view}"
         );
+    }
+
+    /// `plan --accept host-allocation` (#742 part 3): the SKIP the operator
+    /// judged is recorded with its exact detail, inside the hash. The plan
+    /// is then not unready for it, the plan view shows it, and the recheck
+    /// lets the same SKIP through and no other. A plan with no acceptance
+    /// serializes as before, so its hash does not change.
+    #[test]
+    fn an_accepted_skip_is_bound_into_the_hash_and_honoured_only_for_its_detail() {
+        let r = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let mut p = planned(r.path(), &w.path().display().to_string());
+        let before = serde_json::to_value(&p).unwrap();
+        assert!(before.get("accepted").is_none(), "{before}");
+        let now = chrono::Utc::now();
+        p.created_at = now.to_rfc3339();
+        let skip = |detail: &str| Readiness {
+            check: "host-allocation".into(),
+            outcome: "SKIP".into(),
+            code: None,
+            detail: detail.into(),
+        };
+        p.readiness = vec![skip("not verified: X")];
+        // Only a check deploy does not run again can be accepted, and only
+        // when it is SKIP.
+        let e = accept(&mut p.clone(), &["slot-anchors".to_string()]).unwrap_err();
+        assert!(format!("{e:#}").contains("host-allocation"), "{e:#}");
+        let mut passing = p.clone();
+        passing.readiness[0].outcome = "PASS".into();
+        let e = accept(&mut passing, &["host-allocation".to_string()]).unwrap_err();
+        assert!(format!("{e:#}").contains("nothing to accept"), "{e:#}");
+
+        accept(&mut p, &["host-allocation".to_string()]).unwrap();
+        assert_eq!(
+            p.accepted,
+            [Accepted {
+                check: "host-allocation".into(),
+                detail: "not verified: X".into()
+            }]
+        );
+        assert!(unready_at(&p, now, 24).is_empty(), "{:?}", unready_at(&p, now, 24));
+        let h = plan_hash(&p);
+        assert_eq!(p.hash, h, "accept writes the new hash");
+        let mut other = p.clone();
+        other.accepted[0].detail = "not verified: Y".into();
+        assert_ne!(plan_hash(&other), h, "the accepted detail is hashed");
+        let view = super::super::deploy::summary(&p, Path::new("/w/plan.json"));
+        assert!(
+            view.contains("accepted:   host-allocation SKIP, as it read when accepted: not verified: X"),
+            "{view}"
+        );
+
+        let rc = |row: Readiness| Recheck {
+            peering: "velmara".into(),
+            plan_hash: h.clone(),
+            unready: Vec::new(),
+            changed: Vec::new(),
+            live: vec![row],
+            skipped_in_plan: vec!["host-allocation".into()],
+            accepted: p.accepted.clone(),
+        };
+        assert!(rc(skip("not verified: X")).holds(&skip("not verified: X")));
+        assert!(!rc(skip("not verified: Y")).holds(&skip("not verified: Y")));
     }
 
     /// Private keys under <work>/pki are not hashed into the plan; the
