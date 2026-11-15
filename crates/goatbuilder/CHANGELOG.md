@@ -363,6 +363,16 @@ against (today, UTC) and the date the 90 days end. Before 1.0 an entry
 excuses a removal at once, as before. goatbuilder-pr fetches the release tags
 for this check, and reads each named release's list from its tag (#800, #826).
 
+#### Added: join-node's peer-groups query is measured against NetBird's own schema
+
+`ops/netbird/tests/peer-groups-query.sh` starts the pinned NetBird management
+on a disposable Postgres, enrols two real clients with keys from
+`mgmt-host-bootstrap`, and runs the query `mesh-enroll-host.yml` uses at
+join-node's phase 10 to read the groups the minting host's peer holds.
+`tests/test_mesh_enroll_peer_groups.py` holds the query's shape always, and
+its result when the script runs it. The query was designed and is now
+measured. (#754)
+
 #### Added: the release check starts at the cut-off, and the tag's tree check decides a rerun
 
 The rules that hold while a release is cut (`docs/reference/goatbuilder/02-install.md`)
