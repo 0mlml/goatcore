@@ -216,6 +216,19 @@ standup's timing line (the total and the five slowest steps), and join-node
 prints "phase <n> took <s>s" for each step. A dry run writes nothing, and a
 failed step is the last row, with its exit code (#802).
 
+#### Added: a report's -o json document lists the deprecated items a run used
+
+A run that uses a deprecated command, flag or value now lists each one in a
+`deprecations` field of a report's `-o json` or `-o yaml` document and of a
+refused run's error document, so a pipeline sees it without reading stderr.
+The documents a verb prints in a shape of its own (`survey`, `show --json`,
+`federate status`, `explain`, and `promote status --json`, `review --json` and
+`readiness`) do not carry it.
+Each entry names the command, the flag or value, the replacement, the release
+that first warned and the warning line printed on stderr. A run that used none
+has no such field, so every document is unchanged until the list in
+`ops/goatbuilder/compat/deprecations.yaml` names something (#818).
+
 #### Added: goatbuilder federate plan --accept host-allocation records a judged SKIP
 
 A deployment that declares its other peerings by hand may not be able to make
