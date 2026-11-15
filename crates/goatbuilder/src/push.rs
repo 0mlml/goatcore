@@ -483,6 +483,12 @@ fn split_expected(inv: &serde_json::Value, group: &str, write_role: &str) -> (Ve
 /// `deploy` on real hosts. Exit 0 when every host's ledger names the declared
 /// digest with `action: deploy`; 3 otherwise; 1 when refused before any host.
 pub fn deploy(repo: &Path, o: &Options) -> Result<Report> {
+    // This converger is push. An environment declared to pull is refused before
+    // any step: the pull converger is not built, and pushing would change what
+    // the declaration means once it is.
+    if !o.verify_only {
+        crate::converger::refuse_pull_agent(repo, o.goatnet)?;
+    }
     let mut checks = Vec::new();
     let name = o.goatnet.replace('_', "-");
     // The runner frames and records each step's commands under it
@@ -1123,6 +1129,27 @@ mod tests {
         assert_eq!(civil_from_days(20_754), (2026, 10, 28));
         assert!(stamp().ends_with('Z'));
         assert_eq!(stamp().len(), 16);
+    }
+}
+
+#[cfg(test)]
+mod pull_agent_tests {
+    use super::*;
+
+    /// A real-host deploy to a pull-agent environment is refused before any
+    /// step runs, in a dry run too: its plan would be a push.
+    #[test]
+    fn deploy_refuses_a_pull_agent_environment_before_any_step() {
+        let t = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/goatbuilder/fixtures/standup/goatbuilder.yaml");
+        let text = std::fs::read_to_string(fixture).unwrap().replacen("- name: dev\n    converger: push-ansible", "- name: dev\n    converger: pull-agent", 1);
+        std::fs::create_dir_all(t.path().join("ops/goatbuilder")).unwrap();
+        std::fs::write(t.path().join("ops/goatbuilder/goatbuilder.yaml"), text).unwrap();
+        for dry_run in [false, true] {
+            let o = Options { component: "portal", goatnet: "dev", only_group: None, dry_run, verify_only: false, ack: "" };
+            let e = deploy(t.path(), &o).unwrap_err();
+            assert_eq!(e.downcast_ref::<goat_errors::Coded>().map(|c| c.code.as_str()), Some(crate::converger::PULL_NOT_BUILT), "{e:#}");
+        }
     }
 }
 

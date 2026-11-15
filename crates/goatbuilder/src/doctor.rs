@@ -235,7 +235,7 @@ pub fn run(repo: &Path, only_env: Option<&str>, frozen: bool, credentials: bool,
             .filter(|e| only_env.map(|o| o == e.name).unwrap_or(true))
         {
             let mut detail = match (env.converger.as_str(), env.transport.as_deref()) {
-                ("pull-agent", _) => "pull-agent: no transport: the agent reaches out".to_string(),
+                ("pull-agent", _) => "pull-agent: no transport, and no pull converger to use".to_string(),
                 (_, Some("ssm")) => "push over the mesh when this machine is on the environment's profile; otherwise its SSM door (bootstrap/break-glass grade: ~20-minute idle timeout: not for a long play)".to_string(),
                 (_, Some("direct")) | (_, None) => "push over the mesh (direct, SSH with the inventory)".to_string(),
                 (_, Some(other)) => format!("transport '{other}' is not one this binary knows"),
@@ -267,6 +267,7 @@ pub fn run(repo: &Path, only_env: Option<&str>, frozen: bool, credentials: bool,
                 detail.push_str(&s);
             }
             checks.push(ok(&format!("env:{}", env.name), detail));
+            checks.extend(pull_agent_check(env));
             if env.converger != "pull-agent" {
                 checks.push(reach_check(repo, env));
             }
@@ -487,6 +488,21 @@ fn reach_check(repo: &Path, env: &config::Environment) -> Check {
             "fix the file named, then re-run doctor",
         ),
     }
+}
+
+/// The row that refuses an environment declaring `converger: pull-agent`
+/// anywhere (crate::converger::PULL_NOT_BUILT): the pull converger is not
+/// built, and every real-host verb would push to it. None when nothing does.
+fn pull_agent_check(env: &config::Environment) -> Option<Check> {
+    let places = crate::converger::pull_agent_places(env);
+    if places.is_empty() {
+        return None;
+    }
+    Some(refused(
+        &format!("env:{}:converger", env.name),
+        format!("{} {}", crate::converger::PULL_NOT_BUILT, crate::converger::pull_agent_refusal(&env.name, &places)),
+        "declare converger: push-ansible for these machines in ops/goatbuilder/goatbuilder.yaml until the pull converger is built (docs/design/goatbuilder-pull-converger-options.md)",
+    ))
 }
 
 /// The same list, each name once, in reading order.
@@ -2755,6 +2771,21 @@ mod tests {
             peering_edge_reserved_udp: None,
             peering_directory: None,
         }
+    }
+
+    /// doctor refuses a pull-agent environment, naming the code, where it is
+    /// declared, and that pull is not built; a push environment gets no row.
+    #[test]
+    fn doctor_refuses_an_environment_that_declares_the_pull_converger() {
+        assert!(pull_agent_check(&env("dev")).is_none());
+        let c = pull_agent_check(&config::Environment { converger: "pull-agent".into(), ..env("dev") }).expect("a row");
+        assert!(!c.ok, "{c:?}");
+        assert!(c.detail.contains(crate::converger::PULL_NOT_BUILT) && c.detail.contains("not built") && c.detail.contains("environment dev"), "{}", c.detail);
+        assert!(c.fix.as_deref().unwrap_or("").contains("push-ansible"), "{c:?}");
+        let mut by_class = env("dev");
+        by_class.sites.push(config::Site { name: "bravo".into(), role: None, joins: None, converger: None, transport: None, classes: [("core".to_string(), config::Class::default()), ("pod".to_string(), config::Class { converger: Some("pull-agent".into()) })].into_iter().collect() });
+        let c = pull_agent_check(&by_class).expect("a row for a class");
+        assert!(c.detail.contains("site bravo class pod"), "{}", c.detail);
     }
 
     const MESH_ROW: &str = "[zagros_hosts]\nmgmt-zagros-01 ansible_host=100.127.0.45\n\n[zagros_dev_hosts]\n# the Thor\nmgmt-zagros-dev-01-thor ansible_host=100.127.0.155\n";

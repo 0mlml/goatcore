@@ -459,6 +459,17 @@ fn image_repo(r: &str) -> String {
 /// ledger, and the same field `--site` narrows on. Hosts with no `site:` (the
 /// group-based relay ledgers, rolled per-goatnet by their own inventory) are not
 /// goatnets here; the set is sorted and deduplicated.
+/// With no `--site`, every goatnet the rollback would flip, each refused when
+/// it declares the pull converger (`converger::refuse_pull_agent`).
+fn refuse_pull_agent_goatnets(repo: &Path, site: Option<&str>, hosts: &[HostMap]) -> Result<()> {
+    if site.is_none() {
+        for net in goatnets_of(hosts) {
+            crate::converger::refuse_pull_agent(repo, &net)?;
+        }
+    }
+    Ok(())
+}
+
 fn goatnets_of(hosts: &[HostMap]) -> Vec<String> {
     let mut v: Vec<String> = hosts.iter().map(|h| h.site.clone()).filter(|s| !s.is_empty()).collect();
     v.sort();
@@ -499,8 +510,14 @@ pub(crate) fn decide(repo: &Path, component: &str, n: u32, site: Option<&str>) -
     if !(1..=7).contains(&n) {
         return Err(anyhow::Error::from(goat_errors::coded("GB-246", format!("N must be 1..7 (got: {n})"))));
     }
+    // A rollback is a push: a goatnet declared to pull is refused before any
+    // ledger is read (the pull converger is not built).
+    if let Some(s) = site {
+        crate::converger::refuse_pull_agent(repo, s)?;
+    }
     let (hosts, history) = load_reached(repo, component, site)?;
     require_site_when_multi_goatnet(component, site, &hosts)?;
+    refuse_pull_agent_goatnets(repo, site, &hosts)?;
     let m = artifact_meta(&hosts, component);
     let (target, src, _) = pick_target(&hosts, &history, component, n)?;
     Ok(serde_json::json!({
@@ -513,6 +530,11 @@ pub(crate) fn decide(repo: &Path, component: &str, n: u32, site: Option<&str>) -
 pub fn roll(repo: &Path, component: &str, n: u32, dry_run: bool, site: Option<&str>) -> Result<Report> {
     if !(1..=7).contains(&n) {
         return Err(anyhow::Error::from(goat_errors::coded("GB-246", format!("N must be 1..7 (got: {n})"))));
+    }
+    // A rollback is a push: a goatnet declared to pull is refused before any
+    // ledger is read (the pull converger is not built).
+    if let Some(s) = site {
+        crate::converger::refuse_pull_agent(repo, s)?;
     }
     // Fresh source (C3): the guards below read this checkout's deploy-history.yml
     // (the hosts map, do_not_roll_to), so a checkout behind the trunk is refused
@@ -528,6 +550,7 @@ pub fn roll(repo: &Path, component: &str, n: u32, dry_run: bool, site: Option<&s
     }
     let (hosts, history) = load_reached(repo, component, site)?;
     require_site_when_multi_goatnet(component, site, &hosts)?;
+    refuse_pull_agent_goatnets(repo, site, &hosts)?;
     let m = artifact_meta(&hosts, component);
     let mut checks: Vec<Check> = fresh.map(|f| f.check).into_iter().collect();
     let refuse = |checks: Vec<Check>, exit: i32| {
@@ -1018,5 +1041,23 @@ mod more_tests {
         assert!(e.contains("no hosts"), "{e}");
         let e = load_ledger(t.path(), "absent").unwrap_err().to_string();
         assert!(e.contains("no Ansible role"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod pull_agent_tests {
+    use super::*;
+
+    /// A rollback of a goatnet that declares the pull converger is refused
+    /// before any ledger is read, in a dry run too.
+    #[test]
+    fn rollback_refuses_a_pull_agent_goatnet() {
+        let t = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/goatbuilder/fixtures/standup/goatbuilder.yaml");
+        let text = std::fs::read_to_string(fixture).unwrap().replacen("- name: dev\n    converger: push-ansible", "- name: dev\n    converger: pull-agent", 1);
+        std::fs::create_dir_all(t.path().join("ops/goatbuilder")).unwrap();
+        std::fs::write(t.path().join("ops/goatbuilder/goatbuilder.yaml"), text).unwrap();
+        let e = roll(t.path(), "portal", 1, true, Some("dev")).unwrap_err();
+        assert_eq!(e.downcast_ref::<goat_errors::Coded>().map(|c| c.code.as_str()), Some(crate::converger::PULL_NOT_BUILT), "{e:#}");
     }
 }
