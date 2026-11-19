@@ -1131,6 +1131,10 @@ gb-353-cause-2 = the joiner's reference points at another goatnet's entry
 gb-354-title = the env store holds none of a joining site's shared secrets
 gb-354-what = join-node's phase 3 takes a joining site's shared values from its founder. Under the env store nothing persists, so it cannot write them: each joiner name must already be exported in the shell that runs join-node. One or more are not. Nothing was written.
 gb-354-cause-1 = the declared store is env (GOAT_SECRET_STORE=env or secrets.store: env)
+gb-355-title = a standup play limited to the founder selects no host of the site's group
+gb-355-what = Six standup plays run on the site's first management host alone (SPIRE, the LAN service surface, the LAN TLS routes, the dashboard, the portal, grant-keyd), limited with -l 'mgmt-<site>-01*', the declared naming rule. Before the play, the same command checked the site's group, <site>_hosts, in inventory/mgmt-hosts.ini and inventory/mgmt-hosts-mesh.ini, and no host there matches the limit. The play was refused before ansible ran: with another host matching the pattern, ansible prints "skipping: no hosts matched" and exits 0 having done nothing. Both avenues, goatbuilder standup and goat-standup.sh, run the check (ops/scripts/inventory-hosts.py --match --require).
+gb-355-cause-1 = the site's first management host is named otherwise than mgmt-<site>-01 in the inventory
+gb-355-cause-2 = the host is listed under another group than <site>_hosts
 gb-370-title = no usable peering directory URL or id was given
 gb-370-what = goatbuilder federate directory needs the directory's base URL, from --url or FED_DIRECTORY_URL, as an http(s) URL; and a party or counterparty id as the directory accepts it, 2 to 16 of a-z, 0-9 and -. Nothing was requested.
 gb-370-cause-1 = neither --url nor FED_DIRECTORY_URL is set in this shell
