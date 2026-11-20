@@ -169,7 +169,8 @@ pub fn read_yaml(path: &Path) -> Result<Value> {
     if text.trim().is_empty() {
         return Ok(Value::Object(Map::new()));
     }
-    let v: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| anyhow::Error::from(goat_errors::coded("GB-254", format!("{}: {e}", path.display()))))?;
+    // The file was read; what it holds does not parse (GB-329, not GB-254).
+    let v: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| anyhow::Error::from(goat_errors::coded("GB-329", format!("{}: {e}", path.display()))))?;
     let j = yaml_to_json(&v);
     Ok(if j.is_object() { j } else { Value::Object(Map::new()) })
 }
@@ -1307,8 +1308,10 @@ pub fn self_consistent(doc: &Map<String, Value>) -> (String, String) {
 
 pub fn validate_schema(p: &Paths, doc: &Map<String, Value>, where_: &str) -> Result<()> {
     let schema_path = p.intent_schema();
-    let schema: Value = serde_json::from_str(&std::fs::read_to_string(&schema_path).map_err(|e| anyhow::Error::from(goat_errors::coded("GB-254", format!("{}: {e}", schema_path.display()))))?)?;
-    let compiled = jsonschema::JSONSchema::options().with_draft(jsonschema::Draft::Draft7).compile(&schema).map_err(|e| anyhow::Error::from(goat_errors::coded("GB-254", format!("{}: {e}", p.rel(&schema_path)))))?;
+    let text = std::fs::read_to_string(&schema_path).map_err(|e| anyhow::Error::from(goat_errors::coded("GB-254", format!("{}: {e}", schema_path.display()))))?;
+    // Read, but not JSON, or not a draft 7 schema: the checkout's file is damaged (GB-329).
+    let schema: Value = serde_json::from_str(&text).map_err(|e| anyhow::Error::from(goat_errors::coded("GB-329", format!("{} is not JSON: {e}", p.rel(&schema_path)))))?;
+    let compiled = jsonschema::JSONSchema::options().with_draft(jsonschema::Draft::Draft7).compile(&schema).map_err(|e| anyhow::Error::from(goat_errors::coded("GB-329", format!("{} does not compile as a draft 7 schema: {e}", p.rel(&schema_path)))))?;
     let value = Value::Object(doc.clone());
     if let Err(errors) = compiled.validate(&value) {
         if let Some(e) = errors.into_iter().next() {
@@ -2187,5 +2190,62 @@ mod fold_rungs_tests {
         // Without a hotfix record behind it, a different prod pin is kept too.
         let (fold, _) = fold_rungs(&p, "portal", "img:rc.1@sha256:bbbb", "prod", &[], &rungs).unwrap();
         assert_eq!(fold, vec!["pre".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod malformed_checkout_file_tests {
+    //! A checkout file goatbuilder reads that is not well formed stops with GB-329
+    //! (exit 1), not GB-254 ("cannot be read or written"): the file was read.
+    use super::*;
+
+    fn code_of(e: &anyhow::Error) -> Option<String> {
+        e.downcast_ref::<goat_errors::Coded>().map(|c| c.code.clone())
+    }
+
+    fn exit_of(code: &str) -> Option<i32> {
+        goat_errors::explain(code).and_then(|e| e.exit)
+    }
+
+    #[test]
+    fn a_pin_table_that_is_not_yaml_is_gb_329_and_names_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("fleet-pins.yaml");
+        std::fs::write(&p, "components:\n  portal: [unclosed\n").unwrap();
+        let e = read_yaml(&p).unwrap_err();
+        assert_eq!(code_of(&e).as_deref(), Some("GB-329"), "{e:#}");
+        assert!(format!("{e:#}").contains("fleet-pins.yaml"), "{e:#}");
+        assert_eq!(exit_of("GB-329"), Some(1));
+    }
+
+    #[test]
+    fn a_missing_pin_table_is_still_gb_254() {
+        let d = tempfile::tempdir().unwrap();
+        let e = read_yaml(&d.path().join("fleet-pins.yaml")).unwrap_err();
+        assert_eq!(code_of(&e).as_deref(), Some("GB-254"), "{e:#}");
+    }
+
+    fn checkout_with_schema(text: &str) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path()).intent_schema();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+        d
+    }
+
+    #[test]
+    fn an_intent_schema_that_does_not_compile_is_gb_329() {
+        let d = checkout_with_schema("{\"type\": 7}\n");
+        let e = validate_schema(&Paths::new(d.path()), &Map::new(), "rendered intent for 'zagros'").unwrap_err();
+        assert_eq!(code_of(&e).as_deref(), Some("GB-329"), "{e:#}");
+        assert!(format!("{e:#}").contains("intent-v1.schema.json"), "{e:#}");
+    }
+
+    #[test]
+    fn an_intent_schema_that_is_not_json_is_gb_329() {
+        let d = checkout_with_schema("{ not json\n");
+        let e = validate_schema(&Paths::new(d.path()), &Map::new(), "rendered intent for 'zagros'").unwrap_err();
+        assert_eq!(code_of(&e).as_deref(), Some("GB-329"), "{e:#}");
+        assert!(format!("{e:#}").contains("intent-v1.schema.json"), "{e:#}");
     }
 }
